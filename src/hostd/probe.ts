@@ -18,6 +18,7 @@ import {
 } from "../shared/protocol";
 import { ensurePrivateDirectory } from "./atomic-files";
 import { defaultLocalEndpoint, HOSTD_VERSION } from "./paths";
+import { PINNED_PRIME_AGENT_RUNTIME } from "./resident-runtime";
 import { HOST_CAPABILITIES } from "./service";
 import type { HostStore } from "./store";
 
@@ -26,8 +27,9 @@ const TOOL_OUTPUT_LIMIT = 16 * 1024;
 
 export async function collectHostProbe(dataDir: string, store: HostStore): Promise<HostProbe> {
   await ensurePrivateDirectory(dataDir);
-  const [git, python, ipython, primeAgent, availableDiskBytes, runningVersion, catalog] = await Promise.all([
+  const [git, bash, python, ipython, primeAgent, availableDiskBytes, runningVersion, catalog] = await Promise.all([
     probeTool("git", ["--version"]),
+    probeTool("bash", ["--version"]),
     probeFirstTool([
       ["python3", ["--version"]],
       ["python", ["--version"]],
@@ -52,7 +54,18 @@ export async function collectHostProbe(dataDir: string, store: HostStore): Promi
     loginShell: boundedEnvironmentValue(platform === "win32" ? process.env.ComSpec : process.env.SHELL),
     homeDirectory: homedir(),
     availableDiskBytes,
-    tools: { git, python, ipython, primeAgent },
+    tools: { git, node: nodeRuntimeStatus(), bash, python, ipython, primeAgent },
+    primeRuntime: {
+      expectedVersion: PINNED_PRIME_AGENT_RUNTIME.expectedAppVersion,
+      releaseTag: PINNED_PRIME_AGENT_RUNTIME.releaseTag,
+      daemonProtocolVersion: PINNED_PRIME_AGENT_RUNTIME.daemon.protocolVersion,
+      schemaRevision: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaRevision,
+      schemaId: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaId,
+      compatibility: primeAgent.available ? "handshake_required" : "unavailable",
+      diagnostic: primeAgent.available
+        ? "Daemon compatibility is verified from daemon_hello when a resident session attaches."
+        : "Install the pinned Prime Agent runtime before attaching a resident session.",
+    },
     hostd: {
       installedVersion: HOSTD_VERSION,
       runningVersion,
@@ -68,6 +81,22 @@ export async function collectHostProbe(dataDir: string, store: HostStore): Promi
     recentProjects: catalog.projects.slice(0, 1_000),
     capabilities: [...HOST_CAPABILITIES],
   });
+}
+
+export function nodeRuntimeStatus(version = process.versions.node): ProbeToolStatus {
+  if (!/^\d+\.\d+\.\d+(?:[-+].*)?$/.test(version)) {
+    return { available: false, status: "error", diagnostic: "The host Node.js version is invalid." };
+  }
+  const [major = 0, minor = 0] = version.split(".").map((part) => Number.parseInt(part, 10));
+  const supported = major > 22 || (major === 22 && minor >= 8);
+  return supported
+    ? { available: true, status: "ready", version: `Node.js ${version}` }
+    : {
+        available: false,
+        status: "error",
+        version: `Node.js ${version}`,
+        diagnostic: "Prime Agent 0.7.0 requires Node.js 22.8 or newer.",
+      };
 }
 
 async function probeFirstTool(candidates: Array<[string, string[]]>): Promise<ProbeToolStatus> {

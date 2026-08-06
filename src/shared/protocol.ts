@@ -867,9 +867,20 @@ export const HostProbeSchema = z.object({
   availableDiskBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   tools: z.object({
     git: ProbeToolStatusSchema,
+    node: ProbeToolStatusSchema,
+    bash: ProbeToolStatusSchema,
     python: ProbeToolStatusSchema,
     ipython: ProbeToolStatusSchema,
     primeAgent: ProbeToolStatusSchema,
+  }),
+  primeRuntime: z.object({
+    expectedVersion: z.string().min(1).max(64),
+    releaseTag: z.string().min(1).max(64),
+    daemonProtocolVersion: z.number().int().nonnegative().max(1_000_000),
+    schemaRevision: z.number().int().nonnegative().max(1_000_000),
+    schemaId: z.string().min(1).max(256),
+    compatibility: z.enum(["unavailable", "handshake_required", "compatible", "incompatible"]),
+    diagnostic: z.string().max(1_024).optional(),
   }),
   hostd: z.object({
     installedVersion: z.string().min(1).max(64),
