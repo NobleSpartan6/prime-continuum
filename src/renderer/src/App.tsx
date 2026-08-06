@@ -36,7 +36,6 @@ import {
   Server,
   ShieldCheck,
   Smartphone,
-  Sparkles,
   Square,
   Terminal,
   TestTube2,
@@ -82,6 +81,20 @@ function cx(...classes: Array<string | false | null | undefined>): string {
 
 function Icon({ icon: IconComponent, size = 16, strokeWidth = 1.75 }: { icon: LucideIcon; size?: number; strokeWidth?: number }) {
   return <IconComponent aria-hidden="true" focusable="false" size={size} strokeWidth={strokeWidth} />
+}
+
+function BrandMark() {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" focusable="false">
+        <path
+          className="brand-mark__loop"
+          d="M5.25 12c0-2.25 1.62-3.9 3.67-3.9 2.94 0 4.22 7.8 7.16 7.8 2.05 0 3.67-1.65 3.67-3.9s-1.62-3.9-3.67-3.9c-2.94 0-4.22 7.8-7.16 7.8-2.05 0-3.67-1.65-3.67-3.9Z"
+        />
+        <circle className="brand-mark__node" cx="12" cy="12" r="1.15" />
+      </svg>
+    </span>
+  )
 }
 
 function taskLabel(status: TaskState): string {
@@ -553,7 +566,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     return (
       <div className="empty-workbench">
         <header className="empty-workbench__topbar">
-          <div className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></div>
+          <BrandMark />
           <strong>Prime Continuim</strong>
         </header>
         <main className="empty-workbench__main" id="main">
@@ -620,7 +633,7 @@ export default function App({ api: suppliedApi }: AppProps) {
           >
             <Icon icon={sidebarOpen ? PanelLeftClose : Menu} size={18} />
           </button>
-          <div className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></div>
+          <BrandMark />
           <strong className="topbar__brand-name">Prime Continuim</strong>
           <div className="topbar__project">
             <span className="eyebrow">Project</span>
@@ -2263,7 +2276,7 @@ function CompanionPreview({
       <a className="skip-link" href="#companion-main">Skip to companion content</a>
       <header className="companion-topbar">
         <div className="companion-brand">
-          <span className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></span>
+          <BrandMark />
           <span>
             <strong>Prime Continuim</strong>
             <small>{environment === 'preview' ? 'Browser preview · sample data' : 'Read-only companion preview'}</small>

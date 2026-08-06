@@ -437,6 +437,24 @@ code,
   border-radius: var(--radius-md);
 }
 
+.brand-mark svg {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
+  overflow: visible;
+}
+
+.brand-mark__loop {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.15;
+}
+
+.brand-mark__node {
+  fill: var(--color-text);
+}
+
 .panel-heading__icon {
   display: grid;
   place-items: center;

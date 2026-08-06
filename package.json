@@ -2,6 +2,7 @@
   "name": "prime-continuim",
   "version": "0.1.0",
   "private": true,
+  "author": "Prime Continuim contributors",
   "description": "Prime Continuim — a native control surface for durable Prime Agent coding sessions",
   "main": "./out/main/index.js",
   "type": "module",
