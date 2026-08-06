@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 
 const PRIME_AGENT_RELEASE_BASE_URL = "https://github.com/PrimeIntellect-ai/prime-agent/releases/download";
 
@@ -18,6 +19,7 @@ export const PINNED_PRIME_AGENT_RUNTIME = Object.freeze({
   assetUrl: `${PRIME_AGENT_RELEASE_BASE_URL}/v0.7.0/prime-agent-0.7.0.tgz`,
   sha256: "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
   expectedAppVersion: "0.7.0",
+  runtimeBuildId: "be9e2fa-dirty",
   daemon: Object.freeze({
     protocolName: "prime-agent.daemon",
     protocolVersion: 7,
@@ -36,13 +38,15 @@ export const REQUIRED_RESIDENT_DAEMON_CAPABILITIES = Object.freeze([
 
 /**
  * The published package exposes DaemonClient and DaemonAgentConnection but not
- * its daemon launcher. The adapter therefore uses the supported `daemon start`
- * CLI boundary, validates daemon_hello, and performs create/attach via
- * DaemonClient. A resident session is never created through RPC mode because
- * RPC creates a client-owned worker whose lifetime follows the client.
+ * its daemon launcher. In v0.7.0 the old `daemon` command is explicitly
+ * rejected; the documented `--mode daemon --daemon-socket` CLI mode is the
+ * launch boundary. The adapter validates daemon_hello and performs
+ * create/attach via DaemonClient. A resident session is never created through
+ * RPC mode because RPC creates a client-owned worker whose lifetime follows the
+ * client.
  */
 export const RESIDENT_RUNTIME_LAUNCH_STRATEGY = Object.freeze({
-  daemonStart: "pinned_cli_daemon_start",
+  daemonStart: "pinned_cli_daemon_mode",
   sessionCreate: "daemon_client",
   sessionAttach: "daemon_agent_connection",
   sessionLifecycle: "resident",
@@ -58,6 +62,7 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_SCHEMA_ID_MISMATCH"
   | "PRIME_RUNTIME_SOCKET_MISMATCH"
   | "PRIME_RUNTIME_CAPABILITY_MISSING"
+  | "PRIME_RUNTIME_IDENTITY_MISMATCH"
   | "PRIME_RUNTIME_ARGUMENT_INVALID"
   | "PRIME_RUNTIME_MODULE_INVALID"
   | "PRIME_RUNTIME_UNAVAILABLE"
@@ -111,9 +116,9 @@ export class ResidentRuntimeContractError extends Error {
 const BoundedWireStringSchema = z.string().min(1).max(4_096);
 const DaemonRuntimeIdentitySchema = z
   .object({
-    buildId: z.string().min(1).max(256),
+    buildId: z.literal(PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId),
     executablePath: BoundedWireStringSchema,
-    entrypointPath: BoundedWireStringSchema.optional(),
+    entrypointPath: BoundedWireStringSchema,
     launcherPath: BoundedWireStringSchema.optional(),
   })
   .strict();
@@ -132,7 +137,7 @@ const PinnedDaemonHelloSchema = z
     schemaId: z.string().min(1).max(256),
     schemaRevision: z.number().int().nonnegative().max(1_000_000),
     appVersion: z.string().min(1).max(64),
-    runtime: DaemonRuntimeIdentitySchema.optional(),
+    runtime: DaemonRuntimeIdentitySchema,
     supervisorGeneration: z.string().min(1).max(256).optional(),
     supervisorPid: z.number().int().positive().max(2_147_483_647).optional(),
     supervisorOwnerToken: z.string().min(1).max(512).optional(),
@@ -157,7 +162,7 @@ export interface ResidentRuntimeCompatibility {
   readonly schemaRevision: typeof PINNED_PRIME_AGENT_RUNTIME.daemon.schemaRevision;
   readonly schemaId: typeof PINNED_PRIME_AGENT_RUNTIME.daemon.schemaId;
   readonly capabilities: readonly string[];
-  readonly runtimeBuildId?: string;
+  readonly runtimeBuildId: typeof PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId;
   readonly supervisorGeneration?: string;
 }
 
@@ -168,7 +173,11 @@ export interface ResidentRuntimeCompatibility {
  */
 export function validateResidentDaemonHello(
   value: unknown,
-  options: { expectedSocketPath?: string } = {},
+  options: {
+    expectedSocketPath?: string;
+    expectedExecutablePath?: string;
+    expectedEntrypointPath?: string;
+  } = {},
 ): ResidentRuntimeCompatibility {
   const parsed = PinnedDaemonHelloSchema.safeParse(value);
   if (!parsed.success) {
@@ -247,6 +256,27 @@ export function validateResidentDaemonHello(
     );
   }
 
+  const runtimePathMismatches: string[] = [];
+  if (
+    options.expectedExecutablePath !== undefined &&
+    !sameExecutionPath(hello.runtime.executablePath, options.expectedExecutablePath)
+  ) {
+    runtimePathMismatches.push("executablePath");
+  }
+  if (
+    options.expectedEntrypointPath !== undefined &&
+    !sameExecutionPath(hello.runtime.entrypointPath, options.expectedEntrypointPath)
+  ) {
+    runtimePathMismatches.push("entrypointPath");
+  }
+  if (runtimePathMismatches.length > 0) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_IDENTITY_MISMATCH",
+      "Prime Agent daemon was not launched from the verified runtime paths.",
+      { details: { fields: runtimePathMismatches.join(",") } },
+    );
+  }
+
   return Object.freeze({
     releaseVersion: expected.releaseVersion,
     appVersion: expected.expectedAppVersion,
@@ -255,7 +285,7 @@ export function validateResidentDaemonHello(
     schemaRevision: expected.daemon.schemaRevision,
     schemaId: expected.daemon.schemaId,
     capabilities: Object.freeze([...hello.serverCapabilities]),
-    ...(hello.runtime ? { runtimeBuildId: hello.runtime.buildId } : {}),
+    runtimeBuildId: hello.runtime.buildId,
     ...(hello.supervisorGeneration ? { supervisorGeneration: hello.supervisorGeneration } : {}),
   });
 }
@@ -275,45 +305,71 @@ function assertExact<T extends string | number>(
 
 export interface ResidentDaemonStartInvocation {
   readonly executable: string;
-  readonly argv:
-    | readonly ["daemon", "start", "--socket", string]
-    | readonly [string, "daemon", "start", "--socket", string];
+  readonly argv: readonly [string, "--mode", "daemon", "--daemon-socket", string];
   readonly spawn: Readonly<{
     shell: false;
     windowsHide: true;
-    stdio: readonly ["ignore", "pipe", "pipe"];
+    detached: true;
+    cwd: string;
+    env: Readonly<Record<string, string>>;
+    stdio: "ignore";
   }>;
 }
 
 /** Build a fixed argv vector; callers must pass it directly to spawn(). */
 export function buildResidentDaemonStartInvocation(input: {
-  executable?: string;
+  executable: string;
   /** Verified package CLI entrypoint; launch it through a real Node executable. */
-  cliEntrypoint?: string;
+  cliEntrypoint: string;
   socketPath: string;
+  /** Stable, writable host-owned directory; never inherit the caller's cwd. */
+  daemonWorkingDirectory: string;
+  /** Defaults to process.env and is stripped of inherited runtime role state. */
+  environment?: Readonly<NodeJS.ProcessEnv>;
 }): ResidentDaemonStartInvocation {
-  if (input.cliEntrypoint !== undefined && input.executable === undefined) {
-    throw new ResidentRuntimeContractError(
-      "PRIME_RUNTIME_ARGUMENT_INVALID",
-      "Resident runtime executable is required with a CLI entrypoint.",
-      { details: { field: "executable" } },
-    );
-  }
-  const executable = boundedArgument(input.executable ?? "prime-agent", "executable");
-  const cliEntrypoint =
-    input.cliEntrypoint === undefined ? undefined : boundedArgument(input.cliEntrypoint, "cliEntrypoint");
+  const executable = boundedAbsolutePath(input.executable, "executable");
+  const cliEntrypoint = boundedAbsolutePath(input.cliEntrypoint, "cliEntrypoint");
   const socketPath = boundedArgument(input.socketPath, "socketPath");
+  const daemonWorkingDirectory = boundedAbsolutePath(input.daemonWorkingDirectory, "daemonWorkingDirectory");
   return Object.freeze({
     executable,
-    argv: cliEntrypoint
-      ? Object.freeze([cliEntrypoint, "daemon", "start", "--socket", socketPath] as const)
-      : Object.freeze(["daemon", "start", "--socket", socketPath] as const),
+    argv: Object.freeze([cliEntrypoint, "--mode", "daemon", "--daemon-socket", socketPath] as const),
     spawn: Object.freeze({
       shell: false,
       windowsHide: true,
-      stdio: Object.freeze(["ignore", "pipe", "pipe"] as const),
+      detached: true,
+      cwd: daemonWorkingDirectory,
+      env: sanitizeResidentDaemonEnvironment(input.environment ?? process.env),
+      stdio: "ignore" as const,
     } as const),
   });
+}
+
+/**
+ * A supervisor must never inherit a worker/catalog role from the process that
+ * happens to launch it. NODE_OPTIONS and NODE_PATH are also excluded so the
+ * hash-verified entrypoint cannot be preloaded or resolution-shadowed.
+ */
+export function sanitizeResidentDaemonEnvironment(
+  source: Readonly<NodeJS.ProcessEnv>,
+): Readonly<Record<string, string>> {
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    const normalized = key.toUpperCase();
+    if (
+      normalized.startsWith("PRIME_AGENT_INTERNAL_") ||
+      normalized === "PRIME_AGENT_BUILD_ID" ||
+      normalized === "PRIME_AGENT_LAUNCHER_PATH" ||
+      normalized === "NODE_OPTIONS" ||
+      normalized === "NODE_PATH"
+    ) {
+      continue;
+    }
+    if (normalized === "ELECTRON_RUN_AS_NODE" && value !== "1") continue;
+    sanitized[key] = value;
+  }
+  return Object.freeze(sanitized);
 }
 
 export type ResidentSessionSelection =
@@ -395,7 +451,7 @@ const ResidentRuntimeCompatibilitySchema = z
         (capabilities) => REQUIRED_RESIDENT_DAEMON_CAPABILITIES.every((capability) => capabilities.includes(capability)),
         { message: "Runtime capabilities do not satisfy resident continuity" },
       ),
-    runtimeBuildId: z.string().min(1).max(256).optional(),
+    runtimeBuildId: z.literal(PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId),
     supervisorGeneration: z.string().min(1).max(256).optional(),
   })
   .strict();
@@ -497,6 +553,26 @@ function boundedArgument(value: string, field: string): string {
     );
   }
   return value;
+}
+
+function boundedAbsolutePath(value: string, field: string): string {
+  const path = boundedArgument(value, field);
+  if (!isAbsolute(path)) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+      `Resident runtime ${field} must be absolute.`,
+      { details: { field } },
+    );
+  }
+  return path;
+}
+
+function sameExecutionPath(left: string, right: string): boolean {
+  const normalizedLeft = resolvePath(left);
+  const normalizedRight = resolvePath(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLocaleLowerCase("en-US") === normalizedRight.toLocaleLowerCase("en-US")
+    : normalizedLeft === normalizedRight;
 }
 
 function boundedOpaqueId(value: string, field: string): string {

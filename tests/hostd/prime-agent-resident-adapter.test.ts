@@ -13,6 +13,24 @@ import {
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 
+const DAEMON_WORKING_DIRECTORY = "C:\\runtime\\hostd-data";
+const DAEMON_ENVIRONMENT = Object.freeze({
+  Path: "C:\\Windows",
+  ELECTRON_RUN_AS_NODE: "1",
+  NODE_OPTIONS: "--import=C:\\attacker.mjs",
+  PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
+});
+
+function buildHarnessInvocation() {
+  return buildResidentDaemonStartInvocation({
+    executable: "C:\\runtime\\node.exe",
+    cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+    socketPath: "\\\\.\\pipe\\prime-continuim-test",
+    daemonWorkingDirectory: DAEMON_WORKING_DIRECTORY,
+    environment: DAEMON_ENVIRONMENT,
+  });
+}
+
 function validHello(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: "daemon_hello",
@@ -22,7 +40,7 @@ function validHello(overrides: Record<string, unknown> = {}): Record<string, unk
     schemaRevision: 13,
     appVersion: "0.7.0",
     runtime: {
-      buildId: "prime-agent-v0.7.0",
+      buildId: "be9e2fa-dirty",
       executablePath: "C:\\runtime\\node.exe",
       entrypointPath: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
     },
@@ -65,6 +83,7 @@ interface HarnessState {
   attachCalls: Array<{ activeSessionId: string; options: Readonly<Record<string, unknown>> }>;
   spawnCalls: Array<{ executable: string; argv: readonly string[]; options: unknown }>;
   launcherKills: number;
+  launcherUnrefs: number;
   launcherExit?: readonly [number | null, string | null];
   persistCalls: ResidentSessionBinding[];
   completeCalls: ResidentSessionBinding[];
@@ -88,6 +107,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     attachCalls: [],
     spawnCalls: [],
     launcherKills: 0,
+    launcherUnrefs: 0,
     persistCalls: [],
     completeCalls: [],
     ...overrides,
@@ -174,8 +194,6 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
 
   const launcher: ResidentDaemonLauncher = {
     pid: 91,
-    stdout: { on: () => undefined },
-    stderr: { on: () => undefined },
     once: (event, listener) => {
       if (event === "exit" && state.launcherExit) {
         const [code, signal] = state.launcherExit;
@@ -187,12 +205,17 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       state.launcherKills += 1;
       return true;
     },
+    unref: () => {
+      state.launcherUnrefs += 1;
+    },
   };
 
   const adapter = new PrimeAgentResidentAdapter({
     socketPath: "\\\\.\\pipe\\prime-continuim-test",
     executable: "C:\\runtime\\node.exe",
     cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+    daemonWorkingDirectory: DAEMON_WORKING_DIRECTORY,
+    environment: DAEMON_ENVIRONMENT,
     loadRuntimeModule: async () => ({
       DaemonClient: FakeDaemonClient,
       DaemonAgentConnection: FakeDaemonAgentConnection,
@@ -265,11 +288,7 @@ async function expectRuntimeError(promise: Promise<unknown>, code: string): Prom
 describe("PrimeAgentResidentAdapter daemon ownership", () => {
   it("connects first and does not launch when the exact pinned daemon is already available", async () => {
     const { adapter, state } = createHarness();
-    const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    });
+    const invocation = buildHarnessInvocation();
 
     await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.0" });
 
@@ -281,11 +300,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
 
   it("launches the verified CLI through Node with a fixed shell-free argv and a single concurrent spawn", async () => {
     const { adapter, state } = createHarness({ connectOutcomes: ["fail", "fail", "ok", "ok"] });
-    const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    });
+    const invocation = buildHarnessInvocation();
 
     await Promise.all([adapter.ensureDaemon(invocation), adapter.ensureDaemon(invocation)]);
 
@@ -294,25 +309,29 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
         executable: "C:\\runtime\\node.exe",
         argv: [
           "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+          "--mode",
           "daemon",
-          "start",
-          "--socket",
+          "--daemon-socket",
           "\\\\.\\pipe\\prime-continuim-test",
         ],
-        options: { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+        options: {
+          shell: false,
+          windowsHide: true,
+          detached: true,
+          cwd: DAEMON_WORKING_DIRECTORY,
+          env: { Path: "C:\\Windows", ELECTRON_RUN_AS_NODE: "1" },
+          stdio: "ignore",
+        },
       },
     ]);
     expect(state.launcherKills).toBe(0);
+    expect(state.launcherUnrefs).toBe(1);
     await adapter.close();
   });
 
   it("fails closed on an incompatible live daemon without launching a replacement", async () => {
     const { adapter, state } = createHarness({ hello: validHello({ appVersion: "0.7.1" }) });
-    const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    });
+    const invocation = buildHarnessInvocation();
 
     await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_APP_VERSION_MISMATCH");
 
@@ -323,11 +342,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
 
   it("does not launch over an indeterminate endpoint timeout", async () => {
     const { adapter, state } = createHarness({ connectOutcomes: ["timeout"] });
-    const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    });
+    const invocation = buildHarnessInvocation();
 
     await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_UNAVAILABLE");
 
@@ -340,11 +355,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
       connectOutcomes: ["fail", "fail", "ok"],
       launcherExit: [1, null],
     });
-    const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    });
+    const invocation = buildHarnessInvocation();
 
     await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.0" });
 

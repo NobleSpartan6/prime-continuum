@@ -6,6 +6,7 @@ import {
   ResidentRuntimeContractError,
   buildResidentDaemonCreateRequest,
   buildResidentDaemonStartInvocation,
+  sanitizeResidentDaemonEnvironment,
   validateResidentDaemonHello,
   validateResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
@@ -19,8 +20,9 @@ function validHello(): Record<string, unknown> {
     schemaRevision: 13,
     appVersion: "0.7.0",
     runtime: {
-      buildId: "prime-agent-v0.7.0",
+      buildId: "be9e2fa-dirty",
       executablePath: "C:\\Prime Agent\\prime-agent.exe",
+      entrypointPath: "C:\\Prime Agent\\cli.js",
     },
     supervisorGeneration: "supervisor-generation-1",
     supervisorPid: 42,
@@ -52,6 +54,7 @@ describe("resident Prime Agent runtime pin", () => {
         "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.0/prime-agent-0.7.0.tgz",
       sha256: "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
       expectedAppVersion: "0.7.0",
+      runtimeBuildId: "be9e2fa-dirty",
       daemon: {
         protocolName: "prime-agent.daemon",
         protocolVersion: 7,
@@ -83,7 +86,7 @@ describe("resident daemon compatibility", () => {
       schemaRevision: 13,
       schemaId: "protocol-7-schema-13-816309b1cd50",
       capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES, "session_input_admission"],
-      runtimeBuildId: "prime-agent-v0.7.0",
+      runtimeBuildId: "be9e2fa-dirty",
       supervisorGeneration: "supervisor-generation-1",
     });
     expect(compatibility).not.toHaveProperty("socketPath");
@@ -127,6 +130,35 @@ describe("resident daemon compatibility", () => {
     );
   });
 
+  it("binds an accepted hello to the verified executable, entrypoint, and release build", () => {
+    expect(
+      validateResidentDaemonHello(validHello(), {
+        expectedExecutablePath: "C:\\Prime Agent\\prime-agent.exe",
+        expectedEntrypointPath: "C:\\Prime Agent\\cli.js",
+      }),
+    ).toMatchObject({ runtimeBuildId: "be9e2fa-dirty" });
+    expectContractError(
+      () =>
+        validateResidentDaemonHello(validHello(), {
+          expectedExecutablePath: "C:\\other\\node.exe",
+          expectedEntrypointPath: "C:\\Prime Agent\\cli.js",
+        }),
+      "PRIME_RUNTIME_IDENTITY_MISMATCH",
+    );
+    expectContractError(
+      () => validateResidentDaemonHello({ ...validHello(), runtime: undefined }),
+      "PRIME_RUNTIME_HELLO_INVALID",
+    );
+    expectContractError(
+      () =>
+        validateResidentDaemonHello({
+          ...validHello(),
+          runtime: { ...(validHello().runtime as Record<string, unknown>), buildId: "other-build" },
+        }),
+      "PRIME_RUNTIME_HELLO_INVALID",
+    );
+  });
+
   it("rejects malformed or expanded pinned hello shapes before compatibility checks", () => {
     expectContractError(
       () => validateResidentDaemonHello({ ...validHello(), unexpectedWireField: true }),
@@ -141,17 +173,37 @@ describe("resident daemon compatibility", () => {
 
 describe("resident launch and create plans", () => {
   it("builds a fixed daemon argv vector without shell interpolation", () => {
-    const executable = "C:\\Prime Agent & tools\\prime-agent.exe";
+    const executable = "C:\\Prime Agent & tools\\node.exe";
+    const cliEntrypoint = "C:\\Prime Agent & tools\\prime-agent\\dist\\bundle\\cli.js";
     const socketPath = "\\\\.\\pipe\\prime-agent-$(whoami)&daemon";
-    const invocation = buildResidentDaemonStartInvocation({ executable, socketPath });
+    const daemonWorkingDirectory = "C:\\Prime Agent & tools\\data";
+    const invocation = buildResidentDaemonStartInvocation({
+      executable,
+      cliEntrypoint,
+      socketPath,
+      daemonWorkingDirectory,
+      environment: {
+        Path: "C:\\Windows",
+        ELECTRON_RUN_AS_NODE: "1",
+        NODE_OPTIONS: "--import=C:\\attacker.mjs",
+        PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
+      },
+    });
 
     expect(invocation).toEqual({
       executable,
-      argv: ["daemon", "start", "--socket", socketPath],
-      spawn: { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+      argv: [cliEntrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
+      spawn: {
+        shell: false,
+        windowsHide: true,
+        detached: true,
+        cwd: daemonWorkingDirectory,
+        env: { Path: "C:\\Windows", ELECTRON_RUN_AS_NODE: "1" },
+        stdio: "ignore",
+      },
     });
-    expect(invocation.argv).toHaveLength(4);
-    expect(invocation.argv[3]).toBe(socketPath);
+    expect(invocation.argv).toHaveLength(5);
+    expect(invocation.argv[4]).toBe(socketPath);
     expect(invocation.argv.join(" ")).not.toContain("cmd /c");
     expect(invocation.argv.join(" ")).not.toContain("powershell");
     expect(Object.isFrozen(invocation.argv)).toBe(true);
@@ -162,27 +214,64 @@ describe("resident launch and create plans", () => {
       executable: "C:\\runtime\\node.exe",
       cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
       socketPath: "\\\\.\\pipe\\prime-agent-daemon",
+      daemonWorkingDirectory: "C:\\runtime\\data",
+      environment: {},
     });
 
     expect(invocation).toEqual({
       executable: "C:\\runtime\\node.exe",
       argv: [
         "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+        "--mode",
         "daemon",
-        "start",
-        "--socket",
+        "--daemon-socket",
         "\\\\.\\pipe\\prime-agent-daemon",
       ],
-      spawn: { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+      spawn: {
+        shell: false,
+        windowsHide: true,
+        detached: true,
+        cwd: "C:\\runtime\\data",
+        env: {},
+        stdio: "ignore",
+      },
     });
     expectContractError(
       () =>
         buildResidentDaemonStartInvocation({
+          executable: "",
           cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
           socketPath: "\\\\.\\pipe\\prime-agent-daemon",
+          daemonWorkingDirectory: "C:\\runtime\\data",
         }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
     );
+    expectContractError(
+      () =>
+        buildResidentDaemonStartInvocation({
+          executable: "node",
+          cliEntrypoint: "..\\prime-agent\\dist\\bundle\\cli.js",
+          socketPath: "\\\\.\\pipe\\prime-agent-daemon",
+          daemonWorkingDirectory: "C:\\runtime\\data",
+        }),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+  });
+
+  it("strips inherited role and Node injection state from the detached supervisor", () => {
+    expect(
+      sanitizeResidentDaemonEnvironment({
+        Path: "C:\\Windows",
+        PRIME_API_KEY: "provider-secret",
+        PRIME_AGENT_INTERNAL_DAEMON_CATALOG: "1",
+        prime_agent_internal_session_leases: "1",
+        PRIME_AGENT_BUILD_ID: "spoofed",
+        PRIME_AGENT_LAUNCHER_PATH: "C:\\spoofed.exe",
+        NODE_OPTIONS: "--require=C:\\attacker.cjs",
+        node_path: "C:\\shadow-modules",
+        ELECTRON_RUN_AS_NODE: "0",
+      }),
+    ).toEqual({ Path: "C:\\Windows", PRIME_API_KEY: "provider-secret" });
   });
 
   it("creates resident work through DaemonClient semantics, never client-owned RPC semantics", () => {
@@ -196,7 +285,7 @@ describe("resident launch and create plans", () => {
     });
 
     expect(RESIDENT_RUNTIME_LAUNCH_STRATEGY).toEqual({
-      daemonStart: "pinned_cli_daemon_start",
+      daemonStart: "pinned_cli_daemon_mode",
       sessionCreate: "daemon_client",
       sessionAttach: "daemon_agent_connection",
       sessionLifecycle: "resident",
@@ -234,7 +323,13 @@ describe("resident launch and create plans", () => {
 
   it("rejects control characters rather than placing them in process arguments", () => {
     expectContractError(
-      () => buildResidentDaemonStartInvocation({ socketPath: "valid\n--mode rpc" }),
+      () =>
+        buildResidentDaemonStartInvocation({
+          executable: "C:\\runtime\\node.exe",
+          cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+          socketPath: "valid\n--mode rpc",
+          daemonWorkingDirectory: "C:\\runtime\\data",
+        }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
     );
     expectContractError(

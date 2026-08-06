@@ -23,7 +23,6 @@ import {
 const DEFAULT_CONNECT_TIMEOUT_MS = 750;
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_LAUNCH_OUTPUT_BYTES = 32 * 1024;
 const MAX_RUNTIME_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 const MAX_LIVE_SESSIONS = 10_000;
 
@@ -130,16 +129,11 @@ export interface PrimeAgentPublicModule {
 
 export type PrimeAgentPublicModuleLoader = () => Promise<unknown>;
 
-interface ResidentDaemonOutput {
-  on(event: "data", listener: (chunk: unknown) => void): unknown;
-}
-
 export interface ResidentDaemonLauncher {
   readonly pid?: number;
-  readonly stdout?: ResidentDaemonOutput | null;
-  readonly stderr?: ResidentDaemonOutput | null;
   once(event: "error" | "exit", listener: (...args: unknown[]) => void): unknown;
   kill(signal?: NodeJS.Signals): boolean;
+  unref(): void;
 }
 
 export type ResidentDaemonSpawn = (
@@ -150,8 +144,13 @@ export type ResidentDaemonSpawn = (
 
 export interface PrimeAgentResidentAdapterOptions {
   readonly socketPath: string;
-  readonly executable?: string;
-  readonly cliEntrypoint?: string;
+  /** Absolute, verified Node-compatible executable for the pinned runtime. */
+  readonly executable: string;
+  /** Absolute, verified v0.7.0 dist/bundle/cli.js entrypoint. */
+  readonly cliEntrypoint: string;
+  /** Absolute, writable host-owned directory used instead of ambient cwd. */
+  readonly daemonWorkingDirectory: string;
+  readonly environment?: Readonly<NodeJS.ProcessEnv>;
   /** Must resolve only after the package archive and install tree are verified. */
   readonly loadRuntimeModule: PrimeAgentPublicModuleLoader;
   /** Durable host write performed after create succeeds and before attach begins. */
@@ -162,7 +161,6 @@ export interface PrimeAgentResidentAdapterOptions {
   readonly connectTimeoutMs?: number;
   readonly startupTimeoutMs?: number;
   readonly requestTimeoutMs?: number;
-  readonly maxLaunchOutputBytes?: number;
   readonly now?: () => Date;
   readonly wait?: (milliseconds: number) => Promise<void>;
 }
@@ -177,7 +175,6 @@ interface ResolvedOptions {
   readonly connectTimeoutMs: number;
   readonly startupTimeoutMs: number;
   readonly requestTimeoutMs: number;
-  readonly maxLaunchOutputBytes: number;
   readonly now: () => Date;
   readonly wait: (milliseconds: number) => Promise<void>;
 }
@@ -266,6 +263,8 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       executable: options.executable,
       cliEntrypoint: options.cliEntrypoint,
       socketPath: options.socketPath,
+      daemonWorkingDirectory: options.daemonWorkingDirectory,
+      environment: options.environment,
     });
     this.options = Object.freeze({
       invocation,
@@ -277,13 +276,6 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
       startupTimeoutMs: boundedTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, "startupTimeoutMs"),
       requestTimeoutMs: boundedTimeout(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, "requestTimeoutMs"),
-      maxLaunchOutputBytes: boundedInteger(
-        options.maxLaunchOutputBytes,
-        DEFAULT_MAX_LAUNCH_OUTPUT_BYTES,
-        1_024,
-        1024 * 1024,
-        "maxLaunchOutputBytes",
-      ),
       now: options.now ?? (() => new Date()),
       wait: options.wait ?? (async (milliseconds) => void (await delay(milliseconds))),
     });
@@ -555,7 +547,11 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       const hello = client.hello ?? (await client.waitForHello(this.options.connectTimeoutMs));
       return {
         client,
-        compatibility: validateResidentDaemonHello(hello, { expectedSocketPath: this.options.socketPath }),
+        compatibility: validateResidentDaemonHello(hello, {
+          expectedSocketPath: this.options.socketPath,
+          expectedExecutablePath: this.options.invocation.executable,
+          expectedEntrypointPath: this.options.invocation.argv[0],
+        }),
       };
     } catch (error) {
       client.close();
@@ -603,6 +599,8 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       requestTimeoutMs: this.options.requestTimeoutMs,
       now: this.options.now,
       expectedSocketPath: this.options.socketPath,
+      expectedExecutablePath: this.options.invocation.executable,
+      expectedEntrypointPath: this.options.invocation.argv[0],
       persistBinding: this.options.persistBinding,
       completeBinding: this.options.completeBinding,
       onClosed: () => {
@@ -641,6 +639,8 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       requestTimeoutMs: number;
       now: () => Date;
       expectedSocketPath: string;
+      expectedExecutablePath: string;
+      expectedEntrypointPath: string;
       persistBinding: (binding: ResidentSessionBinding) => Promise<void>;
       completeBinding: (binding: ResidentSessionBinding) => Promise<void>;
       onClosed: () => void;
@@ -757,6 +757,8 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         if (event.status !== "connected") throw invalidResponse("connection status");
         const compatibility = validateResidentDaemonHello(this.options.client.hello, {
           expectedSocketPath: this.options.expectedSocketPath,
+          expectedExecutablePath: this.options.expectedExecutablePath,
+          expectedEntrypointPath: this.options.expectedEntrypointPath,
         });
         if (!this.resyncValidated) {
           throw new ResidentRuntimeContractError(
@@ -771,6 +773,8 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       case "session_resynced": {
         const compatibility = validateResidentDaemonHello(this.options.client.hello, {
           expectedSocketPath: this.options.expectedSocketPath,
+          expectedExecutablePath: this.options.expectedExecutablePath,
+          expectedEntrypointPath: this.options.expectedEntrypointPath,
         });
         validateInitialSnapshotValue(event.snapshot, this.binding);
         await this.refreshRuntimeBinding(compatibility);
@@ -825,7 +829,10 @@ function defaultResidentDaemonSpawn(
   return spawn(executable, [...argv], {
     shell: options.shell,
     windowsHide: options.windowsHide,
-    stdio: [...options.stdio],
+    detached: options.detached,
+    cwd: options.cwd,
+    env: { ...options.env },
+    stdio: options.stdio,
   }) as unknown as ResidentDaemonLauncher;
 }
 
@@ -1048,10 +1055,6 @@ function launchDaemon(options: ResolvedOptions): {
 
   let exited = false;
   let failure: Error | undefined;
-  const stdout = new BoundedOutput(options.maxLaunchOutputBytes);
-  const stderr = new BoundedOutput(options.maxLaunchOutputBytes);
-  child.stdout?.on("data", (chunk) => stdout.append(chunk));
-  child.stderr?.on("data", (chunk) => stderr.append(chunk));
   child.once("error", (error) => {
     failure = error instanceof Error ? error : new Error(String(error));
   });
@@ -1063,6 +1066,7 @@ function launchDaemon(options: ResolvedOptions): {
       failure = new Error(`Prime Agent daemon launcher exited on ${String(signal)}`);
     }
   });
+  child.unref();
 
   return {
     child,
@@ -1075,37 +1079,8 @@ function launchDaemon(options: ResolvedOptions): {
     details: () => Object.freeze({
       ...(child.pid ? { launcherPid: child.pid } : {}),
       ...(failure ? { launcherFailure: failure.message.slice(0, 2_048) } : {}),
-      ...(stdout.text ? { stdout: stdout.text } : {}),
-      ...(stderr.text ? { stderr: stderr.text } : {}),
-      ...(stdout.truncated || stderr.truncated ? { outputTruncated: true } : {}),
     }),
   };
-}
-
-class BoundedOutput {
-  private bytes = 0;
-  private value = "";
-  truncated = false;
-
-  constructor(private readonly limit: number) {}
-
-  append(chunk: unknown): void {
-    if (this.bytes >= this.limit) {
-      this.truncated = true;
-      return;
-    }
-    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-    const available = this.limit - this.bytes;
-    const buffer = Buffer.from(text, "utf8");
-    const accepted = buffer.subarray(0, available);
-    this.value += accepted.toString("utf8");
-    this.bytes += accepted.byteLength;
-    if (accepted.byteLength < buffer.byteLength) this.truncated = true;
-  }
-
-  get text(): string {
-    return this.value.trim().slice(0, 2_048);
-  }
 }
 
 function assertSameInvocation(actual: ResidentDaemonStartInvocation, expected: ResidentDaemonStartInvocation): void {
@@ -1115,13 +1090,25 @@ function assertSameInvocation(actual: ResidentDaemonStartInvocation, expected: R
     actual.argv.every((argument, index) => argument === expected.argv[index]) &&
     actual.spawn.shell === false &&
     actual.spawn.windowsHide === true &&
-    actual.spawn.stdio.join(",") === "ignore,pipe,pipe"
+    actual.spawn.detached === true &&
+    actual.spawn.cwd === expected.spawn.cwd &&
+    actual.spawn.stdio === "ignore" &&
+    sameEnvironment(actual.spawn.env, expected.spawn.env)
   ) {
     return;
   }
   throw new ResidentRuntimeContractError(
     "PRIME_RUNTIME_ARGUMENT_INVALID",
     "Resident daemon invocation does not match the adapter's fixed launch plan.",
+  );
+}
+
+function sameEnvironment(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
+  const leftEntries = Object.entries(left);
+  const rightEntries = Object.entries(right);
+  return (
+    leftEntries.length === rightEntries.length &&
+    leftEntries.every(([key, value]) => right[key] === value)
   );
 }
 
