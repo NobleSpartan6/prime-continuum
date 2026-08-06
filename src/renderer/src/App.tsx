@@ -31,8 +31,6 @@ import {
   PanelLeftClose,
   PanelRightClose,
   Paperclip,
-  Plus,
-  Radio,
   RefreshCw,
   Search,
   Server,
@@ -42,7 +40,6 @@ import {
   Square,
   Terminal,
   TestTube2,
-  Users,
   Wifi,
   WifiOff,
   X,
@@ -58,13 +55,14 @@ import {
   type HandoffPlan,
   type HostSummary,
   type RendererApi,
+  type RuntimeSummary,
   type TaskState,
   type ThreadSummary,
   type WorkbenchSnapshot,
 } from './api'
 import { FormEvent, KeyboardEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
-const INSPECTOR_TABS = ['Changes', 'Agents', 'Evidence', 'Context'] as const
+const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type WorkbenchSurface = 'desktop' | 'companion'
 
@@ -387,6 +385,8 @@ export default function App({ api: suppliedApi }: AppProps) {
     snapshot?.projects.find((project) => project.id === selectedProjectId) ??
     snapshot?.projects[0]
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
+  const selectedRuntime: RuntimeSummary =
+    snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
   activeHostIdRef.current = selectedHost?.id
 
   useEffect(() => {
@@ -554,7 +554,7 @@ export default function App({ api: suppliedApi }: AppProps) {
       <div className="empty-workbench">
         <header className="empty-workbench__topbar">
           <div className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></div>
-          <strong>Prime Agent</strong>
+          <strong>Prime Continuim</strong>
         </header>
         <main className="empty-workbench__main" id="main">
           <span className="empty-workbench__icon"><Icon icon={Inbox} size={22} /></span>
@@ -621,6 +621,7 @@ export default function App({ api: suppliedApi }: AppProps) {
             <Icon icon={sidebarOpen ? PanelLeftClose : Menu} size={18} />
           </button>
           <div className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></div>
+          <strong className="topbar__brand-name">Prime Continuim</strong>
           <div className="topbar__project">
             <span className="eyebrow">Project</span>
             <strong>{selectedProject.name}</strong>
@@ -730,9 +731,13 @@ export default function App({ api: suppliedApi }: AppProps) {
               <span aria-hidden="true">·</span>
               <span>{snapshot.evidence.length} checks</span>
             </button>
-            <div className={cx('task-state', `task-state--${selectedThread.status}`)}>
+            <div
+              className={cx('task-state', `task-state--${selectedThread.status}`)}
+              role="status"
+              aria-label={`Task state: ${taskLabel(selectedThread.status)}`}
+            >
               {selectedThread.status === 'running' ? <Icon icon={Activity} size={14} /> : <Icon icon={Circle} size={11} />}
-              <span>{taskLabel(selectedThread.status)}</span>
+              <span className="task-state__label">{taskLabel(selectedThread.status)}</span>
             </div>
           </div>
         </header>
@@ -765,6 +770,7 @@ export default function App({ api: suppliedApi }: AppProps) {
           connection={selectedHost.connection}
           hostName={selectedHost.name}
           taskState={selectedThread.status}
+          runtime={selectedRuntime}
           mode={composerMode}
           onModeChange={setComposerMode}
           text={composerText}
@@ -779,6 +785,7 @@ export default function App({ api: suppliedApi }: AppProps) {
         selectedThread={selectedThread}
         selectedProject={selectedProject}
         selectedHost={selectedHost}
+        runtime={selectedRuntime}
         activeTab={inspectorTab}
         onTabChange={setInspectorTab}
         onClose={closeInspector}
@@ -912,24 +919,15 @@ function Sidebar({
       <div className="sidebar__scroll">
         <div className="sidebar__new-row">
           <button
-            className="button button--quiet button--full sidebar__new-thread"
-            type="button"
-            disabled
-            aria-describedby="thread-creation-help"
-            title="Thread creation is not available in this build"
-          >
-            <Icon icon={Plus} strokeWidth={2} /> New thread
-          </button>
-          <button
-            className="icon-button"
+            className="button button--quiet button--full sidebar__search"
             type="button"
             aria-label="Search projects and threads"
             title="Search projects, threads, and commands"
             onClick={onSearch}
           >
             <Icon icon={Search} size={17} />
+            <span>Search</span>
           </button>
-          <span className="sidebar__availability" id="thread-creation-help">New threads aren’t available yet.</span>
         </div>
 
         <nav className="nav-section" aria-labelledby="projects-heading">
@@ -996,15 +994,7 @@ function Sidebar({
             ) : (
               <li className="empty-list">
                 <span>No threads in this project</span>
-                <button
-                  type="button"
-                  disabled
-                  aria-describedby="empty-thread-help"
-                  title="Thread creation is not available in this build"
-                >
-                  Start a thread
-                </button>
-                <span className="sr-only" id="empty-thread-help">Thread creation is not available in this build.</span>
+                <small>Thread creation isn’t available in this build.</small>
               </li>
             )}
           </ul>
@@ -1062,11 +1052,19 @@ function Sidebar({
   )
 }
 
+const TRANSCRIPT_BLOCK_INCREMENT = 200
+
 function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary }) {
   const scrollRef = useRef<HTMLElement>(null)
   const previousThreadIdRef = useRef('')
   const shouldFollowRef = useRef(true)
+  const pendingHistoryAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
+  const [historyWindow, setHistoryWindow] = useState({ threadId: thread.id, count: TRANSCRIPT_BLOCK_INCREMENT })
   const lastBlock = thread.transcript[thread.transcript.length - 1]
+  const visibleBlockCount = historyWindow.threadId === thread.id ? historyWindow.count : TRANSCRIPT_BLOCK_INCREMENT
+  const firstVisibleIndex = Math.max(0, thread.transcript.length - visibleBlockCount)
+  const visibleBlocks = thread.transcript.slice(firstVisibleIndex)
+  const hasProgressiveHistory = thread.transcript.length > TRANSCRIPT_BLOCK_INCREMENT
 
   useLayoutEffect(() => {
     const scroller = scrollRef.current
@@ -1075,12 +1073,24 @@ function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary
     if (previousThreadIdRef.current !== thread.id) {
       previousThreadIdRef.current = thread.id
       shouldFollowRef.current = true
+      pendingHistoryAnchorRef.current = null
+      if (historyWindow.threadId !== thread.id || historyWindow.count !== TRANSCRIPT_BLOCK_INCREMENT) {
+        setHistoryWindow({ threadId: thread.id, count: TRANSCRIPT_BLOCK_INCREMENT })
+      }
       scroller.scrollTop = scroller.scrollHeight
       return
     }
 
+    const historyAnchor = pendingHistoryAnchorRef.current
+    if (historyAnchor) {
+      pendingHistoryAnchorRef.current = null
+      shouldFollowRef.current = false
+      scroller.scrollTop = historyAnchor.scrollTop + Math.max(0, scroller.scrollHeight - historyAnchor.scrollHeight)
+      return
+    }
+
     if (shouldFollowRef.current) scroller.scrollTop = scroller.scrollHeight
-  }, [lastBlock?.id, thread.id, thread.transcript.length])
+  }, [historyWindow.count, historyWindow.threadId, lastBlock?.body.length, lastBlock?.id, thread.id, thread.transcript.length])
 
   return (
     <section
@@ -1095,10 +1105,43 @@ function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary
       }}
     >
       <div className="transcript__inner">
-        {thread.transcript.map((block) => {
+        {hasProgressiveHistory && (
+          <div className="history-loader">
+            <button
+              className="button button--secondary button--small"
+              type="button"
+              disabled={firstVisibleIndex === 0}
+              onClick={() => {
+                const scroller = scrollRef.current
+                if (!scroller) return
+                pendingHistoryAnchorRef.current = {
+                  scrollHeight: scroller.scrollHeight,
+                  scrollTop: scroller.scrollTop,
+                }
+                setHistoryWindow({
+                  threadId: thread.id,
+                  count: Math.min(thread.transcript.length, visibleBlockCount + TRANSCRIPT_BLOCK_INCREMENT),
+                })
+              }}
+            >
+              <Icon icon={Clock3} size={14} />
+              {firstVisibleIndex > 0 ? 'Load earlier activity' : 'All activity loaded'}
+            </button>
+            <span aria-live="polite">
+              {firstVisibleIndex > 0
+                ? `${firstVisibleIndex} earlier ${firstVisibleIndex === 1 ? 'item' : 'items'}`
+                : `${thread.transcript.length} items loaded`}
+            </span>
+          </div>
+        )}
+        {visibleBlocks.map((block) => {
           if (block.kind === 'checkpoint' || block.kind === 'notice') {
             return (
-              <div className={cx('timeline-marker', block.kind === 'notice' && 'timeline-marker--notice')} key={block.id}>
+              <div
+                className={cx('timeline-marker', block.kind === 'notice' && 'timeline-marker--notice')}
+                data-transcript-block
+                key={block.id}
+              >
                 <span className="timeline-marker__icon">
                   <Icon icon={block.kind === 'checkpoint' ? CheckCircle2 : Info} size={14} />
                 </span>
@@ -1112,7 +1155,7 @@ function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary
           }
 
           return (
-            <article className={cx('message', `message--${block.kind}`)} key={block.id}>
+            <article className={cx('message', `message--${block.kind}`)} data-transcript-block key={block.id}>
               <header className="message__header">
                 <span className="message__avatar" aria-hidden="true">
                   <Icon icon={block.kind === 'user' ? Laptop : block.kind === 'tool' ? Terminal : Bot} size={15} />
@@ -1141,6 +1184,7 @@ interface ComposerProps {
   connection: ConnectionState
   hostName: string
   taskState: TaskState
+  runtime: RuntimeSummary
   mode: 'follow_up' | 'steer'
   onModeChange: (mode: 'follow_up' | 'steer') => void
   text: string
@@ -1149,12 +1193,73 @@ interface ComposerProps {
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
 }
 
-function Composer({ connection, hostName, taskState, mode, onModeChange, text, onTextChange, receipt, onSubmit }: ComposerProps) {
+function SessionContinuity({
+  connection,
+  hostName,
+  taskState,
+  runtime,
+}: Pick<ComposerProps, 'connection' | 'hostName' | 'taskState' | 'runtime'>) {
+  const isFresh = connection === 'online'
+  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
+  const interruptedGoal = runtime.goals?.find((goal) => goal.state !== 'complete')
+  const displayedGoal = activeGoal ?? interruptedGoal
+  const goalCopy = displayedGoal?.objective ?? (runtime.goals ? 'No active goal' : 'Goal state unavailable')
+  const queuedActions = runtime.session?.queuedActionCount
+  const hostCommands = runtime.queue?.pendingCount
+  const queueStateCopy = runtime.queue?.paused
+    ? `Host queue paused · ${hostCommands ?? 0} pending`
+    : hostCommands !== undefined && hostCommands > 0
+      ? `${hostCommands} host ${hostCommands === 1 ? 'command' : 'commands'} queued${queuedActions ? ` · ${queuedActions} session ${queuedActions === 1 ? 'action' : 'actions'}` : ''}`
+      : queuedActions !== undefined
+        ? queuedActions === 0
+          ? 'No actions queued'
+          : `${queuedActions} ${queuedActions === 1 ? 'action' : 'actions'} queued`
+        : runtime.queue
+          ? 'No host commands queued'
+          : 'Queue state unavailable'
+  const queueCopy = isFresh || queueStateCopy === 'Queue state unavailable'
+    ? queueStateCopy
+    : `Cached · ${queueStateCopy}`
+  const residencyCopy = runtime.session?.residency === 'resident'
+    ? isFresh
+      ? `Continues on ${hostName} when this window closes`
+      : `Last reported resident on ${hostName} · current status unverified`
+    : runtime.session?.residency === 'client_owned'
+      ? isFresh
+        ? 'Runs while this client remains attached'
+        : 'Last reported client-owned · current status unverified'
+      : undefined
+  const taskCopy = isFresh ? taskLabel(taskState) : `Last reported ${taskLabel(taskState).toLocaleLowerCase()}`
+
+  return (
+    <section className="session-continuity" aria-label="Session continuity">
+      <span className={cx('session-continuity__state', `session-continuity__state--${taskState}`)}>
+        <Icon icon={taskState === 'running' ? Activity : Circle} size={14} />
+      </span>
+      <span className="session-continuity__body">
+        <span className="eyebrow">
+          {displayedGoal
+            ? `Goal · ${isFresh ? runtimeStateLabel(displayedGoal.state) : `last reported ${runtimeStateLabel(displayedGoal.state).toLocaleLowerCase()}`}`
+            : 'Session continuity'}
+        </span>
+        <strong title={displayedGoal?.objective}>{goalCopy}</strong>
+        <small>Run location: <bdi>{hostName}</bdi> · {taskCopy}{residencyCopy ? ` · ${residencyCopy}` : ''}</small>
+      </span>
+      <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
+        <Icon icon={runtime.queue?.paused ? Clock3 : ListChecks} size={13} />
+        <span title={queueCopy}>{queueCopy}</span>
+      </span>
+    </section>
+  )
+}
+
+function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
   const submitLabel = disconnected ? 'Send when reconnected' : mode === 'steer' ? 'Steer now' : 'Send follow-up'
 
   return (
     <footer className="composer-wrap">
+      <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
       <form className="composer" onSubmit={onSubmit} aria-label="Message composer">
         <div className="composer__toolbar">
           <div className="mode-control" aria-label="Message intent">
@@ -1220,7 +1325,7 @@ function Composer({ connection, hostName, taskState, mode, onModeChange, text, o
           <div className="composer__primary-actions">
             {taskState === 'running' && (
               <button
-                className="button button--quiet"
+                className="button button--quiet composer__stop"
                 type="button"
                 disabled
                 aria-describedby="stop-turn-help"
@@ -1255,6 +1360,7 @@ interface InspectorProps {
   selectedThread: ThreadSummary
   selectedProject: WorkbenchSnapshot['projects'][number]
   selectedHost: HostSummary
+  runtime: RuntimeSummary
   activeTab: InspectorTab
   onTabChange: (tab: InspectorTab) => void
   onClose: () => void
@@ -1263,7 +1369,7 @@ interface InspectorProps {
   inert: boolean
 }
 
-function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, activeTab, onTabChange, onClose, containerRef, modal, inert }: InspectorProps) {
+function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert }: InspectorProps) {
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const activateRelativeTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex = index
@@ -1321,7 +1427,9 @@ function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, ac
         aria-labelledby={`inspector-tab-${activeTab.toLowerCase()}`}
       >
         {activeTab === 'Changes' && <ChangesPanel snapshot={snapshot} />}
-        {activeTab === 'Agents' && <AgentsPanel snapshot={snapshot} />}
+        {activeTab === 'Runtime' && (
+          <RuntimePanel key={selectedThread.id} snapshot={snapshot} thread={selectedThread} host={selectedHost} runtime={runtime} />
+        )}
         {activeTab === 'Evidence' && <EvidencePanel snapshot={snapshot} />}
         {activeTab === 'Context' && (
           <ContextPanel project={selectedProject} host={selectedHost} />
@@ -1368,22 +1476,285 @@ function ChangesPanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
   )
 }
 
-function AgentsPanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
+function runtimeStateLabel(state: string): string {
+  return state.replaceAll('_', ' ').replace(/^./, (character) => character.toUpperCase())
+}
+
+function compactDuration(milliseconds: number): string {
+  const seconds = Math.round(milliseconds / 1_000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.round(minutes / 60)}h`
+}
+
+const SCHEDULE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+})
+
+function scheduleTime(value?: string): string | undefined {
+  if (!value || !Number.isFinite(Date.parse(value))) return undefined
+  return SCHEDULE_TIME_FORMATTER.format(new Date(value))
+}
+
+function agentHierarchy(
+  agent: WorkbenchSnapshot['agents'][number],
+  byId: ReadonlyMap<string, WorkbenchSnapshot['agents'][number]>,
+): {
+  depth: number
+  parent?: WorkbenchSnapshot['agents'][number]
+} {
+  const parent = agent.parentId && agent.parentId !== agent.id ? byId.get(agent.parentId) : undefined
+  const visited = new Set([agent.id])
+  let cursor = parent
+  let depth = 0
+  while (cursor && !visited.has(cursor.id) && depth < 4) {
+    visited.add(cursor.id)
+    depth += 1
+    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined
+  }
+  return { depth, parent }
+}
+
+function parentFirstAgents(agents: WorkbenchSnapshot['agents']): WorkbenchSnapshot['agents'] {
+  const byId = new Map(agents.map((agent) => [agent.id, agent]))
+  const children = new Map<string, WorkbenchSnapshot['agents']>()
+  const roots: WorkbenchSnapshot['agents'] = []
+  for (const agent of agents) {
+    if (agent.parentId && agent.parentId !== agent.id && byId.has(agent.parentId)) {
+      const siblings = children.get(agent.parentId) ?? []
+      siblings.push(agent)
+      children.set(agent.parentId, siblings)
+    } else {
+      roots.push(agent)
+    }
+  }
+
+  const ordered: WorkbenchSnapshot['agents'] = []
+  const visited = new Set<string>()
+  const visit = (agent: WorkbenchSnapshot['agents'][number]): void => {
+    if (visited.has(agent.id)) return
+    visited.add(agent.id)
+    ordered.push(agent)
+    children.get(agent.id)?.forEach(visit)
+  }
+  roots.forEach(visit)
+  // Cycles have no root. Preserve their first-seen order without duplication.
+  agents.forEach(visit)
+  return ordered
+}
+
+const RUNTIME_GOAL_INCREMENT = 20
+const RUNTIME_AGENT_INCREMENT = 50
+const RUNTIME_SCHEDULE_INCREMENT = 20
+
+function RuntimePanel({
+  snapshot,
+  thread,
+  host,
+  runtime,
+}: {
+  snapshot: WorkbenchSnapshot
+  thread: ThreadSummary
+  host: HostSummary
+  runtime: RuntimeSummary
+}) {
+  const [goalLimit, setGoalLimit] = useState(RUNTIME_GOAL_INCREMENT)
+  const [agentLimit, setAgentLimit] = useState(RUNTIME_AGENT_INCREMENT)
+  const [scheduleLimit, setScheduleLimit] = useState(RUNTIME_SCHEDULE_INCREMENT)
+  const runningAgents = snapshot.agents.filter((agent) => agent.status === 'running').length
+  const agentsById = new Map(snapshot.agents.map((agent) => [agent.id, agent]))
+  const orderedAgents = parentFirstAgents(snapshot.agents)
+  const visibleAgents = orderedAgents.slice(0, agentLimit)
+  const visibleGoals = runtime.goals?.slice(0, goalLimit)
+  const visibleSchedules = runtime.schedules?.slice(0, scheduleLimit)
+  const activeGoals = runtime.goals?.filter((goal) => goal.state === 'active') ?? []
+  const session = runtime.session
+  const isFresh = host.connection === 'online'
+  const sessionId = session?.activeSessionId ?? session?.sessionId
+  const hostQueueCopy = runtime.queue
+    ? runtime.queue.paused
+      ? `${runtime.queue.pendingCount} pending · paused`
+      : runtime.queue.pendingCount === 0
+        ? 'Empty'
+        : `${runtime.queue.pendingCount} pending`
+    : 'Unavailable'
+  const residencyCopy = session?.residency === 'resident'
+    ? isFresh
+      ? 'Resident on host'
+      : 'Last reported resident · current status unverified'
+    : session?.residency === 'client_owned'
+      ? isFresh
+        ? 'Client-owned'
+        : 'Last reported client-owned · current status unverified'
+      : session
+        ? 'Unknown'
+        : 'Unavailable'
+
   return (
     <div className="inspector-content">
-      <PanelHeading icon={Users} title="Agent team" meta={`${snapshot.agents.filter((agent) => agent.status === 'working').length} working now`} />
-      <ul className="agent-list">
-        {snapshot.agents.map((agent) => (
-          <li key={agent.id}>
-            <span className={cx('agent-state', `agent-state--${agent.status}`)}><Icon icon={agent.status === 'complete' ? Check : agent.status === 'working' ? Activity : Clock3} size={14} /></span>
-            <span className="agent-list__body">
-              <strong>{agent.name}</strong>
-              <span>{agent.role}</span>
-              <small><bdi>{agent.hostName}</bdi> · {agent.status}</small>
+      <PanelHeading
+        icon={Bot}
+        title="RLM runtime"
+        meta={isFresh
+          ? `${runningAgents} ${runningAgents === 1 ? 'subagent' : 'subagents'} running · ${taskLabel(thread.status)}`
+          : `${runningAgents} last reported running · cached host state`}
+      />
+
+      <section className="runtime-section" aria-labelledby="runtime-session-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-session-heading">Session continuity</h3>
+          {!isFresh && session && <span className="runtime-badge runtime-badge--warning">Cached state</span>}
+          {isFresh && session && (session.isStreaming || session.isBashRunning || session.isCompacting || session.retryAttempt > 0) && (
+            <span className="runtime-badges" aria-label="Runtime activity">
+              {session.isStreaming && <span className="runtime-badge">Streaming</span>}
+              {session.isBashRunning && <span className="runtime-badge">Shell running</span>}
+              {session.isCompacting && <span className="runtime-badge runtime-badge--warning">Compacting</span>}
+              {session.retryAttempt > 0 && <span className="runtime-badge runtime-badge--warning">Retry {session.retryAttempt}</span>}
             </span>
-          </li>
-        ))}
-      </ul>
+          )}
+        </div>
+        <dl className="runtime-facts">
+          <div><dt>Run location</dt><dd><bdi>{host.name}</bdi></dd></div>
+          <div><dt>Turn</dt><dd>{taskLabel(thread.status)}</dd></div>
+          <div><dt>Residency</dt><dd>{residencyCopy}</dd></div>
+          {sessionId && <div><dt>Session</dt><dd><bdi>{sessionId}</bdi></dd></div>}
+          {thread.executionGenerationId && <div><dt>Execution</dt><dd><bdi>{thread.executionGenerationId}</bdi></dd></div>}
+          {thread.workspaceId && <div><dt>Workspace</dt><dd><bdi>{thread.workspaceId}</bdi></dd></div>}
+          <div><dt>Session actions</dt><dd className="tabular">{session ? session.queuedActionCount : 'Unavailable'}</dd></div>
+          <div><dt>Host commands</dt><dd>{hostQueueCopy}</dd></div>
+          {session?.model && <div><dt>Model</dt><dd><bdi>{session.model}</bdi>{session.thinkingLevel ? ` · ${session.thinkingLevel}` : ''}{session.serviceTier ? ` · ${session.serviceTier}` : ''}</dd></div>}
+          {session && session.activeToolNames.length > 0 && <div><dt>Active tools</dt><dd>{session.activeToolNames.join(', ')}</dd></div>}
+          {session?.context && (
+            <div>
+              <dt>Context</dt>
+              <dd className="tabular">
+                {session.context.usedTokens.toLocaleString()}
+                {session.context.maxTokens ? ` of ${session.context.maxTokens.toLocaleString()} tokens` : ' tokens'}
+              </dd>
+            </div>
+          )}
+        </dl>
+        {!session && <p className="runtime-empty">Live Prime Agent session details are unavailable in this snapshot.</p>}
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-goal-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-goal-heading">Goals</h3>
+          {runtime.goals && <span>{isFresh ? `${activeGoals.length} active` : `Cached · ${activeGoals.length} active`}</span>}
+        </div>
+        {runtime.goals === undefined ? (
+          <p className="runtime-empty">Goal state is unavailable in this snapshot.</p>
+        ) : runtime.goals.length === 0 ? (
+          <p className="runtime-empty">No goal is active for this session.</p>
+        ) : (
+          <>
+            <ul className="runtime-list">
+              {visibleGoals?.map((goal) => (
+                <li key={goal.id}>
+                  <span className={cx('runtime-state', `runtime-state--${goal.state}`)} aria-hidden="true" />
+                  <span className="runtime-list__body">
+                    <strong>{goal.objective}</strong>
+                    <small>
+                      {runtimeStateLabel(goal.state)}
+                      {goal.tokensUsed !== undefined ? ` · ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` of ${goal.tokenBudget.toLocaleString()}` : ''} tokens` : ''}
+                    </small>
+                    {goal.detail && <span>{goal.detail}</span>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {runtime.goals.length > goalLimit && (
+              <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setGoalLimit((limit) => limit + RUNTIME_GOAL_INCREMENT)}>
+                Show {Math.min(RUNTIME_GOAL_INCREMENT, runtime.goals.length - goalLimit)} more goals
+              </button>
+            )}
+          </>
+        )}
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-agents-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-agents-heading">Retained subagents</h3>
+          <span>{snapshot.agents.length}</span>
+        </div>
+        {snapshot.agents.length === 0 ? (
+          <p className="runtime-empty">No retained subagents in this session.</p>
+        ) : (
+          <ul className="agent-list">
+            {visibleAgents.map((agent) => {
+              const hierarchy = agentHierarchy(agent, agentsById)
+              return (
+                <li data-runtime-agent key={agent.id} style={{ marginInlineStart: `${hierarchy.depth * 0.75}rem` }}>
+                  <span className={cx('agent-state', `agent-state--${agent.status}`)}>
+                    <Icon icon={agent.status === 'complete' ? Check : agent.status === 'running' ? Activity : agent.status === 'failed' ? AlertCircle : Clock3} size={14} />
+                  </span>
+                  <span className="agent-list__body">
+                    <strong>{agent.name}</strong>
+                    {hierarchy.parent && <span className="agent-list__parent">Subagent of {hierarchy.parent.name}</span>}
+                    <span>{agent.activity ?? agent.recap ?? agent.role}</span>
+                    <small>
+                      <bdi>{agent.hostName}</bdi> · {isFresh ? runtimeStateLabel(agent.status) : `Last reported ${runtimeStateLabel(agent.status).toLocaleLowerCase()}`}
+                      {agent.model ? ` · ${agent.model}` : ''}
+                      {agent.durationMs !== undefined ? ` · ${compactDuration(agent.durationMs)}` : ''}
+                      {agent.toolUseCount !== undefined ? ` · ${agent.toolUseCount.toLocaleString()} tool ${agent.toolUseCount === 1 ? 'use' : 'uses'}` : ''}
+                      {agent.tokenCount !== undefined ? ` · ${agent.tokenCount.toLocaleString()} tokens` : ''}
+                    </small>
+                    {agent.error && <span className="runtime-error">{agent.error}</span>}
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+        {snapshot.agents.length > agentLimit && (
+          <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setAgentLimit((limit) => limit + RUNTIME_AGENT_INCREMENT)}>
+            Show {Math.min(RUNTIME_AGENT_INCREMENT, snapshot.agents.length - agentLimit)} more subagents
+          </button>
+        )}
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-schedules-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-schedules-heading">Schedules</h3>
+          {runtime.schedules && <span>{runtime.schedules.length}</span>}
+        </div>
+        {runtime.schedules === undefined ? (
+          <p className="runtime-empty">Schedule state is unavailable in this snapshot.</p>
+        ) : runtime.schedules.length === 0 ? (
+          <p className="runtime-empty">No schedules are configured for this session.</p>
+        ) : (
+          <>
+            <ul className="runtime-list">
+              {visibleSchedules?.map((schedule) => {
+                const nextRun = scheduleTime(schedule.nextRunAt)
+                return (
+                  <li key={schedule.id}>
+                    <span className={cx('runtime-state', `runtime-state--${schedule.state}`)} aria-hidden="true" />
+                    <span className="runtime-list__body">
+                      <strong>{schedule.label}</strong>
+                      <small>
+                        {runtimeStateLabel(schedule.state)}
+                        {schedule.source ? ` · ${runtimeStateLabel(schedule.source)}` : schedule.kind ? ` · ${runtimeStateLabel(schedule.kind)}` : ''}
+                        {nextRun ? ` · Next ${nextRun}` : ''}
+                      </small>
+                      {schedule.detail && <span>{schedule.detail}</span>}
+                    </span>
+                  </li>
+                )
+              })}
+            </ul>
+            {runtime.schedules.length > scheduleLimit && (
+              <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setScheduleLimit((limit) => limit + RUNTIME_SCHEDULE_INCREMENT)}>
+                Show {Math.min(RUNTIME_SCHEDULE_INCREMENT, runtime.schedules.length - scheduleLimit)} more schedules
+              </button>
+            )}
+          </>
+        )}
+      </section>
     </div>
   )
 }
@@ -1894,8 +2265,8 @@ function CompanionPreview({
         <div className="companion-brand">
           <span className="brand-mark" aria-hidden="true"><Icon icon={Sparkles} size={17} strokeWidth={2} /></span>
           <span>
-            <strong>Prime Companion</strong>
-            <small>{environment === 'preview' ? 'Browser preview · sample data' : 'Read-only preview on this device'}</small>
+            <strong>Prime Continuim</strong>
+            <small>{environment === 'preview' ? 'Browser preview · sample data' : 'Read-only companion preview'}</small>
           </span>
         </div>
         <button className="button button--quiet button--small" type="button" onClick={onExit}>

@@ -93,7 +93,46 @@ function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][
         sequence: 1,
       },
     ],
+    queueState: { pendingCommandIds: ['queued-command'], paused: false },
     childAgents: [],
+    goals: [
+      {
+        goalId: `goal-${thread.threadId}`,
+        objective: `Finish ${thread.title}`,
+        state: 'active',
+        tokenBudget: 100_000,
+        tokensUsed: 12_000,
+      },
+    ],
+    schedules: [
+      {
+        scheduleId: `schedule-${thread.threadId}`,
+        label: 'Review verification',
+        state: 'active',
+        source: 'heartbeat',
+        nextRunAt: '2026-08-06T21:00:00.000Z',
+      },
+    ],
+    runtime: {
+      runtime: 'prime_agent',
+      residency: 'resident',
+      activeSessionId: `active-${thread.threadId}`,
+      sessionId: `session-${thread.threadId}`,
+      sessionName: thread.title,
+      model: 'prime-rlm',
+      thinkingLevel: 'high',
+      isStreaming: thread.status === 'running',
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      steeringMode: 'all',
+      followUpMode: 'all',
+      messageCount: 1,
+      compactionCount: 0,
+      queuedActionCount: 2,
+      activeToolNames: [],
+      context: { usedTokens: 12_000, maxTokens: 100_000 },
+    },
     pendingAttention: [],
     git: { branch: 'main', stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
     evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
@@ -390,6 +429,7 @@ describe('NativeRendererApi', () => {
     expect(inFlight?.evidence).toEqual([])
     expect(inFlight?.agents).toEqual([])
     expect(inFlight?.attention).toEqual([])
+    expect(inFlight?.runtime).toEqual({})
 
     const restored = published.at(-1)
     expect(restored?.selectedThreadId).toBe('thread-one')
@@ -398,6 +438,20 @@ describe('NativeRendererApi', () => {
     )
     expect(restored?.evidence).toHaveLength(2)
     expect(restored?.agents).toHaveLength(1)
+    expect(restored?.runtime.session).toMatchObject({
+      residency: 'resident',
+      activeSessionId: 'active-thread-one',
+      sessionId: 'session-thread-one',
+      model: 'prime-rlm',
+      queuedActionCount: 2,
+    })
+    expect(restored?.runtime.queue).toEqual({ pendingCount: 1, paused: false })
+    expect(restored?.runtime.goals).toEqual([
+      expect.objectContaining({ objective: 'Finish First durable thread', state: 'active', tokensUsed: 12_000 }),
+    ])
+    expect(restored?.runtime.schedules).toEqual([
+      expect.objectContaining({ label: 'Review verification', state: 'active', source: 'heartbeat' }),
+    ])
     expect(restored?.attention.map((item) => [item.title, item.kind])).toEqual([
       ['Answer the host question', 'question'],
       ['Host A went offline', 'failed'],

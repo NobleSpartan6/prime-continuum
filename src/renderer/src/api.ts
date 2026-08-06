@@ -74,8 +74,74 @@ export interface AgentSummary {
   id: string
   name: string
   role: string
-  status: 'working' | 'waiting' | 'complete'
+  status: 'pending' | 'queued' | 'running' | 'waiting' | 'complete' | 'failed' | 'cancelled'
   hostName: string
+  parentId?: string
+  model?: string
+  activity?: string
+  durationMs?: number
+  toolUseCount?: number
+  tokenCount?: number
+  recap?: string
+  error?: string
+}
+
+export interface RuntimeGoalSummary {
+  id: string
+  objective: string
+  state: 'active' | 'paused' | 'budget_limited' | 'complete' | 'error'
+  tokenBudget?: number
+  tokensUsed?: number
+  timeUsedSeconds?: number
+  continuationsUsed?: number
+  detail?: string
+}
+
+export interface RuntimeScheduleSummary {
+  id: string
+  label: string
+  state: 'active' | 'paused' | 'completed' | 'cancelled'
+  kind?: 'once' | 'cron' | 'interval'
+  source?: 'cron' | 'heartbeat' | 'rlm_heartbeat'
+  nextRunAt?: string
+  runCount?: number
+  detail?: string
+}
+
+export interface RuntimeSessionSummary {
+  residency: 'resident' | 'client_owned' | 'unknown'
+  appVersion?: string
+  activeSessionId?: string
+  sessionId?: string
+  sessionName?: string
+  model?: string
+  thinkingLevel?: string
+  serviceTier?: string
+  isStreaming: boolean
+  isCompacting: boolean
+  isBashRunning: boolean
+  retryAttempt: number
+  queuedActionCount: number
+  messageCount: number
+  compactionCount: number
+  activeToolNames: string[]
+  context?: {
+    usedTokens: number
+    maxTokens?: number
+  }
+}
+
+export interface RuntimeSummary {
+  session?: RuntimeSessionSummary
+  /** Undefined means the selected host snapshot did not project this capability. */
+  queue?: {
+    pendingCount: number
+    paused: boolean
+  }
+  /** Undefined means unavailable; an empty array is an authoritative empty state. */
+  goals?: RuntimeGoalSummary[]
+  /** Undefined means unavailable; an empty array is an authoritative empty state. */
+  schedules?: RuntimeScheduleSummary[]
 }
 
 export interface EvidenceSummary {
@@ -96,6 +162,7 @@ export interface WorkbenchSnapshot {
   changes: ChangeSummary[]
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
+  runtime: RuntimeSummary
   composerReceipt: {
     state: ComposerReceiptState
     message?: string
@@ -276,7 +343,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
   projects: [
     {
       id: 'project-prime',
-      name: 'Prime GUI',
+      name: 'Prime Continuim',
       repository: 'prime-agent-native',
       hostIds: ['host-local', 'host-devbox'],
       branch: 'feat/seamless-remote',
@@ -398,15 +465,51 @@ export const previewSnapshot: WorkbenchSnapshot = {
     { path: 'tests/renderer/App.test.tsx', additions: 94, deletions: 0, status: 'added' },
   ],
   agents: [
-    { id: 'agent-1', name: 'Renderer', role: 'Workbench and dialogs', status: 'working', hostName: 'devbox' },
-    { id: 'agent-2', name: 'Control service', role: 'IPC and SSH lifecycle', status: 'working', hostName: 'This computer' },
-    { id: 'agent-3', name: 'Protocol', role: 'Snapshots and command journal', status: 'waiting', hostName: 'devbox' },
+    { id: 'agent-1', name: 'Workbench lead', role: 'Retained subagent', status: 'running', hostName: 'devbox' },
+    { id: 'agent-2', parentId: 'agent-1', name: 'Renderer', role: 'Interface implementation', status: 'running', hostName: 'This computer', toolUseCount: 18, tokenCount: 24_120 },
+    { id: 'agent-3', parentId: 'agent-1', name: 'Protocol', role: 'Snapshots and command journal', status: 'waiting', hostName: 'devbox', toolUseCount: 7, tokenCount: 11_804 },
   ],
   evidence: [
     { id: 'evidence-1', label: 'Sample renderer checks', detail: 'Preview fixture · passing', status: 'passed' },
     { id: 'evidence-2', label: 'Sample type check', detail: 'Preview fixture · passing', status: 'passed' },
     { id: 'evidence-3', label: 'Sample reconnect trace', detail: 'Preview fixture · awaiting path recovery', status: 'running' },
   ],
+  runtime: {
+    session: {
+      residency: 'resident',
+      appVersion: '0.18.4',
+      activeSessionId: 'session-seamless-remote',
+      sessionId: 'session-seamless-remote',
+      sessionName: 'Seamless remote experience',
+      model: 'Prime RLM',
+      thinkingLevel: 'High',
+      isStreaming: true,
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      queuedActionCount: 2,
+      messageCount: seedTranscript.length,
+      compactionCount: 1,
+      activeToolNames: ['renderer'],
+      context: { usedTokens: 32_000, maxTokens: 200_000 },
+    },
+    queue: { pendingCount: 1, paused: false },
+    goals: [
+      {
+        id: 'goal-continuity',
+        objective: 'Implement the seamless remote workbench',
+        state: 'active',
+      },
+    ],
+    schedules: [
+      {
+        id: 'schedule-review',
+        label: 'Review overnight verification',
+        state: 'active',
+        nextRunAt: '2026-08-07T09:00:00.000Z',
+      },
+    ],
+  },
   composerReceipt: { state: 'waiting_for_connection', message: 'Waiting for connection' },
 }
 
@@ -531,7 +634,7 @@ class BrowserPreviewApi implements RendererApi {
       destinationHostId: destination?.id ?? input.destinationHostId,
       destinationName: destination?.name ?? 'This computer',
       repository: 'prime-agent-native',
-      destinationProject: 'Prime GUI',
+      destinationProject: 'Prime Continuim',
       branch: 'feat/seamless-remote',
       dirtyFiles: 6,
       untrackedFiles: 2,
@@ -989,14 +1092,132 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const childAgents = selectedSnapshotIsMaterialized ? records(threadSnapshot?.childAgents) : []
   const agents: AgentSummary[] = childAgents.map((agent, index) => {
     const state = asString(agent.state)
+    const status: AgentSummary['status'] =
+      state === 'pending' ||
+      state === 'queued' ||
+      state === 'running' ||
+      state === 'waiting' ||
+      state === 'complete' ||
+      state === 'failed' ||
+      state === 'cancelled'
+        ? state
+        : 'running'
+    const rawActivity = asRecord(agent.activity)
+    const activityKind = asString(rawActivity?.kind)
+    const toolName = asString(rawActivity?.toolName)
+    const activity = activityKind === 'executing' && toolName
+      ? `Executing ${toolName}`
+      : activityKind === 'executing'
+        ? 'Executing a tool'
+        : activityKind === 'writing'
+          ? 'Writing'
+          : activityKind === 'waiting'
+            ? 'Waiting'
+            : undefined
     return {
       id: asString(agent.agentId) ?? `native-agent-${index}`,
       name: asString(agent.title) ?? `Agent ${index + 1}`,
-      role: 'Child agent',
-      status: state === 'complete' ? 'complete' : state === 'waiting' || state === 'pending' ? 'waiting' : 'working',
+      role: 'Retained subagent',
+      status,
       hostName,
+      ...(asString(agent.parentAgentId) ? { parentId: asString(agent.parentAgentId) } : {}),
+      ...(asString(agent.model) ? { model: asString(agent.model) } : {}),
+      ...(activity ? { activity } : {}),
+      ...(asNumber(agent.durationMs) !== undefined ? { durationMs: asNumber(agent.durationMs) } : {}),
+      ...(asNumber(agent.toolUseCount) !== undefined ? { toolUseCount: asNumber(agent.toolUseCount) } : {}),
+      ...(asNumber(agent.tokenCount) !== undefined ? { tokenCount: asNumber(agent.tokenCount) } : {}),
+      ...(asString(agent.recap) ? { recap: asString(agent.recap) } : {}),
+      ...(asString(agent.error) ? { error: asString(agent.error) } : {}),
     }
   })
+
+  const runtime: RuntimeSummary = {}
+  if (selectedSnapshotIsMaterialized) {
+    const rawSession = asRecord(threadSnapshot?.runtime)
+    if (rawSession && asString(rawSession.runtime) === 'prime_agent') {
+      const residency = asString(rawSession.residency)
+      const rawContext = asRecord(rawSession.context)
+      const usedTokens = asNumber(rawContext?.usedTokens)
+      runtime.session = {
+        residency: residency === 'resident' || residency === 'client_owned' ? residency : 'unknown',
+        ...(asString(rawSession.appVersion) ? { appVersion: asString(rawSession.appVersion) } : {}),
+        ...(asString(rawSession.activeSessionId) ? { activeSessionId: asString(rawSession.activeSessionId) } : {}),
+        ...(asString(rawSession.sessionId) ? { sessionId: asString(rawSession.sessionId) } : {}),
+        ...(asString(rawSession.sessionName) ? { sessionName: asString(rawSession.sessionName) } : {}),
+        ...(asString(rawSession.model) ? { model: asString(rawSession.model) } : {}),
+        ...(asString(rawSession.thinkingLevel) ? { thinkingLevel: asString(rawSession.thinkingLevel) } : {}),
+        ...(asString(rawSession.serviceTier) ? { serviceTier: asString(rawSession.serviceTier) } : {}),
+        isStreaming: asBoolean(rawSession.isStreaming) ?? false,
+        isCompacting: asBoolean(rawSession.isCompacting) ?? false,
+        isBashRunning: asBoolean(rawSession.isBashRunning) ?? false,
+        retryAttempt: asNumber(rawSession.retryAttempt) ?? 0,
+        queuedActionCount: asNumber(rawSession.queuedActionCount) ?? 0,
+        messageCount: asNumber(rawSession.messageCount) ?? 0,
+        compactionCount: asNumber(rawSession.compactionCount) ?? 0,
+        activeToolNames: Array.isArray(rawSession.activeToolNames)
+          ? rawSession.activeToolNames.filter((tool): tool is string => typeof tool === 'string')
+          : [],
+        ...(usedTokens !== undefined
+          ? { context: {
+              usedTokens,
+              ...(asNumber(rawContext?.maxTokens) !== undefined ? { maxTokens: asNumber(rawContext?.maxTokens) } : {}),
+            } }
+          : {}),
+      }
+    }
+
+    const rawQueue = asRecord(threadSnapshot?.queueState)
+    if (rawQueue && Array.isArray(rawQueue.pendingCommandIds)) {
+      runtime.queue = {
+        pendingCount: rawQueue.pendingCommandIds.filter((commandId) => typeof commandId === 'string').length,
+        paused: asBoolean(rawQueue.paused) ?? false,
+      }
+    }
+
+    if (Array.isArray(threadSnapshot?.goals)) {
+      runtime.goals = records(threadSnapshot.goals).flatMap((goal, index) => {
+        const state = asString(goal.state)
+        const objective = asString(goal.objective)
+        if (
+          !objective ||
+          (state !== 'active' && state !== 'paused' && state !== 'budget_limited' && state !== 'complete' && state !== 'error')
+        ) return []
+        return [{
+          id: asString(goal.goalId) ?? `native-goal-${index}`,
+          objective,
+          state,
+          ...(asNumber(goal.tokenBudget) !== undefined ? { tokenBudget: asNumber(goal.tokenBudget) } : {}),
+          ...(asNumber(goal.tokensUsed) !== undefined ? { tokensUsed: asNumber(goal.tokensUsed) } : {}),
+          ...(asNumber(goal.timeUsedSeconds) !== undefined ? { timeUsedSeconds: asNumber(goal.timeUsedSeconds) } : {}),
+          ...(asNumber(goal.continuationsUsed) !== undefined ? { continuationsUsed: asNumber(goal.continuationsUsed) } : {}),
+          ...(asString(goal.lastError) || asString(goal.lastReason)
+            ? { detail: asString(goal.lastError) ?? asString(goal.lastReason) }
+            : {}),
+        }]
+      })
+    }
+
+    if (Array.isArray(threadSnapshot?.schedules)) {
+      runtime.schedules = records(threadSnapshot.schedules).flatMap((schedule, index) => {
+        const state = asString(schedule.state)
+        const label = asString(schedule.label)
+        if (!label || (state !== 'active' && state !== 'paused' && state !== 'completed' && state !== 'cancelled')) return []
+        const nextRunAt = asString(schedule.nextRunAt)
+        const kind = asString(schedule.kind)
+        const source = asString(schedule.source)
+        return [{
+          id: asString(schedule.scheduleId) ?? `native-schedule-${index}`,
+          label,
+          state,
+          ...(kind === 'once' || kind === 'cron' || kind === 'interval' ? { kind } : {}),
+          ...(source === 'cron' || source === 'heartbeat' || source === 'rlm_heartbeat' ? { source } : {}),
+          ...(nextRunAt ? { nextRunAt } : {}),
+          ...(asNumber(schedule.runCount) !== undefined ? { runCount: asNumber(schedule.runCount) } : {}),
+          ...(asString(schedule.lastError) ? { detail: asString(schedule.lastError) } : {}),
+        }]
+      })
+    }
+  }
 
   const rawEvidence = selectedSnapshotIsMaterialized ? asRecord(threadSnapshot?.evidence) : undefined
   const testsPassed = asNumber(rawEvidence?.testsPassed) ?? 0
@@ -1064,6 +1285,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     changes: [],
     agents,
     evidence,
+    runtime,
     composerReceipt,
   }
 }
@@ -1961,7 +2183,7 @@ export function createRendererApi(): RendererApi {
     const nativeBridge = Reflect.get(window, 'prime') as NativePrimeBridge | undefined
     if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge)
     else if (isNativeBridgeUnavailable(window.navigator.userAgent, false)) {
-      throw new Error('The native control bridge did not load. Prime Agent will not substitute sample data in the desktop app.')
+      throw new Error('The native control bridge did not load. Prime Continuim will not substitute sample data in the desktop app.')
     } else singletonApi = new BrowserPreviewApi()
   }
   return singletonApi

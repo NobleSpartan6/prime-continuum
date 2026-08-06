@@ -44,17 +44,21 @@ afterEach(() => {
   window.history.replaceState({}, '', '/')
 })
 
-describe('Prime Agent renderer', () => {
+describe('Prime Continuim renderer', () => {
   it('keeps the durable thread primary while connection and task states remain separate', async () => {
     render(<App api={createPreviewRendererApi()} />)
 
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
+    expect(document.querySelector('.topbar__brand-name')).toHaveTextContent('Prime Continuim')
     expect(screen.getAllByText('Running').some((element) => element.getClientRects().length > 0 || !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).toHaveClass('button--empty')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
+    const continuity = screen.getByRole('region', { name: 'Session continuity' })
+    expect(within(continuity).getByText(/Last reported resident on devbox · current status unverified/i)).toBeVisible()
+    expect(within(continuity).queryByText(/Continues on devbox when this window closes/i)).not.toBeInTheDocument()
   })
 
   it('preserves the composer and cached transcript for an offline thread', async () => {
@@ -146,8 +150,44 @@ describe('Prime Agent renderer', () => {
     changes.focus()
     await user.keyboard('{ArrowRight}')
 
-    expect(screen.getByRole('tab', { name: 'Agents' })).toHaveAttribute('aria-selected', 'true')
-    expect(screen.getByRole('heading', { name: 'Agent team' })).toBeVisible()
+    expect(screen.getByRole('tab', { name: 'Runtime' })).toHaveAttribute('aria-selected', 'true')
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+    expect(within(runtimePanel).getByRole('heading', { name: 'RLM runtime' })).toBeVisible()
+    expect(within(runtimePanel).getByText('Implement the seamless remote workbench')).toBeVisible()
+    expect(within(runtimePanel).getByText('Review overnight verification')).toBeVisible()
+    expect(within(runtimePanel).getAllByText('Subagent of Workbench lead')).toHaveLength(2)
+    expect(within(runtimePanel).getByText(/18 tool uses/)).toBeVisible()
+  })
+
+  it('progressively mounts large retained-subagent projections in bounded windows', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.agents = Array.from({ length: 120 }, (_, index) => ({
+        id: `agent-${index}`,
+        ...(index > 0 ? { parentId: 'agent-0' } : {}),
+        name: `Agent ${index + 1}`,
+        role: 'Retained subagent',
+        status: index % 3 === 0 ? 'running' as const : 'waiting' as const,
+        hostName: 'devbox',
+      }))
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+
+    expect(runtimePanel.querySelectorAll('[data-runtime-agent]')).toHaveLength(50)
+    await user.click(within(runtimePanel).getByRole('button', { name: 'Show 50 more subagents' }))
+    expect(runtimePanel.querySelectorAll('[data-runtime-agent]')).toHaveLength(100)
+    await user.click(within(runtimePanel).getByRole('button', { name: 'Show 20 more subagents' }))
+    expect(runtimePanel.querySelectorAll('[data-runtime-agent]')).toHaveLength(120)
+    expect(within(runtimePanel).queryByRole('button', { name: /more subagents/ })).not.toBeInTheDocument()
   })
 
   it('keeps projection-only inspector data non-interactive and reports the real connection state', async () => {
@@ -160,8 +200,8 @@ describe('Prime Agent renderer', () => {
     expect(within(changesPanel).queryByRole('button')).not.toBeInTheDocument()
     expect(within(changesPanel).queryByText('App.tsx')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('tab', { name: 'Agents' }))
-    expect(within(screen.getByRole('tabpanel', { name: 'Agents' })).queryByRole('button')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    expect(within(screen.getByRole('tabpanel', { name: 'Runtime' })).queryByRole('button')).not.toBeInTheDocument()
     await user.click(screen.getByRole('tab', { name: 'Evidence' }))
     expect(within(screen.getByRole('tabpanel', { name: 'Evidence' })).queryByRole('button', { name: 'Run checks' })).not.toBeInTheDocument()
 
@@ -177,7 +217,7 @@ describe('Prime Agent renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
     expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'New thread' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'New thread' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Running.*Seamless remote experience/i })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Search projects and threads' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Attach files' })).toBeDisabled()
@@ -264,7 +304,7 @@ describe('Prime Agent renderer', () => {
     expect(within(dialog).queryByRole('button', { name: 'Start pairing' })).not.toBeInTheDocument()
 
     await user.click(within(dialog).getByRole('button', { name: 'Open companion preview' }))
-    expect(await screen.findByText('Prime Companion')).toBeVisible()
+    expect(await screen.findByText('Prime Continuim')).toBeVisible()
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Needs you' })).toHaveFocus())
     expect(screen.getByText('Browser preview · sample data')).toBeVisible()
     expect(screen.getByRole('note')).toHaveTextContent(/Preview only.*Secure mobile relay is not available/i)
@@ -429,6 +469,55 @@ describe('Prime Agent renderer', () => {
     }
   })
 
+  it('mounts recent transcript activity in bounded increments and preserves the reading anchor', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.threads[0]!.transcript = Array.from({ length: 450 }, (_, index) => ({
+        id: `history-${index + 1}`,
+        kind: 'assistant' as const,
+        author: 'Prime Agent',
+        time: 'Now',
+        body: `Activity ${index + 1}`,
+      }))
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    let scrollTop = 300
+    Object.defineProperties(transcript, {
+      clientHeight: { configurable: true, get: () => 400 },
+      scrollHeight: {
+        configurable: true,
+        get: () => transcript.querySelectorAll('[data-transcript-block]').length * 10,
+      },
+      scrollTop: {
+        configurable: true,
+        get: () => scrollTop,
+        set: (value: number) => { scrollTop = value },
+      },
+    })
+    fireEvent.scroll(transcript)
+
+    expect(transcript.querySelectorAll('[data-transcript-block]')).toHaveLength(200)
+    expect(within(transcript).queryByText('Activity 250')).not.toBeInTheDocument()
+    expect(within(transcript).getByText('Activity 251')).toBeVisible()
+
+    await user.click(within(transcript).getByRole('button', { name: 'Load earlier activity' }))
+    expect(transcript.querySelectorAll('[data-transcript-block]')).toHaveLength(400)
+    expect(within(transcript).getByText('Activity 51')).toBeVisible()
+    expect(scrollTop).toBe(2_300)
+
+    await user.click(within(transcript).getByRole('button', { name: 'Load earlier activity' }))
+    expect(transcript.querySelectorAll('[data-transcript-block]')).toHaveLength(450)
+    expect(within(transcript).getByText('Activity 1')).toBeVisible()
+    expect(within(transcript).getByRole('button', { name: 'All activity loaded' })).toBeDisabled()
+  })
+
   it('follows new transcript messages only near the bottom and resets on thread changes', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -479,6 +568,43 @@ describe('Prime Agent renderer', () => {
     await user.click(screen.getByRole('button', { name: /Training runs/ }))
     await screen.findByRole('heading', { name: 'Benchmark attention kernel' })
     expect(scrollTop).toBe(800)
+  })
+
+  it('continues following same-block streaming growth while the reader stays near the bottom', async () => {
+    const api = createPreviewRendererApi()
+    const snapshot = await api.loadWorkbench()
+    let publish: ((next: typeof snapshot) => void) | undefined
+    api.loadWorkbench = vi.fn(() => Promise.resolve(snapshot))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    let scrollHeight = 1_000
+    let scrollTop = 600
+    Object.defineProperties(transcript, {
+      clientHeight: { configurable: true, get: () => 400 },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: {
+        configurable: true,
+        get: () => scrollTop,
+        set: (value: number) => { scrollTop = value },
+      },
+    })
+    fireEvent.scroll(transcript)
+
+    const next = structuredClone(snapshot)
+    const selected = next.threads.find((thread) => thread.id === next.selectedThreadId)
+    const last = selected?.transcript.at(-1)
+    if (!last) throw new Error('Expected a final transcript block')
+    last.body = `${last.body} Streaming continuation in the same block.`
+    scrollHeight = 1_180
+    await act(async () => publish?.(next))
+
+    expect(scrollTop).toBe(1_180)
   })
 
   it('contains focus in narrow drawers, closes with Escape, and restores each trigger', async () => {
