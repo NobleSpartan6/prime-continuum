@@ -63,6 +63,7 @@
     },
     "files": [
       "out/**/*",
+      "!out/hostd/hostd-build-provenance.json",
       "!out/runtime/**/*"
     ],
     "extraResources": [

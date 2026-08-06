@@ -1,0 +1,528 @@
+import { createHash } from "node:crypto";
+import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AtomicWriteAmbiguousCommitError, atomicWriteJson } from "../../src/hostd/atomic-files";
+import { getHostDataPaths } from "../../src/hostd/paths";
+import type { EmbeddedRuntimeAttestation } from "../../src/hostd/runtime-attestation";
+import {
+  RuntimeIntegrityManager,
+  parseRuntimeFileManifest,
+  type RuntimeHostIdentity,
+  type RuntimeIntegrityFaultPoint,
+} from "../../src/hostd/runtime-integrity-manager";
+
+const temporaryDirectories: string[] = [];
+const DIGEST = "a".repeat(64);
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+describe("runtime integrity manager", () => {
+  it("promotes an exact seed, publishes a path-free pointer, and survives loss of the seed", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture);
+
+    const installed = await manager.ensureInstalled(fixture.seedRoot);
+    expect(installed).toMatchObject({
+      assurance: "development-integrity",
+      releaseVersion: "0.7.0",
+      manifestSha256: fixture.attestation.manifest.sha256,
+      treeSha256: fixture.attestation.tree.sha256,
+      fileCount: fixture.payloads.length,
+    });
+    expect(installed).not.toHaveProperty("root");
+    expect(installed).not.toHaveProperty("moduleEntrypoint");
+    expect(installed).not.toHaveProperty("runtimeManifest");
+
+    const pointer = JSON.parse(await readFile(fixture.paths.runtimeCurrent, "utf8")) as Record<string, unknown>;
+    expect(pointer).not.toHaveProperty("path");
+    expect(pointer).not.toHaveProperty("runtimeManifest");
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+
+    await rm(fixture.seedRoot, { recursive: true, force: true });
+    await expect(createManager(fixture).ensureInstalled()).resolves.toEqual(installed);
+  });
+
+  it("recreates only a missing attested final when a durable pointer and seed remain", async () => {
+    const fixture = await createFixture();
+    const installed = await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+
+    await rm(finalPath, { recursive: true });
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).resolves.toEqual(installed);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+
+    await rm(finalPath, { recursive: true });
+    await expect(createManager(fixture).ensureInstalled()).rejects.toThrow("no attested recovery seed");
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+  });
+
+  it("atomically rolls forward and back between exact attested images while retaining both installs", async () => {
+    const original = await createFixture("original");
+    const replacement = await createFixture("replacement");
+    const replacementOnOriginalHost = { ...replacement, paths: original.paths };
+
+    await createManager(original).ensureInstalled(original.seedRoot);
+    await expect(createManager(replacementOnOriginalHost).ensureInstalled()).rejects.toThrow("no attested rollover seed");
+
+    const upgraded = await createManager(replacementOnOriginalHost).ensureInstalled(replacement.seedRoot);
+    expect(upgraded.runtimeBuildId).toBe("fixture-build-replacement");
+    expect((await readdir(original.paths.runtimeInstalls)).sort()).toEqual(
+      [original.finalInstallName, replacement.finalInstallName].sort(),
+    );
+    expect(await readFile(original.paths.runtimeCurrent, "utf8")).toContain(replacement.attestation.tree.sha256);
+
+    const rolledBack = await createManager(original).ensureInstalled();
+    expect(rolledBack.runtimeBuildId).toBe("fixture-build-original");
+    expect(await readFile(original.paths.runtimeCurrent, "utf8")).toContain(original.attestation.tree.sha256);
+
+    const rolledForwardAgain = await createManager(replacementOnOriginalHost).ensureInstalled();
+    expect(rolledForwardAgain.runtimeBuildId).toBe("fixture-build-replacement");
+  });
+
+  it("removes a safe abandoned staging tree before promotion", async () => {
+    const fixture = await createFixture();
+    const abandoned = join(fixture.paths.runtimeStaging, "image-abcdef");
+    await mkdir(abandoned, { recursive: true });
+    await writeFile(join(abandoned, "partial.txt"), "incomplete copy");
+
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+  });
+
+  it("rejects an abandoned staging junction without touching its external target", async () => {
+    const fixture = await createFixture();
+    const external = join(fixture.root, "external-staging-target");
+    const sentinel = join(external, "keep.txt");
+    await mkdir(fixture.paths.runtimeStaging, { recursive: true });
+    await mkdir(external);
+    await writeFile(sentinel, "preserve external data");
+    await symlink(
+      external,
+      join(fixture.paths.runtimeStaging, "image-abcdef"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).rejects.toThrow(/symbolic link|junction/i);
+    expect(await readFile(sentinel, "utf8")).toBe("preserve external data");
+  });
+
+  it("fails closed on an unexpected staging name before deleting a valid abandoned image", async () => {
+    const fixture = await createFixture();
+    const abandoned = join(fixture.paths.runtimeStaging, "image-abcdef");
+    await mkdir(abandoned, { recursive: true });
+    await writeFile(join(abandoned, "partial.txt"), "preserve until validation completes");
+    await writeFile(join(fixture.paths.runtimeStaging, "unexpected.txt"), "untrusted entry");
+
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).rejects.toThrow("unexpected entry");
+    expect(await readFile(join(abandoned, "partial.txt"), "utf8")).toBe("preserve until validation completes");
+  });
+
+  it("rejects tampered metadata and a hard-linked payload", async () => {
+    const tampered = await createFixture();
+    await writeFile(join(tampered.seedImage, "runtime.json"), "{}\n");
+    await expect(createManager(tampered).ensureInstalled(tampered.seedRoot)).rejects.toThrow("attestation");
+
+    const linked = await createFixture();
+    const payload = join(linked.seedImage, ...linked.payloads[0]!.path.split("/"));
+    await link(payload, join(linked.root, "outside-hardlink"));
+    await expect(createManager(linked).ensureInstalled(linked.seedRoot)).rejects.toThrow("hard-linked");
+  });
+
+  it("rejects missing, extra, and content-tampered payload files", async () => {
+    const missing = await createFixture();
+    await rm(join(missing.seedImage, ...missing.payloads[0]!.path.split("/")));
+    await expect(createManager(missing).ensureInstalled(missing.seedRoot)).rejects.toThrow(/missing|extra/i);
+
+    const extra = await createFixture();
+    await writeFile(join(extra.seedImage, "unexpected.txt"), "unexpected");
+    await expect(createManager(extra).ensureInstalled(extra.seedRoot)).rejects.toThrow(/missing|extra/i);
+
+    const changed = await createFixture();
+    await writeFile(join(changed.seedImage, ...changed.payloads[0]!.path.split("/")), "changed-content");
+    await expect(createManager(changed).ensureInstalled(changed.seedRoot)).rejects.toThrow(/digest|byte count/i);
+  });
+
+  it("rejects host tuple drift and any unsigned production-authenticated claim", async () => {
+    const fixture = await createFixture();
+    expect(() => createManager(fixture, {
+      hostRuntime: { ...fixture.hostRuntime, nodeVersion: "24.18.2" },
+    })).toThrow("host runtime");
+    expect(() => new RuntimeIntegrityManager({
+      paths: fixture.paths,
+      attestation: { ...fixture.attestation, assurance: "production-authenticated" },
+      hostRuntime: fixture.hostRuntime,
+    })).toThrow("refuses production-authenticated");
+  });
+
+  it("rejects a directory junction or symbolic-link replacement", async () => {
+    const fixture = await createFixture();
+    const nativeDirectory = join(fixture.seedImage, "node_modules", "native");
+    const external = join(fixture.root, "external-native");
+    const addon = fixture.payloads.find((entry) => entry.path.endsWith("addon.node"));
+    if (!addon) throw new Error("fixture addon missing");
+    await mkdir(external);
+    await writeFile(join(external, "addon.node"), addon.bytes);
+    await rm(nativeDirectory, { recursive: true });
+    await symlink(external, nativeDirectory, process.platform === "win32" ? "junction" : "dir");
+
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).rejects.toThrow(/symbolic link|junction/i);
+  });
+
+  it("leaves no pointer or staging image when copying fails", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture, {
+      faultInjector(point) {
+        if (point === "after_copy") throw new Error("simulated copy boundary failure");
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toThrow("simulated copy boundary failure");
+    await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([]);
+  });
+
+  it("single-flights only in-flight work and allows the same manager to retry after failure", async () => {
+    const fixture = await createFixture();
+    let failOnce = true;
+    const manager = createManager(fixture, {
+      faultInjector(point) {
+        if (point === "after_copy" && failOnce) {
+          failOnce = false;
+          throw new Error("transient copy boundary failure");
+        }
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toThrow("transient copy boundary failure");
+    await expect(manager.ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+  });
+
+  it("re-verifies after success on the same manager and exposes an uncached pre-use check", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture);
+    await manager.ensureInstalled(fixture.seedRoot);
+
+    const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    await writeFile(join(finalPath, ...fixture.payloads[0]!.path.split("/")), "tampered after installation");
+
+    await expect(manager.ensureInstalled()).rejects.toThrow(/digest|byte count/i);
+    await expect(manager.verifyInstalled()).rejects.toThrow(/digest|byte count/i);
+  });
+
+  it("recovers a fully verified orphan after an ambiguous final publication", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture, {
+      faultInjector(point) {
+        if (point === "after_final_rename") throw new Error("simulated final publication uncertainty");
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      manifestSha256: fixture.attestation.manifest.sha256,
+    });
+  });
+
+  it("returns no handle after an ambiguous pointer commit and recovers on restart", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture, {
+      writeCurrent: async (path) => {
+        throw new AtomicWriteAmbiguousCommitError(path, new Error("simulated pointer uncertainty"));
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+  });
+
+  it("returns no identity when a pointer writer reports success without publishing", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture, {
+      writeCurrent: async () => undefined,
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+  });
+
+  it("never overwrites a corrupt content-addressed final or a corrupt pointer", async () => {
+    const corruptFinal = await createFixture();
+    await mkdir(corruptFinal.paths.runtimeInstalls, { recursive: true });
+    const finalPath = join(corruptFinal.paths.runtimeInstalls, corruptFinal.finalInstallName);
+    await mkdir(finalPath);
+    await writeFile(join(finalPath, "do-not-overwrite.txt"), "preserve evidence");
+    await expect(createManager(corruptFinal).ensureInstalled(corruptFinal.seedRoot)).rejects.toThrow();
+    expect(await readFile(join(finalPath, "do-not-overwrite.txt"), "utf8")).toBe("preserve evidence");
+
+    const corruptPointer = await createFixture();
+    await mkdir(corruptPointer.paths.runtime, { recursive: true });
+    await writeFile(corruptPointer.paths.runtimeCurrent, `${JSON.stringify({
+      schemaVersion: 1,
+      assurance: "development-integrity",
+      runtime: "prime-agent",
+      releaseVersion: "0.7.0",
+      runtimeBuildId: "fixture-build",
+      platform: "win32",
+      arch: "x64",
+      manifestSha256: "not-a-digest",
+      treeSha256: corruptPointer.attestation.tree.sha256,
+      filesSha256: corruptPointer.attestation.tree.filesSha256,
+    })}\n`);
+    await expect(createManager(corruptPointer).ensureInstalled(corruptPointer.seedRoot)).rejects.toThrow("malformed or unreadable");
+    expect(await readdir(corruptPointer.paths.runtimeInstalls)).toEqual([]);
+  });
+
+  it("rejects a non-canonical mutable path topology at construction", async () => {
+    const fixture = await createFixture();
+    const unsafePaths = {
+      ...fixture.paths,
+      runtimeCurrent: join(fixture.root, "outside-current.json"),
+    };
+
+    expect(() => new RuntimeIntegrityManager({
+      paths: unsafePaths,
+      attestation: fixture.attestation,
+      hostRuntime: fixture.hostRuntime,
+    })).toThrow("path topology is not canonical");
+  });
+
+  it("single-flights concurrent promotion in one endpoint owner", async () => {
+    const fixture = await createFixture();
+    let writes = 0;
+    const manager = createManager(fixture, {
+      writeCurrent: async (path, value) => {
+        writes += 1;
+        await atomicWriteJson(path, value);
+      },
+    });
+
+    const [first, second, third] = await Promise.all([
+      manager.ensureInstalled(fixture.seedRoot),
+      manager.ensureInstalled(fixture.seedRoot),
+      manager.ensureInstalled(fixture.seedRoot),
+    ]);
+    expect(first).toEqual(second);
+    expect(second).toEqual(third);
+    expect(writes).toBe(1);
+  });
+});
+
+describe("runtime file-manifest namespace", () => {
+  it.each([
+    `${DIGEST}  ../escape.js\n`,
+    `${DIGEST}  C:/drive.js\n`,
+    `${DIGEST}  file.js:stream\n`,
+    `${DIGEST}  CON.txt\n`,
+    `${DIGEST}  PACKAGE~1/file.js\n`,
+    `${DIGEST}  native.dll\n`,
+    `${DIGEST}  file.js\n${DIGEST}  file.js/child.js\n`,
+    `${DIGEST}  A.js\n${DIGEST}  a.js\n`,
+    `${DIGEST}  A/x.js\n${DIGEST}  a/y.js\n`,
+  ])("rejects an unsafe or ambiguous Windows namespace", (manifest) => {
+    const count = manifest.trimEnd().split("\n").length;
+    expect(() => parseRuntimeFileManifest(manifest, count)).toThrow();
+  });
+
+  it("requires canonical byte order and a trailing newline", () => {
+    expect(() => parseRuntimeFileManifest(`${DIGEST}  z.js\n${DIGEST}  a.js\n`, 2)).toThrow("canonical");
+    expect(() => parseRuntimeFileManifest(`${DIGEST}  a.js`, 1)).toThrow("canonical");
+  });
+});
+
+interface Fixture {
+  readonly root: string;
+  readonly seedRoot: string;
+  readonly seedImage: string;
+  readonly paths: ReturnType<typeof getHostDataPaths>;
+  readonly attestation: EmbeddedRuntimeAttestation;
+  readonly hostRuntime: RuntimeHostIdentity;
+  readonly finalInstallName: string;
+  readonly payloads: readonly { path: string; bytes: Buffer }[];
+}
+
+async function createFixture(variant = ""): Promise<Fixture> {
+  const root = await mkdtemp(join(tmpdir(), "prime-runtime-integrity-"));
+  temporaryDirectories.push(root);
+  const seedRoot = join(root, "seed");
+  const dataRoot = join(root, "data");
+  const sourceInstallName = "fixture-image";
+  const seedImage = join(seedRoot, "installs", sourceInstallName);
+  const payloads = [
+    { path: "node_modules/native/addon.node", bytes: Buffer.from(`native-addon-fixture${variant}`) },
+    { path: "node_modules/prime-agent/dist/bundle/cli.js", bytes: Buffer.from("export const cli = true;\n") },
+    { path: "node_modules/prime-agent/dist/index.js", bytes: Buffer.from("export const api = true;\n") },
+    { path: "node_modules/prime-agent/package.json", bytes: Buffer.from('{"name":"prime-agent","version":"0.7.0"}\n') },
+  ].sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
+  const fileRecords = payloads.map((entry) => ({
+    path: entry.path,
+    size: entry.bytes.byteLength,
+    sha256: sha256(entry.bytes),
+  }));
+  const filesText = fileRecords.map((entry) => `${entry.sha256}  ${entry.path}\n`).join("");
+  const treeText = fileRecords.map((entry) => `${entry.sha256} ${entry.size} ${entry.path}\n`).join("");
+  const tree = {
+    sha256: sha256(Buffer.from(treeText)),
+    filesSha256: sha256(Buffer.from(filesText)),
+    fileCount: fileRecords.length,
+    totalBytes: fileRecords.reduce((total, entry) => total + entry.size, 0),
+  };
+  const nativeAddons = fileRecords.filter((entry) => entry.path.endsWith(".node"));
+  const manifest = {
+    schemaVersion: 1,
+    product: "Prime Continuim",
+    runtime: "prime-agent",
+    release: {
+      repository: "https://example.test/prime-agent",
+      tag: "v0.7.0",
+      version: "0.7.0",
+      commit: "fixture",
+    },
+    runtimeBuildId: variant ? `fixture-build-${variant}` : "fixture-build",
+    platform: "win32",
+    arch: "x64",
+    libc: "none",
+    buildRuntime: { node: "22.22.3", modules: "127", napi: "10", npm: "10.9.8" },
+    smokeRuntime: { node: "22.22.3", modules: "127", napi: "10", platform: "win32", arch: "x64" },
+    sourcesSha256: "1".repeat(64),
+    policySha256: "2".repeat(64),
+    packageLockSha256: "3".repeat(64),
+    installPolicy: {
+      ignoreScripts: true,
+      omitDev: true,
+      omitOptional: true,
+      installStrategy: "hoisted",
+      targetNativePrebuildsOnly: true,
+    },
+    entrypoints: {
+      module: "node_modules/prime-agent/dist/index.js",
+      cli: "node_modules/prime-agent/dist/bundle/cli.js",
+    },
+    daemon: {
+      protocolName: "prime-agent.daemon",
+      protocolVersion: 7,
+      schemaRevision: 13,
+      schemaId: "fixture-schema",
+      requiredCapabilities: ["attach_snapshot"],
+    },
+    sources: [{
+      packageName: "prime-agent",
+      fileName: "fixture.tgz",
+      url: "https://example.test/fixture.tgz",
+      size: 10,
+      sha256: "4".repeat(64),
+      integrity: "sha512-fixture",
+    }],
+    nativeAddons,
+    tree,
+  };
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const hostRuntime = {
+    kind: "electron-run-as-node",
+    electronVersion: "43.3.0",
+    nodeVersion: "24.18.1",
+    modulesAbi: "148",
+    napiVersion: "10",
+    platform: "win32",
+    arch: "x64",
+    runAsNode: true,
+  } as const;
+  const attestation = {
+    schemaVersion: 1,
+    product: "Prime Continuim",
+    assurance: "development-integrity",
+    runtimePolicySchemaVersion: 1,
+    runtime: {
+      name: "prime-agent",
+      releaseVersion: "0.7.0",
+      runtimeBuildId: manifest.runtimeBuildId,
+      platform: "win32",
+      arch: "x64",
+      libc: "none",
+    },
+    manifest: {
+      relativePath: `installs/${sourceInstallName}/runtime.json`,
+      sha256: sha256(manifestBytes),
+      sourcesSha256: manifest.sourcesSha256,
+      policySha256: manifest.policySha256,
+      packageLockSha256: manifest.packageLockSha256,
+    },
+    tree,
+    entrypoints: manifest.entrypoints,
+    daemon: manifest.daemon,
+    nativeAddons,
+    hostRuntime,
+  } as const satisfies EmbeddedRuntimeAttestation;
+  const finalInstallName = [
+    "prime-agent",
+    attestation.runtime.releaseVersion,
+    attestation.runtime.platform,
+    attestation.runtime.arch,
+    attestation.tree.sha256.slice(0, 16),
+    attestation.manifest.sha256.slice(0, 16),
+  ].join("-");
+
+  for (const payload of payloads) {
+    const destination = join(seedImage, ...payload.path.split("/"));
+    await mkdir(join(destination, ".."), { recursive: true });
+    await writeFile(destination, payload.bytes);
+  }
+  await writeFile(join(seedImage, "files.sha256"), filesText);
+  await writeFile(join(seedImage, "runtime.json"), manifestBytes);
+  await writeFile(join(seedRoot, "current.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    releaseVersion: "0.7.0",
+    platform: "win32",
+    arch: "x64",
+    treeSha256: tree.sha256,
+    manifestSha256: attestation.manifest.sha256,
+    runtimeManifest: attestation.manifest.relativePath,
+  }, null, 2)}\n`);
+
+  return {
+    root,
+    seedRoot,
+    seedImage,
+    paths: getHostDataPaths(dataRoot),
+    attestation,
+    hostRuntime,
+    finalInstallName,
+    payloads,
+  };
+}
+
+function createManager(
+  fixture: Fixture,
+  options: {
+    faultInjector?: (point: RuntimeIntegrityFaultPoint) => void | Promise<void>;
+    writeCurrent?: (path: string, value: Parameters<typeof atomicWriteJson>[1] & Record<string, unknown>) => Promise<void>;
+    hostRuntime?: RuntimeHostIdentity;
+  } = {},
+): RuntimeIntegrityManager {
+  return new RuntimeIntegrityManager({
+    paths: fixture.paths,
+    attestation: fixture.attestation,
+    hostRuntime: options.hostRuntime ?? fixture.hostRuntime,
+    faultInjector: options.faultInjector,
+    writeCurrent: options.writeCurrent,
+  });
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}

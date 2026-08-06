@@ -17,6 +17,10 @@ export interface HostDataPaths {
   handoffs: string;
   security: string;
   pairingAuthority: string;
+  runtime: string;
+  runtimeCurrent: string;
+  runtimeInstalls: string;
+  runtimeStaging: string;
   journals: string;
   eventJournal: string;
   commandJournal: string;
@@ -69,6 +73,7 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
   const root = assertAbsoluteDataDir(dataDir);
   const journals = join(root, "journals");
   const security = join(root, "security");
+  const runtime = join(root, "runtime");
   return {
     root,
     host: join(root, "host.json"),
@@ -82,6 +87,10 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     handoffs: join(root, "handoffs"),
     security,
     pairingAuthority: join(security, "pairing-authority.json"),
+    runtime,
+    runtimeCurrent: join(runtime, "current.json"),
+    runtimeInstalls: join(runtime, "installs"),
+    runtimeStaging: join(runtime, "staging"),
     journals,
     eventJournal: join(journals, "events.jsonl"),
     commandJournal: join(journals, "commands.jsonl"),

@@ -13,6 +13,7 @@ export * from "./probe";
 export * from "./prime-agent-resident-adapter";
 export * from "./resident-runtime";
 export * from "./runtime-attestation";
+export * from "./runtime-integrity-manager";
 export * from "./server";
 export * from "./service";
 export * from "./store";

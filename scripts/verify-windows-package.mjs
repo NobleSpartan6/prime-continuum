@@ -83,6 +83,7 @@ async function main() {
   const packagedHostdPath = resolve(packageDirectory, 'resources/hostd/hostd.cjs')
   const asarPath = resolve(packageDirectory, 'resources/app.asar')
   const builtHostdPath = resolve('out/hostd/hostd.cjs')
+  const builtHostdProvenancePath = resolve('out/hostd/hostd-build-provenance.json')
   const builtMainPath = resolve('out/main/index.js')
   const builtAttestationPath = resolve('out/main/runtime-attestation.json')
   const builtPreloadPath = resolve('out/preload/index.cjs')
@@ -90,10 +91,11 @@ async function main() {
   const packagedRuntimeRoot = resolve(packageDirectory, 'resources/runtime-seed')
   const builtRendererDirectory = resolve('out/renderer')
 
-  const [executable, packagedHostd, builtHostd, builtMain, builtAttestationBytes, builtPreload, asarMetadata] = await Promise.all([
+  const [executable, packagedHostd, builtHostd, builtHostdProvenanceBytes, builtMain, builtAttestationBytes, builtPreload, asarMetadata] = await Promise.all([
     readFile(executablePath),
     readFile(packagedHostdPath),
     readFile(builtHostdPath),
+    readFile(builtHostdProvenancePath),
     readFile(builtMainPath, 'utf8'),
     readFile(builtAttestationPath),
     readFile(builtPreloadPath, 'utf8'),
@@ -124,6 +126,21 @@ async function main() {
   const builtHostdHash = sha256(builtHostd)
   const packagedHostdHash = sha256(packagedHostd)
   invariant(packagedHostdHash === builtHostdHash, 'The packaged host daemon does not match the host daemon built in this run.')
+  const hostdProvenance = parseHostdBuildProvenance(builtHostdProvenanceBytes)
+  invariant(
+    hostdProvenance.bundleSha256.toUpperCase() === builtHostdHash,
+    'The host daemon build provenance does not bind this exact bundle.',
+  )
+  for (const input of hostdProvenance.inputs) {
+    const normalized = input.replaceAll('\\', '/').toLowerCase()
+    invariant(
+      !normalized.includes('/node_modules/prime-agent/') &&
+        !normalized.startsWith('node_modules/prime-agent/') &&
+        !normalized.includes('/out/runtime/') &&
+        !normalized.startsWith('out/runtime/'),
+      `The host daemon input graph includes the isolated Prime Agent runtime: ${input}.`,
+    )
+  }
   const builtHostdAttestation = extractEmbeddedRuntimeAttestation(builtHostd)
   const packagedHostdAttestation = extractEmbeddedRuntimeAttestation(packagedHostd)
   invariant(
@@ -203,7 +220,9 @@ async function main() {
     invariant(!rendererText.includes(fingerprint), `The renderer bundle contains host-only runtime code: ${fingerprint}.`)
     invariant(!builtMain.includes(fingerprint), `The Electron main bundle contains host-only runtime code: ${fingerprint}.`)
     invariant(!builtPreload.includes(fingerprint), `The preload bundle contains host-only runtime code: ${fingerprint}.`)
-    invariant(!builtHostd.toString('utf8').includes(fingerprint), `The hostd bundle statically embeds Prime Agent code: ${fingerprint}.`)
+  }
+  for (const fingerprint of ['@earendil-works/pi-agent-core', '@earendil-works/pi-ai', '@earendil-works/pi-tui']) {
+    invariant(!builtHostd.toString('utf8').includes(fingerprint), `The hostd bundle statically embeds upstream runtime code: ${fingerprint}.`)
   }
 
   console.log(JSON.stringify({
@@ -238,6 +257,26 @@ async function main() {
       electronNapi: runtimeSmoke.runtimeVersions.napi,
     },
   }, null, 2))
+}
+
+function parseHostdBuildProvenance(bytes) {
+  invariant(bytes.length > 0 && bytes.length <= 4 * 1024 * 1024, 'The host daemon build provenance is empty or oversized.')
+  let value
+  try {
+    value = JSON.parse(bytes.toString('utf8'))
+  } catch (error) {
+    throw new Error('The host daemon build provenance is not valid JSON.', { cause: error })
+  }
+  invariant(value && typeof value === 'object' && !Array.isArray(value), 'The host daemon build provenance is not an object.')
+  invariant(value.schemaVersion === 1, 'The host daemon build provenance schema is unsupported.')
+  invariant(typeof value.bundleSha256 === 'string' && /^[a-f0-9]{64}$/.test(value.bundleSha256), 'The host daemon build provenance digest is invalid.')
+  invariant(Array.isArray(value.inputs) && value.inputs.length > 0 && value.inputs.length <= 10000, 'The host daemon build provenance input graph is invalid.')
+  invariant(
+    value.inputs.every((input) => typeof input === 'string' && input.length > 0 && input.length <= 4096 && !/[\0\r\n]/.test(input)),
+    'The host daemon build provenance contains an invalid input path.',
+  )
+  invariant(new Set(value.inputs).size === value.inputs.length, 'The host daemon build provenance contains duplicate inputs.')
+  return value
 }
 
 async function verifyPackagedApplicationCode(asarPath, roots) {
