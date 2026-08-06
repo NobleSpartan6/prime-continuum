@@ -1,6 +1,6 @@
-# Prime Agent Native
+# Prime Continuim
 
-Cross-platform desktop control plane for durable Prime Agent threads that can run locally or over SSH without changing the project and conversation experience.
+Cross-platform desktop control plane for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions that can run locally or over SSH without changing the project and conversation experience.
 
 ## Requirements
 

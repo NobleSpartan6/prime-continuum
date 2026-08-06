@@ -67,7 +67,7 @@ async function main() {
   }
 
   const packageDirectory = resolve(process.argv[2] ?? 'release/win-unpacked')
-  const executablePath = resolve(packageDirectory, 'Prime Agent.exe')
+  const executablePath = resolve(packageDirectory, 'Prime Continuim.exe')
   const packagedHostdPath = resolve(packageDirectory, 'resources/hostd/hostd.cjs')
   const asarPath = resolve(packageDirectory, 'resources/app.asar')
   const builtHostdPath = resolve('out/hostd/hostd.cjs')

@@ -1,4 +1,4 @@
-# Prime Agent Native architecture
+# Prime Continuim architecture
 
 ## Product invariant
 
@@ -33,9 +33,11 @@ Every host request requires a session context and is evaluated before dispatch; 
 
 ## Prime Agent adapter boundary
 
-The host protocol in this application is a stable gateway contract; it is not Prime Agent's local daemon wire protocol and does not export Prime Agent's internal TypeScript types. `hostd` translates the gateway's opaque thread, artifact, cursor, and command identifiers into a Prime Agent adapter. The first production adapter targets Prime Agent's headless RPC surface (`prime-agent --mode rpc`) and retains request correlation while treating acceptance, streamed events, and completion as separate lifecycle moments.
+The host protocol in this application is a stable gateway contract; it is not Prime Agent's local daemon wire protocol and does not export Prime Agent's internal TypeScript types. `hostd` translates the gateway's opaque thread, artifact, cursor, and command identifiers into a pinned Prime Agent adapter.
 
-Prime Agent's daemon-backed `AgentConnection` remains the execution boundary on the host. Its generation-aware replay, snapshots, command journal, and uncertain-mutation semantics inform the gateway behavior, but changes to that internal protocol are absorbed by the adapter. This keeps mobile, relay, and future native clients on a capability-negotiated public DTO surface instead of binding them to local paths, callbacks, or daemon implementation details.
+Durable execution uses a resident daemon session through the public `DaemonClient` and `DaemonAgentConnection` surface. Ordinary desktop shutdown detaches; it must never complete the resident session. The current RPC entry path creates a client-owned session and is therefore diagnostic/fallback only: disposing it can complete the session and cannot satisfy Continuim's close-and-resume contract.
+
+The adapter is gated against the exact Prime Agent 0.7.0 release, daemon protocol 7, schema revision 13, schema ID `protocol-7-schema-13-816309b1cd50`, and required replay/snapshot capabilities. Source constants and the daemon hello are authoritative; prose documentation and parsed CLI version strings are not. The supported CLI command `prime-agent daemon start` supplies the external launch seam because the internal daemon-launch helper is not exported. Runtime DTOs are reduced at the host boundary so renderer, mobile, and relay clients never depend on Prime Agent's local TypeScript shapes.
 
 ## Independent state machines
 
@@ -112,4 +114,4 @@ A move is `quiesce → checkpoint → transfer → materialize → verify → sw
 
 ## Delivery boundary
 
-The first executable milestone proves one local host and the SSH transport seam, durable receipts, cached startup, reconnection, honest move planning, and the read-only mobile supervision projection. Secure pairing, relay routing, mobile mutations, managed compute, and multi-user collaboration remain additive consumers of the protocol rather than alternate architectures.
+The first executable milestone proves one local host and the SSH transport seam, durable receipts, cached startup, reconnection, honest move planning, and the read-only mobile supervision projection. A remote developer preview additionally requires a real close → continue → relaunch → reattach proof against the pinned resident adapter. Secure pairing, relay routing, mobile mutations, managed compute, and multi-user collaboration remain additive consumers of the protocol rather than alternate architectures.

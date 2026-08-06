@@ -29,6 +29,6 @@
 ## Explicitly deferred
 
 - Installing a signed production `hostd` package on arbitrary remote distributions.
-- Prime Agent daemon execution adapter beyond the Phase 0 harness.
+- Verified resident Prime Agent daemon execution beyond the host-only compatibility contract and Phase 0 harness.
 - End-to-end relay, device pairing/revocation, mobile projection, and managed compute.
 - Git object negotiation for production-scale handoff; the milestone preserves the transactional state machine and receipt contract.

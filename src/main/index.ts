@@ -110,7 +110,7 @@ function rendererUrlIsTrusted(candidate: string): boolean {
 }
 
 void app.whenReady().then(() => {
-  app.setAppUserModelId('ai.primeintellect.agent')
+  app.setAppUserModelId('ai.primeintellect.continuim')
   const service = new DesktopControlService({ app })
   mainWindow = createWindow(false)
   unregisterIpc = registerControlIpc({

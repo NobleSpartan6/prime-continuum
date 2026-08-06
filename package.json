@@ -1,8 +1,8 @@
 {
-  "name": "prime-agent-native",
+  "name": "prime-continuim",
   "version": "0.1.0",
   "private": true,
-  "description": "Prime Agent native control plane for seamless local and remote execution",
+  "description": "Prime Continuim — a native control surface for durable Prime Agent coding sessions",
   "main": "./out/main/index.js",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
@@ -45,8 +45,8 @@
     "vitest": "4.1.10"
   },
   "build": {
-    "appId": "ai.primeintellect.agent",
-    "productName": "Prime Agent",
+    "appId": "ai.primeintellect.continuim",
+    "productName": "Prime Continuim",
     "asar": true,
     "electronFuses": {
       "enableEmbeddedAsarIntegrityValidation": true,
