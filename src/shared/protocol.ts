@@ -290,25 +290,88 @@ export type ApprovalSummary = z.infer<typeof ApprovalSummarySchema>;
 
 export const ChildAgentSummarySchema = z.object({
   agentId: IdSchema,
+  parentAgentId: IdSchema.optional(),
+  activeSessionId: IdSchema.optional(),
+  sessionName: z.string().min(1).max(255).optional(),
+  model: z.string().min(1).max(255).optional(),
   title: z.string().min(1).max(255),
-  state: z.enum(["pending", "running", "waiting", "complete", "failed", "cancelled"]),
+  state: z.enum(["pending", "queued", "running", "waiting", "complete", "failed", "cancelled"]),
+  durationMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  answerPreview: z.string().max(4_096).optional(),
+  repliedSinceTask: z.boolean().optional(),
+  toolUseCount: z.number().int().nonnegative().max(1_000_000).optional(),
+  tokenCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  recap: z.string().max(4_096).optional(),
+  activity: z
+    .object({
+      kind: z.enum(["waiting", "writing", "executing"]),
+      toolName: z.string().min(1).max(255).optional(),
+    })
+    .optional(),
+  error: z.string().max(2_048).optional(),
 });
 export type ChildAgentSummary = z.infer<typeof ChildAgentSummarySchema>;
 
 export const GoalSummarySchema = z.object({
   goalId: IdSchema,
   objective: z.string().min(1).max(4_096),
-  state: z.enum(["active", "complete", "blocked"]),
+  state: z.enum(["active", "paused", "budget_limited", "complete", "error"]),
+  tokenBudget: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  tokensUsed: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  timeUsedSeconds: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  continuationsUsed: z.number().int().nonnegative().max(1_000_000).optional(),
+  lastReason: z.string().max(2_048).optional(),
+  lastError: z.string().max(2_048).optional(),
+  updatedAt: IsoDateTimeSchema.optional(),
 });
 export type GoalSummary = z.infer<typeof GoalSummarySchema>;
 
 export const ScheduleSummarySchema = z.object({
   scheduleId: IdSchema,
   label: z.string().min(1).max(255),
-  state: z.enum(["active", "paused", "complete", "failed"]),
+  state: z.enum(["active", "paused", "completed", "cancelled"]),
+  kind: z.enum(["once", "cron", "interval"]).optional(),
+  expression: z.string().min(1).max(255).optional(),
+  prompt: z.string().max(4_096).optional(),
+  source: z.enum(["cron", "heartbeat", "rlm_heartbeat"]).optional(),
+  deliveryMode: z.enum(["steer", "follow_up"]).optional(),
   nextRunAt: IsoDateTimeSchema.optional(),
+  lastRunAt: IsoDateTimeSchema.optional(),
+  runCount: z.number().int().nonnegative().max(1_000_000).optional(),
+  lastError: z.string().max(2_048).optional(),
 });
 export type ScheduleSummary = z.infer<typeof ScheduleSummarySchema>;
+
+/** Stable host-owned subset of Prime Agent state. Upstream local DTOs stop here. */
+export const RuntimeSessionSummarySchema = z.object({
+  runtime: z.literal("prime_agent"),
+  residency: z.enum(["resident", "client_owned", "unknown"]),
+  appVersion: z.string().min(1).max(64).optional(),
+  activeSessionId: IdSchema.optional(),
+  sessionId: IdSchema.optional(),
+  sessionName: z.string().min(1).max(255).optional(),
+  model: z.string().min(1).max(255).optional(),
+  thinkingLevel: z.string().min(1).max(64).optional(),
+  serviceTier: z.string().min(1).max(64).optional(),
+  isStreaming: z.boolean(),
+  isCompacting: z.boolean(),
+  isBashRunning: z.boolean(),
+  retryAttempt: z.number().int().nonnegative().max(1_000_000),
+  steeringMode: z.enum(["all", "one-at-a-time"]),
+  followUpMode: z.enum(["all", "one-at-a-time"]),
+  messageCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  compactionCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  queuedActionCount: z.number().int().nonnegative().max(1_000_000),
+  activeToolNames: z.array(z.string().min(1).max(255)).max(128),
+  context: z
+    .object({
+      usedTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      maxTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    })
+    .optional(),
+  recap: z.string().max(4_096).optional(),
+});
+export type RuntimeSessionSummary = z.infer<typeof RuntimeSessionSummarySchema>;
 
 export const GitSummarySchema = z.object({
   branch: z.string().max(255).optional(),
@@ -358,6 +421,7 @@ export const ThreadProjectionSnapshotSchema = z
     childAgents: z.array(ChildAgentSummarySchema).max(1_000),
     goals: z.array(GoalSummarySchema).max(1_000),
     schedules: z.array(ScheduleSummarySchema).max(1_000),
+    runtime: RuntimeSessionSummarySchema.optional(),
     git: GitSummarySchema,
     evidence: EvidenceSummarySchema,
     pendingAttention: z.array(AttentionEventSchema).max(1_000),
@@ -383,6 +447,44 @@ export const ThreadProjectionSnapshotSchema = z
     }
   });
 export type ThreadProjectionSnapshot = z.infer<typeof ThreadProjectionSnapshotSchema>;
+
+const ProjectionDeltaBase = {
+  cursor: SessionCursorSchema,
+};
+
+/**
+ * Bounded projection updates keep token/tool activity from rebuilding and
+ * republishing unrelated workbench state. A sequence gap requires a snapshot.
+ */
+export const ThreadProjectionDeltaSchema = z.discriminatedUnion("kind", [
+  z.object({
+    ...ProjectionDeltaBase,
+    kind: z.literal("transcript.append"),
+    block: TranscriptBlockSchema,
+  }),
+  z.object({
+    ...ProjectionDeltaBase,
+    kind: z.literal("transcript.stream"),
+    stream: InProgressStreamSchema.nullable(),
+  }),
+  z.object({
+    ...ProjectionDeltaBase,
+    kind: z.literal("runtime.replace"),
+    runtime: RuntimeSessionSummarySchema,
+    queueState: QueueStateSchema,
+    childAgents: z.array(ChildAgentSummarySchema).max(1_000),
+    goals: z.array(GoalSummarySchema).max(1_000),
+    schedules: z.array(ScheduleSummarySchema).max(1_000),
+    threadStatus: TaskStateSchema,
+    recap: z.string().max(4_096).nullable().optional(),
+  }),
+  z.object({
+    ...ProjectionDeltaBase,
+    kind: z.literal("attention.append"),
+    attention: AttentionEventSchema,
+  }),
+]);
+export type ThreadProjectionDelta = z.infer<typeof ThreadProjectionDeltaSchema>;
 
 export const CatalogProjectionSnapshotSchema = z
   .object({
