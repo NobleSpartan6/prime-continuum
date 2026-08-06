@@ -329,7 +329,7 @@ export function buildResidentDaemonStartInvocation(input: {
 }): ResidentDaemonStartInvocation {
   const executable = boundedAbsolutePath(input.executable, "executable");
   const cliEntrypoint = boundedAbsolutePath(input.cliEntrypoint, "cliEntrypoint");
-  const socketPath = boundedArgument(input.socketPath, "socketPath");
+  const socketPath = boundedAbsolutePath(input.socketPath, "socketPath");
   const daemonWorkingDirectory = boundedAbsolutePath(input.daemonWorkingDirectory, "daemonWorkingDirectory");
   return Object.freeze({
     executable,

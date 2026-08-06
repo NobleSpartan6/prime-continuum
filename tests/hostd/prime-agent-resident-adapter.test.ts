@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import {
   PrimeAgentResidentAdapter,
   type PrimeDaemonAgentConnectionPublic,
@@ -13,7 +15,12 @@ import {
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 
-const DAEMON_WORKING_DIRECTORY = "C:\\runtime\\hostd-data";
+const RUNTIME_NODE = resolve("test-runtime", "node.exe");
+const RUNTIME_CLI = resolve("test-runtime", "prime-agent", "dist", "bundle", "cli.js");
+const DAEMON_WORKING_DIRECTORY = resolve("test-runtime", "hostd-data");
+const DAEMON_SOCKET = process.platform === "win32"
+  ? "\\\\.\\pipe\\prime-continuim-test"
+  : resolve(tmpdir(), "prime-continuim-test.sock");
 const DAEMON_ENVIRONMENT = Object.freeze({
   Path: "C:\\Windows",
   ELECTRON_RUN_AS_NODE: "1",
@@ -23,9 +30,9 @@ const DAEMON_ENVIRONMENT = Object.freeze({
 
 function buildHarnessInvocation() {
   return buildResidentDaemonStartInvocation({
-    executable: "C:\\runtime\\node.exe",
-    cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-    socketPath: "\\\\.\\pipe\\prime-continuim-test",
+    executable: RUNTIME_NODE,
+    cliEntrypoint: RUNTIME_CLI,
+    socketPath: DAEMON_SOCKET,
     daemonWorkingDirectory: DAEMON_WORKING_DIRECTORY,
     environment: DAEMON_ENVIRONMENT,
   });
@@ -34,15 +41,15 @@ function buildHarnessInvocation() {
 function validHello(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: "daemon_hello",
-    socketPath: "\\\\.\\pipe\\prime-continuim-test",
+    socketPath: DAEMON_SOCKET,
     protocol: { name: "prime-agent.daemon", version: 7 },
     schemaId: "protocol-7-schema-13-816309b1cd50",
     schemaRevision: 13,
     appVersion: "0.7.0",
     runtime: {
       buildId: "be9e2fa-dirty",
-      executablePath: "C:\\runtime\\node.exe",
-      entrypointPath: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+      executablePath: RUNTIME_NODE,
+      entrypointPath: RUNTIME_CLI,
     },
     supervisorGeneration: "supervisor-1",
     clientId: "client-test",
@@ -211,9 +218,9 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
   };
 
   const adapter = new PrimeAgentResidentAdapter({
-    socketPath: "\\\\.\\pipe\\prime-continuim-test",
-    executable: "C:\\runtime\\node.exe",
-    cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+    socketPath: DAEMON_SOCKET,
+    executable: RUNTIME_NODE,
+    cliEntrypoint: RUNTIME_CLI,
     daemonWorkingDirectory: DAEMON_WORKING_DIRECTORY,
     environment: DAEMON_ENVIRONMENT,
     loadRuntimeModule: async () => ({
@@ -306,13 +313,13 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
 
     expect(state.spawnCalls).toEqual([
       {
-        executable: "C:\\runtime\\node.exe",
+        executable: RUNTIME_NODE,
         argv: [
-          "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+          RUNTIME_CLI,
           "--mode",
           "daemon",
           "--daemon-socket",
-          "\\\\.\\pipe\\prime-continuim-test",
+          DAEMON_SOCKET,
         ],
         options: {
           shell: false,

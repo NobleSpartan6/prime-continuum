@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "release": {
+    "repository": "https://github.com/PrimeIntellect-ai/prime-agent",
+    "tag": "v0.7.0",
+    "version": "0.7.0",
+    "commit": "be9e2fa"
+  },
+  "allowedDownloadHosts": [
+    "github.com",
+    "objects.githubusercontent.com",
+    "pub-728493de92a943e2a9b2d17b4719f318.r2.dev",
+    "release-assets.githubusercontent.com",
+    "registry.npmjs.org"
+  ],
+  "assets": [
+    {
+      "packageName": "prime-agent",
+      "fileName": "prime-agent-0.7.0.tgz",
+      "url": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.0/prime-agent-0.7.0.tgz",
+      "size": 9323789,
+      "sha256": "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
+      "integrity": "sha512-pgrjR4QFg4VqgcPg+50VSmttjISuFQgv2a5Bx6L7jD/Mk72/XGd6strBuQPIJ0+KKNekaiEf7cclt7RWvw8s7w=="
+    },
+    {
+      "packageName": "@earendil-works/pi-agent-core",
+      "fileName": "prime-agent-core-0.7.0.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-core-0.7.0.tgz",
+      "size": 62815,
+      "sha256": "0313373089831d9a2ce06e874fab8b9c05762c0094ff9fc202908cf7db7f99cd",
+      "integrity": "sha512-lx+juh3pTKb8hVFjtVEKjcVttsNBpKh8anWO15cQ4uuYVeHOFXYs/SjHPEEO7/m1PbmuXHpz1E3qEBxoM6AwaQ=="
+    },
+    {
+      "packageName": "@earendil-works/pi-ai",
+      "fileName": "prime-agent-ai-0.7.0.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-ai-0.7.0.tgz",
+      "size": 533591,
+      "sha256": "7cdbb3e835f48dd103325f7a351ce540b27af4d161aeb9c7b9bdcc12fe7909af",
+      "integrity": "sha512-UUYRmIA4SG3wg2v0Dnpj16DxgwZu3GtzZuZhtyEUMeXbdG3Bv7bmHowPCQC/6+GDepd82mwRmV4RVe4IrMlNUg=="
+    },
+    {
+      "packageName": "@earendil-works/pi-tui",
+      "fileName": "prime-agent-tui-0.7.0.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-tui-0.7.0.tgz",
+      "size": 444299,
+      "sha256": "3225f7f92e87db80fe2c9005d1f7770735ae625c32935ef2283688fc9bd33951",
+      "integrity": "sha512-mbypMOaUYrrQCBc59YZ34RQHWmsnzJNhd1ISF5E39L9qEKpVU5ZpctTqrA9Dhdo7IGDk0WfSnppNls/uyAcMjw=="
+    }
+  ]
+}

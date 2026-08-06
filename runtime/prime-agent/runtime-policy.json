@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "releaseVersion": "0.7.0",
+  "runtimeBuildId": "be9e2fa-dirty",
+  "minimumNodeVersion": "22.8.0",
+  "npmVersion": "10.9.8",
+  "lockfileVersion": 3,
+  "lockPackageEntries": 202,
+  "install": {
+    "ignoreScripts": true,
+    "omitDev": true,
+    "omitOptional": true,
+    "installStrategy": "hoisted",
+    "targetNativePrebuildsOnly": true
+  },
+  "packaging": {
+    "excludedBasenames": [
+      ".gitkeep"
+    ]
+  },
+  "entrypoints": {
+    "module": "node_modules/prime-agent/dist/index.js",
+    "cli": "node_modules/prime-agent/dist/bundle/cli.js"
+  },
+  "daemon": {
+    "protocolName": "prime-agent.daemon",
+    "protocolVersion": 7,
+    "schemaRevision": 13,
+    "schemaId": "protocol-7-schema-13-816309b1cd50",
+    "requiredCapabilities": [
+      "attach_snapshot",
+      "event_sequence",
+      "slim_attach",
+      "chunked_snapshot"
+    ]
+  },
+  "criticalPackages": {
+    "prime-agent": {
+      "version": "0.7.0",
+      "integrity": "sha512-pgrjR4QFg4VqgcPg+50VSmttjISuFQgv2a5Bx6L7jD/Mk72/XGd6strBuQPIJ0+KKNekaiEf7cclt7RWvw8s7w=="
+    },
+    "zeromq": {
+      "version": "6.5.0",
+      "integrity": "sha512-vWOrt19lvcXTxu5tiHXfEGQuldSlU+qZn2TT+4EbRQzaciWGwNZ99QQTolQOmcwVgZLodv+1QfC6UZs2PX/6pQ=="
+    }
+  }
+}

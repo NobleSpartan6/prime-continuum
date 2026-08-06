@@ -15,12 +15,15 @@
     "dev:web": "vite --host 127.0.0.1",
     "build": "electron-vite build && pnpm build:hostd",
     "build:hostd": "esbuild src/hostd/index.ts --bundle --platform=node --format=cjs --target=node22 --outfile=out/hostd/hostd.cjs",
+    "build:runtime": "node scripts/build-prime-agent-runtime.mjs",
+    "verify:runtime": "node scripts/verify-prime-agent-runtime.mjs",
+    "verify:runtime:smoke": "node scripts/verify-prime-agent-runtime.mjs --smoke",
     "preview": "electron-vite preview",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "package": "pnpm build && electron-builder --dir && node scripts/verify-windows-package.mjs",
-    "dist": "pnpm build && electron-builder"
+    "package": "pnpm build:runtime && pnpm build && electron-builder --dir && node scripts/verify-windows-package.mjs",
+    "dist": "pnpm build:runtime && pnpm build && electron-builder && node scripts/verify-windows-package.mjs"
   },
   "dependencies": {
     "lucide-react": "1.28.0",
@@ -29,6 +32,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
@@ -41,6 +45,7 @@
     "electron-vite": "5.0.0",
     "esbuild": "0.25.12",
     "jsdom": "29.0.0",
+    "npm": "10.9.8",
     "typescript": "7.0.2",
     "vite": "8.2.0",
     "vitest": "4.1.10"
@@ -54,12 +59,21 @@
       "onlyLoadAppFromAsar": true
     },
     "files": [
-      "out/**/*"
+      "out/**/*",
+      "!out/runtime/**/*"
     ],
     "extraResources": [
       {
         "from": "out/hostd/hostd.cjs",
         "to": "hostd/hostd.cjs"
+      },
+      {
+        "from": "out/runtime",
+        "to": "runtime-seed",
+        "filter": [
+          "current.json",
+          "installs/**/*"
+        ]
       }
     ],
     "directories": {

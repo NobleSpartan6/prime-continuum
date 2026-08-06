@@ -1,0 +1,86 @@
+export type JsonRecord = Record<string, any>;
+
+export interface RuntimeInputs {
+  templateDirectory: string;
+  packageJson: JsonRecord;
+  lockfile: JsonRecord & {
+    lockfileVersion: number;
+    packages: Record<string, JsonRecord>;
+  };
+  sources: JsonRecord;
+  policy: JsonRecord;
+  lockfileSha256: string;
+  sourcesSha256: string;
+  policySha256: string;
+}
+
+export interface RuntimeSmokeResult {
+  runtimeExecutable: string;
+  runtimeVersions: Record<string, string>;
+  hello: JsonRecord;
+}
+
+export const REPO_ROOT: string;
+export const RUNTIME_TEMPLATE_DIRECTORY: string;
+
+export class PrimeAgentRuntimeBuildError extends Error {
+  constructor(message: string, options?: ErrorOptions);
+}
+
+export function loadRuntimeInputs(templateDirectory?: string): Promise<Readonly<RuntimeInputs>>;
+export function validateRuntimeInputs(inputs: {
+  packageJson: JsonRecord;
+  lockfile: JsonRecord;
+  sources: JsonRecord;
+  policy: JsonRecord;
+}): void;
+export function verifyReleaseAssets(inputs: RuntimeInputs, cacheDirectory: string): Promise<readonly string[]>;
+export function discoverNpmCli(explicitPath?: string): Promise<string>;
+export function installLockedRuntime(options: {
+  inputs: RuntimeInputs;
+  stagingDirectory: string;
+  npmCli: string;
+}): Promise<string>;
+export function pruneRuntimePackagingNoise(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
+export function pruneRuntimeForTarget(runtimeDirectory: string): Promise<void>;
+export function smokeRuntime(
+  runtimeDirectory: string,
+  options?: JsonRecord,
+): Promise<Readonly<RuntimeSmokeResult>>;
+export function createRuntimeManifest(options: {
+  runtimeDirectory: string;
+  inputs: JsonRecord;
+  npmVersion: string;
+  smoke: JsonRecord;
+}): Promise<Readonly<JsonRecord>>;
+export function verifyBuiltRuntime(
+  runtimeDirectory: string,
+  options?: JsonRecord,
+): Promise<Readonly<{ root: string; manifest: JsonRecord }>>;
+export function resolveVerifiedEntrypoints(
+  runtimeDirectory: string,
+  policy: JsonRecord,
+): Promise<Readonly<{ root: string; modulePath: string; moduleUrl: string; cli: string; packageJson: string }>>;
+export function writeCurrentPointer(
+  outputRoot: string,
+  finalDirectory: string,
+  manifest: JsonRecord,
+  manifestSha256: string,
+): Promise<JsonRecord>;
+export function removeObsoleteRuntimeInstalls(outputRoot: string, finalDirectory: string): Promise<void>;
+export function verifyOnlySelectedRuntimeInstall(outputRoot: string, finalDirectory: string): Promise<void>;
+export function acquireBuildLock(outputRoot: string): Promise<() => Promise<void>>;
+export function runCommand(
+  command: string,
+  args: string[],
+  options?: JsonRecord,
+): Promise<{ stdout: string; stderr: string }>;
+export function cleanBuildEnvironment(
+  source: NodeJS.ProcessEnv,
+  npmConfigPaths: { user: string; global: string },
+): Record<string, string>;
+export function cleanRuntimeEnvironment(
+  source: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  options: { electronRunAsNode: boolean },
+): Record<string, string>;
+export function sha256File(path: string): Promise<string>;

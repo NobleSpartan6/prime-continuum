@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
@@ -173,10 +175,12 @@ describe("resident daemon compatibility", () => {
 
 describe("resident launch and create plans", () => {
   it("builds a fixed daemon argv vector without shell interpolation", () => {
-    const executable = "C:\\Prime Agent & tools\\node.exe";
-    const cliEntrypoint = "C:\\Prime Agent & tools\\prime-agent\\dist\\bundle\\cli.js";
-    const socketPath = "\\\\.\\pipe\\prime-agent-$(whoami)&daemon";
-    const daemonWorkingDirectory = "C:\\Prime Agent & tools\\data";
+    const executable = resolve("Prime Agent & tools", "node.exe");
+    const cliEntrypoint = resolve("Prime Agent & tools", "prime-agent", "dist", "bundle", "cli.js");
+    const socketPath = process.platform === "win32"
+      ? "\\\\.\\pipe\\prime-agent-$(whoami)&daemon"
+      : resolve(tmpdir(), "prime-agent-$(whoami)&daemon.sock");
+    const daemonWorkingDirectory = resolve("Prime Agent & tools", "data");
     const invocation = buildResidentDaemonStartInvocation({
       executable,
       cliEntrypoint,
@@ -210,28 +214,34 @@ describe("resident launch and create plans", () => {
   });
 
   it("launches a verified package CLI entrypoint through an explicit Node executable", () => {
+    const executable = resolve("runtime", "node.exe");
+    const cliEntrypoint = resolve("runtime", "prime-agent", "dist", "bundle", "cli.js");
+    const socketPath = process.platform === "win32"
+      ? "\\\\.\\pipe\\prime-agent-daemon"
+      : resolve(tmpdir(), "prime-agent-daemon.sock");
+    const daemonWorkingDirectory = resolve("runtime", "data");
     const invocation = buildResidentDaemonStartInvocation({
-      executable: "C:\\runtime\\node.exe",
-      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-      socketPath: "\\\\.\\pipe\\prime-agent-daemon",
-      daemonWorkingDirectory: "C:\\runtime\\data",
+      executable,
+      cliEntrypoint,
+      socketPath,
+      daemonWorkingDirectory,
       environment: {},
     });
 
     expect(invocation).toEqual({
-      executable: "C:\\runtime\\node.exe",
+      executable,
       argv: [
-        "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+        cliEntrypoint,
         "--mode",
         "daemon",
         "--daemon-socket",
-        "\\\\.\\pipe\\prime-agent-daemon",
+        socketPath,
       ],
       spawn: {
         shell: false,
         windowsHide: true,
         detached: true,
-        cwd: "C:\\runtime\\data",
+        cwd: daemonWorkingDirectory,
         env: {},
         stdio: "ignore",
       },
@@ -240,9 +250,9 @@ describe("resident launch and create plans", () => {
       () =>
         buildResidentDaemonStartInvocation({
           executable: "",
-          cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-          socketPath: "\\\\.\\pipe\\prime-agent-daemon",
-          daemonWorkingDirectory: "C:\\runtime\\data",
+          cliEntrypoint,
+          socketPath,
+          daemonWorkingDirectory,
         }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
     );
@@ -251,8 +261,8 @@ describe("resident launch and create plans", () => {
         buildResidentDaemonStartInvocation({
           executable: "node",
           cliEntrypoint: "..\\prime-agent\\dist\\bundle\\cli.js",
-          socketPath: "\\\\.\\pipe\\prime-agent-daemon",
-          daemonWorkingDirectory: "C:\\runtime\\data",
+          socketPath,
+          daemonWorkingDirectory,
         }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
     );
@@ -325,10 +335,20 @@ describe("resident launch and create plans", () => {
     expectContractError(
       () =>
         buildResidentDaemonStartInvocation({
-          executable: "C:\\runtime\\node.exe",
-          cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
-          socketPath: "valid\n--mode rpc",
-          daemonWorkingDirectory: "C:\\runtime\\data",
+          executable: resolve("runtime", "node.exe"),
+          cliEntrypoint: resolve("runtime", "prime-agent", "dist", "bundle", "cli.js"),
+          socketPath: `${resolve(tmpdir(), "valid.sock")}\n--mode rpc`,
+          daemonWorkingDirectory: resolve("runtime", "data"),
+        }),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+    expectContractError(
+      () =>
+        buildResidentDaemonStartInvocation({
+          executable: resolve("runtime", "node.exe"),
+          cliEntrypoint: resolve("runtime", "prime-agent", "dist", "bundle", "cli.js"),
+          socketPath: "relative-daemon.sock",
+          daemonWorkingDirectory: resolve("runtime", "data"),
         }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
     );
