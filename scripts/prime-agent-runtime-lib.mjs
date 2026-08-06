@@ -410,7 +410,7 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     "const require = createRequire(packageJsonPath);",
     'const zeromq = require("zeromq");',
     'if (!zeromq || (typeof zeromq !== "object" && typeof zeromq !== "function")) throw new Error("zeromq did not load");',
-    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch }));',
+    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
   ].join("\n");
   await writeFile(probePath, probeSource, { encoding: "utf8", mode: 0o600, flag: "wx" });
   let probe;

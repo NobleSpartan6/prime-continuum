@@ -9,6 +9,11 @@ import {
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
 } from './prime-agent-runtime-lib.mjs'
+import {
+  assertRuntimeAttestationMatches,
+  extractEmbeddedRuntimeAttestation,
+  parseRuntimeAttestation,
+} from './runtime-attestation-lib.mjs'
 
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'ascii')
 const FUSE_ENABLED = '1'.charCodeAt(0)
@@ -79,16 +84,18 @@ async function main() {
   const asarPath = resolve(packageDirectory, 'resources/app.asar')
   const builtHostdPath = resolve('out/hostd/hostd.cjs')
   const builtMainPath = resolve('out/main/index.js')
+  const builtAttestationPath = resolve('out/main/runtime-attestation.json')
   const builtPreloadPath = resolve('out/preload/index.cjs')
   const builtRuntimeRoot = resolve('out/runtime')
   const packagedRuntimeRoot = resolve(packageDirectory, 'resources/runtime-seed')
   const builtRendererDirectory = resolve('out/renderer')
 
-  const [executable, packagedHostd, builtHostd, builtMain, builtPreload, asarMetadata] = await Promise.all([
+  const [executable, packagedHostd, builtHostd, builtMain, builtAttestationBytes, builtPreload, asarMetadata] = await Promise.all([
     readFile(executablePath),
     readFile(packagedHostdPath),
     readFile(builtHostdPath),
     readFile(builtMainPath, 'utf8'),
+    readFile(builtAttestationPath),
     readFile(builtPreloadPath, 'utf8'),
     stat(asarPath),
   ])
@@ -106,11 +113,23 @@ async function main() {
     { sourceRoot: resolve('out/preload'), archiveRoot: 'out/preload' },
     { sourceRoot: resolve('out/renderer'), archiveRoot: 'out/renderer' },
   ])
+  const packagedAttestationBytes = extractFile(asarPath, join('out', 'main', 'runtime-attestation.json'))
+  invariant(
+    packagedAttestationBytes.equals(builtAttestationBytes),
+    'The packaged ASAR runtime attestation does not match this release build.',
+  )
+  const attestation = parseRuntimeAttestation(builtAttestationBytes)
 
   const fuses = readRequiredFuses(executable)
   const builtHostdHash = sha256(builtHostd)
   const packagedHostdHash = sha256(packagedHostd)
   invariant(packagedHostdHash === builtHostdHash, 'The packaged host daemon does not match the host daemon built in this run.')
+  const builtHostdAttestation = extractEmbeddedRuntimeAttestation(builtHostd)
+  const packagedHostdAttestation = extractEmbeddedRuntimeAttestation(packagedHostd)
+  invariant(
+    builtHostdAttestation.equals(builtAttestationBytes) && packagedHostdAttestation.equals(builtAttestationBytes),
+    'The host daemon and ASAR do not carry the same runtime attestation.',
+  )
 
   const inputs = await loadRuntimeInputs(RUNTIME_TEMPLATE_DIRECTORY)
   const seedEntries = await readdir(packagedRuntimeRoot, { withFileTypes: true })
@@ -153,17 +172,24 @@ async function main() {
     sha256(packagedRuntimeManifest).toLowerCase() === runtimePointer.manifestSha256,
     'The packaged runtime manifest digest does not match its pointer.',
   )
-  const builtRuntime = await verifyBuiltRuntime(dirname(builtRuntimeManifestPath), { inputs, policy: inputs.policy })
   const packagedRuntime = await verifyBuiltRuntime(dirname(runtimeManifestPath), { inputs, policy: inputs.policy })
   invariant(
-    packagedRuntime.manifest.tree.sha256 === builtRuntime.manifest.tree.sha256,
-    'The packaged runtime tree does not match the runtime built in this run.',
+    packagedRuntime.manifest.tree.sha256 === JSON.parse(builtRuntimeManifest.toString('utf8')).tree?.sha256,
+    'The packaged runtime tree does not match the attested runtime built in this run.',
   )
   invariant(packagedRuntime.manifest.tree.sha256 === runtimePointer.treeSha256, 'The packaged runtime pointer digest is stale.')
   const runtimeSmoke = await smokeRuntime(packagedRuntime.root, {
     runtimeExecutable: executablePath,
     electronRunAsNode: true,
     policy: inputs.policy,
+  })
+  assertRuntimeAttestationMatches(attestation, {
+    pointer: runtimePointer,
+    manifest: packagedRuntime.manifest,
+    manifestBytes: packagedRuntimeManifest,
+    fileManifestBytes: packagedFileManifest,
+    runtimeVersions: runtimeSmoke.runtimeVersions,
+    inputs,
   })
 
   const rendererText = await readTextArtifacts(builtRendererDirectory)
@@ -175,6 +201,8 @@ async function main() {
     'node_modules/zeromq',
   ]) {
     invariant(!rendererText.includes(fingerprint), `The renderer bundle contains host-only runtime code: ${fingerprint}.`)
+    invariant(!builtMain.includes(fingerprint), `The Electron main bundle contains host-only runtime code: ${fingerprint}.`)
+    invariant(!builtPreload.includes(fingerprint), `The preload bundle contains host-only runtime code: ${fingerprint}.`)
     invariant(!builtHostd.toString('utf8').includes(fingerprint), `The hostd bundle statically embeds Prime Agent code: ${fingerprint}.`)
   }
 
@@ -193,11 +221,18 @@ async function main() {
     asarVerifiedFiles: asarArtifacts.fileCount,
     preloadEntry: 'out/preload/index.cjs',
     hostdSha256: packagedHostdHash,
+    runtimeAttestation: {
+      assurance: attestation.assurance,
+      bytes: builtAttestationBytes.byteLength,
+      embeddedInAsar: true,
+      embeddedInHostd: true,
+    },
     runtime: {
       releaseVersion: packagedRuntime.manifest.release.version,
       treeSha256: packagedRuntime.manifest.tree.sha256,
       files: packagedRuntime.manifest.tree.fileCount,
       bytes: packagedRuntime.manifest.tree.totalBytes,
+      electron: runtimeSmoke.runtimeVersions.electron,
       electronNode: runtimeSmoke.runtimeVersions.node,
       electronModulesAbi: runtimeSmoke.runtimeVersions.modules,
       electronNapi: runtimeSmoke.runtimeVersions.napi,

@@ -54,8 +54,13 @@ enabled, then rejects a truncated PE image, missing hardening fuses, any
 main/preload/renderer ASAR byte that differs from the current build, a packaged
 host daemon mismatch, or a Prime Agent runtime seed that differs from the exact
 pointer, manifest, file list, and tree built in that run. The verifier also
-starts the packaged Prime Agent daemon through Electron's RunAsNode mode,
-checks its pinned protocol identity, and requires a clean shutdown.
+requires one byte-identical runtime attestation in both hostd and the ASAR,
+matches its exact Electron/Node/ABI tuple to the packaged executable, scans
+main/preload/renderer/hostd for host-only dependency leakage, starts the
+packaged Prime Agent daemon through Electron's RunAsNode mode, checks its
+pinned protocol identity, and requires a clean shutdown. The current unsigned
+artifact labels this assurance `development-integrity`; it does not claim
+adversarial authentication.
 Leave enough local disk space for Electron's executable rewrite; synced folders
 can otherwise defer the out-of-space failure until after Electron Builder exits.
 If Electron Builder 26.8.1 cannot create two unused macOS symlinks in its helper
