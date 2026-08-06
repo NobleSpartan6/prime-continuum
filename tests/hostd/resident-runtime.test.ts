@@ -7,6 +7,7 @@ import {
   buildResidentDaemonCreateRequest,
   buildResidentDaemonStartInvocation,
   validateResidentDaemonHello,
+  validateResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 
 function validHello(): Record<string, unknown> {
@@ -116,6 +117,16 @@ describe("resident daemon compatibility", () => {
     });
   });
 
+  it("binds an accepted hello to the exact requested socket path", () => {
+    expect(
+      validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\prime-agent-daemon" }),
+    ).toMatchObject({ appVersion: "0.7.0" });
+    expectContractError(
+      () => validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\other-daemon" }),
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
+    );
+  });
+
   it("rejects malformed or expanded pinned hello shapes before compatibility checks", () => {
     expectContractError(
       () => validateResidentDaemonHello({ ...validHello(), unexpectedWireField: true }),
@@ -144,6 +155,34 @@ describe("resident launch and create plans", () => {
     expect(invocation.argv.join(" ")).not.toContain("cmd /c");
     expect(invocation.argv.join(" ")).not.toContain("powershell");
     expect(Object.isFrozen(invocation.argv)).toBe(true);
+  });
+
+  it("launches a verified package CLI entrypoint through an explicit Node executable", () => {
+    const invocation = buildResidentDaemonStartInvocation({
+      executable: "C:\\runtime\\node.exe",
+      cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+      socketPath: "\\\\.\\pipe\\prime-agent-daemon",
+    });
+
+    expect(invocation).toEqual({
+      executable: "C:\\runtime\\node.exe",
+      argv: [
+        "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+        "daemon",
+        "start",
+        "--socket",
+        "\\\\.\\pipe\\prime-agent-daemon",
+      ],
+      spawn: { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    });
+    expectContractError(
+      () =>
+        buildResidentDaemonStartInvocation({
+          cliEntrypoint: "C:\\runtime\\prime-agent\\dist\\bundle\\cli.js",
+          socketPath: "\\\\.\\pipe\\prime-agent-daemon",
+        }),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
   });
 
   it("creates resident work through DaemonClient semantics, never client-owned RPC semantics", () => {
@@ -206,6 +245,41 @@ describe("resident launch and create plans", () => {
           workspaceDirectory: "C:\\work\0other",
         }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+  });
+});
+
+describe("durable resident bindings", () => {
+  it("revalidates the complete persisted identity and exact runtime fence", () => {
+    const value = {
+      bindingVersion: 1,
+      lifecycle: "resident",
+      threadId: "thread-1",
+      executionGenerationId: "generation-1",
+      workspaceDirectory: "C:\\work\\project",
+      activeSessionId: "active-1",
+      sessionId: "session-1",
+      sessionFile: "C:\\sessions\\session-1.jsonl",
+      boundAt: "2026-08-06T17:00:00.000Z",
+      runtime: validateResidentDaemonHello(validHello()),
+    };
+
+    const parsed = validateResidentSessionBinding(value);
+
+    expect(parsed).toEqual(value);
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(Object.isFrozen(parsed.runtime)).toBe(true);
+    expectContractError(
+      () =>
+        validateResidentSessionBinding({
+          ...value,
+          runtime: { ...value.runtime, appVersion: "0.7.1" },
+        }),
+      "PRIME_RUNTIME_BINDING_INVALID",
+    );
+    expectContractError(
+      () => validateResidentSessionBinding({ ...value, unexpected: true }),
+      "PRIME_RUNTIME_BINDING_INVALID",
     );
   });
 });

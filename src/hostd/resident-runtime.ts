@@ -56,8 +56,21 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_PROTOCOL_VERSION_MISMATCH"
   | "PRIME_RUNTIME_SCHEMA_REVISION_MISMATCH"
   | "PRIME_RUNTIME_SCHEMA_ID_MISMATCH"
+  | "PRIME_RUNTIME_SOCKET_MISMATCH"
   | "PRIME_RUNTIME_CAPABILITY_MISSING"
-  | "PRIME_RUNTIME_ARGUMENT_INVALID";
+  | "PRIME_RUNTIME_ARGUMENT_INVALID"
+  | "PRIME_RUNTIME_MODULE_INVALID"
+  | "PRIME_RUNTIME_UNAVAILABLE"
+  | "PRIME_RUNTIME_DAEMON_START_FAILED"
+  | "PRIME_RUNTIME_RESPONSE_INVALID"
+  | "PRIME_RUNTIME_REQUEST_FAILED"
+  | "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN"
+  | "PRIME_RUNTIME_SESSION_NOT_FOUND"
+  | "PRIME_RUNTIME_SESSION_MISMATCH"
+  | "PRIME_RUNTIME_BINDING_INVALID"
+  | "PRIME_RUNTIME_BINDING_PERSIST_FAILED"
+  | "PRIME_RUNTIME_ADAPTER_CLOSED"
+  | "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT";
 
 export type ResidentRuntimeErrorDetails = Readonly<Record<string, string | number | boolean>>;
 
@@ -153,7 +166,10 @@ export interface ResidentRuntimeCompatibility {
  * terminal for this exact adapter and becomes an explicit upgrade/reinstall
  * path instead of best-effort protocol use.
  */
-export function validateResidentDaemonHello(value: unknown): ResidentRuntimeCompatibility {
+export function validateResidentDaemonHello(
+  value: unknown,
+  options: { expectedSocketPath?: string } = {},
+): ResidentRuntimeCompatibility {
   const parsed = PinnedDaemonHelloSchema.safeParse(value);
   if (!parsed.success) {
     const issues = parsed.error.issues
@@ -170,6 +186,19 @@ export function validateResidentDaemonHello(value: unknown): ResidentRuntimeComp
 
   const hello = parsed.data;
   const expected = PINNED_PRIME_AGENT_RUNTIME;
+  if (options.expectedSocketPath !== undefined && hello.socketPath !== options.expectedSocketPath) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
+      "Prime Agent daemon handshake belongs to a different local endpoint.",
+      {
+        details: {
+          field: "socketPath",
+          expected: options.expectedSocketPath,
+          received: hello.socketPath,
+        },
+      },
+    );
+  }
   assertExact(
     hello.protocol.name,
     expected.daemon.protocolName,
@@ -246,7 +275,9 @@ function assertExact<T extends string | number>(
 
 export interface ResidentDaemonStartInvocation {
   readonly executable: string;
-  readonly argv: readonly ["daemon", "start", "--socket", string];
+  readonly argv:
+    | readonly ["daemon", "start", "--socket", string]
+    | readonly [string, "daemon", "start", "--socket", string];
   readonly spawn: Readonly<{
     shell: false;
     windowsHide: true;
@@ -257,13 +288,26 @@ export interface ResidentDaemonStartInvocation {
 /** Build a fixed argv vector; callers must pass it directly to spawn(). */
 export function buildResidentDaemonStartInvocation(input: {
   executable?: string;
+  /** Verified package CLI entrypoint; launch it through a real Node executable. */
+  cliEntrypoint?: string;
   socketPath: string;
 }): ResidentDaemonStartInvocation {
+  if (input.cliEntrypoint !== undefined && input.executable === undefined) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+      "Resident runtime executable is required with a CLI entrypoint.",
+      { details: { field: "executable" } },
+    );
+  }
   const executable = boundedArgument(input.executable ?? "prime-agent", "executable");
+  const cliEntrypoint =
+    input.cliEntrypoint === undefined ? undefined : boundedArgument(input.cliEntrypoint, "cliEntrypoint");
   const socketPath = boundedArgument(input.socketPath, "socketPath");
   return Object.freeze({
     executable,
-    argv: Object.freeze(["daemon", "start", "--socket", socketPath] as const),
+    argv: cliEntrypoint
+      ? Object.freeze([cliEntrypoint, "daemon", "start", "--socket", socketPath] as const)
+      : Object.freeze(["daemon", "start", "--socket", socketPath] as const),
     spawn: Object.freeze({
       shell: false,
       windowsHide: true,
@@ -332,6 +376,73 @@ export interface ResidentSessionBinding {
   readonly runtime: ResidentRuntimeCompatibility;
 }
 
+const ResidentRuntimeCompatibilitySchema = z
+  .object({
+    releaseVersion: z.literal(PINNED_PRIME_AGENT_RUNTIME.releaseVersion),
+    appVersion: z.literal(PINNED_PRIME_AGENT_RUNTIME.expectedAppVersion),
+    protocolName: z.literal(PINNED_PRIME_AGENT_RUNTIME.daemon.protocolName),
+    protocolVersion: z.literal(PINNED_PRIME_AGENT_RUNTIME.daemon.protocolVersion),
+    schemaRevision: z.literal(PINNED_PRIME_AGENT_RUNTIME.daemon.schemaRevision),
+    schemaId: z.literal(PINNED_PRIME_AGENT_RUNTIME.daemon.schemaId),
+    capabilities: z
+      .array(z.string().min(1).max(128))
+      .min(REQUIRED_RESIDENT_DAEMON_CAPABILITIES.length)
+      .max(128)
+      .refine((capabilities) => new Set(capabilities).size === capabilities.length, {
+        message: "Runtime capabilities must be unique",
+      })
+      .refine(
+        (capabilities) => REQUIRED_RESIDENT_DAEMON_CAPABILITIES.every((capability) => capabilities.includes(capability)),
+        { message: "Runtime capabilities do not satisfy resident continuity" },
+      ),
+    runtimeBuildId: z.string().min(1).max(256).optional(),
+    supervisorGeneration: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+
+const ResidentSessionBindingSchema = z
+  .object({
+    bindingVersion: z.literal(1),
+    lifecycle: z.literal("resident"),
+    threadId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+    executionGenerationId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+    workspaceDirectory: BoundedWireStringSchema,
+    activeSessionId: BoundedWireStringSchema,
+    sessionId: BoundedWireStringSchema,
+    sessionFile: BoundedWireStringSchema.optional(),
+    boundAt: z
+      .string()
+      .min(20)
+      .max(40)
+      .refine((value) => Number.isFinite(Date.parse(value)), "Binding time must be an ISO date-time"),
+    runtime: ResidentRuntimeCompatibilitySchema,
+  })
+  .strict();
+
+/** Validate durable data before it can select or attach an upstream session. */
+export function validateResidentSessionBinding(value: unknown): ResidentSessionBinding {
+  const parsed = ResidentSessionBindingSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join(".") || "binding"}: ${issue.message}`)
+      .join("; ")
+      .slice(0, 2_048);
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_BINDING_INVALID",
+      "The durable resident session binding is invalid.",
+      { details: { issues } },
+    );
+  }
+  return Object.freeze({
+    ...parsed.data,
+    runtime: Object.freeze({
+      ...parsed.data.runtime,
+      capabilities: Object.freeze([...parsed.data.runtime.capabilities]),
+    }),
+  });
+}
+
 export type ResidentRuntimeLifecycleState =
   | "idle"
   | "starting_daemon"
@@ -360,6 +471,8 @@ export interface ResidentRuntimeConnection {
   subscribeLifecycle(listener: ResidentRuntimeLifecycleListener): () => void;
   /** Detach the client-side connection without stopping the resident worker. */
   detach(): Promise<void>;
+  /** Stop the resident worker only after an explicit user-facing end action. */
+  endSession(): Promise<void>;
 }
 
 /**
