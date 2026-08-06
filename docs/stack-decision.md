@@ -6,8 +6,8 @@
 
 - Prime Agent is a Node/TypeScript runtime with a persistent Python/IPython execution layer. Tauri, Flutter, Qt, and platform-native shells still need that runtime or a Node sidecar.
 - Electron embeds Node 24.18.1, above Prime Agent's Node 22.8 minimum, and gives the renderer one deterministic Chromium target across desktop platforms.
-- The measured renderer is 796,664 bytes raw and 147,286 bytes gzip. Bundle size is not the current bottleneck.
-- The current hot path rebuilds the whole workbench projection and root React state for host events, and the transcript mounts every block. Those are dataflow/rendering problems rather than Electron limitations.
+- At commit `20f4058`, the measured renderer is 831,898 bytes raw and 154,595 bytes gzip. That is a 5.0% gzip increase from the pre-workbench baseline and remains below the 200 KiB release budget, so bundle size is not the current bottleneck.
+- The renderer now bounds transcript and runtime-list mounting, but the current host-event hot path still replaces the whole workbench snapshot and root React state. Delta publication and consumption remain the next dataflow optimization; that is not an Electron limitation.
 - A rewrite would replace thousands of lines of working renderer, main-process, hostd, and protocol code while preserving the difficult daemon/Python boundary.
 
 The strongest contrary case is Electron's idle memory and security surface. That is a real cost. A thin Tauri remote-only client becomes worth testing if, after projection normalization and bounded rendering, Electron itself is the measured cause of missed startup, memory, or security budgets.
