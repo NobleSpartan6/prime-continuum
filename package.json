@@ -1,0 +1,82 @@
+{
+  "name": "prime-agent-native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prime Agent native control plane for seamless local and remote execution",
+  "main": "./out/main/index.js",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "pnpm build:hostd && electron-vite dev",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "electron-vite build && pnpm build:hostd",
+    "build:hostd": "esbuild src/hostd/index.ts --bundle --platform=node --format=cjs --target=node22 --outfile=out/hostd/hostd.cjs",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "pnpm build && electron-builder --dir && node scripts/verify-windows-package.mjs",
+    "dist": "pnpm build && electron-builder"
+  },
+  "dependencies": {
+    "lucide-react": "1.28.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/node": "24.10.12",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.1",
+    "electron": "43.3.0",
+    "electron-builder": "26.8.1",
+    "electron-vite": "5.0.0",
+    "esbuild": "0.25.12",
+    "jsdom": "29.0.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.0",
+    "vitest": "4.1.10"
+  },
+  "build": {
+    "appId": "ai.primeintellect.agent",
+    "productName": "Prime Agent",
+    "asar": true,
+    "electronFuses": {
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "out/hostd/hostd.cjs",
+        "to": "hostd/hostd.cjs"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development"
+    }
+  }
+}

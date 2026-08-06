@@ -1,0 +1,28 @@
+{
+  "name": "@prime-agent/relay-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Content-blind self-hosted WebSocket relay for Prime Agent secure channels",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js --external:ws",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.12",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.25.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
