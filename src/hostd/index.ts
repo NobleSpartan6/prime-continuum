@@ -10,6 +10,7 @@ import { HostStore } from "./store";
 export * from "./gateway";
 export * from "./paths";
 export * from "./probe";
+export * from "./resident-runtime";
 export * from "./server";
 export * from "./service";
 export * from "./store";
