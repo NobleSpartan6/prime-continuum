@@ -107,6 +107,30 @@ describe('Prime Continuim renderer', () => {
     expect(api.sendComposer).toHaveBeenCalledWith(expect.objectContaining({ intent: 'follow_up' }))
   })
 
+  it('focuses and describes an empty composer submission, then clears the error while typing', async () => {
+    const user = userEvent.setup()
+    const previewApi = createPreviewRendererApi()
+    const sendComposer = vi.fn(previewApi.sendComposer.bind(previewApi))
+    const api = Object.create(previewApi) as typeof previewApi
+    Object.defineProperty(api, 'sendComposer', { configurable: true, value: sendComposer })
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+
+    await waitFor(() => expect(composer).toHaveFocus())
+    expect(composer).toHaveAttribute('aria-invalid', 'true')
+    expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-message-error')
+    expect(document.getElementById('composer-message-error')).toHaveTextContent('Write a message before sending.')
+    expect(sendComposer).not.toHaveBeenCalled()
+
+    await user.type(composer, 'Continue from the latest checkpoint.')
+    expect(composer).not.toHaveAttribute('aria-invalid')
+    expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-status')
+    expect(document.getElementById('composer-message-error')).not.toBeInTheDocument()
+  })
+
   it('preserves a draft when the host rejects command admission', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -664,6 +688,38 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Search projects, threads, and commands' })).toHaveFocus())
   })
 
+  it('closes the command palette with an explicit touch target and ignores its shortcut over another sheet', async () => {
+    const user = userEvent.setup()
+    render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    const sidebarTrigger = screen.getByRole('button', { name: 'Open sidebar' })
+    await user.click(sidebarTrigger)
+    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+    await user.keyboard('{Control>}k{/Control}')
+    expect(sidebar).toHaveAttribute('aria-modal', 'true')
+    expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
+    await user.click(within(sidebar).getByRole('button', { name: 'Close sidebar' }))
+    await waitFor(() => expect(sidebarTrigger).toHaveFocus())
+
+    const paletteTrigger = screen.getByRole('button', { name: 'Search projects, threads, and commands' })
+    await user.click(paletteTrigger)
+    const palette = await screen.findByRole('dialog', { name: 'Search and commands' })
+    expect(palette).toHaveAttribute('open')
+
+    await user.click(within(palette).getByRole('button', { name: 'Close search and commands' }))
+    await waitFor(() => expect(paletteTrigger).toHaveFocus())
+    expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Add computer' }))
+    const addComputer = await screen.findByRole('dialog', { name: 'Add computer' })
+    await user.keyboard('{Control>}k{/Control}')
+
+    expect(addComputer).toHaveAttribute('open')
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
+  })
+
   it('shows an honest pairing gate and a sample, read-only Companion Preview with stable focus', async () => {
     const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)
@@ -1004,9 +1060,18 @@ describe('Prime Continuim renderer', () => {
       time: 'Now',
       body: 'Do not steal my reading position.',
     })
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    composer.focus()
     await act(async () => publish?.(authoritative))
     await screen.findByText('Do not steal my reading position.')
     expect(scrollTop).toBe(200)
+    expect(composer).toHaveFocus()
+
+    const jumpToLatest = await screen.findByRole('button', { name: 'New activity · Jump to latest' })
+    await user.click(jumpToLatest)
+    expect(scrollTop).toBe(1_400)
+    expect(screen.queryByRole('button', { name: 'New activity · Jump to latest' })).not.toBeInTheDocument()
+    expect(transcript).toHaveFocus()
 
     scrollHeight = 800
     await user.click(screen.getByRole('button', { name: /Training runs/ }))

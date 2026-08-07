@@ -23,6 +23,8 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.message__header\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
     expect(narrowLayout).toMatch(/\.session-continuity__body small\s*{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/s)
     expect(narrowLayout).toMatch(/\.composer__primary-actions \.button\s*{[^}]*max-inline-size:\s*100%;[^}]*min-inline-size:\s*0;[^}]*white-space:\s*normal;/s)
+    expect(narrowLayout).toMatch(/\.command-palette__input\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
+    expect(narrowLayout).toMatch(/\.command-palette__shortcut\s*{[^}]*display:\s*none;/s)
   })
 
   it('preserves a readable thread title and primary composer actions at 320 CSS pixels', async () => {
@@ -31,10 +33,16 @@ describe('renderer style contracts', () => {
       css.indexOf('@media (max-width: 24rem)'),
       css.indexOf('@media (max-width: 24rem) and (max-height: 44rem)'),
     )
+    const compactMinimumLayout = css.slice(
+      css.indexOf('@media (max-width: 24rem) and (max-height: 44rem)'),
+      css.indexOf('@media (min-width: 38.001rem)'),
+    )
 
     expect(css).toMatch(/\.topbar__thread-copy h1\s*{[^}]*inline-size:\s*auto;[^}]*text-overflow:\s*ellipsis;/s)
+    expect(css).toMatch(/\.transcript-jump__button\s*{[^}]*min-inline-size:\s*0;[^}]*max-inline-size:\s*100%;[^}]*white-space:\s*normal;/s)
     expect(minimumLayout).toMatch(/\.topbar__leading \.brand-mark\s*{[^}]*display:\s*none;/s)
     expect(minimumLayout).toMatch(/\.composer__hint\s*{[^}]*display:\s*none;/s)
+    expect(compactMinimumLayout).toMatch(/\.composer__connection--validation\s*{[^}]*display:\s*inline-flex;/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {

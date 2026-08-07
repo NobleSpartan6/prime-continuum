@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertCircle,
+  ArrowDown,
   ArrowRight,
   Bell,
   Bot,
@@ -66,6 +67,7 @@ const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type WorkbenchSurface = 'desktop' | 'companion'
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
+const EMPTY_COMPOSER_ERROR = 'Write a message before sending.'
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
   { phase: 'quiescing', label: 'Prepare source' },
@@ -289,6 +291,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [moveDestinationId, setMoveDestinationId] = useState('')
   const [composerMode, setComposerMode] = useState<'follow_up' | 'steer'>('follow_up')
   const [composerText, setComposerText] = useState('')
+  const [composerValidationError, setComposerValidationError] = useState('')
   const [composerReceipt, setComposerReceipt] = useState<{ state: ComposerReceiptState; message: string }>({
     state: 'idle',
     message: '',
@@ -351,6 +354,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     const openPalette = (event: globalThis.KeyboardEvent) => {
       if (surface !== 'desktop' || event.defaultPrevented || event.repeat) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return
         event.preventDefault()
         openCommandPalette()
       }
@@ -427,6 +431,10 @@ export default function App({ api: suppliedApi }: AppProps) {
   const canLoadModelCatalog = snapshot?.operations.modelCatalog ?? false
   activeHostIdRef.current = selectedHost?.id
   activeThreadIdRef.current = selectedThread?.id
+
+  useEffect(() => {
+    setComposerValidationError('')
+  }, [selectedThread?.id])
 
   useEffect(() => {
     if (!selectedHost || !selectedThread) return
@@ -519,9 +527,14 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
     const text = composerText.trim()
     if (!text) {
-      setComposerReceipt({ state: 'rejected', message: 'Write a message before sending.' })
+      const messageField = event.currentTarget.elements.namedItem('message')
+      setComposerValidationError(EMPTY_COMPOSER_ERROR)
+      window.requestAnimationFrame(() => {
+        if (messageField instanceof HTMLTextAreaElement) messageField.focus()
+      })
       return
     }
+    setComposerValidationError('')
     const effectiveComposerMode = selectedThread.status === 'running' ? composerMode : 'follow_up'
     if (effectiveComposerMode === 'steer' && selectedHost.connection !== 'online') {
       setComposerReceipt({ state: 'rejected', message: `Reconnect to ${selectedHost.name} before steering this turn.` })
@@ -821,7 +834,11 @@ export default function App({ api: suppliedApi }: AppProps) {
           mode={composerMode}
           onModeChange={setComposerMode}
           text={composerText}
-          onTextChange={setComposerText}
+          onTextChange={(nextText) => {
+            setComposerText(nextText)
+            if (composerValidationError) setComposerValidationError('')
+          }}
+          validationError={composerValidationError}
           receipt={composerReceipt}
           canSubmit={canSubmitCommands}
           modelCatalogAvailable={canLoadModelCatalog}
@@ -1179,8 +1196,15 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
   const scrollRef = useRef<HTMLElement>(null)
   const previousThreadIdRef = useRef('')
   const shouldFollowRef = useRef(true)
+  const previousActivityRef = useRef({
+    threadId: thread.id,
+    transcriptLength: thread.transcript.length,
+    lastBlockId: thread.transcript.at(-1)?.id,
+    lastBlockBody: thread.transcript.at(-1)?.body,
+  })
   const pendingHistoryAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
   const [historyWindow, setHistoryWindow] = useState({ threadId: thread.id, count: TRANSCRIPT_BLOCK_INCREMENT })
+  const [hasNewActivity, setHasNewActivity] = useState(false)
   const lastBlock = thread.transcript[thread.transcript.length - 1]
   const visibleBlockCount = historyWindow.threadId === thread.id ? historyWindow.count : TRANSCRIPT_BLOCK_INCREMENT
   const firstVisibleIndex = Math.max(0, thread.transcript.length - visibleBlockCount)
@@ -1190,10 +1214,19 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
   useLayoutEffect(() => {
     const scroller = scrollRef.current
     if (!scroller) return
+    const previousActivity = previousActivityRef.current
+    const currentActivity = {
+      threadId: thread.id,
+      transcriptLength: thread.transcript.length,
+      lastBlockId: lastBlock?.id,
+      lastBlockBody: lastBlock?.body,
+    }
+    previousActivityRef.current = currentActivity
 
     if (previousThreadIdRef.current !== thread.id) {
       previousThreadIdRef.current = thread.id
       shouldFollowRef.current = true
+      setHasNewActivity(false)
       pendingHistoryAnchorRef.current = null
       if (historyWindow.threadId !== thread.id || historyWindow.count !== TRANSCRIPT_BLOCK_INCREMENT) {
         setHistoryWindow({ threadId: thread.id, count: TRANSCRIPT_BLOCK_INCREMENT })
@@ -1210,93 +1243,131 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
       return
     }
 
-    if (shouldFollowRef.current) scroller.scrollTop = scroller.scrollHeight
-  }, [historyWindow.count, historyWindow.threadId, lastBlock?.body.length, lastBlock?.id, thread.id, thread.transcript.length])
+    const activityChanged = previousActivity.threadId === thread.id && (
+      previousActivity.transcriptLength !== currentActivity.transcriptLength ||
+      previousActivity.lastBlockId !== currentActivity.lastBlockId ||
+      previousActivity.lastBlockBody !== currentActivity.lastBlockBody
+    )
+    if (shouldFollowRef.current) {
+      scroller.scrollTop = scroller.scrollHeight
+      setHasNewActivity(false)
+    } else if (activityChanged) {
+      setHasNewActivity(true)
+    }
+  }, [historyWindow.count, historyWindow.threadId, lastBlock?.body, lastBlock?.id, thread.id, thread.transcript.length])
 
   return (
-    <section
-      ref={scrollRef}
-      className="transcript"
-      aria-label="Thread transcript"
-      onScroll={(event) => {
-        const scroller = event.currentTarget
-        const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
-        shouldFollowRef.current = distanceFromBottom <= 96
-      }}
-    >
-      <div className="transcript__inner">
-        {hasProgressiveHistory && (
-          <div className="history-loader">
-            <button
-              className="button button--secondary button--small"
-              type="button"
-              disabled={firstVisibleIndex === 0}
-              onClick={() => {
-                const scroller = scrollRef.current
-                if (!scroller) return
-                pendingHistoryAnchorRef.current = {
-                  scrollHeight: scroller.scrollHeight,
-                  scrollTop: scroller.scrollTop,
-                }
-                setHistoryWindow({
-                  threadId: thread.id,
-                  count: Math.min(thread.transcript.length, visibleBlockCount + TRANSCRIPT_BLOCK_INCREMENT),
-                })
-              }}
-            >
-              <Icon icon={Clock3} size={14} />
-              {firstVisibleIndex > 0 ? 'Load earlier activity' : 'All activity loaded'}
-            </button>
-            <span aria-live="polite">
-              {firstVisibleIndex > 0
-                ? `${firstVisibleIndex} earlier ${firstVisibleIndex === 1 ? 'item' : 'items'}`
-                : `${thread.transcript.length} items loaded`}
-            </span>
-          </div>
-        )}
-        {visibleBlocks.map((block) => {
-          if (block.kind === 'checkpoint' || block.kind === 'notice') {
-            return (
-              <div
-                className={cx('timeline-marker', block.kind === 'notice' && 'timeline-marker--notice')}
-                data-transcript-block
-                key={block.id}
+    <div className="transcript">
+      <section
+        ref={scrollRef}
+        id="thread-transcript"
+        className="transcript__scroller"
+        aria-label="Thread transcript"
+        tabIndex={-1}
+        onScroll={(event) => {
+          const scroller = event.currentTarget
+          const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+          shouldFollowRef.current = distanceFromBottom <= 96
+          if (shouldFollowRef.current) setHasNewActivity(false)
+        }}
+      >
+        <div className="transcript__inner">
+          {hasProgressiveHistory && (
+            <div className="history-loader">
+              <button
+                className="button button--secondary button--small"
+                type="button"
+                disabled={firstVisibleIndex === 0}
+                onClick={() => {
+                  const scroller = scrollRef.current
+                  if (!scroller) return
+                  pendingHistoryAnchorRef.current = {
+                    scrollHeight: scroller.scrollHeight,
+                    scrollTop: scroller.scrollTop,
+                  }
+                  setHistoryWindow({
+                    threadId: thread.id,
+                    count: Math.min(thread.transcript.length, visibleBlockCount + TRANSCRIPT_BLOCK_INCREMENT),
+                  })
+                }}
               >
-                <span className="timeline-marker__icon">
-                  <Icon icon={block.kind === 'checkpoint' ? CheckCircle2 : Info} size={14} />
-                </span>
-                <div>
-                  <TranscriptBody body={block.body} kind={block.kind} />
-                  {block.detail && <span>{block.detail}</span>}
-                </div>
-                <time>{block.time}</time>
-              </div>
-            )
-          }
-
-          return (
-            <article className={cx('message', `message--${block.kind}`)} data-transcript-block key={block.id}>
-              <header className="message__header">
-                <span className="message__avatar" aria-hidden="true">
-                  <Icon icon={block.kind === 'user' ? Laptop : block.kind === 'tool' ? Terminal : Bot} size={15} />
-                </span>
-                <strong>{block.author}</strong>
-                <time>{block.time}</time>
-              </header>
-              <div className="message__body">
-                <TranscriptBody body={block.body} kind={block.kind} />
-                {block.detail && <p className="message__detail">{block.detail}</p>}
-                {block.receipt && (
-                  <span className="message__receipt">
-                    Receipt <bdi>{block.receipt}</bdi>
+                <Icon icon={Clock3} size={14} />
+                {firstVisibleIndex > 0 ? 'Load earlier activity' : 'All activity loaded'}
+              </button>
+              <span aria-live="polite">
+                {firstVisibleIndex > 0
+                  ? `${firstVisibleIndex} earlier ${firstVisibleIndex === 1 ? 'item' : 'items'}`
+                  : `${thread.transcript.length} items loaded`}
+              </span>
+            </div>
+          )}
+          {visibleBlocks.map((block) => {
+            if (block.kind === 'checkpoint' || block.kind === 'notice') {
+              return (
+                <div
+                  className={cx('timeline-marker', block.kind === 'notice' && 'timeline-marker--notice')}
+                  data-transcript-block
+                  key={block.id}
+                >
+                  <span className="timeline-marker__icon">
+                    <Icon icon={block.kind === 'checkpoint' ? CheckCircle2 : Info} size={14} />
                   </span>
-                )}
-              </div>
-            </article>
-          )
-        })}
-      </div>
-    </section>
+                  <div>
+                    <TranscriptBody body={block.body} kind={block.kind} />
+                    {block.detail && <span>{block.detail}</span>}
+                  </div>
+                  <time>{block.time}</time>
+                </div>
+              )
+            }
+
+            return (
+              <article className={cx('message', `message--${block.kind}`)} data-transcript-block key={block.id}>
+                <header className="message__header">
+                  <span className="message__avatar" aria-hidden="true">
+                    <Icon icon={block.kind === 'user' ? Laptop : block.kind === 'tool' ? Terminal : Bot} size={15} />
+                  </span>
+                  <strong>{block.author}</strong>
+                  <time>{block.time}</time>
+                </header>
+                <div className="message__body">
+                  <TranscriptBody body={block.body} kind={block.kind} />
+                  {block.detail && <p className="message__detail">{block.detail}</p>}
+                  {block.receipt && (
+                    <span className="message__receipt">
+                      Receipt <bdi>{block.receipt}</bdi>
+                    </span>
+                  )}
+                </div>
+              </article>
+            )
+          })}
+        </div>
+      </section>
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {hasNewActivity ? 'New transcript activity is available.' : ''}
+      </span>
+      {hasNewActivity && (
+        <div className="transcript-jump">
+          <button
+            className="button button--secondary transcript-jump__button"
+            type="button"
+            aria-controls="thread-transcript"
+            onClick={() => {
+              const scroller = scrollRef.current
+              if (!scroller) return
+              shouldFollowRef.current = true
+              scroller.scrollTop = scroller.scrollHeight
+              setHasNewActivity(false)
+              scroller.focus({ preventScroll: true })
+            }}
+          >
+            <Icon icon={ArrowDown} size={14} />
+            New activity · Jump to latest
+          </button>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1309,6 +1380,7 @@ interface ComposerProps {
   onModeChange: (mode: 'follow_up' | 'steer') => void
   text: string
   onTextChange: (value: string) => void
+  validationError: string
   receipt: { state: ComposerReceiptState; message: string }
   canSubmit: boolean
   modelCatalogAvailable: boolean
@@ -1380,7 +1452,7 @@ function SessionContinuity({
   )
 }
 
-function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, canSubmit, modelCatalogAvailable, onOpenModelCatalog, onSubmit }: ComposerProps) {
+function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, validationError, receipt, canSubmit, modelCatalogAvailable, onOpenModelCatalog, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
   const effectiveMode = taskState === 'running' ? mode : 'follow_up'
   const unavailableCopy = 'Prime Agent isn’t attached to this host, so commands are unavailable.'
@@ -1391,7 +1463,9 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
       : effectiveMode === 'steer'
         ? 'Steer next step'
         : 'Send follow-up'
-  const statusCopy = canSubmit ? (receipt.message || (disconnected ? 'Waiting for connection' : 'Ready to send')) : unavailableCopy
+  const receiptStatusCopy = canSubmit ? (receipt.message || (disconnected ? 'Waiting for connection' : 'Ready to send')) : unavailableCopy
+  const statusCopy = validationError || receiptStatusCopy
+  const statusState = validationError ? 'rejected' : canSubmit ? receipt.state : 'rejected'
 
   return (
     <footer className="composer-wrap">
@@ -1419,13 +1493,17 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
               </button>
             </div>
           ) : <span className="composer__intent">Follow up</span>}
-          <span className={cx('composer__connection', `composer__connection--${canSubmit ? receipt.state : 'rejected'}`)}>
-            {canSubmit && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
-            {canSubmit && receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
-            {canSubmit && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
-            {canSubmit && receipt.state === 'uncertain' && <Icon icon={RefreshCw} size={13} />}
-            {(!canSubmit || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
-            <span>{statusCopy}</span>
+          <span className={cx(
+            'composer__connection',
+            `composer__connection--${statusState}`,
+            Boolean(validationError) && 'composer__connection--validation',
+          )}>
+            {canSubmit && !validationError && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
+            {canSubmit && !validationError && receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
+            {canSubmit && !validationError && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
+            {canSubmit && !validationError && receipt.state === 'uncertain' && <Icon icon={RefreshCw} size={13} />}
+            {(!canSubmit || Boolean(validationError) || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
+            <span id={validationError ? 'composer-message-error' : undefined}>{statusCopy}</span>
           </span>
         </div>
 
@@ -1444,7 +1522,8 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
               event.currentTarget.form?.requestSubmit()
             }
           }}
-          aria-describedby="composer-hint composer-status"
+          aria-invalid={validationError ? 'true' : undefined}
+          aria-describedby={validationError ? 'composer-hint composer-message-error' : 'composer-hint composer-status'}
         />
 
         <div className="composer__actions">
@@ -1475,7 +1554,7 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
           </div>
         </div>
         <span className="sr-only" id="composer-status" role="status" aria-live="polite" aria-atomic="true">
-          {statusCopy}
+          {validationError ? '' : receiptStatusCopy}
         </span>
       </form>
     </footer>
@@ -2249,7 +2328,15 @@ function CommandPaletteDialog({
               }
             }}
           />
-          <kbd>Esc</kbd>
+          <kbd className="command-palette__shortcut" aria-hidden="true">Esc</kbd>
+          <button
+            className="icon-button command-palette__close"
+            type="button"
+            aria-label="Close search and commands"
+            onClick={onClose}
+          >
+            <Icon icon={X} size={17} />
+          </button>
         </div>
         <ul id="command-palette-results" className="command-palette__results" role="listbox">
           {filteredItems.map((item, index) => {

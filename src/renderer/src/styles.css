@@ -1139,10 +1139,45 @@ code,
 }
 
 .transcript {
+  position: relative;
+  min-block-size: 0;
+  overflow: hidden;
+}
+
+.transcript__scroller {
+  block-size: 100%;
   min-block-size: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+
+.transcript__scroller:focus-visible {
+  outline-offset: -3px;
+}
+
+.transcript-jump {
+  position: absolute;
+  z-index: 2;
+  inset-block-end: 0.9rem;
+  inset-inline: 0;
+  display: flex;
+  justify-content: center;
+  padding-inline: 1rem;
+  pointer-events: none;
+}
+
+.transcript-jump__button {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  color: var(--color-text);
+  background: var(--color-surface-raised);
+  box-shadow:
+    0 0 0 1px var(--color-border-strong),
+    0 8px 24px oklch(0 0 0 / 0.16);
+  text-align: center;
+  white-space: normal;
+  pointer-events: auto;
 }
 
 .transcript__inner {
@@ -1653,6 +1688,10 @@ code,
 
 .composer textarea::placeholder {
   color: var(--color-text-faint);
+}
+
+.composer textarea[aria-invalid="true"] {
+  caret-color: var(--color-danger);
 }
 
 .composer__primary-actions {
@@ -3063,7 +3102,7 @@ dialog.command-palette-sheet {
 
 .command-palette__input {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 0.6rem;
   padding: 0.65rem 0.75rem;
@@ -3095,6 +3134,10 @@ dialog.command-palette-sheet {
 
 .command-palette__input input::placeholder {
   color: var(--color-text-faint);
+}
+
+.command-palette__close {
+  color: var(--color-text-muted);
 }
 
 .command-palette__results {
@@ -4947,6 +4990,14 @@ dialog.pair-mobile-sheet {
     max-block-size: calc(100dvh - 0.75rem);
   }
 
+  .command-palette__input {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .command-palette__shortcut {
+    display: none;
+  }
+
   .command-palette__group,
   .command-palette__footer {
     display: none;
@@ -5087,6 +5138,14 @@ dialog.pair-mobile-sheet {
 
   .composer__connection {
     display: none;
+  }
+
+  .composer__connection--validation {
+    display: inline-flex;
+  }
+
+  .composer__connection--validation > span {
+    white-space: normal;
   }
 
   .composer textarea {
