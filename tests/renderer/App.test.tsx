@@ -283,7 +283,7 @@ describe('Prime Continuim renderer', () => {
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
   })
 
-  it('shows a host-scoped, read-only model registry with OAuth metadata', async () => {
+  it('labels the browser model registry as illustrative while preserving its read-only metadata controls', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
     const loadRuntimeModelCatalog = vi.spyOn(api, 'loadRuntimeModelCatalog')
@@ -294,17 +294,19 @@ describe('Prime Continuim renderer', () => {
     await user.click(trigger)
 
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    expect(await within(dialog).findByText('Accounts on devbox')).toBeVisible()
+    expect(await within(dialog).findByText('Sample accounts')).toBeVisible()
+    expect(within(dialog).getByText(/Illustrative sample catalog.*No Prime Agent host was queried/i)).toBeVisible()
+    expect(within(dialog).queryByText(/reported by Prime Agent on devbox/i)).not.toBeInTheDocument()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledWith('host-devbox')
     expect(within(dialog).getByText('2 configured')).toBeVisible()
-    expect(within(dialog).getByText(/3 OAuth-capable providers · Prime Agent 0\.7\.0/)).toBeVisible()
+    expect(within(dialog).getByText(/Browser preview · illustrative Prime Agent 0\.7\.0 fixture/)).toBeVisible()
     expect(within(dialog).getByText('GPT-5.6 Sol')).toBeVisible()
     expect(within(dialog).getByText('Kimi K3')).toBeVisible()
     expect(within(dialog).getByText('Current')).toBeVisible()
     expect(within(dialog).queryByText('Claude Opus 5')).not.toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: /connect|select/i })).not.toBeInTheDocument()
-    expect(within(dialog).getByText(/This registry view is read-only/)).toBeVisible()
-    expect(within(dialog).getByText(/no inference smoke test was run/i)).toBeVisible()
+    expect(within(dialog).getByText(/Illustrative sample only/)).toBeVisible()
+    expect(within(dialog).getByText(/model names and availability are not host evidence/i)).toBeVisible()
 
     const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
     const allProviders = within(providerToolbar).getByRole('button', { name: /All providers/ })
@@ -325,9 +327,9 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
     expect(within(dialog).getByText('OAuth is supported by Prime Agent')).toBeVisible()
-    expect(within(dialog).getByText('0 available with current setup · 2 listed by the runtime')).toBeVisible()
+    expect(within(dialog).getByText('0 shown as available · 2 listed in this sample')).toBeVisible()
     expect(within(dialog).getByText('/login')).toBeVisible()
-    expect(within(dialog).getByText(/Credentials remain on that host/)).toBeVisible()
+    expect(within(dialog).getByText(/This sample never reads or stores credentials/)).toBeVisible()
     expect(within(dialog).getByText('No available models match')).toBeVisible()
 
     await user.click(within(dialog).getByRole('button', { name: 'All models' }))
@@ -395,7 +397,7 @@ describe('Prime Continuim renderer', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
     expect(await within(dialog).findByText('The catalog request timed out.')).toBeVisible()
     await user.click(within(dialog).getByRole('button', { name: 'Retry loading catalog' }))
-    expect(await within(dialog).findByText('Models reported by this host')).toBeVisible()
+    expect(await within(dialog).findByText('Illustrative sample models')).toBeVisible()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledTimes(2)
     expect(within(dialog).queryByRole('button', { name: /select model|use model|switch model/i })).not.toBeInTheDocument()
   })

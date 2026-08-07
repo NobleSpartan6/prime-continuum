@@ -2863,6 +2863,7 @@ type ModelsCatalogError = {
 }
 
 function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: ModelsDialogProps) {
+  const isPreview = api.environment === 'preview'
   const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ModelsCatalogError | null>(null)
@@ -2985,7 +2986,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <span className="sheet__title-icon"><Icon icon={Bot} size={18} /></span>
             <div>
               <h2 id="models-title">Models &amp; accounts</h2>
-              <p id="models-description">Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.</p>
+              <p id="models-description">
+                {isPreview
+                  ? 'Illustrative sample catalog for the browser preview. No Prime Agent host was queried.'
+                  : <>Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.</>}
+              </p>
             </div>
           </div>
           <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={onClose}>
@@ -3016,11 +3021,15 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
           </div>
         ) : catalog ? (
           <div className="models-workspace">
-            <aside className="provider-rail" aria-label={`Accounts on ${host.name}`}>
+            <aside className="provider-rail" aria-label={isPreview ? 'Sample accounts' : `Accounts on ${host.name}`}>
               <div className="provider-rail__summary">
-                <span className="eyebrow">Accounts on {host.name}</span>
+                <span className="eyebrow">{isPreview ? 'Sample accounts' : <>Accounts on <bdi>{host.name}</bdi></>}</span>
                 <strong>{configuredProviders.length} configured</strong>
-                <small>{oauthProviders.length} OAuth-capable providers · Prime Agent {catalog.releaseVersion}</small>
+                <small>
+                  {isPreview
+                    ? `Browser preview · illustrative Prime Agent ${catalog.releaseVersion} fixture`
+                    : `${oauthProviders.length} OAuth-capable providers · Prime Agent ${catalog.releaseVersion}`}
+                </small>
               </div>
               <p className="sr-only" id="provider-filter-instructions">
                 {providerRailHorizontal
@@ -3070,11 +3079,15 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <section className="model-catalog" aria-label="Prime Agent models">
               <div className="model-catalog__topline">
                 <div>
-                  <span className="eyebrow">Runtime catalog</span>
-                  <h3>{selectedProvider?.displayName ?? 'Models reported by this host'}</h3>
-                  <p>{scopedAvailableCount} available with current setup · {scopedModelCount} listed by the runtime</p>
+                  <span className="eyebrow">{isPreview ? 'Sample catalog' : 'Runtime catalog'}</span>
+                  <h3>{selectedProvider?.displayName ?? (isPreview ? 'Illustrative sample models' : 'Models reported by this host')}</h3>
+                  <p>
+                    {isPreview
+                      ? `${scopedAvailableCount} shown as available · ${scopedModelCount} listed in this sample`
+                      : `${scopedAvailableCount} available with current setup · ${scopedModelCount} listed by the runtime`}
+                  </p>
                 </div>
-                <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
+                <span className="catalog-freshness"><span aria-hidden="true" /> {isPreview ? 'Sample data' : `Read ${formatCatalogTime(catalog.observedAt)}`}</span>
               </div>
 
               {selectedProvider && !selectedProvider.configured && (
@@ -3082,7 +3095,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                   <span><Icon icon={LockKeyhole} size={16} /></span>
                   <div>
                     <strong>{selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
-                    <p>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credentials remain on that host; Continuim only reads secret-free status.</p>
+                    <p>
+                      {isPreview
+                        ? <>In the native app, run <code>/login</code> on the connected Prime Agent host. This sample never reads or stores credentials.</>
+                        : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credentials remain on that host; Continuim only reads secret-free status.</>}
+                    </p>
                   </div>
                 </div>
               )}
@@ -3170,7 +3187,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
               )}
               <footer className="model-catalog__footer">
                 <Icon icon={Info} size={14} />
-                <span>This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.</span>
+                <span>
+                  {isPreview
+                    ? 'Illustrative sample only; model names and availability are not host evidence. No sign-in, inference test, or model change runs in this browser preview.'
+                    : 'This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.'}
+                </span>
               </footer>
             </section>
           </div>
