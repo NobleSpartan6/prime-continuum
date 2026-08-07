@@ -1229,6 +1229,7 @@ code,
 .message__header {
   display: flex;
   align-items: center;
+  min-inline-size: 0;
   gap: 0.5rem;
   margin-block-end: 0.55rem;
 }
@@ -1250,11 +1251,16 @@ code,
 }
 
 .message__header strong {
+  min-inline-size: 0;
+  overflow: hidden;
   font-size: var(--font-ui);
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .message__header time {
+  flex: 0 0 auto;
   margin-inline-start: auto;
 }
 
@@ -1429,6 +1435,7 @@ code,
 .composer__primary-actions {
   display: flex;
   align-items: center;
+  min-inline-size: 0;
 }
 
 .composer__toolbar,
@@ -1492,6 +1499,11 @@ code,
 .composer__hint {
   color: var(--color-text-faint);
   font-size: var(--font-caption);
+}
+
+.composer__hint {
+  flex: 1 1 12rem;
+  min-inline-size: 0;
 }
 
 .composer textarea {
@@ -1884,6 +1896,31 @@ code,
   color: var(--color-text-secondary);
   font-size: var(--font-caption);
   text-align: end;
+}
+
+.runtime-integrity-fact {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.runtime-integrity-fact small,
+.runtime-integrity-fact time {
+  color: var(--color-text-muted);
+  font-size: inherit;
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+.runtime-integrity-fact time {
+  font-variant-numeric: tabular-nums;
+}
+
+.runtime-integrity-fact--muted {
+  color: var(--color-text-muted);
+}
+
+.runtime-integrity-fact--danger > span {
+  color: var(--color-danger);
 }
 
 .runtime-list {
@@ -3964,6 +4001,16 @@ dialog.pair-mobile-sheet {
     padding-inline-start: 0;
   }
 
+  .message__header {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .message__header time {
+    min-inline-size: max-content;
+    margin-inline-start: 0;
+  }
+
   .timeline-marker {
     grid-template-columns: auto minmax(0, 1fr);
   }
@@ -3994,8 +4041,9 @@ dialog.pair-mobile-sheet {
   .session-continuity__body small {
     display: block;
     overflow: hidden;
+    overflow-wrap: anywhere;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
   }
 
   .session-continuity__queue {
@@ -4030,7 +4078,15 @@ dialog.pair-mobile-sheet {
   }
 
   .composer__primary-actions {
+    max-inline-size: 100%;
     margin-inline-start: auto;
+  }
+
+  .composer__primary-actions .button {
+    max-inline-size: 100%;
+    min-inline-size: 0;
+    text-align: center;
+    white-space: normal;
   }
 
   dialog.sheet {

@@ -15,6 +15,7 @@ import {
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
+  type CommandEnvelope,
   type HealthSnapshot,
   type RuntimeIntegritySnapshot,
 } from "../../src/shared/protocol";
@@ -150,6 +151,81 @@ describe("HostService runtime integrity readiness", () => {
     await service.close();
   });
 
+  it.each(["initializing", "failed", "unavailable"] as const)(
+    "withholds command delivery from a resident gateway while runtime integrity is %s",
+    async (status) => {
+      const provider: RuntimeIntegrityReadinessProvider = { snapshot: () => runtimeSnapshot(status) };
+      const { service } = await temporaryService(provider, residentGateway());
+
+      const health = await healthSnapshot(service);
+
+      expect(health.capabilities).toContain(RUNTIME_INTEGRITY_CAPABILITY);
+      expect(health.capabilities).not.toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+      await service.close();
+    },
+  );
+
+  it("advertises command delivery after runtime integrity becomes ready", async () => {
+    let status: RuntimeIntegritySnapshot["status"] = "initializing";
+    const provider: RuntimeIntegrityReadinessProvider = { snapshot: () => runtimeSnapshot(status) };
+    const { service } = await temporaryService(provider, residentGateway());
+
+    expect((await healthSnapshot(service)).capabilities).not.toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    status = "ready";
+    expect((await healthSnapshot(service)).capabilities).toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    await service.close();
+  });
+
+  it.each([
+    ["initializing", "RUNTIME_INTEGRITY_INITIALIZING", true],
+    ["failed", "RUNTIME_INTEGRITY_FAILED", true],
+    ["unavailable", "RUNTIME_INTEGRITY_UNAVAILABLE", false],
+  ] as const)(
+    "durably rejects command delivery without invoking a resident gateway while runtime integrity is %s",
+    async (status, expectedCode, expectedRetryable) => {
+      const provider: RuntimeIntegrityReadinessProvider = { snapshot: () => runtimeSnapshot(status) };
+      const gateway = residentGateway();
+      const { service, store } = await temporaryService(provider, gateway);
+      const host = await store.getHost();
+      const command = runtimeCommand(host.hostId, `runtime-not-ready-${status}`);
+
+      const response = await submitCommand(service, command);
+
+      expect(response).toMatchObject({
+        status: "rejected",
+        error: {
+          code: expectedCode,
+          retryable: expectedRetryable,
+        },
+      });
+      expect(response.message).toContain("not queued");
+      expect(response.queuePosition).toBeUndefined();
+      expect(gateway.isLive).not.toHaveBeenCalled();
+      expect(gateway.submit).not.toHaveBeenCalled();
+      expect((await store.getThreadSnapshot(command.threadId)).queueState.pendingCommandIds).not.toContain(
+        command.commandId,
+      );
+      expect((await store.reconcileCommands([command])).receipts).toEqual([response]);
+      await service.close();
+    },
+  );
+
+  it("delivers a command to the resident gateway when runtime integrity is ready", async () => {
+    const provider: RuntimeIntegrityReadinessProvider = { snapshot: () => runtimeSnapshot("ready") };
+    const gateway = residentGateway();
+    const { service, store } = await temporaryService(provider, gateway);
+    const host = await store.getHost();
+    const command = runtimeCommand(host.hostId, "runtime-ready-delivery");
+
+    const response = await submitCommand(service, command);
+
+    expect(response).toMatchObject({ status: "running" });
+    expect(gateway.isLive).toHaveBeenCalledOnce();
+    expect(gateway.submit).toHaveBeenCalledOnce();
+    expect(gateway.submit).toHaveBeenCalledWith(command);
+    await service.close();
+  });
+
   it("waits for runtime integrity shutdown and closes other resources even when it fails", async () => {
     let settleProviderClose: ((reason?: Error) => void) | undefined;
     const providerClose = new Promise<void>((resolve, reject) => {
@@ -266,6 +342,33 @@ async function healthSnapshot(service: HostService): Promise<HealthSnapshot> {
   return response.result;
 }
 
+function runtimeCommand(hostId: string, commandId: string): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "runtime-readiness-device",
+    commandId,
+    expectedHostId: hostId,
+    threadId: "demo-thread",
+    issuedAt: "2026-08-06T00:00:02.000Z",
+    expectedExecutionGenerationId: "demo-execution-1",
+    command: { kind: "prompt", text: "Run only through a verified Prime Agent runtime." },
+  };
+}
+
+async function submitCommand(service: HostService, command: CommandEnvelope) {
+  const response = await service.handle(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: `submit-${command.commandId}`,
+      method: "command.submit",
+      payload: { command },
+    },
+    TRUSTED_USER_SESSION,
+  );
+  if (!response.ok || response.method !== "command.submit") throw new Error("command submit request failed");
+  return response.result;
+}
+
 function unavailableGateway(): PrimeAgentGateway & { close: ReturnType<typeof vi.fn> } {
   return {
     continuity: "unavailable",
@@ -277,7 +380,11 @@ function unavailableGateway(): PrimeAgentGateway & { close: ReturnType<typeof vi
   };
 }
 
-function residentGateway(): PrimeAgentGateway & { close: ReturnType<typeof vi.fn> } {
+function residentGateway(): PrimeAgentGateway & {
+  isLive: ReturnType<typeof vi.fn>;
+  submit: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+} {
   return {
     continuity: "resident",
     isLive: vi.fn(async () => true),

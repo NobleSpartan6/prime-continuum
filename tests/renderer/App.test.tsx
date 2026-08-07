@@ -5,7 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import App from '../../src/renderer/src/App'
-import { createPreviewRendererApi } from '../../src/renderer/src/api'
+import { createPreviewRendererApi, type HostRuntimeReadiness } from '../../src/renderer/src/api'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -265,6 +265,73 @@ describe('Prime Continuim renderer', () => {
     expect(within(runtimePanel).getByText('Goals not reported · Agents not reported')).toBeVisible()
     expect(within(runtimePanel).queryByText('0 active · 0 agents')).not.toBeInTheDocument()
   })
+
+  it.each([
+    [
+      'unreported verification',
+      { kind: 'not_reported', freshness: 'live' },
+      'This host service doesn’t report runtime verification.',
+      undefined,
+    ],
+    [
+      'runtime preparation',
+      { kind: 'reported', freshness: 'live', status: 'initializing', phase: 'verifying' },
+      'Preparing verified Prime Agent runtime · Verifying files',
+      undefined,
+    ],
+    [
+      'cached verification failure',
+      {
+        kind: 'reported',
+        freshness: 'cached',
+        observedAt: '2026-08-05T20:00:00.000Z',
+        status: 'failed',
+        recovery: 'repair',
+      },
+      'Last reported · Runtime verification failed',
+      'Repair or reinstall Prime Continuim on this computer.',
+    ],
+    [
+      'ready development integrity',
+      { kind: 'reported', freshness: 'live', status: 'ready', assurance: 'development-integrity' },
+      'Development integrity',
+      undefined,
+    ],
+    [
+      'ready runtime without an assurance claim',
+      { kind: 'reported', freshness: 'live', status: 'ready' },
+      'Runtime ready',
+      undefined,
+    ],
+  ] satisfies Array<[string, HostRuntimeReadiness, string, string | undefined]>) (
+    'renders compact, honest host %s in the Runtime facts',
+    async (_caseName, readiness, summary, detail) => {
+      const user = userEvent.setup()
+      const api = createPreviewRendererApi()
+      const loadWorkbench = api.loadWorkbench.bind(api)
+      api.loadWorkbench = async () => {
+        const snapshot = await loadWorkbench()
+        const activeHost = snapshot.hosts.find((host) => host.id === snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)?.hostId)
+        if (activeHost) activeHost.runtimeReadiness = readiness
+        return snapshot
+      }
+
+      render(<App api={api} />)
+      await screen.findByRole('heading', { name: 'Seamless remote experience' })
+      await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+      const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+
+      expect(within(runtimePanel).getByText('Runtime verification')).toBeVisible()
+      expect(within(runtimePanel).getByText(summary)).toBeVisible()
+      if (detail) expect(within(runtimePanel).getByText(detail)).toBeVisible()
+      if (readiness.freshness === 'cached') {
+        const observed = runtimePanel.querySelector(`time[datetime="${readiness.observedAt}"]`)
+        expect(observed).toBeVisible()
+        expect(observed).toHaveTextContent(/^Observed /)
+      }
+      expect(within(runtimePanel).queryByText(/RUNTIME_INTEGRITY_/)).not.toBeInTheDocument()
+    },
+  )
 
   it('renders persisted work reports independently from live session telemetry', async () => {
     const user = userEvent.setup()

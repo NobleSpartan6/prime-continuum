@@ -2,7 +2,8 @@ import { app, BrowserWindow, ipcMain, type Session } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerControlIpc } from './control/ipc'
-import { connectLocalHostd, localHostdEndpoint, stopPackageSmokeHostds } from './control/local-hostd'
+import type { ConnectionState } from './control/contracts'
+import { stopPackageSmokeHostds } from './control/local-hostd'
 import { DesktopControlService } from './control/service'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
@@ -118,7 +119,7 @@ async function runPackageSmoke(window: BrowserWindow, service: DesktopControlSer
   try {
     await loadRenderer(window)
     await waitForPackageSmokeConnection(window)
-    await waitForPackageSmokeRuntimeReady()
+    await waitForPackageSmokeRuntimeReady(service)
   } finally {
     await service.disconnect()
     await stopPackageSmokeHostds()
@@ -127,27 +128,41 @@ async function runPackageSmoke(window: BrowserWindow, service: DesktopControlSer
   app.quit()
 }
 
-async function waitForPackageSmokeRuntimeReady(): Promise<void> {
+async function waitForPackageSmokeRuntimeReady(service: DesktopControlService): Promise<void> {
   const deadline = Date.now() + 180_000
-  const endpoint = await localHostdEndpoint()
   while (Date.now() < deadline) {
-    const connection = await connectLocalHostd(endpoint)
-    try {
-      const health = (await connection.request('health.get', {}, { timeoutMs: 3_000, priority: 'urgent' })) as {
-        capabilities?: unknown
-        runtimeIntegrity?: { status?: unknown; code?: unknown }
-      }
-      const capabilities = Array.isArray(health.capabilities) ? health.capabilities : []
-      if (health.runtimeIntegrity?.status === 'ready' && capabilities.includes('runtime_integrity_v1')) return
-      if (health.runtimeIntegrity?.status === 'failed' || health.runtimeIntegrity?.status === 'unavailable') {
-        throw new Error(`The packaged runtime failed readiness (${String(health.runtimeIntegrity.code ?? 'unknown')}).`)
-      }
-    } finally {
-      connection.close()
+    const connection = service.getConnectionState()
+    const readiness = connection.runtimeReadiness
+    if (isPackageSmokeRuntimeReady(connection)) return
+    if (
+      readiness?.kind === 'reported' &&
+      (readiness.snapshot.status === 'failed' || readiness.snapshot.status === 'unavailable')
+    ) {
+      throw new Error(`The packaged runtime failed readiness (${readiness.snapshot.status}).`)
     }
     await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250))
   }
   throw new Error('The packaged runtime did not become ready within its deadline.')
+}
+
+/**
+ * Accept a package-smoke readiness sample only when every signal belongs to the
+ * same live, verified local-host connection. A cached observation retained
+ * while offline (or one produced by another host authority) must never make a
+ * packaged build look ready.
+ */
+export function isPackageSmokeRuntimeReady(connection: ConnectionState): boolean {
+  const readiness = connection.runtimeReadiness
+  return (
+    connection.phase === 'online' &&
+    connection.path === 'local_socket' &&
+    typeof connection.hostId === 'string' &&
+    connection.hostId.length > 0 &&
+    readiness?.kind === 'reported' &&
+    readiness.hostId === connection.hostId &&
+    readiness.snapshot.status === 'ready' &&
+    connection.capabilities?.includes('runtime_integrity_v1') === true
+  )
 }
 
 async function waitForPackageSmokeConnection(window: BrowserWindow): Promise<void> {

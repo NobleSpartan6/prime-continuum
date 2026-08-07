@@ -6,6 +6,8 @@
  * between renderer-safe values and host protocol frames.
  */
 
+import type { RuntimeIntegritySnapshot } from '../../shared/protocol'
+
 export const IPC = {
   bootstrap: 'prime:bootstrap',
   discoverSshHosts: 'prime:ssh:discover',
@@ -87,6 +89,24 @@ export type ConnectionTarget =
   | { kind: 'local' }
   | { kind: 'ssh'; alias: string }
 
+interface HostRuntimeReadinessBase {
+  /** Immutable host authority that produced this observation. */
+  hostId: string
+  hostdVersion: string
+  startedAt: string
+  /** Time of the most recent successful health sample, not a state transition. */
+  observedAt: string
+}
+
+export type HostRuntimeReadiness =
+  | (HostRuntimeReadinessBase & {
+      kind: 'not_reported'
+    })
+  | (HostRuntimeReadinessBase & {
+      kind: 'reported'
+      snapshot: RuntimeIntegritySnapshot
+    })
+
 export interface ConnectionState {
   phase: 'offline' | 'connecting' | 'online' | 'reconnecting' | 'degraded'
   target?: ConnectionTarget
@@ -97,6 +117,8 @@ export interface ConnectionState {
   attempt: number
   /** Versioned features advertised by the verified host health handshake. */
   capabilities?: string[]
+  /** Last integrity-readiness observation for this exact verified host authority. */
+  runtimeReadiness?: HostRuntimeReadiness
   error?: StructuredError
 }
 

@@ -12,6 +12,22 @@ export type ComposerReceiptState =
   | 'uncertain'
   | 'rejected'
 
+export type HostRuntimeReadiness =
+  | {
+      kind: 'not_reported'
+      freshness: 'live' | 'cached'
+      observedAt?: string
+    }
+  | {
+      kind: 'reported'
+      freshness: 'live' | 'cached'
+      observedAt?: string
+      status: 'initializing' | 'ready' | 'failed' | 'unavailable'
+      phase?: 'preparing' | 'validating_seed' | 'copying' | 'verifying' | 'publishing'
+      assurance?: 'development-integrity' | 'production-authenticated'
+      recovery?: 'restart' | 'repair' | 'diagnostics'
+    }
+
 export interface HostSummary {
   id: string
   name: string
@@ -21,6 +37,8 @@ export interface HostSummary {
   lastSynchronized?: string
   latencyMs?: number
   compatibility: 'compatible' | 'update_available' | 'upgrade_required'
+  /** Integrity readiness is projected only for the currently verified host authority. */
+  runtimeReadiness?: HostRuntimeReadiness
 }
 
 export interface TranscriptBlock {
@@ -747,6 +765,53 @@ function connectionFromNative(value: unknown): ConnectionState {
   return 'offline'
 }
 
+function runtimeReadinessFromNative(value: unknown, activePhase: string | undefined): HostRuntimeReadiness | undefined {
+  const readiness = asRecord(value)
+  const kind = asString(readiness?.kind)
+  const freshness = activePhase === 'online' || activePhase === 'degraded' ? 'live' : 'cached'
+  const observedAt = asString(readiness?.observedAt)
+  if (kind === 'not_reported') {
+    return { kind, freshness, ...(observedAt ? { observedAt } : {}) }
+  }
+  if (kind !== 'reported') return undefined
+  const snapshot = asRecord(readiness?.snapshot)
+  const status = asString(snapshot?.status)
+  if (status !== 'initializing' && status !== 'ready' && status !== 'failed' && status !== 'unavailable') {
+    return undefined
+  }
+  const phase = asString(snapshot?.phase)
+  const validPhase =
+    phase === 'preparing' ||
+    phase === 'validating_seed' ||
+    phase === 'copying' ||
+    phase === 'verifying' ||
+    phase === 'publishing'
+      ? phase
+      : undefined
+  const assurance = asString(snapshot?.assurance)
+  const validAssurance =
+    assurance === 'development-integrity' || assurance === 'production-authenticated'
+      ? assurance
+      : undefined
+  const recoveryAction = asString(snapshot?.recoveryAction)
+  const recovery = recoveryAction === 'retry_runtime_initialization' || recoveryAction === 'restart_host_service'
+    ? 'restart'
+    : recoveryAction === 'reinstall_application' || recoveryAction === 'repair_application'
+      ? 'repair'
+      : status === 'failed' || status === 'unavailable'
+        ? 'diagnostics'
+        : undefined
+  return {
+    kind,
+    freshness,
+    ...(observedAt ? { observedAt } : {}),
+    status,
+    ...(validPhase ? { phase: validPhase } : {}),
+    ...(validAssurance ? { assurance: validAssurance } : {}),
+    ...(recovery ? { recovery } : {}),
+  }
+}
+
 function taskFromNative(value: unknown): TaskState {
   if (value === 'running' || value === 'waiting' || value === 'needs_approval' || value === 'complete' || value === 'failed') {
     return value
@@ -967,6 +1032,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const activePhase = asString(rawConnection?.phase)
   const activeHostId = asString(rawConnection?.hostId)
   const activeTarget = asRecord(rawConnection?.target)
+  const rawRuntimeReadiness = asRecord(rawConnection?.runtimeReadiness)
   const advertisedCapabilities = Array.isArray(rawConnection?.capabilities)
     ? rawConnection.capabilities.filter((capability): capability is string => typeof capability === 'string')
     : []
@@ -1003,6 +1069,10 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     const state = connectionFromNative(isActive && activePhase ? activePhase : 'offline')
     const rawKind = asString(host.kind)
     const synchronizedAt = asString(host.cacheUpdatedAt) ?? asString(host.lastSeenAt) ?? (isActive ? updatedAt : undefined)
+    const runtimeReadiness =
+      isActive && asString(rawRuntimeReadiness?.hostId) === hostId
+        ? runtimeReadinessFromNative(rawRuntimeReadiness, activePhase)
+        : undefined
     return {
       id: hostId,
       name: hostName,
@@ -1015,6 +1085,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         host.compatibility === 'update_available' || host.compatibility === 'upgrade_required'
           ? host.compatibility
           : 'compatible',
+      ...(runtimeReadiness ? { runtimeReadiness } : {}),
     }
   })
 

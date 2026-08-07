@@ -50,6 +50,7 @@ import {
   type DiscoveredComputer,
   type HandoffPhase,
   type HandoffPlan,
+  type HostRuntimeReadiness,
   type HostSummary,
   type RendererApi,
   type RuntimeSummary,
@@ -1626,6 +1627,56 @@ const RUNTIME_GOAL_INCREMENT = 20
 const RUNTIME_AGENT_INCREMENT = 50
 const RUNTIME_SCHEDULE_INCREMENT = 20
 
+function runtimeReadinessCopy(readiness: HostRuntimeReadiness | undefined): {
+  summary: string
+  detail?: string
+  tone?: 'danger' | 'muted'
+  cached: boolean
+  observedAt?: string
+} | undefined {
+  if (!readiness) return undefined
+  const cached = readiness.freshness === 'cached'
+  const observation = cached && readiness.observedAt ? { observedAt: readiness.observedAt } : {}
+  if (readiness.kind === 'not_reported') {
+    return readiness.freshness === 'live'
+      ? { summary: 'This host service doesn’t report runtime verification.', tone: 'muted', cached }
+      : { summary: 'Last reported · Runtime verification wasn’t reported by this host service.', tone: 'muted', cached, ...observation }
+  }
+  const prefix = cached ? 'Last reported · ' : ''
+  if (readiness.status === 'initializing') {
+    const phase = readiness.phase === 'validating_seed'
+      ? 'Validating bundled files'
+      : readiness.phase === 'copying'
+        ? 'Installing verified files'
+        : readiness.phase === 'verifying'
+          ? 'Verifying files'
+          : readiness.phase === 'publishing'
+            ? 'Finishing setup'
+            : 'Preparing files'
+    return { summary: `${prefix}Preparing verified Prime Agent runtime · ${phase}`, cached, ...observation }
+  }
+  if (readiness.status === 'ready') {
+    const assurance = readiness.assurance === 'production-authenticated'
+      ? 'Production authenticated'
+      : readiness.assurance === 'development-integrity'
+        ? 'Development integrity'
+        : 'Runtime ready'
+    return { summary: `${prefix}${assurance}`, cached, ...observation, ...(cached ? { tone: 'muted' as const } : {}) }
+  }
+  const detail = readiness.recovery === 'restart'
+    ? 'Restart the host service, then try again.'
+    : readiness.recovery === 'repair'
+      ? 'Repair or reinstall Prime Continuim on this computer.'
+      : 'Review diagnostics for this host before retrying.'
+  return {
+    summary: `${prefix}${readiness.status === 'failed' ? 'Runtime verification failed' : 'Runtime verification unavailable'}`,
+    detail,
+    tone: 'danger',
+    cached,
+    ...observation,
+  }
+}
+
 function RuntimePanel({
   snapshot,
   thread,
@@ -1641,6 +1692,7 @@ function RuntimePanel({
   const [agentLimit, setAgentLimit] = useState(RUNTIME_AGENT_INCREMENT)
   const [scheduleLimit, setScheduleLimit] = useState(RUNTIME_SCHEDULE_INCREMENT)
   const session = runtime.session
+  const readinessCopy = runtimeReadinessCopy(host.runtimeReadiness)
   const agentsReported = runtime.agentsReported === true
   const hasAnyRuntimeReport = Boolean(
     session || agentsReported || runtime.goals !== undefined || runtime.schedules !== undefined,
@@ -1710,6 +1762,20 @@ function RuntimePanel({
         <dl className="runtime-facts">
           <div><dt>Run location</dt><dd><bdi>{host.name}</bdi></dd></div>
           <div><dt>Connection</dt><dd>{connectionLabel(host.connection)}</dd></div>
+          {readinessCopy && (
+            <div>
+              <dt>Runtime verification</dt>
+              <dd className={cx('runtime-integrity-fact', readinessCopy.tone && `runtime-integrity-fact--${readinessCopy.tone}`)}>
+                <span>{readinessCopy.summary}</span>
+                {readinessCopy.detail && <small>{readinessCopy.detail}</small>}
+                {readinessCopy.cached && (
+                  readinessCopy.observedAt && scheduleTime(readinessCopy.observedAt)
+                    ? <time dateTime={readinessCopy.observedAt}>Observed {scheduleTime(readinessCopy.observedAt)}</time>
+                    : <small>Observation time unavailable</small>
+                )}
+              </dd>
+            </div>
+          )}
           <div><dt>Turn</dt><dd>{taskLabel(thread.status)}</dd></div>
           <div><dt>Residency</dt><dd>{residencyCopy}</dd></div>
           {sessionId && <div><dt>Session</dt><dd><bdi>{sessionId}</bdi></dd></div>}

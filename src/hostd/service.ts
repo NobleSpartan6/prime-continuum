@@ -209,7 +209,8 @@ export class HostService {
       case "health.get": {
         const host = await this.store.getHost();
         const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
-        const executionCapabilities = this.gateway.continuity === "resident"
+        const executionCapabilities = this.gateway.continuity === "resident" &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [PRIME_AGENT_COMMAND_CAPABILITY]
           : [];
         return {
@@ -240,6 +241,20 @@ export class HostService {
             "HOST_AUTHORITY_MISMATCH",
             "The command was composed for a different host authority.",
           );
+        }
+        const runtimeIntegrity = this.gateway.continuity === "resident"
+          ? this.runtimeIntegrityProvider?.snapshot()
+          : undefined;
+        const runtimeIntegrityRejection = runtimeIntegrity === undefined
+          ? undefined
+          : runtimeIntegrityAdmissionRejection(runtimeIntegrity);
+        if (runtimeIntegrityRejection) {
+          // Runtime readiness is host authority, not a client-side hint. Fail
+          // closed before consulting or invoking a resident gateway so a stale
+          // desktop capability observation cannot dispatch into a revoked
+          // verified-runtime boundary.
+          const admission = await this.store.admitCommand(command, false, runtimeIntegrityRejection);
+          return admission.receipt;
         }
         const catalog = await this.store.getCatalogSnapshot();
         const thread = catalog.threads.find((item) => item.threadId === command.threadId);
@@ -490,6 +505,33 @@ function serviceStateForRuntimeIntegrity(
     case "failed":
     case "unavailable":
       return "degraded";
+  }
+}
+
+function runtimeIntegrityAdmissionRejection(
+  runtimeIntegrity: RuntimeIntegritySnapshot,
+): StructuredError | undefined {
+  switch (runtimeIntegrity.status) {
+    case "ready":
+      return undefined;
+    case "initializing":
+      return {
+        code: "RUNTIME_INTEGRITY_INITIALIZING",
+        message: "Prime Agent runtime integrity verification is still initializing; the command was not queued.",
+        retryable: true,
+      };
+    case "failed":
+      return {
+        code: runtimeIntegrity.code,
+        message: "Prime Agent runtime integrity verification failed; the command was not queued.",
+        retryable: runtimeIntegrity.retryable,
+      };
+    case "unavailable":
+      return {
+        code: runtimeIntegrity.code,
+        message: "Prime Agent runtime integrity verification is unavailable; the command was not queued.",
+        retryable: runtimeIntegrity.retryable,
+      };
   }
 }
 

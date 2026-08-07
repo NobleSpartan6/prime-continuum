@@ -761,6 +761,102 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('projects runtime readiness only onto its active immutable host without inferring command support', async () => {
+    const catalog = singleHostCatalog('host-local', 'This computer', 'thread-local', 'project-local')
+    const remoteCatalog = singleHostCatalog('host-remote', 'devbox', 'thread-remote', 'project-remote')
+    const threadSnapshot = recoverySnapshot(catalog.threads[0], 'Verified host transcript.')
+    let connectionListener: ((state: unknown) => void) | undefined
+    const runtimeReadiness = {
+      kind: 'reported',
+      hostId: 'host-local',
+      hostdVersion: '0.1.0',
+      startedAt: '2026-08-05T19:59:00.000Z',
+      observedAt: '2026-08-05T20:00:00.000Z',
+      snapshot: {
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    }
+    const connection = {
+      ...onlineConnection(),
+      capabilities: ['runtime_integrity_v1'],
+      runtimeReadiness,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: {
+          version: 3,
+          activeHostId: 'host-local',
+          entries: {
+            'host-local': { hostId: 'host-local', catalog, lastSnapshot: threadSnapshot },
+            'host-remote': { hostId: 'host-remote', catalog: remoteCatalog },
+          },
+        },
+        outbox: [],
+        connection,
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(() => new Promise<never>(() => undefined)),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(threadSnapshot)),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+
+    const live = await api.loadWorkbench()
+    expect(live.hosts.find((host) => host.id === 'host-local')?.runtimeReadiness).toEqual({
+      kind: 'reported',
+      freshness: 'live',
+      observedAt: '2026-08-05T20:00:00.000Z',
+      status: 'ready',
+      assurance: 'development-integrity',
+    })
+    expect(live.hosts.find((host) => host.id === 'host-remote')?.runtimeReadiness).toBeUndefined()
+    expect(live.operations.submitCommands).toBe(false)
+
+    connectionListener?.({ ...connection, phase: 'degraded' })
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-local')?.runtimeReadiness).toMatchObject({
+      kind: 'reported',
+      freshness: 'live',
+    })
+
+    connectionListener?.({ ...connection, phase: 'offline' })
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-local')?.runtimeReadiness).toMatchObject({
+      kind: 'reported',
+      freshness: 'cached',
+      status: 'ready',
+    })
+
+    connectionListener?.({
+      ...connection,
+      runtimeReadiness: {
+        ...runtimeReadiness,
+        snapshot: { status: 'failed', recoveryAction: 'future_recovery_action' },
+      },
+    })
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-local')?.runtimeReadiness).toMatchObject({
+      kind: 'reported',
+      freshness: 'live',
+      status: 'failed',
+      recovery: 'diagnostics',
+    })
+
+    connectionListener?.({
+      ...connection,
+      runtimeReadiness: { ...runtimeReadiness, hostId: 'host-remote' },
+    })
+    expect(published.at(-1)?.hosts.every((host) => host.runtimeReadiness === undefined)).toBe(true)
+    unsubscribe()
+  })
+
   it('surfaces the first blocking host warning for a non-executable handoff plan', async () => {
     const catalog = singleHostCatalog('host-local', 'This computer', 'thread-one', 'project-local')
     const destinationCatalog = singleHostCatalog('host-remote', 'devbox', 'thread-remote', 'project-remote')

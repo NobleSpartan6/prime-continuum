@@ -6,9 +6,13 @@ import {
   CapabilitySchema,
   CatalogProjectionSnapshotSchema,
   CommandEnvelopeSchema,
+  PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RuntimeIntegritySnapshotSchema,
   ThreadProjectionSnapshotSchema,
-  type CommandEnvelope
+  type CommandEnvelope,
+  type RuntimeIntegritySnapshot,
 } from '../../shared/protocol'
 import type {
   ApprovalResolution,
@@ -21,6 +25,7 @@ import type {
   Diagnostics,
   HandoffCommitRequest,
   HandoffPlanRequest,
+  HostRuntimeReadiness,
   HostInstallPlan,
   OutboxEntry,
   SessionCursor,
@@ -82,12 +87,32 @@ interface CapturedProjectionAuthority {
   generation: number
 }
 
+interface HealthLineage {
+  hostId: string
+  hostdVersion: string
+  startedAt: string
+  reportsRuntimeIntegrity: boolean
+  runtimeContractVersion?: number
+  runtimeTrustAnchorId?: string
+  runtimeTargetKey?: string
+}
+
+interface HealthObservation {
+  hostId: string
+  capabilities: string[]
+  runtimeReadiness: HostRuntimeReadiness
+  lineage: HealthLineage
+}
+
 interface ServiceOptions {
   app: App
   sshExecutable?: string
 }
 
 const RECONNECT_DELAYS_MS = [500, 1_500, 3_500, 8_000, 15_000, 30_000] as const
+const HEALTH_POLL_INITIALIZING_MS = 500
+const HEALTH_POLL_STEADY_MS = 15_000
+const HEALTH_POLL_TIMEOUT_MS = 10_000
 const OUTBOX_LIMIT = 1_000
 const TARGET_BINDING_LIMIT = 128
 const TERMINAL_OR_DURABLE = new Set([
@@ -112,6 +137,10 @@ export class DesktopControlService extends EventEmitter {
   private target?: ConnectionTarget
   private authorityHostId?: string
   private authorityCapabilities: string[] = []
+  private authorityRuntimeReadiness?: HostRuntimeReadiness
+  private authorityHealthLineage?: HealthLineage
+  private healthPollTimer?: NodeJS.Timeout
+  private controlIntentGeneration = 0
   private reconnectGeneration = 0
   private attempt = 0
   private intentionallyOffline = true
@@ -241,17 +270,29 @@ export class DesktopControlService extends EventEmitter {
 
   async connect(target: ConnectionTarget): Promise<ConnectionState> {
     if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
-    this.intentionallyOffline = false
-    this.target = target
-    // A locator is not capability authority. Preserve capabilities only across
-    // automatic/manual reconnects to the already verified target.
-    this.authorityCapabilities = []
-    const generation = ++this.reconnectGeneration
+    const intentGeneration = ++this.controlIntentGeneration
     const cache = await this.cache.update((current) => ({
       ...normalizeCache(current),
       lastAttemptedTarget: target,
       lastAttemptedAt: now()
     }))
+    if (intentGeneration !== this.controlIntentGeneration) {
+      throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
+    }
+
+    // Persist the locator attempt before changing any live connection state.
+    // A failed cache write must leave the existing connection, poll lineage,
+    // and renderer authority internally consistent.
+    this.intentionallyOffline = false
+    const targetChanged = !this.target || !sameTarget(this.target, target)
+    if (targetChanged) {
+      this.authorityHostId = undefined
+      this.authorityCapabilities = []
+      this.authorityRuntimeReadiness = undefined
+      this.authorityHealthLineage = undefined
+    }
+    this.target = target
+    const generation = ++this.reconnectGeneration
     if (
       generation !== this.reconnectGeneration ||
       this.intentionallyOffline ||
@@ -270,6 +311,7 @@ export class DesktopControlService extends EventEmitter {
     if (!this.target) {
       throw new ControlError('connection.no_target', 'There is no previous host to reconnect to.')
     }
+    this.controlIntentGeneration += 1
     this.intentionallyOffline = false
     this.reconnectGeneration += 1
     return await this.establish(this.target, 'reconnecting', this.reconnectGeneration)
@@ -277,7 +319,9 @@ export class DesktopControlService extends EventEmitter {
 
   async disconnect(): Promise<void> {
     this.intentionallyOffline = true
+    this.controlIntentGeneration += 1
     this.reconnectGeneration += 1
+    this.stopHealthPolling()
     const connection = this.connection
     this.connection = undefined
     connection?.close()
@@ -285,7 +329,7 @@ export class DesktopControlService extends EventEmitter {
       phase: 'offline',
       target: this.target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-      ...this.capabilityState(),
+      ...this.authorityObservationState(),
       since: now(),
       attempt: this.attempt
     })
@@ -400,6 +444,14 @@ export class DesktopControlService extends EventEmitter {
       }
       await this.putOutbox({ hostId, command, state: 'waiting_for_connection', updatedAt: now() })
       return { hostId, deviceId: command.deviceId, commandId: command.commandId, status: 'waiting_for_connection', durable: false }
+    }
+
+    if (!this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) {
+      throw new ControlError(
+        'command.capability_unavailable',
+        'Prime Agent commands are unavailable until this host reports a verified resident runtime.',
+        { retryable: true, details: { hostId, capability: PRIME_AGENT_COMMAND_CAPABILITY } }
+      )
     }
 
     await this.putOutbox({ hostId, command, state: 'uncertain', updatedAt: now() })
@@ -547,6 +599,7 @@ export class DesktopControlService extends EventEmitter {
     phase: 'connecting' | 'reconnecting',
     generation: number
   ): Promise<ConnectionState> {
+    this.stopHealthPolling()
     const previous = this.connection
     this.connection = undefined
     previous?.close()
@@ -555,7 +608,7 @@ export class DesktopControlService extends EventEmitter {
       phase,
       target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-      ...this.capabilityState(),
+      ...this.authorityObservationState(),
       since: now(),
       attempt: this.attempt
     })
@@ -580,10 +633,12 @@ export class DesktopControlService extends EventEmitter {
         candidate.close()
         throw new ControlError('connection.superseded', 'The connection attempt was superseded.')
       }
-      const hostId = authorityHostIdFromHealth(health)
-      const capabilities = capabilitiesFromHealth(health)
+      const observation = observationFromHealth(health)
+      const hostId = observation.hostId
       const projectionInvalidated = await this.bindAuthority(target, hostId, generation)
-      this.authorityCapabilities = capabilities
+      this.authorityCapabilities = observation.capabilities
+      this.authorityRuntimeReadiness = observation.runtimeReadiness
+      this.authorityHealthLineage = observation.lineage
       // Publish verified authority before reconciliation or an online state so
       // a same-alias host replacement invalidates stale renderer projections.
       if (projectionInvalidated) {
@@ -592,7 +647,7 @@ export class DesktopControlService extends EventEmitter {
           target,
           hostId,
           path: target.kind === 'local' ? 'local_socket' : 'ssh',
-          ...this.capabilityState(),
+          ...this.authorityObservationState(),
           since: now(),
           attempt: this.attempt
         })
@@ -613,11 +668,12 @@ export class DesktopControlService extends EventEmitter {
           target,
           hostId,
           path: target.kind === 'local' ? 'local_socket' : 'ssh',
-          ...this.capabilityState(),
+          ...this.authorityObservationState(),
           since: now(),
           attempt: this.attempt,
           error: toStructuredError(error)
         })
+        this.scheduleHealthPoll(candidate, target, hostId, generation)
         return this.getConnectionState()
       }
       this.assertActiveConnection(candidate, target, hostId, generation)
@@ -629,10 +685,11 @@ export class DesktopControlService extends EventEmitter {
         target,
         hostId,
         path: target.kind === 'local' ? 'local_socket' : 'ssh',
-        ...this.capabilityState(),
+        ...this.authorityObservationState(),
         since: now(),
         attempt: this.attempt
       })
+      this.scheduleHealthPoll(candidate, target, hostId, generation)
       return this.getConnectionState()
     } catch (error) {
       if (this.connection === candidate) this.connection = undefined
@@ -642,7 +699,7 @@ export class DesktopControlService extends EventEmitter {
           phase: 'offline',
           target,
           ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-          ...this.capabilityState(),
+          ...this.authorityObservationState(),
           since: now(),
           attempt: this.attempt,
           error: toStructuredError(error)
@@ -682,6 +739,7 @@ export class DesktopControlService extends EventEmitter {
     })
     connection.once('close', (error: unknown) => {
       if (this.connection !== connection) return
+      this.stopHealthPolling()
       this.connection = undefined
       if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
       this.beginAutomaticReconnect(target, error)
@@ -694,7 +752,7 @@ export class DesktopControlService extends EventEmitter {
       phase: 'reconnecting',
       target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-      ...this.capabilityState(),
+      ...this.authorityObservationState(),
       since: now(),
       attempt: this.attempt,
       error: toStructuredError(cause)
@@ -717,7 +775,7 @@ export class DesktopControlService extends EventEmitter {
               phase: 'reconnecting',
               target,
               ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-              ...this.capabilityState(),
+              ...this.authorityObservationState(),
               since: now(),
               attempt: this.attempt,
               error: toStructuredError(lastError)
@@ -733,10 +791,90 @@ export class DesktopControlService extends EventEmitter {
     this.emit('connection-state', this.getConnectionState())
   }
 
-  private capabilityState(): Pick<ConnectionState, 'capabilities'> | Record<string, never> {
-    return this.authorityCapabilities.length > 0
-      ? { capabilities: [...this.authorityCapabilities] }
-      : {}
+  private authorityObservationState(): Pick<ConnectionState, 'capabilities' | 'runtimeReadiness'> | Record<string, never> {
+    return {
+      ...(this.authorityCapabilities.length > 0 ? { capabilities: [...this.authorityCapabilities] } : {}),
+      ...(this.authorityRuntimeReadiness && this.authorityRuntimeReadiness.hostId === this.authorityHostId
+        ? { runtimeReadiness: structuredClone(this.authorityRuntimeReadiness) }
+        : {}),
+    }
+  }
+
+  private scheduleHealthPoll(
+    connection: FramedConnection,
+    target: ConnectionTarget,
+    hostId: string,
+    generation: number,
+  ): void {
+    this.stopHealthPolling()
+    if (!this.isActiveConnection(connection, target, hostId, generation)) return
+    const initializing =
+      this.authorityRuntimeReadiness?.kind === 'reported' &&
+      this.authorityRuntimeReadiness.snapshot.status === 'initializing'
+    const delayMs = initializing ? HEALTH_POLL_INITIALIZING_MS : HEALTH_POLL_STEADY_MS
+    this.healthPollTimer = setTimeout(() => {
+      this.healthPollTimer = undefined
+      void this.pollHealth(connection, target, hostId, generation)
+    }, delayMs)
+    this.healthPollTimer.unref?.()
+  }
+
+  private stopHealthPolling(): void {
+    if (!this.healthPollTimer) return
+    clearTimeout(this.healthPollTimer)
+    this.healthPollTimer = undefined
+  }
+
+  private async pollHealth(
+    connection: FramedConnection,
+    target: ConnectionTarget,
+    hostId: string,
+    generation: number,
+  ): Promise<void> {
+    if (!this.isActiveConnection(connection, target, hostId, generation)) return
+    try {
+      const health = await connection.request('health.get', {}, {
+        timeoutMs: HEALTH_POLL_TIMEOUT_MS,
+        priority: 'urgent',
+      })
+      if (!this.isActiveConnection(connection, target, hostId, generation)) return
+      const observation = observationFromHealth(health)
+      const expectedLineage = this.authorityHealthLineage
+      if (!expectedLineage) {
+        throw new ControlError('protocol.health_lineage_missing', 'The verified host health lineage is unavailable.')
+      }
+      assertSameHealthLineage(expectedLineage, observation.lineage)
+      const commandsWereAvailable = this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)
+      this.applyHealthObservation(observation)
+      if (!commandsWereAvailable && observation.capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) {
+        await this.reconcileOutboxAfterConnect(hostId, connection)
+      }
+      this.scheduleHealthPoll(connection, target, hostId, generation)
+    } catch (error) {
+      if (!this.isActiveConnection(connection, target, hostId, generation)) return
+      connection.terminate(
+        error instanceof ControlError
+          ? error
+          : new ControlError('connection.health_poll_failed', 'The host health check failed.', {
+              retryable: true,
+              cause: error,
+            }),
+      )
+    }
+  }
+
+  private applyHealthObservation(observation: HealthObservation): void {
+    const semanticChange =
+      !sameStringArray(this.authorityCapabilities, observation.capabilities) ||
+      runtimeReadinessSemanticKey(this.authorityRuntimeReadiness) !==
+        runtimeReadinessSemanticKey(observation.runtimeReadiness)
+    this.authorityCapabilities = observation.capabilities
+    this.authorityRuntimeReadiness = observation.runtimeReadiness
+    this.authorityHealthLineage = observation.lineage
+    const { capabilities: _capabilities, runtimeReadiness: _runtimeReadiness, ...base } = this.state
+    const next = { ...base, ...this.authorityObservationState() }
+    if (semanticChange) this.setState(next)
+    else this.state = next
   }
 
   private requireConnection(): FramedConnection {
@@ -1016,6 +1154,12 @@ export class DesktopControlService extends EventEmitter {
         }))
     )
 
+    // Receipt reconciliation is safe while runtime startup is incomplete, but
+    // queued execution remains local until the verified host advertises the
+    // resident command capability. The health-poll transition that gains that
+    // capability re-runs reconciliation before attempting delivery.
+    if (!this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) return
+
     let firstDeliveryError: unknown
     for (const key of explicitlyUnknownWaitingIdentities) {
       const entry = entriesByIdentity.get(key)
@@ -1193,12 +1337,67 @@ function matchesOutboxIdentity(entry: OutboxEntry, identity: OutboxIdentity): bo
   )
 }
 
-function authorityHostIdFromHealth(value: unknown): string {
-  const hostId = isRecord(value) ? asHostId(isRecord(value.host) ? value.host.hostId : undefined) : undefined
+function observationFromHealth(value: unknown): HealthObservation {
+  const health = isRecord(value) ? value : undefined
+  const hostId = health ? asHostId(isRecord(health.host) ? health.host.hostId : undefined) : undefined
   if (!hostId) {
     throw new ControlError('protocol.host_identity_missing', 'The host health response did not include an immutable host identity.')
   }
-  return hostId
+  const hostdVersion = boundedHealthString(health?.hostdVersion, 64)
+  const startedAt = healthTimestamp(health?.startedAt)
+  const observedAt = healthTimestamp(health?.checkedAt)
+  if (!hostdVersion || !startedAt || !observedAt) {
+    throw new ControlError('protocol.health_lineage_missing', 'The host health response did not include a stable service lineage.')
+  }
+  const capabilities = capabilitiesFromHealth(health)
+  const rawRuntimeIntegrity = health?.runtimeIntegrity
+  const reportsRuntimeIntegrity = rawRuntimeIntegrity !== undefined
+  if (reportsRuntimeIntegrity !== capabilities.includes(RUNTIME_INTEGRITY_CAPABILITY)) {
+    throw new ControlError(
+      'protocol.runtime_integrity_contract_mismatch',
+      'The host runtime-integrity report did not match its advertised capabilities.',
+    )
+  }
+  const parsedRuntimeIntegrity = reportsRuntimeIntegrity
+    ? RuntimeIntegritySnapshotSchema.safeParse(rawRuntimeIntegrity)
+    : undefined
+  if (parsedRuntimeIntegrity && !parsedRuntimeIntegrity.success) {
+    throw new ControlError('protocol.runtime_integrity_invalid', 'The host runtime-integrity report was invalid.')
+  }
+  const runtimeIntegrity: RuntimeIntegritySnapshot | undefined = parsedRuntimeIntegrity?.success
+    ? parsedRuntimeIntegrity.data
+    : undefined
+  if (
+    runtimeIntegrity &&
+    runtimeIntegrity.status !== 'ready' &&
+    capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)
+  ) {
+    throw new ControlError(
+      'protocol.runtime_command_capability_mismatch',
+      'The host advertised command execution before its reported runtime was ready.',
+    )
+  }
+  const runtimeReadiness: HostRuntimeReadiness = runtimeIntegrity
+    ? { kind: 'reported', hostId, hostdVersion, startedAt, observedAt, snapshot: runtimeIntegrity }
+    : { kind: 'not_reported', hostId, hostdVersion, startedAt, observedAt }
+  return {
+    hostId,
+    capabilities,
+    runtimeReadiness,
+    lineage: {
+      hostId,
+      hostdVersion,
+      startedAt,
+      reportsRuntimeIntegrity,
+      ...(runtimeIntegrity
+        ? {
+            runtimeContractVersion: runtimeIntegrity.contractVersion,
+            runtimeTrustAnchorId: runtimeIntegrity.trustAnchorId,
+            runtimeTargetKey: JSON.stringify(runtimeIntegrity.target),
+          }
+        : {}),
+    },
+  }
 }
 
 function capabilitiesFromHealth(value: unknown): string[] {
@@ -1208,6 +1407,49 @@ function capabilitiesFromHealth(value: unknown): string[] {
     return parsed.success ? [parsed.data] : []
   })
   return [...new Set(capabilities)].sort()
+}
+
+function assertSameHealthLineage(expected: HealthLineage, received: HealthLineage): void {
+  const changedField = (
+    [
+      'hostId',
+      'hostdVersion',
+      'startedAt',
+      'reportsRuntimeIntegrity',
+      'runtimeContractVersion',
+      'runtimeTrustAnchorId',
+      'runtimeTargetKey',
+    ] as const
+  ).find((field) => expected[field] !== received[field])
+  if (!changedField) return
+  throw new ControlError(
+    'protocol.health_lineage_changed',
+    'The host health lineage changed on an established connection.',
+    { retryable: true, details: { field: changedField } },
+  )
+}
+
+function runtimeReadinessSemanticKey(readiness: HostRuntimeReadiness | undefined): string {
+  if (!readiness) return ''
+  const { observedAt: _observedAt, ...semantic } = readiness
+  if (semantic.kind === 'reported') {
+    const { changedAt: _changedAt, ...snapshot } = semantic.snapshot
+    return JSON.stringify({ ...semantic, snapshot })
+  }
+  return JSON.stringify(semantic)
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function boundedHealthString(value: unknown, maxLength: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength ? value : undefined
+}
+
+function healthTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 64 || !Number.isFinite(Date.parse(value))) return undefined
+  return value
 }
 
 function snapshotEventForAuthority(value: unknown, hostId: string): unknown {

@@ -145,6 +145,72 @@ describe('DesktopControlService recovery', () => {
     })
   })
 
+  it('leaves a live same-target connection and its health poll intact when attempt persistence fails', async () => {
+    const directory = await createUserData({})
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    const internals = service as unknown as {
+      cache: { update: (...args: unknown[]) => Promise<unknown> }
+      healthPollTimer?: NodeJS.Timeout
+      reconnectGeneration: number
+    }
+    const originalTimer = internals.healthPollTimer
+    const originalGeneration = internals.reconnectGeneration
+    internals.cache.update = vi.fn(async () => { throw new Error('Attempt write failed') })
+
+    await expect(service.connect({ kind: 'local' })).rejects.toThrow('Attempt write failed')
+
+    expect(connection.isClosed).toBe(false)
+    expect(internals.healthPollTimer).toBe(originalTimer)
+    expect(internals.reconnectGeneration).toBe(originalGeneration)
+    expect(service.getConnectionState()).toMatchObject({
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-a',
+      capabilities: ['prime_agent_commands_v1'],
+    })
+    await service.disconnect()
+  })
+
+  it('leaves the previous target authoritative when a target-switch attempt cannot persist', async () => {
+    const directory = await createUserData({})
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    ;(service as unknown as { discoveredAliases: Set<string> }).discoveredAliases.add('remote')
+    const internals = service as unknown as {
+      cache: { update: (...args: unknown[]) => Promise<unknown> }
+      healthPollTimer?: NodeJS.Timeout
+      reconnectGeneration: number
+    }
+    const originalTimer = internals.healthPollTimer
+    const originalGeneration = internals.reconnectGeneration
+    internals.cache.update = vi.fn(async () => { throw new Error('Attempt write failed') })
+
+    await expect(service.connect({ kind: 'ssh', alias: 'remote' })).rejects.toThrow('Attempt write failed')
+
+    expect(connectSshHost).not.toHaveBeenCalled()
+    expect(connection.isClosed).toBe(false)
+    expect(internals.healthPollTimer).toBe(originalTimer)
+    expect(internals.reconnectGeneration).toBe(originalGeneration)
+    expect(service.getConnectionState()).toMatchObject({
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-a',
+      capabilities: ['prime_agent_commands_v1'],
+    })
+    await service.disconnect()
+  })
+
   it('replays only explicitly queued follow-ups the host marks unknown for the exact identity', async () => {
     const replayable = followUp('device-a', 'replay-me')
     const uncertain = followUp('device-a', 'uncertain-command')
@@ -841,8 +907,16 @@ function waiting(command: ClientCommand): OutboxEntry {
   return { hostId: command.expectedHostId, command, state: 'waiting_for_connection', updatedAt: timestamp }
 }
 
-function health(hostId = 'host-a'): { host: { hostId: string } } {
-  return { host: { hostId } }
+function health(hostId = 'host-a') {
+  return {
+    protocolVersion: 1,
+    hostdVersion: '0.1.0',
+    startedAt: '2026-08-05T11:59:00.000Z',
+    checkedAt: timestamp,
+    serviceState: 'ready',
+    host: { hostId },
+    capabilities: ['prime_agent_commands_v1'],
+  }
 }
 
 function catalog(hostId = 'host-a') {
