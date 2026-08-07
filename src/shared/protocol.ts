@@ -43,6 +43,8 @@ export const CapabilitySchema = z
   .max(96)
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
 
+export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
+
 export const IsoDateTimeSchema = z
   .string()
   .min(20)
@@ -834,17 +836,118 @@ export const HostIdentityReadinessSchema = z.discriminatedUnion("state", [
 ]);
 export type HostIdentityReadiness = z.infer<typeof HostIdentityReadinessSchema>;
 
-export const HealthSnapshotSchema = z.object({
-  protocolVersion: z.literal(PROTOCOL_VERSION),
-  hostdVersion: z.string().min(1).max(64),
-  startedAt: IsoDateTimeSchema,
-  checkedAt: IsoDateTimeSchema,
-  serviceState: z.enum(["starting", "ready", "degraded"]),
-  host: HostSummarySchema,
-  capabilities: z.array(CapabilitySchema).max(128),
-  /** Optional in protocol v1 so new desktops remain compatible with old hostd. */
-  pairingIdentity: HostIdentityReadinessSchema.optional(),
-});
+const RuntimeIntegrityIdentityPartSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9._:+-]*$/,
+    "Runtime identity fields must be bounded path-free identifiers",
+  );
+const RuntimeIntegrityDigestSchema = z.string().length(64).regex(/^[a-f0-9]{64}$/);
+const RuntimeIntegrityTrustAnchorIdSchema = RuntimeIntegrityDigestSchema;
+
+export const RuntimeIntegrityTargetSchema = z
+  .object({
+    runtime: z.literal("prime-agent"),
+    releaseVersion: RuntimeIntegrityIdentityPartSchema,
+    runtimeBuildId: RuntimeIntegrityIdentityPartSchema,
+    platform: RuntimeIntegrityIdentityPartSchema,
+    arch: RuntimeIntegrityIdentityPartSchema,
+    manifestSha256: RuntimeIntegrityDigestSchema,
+    treeSha256: RuntimeIntegrityDigestSchema,
+    filesSha256: RuntimeIntegrityDigestSchema,
+  })
+  .strict();
+export type RuntimeIntegrityTarget = z.infer<typeof RuntimeIntegrityTargetSchema>;
+
+const RuntimeIntegritySnapshotBase = {
+  contractVersion: z.literal(1),
+  changedAt: IsoDateTimeSchema,
+  trustAnchorId: RuntimeIntegrityTrustAnchorIdSchema,
+  target: RuntimeIntegrityTargetSchema,
+};
+const RuntimeIntegrityFailureDetail = {
+  code: z.string().min(1).max(64).regex(/^[A-Z][A-Z0-9_]*$/),
+  retryable: z.boolean(),
+  recoveryAction: z.string().min(1).max(64).regex(/^[a-z][a-z0-9_]*$/),
+};
+
+/**
+ * Public integrity readiness only. It deliberately contains no install paths,
+ * raw errors, runtime handles, or claims that Prime Agent can execute work.
+ */
+export const RuntimeIntegritySnapshotSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      ...RuntimeIntegritySnapshotBase,
+      status: z.literal("initializing"),
+      phase: z.enum(["preparing", "validating_seed", "copying", "verifying", "publishing"]),
+      attempt: z.number().int().min(1).max(32),
+    })
+    .strict(),
+  z
+    .object({
+      ...RuntimeIntegritySnapshotBase,
+      status: z.literal("ready"),
+      assurance: z.enum(["development-integrity", "production-authenticated"]),
+    })
+    .strict(),
+  z
+    .object({
+      ...RuntimeIntegritySnapshotBase,
+      ...RuntimeIntegrityFailureDetail,
+      status: z.literal("failed"),
+    })
+    .strict(),
+  z
+    .object({
+      ...RuntimeIntegritySnapshotBase,
+      ...RuntimeIntegrityFailureDetail,
+      status: z.literal("unavailable"),
+    })
+    .strict(),
+]);
+export type RuntimeIntegritySnapshot = z.infer<typeof RuntimeIntegritySnapshotSchema>;
+
+export const HealthSnapshotSchema = z
+  .object({
+    protocolVersion: z.literal(PROTOCOL_VERSION),
+    hostdVersion: z.string().min(1).max(64),
+    startedAt: IsoDateTimeSchema,
+    checkedAt: IsoDateTimeSchema,
+    serviceState: z.enum(["starting", "ready", "degraded"]),
+    host: HostSummarySchema,
+    capabilities: z.array(CapabilitySchema).max(128),
+    /** Optional in protocol v1 so new desktops remain compatible with old hostd. */
+    pairingIdentity: HostIdentityReadinessSchema.optional(),
+    /** Optional in protocol v1 so new desktops remain compatible with old hostd. */
+    runtimeIntegrity: RuntimeIntegritySnapshotSchema.optional(),
+  })
+  .superRefine((health, context) => {
+    const advertisesRuntimeIntegrity = health.capabilities.includes(RUNTIME_INTEGRITY_CAPABILITY);
+    const includesRuntimeIntegrity = health.runtimeIntegrity !== undefined;
+    if (advertisesRuntimeIntegrity !== includesRuntimeIntegrity) {
+      context.addIssue({
+        code: "custom",
+        path: advertisesRuntimeIntegrity ? ["runtimeIntegrity"] : ["capabilities"],
+        message: `${RUNTIME_INTEGRITY_CAPABILITY} must be advertised if and only if runtimeIntegrity is present`,
+      });
+    }
+    if (!health.runtimeIntegrity) return;
+    const expectedServiceState = health.runtimeIntegrity.status === "initializing"
+      ? "starting"
+      : health.runtimeIntegrity.status === "ready"
+        ? "ready"
+        : "degraded";
+    if (health.serviceState !== expectedServiceState) {
+      context.addIssue({
+        code: "custom",
+        path: ["serviceState"],
+        message: `serviceState must be ${expectedServiceState} while runtime integrity is ${health.runtimeIntegrity.status}`,
+      });
+    }
+  });
 export type HealthSnapshot = z.infer<typeof HealthSnapshotSchema>;
 
 export const ProbeToolStatusSchema = z.object({

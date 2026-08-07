@@ -17,6 +17,10 @@ import {
   atomicWriteJson,
   ensurePrivateDirectory,
 } from "./atomic-files";
+import {
+  HostOwnershipPublicationAmbiguousError,
+  type HostOwnershipLease,
+} from "./ownership-lease";
 import { getHostDataPaths, type HostDataPaths } from "./paths";
 import type { EmbeddedRuntimeAttestation } from "./runtime-attestation";
 
@@ -29,6 +33,8 @@ const RUNTIME_FILE_CONCURRENCY = 16;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const WINDOWS_SHORT_NAME_PATTERN = /~[0-9]+(?:\.[^.]*)?$/i;
+const TRANSIENT_RUNTIME_FILESYSTEM_CODES = new Set(["EACCES", "EAGAIN", "EBUSY", "EMFILE", "ENFILE", "EPERM"]);
+const REPAIR_REQUIRED_RUNTIME_FILESYSTEM_CODES = new Set(["EISDIR", "ENOENT", "ENOTDIR"]);
 
 const Sha256Schema = z.string().regex(SHA256_PATTERN);
 const BoundedStringSchema = z.string().min(1).max(4_096).refine((value) => !/[\0\r\n]/.test(value));
@@ -141,9 +147,85 @@ export interface InstalledRuntimeIntegrityIdentity extends InstalledPointer {
   readonly totalBytes: number;
 }
 
+export const RUNTIME_INTEGRITY_CANCELLED = "RUNTIME_INTEGRITY_CANCELLED" as const;
+
+export class RuntimeIntegrityCancelledError extends Error {
+  readonly code = RUNTIME_INTEGRITY_CANCELLED;
+
+  constructor(options?: ErrorOptions) {
+    super("Runtime integrity work was cancelled", options);
+    this.name = "RuntimeIntegrityCancelledError";
+  }
+}
+
+export class RuntimeIntegrityPublicationPoisonedError extends Error {
+  readonly code = "RUNTIME_INTEGRITY_PUBLICATION_POISONED" as const;
+  readonly generation: string;
+
+  constructor(generation: string, cause: Error) {
+    super("Runtime integrity publication is poisoned until endpoint ownership is reacquired", { cause });
+    this.name = "RuntimeIntegrityPublicationPoisonedError";
+    this.generation = generation;
+  }
+}
+
+export class RuntimeIntegrityInstalledCorruptionError extends Error {
+  readonly code = "RUNTIME_INSTALLED_CORRUPTION" as const;
+
+  constructor(cause: Error) {
+    super("The installed runtime image failed integrity verification", { cause });
+    this.name = "RuntimeIntegrityInstalledCorruptionError";
+  }
+}
+
+export class RuntimeIntegrityTransientVerificationError extends Error {
+  readonly code = "RUNTIME_TRANSIENT_VERIFICATION" as const;
+  readonly reason: "filesystem_contention" | "final_disappeared";
+
+  constructor(reason: "filesystem_contention" | "final_disappeared", cause: Error) {
+    super(
+      reason === "filesystem_contention"
+        ? "Installed runtime verification encountered transient filesystem contention"
+        : "The installed runtime disappeared during its final verification",
+      { cause },
+    );
+    this.name = "RuntimeIntegrityTransientVerificationError";
+    this.reason = reason;
+  }
+}
+
+export type RuntimeIntegrityRepairReason =
+  | "installed_pointer_invalid"
+  | "packaged_seed_unavailable"
+  | "packaged_seed_invalid";
+
+export class RuntimeIntegrityRepairRequiredError extends Error {
+  readonly code = "RUNTIME_REPAIR_REQUIRED" as const;
+  readonly reason: RuntimeIntegrityRepairReason;
+
+  constructor(reason: RuntimeIntegrityRepairReason, cause: Error) {
+    const message = reason === "installed_pointer_invalid"
+      ? "The installed runtime pointer requires application repair"
+      : reason === "packaged_seed_unavailable"
+        ? "The packaged runtime seed is unavailable and requires application repair"
+        : "The packaged runtime seed failed integrity validation and requires application repair";
+    super(message, { cause });
+    this.name = "RuntimeIntegrityRepairRequiredError";
+    this.reason = reason;
+  }
+}
+
+export type RuntimeIntegrityProgressPhase =
+  | "preparing"
+  | "validating_seed"
+  | "copying"
+  | "verifying"
+  | "publishing";
+
 export type RuntimeIntegrityFaultPoint =
   | "before_copy"
   | "after_copy"
+  | "before_final_verify"
   | "before_final_rename"
   | "after_final_rename"
   | "before_pointer_write"
@@ -152,9 +234,11 @@ export type RuntimeIntegrityFaultPoint =
 export interface RuntimeIntegrityManagerOptions {
   readonly paths: HostDataPaths;
   readonly attestation: EmbeddedRuntimeAttestation;
+  readonly ownershipLease: HostOwnershipLease;
   readonly hostRuntime?: RuntimeHostIdentity;
   readonly faultInjector?: (point: RuntimeIntegrityFaultPoint) => void | Promise<void>;
   readonly writeCurrent?: (path: string, value: InstalledPointer) => Promise<void>;
+  readonly onProgress?: (phase: RuntimeIntegrityProgressPhase) => void;
 }
 
 interface RuntimeFileEntry {
@@ -176,9 +260,12 @@ export class RuntimeIntegrityManager {
   private readonly paths: HostDataPaths;
   private readonly attestation: EmbeddedRuntimeAttestation;
   private readonly hostRuntime: RuntimeHostIdentity;
+  private readonly ownershipLease: HostOwnershipLease;
   private readonly faultInjector?: RuntimeIntegrityManagerOptions["faultInjector"];
   private readonly writeCurrent: NonNullable<RuntimeIntegrityManagerOptions["writeCurrent"]>;
+  private readonly onProgress?: RuntimeIntegrityManagerOptions["onProgress"];
   private ensurePromise?: Promise<InstalledRuntimeIntegrityIdentity>;
+  private publicationPoison?: RuntimeIntegrityPublicationPoisonedError;
 
   constructor(options: RuntimeIntegrityManagerOptions) {
     const canonicalPaths = getHostDataPaths(options.paths.root);
@@ -189,9 +276,11 @@ export class RuntimeIntegrityManager {
     }
     this.paths = Object.freeze(canonicalPaths);
     this.attestation = options.attestation;
+    this.ownershipLease = options.ownershipLease;
     this.hostRuntime = options.hostRuntime ?? currentRuntimeHostIdentity();
     this.faultInjector = options.faultInjector;
     this.writeCurrent = options.writeCurrent ?? ((path, value) => atomicWriteJson(path, value));
+    this.onProgress = options.onProgress;
     assertHostRuntime(this.hostRuntime, this.attestation);
     if (this.attestation.assurance !== "development-integrity") {
       throw new Error("The unsigned runtime integrity manager refuses production-authenticated claims");
@@ -199,6 +288,7 @@ export class RuntimeIntegrityManager {
   }
 
   ensureInstalled(seedRoot?: string): Promise<InstalledRuntimeIntegrityIdentity> {
+    if (this.publicationPoison) return Promise.reject(this.publicationPoison);
     if (this.ensurePromise) return this.ensurePromise;
     const attempt = this.ensureInstalledOnce(seedRoot);
     this.ensurePromise = attempt;
@@ -214,25 +304,54 @@ export class RuntimeIntegrityManager {
   }
 
   async verifyInstalled(): Promise<InstalledRuntimeIntegrityIdentity> {
+    this.assertManagerUsable();
+    await this.ownershipLease.assertActive();
+    throwIfRuntimeIntegrityCancelled(this.ownershipLease.signal);
+    this.reportProgress("verifying");
+    return await this.verifyInstalledUnderLease();
+  }
+
+  private async verifyInstalledUnderLease(): Promise<InstalledRuntimeIntegrityIdentity> {
+    const signal = this.ownershipLease.signal;
     const expectedPointer = installedPointerFromAttestation(this.attestation);
-    const pointer = await readRequiredJson(this.paths.runtimeCurrent, InstalledPointerSchema, MAX_RUNTIME_POINTER_BYTES);
+    const pointer = await readRequiredJson(
+      this.paths.runtimeCurrent,
+      InstalledPointerSchema,
+      MAX_RUNTIME_POINTER_BYTES,
+      signal,
+    );
     if (!jsonEqual(pointer, expectedPointer)) {
       throw new Error("Installed runtime pointer belongs to a different runtime image");
     }
-    const verified = await verifyRuntimeDirectory(this.finalDirectory(), this.attestation);
+    const verified = await this.verifyFinalDirectory(this.finalDirectory(), signal);
+    throwIfRuntimeIntegrityCancelled(signal);
+    await this.ownershipLease.assertActive();
+    throwIfRuntimeIntegrityCancelled(signal);
     return this.identity(expectedPointer, verified.manifest);
   }
 
   private async ensureInstalledOnce(seedRoot?: string): Promise<InstalledRuntimeIntegrityIdentity> {
-    await this.prepareRuntimeDirectories();
+    this.assertManagerUsable();
+    await this.ownershipLease.assertActive();
+    const signal = this.ownershipLease.signal;
+    throwIfRuntimeIntegrityCancelled(signal);
+    this.reportProgress("preparing");
+    throwIfRuntimeIntegrityCancelled(signal);
+    await this.prepareRuntimeDirectories(signal);
     const expectedPointer = installedPointerFromAttestation(this.attestation);
     const finalDirectory = this.finalDirectory();
     let existingPointer: InstalledPointer | undefined;
     try {
-      existingPointer = await readOptionalJson(this.paths.runtimeCurrent, InstalledPointerSchema);
+      existingPointer = await readOptionalJson(this.paths.runtimeCurrent, InstalledPointerSchema, signal);
     } catch (error) {
-      throw new Error("Installed runtime pointer is malformed or unreadable", { cause: error });
+      throw classifyRuntimeRepairFailure(
+        "installed_pointer_invalid",
+        error,
+        "Installed runtime pointer is malformed or unreadable",
+      );
     }
+    this.reportProgress("verifying");
+    throwIfRuntimeIntegrityCancelled(signal);
     if (existingPointer) {
       if (!jsonEqual(existingPointer, expectedPointer)) {
         // This unsigned development-integrity checkpoint cannot distinguish a
@@ -241,76 +360,139 @@ export class RuntimeIntegrityManager {
         // already-verified exact image or seed may authorize the new identity.
         // Authenticated releases must bind allowed predecessor identities in
         // signed updater metadata.
-        if (await entryExists(finalDirectory)) {
-          await verifyRuntimeDirectory(finalDirectory, this.attestation);
+        if (await entryExists(finalDirectory, signal)) {
+          await this.verifyFinalDirectory(finalDirectory, signal);
+          await this.publishCurrentPointer(expectedPointer);
         } else {
-          if (!seedRoot) throw new Error("Installed runtime pointer belongs to a different runtime image and no attested rollover seed is available");
-          const sourceDirectory = await this.resolveAndValidateSeed(seedRoot);
-          await this.promoteSeed(sourceDirectory, finalDirectory);
+          if (!seedRoot) {
+            throw new RuntimeIntegrityRepairRequiredError(
+              "packaged_seed_unavailable",
+              new Error("Installed runtime pointer belongs to a different runtime image and no attested rollover seed is available"),
+            );
+          }
+          const sourceDirectory = await this.resolveAndValidateSeed(seedRoot, signal);
+          await this.promoteSeed(sourceDirectory, finalDirectory, expectedPointer);
         }
-        await this.publishCurrentPointer(expectedPointer);
-        return await this.verifyInstalled();
+        return await this.verifyInstalledUnderLease();
       }
       let verified: { manifest: RuntimeManifest };
       try {
-        verified = await verifyRuntimeDirectory(finalDirectory, this.attestation);
+        verified = await this.verifyFinalDirectory(finalDirectory, signal);
       } catch (error) {
         // Windows cannot durably flush directory renames through Node. If a
         // trusted pointer survived power loss but its content-addressed final
         // did not, the still-attested packaged seed can recreate only that
         // missing identity. A present-but-corrupt final is never overwritten.
-        if (await entryExists(finalDirectory)) throw error;
-        if (!seedRoot) throw new Error("Installed runtime image is missing and no attested recovery seed is available", { cause: error });
-        const sourceDirectory = await this.resolveAndValidateSeed(seedRoot);
+        if (
+          error instanceof RuntimeIntegrityCancelledError ||
+          error instanceof RuntimeIntegrityInstalledCorruptionError ||
+          (error instanceof RuntimeIntegrityTransientVerificationError && error.reason === "filesystem_contention")
+        ) {
+          throw error;
+        }
+        const filesystemCode = firstErrorCodeInChain(error);
+        if (
+          !(error instanceof RuntimeIntegrityTransientVerificationError) &&
+          filesystemCode !== undefined &&
+          !REPAIR_REQUIRED_RUNTIME_FILESYSTEM_CODES.has(filesystemCode)
+        ) {
+          // A coded OS fault outside the closed repair-required set is not
+          // evidence that either the installed image or packaged seed is bad.
+          throw error;
+        }
+        if (
+          !(error instanceof RuntimeIntegrityTransientVerificationError) ||
+          error.reason !== "final_disappeared"
+        ) {
+          // Recovery is authorized only when verification established that the
+          // exact final disappeared. Unclassified failures retain their type.
+          throw error;
+        }
+        if (!seedRoot) {
+          throw new RuntimeIntegrityRepairRequiredError(
+            "packaged_seed_unavailable",
+            new Error("Installed runtime image is missing and no attested recovery seed is available", { cause: error }),
+          );
+        }
+        const sourceDirectory = await this.resolveAndValidateSeed(seedRoot, signal);
         await this.promoteSeed(sourceDirectory, finalDirectory);
-        verified = await verifyRuntimeDirectory(finalDirectory, this.attestation);
+        verified = await this.verifyFinalDirectory(finalDirectory, signal);
       }
+      throwIfRuntimeIntegrityCancelled(signal);
+      await this.ownershipLease.assertActive();
+      throwIfRuntimeIntegrityCancelled(signal);
       return this.identity(expectedPointer, verified.manifest);
     }
 
-    if (await entryExists(finalDirectory)) {
-      await verifyRuntimeDirectory(finalDirectory, this.attestation);
+    if (await entryExists(finalDirectory, signal)) {
+      await this.verifyFinalDirectory(finalDirectory, signal);
+      await this.publishCurrentPointer(expectedPointer);
     } else {
-      if (!seedRoot) throw new Error("No installed runtime or packaged runtime seed is available");
-      const sourceDirectory = await this.resolveAndValidateSeed(seedRoot);
-      await this.promoteSeed(sourceDirectory, finalDirectory);
+      if (!seedRoot) {
+        throw new RuntimeIntegrityRepairRequiredError(
+          "packaged_seed_unavailable",
+          new Error("No installed runtime or packaged runtime seed is available"),
+        );
+      }
+      const sourceDirectory = await this.resolveAndValidateSeed(seedRoot, signal);
+      await this.promoteSeed(sourceDirectory, finalDirectory, expectedPointer);
     }
 
-    await this.publishCurrentPointer(expectedPointer);
-    return await this.verifyInstalled();
+    return await this.verifyInstalledUnderLease();
   }
 
-  private async prepareRuntimeDirectories(): Promise<void> {
+  private async prepareRuntimeDirectories(signal: AbortSignal): Promise<void> {
     for (const directory of [this.paths.runtime, this.paths.runtimeInstalls, this.paths.runtimeStaging]) {
+      throwIfRuntimeIntegrityCancelled(signal);
       await ensurePrivateDirectory(directory);
-      await assertPlainDirectory(directory, "host runtime directory");
+      throwIfRuntimeIntegrityCancelled(signal);
+      await assertPlainDirectory(directory, "host runtime directory", signal);
       assertContainedPath(this.paths.root, directory, "host runtime directory");
     }
-    await cleanupAbandonedStaging(this.paths.runtimeStaging);
+    await cleanupAbandonedStaging(this.paths.runtimeStaging, signal);
   }
 
-  private async resolveAndValidateSeed(seedRoot: string): Promise<string> {
+  private async resolveAndValidateSeed(seedRoot: string, signal: AbortSignal): Promise<string> {
+    try {
+      return await this.resolveAndValidateSeedUnchecked(seedRoot, signal);
+    } catch (error) {
+      throw classifyRuntimeRepairFailure(
+        errorCodeInChain(error, "ENOENT") ? "packaged_seed_unavailable" : "packaged_seed_invalid",
+        error,
+        "Packaged runtime seed validation failed",
+      );
+    }
+  }
+
+  private async resolveAndValidateSeedUnchecked(seedRoot: string, signal: AbortSignal): Promise<string> {
+    this.reportProgress("validating_seed");
+    throwIfRuntimeIntegrityCancelled(signal);
     if (!isAbsolute(seedRoot) || seedRoot.length > 4_096 || /[\0\r\n]/.test(seedRoot)) {
       throw new Error("Runtime seed root must be a bounded absolute path");
     }
     const root = resolve(seedRoot);
-    await assertPlainDirectory(root, "runtime seed root");
+    await assertPlainDirectory(root, "runtime seed root", signal);
     const segments = this.attestation.manifest.relativePath.split("/");
     if (segments.length !== 3 || segments[0] !== "installs" || segments[2] !== "runtime.json") {
       throw new Error("Embedded runtime attestation has an unsupported seed locator");
     }
     const installName = segments[1];
     if (!installName || !isSafeRuntimePath(installName)) throw new Error("Runtime seed install name is unsafe");
-    const topLevel = await readPlainDirectory(root, "runtime seed root");
+    const topLevel = await readPlainDirectory(root, "runtime seed root", signal);
     assertDirectoryNames(topLevel, ["current.json", "installs"], "runtime seed root");
     const installs = join(root, "installs");
-    await assertPlainDirectory(installs, "runtime seed installs directory");
-    const installEntries = await readPlainDirectory(installs, "runtime seed installs directory");
+    await assertPlainDirectory(installs, "runtime seed installs directory", signal);
+    const installEntries = await readPlainDirectory(installs, "runtime seed installs directory", signal);
     assertDirectoryNames(installEntries, [installName], "runtime seed installs directory");
     const sourceDirectory = join(installs, installName);
-    await assertPlainDirectory(sourceDirectory, "runtime seed image");
+    await assertPlainDirectory(sourceDirectory, "runtime seed image", signal);
 
-    const seedPointer = await readRequiredJson(join(root, "current.json"), SeedPointerSchema, MAX_RUNTIME_POINTER_BYTES);
+    const seedPointer = await readRequiredJson(
+      join(root, "current.json"),
+      SeedPointerSchema,
+      MAX_RUNTIME_POINTER_BYTES,
+      signal,
+    );
     const expectedSeedPointer = {
       schemaVersion: 1,
       releaseVersion: this.attestation.runtime.releaseVersion,
@@ -326,35 +508,121 @@ export class RuntimeIntegrityManager {
     return sourceDirectory;
   }
 
-  private async promoteSeed(sourceDirectory: string, finalDirectory: string): Promise<void> {
+  private async verifyFinalDirectory(
+    finalDirectory: string,
+    signal: AbortSignal,
+  ): Promise<{ manifest: RuntimeManifest }> {
+    try {
+      await this.faultInjector?.("before_final_verify");
+      return await verifyRuntimeDirectory(finalDirectory, this.attestation, undefined, signal);
+    } catch (error) {
+      const cause = asError(error, "Installed runtime verification failed");
+      if (error instanceof RuntimeIntegrityCancelledError) throw error;
+      if (isTransientRuntimeFilesystemError(error)) {
+        throw new RuntimeIntegrityTransientVerificationError("filesystem_contention", cause);
+      }
+      let finalExists: boolean;
+      try {
+        finalExists = await entryExists(finalDirectory, signal);
+      } catch (inspectionError) {
+        if (inspectionError instanceof RuntimeIntegrityCancelledError) throw inspectionError;
+        if (isTransientRuntimeFilesystemError(inspectionError)) {
+          throw new RuntimeIntegrityTransientVerificationError(
+            "filesystem_contention",
+            asError(inspectionError, "Installed runtime presence check encountered filesystem contention"),
+          );
+        }
+        throw inspectionError;
+      }
+      if (finalExists) {
+        // Unknown coded OS failures say the verifier could not establish
+        // integrity. The closed structural set is different: against a
+        // still-present root, it means required runtime topology is corrupt.
+        const filesystemCode = firstErrorCodeInChain(error);
+        if (
+          filesystemCode !== undefined &&
+          !REPAIR_REQUIRED_RUNTIME_FILESYSTEM_CODES.has(filesystemCode)
+        ) {
+          throw cause;
+        }
+        throw new RuntimeIntegrityInstalledCorruptionError(cause);
+      }
+      // A final that disappeared between publication and the pre-use check is
+      // recoverable from the same attested seed on one complete retry.
+      throw new RuntimeIntegrityTransientVerificationError("final_disappeared", cause);
+    }
+  }
+
+  private async promoteSeed(
+    sourceDirectory: string,
+    finalDirectory: string,
+    pointer?: InstalledPointer,
+  ): Promise<void> {
+    const signal = this.ownershipLease.signal;
+    throwIfRuntimeIntegrityCancelled(signal);
     const stagingDirectory = await mkdtemp(join(this.paths.runtimeStaging, "image-"));
     assertContainedPath(this.paths.runtimeStaging, stagingDirectory, "runtime staging directory");
     let published = false;
     try {
+      this.reportProgress("copying");
+      throwIfRuntimeIntegrityCancelled(signal);
       await this.faultInjector?.("before_copy");
-      await verifyRuntimeDirectory(sourceDirectory, this.attestation, stagingDirectory);
+      throwIfRuntimeIntegrityCancelled(signal);
+      try {
+        await verifyRuntimeDirectory(sourceDirectory, this.attestation, stagingDirectory, signal);
+      } catch (error) {
+        throw classifyRuntimeRepairFailure(
+          errorCodeInChain(error, "ENOENT") ? "packaged_seed_unavailable" : "packaged_seed_invalid",
+          error,
+          "Packaged runtime payload verification failed",
+        );
+      }
       await this.faultInjector?.("after_copy");
-      await verifyRuntimeDirectory(stagingDirectory, this.attestation);
+      throwIfRuntimeIntegrityCancelled(signal);
+      this.reportProgress("verifying");
+      throwIfRuntimeIntegrityCancelled(signal);
+      await verifyRuntimeDirectory(stagingDirectory, this.attestation, undefined, signal);
 
-      if (await entryExists(finalDirectory)) {
-        await verifyRuntimeDirectory(finalDirectory, this.attestation);
+      if (await entryExists(finalDirectory, signal)) {
+        await this.verifyFinalDirectory(finalDirectory, signal);
+        if (pointer) await this.publishCurrentPointer(pointer);
         return;
       }
 
       await this.faultInjector?.("before_final_rename");
-      try {
-        await rename(stagingDirectory, finalDirectory);
-        published = true;
-        await syncParentDirectory(stagingDirectory);
-        await syncParentDirectory(finalDirectory);
-        await this.faultInjector?.("after_final_rename");
-      } catch (error) {
-        if (published) throw new AtomicWriteAmbiguousCommitError(finalDirectory, error);
-        if (isPublicationConflict(error)) {
-          await verifyRuntimeDirectory(finalDirectory, this.attestation);
-          return;
+      throwIfRuntimeIntegrityCancelled(signal);
+      this.reportProgress("publishing");
+      throwIfRuntimeIntegrityCancelled(signal);
+      const outcome = await this.withPublicationPermit(async (): Promise<PublicationOutcome> => {
+        // Cancellation is deliberately not observed after permit admission.
+        if (await entryExists(finalDirectory)) return { kind: "retained" };
+        try {
+          await rename(stagingDirectory, finalDirectory);
+          published = true;
+        } catch (error) {
+          return { kind: "failed", error: asError(error, "Runtime final publication failed") };
         }
-        throw error;
+
+        try {
+          await syncParentDirectory(stagingDirectory);
+          await syncParentDirectory(finalDirectory);
+          await this.faultInjector?.("after_final_rename");
+        } catch (error) {
+          throw new AtomicWriteAmbiguousCommitError(finalDirectory, error);
+        }
+
+        if (pointer) {
+          const pointerOutcome = await this.writeCurrentWithinPermit(pointer);
+          if (pointerOutcome) return pointerOutcome;
+        }
+        return { kind: "published" };
+      });
+
+      if (outcome.kind === "failed") throw outcome.error;
+      if (outcome.kind === "retained") {
+        throwIfRuntimeIntegrityCancelled(signal);
+        await this.verifyFinalDirectory(finalDirectory, signal);
+        if (pointer) await this.publishCurrentPointer(pointer);
       }
     } finally {
       if (!published) await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -362,12 +630,63 @@ export class RuntimeIntegrityManager {
   }
 
   private async publishCurrentPointer(pointer: InstalledPointer): Promise<void> {
-    await this.faultInjector?.("before_pointer_write");
-    await this.writeCurrent(this.paths.runtimeCurrent, pointer);
+    const signal = this.ownershipLease.signal;
+    throwIfRuntimeIntegrityCancelled(signal);
+    this.reportProgress("publishing");
+    throwIfRuntimeIntegrityCancelled(signal);
+    const outcome = await this.withPublicationPermit(async (): Promise<PublicationOutcome> => {
+      // Cancellation is deliberately not observed after permit admission.
+      const pointerOutcome = await this.writeCurrentWithinPermit(pointer);
+      return pointerOutcome ?? { kind: "published" };
+    });
+    if (outcome.kind === "failed") throw outcome.error;
+  }
+
+  private async writeCurrentWithinPermit(pointer: InstalledPointer): Promise<PublicationOutcome | undefined> {
+    let pointerWritten = false;
     try {
+      await this.faultInjector?.("before_pointer_write");
+      await this.writeCurrent(this.paths.runtimeCurrent, pointer);
+      pointerWritten = true;
       await this.faultInjector?.("after_pointer_write");
     } catch (error) {
-      throw new AtomicWriteAmbiguousCommitError(this.paths.runtimeCurrent, error);
+      if (error instanceof AtomicWriteAmbiguousCommitError) throw error;
+      if (pointerWritten) throw new AtomicWriteAmbiguousCommitError(this.paths.runtimeCurrent, error);
+      return { kind: "failed", error: asError(error, "Runtime pointer publication failed") };
+    }
+    return undefined;
+  }
+
+  private async withPublicationPermit<T>(publish: () => Promise<T>): Promise<T> {
+    try {
+      return await this.ownershipLease.withPublicationPermit(publish);
+    } catch (error) {
+      if (isPublicationUncertain(error)) {
+        this.poisonPublication(asError(error, "Runtime publication became uncertain"));
+      }
+      throw error;
+    }
+  }
+
+  private poisonPublication(cause: Error): void {
+    if (!this.publicationPoison) {
+      this.publicationPoison = new RuntimeIntegrityPublicationPoisonedError(
+        this.ownershipLease.generation,
+        cause,
+      );
+    }
+    this.ownershipLease.poisonPublication(cause);
+  }
+
+  private assertManagerUsable(): void {
+    if (this.publicationPoison) throw this.publicationPoison;
+  }
+
+  private reportProgress(phase: RuntimeIntegrityProgressPhase): void {
+    try {
+      this.onProgress?.(phase);
+    } catch {
+      // Progress is diagnostic-only and cannot alter integrity behavior.
     }
   }
 
@@ -386,6 +705,51 @@ export class RuntimeIntegrityManager {
       totalBytes: manifest.tree.totalBytes,
     });
   }
+}
+
+type PublicationOutcome =
+  | { readonly kind: "published" }
+  | { readonly kind: "retained" }
+  | { readonly kind: "failed"; readonly error: Error };
+
+function isPublicationUncertain(error: unknown): boolean {
+  return error instanceof AtomicWriteAmbiguousCommitError ||
+    error instanceof HostOwnershipPublicationAmbiguousError ||
+    isErrorCode(error, "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN");
+}
+
+function asError(error: unknown, message: string): Error {
+  return error instanceof Error ? error : new Error(message, { cause: error });
+}
+
+function classifyRuntimeRepairFailure(
+  reason: RuntimeIntegrityRepairReason,
+  error: unknown,
+  message: string,
+): Error {
+  if (
+    error instanceof RuntimeIntegrityRepairRequiredError ||
+    error instanceof RuntimeIntegrityTransientVerificationError ||
+    error instanceof RuntimeIntegrityCancelledError
+  ) {
+    return error;
+  }
+  const cause = asError(error, message);
+  if (isTransientRuntimeFilesystemError(error)) {
+    return new RuntimeIntegrityTransientVerificationError("filesystem_contention", cause);
+  }
+  const filesystemCode = firstErrorCodeInChain(error);
+  if (filesystemCode !== undefined && !REPAIR_REQUIRED_RUNTIME_FILESYSTEM_CODES.has(filesystemCode)) {
+    // Unknown coded OS faults are not evidence that package bytes are bad.
+    return cause;
+  }
+  return new RuntimeIntegrityRepairRequiredError(reason, cause);
+}
+
+function throwIfRuntimeIntegrityCancelled(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  const cause = signal.reason;
+  throw new RuntimeIntegrityCancelledError(cause === undefined ? undefined : { cause });
 }
 
 export function currentRuntimeHostIdentity(): RuntimeHostIdentity {
@@ -408,7 +772,9 @@ export function currentRuntimeHostIdentity(): RuntimeHostIdentity {
 export function parseRuntimeFileManifest(
   value: Uint8Array | string,
   expectedCount: number,
+  signal?: AbortSignal,
 ): readonly RuntimeFileEntry[] {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_RUNTIME_FILE_MANIFEST_BYTES) {
     throw new Error("Runtime file manifest is empty or exceeds its bounded size");
@@ -427,6 +793,7 @@ export function parseRuntimeFileManifest(
   const foldedDirectories = new Map<string, string>();
   let previous: string | undefined;
   for (const line of lines) {
+    if (signal && entries.length % 256 === 0) throwIfRuntimeIntegrityCancelled(signal);
     const match = /^([a-f0-9]{64})  (.+)$/.exec(line);
     if (!match?.[1] || !match[2] || !isSafeRuntimePath(match[2])) {
       throw new Error("Runtime file manifest contains an invalid digest or path");
@@ -462,6 +829,7 @@ export function parseRuntimeFileManifest(
   }
   const sortedFolded = [...foldedPaths].sort();
   for (let index = 1; index < sortedFolded.length; index += 1) {
+    if (signal && index % 256 === 0) throwIfRuntimeIntegrityCancelled(signal);
     const prior = sortedFolded[index - 1];
     const current = sortedFolded[index];
     if (prior && current?.startsWith(`${prior}/`)) {
@@ -475,12 +843,15 @@ async function verifyRuntimeDirectory(
   directory: string,
   attestation: EmbeddedRuntimeAttestation,
   copyDestination?: string,
+  signal?: AbortSignal,
 ): Promise<{ manifest: RuntimeManifest }> {
-  await assertPlainDirectory(directory, "runtime image");
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  await assertPlainDirectory(directory, "runtime image", signal);
   const [manifestBytes, fileManifestBytes] = await Promise.all([
-    readBoundedRegularFile(join(directory, "runtime.json"), MAX_RUNTIME_MANIFEST_BYTES, "runtime manifest"),
-    readBoundedRegularFile(join(directory, "files.sha256"), MAX_RUNTIME_FILE_MANIFEST_BYTES, "runtime file manifest"),
+    readBoundedRegularFile(join(directory, "runtime.json"), MAX_RUNTIME_MANIFEST_BYTES, "runtime manifest", signal),
+    readBoundedRegularFile(join(directory, "files.sha256"), MAX_RUNTIME_FILE_MANIFEST_BYTES, "runtime file manifest", signal),
   ]);
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   if (sha256(manifestBytes) !== attestation.manifest.sha256) {
     throw new Error("Runtime manifest does not match the embedded attestation");
   }
@@ -489,7 +860,7 @@ async function verifyRuntimeDirectory(
   }
   const manifest = RuntimeManifestSchema.parse(parseJson(manifestBytes, "runtime manifest"));
   assertManifestMatchesAttestation(manifest, attestation);
-  const files = parseRuntimeFileManifest(fileManifestBytes, attestation.tree.fileCount);
+  const files = parseRuntimeFileManifest(fileManifestBytes, attestation.tree.fileCount, signal);
   const payloadPaths = new Set(files.map((file) => file.path));
   for (const requiredPath of [
     manifest.entrypoints.module,
@@ -498,24 +869,26 @@ async function verifyRuntimeDirectory(
   ]) {
     if (!payloadPaths.has(requiredPath)) throw new Error(`Runtime image is missing a required entrypoint file: ${requiredPath}`);
   }
-  const expectedDirectories = runtimeDirectorySet(files);
-  await assertExactRuntimeNamespace(directory, files, expectedDirectories);
+  const expectedDirectories = runtimeDirectorySet(files, signal);
+  await assertExactRuntimeNamespace(directory, files, expectedDirectories, signal);
 
   if (copyDestination) {
-    await assertPlainDirectory(copyDestination, "runtime staging image");
-    await createRuntimeDirectories(copyDestination, expectedDirectories);
+    await assertPlainDirectory(copyDestination, "runtime staging image", signal);
+    await createRuntimeDirectories(copyDestination, expectedDirectories, signal);
     await Promise.all([
       copyAndHashRegularFile(
         join(directory, "runtime.json"),
         join(copyDestination, "runtime.json"),
         attestation.manifest.sha256,
         manifestBytes.byteLength,
+        signal,
       ),
       copyAndHashRegularFile(
         join(directory, "files.sha256"),
         join(copyDestination, "files.sha256"),
         attestation.tree.filesSha256,
         fileManifestBytes.byteLength,
+        signal,
       ),
     ]);
   }
@@ -526,9 +899,10 @@ async function verifyRuntimeDirectory(
   const verifiedFiles = await mapConcurrentOrdered(files, RUNTIME_FILE_CONCURRENCY, async (file) => {
     const source = join(directory, ...file.path.split("/"));
     const destination = copyDestination ? join(copyDestination, ...file.path.split("/")) : undefined;
-    return await hashRegularFile(source, file.sha256, destination);
-  });
+    return await hashRegularFile(source, file.sha256, destination, signal);
+  }, signal);
   for (let index = 0; index < files.length; index += 1) {
+    if (signal && index % 256 === 0) throwIfRuntimeIntegrityCancelled(signal);
     const file = files[index] as RuntimeFileEntry;
     const verified = verifiedFiles[index] as { size: number };
     totalBytes += verified.size;
@@ -543,7 +917,7 @@ async function verifyRuntimeDirectory(
   ) {
     throw new Error("Runtime payload tree or native-addon allowlist does not match its attestation");
   }
-  if (copyDestination) await syncRuntimeTreeDirectories(copyDestination, expectedDirectories);
+  if (copyDestination) await syncRuntimeTreeDirectories(copyDestination, expectedDirectories, signal);
   return { manifest };
 }
 
@@ -551,6 +925,7 @@ async function mapConcurrentOrdered<T, R>(
   values: readonly T[],
   concurrency: number,
   operation: (value: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> {
   const results = new Array<R>(values.length);
   let nextIndex = 0;
@@ -558,10 +933,11 @@ async function mapConcurrentOrdered<T, R>(
   let failure: unknown;
   const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
     while (!failed) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= values.length) return;
       try {
+        if (signal) throwIfRuntimeIntegrityCancelled(signal);
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= values.length) return;
         results[index] = await operation(values[index] as T, index);
       } catch (error) {
         if (!failed) {
@@ -576,22 +952,28 @@ async function mapConcurrentOrdered<T, R>(
   return results;
 }
 
-async function cleanupAbandonedStaging(stagingRoot: string): Promise<void> {
+async function cleanupAbandonedStaging(stagingRoot: string, signal?: AbortSignal): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const entries = await readdir(stagingRoot, { withFileTypes: true });
   const abandoned: string[] = [];
   for (const entry of entries) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     if (!/^image-[A-Za-z0-9_-]{6,64}$/.test(entry.name)) {
       throw new Error(`Runtime staging contains an unexpected entry: ${entry.name}`);
     }
     const path = join(stagingRoot, entry.name);
     assertContainedPath(stagingRoot, path, "abandoned runtime staging image");
-    await assertDisposableStagingTree(path);
+    await assertDisposableStagingTree(path, signal);
     abandoned.push(path);
   }
-  for (const path of abandoned) await rm(path, { recursive: true, force: false });
+  for (const path of abandoned) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
+    await rm(path, { recursive: true, force: false });
+  }
 }
 
-async function assertDisposableStagingTree(path: string): Promise<void> {
+async function assertDisposableStagingTree(path: string, signal?: AbortSignal): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const metadata = await lstat(path, { bigint: true });
   if (metadata.isSymbolicLink()) throw new Error(`Runtime staging contains a symbolic link or junction: ${path}`);
   if (metadata.isFile()) {
@@ -601,8 +983,9 @@ async function assertDisposableStagingTree(path: string): Promise<void> {
   if (!metadata.isDirectory()) throw new Error(`Runtime staging contains a non-regular entry: ${path}`);
   const children = await readdir(path);
   for (const child of children) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     if (!isSafeRuntimePath(child)) throw new Error(`Runtime staging contains an unsafe entry: ${child}`);
-    await assertDisposableStagingTree(join(path, child));
+    await assertDisposableStagingTree(join(path, child), signal);
   }
 }
 
@@ -610,13 +993,16 @@ async function assertExactRuntimeNamespace(
   root: string,
   files: readonly RuntimeFileEntry[],
   directories: ReadonlySet<string>,
+  signal?: AbortSignal,
 ): Promise<void> {
   const actualFiles: string[] = [];
   const actualDirectories: string[] = [];
   const visit = async (directory: string, prefix: string): Promise<void> => {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const children = await readdir(directory, { withFileTypes: true });
     children.sort((left, right) => compareRuntimePaths(left.name, right.name));
     for (const child of children) {
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
       const path = prefix ? `${prefix}/${child.name}` : child.name;
       if (!isSafeRuntimePath(path)) throw new Error(`Runtime image contains an unsafe path: ${path}`);
       const absolute = join(directory, child.name);
@@ -644,15 +1030,20 @@ async function assertExactRuntimeNamespace(
   }
 }
 
-async function createRuntimeDirectories(root: string, directories: ReadonlySet<string>): Promise<void> {
+async function createRuntimeDirectories(
+  root: string,
+  directories: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<void> {
   const ordered = [...directories].sort((left, right) => {
     const depth = left.split("/").length - right.split("/").length;
     return depth || compareRuntimePaths(left, right);
   });
   for (const path of ordered) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const absolute = join(root, ...path.split("/"));
     await mkdir(absolute, { recursive: false, mode: 0o700 });
-    await assertPlainDirectory(absolute, "runtime staging subdirectory");
+    await assertPlainDirectory(absolute, "runtime staging subdirectory", signal);
   }
 }
 
@@ -660,13 +1051,16 @@ async function hashRegularFile(
   sourcePath: string,
   expectedSha256: string,
   destinationPath?: string,
+  signal?: AbortSignal,
 ): Promise<{ size: number }> {
-  const pathBefore = await requirePlainRegularFile(sourcePath, "runtime payload file");
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  const pathBefore = await requirePlainRegularFile(sourcePath, "runtime payload file", signal);
   if (pathBefore.size > BigInt(MAX_RUNTIME_FILE_BYTES)) throw new Error(`Runtime payload file exceeds its bound: ${sourcePath}`);
   const source = await open(sourcePath, "r");
   let destination: FileHandle | undefined;
   let destinationCreated = false;
   try {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const sourceBefore = await source.stat({ bigint: true });
     assertSameFileIdentity(pathBefore, sourceBefore, "Runtime payload changed before open");
     if (destinationPath) {
@@ -678,16 +1072,19 @@ async function hashRegularFile(
     const buffer = Buffer.allocUnsafe(Math.min(COPY_BUFFER_BYTES, Math.max(1, size)));
     let position = 0;
     while (position < size) {
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
       const requested = Math.min(buffer.byteLength, size - position);
       const { bytesRead } = await source.read(buffer, 0, requested, position);
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
       if (bytesRead <= 0) throw new Error(`Runtime payload ended early: ${sourcePath}`);
       const chunk = buffer.subarray(0, bytesRead);
       hash.update(chunk);
-      if (destination) await writeAll(destination, chunk);
+      if (destination) await writeAll(destination, chunk, signal);
       position += bytesRead;
     }
     if (hash.digest("hex") !== expectedSha256) throw new Error(`Runtime payload digest mismatch: ${sourcePath}`);
     if (destination) {
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
       await destination.sync();
       const target = await destination.stat({ bigint: true });
       if (!target.isFile() || target.nlink !== 1n || target.size !== sourceBefore.size) {
@@ -695,10 +1092,11 @@ async function hashRegularFile(
       }
       await destination.close();
       destination = undefined;
-      await requirePlainRegularFile(destinationPath as string, "runtime staging file");
+      await requirePlainRegularFile(destinationPath as string, "runtime staging file", signal);
     }
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const sourceAfter = await source.stat({ bigint: true });
-    const pathAfter = await requirePlainRegularFile(sourcePath, "runtime payload file");
+    const pathAfter = await requirePlainRegularFile(sourcePath, "runtime payload file", signal);
     assertSameFileIdentity(sourceBefore, sourceAfter, "Runtime payload changed while hashing");
     assertSameFileIdentity(sourceBefore, pathAfter, "Runtime payload path changed while hashing");
     return { size };
@@ -716,32 +1114,43 @@ async function copyAndHashRegularFile(
   destination: string,
   expectedSha256: string,
   expectedSize: number,
+  signal?: AbortSignal,
 ): Promise<void> {
-  const result = await hashRegularFile(source, expectedSha256, destination);
+  const result = await hashRegularFile(source, expectedSha256, destination, signal);
   if (result.size !== expectedSize) throw new Error(`Runtime metadata size changed while copying: ${source}`);
 }
 
-async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
+async function writeAll(handle: FileHandle, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
   let offset = 0;
   while (offset < bytes.byteLength) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, null);
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     if (bytesWritten <= 0) throw new Error("Runtime staging write made no progress");
     offset += bytesWritten;
   }
 }
 
-async function readBoundedRegularFile(path: string, maxBytes: number, label: string): Promise<Buffer> {
-  const pathBefore = await requirePlainRegularFile(path, label);
+async function readBoundedRegularFile(
+  path: string,
+  maxBytes: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  const pathBefore = await requirePlainRegularFile(path, label, signal);
   if (pathBefore.size <= 0n || pathBefore.size > BigInt(maxBytes)) {
     throw new Error(`${label} is empty or exceeds its bounded size`);
   }
   const handle = await open(path, "r");
   try {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const before = await handle.stat({ bigint: true });
     assertSameFileIdentity(pathBefore, before, `${label} changed before open`);
     const bytes = await handle.readFile();
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const after = await handle.stat({ bigint: true });
-    const pathAfter = await requirePlainRegularFile(path, label);
+    const pathAfter = await requirePlainRegularFile(path, label, signal);
     assertSameFileIdentity(before, after, `${label} changed while reading`);
     assertSameFileIdentity(before, pathAfter, `${label} path changed while reading`);
     if (bytes.byteLength !== Number(before.size)) throw new Error(`${label} changed size while reading`);
@@ -751,23 +1160,29 @@ async function readBoundedRegularFile(path: string, maxBytes: number, label: str
   }
 }
 
-async function requirePlainRegularFile(path: string, label: string): Promise<BigIntStats> {
+async function requirePlainRegularFile(path: string, label: string, signal?: AbortSignal): Promise<BigIntStats> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const metadata = await lstat(path, { bigint: true });
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1n) {
     throw new Error(`${label} must be one non-linked regular file: ${path}`);
   }
   return metadata;
 }
 
-async function assertPlainDirectory(path: string, label: string): Promise<void> {
+async function assertPlainDirectory(path: string, label: string, signal?: AbortSignal): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const metadata = await lstat(path, { bigint: true });
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error(`${label} must be a plain directory: ${path}`);
   }
 }
 
-async function readPlainDirectory(path: string, label: string) {
+async function readPlainDirectory(path: string, label: string, signal?: AbortSignal) {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const entries = await readdir(path, { withFileTypes: true });
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   for (const entry of entries) {
     if (entry.isSymbolicLink()) throw new Error(`${label} contains a symbolic link or junction: ${entry.name}`);
   }
@@ -821,9 +1236,10 @@ function assertManifestMatchesAttestation(
   }
 }
 
-function runtimeDirectorySet(files: readonly RuntimeFileEntry[]): ReadonlySet<string> {
+function runtimeDirectorySet(files: readonly RuntimeFileEntry[], signal?: AbortSignal): ReadonlySet<string> {
   const result = new Set<string>();
   for (const file of files) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const segments = file.path.split("/");
     for (let index = 1; index < segments.length; index += 1) {
       result.add(segments.slice(0, index).join("/"));
@@ -934,23 +1350,35 @@ function assertSameFileIdentity(left: BigIntStats, right: BigIntStats, message: 
   }
 }
 
-async function readOptionalJson<T>(path: string, schema: z.ZodType<T>): Promise<T | undefined> {
+async function readOptionalJson<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  signal?: AbortSignal,
+): Promise<T | undefined> {
   try {
-    return await readRequiredJson(path, schema, MAX_RUNTIME_POINTER_BYTES);
+    return await readRequiredJson(path, schema, MAX_RUNTIME_POINTER_BYTES, signal);
   } catch (error) {
     if (isErrorCode(error, "ENOENT")) return undefined;
     throw error;
   }
 }
 
-async function readRequiredJson<T>(path: string, schema: z.ZodType<T>, maxBytes: number): Promise<T> {
-  const bytes = await readBoundedRegularFile(path, maxBytes, "runtime JSON state");
+async function readRequiredJson<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  const bytes = await readBoundedRegularFile(path, maxBytes, "runtime JSON state", signal);
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   return schema.parse(parseJson(bytes, "runtime JSON state"));
 }
 
-async function entryExists(path: string): Promise<boolean> {
+async function entryExists(path: string, signal?: AbortSignal): Promise<boolean> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   try {
     await lstat(path);
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     return true;
   } catch (error) {
     if (isErrorCode(error, "ENOENT")) return false;
@@ -968,32 +1396,73 @@ async function syncParentDirectory(path: string): Promise<void> {
   }
 }
 
-async function syncRuntimeTreeDirectories(root: string, directories: ReadonlySet<string>): Promise<void> {
+async function syncRuntimeTreeDirectories(
+  root: string,
+  directories: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   if (process.platform === "win32") return;
   const deepestFirst = [...directories].sort((left, right) => {
     const depth = right.split("/").length - left.split("/").length;
     return depth || compareRuntimePaths(left, right);
   });
-  for (const path of deepestFirst) await syncDirectory(join(root, ...path.split("/")));
-  await syncDirectory(root);
+  for (const path of deepestFirst) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
+    await syncDirectory(join(root, ...path.split("/")), signal);
+  }
+  await syncDirectory(root, signal);
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   await syncParentDirectory(root);
 }
 
-async function syncDirectory(path: string): Promise<void> {
+async function syncDirectory(path: string, signal?: AbortSignal): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const directory = await open(path, "r");
   try {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
     await directory.sync();
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
   } finally {
     await directory.close();
   }
 }
 
-function isPublicationConflict(error: unknown): boolean {
-  return ["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].some((code) => isErrorCode(error, code));
-}
-
 function isErrorCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+function isTransientRuntimeFilesystemError(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    if (
+      "code" in current &&
+      typeof current.code === "string" &&
+      TRANSIENT_RUNTIME_FILESYSTEM_CODES.has(current.code)
+    ) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
+function errorCodeInChain(error: unknown, expected: string): boolean {
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    if ("code" in current && current.code === expected) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+function firstErrorCodeInChain(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    if ("code" in current && typeof current.code === "string") return current.code;
+    current = current.cause;
+  }
+  return undefined;
 }
 
 function parseJson(bytes: Uint8Array, label: string): unknown {

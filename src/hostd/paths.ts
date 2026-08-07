@@ -1,6 +1,9 @@
-import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
+import {
+  localHostEndpointForCanonicalDataDirectory,
+  normalizeHostDataDirectory,
+} from "../shared/local-host-target";
 
 export const HOSTD_VERSION = "0.1.0";
 
@@ -49,24 +52,12 @@ export function resolveHostDataDir(
 }
 
 export function assertAbsoluteDataDir(dataDir: string): string {
-  if (!dataDir || dataDir.length > 4_096) {
-    throw new Error("The host data directory must be between 1 and 4096 characters");
-  }
-  const resolved = resolve(dataDir);
-  if (!isAbsolute(resolved)) {
-    throw new Error("The host data directory must resolve to an absolute path");
-  }
-  return resolved;
+  return normalizeHostDataDirectory(dataDir);
 }
 
-/** Pure endpoint formula mirrored by the native control service. */
+/** Pure endpoint formula for a root that is already physically canonical. */
 export function defaultLocalEndpoint(dataDir: string, platform: NodeJS.Platform = process.platform): string {
-  const resolved = assertAbsoluteDataDir(dataDir);
-  if (platform === "win32") {
-    const digest = createHash("sha256").update(resolved.toLowerCase()).digest("hex").slice(0, 16);
-    return `\\\\.\\pipe\\prime-agent-hostd-${digest}`;
-  }
-  return join(resolved, "hostd.sock");
+  return localHostEndpointForCanonicalDataDirectory(assertAbsoluteDataDir(dataDir), platform);
 }
 
 export function getHostDataPaths(dataDir: string): HostDataPaths {

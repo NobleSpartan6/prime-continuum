@@ -1,8 +1,12 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
-import { readEmbeddedRuntimeAttestation } from "../../src/hostd/runtime-attestation";
+import {
+  parseEmbeddedRuntimeAttestationRecord,
+  readEmbeddedRuntimeAttestation,
+} from "../../src/hostd/runtime-attestation";
 import {
   createEmbeddedRuntimeAttestationRecord,
   extractEmbeddedRuntimeAttestation,
@@ -66,9 +70,16 @@ describe("release runtime attestation", () => {
     const bytes = serializeRuntimeAttestation(attestation);
     const record = createEmbeddedRuntimeAttestationRecord(bytes);
     const extracted = extractEmbeddedRuntimeAttestation(Buffer.from(`const releaseRecord = ${JSON.stringify(record)};`));
+    const envelope = parseEmbeddedRuntimeAttestationRecord(record);
 
     expect(extracted).toEqual(bytes);
     expect(parseRuntimeAttestation(extracted)).toEqual(attestation);
+    expect(envelope).toEqual({
+      attestation,
+      trustAnchorId: createHash("sha256").update(bytes).digest("hex"),
+    });
+    expect(Object.isFrozen(envelope)).toBe(true);
+    expect(Object.isFrozen(envelope.attestation)).toBe(true);
   });
 
   it("rejects absent, duplicated, malformed, and overstated records", () => {

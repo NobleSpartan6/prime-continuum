@@ -16,18 +16,20 @@ import {
   type ProbeToolStatus,
   type SavedProject,
 } from "../shared/protocol";
-import { ensurePrivateDirectory } from "./atomic-files";
-import { defaultLocalEndpoint, HOSTD_VERSION } from "./paths";
+import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
+import { HOSTD_VERSION } from "./paths";
 import { PINNED_PRIME_AGENT_RUNTIME } from "./resident-runtime";
 import { HOST_CAPABILITIES } from "./service";
-import type { HostStore } from "./store";
 
 const TOOL_TIMEOUT_MS = 2_500;
 const TOOL_OUTPUT_LIMIT = 16 * 1024;
+const LIVE_HOST_PROBE_TIMEOUT_MS = 1_000;
 
-export async function collectHostProbe(dataDir: string, store: HostStore): Promise<HostProbe> {
-  await ensurePrivateDirectory(dataDir);
-  const [git, bash, python, ipython, primeAgent, availableDiskBytes, runningVersion, catalog] = await Promise.all([
+export async function collectHostProbe(dataDir: string): Promise<HostProbe> {
+  // Existing roots resolve through junction/symlink aliases. A missing probe
+  // target remains normalized but is never created.
+  const target = await resolveCanonicalLocalHostTarget(dataDir);
+  const [git, bash, python, ipython, primeAgent, availableDiskBytes, liveHost] = await Promise.all([
     probeTool("git", ["--version"]),
     probeTool("bash", ["--version"]),
     probeFirstTool([
@@ -37,10 +39,10 @@ export async function collectHostProbe(dataDir: string, store: HostStore): Promi
     ]),
     probeTool("ipython", ["--version"]),
     probeTool("prime-agent", ["--version"]),
-    probeAvailableDisk(dataDir),
-    probeRunningVersion(defaultLocalEndpoint(dataDir)),
-    store.getCatalogSnapshot(),
+    probeAvailableDisk(target.dataDirectory),
+    probeLiveHost(target.endpoint),
   ]);
+  const { runningVersion, recentProjects } = liveHost;
 
   const platform = nodePlatform();
   const os = platform === "win32" ? "windows" : platform === "darwin" ? "macos" : platform === "linux" ? "linux" : "unknown";
@@ -78,7 +80,7 @@ export async function collectHostProbe(dataDir: string, store: HostStore): Promi
       compatible: true,
     },
     configuredRepositoryRoots: configuredRepositoryRoots(),
-    recentProjects: catalog.projects.slice(0, 1_000),
+    recentProjects,
     capabilities: [...HOST_CAPABILITIES],
   });
 }
@@ -143,39 +145,71 @@ async function probeAvailableDisk(dataDir: string): Promise<number | undefined> 
   }
 }
 
-async function probeRunningVersion(endpoint: string): Promise<string | undefined> {
+interface LiveHostProbe {
+  runningVersion?: string;
+  recentProjects: SavedProject[];
+}
+
+/**
+ * Reads host-owned metadata only through the live protocol. If no daemon is
+ * available, probe remains useful for tool/platform diagnostics but returns no
+ * recent-project catalog rather than initializing or recovering durable state.
+ */
+async function probeLiveHost(endpoint: string): Promise<LiveHostProbe> {
   return new Promise((resolvePromise) => {
     const socket = createConnection(endpoint);
     const decoder = new LengthPrefixedJsonDecoder({ parse: (value) => HostIpcResponseSchema.parse(value) });
+    const healthRequestId = `probe-health-${randomUUID()}`;
+    const catalogRequestId = `probe-catalog-${randomUUID()}`;
     let settled = false;
-    const finish = (version?: string): void => {
+    let healthSettled = false;
+    let catalogSettled = false;
+    let runningVersion: string | undefined;
+    let recentProjects: SavedProject[] = [];
+    const finish = (): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      resolvePromise(version);
+      resolvePromise({ runningVersion, recentProjects });
     };
-    const timer = setTimeout(() => finish(), 500);
+    const timer = setTimeout(finish, LIVE_HOST_PROBE_TIMEOUT_MS);
     timer.unref();
-    socket.once("error", () => finish());
+    socket.once("error", finish);
+    socket.once("close", finish);
     socket.on("data", (chunk: Buffer) => {
       try {
         const responses = decoder.push(chunk);
-        const response = responses[0];
-        if (response?.ok && response.method === "health.get") finish(response.result.hostdVersion);
+        for (const response of responses) {
+          if (response.requestId === healthRequestId && response.method === "health.get") {
+            healthSettled = true;
+            if (response.ok) runningVersion = response.result.hostdVersion;
+          }
+          if (response.requestId === catalogRequestId && response.method === "catalog.snapshot") {
+            catalogSettled = true;
+            if (response.ok) recentProjects = recentProjectSummaries(response.result.projects);
+          }
+        }
+        if (healthSettled && catalogSettled) finish();
       } catch {
         finish();
       }
     });
     socket.once("connect", () => {
-      socket.write(
+      socket.write(Buffer.concat([
         encodeJsonFrame({
           protocolVersion: PROTOCOL_VERSION,
-          requestId: `probe-${randomUUID()}`,
+          requestId: healthRequestId,
           method: "health.get",
           payload: {},
         }),
-      );
+        encodeJsonFrame({
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: catalogRequestId,
+          method: "catalog.snapshot",
+          payload: {},
+        }),
+      ]));
     });
   });
 }

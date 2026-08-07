@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, realpath, rename, rm } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   REPO_ROOT,
   RUNTIME_TEMPLATE_DIRECTORY,
@@ -9,8 +9,10 @@ import {
   discoverNpmCli,
   installLockedRuntime,
   loadRuntimeInputs,
+  pruneEmptyRuntimeDirectories,
   pruneRuntimePackagingNoise,
   pruneRuntimeForTarget,
+  removeLegacyRuntimeAssetCache,
   removeObsoleteRuntimeInstalls,
   smokeRuntime,
   sha256File,
@@ -22,6 +24,10 @@ import {
 
 const argumentsValue = parseArguments(process.argv.slice(2));
 const outputRoot = resolve(argumentsValue.output ?? join(REPO_ROOT, "out", "runtime"));
+// Download caches are build inputs, not part of the exact runtime seed
+// namespace. Keeping them beside the seed prevents both development and
+// packaged verification from silently accepting unrelated bytes.
+const assetCacheDirectory = join(dirname(outputRoot), `${basename(outputRoot)}-cache`, "assets");
 const runtimeExecutable = argumentsValue.runtimeNode
   ? resolve(argumentsValue.runtimeNode)
   : process.execPath;
@@ -36,10 +42,15 @@ const stagingDirectory = join(
 
 try {
   const npmCli = await discoverNpmCli(argumentsValue.npmCli);
-  await verifyReleaseAssets(inputs, join(outputRoot, "cache", "assets"));
+  await verifyReleaseAssets(inputs, assetCacheDirectory);
+  await removeLegacyRuntimeAssetCache(
+    outputRoot,
+    inputs.sources.assets.map((asset) => `${asset.sha256}-${asset.fileName}`),
+  );
   const npmVersion = await installLockedRuntime({ inputs, stagingDirectory, npmCli });
   await pruneRuntimePackagingNoise(stagingDirectory, inputs.policy);
   await pruneRuntimeForTarget(stagingDirectory);
+  await pruneEmptyRuntimeDirectories(stagingDirectory);
   const smoke = await smokeRuntime(stagingDirectory, {
     runtimeExecutable,
     electronRunAsNode: argumentsValue.electronRunAsNode,
@@ -55,11 +66,20 @@ try {
   await mkdir(installsDirectory, { recursive: true });
   try {
     await realpath(finalDirectory);
+    // Older generated images may have unattested package-manager namespace
+    // directories. Removing only directories that are still empty preserves
+    // every attested byte and lets the content-addressed image converge.
+    await pruneEmptyRuntimeDirectories(finalDirectory);
     await verifyBuiltRuntime(finalDirectory, { inputs, policy: inputs.policy });
     if ((await sha256File(join(finalDirectory, "runtime.json"))) !== manifestSha256) {
       throw new Error("Existing runtime payload has different attestation metadata.");
     }
-    await rm(stagingDirectory, { recursive: true, force: true });
+    await rm(stagingDirectory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     await rename(stagingDirectory, finalDirectory);
@@ -69,7 +89,12 @@ try {
   await verifyOnlySelectedRuntimeInstall(outputRoot, finalDirectory);
   process.stdout.write(`${JSON.stringify({ finalDirectory, treeSha256: manifest.tree.sha256, manifestSha256 }, null, 2)}\n`);
 } catch (error) {
-  await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+  await rm(stagingDirectory, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 100,
+  }).catch(() => undefined);
   throw error;
 } finally {
   await release();

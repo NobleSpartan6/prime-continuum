@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, type Session } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerControlIpc } from './control/ipc'
+import { connectLocalHostd, localHostdEndpoint, stopPackageSmokeHostds } from './control/local-hostd'
 import { DesktopControlService } from './control/service'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
@@ -10,8 +11,9 @@ let mainWindow: BrowserWindow | undefined
 let trustedRendererUrl = ''
 let unregisterIpc: (() => void) | undefined
 const configuredSessions = new WeakSet<Session>()
+const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
 
-function createWindow(loadImmediately = true): BrowserWindow {
+function createWindow(loadImmediately = true, showWhenReady = true): BrowserWindow {
   const rendererFile = path.join(__dirname, '../renderer/index.html')
   trustedRendererUrl = process.env.ELECTRON_RENDERER_URL || pathToFileURL(rendererFile).href
 
@@ -34,7 +36,7 @@ function createWindow(loadImmediately = true): BrowserWindow {
   window.webContents.on('will-attach-webview', (event) => event.preventDefault())
   configureSession(window.webContents.session)
 
-  window.once('ready-to-show', () => window.show())
+  if (showWhenReady) window.once('ready-to-show', () => window.show())
   window.once('closed', () => {
     if (mainWindow === window) mainWindow = undefined
   })
@@ -73,9 +75,12 @@ function configureSession(session: Session): void {
   )
 }
 
-function loadRenderer(window: BrowserWindow, rendererFile = path.join(__dirname, '../renderer/index.html')): void {
-  if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL)
-  else void window.loadFile(rendererFile)
+function loadRenderer(
+  window: BrowserWindow,
+  rendererFile = path.join(__dirname, '../renderer/index.html')
+): Promise<void> {
+  if (process.env.ELECTRON_RENDERER_URL) return window.loadURL(process.env.ELECTRON_RENDERER_URL)
+  return window.loadFile(rendererFile)
 }
 
 function isSameDocumentNavigation(currentValue: string, nextValue: string): boolean {
@@ -109,10 +114,67 @@ function rendererUrlIsTrusted(candidate: string): boolean {
   }
 }
 
-void app.whenReady().then(() => {
+async function runPackageSmoke(window: BrowserWindow, service: DesktopControlService): Promise<void> {
+  try {
+    await loadRenderer(window)
+    await waitForPackageSmokeConnection(window)
+    await waitForPackageSmokeRuntimeReady()
+  } finally {
+    await service.disconnect()
+    await stopPackageSmokeHostds()
+  }
+  process.stdout.write(`${PACKAGE_SMOKE_MARKER}\n`)
+  app.quit()
+}
+
+async function waitForPackageSmokeRuntimeReady(): Promise<void> {
+  const deadline = Date.now() + 180_000
+  const endpoint = await localHostdEndpoint()
+  while (Date.now() < deadline) {
+    const connection = await connectLocalHostd(endpoint)
+    try {
+      const health = (await connection.request('health.get', {}, { timeoutMs: 3_000, priority: 'urgent' })) as {
+        capabilities?: unknown
+        runtimeIntegrity?: { status?: unknown; code?: unknown }
+      }
+      const capabilities = Array.isArray(health.capabilities) ? health.capabilities : []
+      if (health.runtimeIntegrity?.status === 'ready' && capabilities.includes('runtime_integrity_v1')) return
+      if (health.runtimeIntegrity?.status === 'failed' || health.runtimeIntegrity?.status === 'unavailable') {
+        throw new Error(`The packaged runtime failed readiness (${String(health.runtimeIntegrity.code ?? 'unknown')}).`)
+      }
+    } finally {
+      connection.close()
+    }
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250))
+  }
+  throw new Error('The packaged runtime did not become ready within its deadline.')
+}
+
+async function waitForPackageSmokeConnection(window: BrowserWindow): Promise<void> {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    const diagnostics = await window.webContents.executeJavaScript(
+      "window.prime && typeof window.prime.diagnostics === 'function' ? window.prime.diagnostics() : null",
+      true
+    )
+    const connection = diagnostics?.ok === true ? diagnostics.value?.connection : undefined
+    if (
+      connection?.phase === 'online' &&
+      connection.path === 'local_socket' &&
+      typeof connection.hostId === 'string'
+    ) {
+      return
+    }
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 100))
+  }
+  throw new Error('The packaged renderer did not establish a verified local host connection within its deadline.')
+}
+
+void app.whenReady().then(async () => {
   app.setAppUserModelId('ai.primeintellect.continuim')
   const service = new DesktopControlService({ app })
-  mainWindow = createWindow(false)
+  const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
+  mainWindow = createWindow(false, !packageSmoke)
   unregisterIpc = registerControlIpc({
     ipcMain,
     service,
@@ -128,7 +190,18 @@ void app.whenReady().then(() => {
       )
     }
   })
-  loadRenderer(mainWindow)
+  if (packageSmoke) {
+    try {
+      await runPackageSmoke(mainWindow, service)
+    } catch (error) {
+      process.stderr.write(
+        `Prime Continuim package smoke failed: ${error instanceof Error ? error.message : String(error)}\n`
+      )
+      app.exit(1)
+    }
+    return
+  }
+  void loadRenderer(mainWindow)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()

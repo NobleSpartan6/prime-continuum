@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-  [string]$CacheRoot = (Join-Path $env:LOCALAPPDATA 'PrimeAgentBuildCache\electron-builder-26.8.1-winCodeSign-2.6.0-e8b408d9')
+  [string]$CacheRoot = (Join-Path $env:LOCALAPPDATA 'PrimeAgentBuildCache\electron-builder-26.8.1-winCodeSign-2.6.0-e8b408d9'),
+  [string]$SevenZipPath
 )
 
 Set-StrictMode -Version Latest
@@ -28,6 +29,15 @@ $requiredFiles = @(
   'windows-10\ia32\signtool.exe',
   'windows-6\signtool.exe'
 )
+$requiredFileSha256 = @{
+  'rcedit-x64.exe' = 'ab53500d556fd824636621bca7dbecd8583ba181891c3e9efdcf16b72a28b0cd'
+  'rcedit-ia32.exe' = '8d7f9e4cdbffadf53806ea0646a6cf5a67244f16dda3cabb7b3f00dc0cddb552'
+  'windows-10\x64\signtool.exe' = 'e472ab54601f9da46915a68da4d93b6d6cc61502e6bf18d5a53c0a70176119a4'
+  'windows-10\x64\wintrust.dll' = 'fa647b3aab83e6566675289f93e60ba2cc045dd82fabf77e9f80adaa3daabce7'
+  'windows-10\x64\mssign32.dll' = '72692c180e163e55571036438a90f02cc11c5c0f1303008c9dbd1bd743c7b078'
+  'windows-10\ia32\signtool.exe' = 'a13bfd50668b2acb91b0334d36dce7e04d6fc2e3a122f9c9c145d3659fd0cd84'
+  'windows-6\signtool.exe' = '854c356a9d9977fb2ed22ce04b531ab6f4417da06a4dba6e3d3d628b9cfb988c'
+}
 
 function Assert-PreparedPayload([string]$Root) {
   $missing = @($requiredFiles | Where-Object {
@@ -35,6 +45,20 @@ function Assert-PreparedPayload([string]$Root) {
   })
   if ($missing.Count -gt 0) {
     throw "The prepared cache is missing required Windows tools: $($missing -join ', ')"
+  }
+
+  $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File)
+  $directories = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory)
+  $totalBytes = ($files | Measure-Object Length -Sum).Sum
+  if ($files.Count -ne 81 -or $directories.Count -ne 13 -or $totalBytes -ne 24762844) {
+    throw "The prepared cache inventory is invalid: files=$($files.Count), directories=$($directories.Count), bytes=$totalBytes"
+  }
+
+  foreach ($relativePath in $requiredFiles) {
+    $actualHash = (Get-FileHash -LiteralPath (Join-Path $Root $relativePath) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $requiredFileSha256[$relativePath]) {
+      throw "The prepared cache contains an untrusted Windows tool: $relativePath"
+    }
   }
 
   $reparsePoints = @(Get-ChildItem -LiteralPath $Root -Recurse -Force | Where-Object {
@@ -78,9 +102,14 @@ if ($archiveHash -ne $expectedSha512) {
   throw "Refusing an untrusted winCodeSign archive: $archiveHash"
 }
 
-$sevenZip = Get-ChildItem -Path (Join-Path $PWD 'node_modules\.pnpm\7zip-bin@*\node_modules\7zip-bin\win\x64\7za.exe') -File |
-  Select-Object -First 1 -ExpandProperty FullName
-if (-not $sevenZip) {
+$sevenZip = if ([string]::IsNullOrWhiteSpace($SevenZipPath)) {
+  Get-ChildItem -Path (Join-Path $PWD 'node_modules\.pnpm\7zip-bin@*\node_modules\7zip-bin\win\x64\7za.exe') -File |
+    Select-Object -First 1 -ExpandProperty FullName
+}
+else {
+  [IO.Path]::GetFullPath($SevenZipPath)
+}
+if (-not $sevenZip -or -not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
   throw 'Bundled 7za.exe was not found. Run pnpm install first.'
 }
 

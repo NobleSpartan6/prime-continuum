@@ -524,7 +524,7 @@ export class DesktopControlService extends EventEmitter {
       platform: process.platform,
       arch: process.arch,
       appVersion: this.app.getVersion(),
-      localEndpoint: localHostdEndpoint(),
+      localEndpoint: await localHostdEndpoint(),
       connection: this.getConnectionState(),
       sshExecutable: this.sshExecutable,
       outboxCount: (await this.readOutbox()).length,

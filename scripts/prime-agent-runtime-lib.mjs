@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   copyFile,
+  lstat,
   mkdtemp,
   mkdir,
   open,
@@ -10,6 +11,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -352,6 +354,134 @@ export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
   return Object.freeze(removed);
 }
 
+export async function pruneEmptyRuntimeDirectories(runtimeDirectory) {
+  const root = resolve(runtimeDirectory);
+  const rootDetails = await lstat(root);
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw buildError("Runtime empty-directory pruning root must be a plain directory.");
+  }
+  const removed = [];
+  async function visit(directory, prefix, expectedDetails) {
+    await assertSamePlainDirectory(directory, expectedDetails);
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)));
+    let retainedEntry = false;
+    for (const entry of entries) {
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absolutePath = join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        const childDetails = await lstat(absolutePath);
+        if (!childDetails.isDirectory() || childDetails.isSymbolicLink()) {
+          retainedEntry = true;
+        } else if (!(await visit(absolutePath, relativePath, childDetails))) {
+          retainedEntry = true;
+        }
+      } else {
+        retainedEntry = true;
+      }
+    }
+    if (!prefix || retainedEntry) return false;
+    try {
+      // Re-prove the exact directory identity immediately before the
+      // non-recursive mutation; never act on a stale Dirent observation.
+      await assertSamePlainDirectory(directory, expectedDetails);
+      // rmdir is intentionally non-recursive: if anything appears after the
+      // empty-directory check, fail to remove it instead of deleting bytes.
+      await rmdir(directory);
+      removed.push(prefix);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOTEMPTY" || error?.code === "EEXIST") return false;
+      throw error;
+    }
+  }
+  await visit(root, "", rootDetails);
+  return Object.freeze(removed);
+}
+
+async function assertSamePlainDirectory(directory, expectedDetails) {
+  const current = await lstat(directory);
+  if (
+    !current.isDirectory() ||
+    current.isSymbolicLink() ||
+    current.dev !== expectedDetails.dev ||
+    current.ino !== expectedDetails.ino
+  ) {
+    throw buildError("Runtime directory identity changed during empty-directory pruning.");
+  }
+}
+
+export async function removeLegacyRuntimeAssetCache(outputRoot, allowedFileNames) {
+  if (
+    !Array.isArray(allowedFileNames) ||
+    allowedFileNames.length < 1 ||
+    new Set(allowedFileNames).size !== allowedFileNames.length ||
+    allowedFileNames.some((name) => typeof name !== "string" || basename(name) !== name || /[\0\r\n]/.test(name))
+  ) {
+    throw buildError("Legacy runtime cache cleanup requires exact asset basenames.");
+  }
+  const legacyRoot = join(resolve(outputRoot), "cache");
+  try {
+    await lstat(legacyRoot);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  const allowed = new Set(allowedFileNames);
+  await assertExactLegacyRuntimeAssetCache(legacyRoot, allowed);
+
+  // Moving the reviewed cache root is atomic and never follows a racing
+  // junction/symlink to delete its target. The bytes remain available for
+  // inspection under the excluded build-cache namespace.
+  const resolvedOutputRoot = resolve(outputRoot);
+  const quarantineRoot = join(dirname(resolvedOutputRoot), `${basename(resolvedOutputRoot)}-cache`);
+  await mkdir(quarantineRoot, { recursive: true });
+  const quarantineDetails = await lstat(quarantineRoot);
+  if (!quarantineDetails.isDirectory() || quarantineDetails.isSymbolicLink()) {
+    throw buildError("Runtime cache quarantine root must be a plain directory.");
+  }
+  const quarantinePath = join(quarantineRoot, `legacy-v1-${randomUUID()}`);
+  await rename(legacyRoot, quarantinePath);
+  await assertExactLegacyRuntimeAssetCache(quarantinePath, allowed);
+  return true;
+}
+
+async function assertExactLegacyRuntimeAssetCache(cacheRoot, allowed) {
+  const rootDetails = await lstat(cacheRoot);
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw buildError("Legacy runtime cache root must be a plain directory.");
+  }
+  const rootEntries = await readdir(cacheRoot, { withFileTypes: true });
+  if (rootEntries.length === 0) return;
+  if (
+    rootEntries.length !== 1 ||
+    rootEntries[0]?.name !== "assets" ||
+    !rootEntries[0].isDirectory() ||
+    rootEntries[0].isSymbolicLink()
+  ) {
+    throw buildError("Legacy runtime cache contains an unexpected entry and requires inspection.");
+  }
+  const assetsDirectory = join(cacheRoot, "assets");
+  const assetsDetails = await lstat(assetsDirectory);
+  if (!assetsDetails.isDirectory() || assetsDetails.isSymbolicLink()) {
+    throw buildError("Legacy runtime cache contains an unexpected entry and requires inspection.");
+  }
+  const assets = await readdir(assetsDirectory, { withFileTypes: true });
+  for (const asset of assets) {
+    const assetPath = join(assetsDirectory, asset.name);
+    const details = await lstat(assetPath);
+    if (
+      !asset.isFile() ||
+      asset.isSymbolicLink() ||
+      !details.isFile() ||
+      details.isSymbolicLink() ||
+      !allowed.has(asset.name)
+    ) {
+      throw buildError("Legacy runtime asset cache contains an unexpected entry and requires inspection.");
+    }
+  }
+}
+
 export async function pruneRuntimeForTarget(runtimeDirectory) {
   const buildDirectory = join(runtimeDirectory, "node_modules", "zeromq", "build");
   const manifestPath = join(buildDirectory, "manifest.json");
@@ -380,7 +510,15 @@ export async function pruneRuntimeForTarget(runtimeDirectory) {
     throw buildError(`zeromq has no reviewed prebuild for ${process.platform}-${process.arch}-${libc}.`);
   }
   compatible.sort((left, right) => left.key.localeCompare(right.key, "en-US"));
-  await rm(buildDirectory, { recursive: true, force: true });
+  // Windows antivirus and sync providers can briefly retain a just-installed
+  // native image. Node's bounded recursive-rm retry handles only the documented
+  // transient EPERM/EBUSY/ENOTEMPTY class; integrity errors still fail closed.
+  await rm(buildDirectory, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 100,
+  });
   await mkdir(buildDirectory, { recursive: true });
   const filteredManifest = {};
   for (const entry of compatible) {
@@ -399,9 +537,12 @@ export async function pruneRuntimeForTarget(runtimeDirectory) {
 export async function smokeRuntime(runtimeDirectory, options = {}) {
   const runtimeExecutable = await requireAbsoluteRealFile(options.runtimeExecutable ?? process.execPath, "runtime executable");
   const electronRunAsNode = options.electronRunAsNode ?? process.env.ELECTRON_RUN_AS_NODE === "1";
+  const commandRunner = options.commandRunner ?? runCommand;
+  if (typeof commandRunner !== "function") throw buildError("Runtime smoke command runner is invalid.");
   const entrypoints = await resolveVerifiedEntrypoints(runtimeDirectory, options.policy);
   const scratchDirectory = await mkdtemp(join(tmpdir(), "prime-continuim-runtime-smoke-"));
   const probePath = join(scratchDirectory, "runtime-probe.mjs");
+  const daemonClientPath = join(scratchDirectory, "runtime-daemon-client.mjs");
   const probeSource = [
     'import { createRequire } from "node:module";',
     "const [moduleUrl, packageJsonPath] = process.argv.slice(2);",
@@ -412,10 +553,44 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     'if (!zeromq || (typeof zeromq !== "object" && typeof zeromq !== "function")) throw new Error("zeromq did not load");',
     'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
   ].join("\n");
-  await writeFile(probePath, probeSource, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  let probe;
+  const daemonClientSource = [
+    "const [moduleUrl, socketPath] = process.argv.slice(2);",
+    'if (!moduleUrl || !socketPath) throw new Error("missing daemon smoke arguments");',
+    "const runtime = await import(moduleUrl);",
+    'if (typeof runtime.DaemonClient !== "function") throw new Error("missing DaemonClient export");',
+    "const wait = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));",
+    "let client;",
+    "try {",
+    "  const deadline = Date.now() + 15_000;",
+    "  let lastError;",
+    "  while (Date.now() < deadline) {",
+    "    const candidate = new runtime.DaemonClient(socketPath);",
+    "    try {",
+    "      await candidate.connect(300);",
+    "      client = candidate;",
+    "      break;",
+    "    } catch (error) {",
+    "      lastError = error;",
+    "      candidate.close();",
+    "      await wait(30);",
+    "    }",
+    "  }",
+    '  if (!client) throw new Error(`daemon did not become ready: ${lastError instanceof Error ? lastError.message : String(lastError)}`);',
+    "  const hello = client.hello ?? (await client.waitForHello(1_000));",
+    '  const response = await client.request({ type: "shutdown", force: true }, 5_000);',
+    '  if (response?.type !== "response" || response.command !== "shutdown" || response.success !== true) throw new Error("daemon did not confirm smoke shutdown");',
+    "  process.stdout.write(JSON.stringify({ hello, response }));",
+    "} finally {",
+    "  client?.close();",
+    "}",
+  ].join("\n");
+  let child;
   try {
-    probe = await runCommand(
+    await Promise.all([
+      writeFile(probePath, probeSource, { encoding: "utf8", mode: 0o600, flag: "wx" }),
+      writeFile(daemonClientPath, daemonClientSource, { encoding: "utf8", mode: 0o600, flag: "wx" }),
+    ]);
+    const probe = await commandRunner(
       runtimeExecutable,
       [probePath, entrypoints.moduleUrl, entrypoints.packageJson],
       {
@@ -424,28 +599,19 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
         timeoutMs: 30_000,
       },
     );
-  } catch (error) {
-    await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
-    throw error;
-  } finally {
-    await rm(probePath, { force: true });
-  }
-  const runtimeVersions = JSON.parse(probe.stdout);
-  if (runtimeVersions.platform !== process.platform || runtimeVersions.arch !== process.arch) {
-    throw buildError("Runtime smoke process target does not match the build target.");
-  }
-  assertMinimumNodeVersion(runtimeVersions.node, options.policy.minimumNodeVersion);
+    const runtimeVersions = JSON.parse(probe.stdout);
+    if (runtimeVersions.platform !== process.platform || runtimeVersions.arch !== process.arch) {
+      throw buildError("Runtime smoke process target does not match the build target.");
+    }
+    assertMinimumNodeVersion(runtimeVersions.node, options.policy.minimumNodeVersion);
 
-  const smokeAgentDirectory = join(scratchDirectory, "agent");
-  await mkdir(smokeAgentDirectory, { recursive: false });
-  const socketPath = process.platform === "win32"
-    ? `\\\\.\\pipe\\prime-continuim-runtime-${process.pid}-${randomUUID()}`
-    : join(smokeAgentDirectory, "daemon.sock");
-  const daemonEnvironment = cleanRuntimeEnvironment(process.env, { electronRunAsNode });
-  daemonEnvironment.PRIME_AGENT_CODING_AGENT_DIR = smokeAgentDirectory;
-  let child;
-  let client;
-  try {
+    const smokeAgentDirectory = join(scratchDirectory, "agent");
+    await mkdir(smokeAgentDirectory, { recursive: false });
+    const socketPath = process.platform === "win32"
+      ? `\\\\.\\pipe\\prime-continuim-runtime-${process.pid}-${randomUUID()}`
+      : join(smokeAgentDirectory, "daemon.sock");
+    const daemonEnvironment = cleanRuntimeEnvironment(process.env, { electronRunAsNode });
+    daemonEnvironment.PRIME_AGENT_CODING_AGENT_DIR = smokeAgentDirectory;
     child = spawn(runtimeExecutable, [entrypoints.cli, "--mode", "daemon", "--daemon-socket", socketPath], {
       cwd: smokeAgentDirectory,
       detached: true,
@@ -454,39 +620,35 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
       windowsHide: true,
     });
     child.unref();
-    const runtimeModule = await import(`${entrypoints.moduleUrl}?smoke=${randomUUID()}`);
-    const deadline = Date.now() + 15_000;
-    let lastError;
-    while (Date.now() < deadline) {
-      const candidate = new runtimeModule.DaemonClient(socketPath);
-      try {
-        await candidate.connect(300);
-        client = candidate;
-        break;
-      } catch (error) {
-        lastError = error;
-        candidate.close();
-        await new Promise((resolveWait) => setTimeout(resolveWait, 30));
-      }
+    const interactionResult = await commandRunner(
+      runtimeExecutable,
+      [daemonClientPath, entrypoints.moduleUrl, socketPath],
+      {
+        cwd: smokeAgentDirectory,
+        env: daemonEnvironment,
+        timeoutMs: 30_000,
+      },
+    );
+    let interaction;
+    try {
+      interaction = JSON.parse(interactionResult.stdout);
+    } catch (error) {
+      throw buildError("Prime Agent daemon smoke helper returned invalid JSON.", error);
     }
-    if (!client) throw buildError(`Prime Agent daemon smoke did not become ready: ${errorMessage(lastError)}.`);
-    const hello = client.hello ?? (await client.waitForHello(1_000));
+    const hello = interaction?.hello;
     validateSmokeHello(hello, {
       socketPath,
       runtimeExecutable,
       cliEntrypoint: entrypoints.cli,
       policy: options.policy,
     });
-    const response = await client.request({ type: "shutdown", force: true }, 5_000);
+    const response = interaction?.response;
     if (response?.type !== "response" || response.command !== "shutdown" || response.success !== true) {
       throw buildError("Prime Agent daemon did not confirm smoke shutdown.");
     }
-    client.close();
-    client = undefined;
     await waitForChildExit(child, 10_000);
     return Object.freeze({ runtimeExecutable, runtimeVersions, hello });
   } finally {
-    client?.close();
     if (child && child.exitCode === null && child.signalCode === null) child.kill();
     await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -578,7 +740,7 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
   }
   assertMinimumNodeVersion(manifest.buildRuntime.node, options.policy.minimumNodeVersion);
   assertMinimumNodeVersion(manifest.smokeRuntime.node, options.policy.minimumNodeVersion);
-  const entries = await collectRuntimeFiles(root);
+  const entries = await collectRuntimeFiles(root, { rejectEmptyDirectories: true });
   const fileManifest = entries.map((entry) => `${entry.sha256}  ${entry.path}\n`).join("");
   const treeSource = entries.map((entry) => `${entry.sha256} ${entry.size} ${entry.path}\n`).join("");
   if (
@@ -835,10 +997,13 @@ export function cleanRuntimeEnvironment(source, { electronRunAsNode }) {
   return environment;
 }
 
-async function collectRuntimeFiles(root) {
+async function collectRuntimeFiles(root, options = {}) {
   const entries = [];
   async function visit(directory, prefix) {
     const children = await readdir(directory, { withFileTypes: true });
+    if (prefix && children.length === 0 && options.rejectEmptyDirectories === true) {
+      throw buildError(`Runtime contains an unexpected empty directory: ${prefix}.`);
+    }
     children.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)));
     for (const child of children) {
       if (/[\0\r\n]/.test(child.name) || child.name.normalize("NFC") !== child.name) {
@@ -909,8 +1074,11 @@ async function waitForChildExit(child, timeoutMs) {
 
 async function requireContainedRealFile(root, relativePath, label) {
   assertSafeRelativePath(relativePath, label);
-  const candidate = await requireAbsoluteRealFile(join(root, ...relativePath.split("/")), label);
-  const escaped = relative(root, candidate);
+  const canonicalRoot = await realpath(root).catch((error) => {
+    throw buildError(`Verified runtime root is unavailable: ${root}.`, error);
+  });
+  const candidate = await requireAbsoluteRealFile(join(canonicalRoot, ...relativePath.split("/")), label);
+  const escaped = relative(canonicalRoot, candidate);
   if (escaped.startsWith(`..${sep}`) || escaped === ".." || isAbsolute(escaped)) {
     throw buildError(`${label} escapes the verified runtime root.`);
   }
@@ -1009,10 +1177,6 @@ function targetLibcFamily() {
 
 function assertRecord(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw buildError(`${label} must be an object.`);
-}
-
-function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function jsonEqual(left, right) {

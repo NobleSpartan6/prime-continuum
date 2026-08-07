@@ -1,10 +1,12 @@
 import { access, mkdir, mkdtemp, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { createConnection, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AtomicWriteAmbiguousCommitError } from "../../src/hostd/atomic-files";
 import { encodeJsonFrame, LengthPrefixedJsonDecoder } from "../../src/shared/frame-codec";
 import { HostIpcResponseSchema, PROTOCOL_VERSION, type HostIpcResponse } from "../../src/shared/protocol";
+import { createHostOwnershipLease, type HostOwnershipLease } from "../../src/hostd/ownership-lease";
 import { defaultLocalEndpoint } from "../../src/hostd/paths";
 import {
   acquireUnixEndpointOwnership,
@@ -100,6 +102,31 @@ describe("hostd local transport", () => {
     }
   });
 
+  it("rejects an alternate endpoint before it can own the same durable store", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-noncanonical-endpoint-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    const canonicalEndpoint = defaultLocalEndpoint(directory);
+    const alternateEndpoint = process.platform === "win32"
+      ? `${canonicalEndpoint}-alternate`
+      : join(directory, "alternate-hostd.sock");
+    const onOwned = vi.fn(async () => service.initialize());
+
+    try {
+      await expect(
+        serveLocalSocket({
+          endpoint: alternateEndpoint,
+          dataDir: directory,
+          service,
+          onOwned,
+        }),
+      ).rejects.toMatchObject({ code: "HOST_ENDPOINT_NONCANONICAL" });
+      expect(onOwned).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+    }
+  });
+
   it("keeps endpoint ownership until the current service and admitted work are inert", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
     temporaryDirectories.push(directory);
@@ -130,45 +157,549 @@ describe("hostd local transport", () => {
     }
   });
 
-  it("atomically elects one owner when concurrent Unix contenders recover one stale sidecar", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+  it("holds a legitimate successor behind an admitted command publication", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-admitted-command-test-"));
     temporaryDirectories.push(directory);
-    const endpoint = join(directory, "hostd.sock");
-    const lockPath = unixEndpointOwnershipLockPath(endpoint);
-    const staleToken = "1".repeat(64);
-    await mkdir(lockPath, { mode: 0o700 });
-    await writeFile(
-      join(lockPath, `owner-${staleToken}.json`),
-      `${JSON.stringify({
-        version: 1,
-        token: staleToken,
-        pid: process.pid === 1 ? 2 : 1,
-        createdAt: "2026-08-06T00:00:00.000Z",
-      })}\n`,
-      { mode: 0o600 },
-    );
-    const acquisitionOptions = {
-      acquisitionWaitMs: 100,
-      retryDelayMs: 1,
-      isProcessAlive: (pid: number) => pid === process.pid,
-    };
+    const admissionPrepared = deferred<void>();
+    const releaseAdmission = deferred<void>();
+    let pauseAdmission = true;
+    const store = new HostStore(directory, {
+      admissionFaultInjector: async (point) => {
+        if (point !== "after_prepare" || !pauseAdmission) return;
+        pauseAdmission = false;
+        admissionPrepared.resolve(undefined);
+        await releaseAdmission.promise;
+      },
+    });
+    const service = new HostService(store);
+    await service.initialize({ seed: true });
+    const host = await store.getHost();
+    const endpoint = defaultLocalEndpoint(directory);
+    const server = await serveLocalSocket({ endpoint, dataDir: directory, service });
+    const command = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: "device-admitted-before-close",
+      commandId: "command-admitted-before-close",
+      expectedHostId: host.hostId,
+      threadId: "demo-thread",
+      issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "demo-execution-1",
+      command: { kind: "prompt", text: "Finish this admitted publication before handoff." },
+    } as const;
+    const requestOutcome = request(endpoint, {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "admitted-command-during-close",
+      method: "command.submit",
+      payload: { command },
+    }).catch((error: unknown) => error);
+    await admissionPrepared.promise;
 
-    const results = await Promise.allSettled([
-      acquireUnixEndpointOwnership(endpoint, acquisitionOptions),
-      acquireUnixEndpointOwnership(endpoint, acquisitionOptions),
-    ]);
-    const winners = results.filter(
-      (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof acquireUnixEndpointOwnership>>> =>
-        result.status === "fulfilled",
+    const closing = server.close();
+    let closeSettled = false;
+    void closing.then(
+      () => {
+        closeSettled = true;
+      },
+      () => {
+        closeSettled = true;
+      },
     );
-    const losers = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    const contenderStore = new HostStore(directory);
+    const contenderService = new HostService(contenderStore);
+    const contenderOwned = vi.fn(async () => contenderService.initialize());
 
-    expect(winners).toHaveLength(1);
-    expect(losers).toHaveLength(1);
-    expect(losers[0]?.reason).toMatchObject({ code: "HOST_ENDPOINT_OWNED" });
-    await winners[0]?.value.release();
-    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    try {
+      await expect(
+        serveLocalSocket({
+          endpoint,
+          dataDir: directory,
+          service: contenderService,
+          onOwned: contenderOwned,
+        }),
+      ).rejects.toThrow();
+      expect(contenderOwned).not.toHaveBeenCalled();
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+    } finally {
+      await contenderService.close();
+      releaseAdmission.resolve(undefined);
+    }
+
+    await expect(closing).resolves.toBeUndefined();
+    expect(await requestOutcome).toBeInstanceOf(Error);
+
+    const successorStore = new HostStore(directory);
+    const successorService = new HostService(successorStore);
+    const successorOwned = vi.fn(async () => successorService.initialize());
+    const successor = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service: successorService,
+      onOwned: successorOwned,
+    });
+    try {
+      expect(successorOwned).toHaveBeenCalledOnce();
+      expect(
+        await successorStore.reconcileCommands([
+          { deviceId: command.deviceId, commandId: command.commandId },
+        ]),
+      ).toMatchObject({
+        receipts: [
+          {
+            deviceId: command.deviceId,
+            commandId: command.commandId,
+            status: "rejected",
+            error: { code: "GATEWAY_UNAVAILABLE", retryable: true },
+          },
+        ],
+        unknown: [],
+      });
+    } finally {
+      await successor.close();
+    }
   });
+
+  it("drains an admitted publication before releasing the endpoint to a successor", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    await service.initialize();
+    const endpoint = defaultLocalEndpoint(directory);
+    let lease!: HostOwnershipLease;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      onOwned: async (ownedLease) => {
+        lease = ownedLease;
+      },
+    });
+    const publicationEntered = deferred<void>();
+    const releasePublication = deferred<void>();
+    const events: string[] = [];
+    const publication = lease.withPublicationPermit(async () => {
+      events.push("publication:start");
+      publicationEntered.resolve(undefined);
+      await releasePublication.promise;
+      events.push("publication:end");
+      return "committed";
+    });
+    await publicationEntered.promise;
+
+    const closing = server.close();
+    expect(lease.signal.aborted).toBe(true);
+    const latePublication = vi.fn(async () => undefined);
+    expect(() => lease.withPublicationPermit(latePublication)).toThrowError(
+      expect.objectContaining({ code: "HOST_OWNERSHIP_CLOSING" }),
+    );
+    expect(latePublication).not.toHaveBeenCalled();
+
+    const contenderService = new HostService(new HostStore(directory));
+    const contenderOwned = vi.fn(async () => undefined);
+    try {
+      await expect(
+        serveLocalSocket({ endpoint, dataDir: directory, service: contenderService, onOwned: contenderOwned }),
+      ).rejects.toThrow();
+      expect(contenderOwned).not.toHaveBeenCalled();
+    } finally {
+      await contenderService.close();
+    }
+
+    releasePublication.resolve(undefined);
+    await expect(publication).resolves.toBe("committed");
+    await closing;
+
+    const successorService = new HostService(new HostStore(directory));
+    await successorService.initialize();
+    const successor = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service: successorService,
+      onOwned: async () => {
+        events.push("successor:owned");
+      },
+    });
+    try {
+      expect(events).toEqual(["publication:start", "publication:end", "successor:owned"]);
+    } finally {
+      await successor.close();
+      await successorService.close();
+    }
+  });
+
+  it("upgrades an in-progress clean close when a publication discovers physical loss", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-close-upgrade-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    await service.initialize();
+    const endpoint = defaultLocalEndpoint(directory);
+    let lease!: HostOwnershipLease;
+    let ownershipChecks = 0;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      onOwned: async (ownedLease) => {
+        lease = ownedLease;
+      },
+      ownershipAssertion: async () => {
+        ownershipChecks += 1;
+        if (ownershipChecks === 2) throw new Error("simulated loss during clean close");
+      },
+    });
+    const publicationEntered = deferred<void>();
+    const releasePublication = deferred<void>();
+    const publication = lease.withPublicationPermit(async () => {
+      publicationEntered.resolve(undefined);
+      await releasePublication.promise;
+    });
+    await publicationEntered.promise;
+
+    const closing = server.close();
+    expect(closing).toBe(server.closed);
+    releasePublication.resolve(undefined);
+
+    await expect(publication).rejects.toMatchObject({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" });
+    await expect(closing).rejects.toMatchObject({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" });
+  });
+
+  it("fatally closes after post-publication ownership loss and holds successors behind service teardown", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-publication-test-"));
+    temporaryDirectories.push(directory);
+    const store = new HostStore(directory);
+    const service = new HostService(store);
+    await service.initialize();
+    const host = await store.getHost();
+    const endpoint = defaultLocalEndpoint(directory);
+    const serviceCloseStarted = deferred<void>();
+    const releaseServiceClose = deferred<void>();
+    const events: string[] = [];
+    const originalClose = service.close.bind(service);
+    vi.spyOn(service, "close").mockImplementation(async () => {
+      events.push("service:close:start");
+      serviceCloseStarted.resolve(undefined);
+      await releaseServiceClose.promise;
+      await originalClose();
+      events.push("service:close:end");
+    });
+    const handle = vi.spyOn(service, "handle");
+    let ownershipChecks = 0;
+    let lease!: HostOwnershipLease;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      onOwned: async (ownedLease) => {
+        lease = ownedLease;
+      },
+      ownershipAssertion: async () => {
+        ownershipChecks += 1;
+        if (ownershipChecks === 2) throw new Error("simulated physical ownership loss");
+      },
+    });
+
+    const publication = lease.withPublicationPermit(async () => {
+      events.push("publication");
+      return "visible";
+    });
+    try {
+      await expect(publication).rejects.toMatchObject({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" });
+      await serviceCloseStarted.promise;
+      expect(server.close()).toBe(server.closed);
+
+      let closedSettled = false;
+      void server.closed.then(
+        () => {
+          closedSettled = true;
+        },
+        () => {
+          closedSettled = true;
+        },
+      );
+      await Promise.resolve();
+      expect(closedSettled).toBe(false);
+
+      await expect(request(endpoint, healthRequest("health-after-ownership-loss"))).rejects.toThrow();
+      await expect(request(endpoint, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "mutation-after-ownership-loss",
+        method: "command.submit",
+        payload: {
+          command: {
+            protocolVersion: PROTOCOL_VERSION,
+            deviceId: "device-after-ownership-loss",
+            commandId: "command-after-ownership-loss",
+            expectedHostId: host.hostId,
+            threadId: "demo-thread",
+            issuedAt: new Date().toISOString(),
+            command: { kind: "prompt", text: "This mutation must never be admitted." },
+          },
+        },
+      })).rejects.toThrow();
+      expect(handle).not.toHaveBeenCalled();
+
+      const contenderService = new HostService(new HostStore(directory));
+      const contenderOwned = vi.fn(async () => undefined);
+      try {
+        await expect(
+          serveLocalSocket({ endpoint, dataDir: directory, service: contenderService, onOwned: contenderOwned }),
+        ).rejects.toThrow();
+        expect(contenderOwned).not.toHaveBeenCalled();
+      } finally {
+        await contenderService.close();
+      }
+    } finally {
+      releaseServiceClose.resolve(undefined);
+      await server.closed.catch(() => undefined);
+    }
+
+    await expect(server.closed).rejects.toMatchObject({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" });
+    const successorService = new HostService(new HostStore(directory));
+    await successorService.initialize();
+    const successor = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service: successorService,
+      onOwned: async () => {
+        events.push("successor:owned");
+      },
+    });
+    try {
+      expect(events).toEqual([
+        "publication",
+        "service:close:start",
+        "service:close:end",
+        "successor:owned",
+      ]);
+    } finally {
+      await successor.close();
+      await successorService.close();
+    }
+  });
+
+  it("turns verify-only ownership loss into fatal server shutdown", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-verify-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    await service.initialize();
+    const endpoint = defaultLocalEndpoint(directory);
+    let lease!: HostOwnershipLease;
+    let failOwnership = false;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      onOwned: async (ownedLease) => {
+        lease = ownedLease;
+      },
+      ownershipAssertion: async () => {
+        if (failOwnership) throw new Error("simulated verify-only ownership loss");
+      },
+    });
+
+    failOwnership = true;
+    await expect(lease.assertActive()).rejects.toMatchObject({ code: "HOST_OWNERSHIP_LOST" });
+    await expect(server.closed).rejects.toMatchObject({ code: "HOST_OWNERSHIP_LOST" });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "never unlinks a replacement Unix socket after physical ownership loss",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-socket-replacement-test-"));
+      temporaryDirectories.push(directory);
+      const service = new HostService(new HostStore(directory));
+      await service.initialize();
+      const endpoint = defaultLocalEndpoint(directory);
+      let lease!: HostOwnershipLease;
+      const server = await serveLocalSocket({
+        endpoint,
+        dataDir: directory,
+        service,
+        onOwned: async (ownedLease) => {
+          lease = ownedLease;
+        },
+      });
+      const displacedEndpoint = join(directory, "displaced-hostd.sock");
+      const replacement = createNetServer((socket) => socket.end());
+      try {
+        await rename(endpoint, displacedEndpoint);
+        await new Promise<void>((resolvePromise, rejectPromise) => {
+          replacement.once("error", rejectPromise);
+          replacement.listen(endpoint, resolvePromise);
+        });
+
+        await expect(lease.assertActive()).rejects.toMatchObject({ code: "HOST_OWNERSHIP_LOST" });
+        await expect(server.closed).rejects.toMatchObject({ code: "HOST_OWNERSHIP_LOST" });
+        await expect(connectOnce(endpoint)).resolves.toBeUndefined();
+      } finally {
+        await server.close().catch(() => undefined);
+        await new Promise<void>((resolvePromise) => {
+          if (!replacement.listening) return resolvePromise();
+          replacement.close(() => resolvePromise());
+        });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "never unlinks a successor Unix socket when ownership is displaced during post-listen startup",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-startup-socket-replacement-test-"));
+      temporaryDirectories.push(directory);
+      const service = new HostService(new HostStore(directory));
+      await service.initialize();
+      const endpoint = defaultLocalEndpoint(directory);
+      const displacedEndpoint = join(directory, "displaced-startup-hostd.sock");
+      const displacedOwnership = join(directory, "displaced-startup-owner");
+      const replacement = createNetServer((socket) => socket.end());
+      let successorOwnership: Awaited<ReturnType<typeof acquireUnixEndpointOwnership>> | undefined;
+      try {
+        await expect(
+          serveLocalSocket({
+            endpoint,
+            dataDir: directory,
+            service,
+            beforePostListenOwnershipProof: async () => {
+              await rename(unixEndpointOwnershipLockPath(endpoint), displacedOwnership);
+              successorOwnership = await acquireUnixEndpointOwnership(endpoint);
+              await rename(endpoint, displacedEndpoint);
+              await new Promise<void>((resolvePromise, rejectPromise) => {
+                replacement.once("error", rejectPromise);
+                replacement.listen(endpoint, resolvePromise);
+              });
+            },
+          }),
+        ).rejects.toMatchObject({ code: "HOST_ENDPOINT_LOCK_LOST" });
+
+        await expect(successorOwnership?.assertOwned()).resolves.toBeUndefined();
+        await expect(connectOnce(endpoint)).resolves.toBeUndefined();
+      } finally {
+        await new Promise<void>((resolvePromise) => {
+          if (!replacement.listening) return resolvePromise();
+          replacement.close(() => resolvePromise());
+        });
+        await successorOwnership?.release();
+        await service.close();
+      }
+    },
+  );
+
+  it("fences every request immediately before HostService admission", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-request-fence-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    await service.initialize();
+    const handle = vi.spyOn(service, "handle");
+    const endpoint = defaultLocalEndpoint(directory);
+    let failOwnership = false;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      ownershipAssertion: async () => {
+        if (failOwnership) throw new Error("simulated request-admission ownership loss");
+      },
+    });
+
+    failOwnership = true;
+    try {
+      await expect(request(endpoint, healthRequest("request-fence-loss"))).rejects.toThrow();
+      expect(handle).not.toHaveBeenCalled();
+      await expect(server.closed).rejects.toMatchObject({ code: "HOST_OWNERSHIP_LOST" });
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it("keeps the base service alive after ordinary atomic publication uncertainty", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-runtime-poison-test-"));
+    temporaryDirectories.push(directory);
+    const service = new HostService(new HostStore(directory));
+    await service.initialize();
+    const endpoint = defaultLocalEndpoint(directory);
+    let lease!: HostOwnershipLease;
+    const server = await serveLocalSocket({
+      endpoint,
+      dataDir: directory,
+      service,
+      onOwned: async (ownedLease) => {
+        lease = ownedLease;
+      },
+    });
+    const ambiguousCommit = new AtomicWriteAmbiguousCommitError(
+      "runtime/current.json",
+      new Error("simulated runtime pointer durability uncertainty"),
+    );
+
+    try {
+      await expect(
+        lease.withPublicationPermit(async () => {
+          throw ambiguousCommit;
+        }),
+      ).rejects.toBe(ambiguousCommit);
+      expect(lease.signal.aborted).toBe(true);
+
+      const response = await request(endpoint, healthRequest("health-after-runtime-poison"));
+      expect(response).toMatchObject({ ok: true, method: "health.get" });
+      let closedSettled = false;
+      void server.closed.then(
+        () => {
+          closedSettled = true;
+        },
+        () => {
+          closedSettled = true;
+        },
+      );
+      await Promise.resolve();
+      expect(closedSettled).toBe(false);
+    } finally {
+      await server.close();
+    }
+    await expect(server.closed).resolves.toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "atomically elects one owner when concurrent Unix contenders recover one stale sidecar",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+      temporaryDirectories.push(directory);
+      const endpoint = join(directory, "hostd.sock");
+      const lockPath = unixEndpointOwnershipLockPath(endpoint);
+      const staleToken = "1".repeat(64);
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(
+        join(lockPath, `owner-${staleToken}.json`),
+        `${JSON.stringify({
+          version: 1,
+          token: staleToken,
+          pid: process.pid === 1 ? 2 : 1,
+          createdAt: "2026-08-06T00:00:00.000Z",
+        })}\n`,
+        { mode: 0o600 },
+      );
+      const acquisitionOptions = {
+        acquisitionWaitMs: 100,
+        retryDelayMs: 1,
+        isProcessAlive: (pid: number) => pid === process.pid,
+      };
+
+      const results = await Promise.allSettled([
+        acquireUnixEndpointOwnership(endpoint, acquisitionOptions),
+        acquireUnixEndpointOwnership(endpoint, acquisitionOptions),
+      ]);
+      const winners = results.filter(
+        (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof acquireUnixEndpointOwnership>>> =>
+          result.status === "fulfilled",
+      );
+      const losers = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect(losers[0]?.reason).toMatchObject({ code: "HOST_ENDPOINT_OWNED" });
+      await winners[0]?.value.release();
+      await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   it("never auto-deletes an empty Unix ownership directory, even when it is old", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
@@ -256,6 +787,130 @@ describe("hostd local transport", () => {
   });
 });
 
+describe("host endpoint ownership publication lease", () => {
+  it("notifies the first physical loss once after synchronous revocation", async () => {
+    const fatalLoss = vi.fn();
+    let controller!: ReturnType<typeof createHostOwnershipLease>;
+    controller = createHostOwnershipLease(
+      async () => {
+        throw new Error("simulated physical loss");
+      },
+      {
+        generation: "9".repeat(64),
+        onFatalLoss: (error) => {
+          expect(controller.lease.signal.aborted).toBe(true);
+          expect(() => controller.lease.withPublicationPermit(async () => undefined)).toThrowError(
+            expect.objectContaining({ code: "HOST_OWNERSHIP_LOST" }),
+          );
+          fatalLoss(error);
+        },
+      },
+    );
+
+    const results = await Promise.allSettled([
+      controller.lease.assertActive(),
+      controller.assertOwned(),
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results.every((result) => result.status === "rejected")).toBe(true);
+    expect(fatalLoss).toHaveBeenCalledOnce();
+    expect(fatalLoss).toHaveBeenCalledWith(expect.objectContaining({ code: "HOST_OWNERSHIP_LOST" }));
+  });
+
+  it("linearizes shutdown against an ownership check before invoking the publication", async () => {
+    const ownershipCheckEntered = deferred<void>();
+    const releaseOwnershipCheck = deferred<void>();
+    const publish = vi.fn(async () => "published");
+    const controller = createHostOwnershipLease(async () => {
+      ownershipCheckEntered.resolve(undefined);
+      await releaseOwnershipCheck.promise;
+    }, { generation: "a".repeat(64) });
+
+    const publication = controller.lease.withPublicationPermit(publish);
+    await ownershipCheckEntered.promise;
+    controller.closeAdmission();
+    releaseOwnershipCheck.resolve(undefined);
+
+    await expect(publication).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_CLOSING",
+      generation: "a".repeat(64),
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await controller.drain();
+  });
+
+  it("does not cancel an admitted callback and drains it after closing admission", async () => {
+    const publicationEntered = deferred<void>();
+    const releasePublication = deferred<void>();
+    const assertOwned = vi.fn(async () => undefined);
+    const controller = createHostOwnershipLease(assertOwned, { generation: "b".repeat(64) });
+    const publication = controller.lease.withPublicationPermit(async () => {
+      publicationEntered.resolve(undefined);
+      await releasePublication.promise;
+      return "committed";
+    });
+    await publicationEntered.promise;
+
+    controller.closeAdmission();
+    let drained = false;
+    const draining = controller.drain().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    releasePublication.resolve(undefined);
+
+    await expect(publication).resolves.toBe("committed");
+    await draining;
+    expect(assertOwned).toHaveBeenCalledTimes(2);
+    expect(drained).toBe(true);
+  });
+
+  it("poisons the ownership generation when ownership is lost after publication", async () => {
+    const ownershipLoss = new Error("simulated ownership replacement");
+    let ownershipChecks = 0;
+    const controller = createHostOwnershipLease(async () => {
+      ownershipChecks += 1;
+      if (ownershipChecks === 2) throw ownershipLoss;
+    }, { generation: "c".repeat(64) });
+    const publish = vi.fn(async () => "visible");
+
+    await expect(controller.lease.withPublicationPermit(publish)).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN",
+      generation: "c".repeat(64),
+    });
+    expect(publish).toHaveBeenCalledOnce();
+    expect(controller.lease.signal.aborted).toBe(true);
+
+    const retry = vi.fn(async () => undefined);
+    expect(() => controller.lease.withPublicationPermit(retry)).toThrowError(
+      expect.objectContaining({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" }),
+    );
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("poisons the ownership generation after an ambiguous atomic commit", async () => {
+    const controller = createHostOwnershipLease(async () => undefined, { generation: "d".repeat(64) });
+    const ambiguousCommit = new AtomicWriteAmbiguousCommitError(
+      "state/current.json",
+      new Error("simulated directory sync failure"),
+    );
+
+    await expect(
+      controller.lease.withPublicationPermit(async () => {
+        throw ambiguousCommit;
+      }),
+    ).rejects.toBe(ambiguousCommit);
+    expect(controller.lease.signal.aborted).toBe(true);
+
+    const retry = vi.fn(async () => undefined);
+    expect(() => controller.lease.withPublicationPermit(retry)).toThrowError(
+      expect.objectContaining({ code: "HOST_OWNERSHIP_PUBLICATION_POISONED" }),
+    );
+    expect(retry).not.toHaveBeenCalled();
+  });
+});
+
 function deferred<T>() {
   let resolvePromise!: (value: T | PromiseLike<T>) => void;
   let rejectPromise!: (reason?: unknown) => void;
@@ -266,29 +921,61 @@ function deferred<T>() {
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
+function healthRequest(requestId: string) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    requestId,
+    method: "health.get",
+    payload: {},
+  } as const;
+}
+
 async function request(endpoint: string, value: unknown): Promise<HostIpcResponse> {
   return new Promise((resolvePromise, reject) => {
     const socket = createConnection(endpoint);
     const decoder = new LengthPrefixedJsonDecoder({ parse: (frame) => HostIpcResponseSchema.parse(frame) });
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timer!: ReturnType<typeof setTimeout>;
+    const resolve = (response: HostIpcResponse): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.destroy();
-      reject(new Error("Timed out waiting for hostd response"));
+      resolvePromise(response);
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error);
+    };
+    timer = setTimeout(() => {
+      fail(new Error("Timed out waiting for hostd response"));
     }, 3_000);
-    socket.once("error", reject);
+    socket.once("error", fail);
+    socket.once("close", () => fail(new Error("Hostd closed the connection without a response")));
     socket.on("data", (chunk: Buffer) => {
       try {
         const responses = decoder.push(chunk);
         const response = responses[0];
         if (!response) return;
-        clearTimeout(timer);
-        socket.destroy();
-        resolvePromise(response);
+        resolve(response);
       } catch (error) {
-        clearTimeout(timer);
-        socket.destroy();
-        reject(error);
+        fail(error instanceof Error ? error : new Error("Invalid hostd response", { cause: error }));
       }
     });
     socket.once("connect", () => socket.write(encodeJsonFrame(value)));
+  });
+}
+
+async function connectOnce(endpoint: string): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const socket = createConnection(endpoint);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolvePromise();
+    });
+    socket.once("error", rejectPromise);
   });
 }

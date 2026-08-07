@@ -18,6 +18,7 @@ const buildResult = await build({
   outfile,
   bundle: true,
   metafile: true,
+  preserveSymlinks: true,
   platform: "node",
   format: "cjs",
   target: "node22",

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 declare const __PRIME_CONTINUIM_RUNTIME_ATTESTATION_RECORD__: string | undefined;
 
 export const RUNTIME_ATTESTATION_RECORD_PREFIX = "PRIME_CONTINUIM_RUNTIME_ATTESTATION_V1:";
@@ -52,16 +54,37 @@ export interface EmbeddedRuntimeAttestation {
   }>;
 }
 
+export interface EmbeddedRuntimeAttestationEnvelope {
+  /** The parsed, release-generated attestation bound into this exact hostd. */
+  readonly attestation: EmbeddedRuntimeAttestation;
+  /** SHA-256 of the exact canonical attestation bytes embedded in hostd. */
+  readonly trustAnchorId: string;
+}
+
 /**
  * Returns the release-generated runtime attestation embedded in hostd.
  * Development hostd builds intentionally return undefined; release builds
  * must be rejected by packaging verification unless this record is present.
  */
 export function readEmbeddedRuntimeAttestation(): EmbeddedRuntimeAttestation | undefined {
+  return readEmbeddedRuntimeAttestationEnvelope()?.attestation;
+}
+
+/**
+ * Returns both the attestation and its byte-exact trust-anchor identifier.
+ * The identifier deliberately hashes the embedded bytes rather than a parsed
+ * object so health clients can bind readiness to the same release artifact.
+ */
+export function readEmbeddedRuntimeAttestationEnvelope(): EmbeddedRuntimeAttestationEnvelope | undefined {
   const record = typeof __PRIME_CONTINUIM_RUNTIME_ATTESTATION_RECORD__ === "undefined"
     ? undefined
     : __PRIME_CONTINUIM_RUNTIME_ATTESTATION_RECORD__;
   if (record === undefined) return undefined;
+  return parseEmbeddedRuntimeAttestationRecord(record);
+}
+
+/** Parses one bounded embedded record. Exported for release-verifier tests. */
+export function parseEmbeddedRuntimeAttestationRecord(record: string): EmbeddedRuntimeAttestationEnvelope {
   if (!record.startsWith(RUNTIME_ATTESTATION_RECORD_PREFIX)) {
     throw new Error("The embedded runtime attestation record is malformed");
   }
@@ -86,7 +109,10 @@ export function readEmbeddedRuntimeAttestation(): EmbeddedRuntimeAttestation | u
   if (!isEmbeddedRuntimeAttestation(value)) {
     throw new Error("The embedded runtime attestation has an invalid identity");
   }
-  return deepFreeze(value);
+  return deepFreeze({
+    attestation: value,
+    trustAnchorId: createHash("sha256").update(bytes).digest("hex"),
+  });
 }
 
 function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeAttestation {

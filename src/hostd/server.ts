@@ -18,8 +18,16 @@ import {
   type HostIpcResponse,
   type HostIpcSnapshotTransferEnvelope,
 } from "../shared/protocol";
+import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
 import { ensurePrivateDirectory } from "./atomic-files";
+import {
+  createHostOwnershipLease,
+  type HostOwnershipLease,
+  type HostOwnershipLeaseController,
+} from "./ownership-lease";
 import { TRUSTED_USER_SESSION, type HostService, type HostSessionContext } from "./service";
+
+export type { HostOwnershipLease } from "./ownership-lease";
 
 export const MAX_HOST_CONNECTIONS = 32;
 export const CONNECTION_IDLE_TIMEOUT_MS = 5 * 60_000;
@@ -33,7 +41,9 @@ const OWNERSHIP_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const OWNERSHIP_MARKER_PATTERN = /^owner-([0-9a-f]{64})\.json$/;
 
 export interface HostServer {
-  endpoint: string;
+  readonly endpoint: string;
+  /** Resolves after clean teardown and rejects after fatal ownership-loss teardown. */
+  readonly closed: Promise<void>;
   close(): Promise<void>;
 }
 
@@ -67,9 +77,24 @@ export async function serveLocalSocket(options: {
   dataDir: string;
   service: HostService;
   /** Runs only after this process has won exclusive endpoint ownership. */
-  onOwned?: () => Promise<void>;
+  onOwned?: (lease: HostOwnershipLease) => Promise<void>;
+  /** Adds a deterministic assertion after the platform ownership proof. */
+  ownershipAssertion?: () => Promise<void>;
+  /** Test seam immediately before the post-listen Unix sidecar proof. */
+  beforePostListenOwnershipProof?: () => Promise<void>;
 }): Promise<HostServer> {
-  const endpoint = validateLocalEndpoint(options.endpoint, options.dataDir);
+  const canonicalTarget = await resolveCanonicalLocalHostTarget(options.dataDir, { create: true });
+  const endpoint = validateLocalEndpoint(options.endpoint, canonicalTarget.dataDirectory);
+  const canonicalEndpoint = canonicalTarget.endpoint;
+  const ownsCanonicalEndpoint = process.platform === "win32"
+    ? endpoint.toLowerCase() === canonicalEndpoint.toLowerCase()
+    : endpoint === canonicalEndpoint;
+  if (!ownsCanonicalEndpoint) {
+    throw new HostEndpointOwnershipError(
+      "HOST_ENDPOINT_NONCANONICAL",
+      "Host service endpoint must be the canonical endpoint for its durable data directory",
+    );
+  }
   let unixOwnership: UnixEndpointOwnership | undefined;
   if (process.platform !== "win32") {
     await ensurePrivateDirectory(dirname(endpoint));
@@ -87,7 +112,8 @@ export async function serveLocalSocket(options: {
   const sockets = new Set<Socket>();
   const pendingSockets = new Set<Socket>();
   const sessions = new Set<Promise<void>>();
-  let phase: "initializing" | "accepting" | "closing" = options.onOwned === undefined ? "accepting" : "initializing";
+  let phase: "initializing" | "accepting" | "closing" = "initializing";
+  let ownershipLeaseController!: HostOwnershipLeaseController;
   const startSession = (socket: Socket): void => {
     pendingSockets.delete(socket);
     if (socket.destroyed) return;
@@ -100,7 +126,13 @@ export async function serveLocalSocket(options: {
     socket.setTimeout(CONNECTION_IDLE_TIMEOUT_MS, () => socket.destroy());
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    const session = runFramedSession(options.service, socket, socket, TRUSTED_USER_SESSION)
+    const session = runFramedSession(
+      options.service,
+      socket,
+      socket,
+      TRUSTED_USER_SESSION,
+      () => ownershipLeaseController.assertOwned(),
+    )
       .catch(() => {
         socket.destroy();
       })
@@ -132,88 +164,136 @@ export async function serveLocalSocket(options: {
   });
   server.maxConnections = MAX_HOST_CONNECTIONS;
   let ownedSocketIdentity: SocketFileIdentity | undefined;
+  let shutdownStarted = false;
+  let fatalOwnershipError: Error | undefined;
+  let resolveClosed!: () => void;
+  let rejectClosed!: (error: unknown) => void;
+  const closed = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveClosed = resolvePromise;
+    rejectClosed = rejectPromise;
+  });
+  // A caller may choose to observe `closed` only when coordinating process
+  // lifetime. Fatal shutdown must not become an unhandled rejection before it
+  // has a chance to do so.
+  void closed.catch(() => undefined);
+
+  const performShutdown = async (): Promise<void> => {
+    await Promise.allSettled([...sessions]);
+    await ownershipLeaseController.drain();
+    let cleanupError: unknown;
+    try {
+      await options.service.close();
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await closeServer(server);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (ownedSocketIdentity && !fatalOwnershipError) {
+      try {
+        await removeSocketIfStillOwned(endpoint, ownedSocketIdentity);
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (!cleanupError && !fatalOwnershipError) {
+      try {
+        // Unix release re-proves the exact directory identity and token before
+        // removing anything. A physically displaced owner is a safe no-op.
+        await unixOwnership?.release();
+        ownershipLeaseController.markReleased();
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    // After physical ownership loss, pathname cleanup is unsafe: without the
+    // sidecar fence a successor could replace the socket between lstat and rm.
+    // Leave both path and sidecar untouched for the proven successor or stale
+    // recovery path; this generation is already synchronously revoked.
+    if (fatalOwnershipError) throw fatalOwnershipError;
+    if (cleanupError) throw cleanupError;
+  };
+
+  const beginShutdown = (reason?: Error, fatal = false): Promise<void> => {
+    if (fatal && reason && !fatalOwnershipError) fatalOwnershipError = reason;
+    if (shutdownStarted) return closed;
+    // Set the guard before aborting the lease: AbortSignal listeners run
+    // synchronously and may re-enter close().
+    shutdownStarted = true;
+    phase = "closing";
+    ownershipLeaseController.closeAdmission(reason);
+    for (const socket of pendingSockets) socket.destroy();
+    pendingSockets.clear();
+    for (const socket of sockets) socket.destroy();
+    void performShutdown().then(resolveClosed, rejectClosed);
+    return closed;
+  };
+
   try {
     await listen(server, endpoint);
     if (process.platform !== "win32") {
       await chmod(endpoint, 0o600);
       ownedSocketIdentity = await readSocketIdentity(endpoint);
+      await options.beforePostListenOwnershipProof?.();
       await unixOwnership?.assertOwned();
     }
+    const assertUnderlyingOwned = async (): Promise<void> => {
+      if (!server.listening) {
+        throw new HostEndpointOwnershipError(
+          "HOST_ENDPOINT_LOCK_LOST",
+          `The local endpoint is no longer listening: ${endpoint}`,
+        );
+      }
+      await unixOwnership?.assertOwned();
+      if (ownedSocketIdentity && !(await socketIdentityMatches(endpoint, ownedSocketIdentity))) {
+        throw new HostEndpointOwnershipError(
+          "HOST_ENDPOINT_LOCK_LOST",
+          `The local endpoint socket was replaced: ${endpoint}`,
+        );
+      }
+      await options.ownershipAssertion?.();
+    };
+    ownershipLeaseController = createHostOwnershipLease(assertUnderlyingOwned, {
+      onFatalLoss: (error) => {
+        // Revocation already happened synchronously in the lease. Never await
+        // here: shutdown drains the assertion/publication that found the loss.
+        void beginShutdown(error, true);
+      },
+    });
   } catch (error) {
     phase = "closing";
     for (const socket of pendingSockets) socket.destroy();
     pendingSockets.clear();
-    let cleanupComplete = true;
+    let listenerClosed = true;
     await closeServer(server).catch(() => {
-      cleanupComplete = false;
+      listenerClosed = false;
     });
-    if (ownedSocketIdentity) {
-      await removeSocketIfStillOwned(endpoint, ownedSocketIdentity).catch(() => {
-        cleanupComplete = false;
-      });
-    }
-    if (cleanupComplete) await unixOwnership?.release().catch(() => undefined);
+    // Never unlink a published Unix socket from this startup-failure path.
+    // There is no cross-platform unlink-if-inode primitive, so any separate
+    // ownership proof would leave a successor-replacement TOCTOU. A subsequent
+    // proven owner safely removes this now-stale socket during acquisition.
+    // Token-specific sidecar release is replacement-safe on its own.
+    if (listenerClosed) await unixOwnership?.release().catch(() => undefined);
     throw error;
   }
   try {
-    await options.onOwned?.();
+    await options.onOwned?.(ownershipLeaseController.lease);
+    if (shutdownStarted) await closed;
     phase = "accepting";
     for (const socket of [...pendingSockets]) startSession(socket);
   } catch (error) {
-    phase = "closing";
-    for (const socket of pendingSockets) socket.destroy();
-    pendingSockets.clear();
-    let cleanupComplete = true;
-    await options.service.close().catch(() => {
-      cleanupComplete = false;
-    });
-    await closeServer(server).catch(() => {
-      cleanupComplete = false;
-    });
-    if (ownedSocketIdentity) {
-      await removeSocketIfStillOwned(endpoint, ownedSocketIdentity).catch(() => {
-        cleanupComplete = false;
-      });
-    }
-    if (cleanupComplete) await unixOwnership?.release().catch(() => undefined);
+    const reason = error instanceof Error ? error : new Error("Owned host initialization failed", { cause: error });
+    await beginShutdown(reason).catch(() => undefined);
     throw error;
   }
 
-  let closePromise: Promise<void> | undefined;
   return {
     endpoint,
+    closed,
     close() {
-      closePromise ??= (async () => {
-        // Keep the owned endpoint bound while every admitted request and the
-        // authority shut down. A successor cannot initialize against the same
-        // durable state until this owner has become inert.
-        phase = "closing";
-        for (const socket of pendingSockets) socket.destroy();
-        pendingSockets.clear();
-        for (const socket of sockets) socket.destroy();
-        await Promise.allSettled([...sessions]);
-        let shutdownError: unknown;
-        try {
-          await options.service.close();
-        } catch (error) {
-          shutdownError = error;
-        }
-        try {
-          await closeServer(server);
-        } catch (error) {
-          shutdownError ??= error;
-        }
-        if (ownedSocketIdentity) {
-          try {
-            await removeSocketIfStillOwned(endpoint, ownedSocketIdentity);
-          } catch (error) {
-            shutdownError ??= error;
-          }
-        }
-        if (!shutdownError) await unixOwnership?.release();
-        if (shutdownError) throw shutdownError;
-      })();
-      return closePromise;
+      return beginShutdown();
     },
   };
 }
@@ -223,12 +303,16 @@ export async function runFramedSession(
   readable: Readable,
   writable: Writable,
   context: HostSessionContext,
+  assertRequestOwnership?: () => Promise<void>,
 ): Promise<void> {
   try {
     for await (const request of readJsonFrames(readable, {
       maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
       maxFramesPerChunk: 256,
     })) {
+      // There is no await between the completed physical ownership proof and
+      // HostService admission, so shutdown/loss cannot interleave this edge.
+      await assertRequestOwnership?.();
       const response = await service.handle(request, context);
       if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
         await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
@@ -905,16 +989,19 @@ async function readSocketIdentity(endpoint: string): Promise<SocketFileIdentity>
   return { dev: stats.dev, ino: stats.ino };
 }
 
-/** Never unlink a replacement socket that another owner bound during teardown. */
-async function removeSocketIfStillOwned(endpoint: string, owned: SocketFileIdentity): Promise<void> {
-  let current;
+async function socketIdentityMatches(endpoint: string, owned: SocketFileIdentity): Promise<boolean> {
   try {
-    current = await lstat(endpoint);
+    const current = await lstat(endpoint);
+    return current.isSocket() && current.dev === owned.dev && current.ino === owned.ino;
   } catch (error) {
-    if (isErrorCode(error, "ENOENT")) return;
+    if (isErrorCode(error, "ENOENT")) return false;
     throw error;
   }
-  if (!current.isSocket() || current.dev !== owned.dev || current.ino !== owned.ino) return;
+}
+
+/** Never unlink a replacement socket that another owner bound during teardown. */
+async function removeSocketIfStillOwned(endpoint: string, owned: SocketFileIdentity): Promise<void> {
+  if (!(await socketIdentityMatches(endpoint, owned))) return;
   await rm(endpoint);
 }
 

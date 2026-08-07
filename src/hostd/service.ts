@@ -4,10 +4,12 @@ import {
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PROTOCOL_VERSION,
+  RUNTIME_INTEGRITY_CAPABILITY,
   type HostIpcRequest,
   type HostIpcResponse,
   type HostIdentityReadiness,
   type RemoteDeviceScope,
+  type RuntimeIntegritySnapshot,
   type StructuredError,
 } from "../shared/protocol";
 import { GatewayError, type PrimeAgentGateway, UnavailablePrimeAgentGateway } from "./gateway";
@@ -64,6 +66,14 @@ const DEFAULT_IDENTITY_LOAD_TIMEOUT_MS = 5_000;
 export interface HostServiceOptions {
   hostIdentityProvider?: HostIdentityKeyProvider;
   identityLoadTimeoutMs?: number;
+  runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
+}
+
+export interface RuntimeIntegrityReadinessProvider {
+  /** Returns the latest bounded snapshot synchronously without performing integrity work. */
+  snapshot(): RuntimeIntegritySnapshot;
+  /** Settles any background integrity work before endpoint ownership is released. */
+  close?(): Promise<void>;
 }
 
 export class HostService {
@@ -73,6 +83,7 @@ export class HostService {
   readonly hostIdentityProvider: HostIdentityKeyProvider;
   private closePromise: Promise<void> | undefined;
   private readonly identityLoadTimeoutMs: number;
+  private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
   readonly startedAt = new Date().toISOString();
@@ -88,6 +99,7 @@ export class HostService {
     this.pairingAuthority = pairingAuthority;
     this.hostIdentityProvider = options.hostIdentityProvider ?? new UnavailableHostIdentityKeyProvider();
     this.identityLoadTimeoutMs = options.identityLoadTimeoutMs ?? DEFAULT_IDENTITY_LOAD_TIMEOUT_MS;
+    this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     if (!Number.isSafeInteger(this.identityLoadTimeoutMs) || this.identityLoadTimeoutMs < 10 || this.identityLoadTimeoutMs > 30_000) {
       throw new TypeError("Identity load timeout must be an integer from 10 to 30000 milliseconds");
     }
@@ -104,9 +116,16 @@ export class HostService {
 
   close(): Promise<void> {
     this.closePromise ??= (async () => {
-      await this.pairingAuthority.close();
-      if (this.hostIdentityProviderUsed) await this.hostIdentityProvider.close();
-      await this.gateway.close();
+      const closeResults = await Promise.allSettled([
+        Promise.resolve().then(() => this.runtimeIntegrityProvider?.close?.()),
+        Promise.resolve().then(() => this.pairingAuthority.close()),
+        Promise.resolve().then(() => (this.hostIdentityProviderUsed ? this.hostIdentityProvider.close() : undefined)),
+        Promise.resolve().then(() => this.gateway.close()),
+      ]);
+      const failures = closeResults.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "One or more host service resources failed to close");
+      }
     })();
     return this.closePromise;
   }
@@ -188,15 +207,19 @@ export class HostService {
     switch (request.method) {
       case "health.get": {
         const host = await this.store.getHost();
+        const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
           startedAt: this.startedAt,
           checkedAt: new Date().toISOString(),
-          serviceState: "ready",
+          serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
           host,
-          capabilities: [...HOST_CAPABILITIES],
+          capabilities: runtimeIntegrity === undefined
+            ? [...HOST_CAPABILITIES]
+            : [...HOST_CAPABILITIES, RUNTIME_INTEGRITY_CAPABILITY],
           pairingIdentity: this.pairingIdentity,
+          ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
         };
       }
       case "catalog.snapshot":
@@ -449,6 +472,20 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
         case "approval.resolve":
           return "approval.resolve";
       }
+  }
+}
+
+function serviceStateForRuntimeIntegrity(
+  runtimeIntegrity: RuntimeIntegritySnapshot,
+): "starting" | "ready" | "degraded" {
+  switch (runtimeIntegrity.status) {
+    case "initializing":
+      return "starting";
+    case "ready":
+      return "ready";
+    case "failed":
+    case "unavailable":
+      return "degraded";
   }
 }
 

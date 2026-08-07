@@ -4,17 +4,36 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AtomicWriteAmbiguousCommitError, atomicWriteJson } from "../../src/hostd/atomic-files";
+import {
+  createHostOwnershipLease,
+  type HostOwnershipLease,
+} from "../../src/hostd/ownership-lease";
 import { getHostDataPaths } from "../../src/hostd/paths";
 import type { EmbeddedRuntimeAttestation } from "../../src/hostd/runtime-attestation";
 import {
   RuntimeIntegrityManager,
+  RuntimeIntegrityCancelledError,
+  RuntimeIntegrityInstalledCorruptionError,
+  RuntimeIntegrityRepairRequiredError,
+  RuntimeIntegrityTransientVerificationError,
   parseRuntimeFileManifest,
+  type RuntimeIntegrityProgressPhase,
   type RuntimeHostIdentity,
   type RuntimeIntegrityFaultPoint,
 } from "../../src/hostd/runtime-integrity-manager";
 
 const temporaryDirectories: string[] = [];
 const DIGEST = "a".repeat(64);
+const FINAL_VERIFICATION_FAILURES = [
+  {
+    name: "cancellation",
+    createError: () => new RuntimeIntegrityCancelledError(),
+  },
+  {
+    name: "an unknown coded OS failure",
+    createError: () => Object.assign(new Error("simulated final read failure"), { code: "EIO" }),
+  },
+] as const;
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -57,7 +76,9 @@ describe("runtime integrity manager", () => {
     expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
 
     await rm(finalPath, { recursive: true });
-    await expect(createManager(fixture).ensureInstalled()).rejects.toThrow("no attested recovery seed");
+    const recoveryFailure = await createManager(fixture).ensureInstalled().catch((error: unknown) => error);
+    expect(recoveryFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(recoveryFailure).toMatchObject({ reason: "packaged_seed_unavailable" });
     expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
   });
 
@@ -67,7 +88,11 @@ describe("runtime integrity manager", () => {
     const replacementOnOriginalHost = { ...replacement, paths: original.paths };
 
     await createManager(original).ensureInstalled(original.seedRoot);
-    await expect(createManager(replacementOnOriginalHost).ensureInstalled()).rejects.toThrow("no attested rollover seed");
+    const rolloverFailure = await createManager(replacementOnOriginalHost)
+      .ensureInstalled()
+      .catch((error: unknown) => error);
+    expect(rolloverFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(rolloverFailure).toMatchObject({ reason: "packaged_seed_unavailable" });
 
     const upgraded = await createManager(replacementOnOriginalHost).ensureInstalled(replacement.seedRoot);
     expect(upgraded.runtimeBuildId).toBe("fixture-build-replacement");
@@ -127,26 +152,64 @@ describe("runtime integrity manager", () => {
   it("rejects tampered metadata and a hard-linked payload", async () => {
     const tampered = await createFixture();
     await writeFile(join(tampered.seedImage, "runtime.json"), "{}\n");
-    await expect(createManager(tampered).ensureInstalled(tampered.seedRoot)).rejects.toThrow("attestation");
+    await expect(createManager(tampered).ensureInstalled(tampered.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
 
     const linked = await createFixture();
     const payload = join(linked.seedImage, ...linked.payloads[0]!.path.split("/"));
     await link(payload, join(linked.root, "outside-hardlink"));
-    await expect(createManager(linked).ensureInstalled(linked.seedRoot)).rejects.toThrow("hard-linked");
+    await expect(createManager(linked).ensureInstalled(linked.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
   });
 
   it("rejects missing, extra, and content-tampered payload files", async () => {
     const missing = await createFixture();
     await rm(join(missing.seedImage, ...missing.payloads[0]!.path.split("/")));
-    await expect(createManager(missing).ensureInstalled(missing.seedRoot)).rejects.toThrow(/missing|extra/i);
+    await expect(createManager(missing).ensureInstalled(missing.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
 
     const extra = await createFixture();
     await writeFile(join(extra.seedImage, "unexpected.txt"), "unexpected");
-    await expect(createManager(extra).ensureInstalled(extra.seedRoot)).rejects.toThrow(/missing|extra/i);
+    await expect(createManager(extra).ensureInstalled(extra.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
 
     const changed = await createFixture();
     await writeFile(join(changed.seedImage, ...changed.payloads[0]!.path.split("/")), "changed-content");
-    await expect(createManager(changed).ensureInstalled(changed.seedRoot)).rejects.toThrow(/digest|byte count/i);
+    await expect(createManager(changed).ensureInstalled(changed.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
+  });
+
+  it("requires repair for an absent packaged seed and malformed or mismatched seed pointer bytes", async () => {
+    const absent = await createFixture();
+    await rm(absent.seedRoot, { recursive: true, force: true });
+    const absentFailure = await createManager(absent)
+      .ensureInstalled(absent.seedRoot)
+      .catch((error: unknown) => error);
+    expect(absentFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(absentFailure).toMatchObject({ reason: "packaged_seed_unavailable" });
+
+    const malformed = await createFixture();
+    await writeFile(join(malformed.seedRoot, "current.json"), "{not-json\n");
+    const malformedFailure = await createManager(malformed)
+      .ensureInstalled(malformed.seedRoot)
+      .catch((error: unknown) => error);
+    expect(malformedFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(malformedFailure).toMatchObject({ reason: "packaged_seed_invalid" });
+
+    const mismatched = await createFixture();
+    const seedPointerPath = join(mismatched.seedRoot, "current.json");
+    const seedPointer = JSON.parse(await readFile(seedPointerPath, "utf8")) as Record<string, unknown>;
+    await writeFile(seedPointerPath, `${JSON.stringify({ ...seedPointer, treeSha256: "f".repeat(64) })}\n`);
+    const mismatchedFailure = await createManager(mismatched)
+      .ensureInstalled(mismatched.seedRoot)
+      .catch((error: unknown) => error);
+    expect(mismatchedFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(mismatchedFailure).toMatchObject({ reason: "packaged_seed_invalid" });
   });
 
   it("rejects host tuple drift and any unsigned production-authenticated claim", async () => {
@@ -157,6 +220,7 @@ describe("runtime integrity manager", () => {
     expect(() => new RuntimeIntegrityManager({
       paths: fixture.paths,
       attestation: { ...fixture.attestation, assurance: "production-authenticated" },
+      ownershipLease: createTestOwnershipLease(),
       hostRuntime: fixture.hostRuntime,
     })).toThrow("refuses production-authenticated");
   });
@@ -172,7 +236,9 @@ describe("runtime integrity manager", () => {
     await rm(nativeDirectory, { recursive: true });
     await symlink(external, nativeDirectory, process.platform === "win32" ? "junction" : "dir");
 
-    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).rejects.toThrow(/symbolic link|junction/i);
+    await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityRepairRequiredError,
+    );
   });
 
   it("leaves no pointer or staging image when copying fails", async () => {
@@ -187,6 +253,99 @@ describe("runtime integrity manager", () => {
     await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
     expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([]);
+  });
+
+  it("cancels cooperatively with a stable error, phase-only progress, and complete staging cleanup", async () => {
+    const fixture = await createFixture();
+    const ownership = createHostOwnershipLease(async () => undefined, { generation: "b".repeat(64) });
+    const progress = vi.fn((phase: RuntimeIntegrityProgressPhase) => {
+      if (phase === "copying") ownership.closeAdmission();
+    });
+    const manager = createManager(fixture, {
+      ownershipLease: ownership.lease,
+      onProgress: progress,
+    });
+
+    const cancellation = await manager.ensureInstalled(fixture.seedRoot).catch((error: unknown) => error);
+    expect(cancellation).toBeInstanceOf(RuntimeIntegrityCancelledError);
+    expect(cancellation).toMatchObject({
+      name: "RuntimeIntegrityCancelledError",
+      code: "RUNTIME_INTEGRITY_CANCELLED",
+    });
+    expect(progress.mock.calls.every((call) => call.length === 1 && typeof call[0] === "string")).toBe(true);
+    expect(progress.mock.calls.map(([phase]) => phase)).toEqual([
+      "preparing",
+      "verifying",
+      "validating_seed",
+      "copying",
+    ]);
+    await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([]);
+  });
+
+  it("publishes a new final and its pointer under one ownership permit", async () => {
+    const fixture = await createFixture();
+    const underlying = createTestOwnershipLease();
+    let permits = 0;
+    const ownershipLease: HostOwnershipLease = {
+      signal: underlying.signal,
+      generation: underlying.generation,
+      assertActive: () => underlying.assertActive(),
+      poisonPublication: (reason) => underlying.poisonPublication(reason),
+      withPublicationPermit: async <T>(publish: () => Promise<T>): Promise<T> => {
+        permits += 1;
+        return await underlying.withPublicationPermit(publish);
+      },
+    };
+
+    await expect(createManager(fixture, { ownershipLease }).ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(permits).toBe(1);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+  });
+
+  it("does not observe cancellation inside an admitted final-and-pointer publication", async () => {
+    const fixture = await createFixture();
+    const ownership = createHostOwnershipLease(async () => undefined, { generation: "c".repeat(64) });
+    const manager = createManager(fixture, {
+      ownershipLease: ownership.lease,
+      faultInjector(point) {
+        if (point === "before_pointer_write") ownership.closeAdmission();
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toMatchObject({
+      code: "RUNTIME_INTEGRITY_CANCELLED",
+    });
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+  });
+
+  it("keeps deterministic pre-publication writer failures retryable on the same lease", async () => {
+    const fixture = await createFixture();
+    let failOnce = true;
+    const manager = createManager(fixture, {
+      writeCurrent: async (path, value) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("transient pointer writer failure");
+        }
+        await atomicWriteJson(path, value);
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toThrow("transient pointer writer failure");
+    await expect(manager.ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
   });
 
   it("single-flights only in-flight work and allows the same manager to retry after failure", async () => {
@@ -215,13 +374,54 @@ describe("runtime integrity manager", () => {
     const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
     await writeFile(join(finalPath, ...fixture.payloads[0]!.path.split("/")), "tampered after installation");
 
-    await expect(manager.ensureInstalled()).rejects.toThrow(/digest|byte count/i);
-    await expect(manager.verifyInstalled()).rejects.toThrow(/digest|byte count/i);
+    await expect(manager.ensureInstalled()).rejects.toBeInstanceOf(RuntimeIntegrityInstalledCorruptionError);
+    await expect(manager.verifyInstalled()).rejects.toBeInstanceOf(RuntimeIntegrityInstalledCorruptionError);
   });
+
+  it.each(FINAL_VERIFICATION_FAILURES)(
+    "preserves $name while directly verifying a still-present final",
+    async ({ createError }) => {
+      const fixture = await createFixture();
+      await createManager(fixture).ensureInstalled(fixture.seedRoot);
+      const injected = createError();
+      const manager = createManager(fixture, {
+        faultInjector(point) {
+          if (point === "before_final_verify") throw injected;
+        },
+      });
+
+      const failure = await manager.verifyInstalled().catch((error: unknown) => error);
+      expect(failure).toBe(injected);
+      expect(failure).not.toBeInstanceOf(RuntimeIntegrityInstalledCorruptionError);
+    },
+  );
+
+  it.each(FINAL_VERIFICATION_FAILURES)(
+    "does not convert $name into a no-seed repair requirement",
+    async ({ createError }) => {
+      const fixture = await createFixture();
+      await createManager(fixture).ensureInstalled(fixture.seedRoot);
+      const injected = createError();
+      const manager = createManager(fixture, {
+        faultInjector(point) {
+          if (point === "before_final_verify") throw injected;
+        },
+      });
+
+      const failure = await manager.ensureInstalled().catch((error: unknown) => error);
+      expect(failure).toBe(injected);
+      expect(failure).not.toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    },
+  );
 
   it("recovers a fully verified orphan after an ambiguous final publication", async () => {
     const fixture = await createFixture();
+    let ownershipChecks = 0;
+    const ownershipLease = createTestOwnershipLease(async () => {
+      ownershipChecks += 1;
+    });
     const manager = createManager(fixture, {
+      ownershipLease,
       faultInjector(point) {
         if (point === "after_final_rename") throw new Error("simulated final publication uncertainty");
       },
@@ -231,6 +431,15 @@ describe("runtime integrity manager", () => {
     expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
     await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
 
+    const checksAfterPoison = ownershipChecks;
+    await expect(manager.ensureInstalled()).rejects.toMatchObject({
+      code: "RUNTIME_INTEGRITY_PUBLICATION_POISONED",
+    });
+    await expect(createManager(fixture, { ownershipLease }).ensureInstalled()).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_PUBLICATION_POISONED",
+    });
+    expect(ownershipChecks).toBe(checksAfterPoison);
+
     await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
       manifestSha256: fixture.attestation.manifest.sha256,
     });
@@ -238,14 +447,60 @@ describe("runtime integrity manager", () => {
 
   it("returns no handle after an ambiguous pointer commit and recovers on restart", async () => {
     const fixture = await createFixture();
+    let ownershipChecks = 0;
+    const ownershipLease = createTestOwnershipLease(async () => {
+      ownershipChecks += 1;
+    });
     const manager = createManager(fixture, {
-      writeCurrent: async (path) => {
+      ownershipLease,
+      writeCurrent: async (path, value) => {
+        await atomicWriteJson(path, value);
         throw new AtomicWriteAmbiguousCommitError(path, new Error("simulated pointer uncertainty"));
       },
     });
 
     await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
     expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+
+    const checksAfterPoison = ownershipChecks;
+    await expect(manager.ensureInstalled()).rejects.toMatchObject({
+      code: "RUNTIME_INTEGRITY_PUBLICATION_POISONED",
+    });
+    await expect(createManager(fixture, { ownershipLease }).ensureInstalled()).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_PUBLICATION_POISONED",
+    });
+    expect(ownershipChecks).toBe(checksAfterPoison);
+
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+  });
+
+  it("poisons the manager and lease when ownership becomes uncertain after publication", async () => {
+    const fixture = await createFixture();
+    let ownershipChecks = 0;
+    const ownershipLease = createTestOwnershipLease(async () => {
+      ownershipChecks += 1;
+      if (ownershipChecks === 3) throw new Error("simulated post-publication ownership loss");
+    });
+    const manager = createManager(fixture, { ownershipLease });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN",
+    });
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([fixture.finalInstallName]);
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+
+    const checksAfterPoison = ownershipChecks;
+    await expect(manager.verifyInstalled()).rejects.toMatchObject({
+      code: "RUNTIME_INTEGRITY_PUBLICATION_POISONED",
+    });
+    await expect(createManager(fixture, { ownershipLease }).ensureInstalled()).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_PUBLICATION_POISONED",
+    });
+    expect(ownershipChecks).toBe(checksAfterPoison);
+
     await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
       treeSha256: fixture.attestation.tree.sha256,
     });
@@ -267,7 +522,14 @@ describe("runtime integrity manager", () => {
     const finalPath = join(corruptFinal.paths.runtimeInstalls, corruptFinal.finalInstallName);
     await mkdir(finalPath);
     await writeFile(join(finalPath, "do-not-overwrite.txt"), "preserve evidence");
-    await expect(createManager(corruptFinal).ensureInstalled(corruptFinal.seedRoot)).rejects.toThrow();
+    const corruptFinalFailure = await createManager(corruptFinal)
+      .ensureInstalled(corruptFinal.seedRoot)
+      .catch((error: unknown) => error);
+    expect(corruptFinalFailure).toBeInstanceOf(RuntimeIntegrityInstalledCorruptionError);
+    expect(corruptFinalFailure).toMatchObject({
+      name: "RuntimeIntegrityInstalledCorruptionError",
+      code: "RUNTIME_INSTALLED_CORRUPTION",
+    });
     expect(await readFile(join(finalPath, "do-not-overwrite.txt"), "utf8")).toBe("preserve evidence");
 
     const corruptPointer = await createFixture();
@@ -284,8 +546,34 @@ describe("runtime integrity manager", () => {
       treeSha256: corruptPointer.attestation.tree.sha256,
       filesSha256: corruptPointer.attestation.tree.filesSha256,
     })}\n`);
-    await expect(createManager(corruptPointer).ensureInstalled(corruptPointer.seedRoot)).rejects.toThrow("malformed or unreadable");
+    const corruptPointerFailure = await createManager(corruptPointer)
+      .ensureInstalled(corruptPointer.seedRoot)
+      .catch((error: unknown) => error);
+    expect(corruptPointerFailure).toBeInstanceOf(RuntimeIntegrityRepairRequiredError);
+    expect(corruptPointerFailure).toMatchObject({ reason: "installed_pointer_invalid" });
     expect(await readdir(corruptPointer.paths.runtimeInstalls)).toEqual([]);
+  });
+
+  it("types a final that disappears during pre-use verification as transient and fully recovers it", async () => {
+    const fixture = await createFixture();
+    const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    let removeAfterPointer = true;
+    const manager = createManager(fixture, {
+      async faultInjector(point) {
+        if (point === "after_pointer_write" && removeAfterPointer) {
+          removeAfterPointer = false;
+          await rm(finalPath, { recursive: true, force: true });
+        }
+      },
+    });
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(
+      RuntimeIntegrityTransientVerificationError,
+    );
+    await expect(manager.ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      runtimeBuildId: fixture.attestation.runtime.runtimeBuildId,
+      treeSha256: fixture.attestation.tree.sha256,
+    });
   });
 
   it("rejects a non-canonical mutable path topology at construction", async () => {
@@ -298,6 +586,7 @@ describe("runtime integrity manager", () => {
     expect(() => new RuntimeIntegrityManager({
       paths: unsafePaths,
       attestation: fixture.attestation,
+      ownershipLease: createTestOwnershipLease(),
       hostRuntime: fixture.hostRuntime,
     })).toThrow("path topology is not canonical");
   });
@@ -509,18 +798,26 @@ async function createFixture(variant = ""): Promise<Fixture> {
 function createManager(
   fixture: Fixture,
   options: {
+    ownershipLease?: HostOwnershipLease;
     faultInjector?: (point: RuntimeIntegrityFaultPoint) => void | Promise<void>;
     writeCurrent?: (path: string, value: Parameters<typeof atomicWriteJson>[1] & Record<string, unknown>) => Promise<void>;
     hostRuntime?: RuntimeHostIdentity;
+    onProgress?: (phase: RuntimeIntegrityProgressPhase) => void;
   } = {},
 ): RuntimeIntegrityManager {
   return new RuntimeIntegrityManager({
     paths: fixture.paths,
     attestation: fixture.attestation,
+    ownershipLease: options.ownershipLease ?? createTestOwnershipLease(),
     hostRuntime: options.hostRuntime ?? fixture.hostRuntime,
     faultInjector: options.faultInjector,
     writeCurrent: options.writeCurrent,
+    onProgress: options.onProgress,
   });
+}
+
+function createTestOwnershipLease(assertOwned: () => Promise<void> = async () => undefined): HostOwnershipLease {
+  return createHostOwnershipLease(assertOwned, { generation: "a".repeat(64) }).lease;
 }
 
 function sha256(bytes: Uint8Array): string {

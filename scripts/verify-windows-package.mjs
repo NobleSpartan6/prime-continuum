@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { promisify, isDeepStrictEqual } from 'node:util'
 import { extractFile, listPackage } from '@electron/asar'
 import {
   RUNTIME_TEMPLATE_DIRECTORY,
@@ -17,6 +20,8 @@ import {
 
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'ascii')
 const FUSE_ENABLED = '1'.charCodeAt(0)
+const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
+const execFileAsync = promisify(execFile)
 
 function invariant(condition, message) {
   if (!condition) {
@@ -91,7 +96,7 @@ async function main() {
   const packagedRuntimeRoot = resolve(packageDirectory, 'resources/runtime-seed')
   const builtRendererDirectory = resolve('out/renderer')
 
-  const [executable, packagedHostd, builtHostd, builtHostdProvenanceBytes, builtMain, builtAttestationBytes, builtPreload, asarMetadata] = await Promise.all([
+  const [executable, packagedHostd, builtHostd, builtHostdProvenanceBytes, builtMain, builtAttestationBytes, builtPreload, asarMetadata, projectPackageBytes] = await Promise.all([
     readFile(executablePath),
     readFile(packagedHostdPath),
     readFile(builtHostdPath),
@@ -100,6 +105,7 @@ async function main() {
     readFile(builtAttestationPath),
     readFile(builtPreloadPath, 'utf8'),
     stat(asarPath),
+    readFile(resolve('package.json')),
   ])
 
   const maximumRawEnd = readPeMaximumRawEnd(executable)
@@ -115,6 +121,13 @@ async function main() {
     { sourceRoot: resolve('out/preload'), archiveRoot: 'out/preload' },
     { sourceRoot: resolve('out/renderer'), archiveRoot: 'out/renderer' },
   ])
+  const projectPackage = parseJsonObject(projectPackageBytes, 'The project package manifest')
+  const packagedPackage = parseJsonObject(extractFile(asarPath, 'package.json'), 'The packaged application manifest')
+  const expectedPackagedPackage = selectPackagedMetadata(projectPackage)
+  invariant(
+    isDeepStrictEqual(packagedPackage, expectedPackagedPackage),
+    'The packaged application manifest does not match this project release metadata and dependency set.',
+  )
   const packagedAttestationBytes = extractFile(asarPath, join('out', 'main', 'runtime-attestation.json'))
   invariant(
     packagedAttestationBytes.equals(builtAttestationBytes),
@@ -123,6 +136,8 @@ async function main() {
   const attestation = parseRuntimeAttestation(builtAttestationBytes)
 
   const fuses = readRequiredFuses(executable)
+  const windowsVersionInfo = await readWindowsVersionInfo(executablePath)
+  verifyWindowsVersionInfo(windowsVersionInfo, projectPackage)
   const builtHostdHash = sha256(builtHostd)
   const packagedHostdHash = sha256(packagedHostd)
   invariant(packagedHostdHash === builtHostdHash, 'The packaged host daemon does not match the host daemon built in this run.')
@@ -200,6 +215,7 @@ async function main() {
     electronRunAsNode: true,
     policy: inputs.policy,
   })
+  const applicationSmoke = await smokePackagedApplication(executablePath, packageDirectory)
   assertRuntimeAttestationMatches(attestation, {
     pointer: runtimePointer,
     manifest: packagedRuntime.manifest,
@@ -236,6 +252,8 @@ async function main() {
       embeddedAsarIntegrityValidation: true,
       onlyLoadAppFromAsar: true,
     },
+    windowsVersionInfo,
+    applicationSmoke,
     asarBytes: asarMetadata.size,
     asarVerifiedFiles: asarArtifacts.fileCount,
     preloadEntry: 'out/preload/index.cjs',
@@ -287,6 +305,23 @@ async function verifyPackagedApplicationCode(asarPath, roots) {
     ![...archiveEntries].some((entry) => entry === 'out/runtime' || entry.startsWith('out/runtime/')),
     'The Prime Agent runtime was duplicated inside app.asar.',
   )
+  invariant(
+    ![...archiveEntries].some((entry) => entry === 'out/runtime-cache' || entry.startsWith('out/runtime-cache/')),
+    'Prime Agent release-asset caches were duplicated inside app.asar.',
+  )
+  invariant(
+    ![...archiveEntries].some((entry) => entry === 'out/hostd' || entry.startsWith('out/hostd/')),
+    'The external host daemon was duplicated inside app.asar.',
+  )
+  invariant(
+    [...archiveEntries]
+      .filter((entry) => entry === 'out' || entry.startsWith('out/'))
+      .every(
+        (entry) =>
+          entry === 'out' || roots.some(({ archiveRoot }) => entry === archiveRoot || entry.startsWith(`${archiveRoot}/`)),
+      ),
+    'The packaged ASAR contains an unexpected build-output subtree.',
+  )
 
   const expectedEntries = new Set()
   const expectedFiles = []
@@ -326,6 +361,89 @@ async function verifyPackagedApplicationCode(asarPath, roots) {
     invariant(packaged.equals(built), `Packaged app.asar file differs from this build: ${file.archivePath}.`)
   }
   return { fileCount: expectedFiles.length }
+}
+
+function parseJsonObject(bytes, label) {
+  let value
+  try {
+    value = JSON.parse(bytes.toString('utf8'))
+  } catch (error) {
+    throw new Error(`${label} is not valid JSON.`, { cause: error })
+  }
+  invariant(value && typeof value === 'object' && !Array.isArray(value), `${label} is not an object.`)
+  return value
+}
+
+function selectPackagedMetadata(projectPackage) {
+  const fields = ['name', 'version', 'private', 'author', 'description', 'main', 'type', 'packageManager', 'engines', 'dependencies']
+  const selected = {}
+  for (const field of fields) {
+    invariant(Object.hasOwn(projectPackage, field), `The project package manifest is missing ${field}.`)
+    selected[field] = projectPackage[field]
+  }
+  return selected
+}
+
+async function readWindowsVersionInfo(executablePath) {
+  const systemRoot = process.env.SystemRoot
+  invariant(typeof systemRoot === 'string' && isAbsolute(systemRoot), 'SystemRoot is required to inspect Windows executable metadata.')
+  const powershell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const command = [
+    '$value = (Get-Item -LiteralPath $env:PRIME_CONTINUIM_VERIFY_EXECUTABLE).VersionInfo',
+    '[ordered]@{ ProductName = $value.ProductName; FileDescription = $value.FileDescription; FileVersion = $value.FileVersion; ProductVersion = $value.ProductVersion; OriginalFilename = $value.OriginalFilename; CompanyName = $value.CompanyName } | ConvertTo-Json -Compress',
+  ].join('; ')
+  const { stdout } = await execFileAsync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+    env: { ...process.env, PRIME_CONTINUIM_VERIFY_EXECUTABLE: executablePath },
+    timeout: 15_000,
+    windowsHide: true,
+    maxBuffer: 64 * 1024,
+  })
+  const value = parseJsonObject(Buffer.from(stdout, 'utf8'), 'The Windows executable version metadata')
+  for (const field of ['ProductName', 'FileDescription', 'FileVersion', 'ProductVersion', 'OriginalFilename', 'CompanyName']) {
+    invariant(typeof value[field] === 'string' && value[field].length <= 1024, `The Windows executable ${field} value is invalid.`)
+  }
+  return value
+}
+
+function verifyWindowsVersionInfo(value, projectPackage) {
+  const productName = projectPackage.build?.productName
+  const version = projectPackage.version
+  const author = projectPackage.author
+  invariant(typeof productName === 'string' && productName.length > 0, 'The configured Windows product name is invalid.')
+  invariant(typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version), 'The configured application version is invalid.')
+  invariant(typeof author === 'string' && author.length > 0, 'The configured application author is invalid.')
+  const productVersion = `${version}.0`
+  invariant(value.ProductName === productName, 'Windows ProductName was not edited for Prime Continuim.')
+  invariant(value.FileDescription === productName, 'Windows FileDescription was not edited for Prime Continuim.')
+  invariant(value.FileVersion === version, 'Windows FileVersion does not match this release.')
+  invariant(value.ProductVersion === productVersion, 'Windows ProductVersion does not match this release.')
+  invariant(value.CompanyName === author, 'Windows CompanyName does not match this release.')
+  invariant(
+    value.OriginalFilename === '' || value.OriginalFilename === `${productName}.exe`,
+    'Windows OriginalFilename still identifies a different executable.',
+  )
+}
+
+async function smokePackagedApplication(executablePath, packageDirectory) {
+  const scratch = await mkdtemp(join(tmpdir(), 'prime-continuim-package-smoke-'))
+  const environment = { ...process.env }
+  for (const name of ['ELECTRON_RUN_AS_NODE', 'ELECTRON_RENDERER_URL', 'NODE_OPTIONS', 'NODE_PATH']) delete environment[name]
+  environment.PRIME_CONTINUIM_PACKAGE_SMOKE = '1'
+  environment.PRIME_AGENT_DATA_DIR = join(scratch, 'hostd')
+  try {
+    const { stdout } = await execFileAsync(executablePath, [`--user-data-dir=${join(scratch, 'user-data')}`, '--disable-gpu'], {
+      cwd: packageDirectory,
+      env: environment,
+      timeout: 210_000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    })
+    const markers = stdout.split(/\r?\n/).filter((line) => line === PACKAGE_SMOKE_MARKER)
+    invariant(markers.length === 1, 'The packaged application did not complete its main/preload/renderer bridge smoke exactly once.')
+    return { mainLoaded: true, preloadBridgeInstalled: true, rendererLoaded: true }
+  } finally {
+    await rm(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+  }
 }
 
 function validateRuntimePointer(pointer, inputs, label) {

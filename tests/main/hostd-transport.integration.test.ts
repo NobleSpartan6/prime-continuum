@@ -9,9 +9,9 @@ import { HostService, TRUSTED_USER_SESSION } from '../../src/hostd/service'
 import { runFramedSession } from '../../src/hostd/server'
 import { HostStore } from '../../src/hostd/store'
 import { FramedConnection } from '../../src/main/control/framed-connection'
-import { defaultLocalEndpoint } from '../../src/hostd/paths'
 import { connectLocalHostd } from '../../src/main/control/local-hostd'
 import { LengthPrefixedJsonDecoder, writeJsonFrame } from '../../src/shared/frame-codec'
+import { resolveCanonicalLocalHostTarget } from '../../src/shared/local-host-target'
 import type { ThreadProjectionSnapshot } from '../../src/shared/protocol'
 
 const temporaryDirectories: string[] = []
@@ -172,7 +172,8 @@ describe('native ↔ hostd framed protocol', () => {
   it('starts the bundled CLI on a real named pipe or Unix socket', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'prime-hostd-cli-integration-'))
     temporaryDirectories.push(root)
-    const dataDirectory = path.join(root, 'data')
+    const target = await resolveCanonicalLocalHostTarget(path.join(root, 'data'), { create: true })
+    const dataDirectory = target.dataDirectory
     const bundle = path.join(root, 'hostd.cjs')
     await build({
       entryPoints: [path.resolve('src/hostd/index.ts')],
@@ -183,7 +184,7 @@ describe('native ↔ hostd framed protocol', () => {
       target: 'node22',
       logLevel: 'silent'
     })
-    const endpoint = defaultLocalEndpoint(dataDirectory)
+    const endpoint = target.endpoint
     const child = spawn(
       process.execPath,
       [bundle, 'serve', '--socket', endpoint, '--data-dir', dataDirectory],
