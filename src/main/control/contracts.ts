@@ -6,7 +6,7 @@
  * between renderer-safe values and host protocol frames.
  */
 
-import type { RuntimeIntegritySnapshot } from '../../shared/protocol'
+import type { RuntimeIntegritySnapshot, RuntimeModelCatalogSnapshot } from '../../shared/protocol'
 
 export const IPC = {
   bootstrap: 'prime:bootstrap',
@@ -20,6 +20,7 @@ export const IPC = {
   hostCatalog: 'prime:catalog:hosts',
   projectCatalog: 'prime:catalog:projects',
   threadProjection: 'prime:thread:projection',
+  runtimeModelCatalog: 'prime:runtime:model-catalog',
   requestSnapshot: 'prime:thread:snapshot',
   submitCommand: 'prime:command:submit',
   approve: 'prime:approval:resolve',
@@ -233,6 +234,7 @@ export interface PrimeBridge {
   hostCatalog(): Promise<Result<unknown>>
   projectCatalog(input: { hostId: string }): Promise<Result<unknown>>
   threadProjection(input: { threadId: string; cursor?: SessionCursor }): Promise<Result<unknown>>
+  runtimeModelCatalog(input: { expectedHostId: string }): Promise<Result<RuntimeModelCatalogSnapshot>>
   requestSnapshot(input: { threadId?: string; cursor?: SessionCursor }): Promise<Result<unknown>>
   submitCommand(input: ClientCommand): Promise<Result<CommandReceipt>>
   approve(input: ApprovalResolution): Promise<Result<CommandReceipt>>

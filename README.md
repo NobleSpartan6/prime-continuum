@@ -31,6 +31,8 @@ pnpm dev:web
 
 The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search real projects and threads or run available commands. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
 
+Open **Models & accounts** to inspect the secret-free compatibility catalog reported by the verified Prime Agent runtime on the selected host. The exact Prime Agent v0.7.0 artifact currently projects 1,169 model routes across 32 providers, including current GPT-5.6, Claude 5, Gemini 3.6, DeepSeek V4, Kimi K3, GLM-5.2, Qwen3.6, MiniMax M3, Mistral, and gpt-oss families. This list is generated from the installed runtime rather than maintained as a renderer allow-list. The runtime reports OAuth compatibility metadata for ChatGPT Plus/Pro (Codex), Claude Pro/Max, and GitHub Copilot. The catalog is host-scoped and read-only: authenticate by running `/login` in Prime Agent on that host. In-app OAuth and model switching are not implemented yet.
+
 Open **Companion preview** from the sidebar to inspect the pairing requirements and launch the read-only phone projection. For a direct browser preview, visit:
 
 ```text

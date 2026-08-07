@@ -6,6 +6,7 @@ import { collectHostProbe } from "./probe";
 import { PairingAuthority, type ChannelCloseFailureDiagnostic } from "./pairing/authority";
 import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
 import { RuntimeInitializationCoordinator } from "./runtime-initialization-coordinator";
+import { VerifiedRuntimeModelCatalog } from "./runtime-model-catalog";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
 import { HostService } from "./service";
 import { HostStore } from "./store";
@@ -18,6 +19,7 @@ export * from "./resident-runtime";
 export * from "./runtime-attestation";
 export * from "./runtime-initialization-coordinator";
 export * from "./runtime-integrity-manager";
+export * from "./runtime-model-catalog";
 export * from "./server";
 export * from "./service";
 export * from "./store";
@@ -105,13 +107,19 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
               : {}),
           })
       : undefined;
+    const runtimeModelCatalog = runtimeInitialization
+      ? new VerifiedRuntimeModelCatalog({ runtimeHandles: runtimeInitialization })
+      : undefined;
     const service = new HostService(
       store,
       undefined,
       new PairingAuthority(store.paths.pairingAuthority, {
         onChannelCloseFailure: reportChannelCloseFailure,
       }),
-      { runtimeIntegrityProvider: runtimeInitialization },
+      {
+        runtimeIntegrityProvider: runtimeInitialization,
+        runtimeModelCatalogProvider: runtimeModelCatalog,
+      },
     );
     const endpoint = options.socket ?? target.endpoint;
     // Endpoint ownership is the cross-process single-writer boundary. Pairing

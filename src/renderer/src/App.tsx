@@ -53,6 +53,7 @@ import {
   type HostRuntimeReadiness,
   type HostSummary,
   type RendererApi,
+  type RuntimeModelCatalog,
   type RuntimeSummary,
   type TaskState,
   type ThreadSummary,
@@ -271,6 +272,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [pairMobileOpen, setPairMobileOpen] = useState(false)
   const [addComputerOpen, setAddComputerOpen] = useState(false)
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
+  const [modelsOpen, setModelsOpen] = useState(false)
   const [moveDestinationId, setMoveDestinationId] = useState('')
   const [composerMode, setComposerMode] = useState<'follow_up' | 'steer'>('follow_up')
   const [composerText, setComposerText] = useState('')
@@ -287,6 +289,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const pairMobileTriggerRef = useRef<HTMLButtonElement>(null)
   const pairMobileDialogTriggerRef = useRef<HTMLElement | null>(null)
+  const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
   const companionReturnTargetRef = useRef<'companion-button' | 'sidebar-toggle' | 'command' | null>(null)
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
@@ -408,6 +411,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
   const canSubmitCommands = snapshot?.operations.submitCommands ?? false
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
+  const canLoadModelCatalog = snapshot?.operations.modelCatalog ?? false
   activeHostIdRef.current = selectedHost?.id
   activeThreadIdRef.current = selectedThread?.id
 
@@ -536,30 +540,6 @@ export default function App({ api: suppliedApi }: AppProps) {
       setComposerReceipt(receipt)
       if (receipt.state === 'rejected') return
       setComposerText((current) => current === submittedDraft ? '' : current)
-      setSnapshot((current) => {
-        if (!current) return current
-        return {
-          ...current,
-          threads: current.threads.map((thread) =>
-            thread.id === selectedThread.id && thread.hostId === submissionHostId
-              ? {
-                  ...thread,
-                  transcript: [
-                    ...thread.transcript,
-                    {
-                      id: `local-${Date.now()}`,
-                      kind: 'user' as const,
-                      author: 'You',
-                      time: 'Now',
-                      body: text,
-                      detail: receipt.message,
-                    },
-                  ],
-                }
-              : thread,
-          ),
-        }
-      })
     } catch (error) {
       if (
         isStaleHostAuthorityError(error) ||
@@ -778,8 +758,14 @@ export default function App({ api: suppliedApi }: AppProps) {
           if (sidebarIsOverlay) closeSidebar()
           setPairMobileOpen(true)
         }}
+        onOpenModels={(trigger) => {
+          modelsDialogTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
+          if (sidebarIsOverlay) closeSidebar()
+          setModelsOpen(true)
+        }}
         onMoveThread={openMoveThread}
         canMoveThread={canMoveThreads}
+        canLoadModelCatalog={canLoadModelCatalog}
         addComputerTriggerRef={addComputerTriggerRef}
         companionTriggerRef={pairMobileTriggerRef}
         environment={api.environment}
@@ -824,6 +810,11 @@ export default function App({ api: suppliedApi }: AppProps) {
           onTextChange={setComposerText}
           receipt={composerReceipt}
           canSubmit={canSubmitCommands}
+          modelCatalogAvailable={canLoadModelCatalog}
+          onOpenModelCatalog={(trigger) => {
+            modelsDialogTriggerRef.current = trigger
+            setModelsOpen(true)
+          }}
           onSubmit={submitComposer}
         />
       </main>
@@ -879,6 +870,11 @@ export default function App({ api: suppliedApi }: AppProps) {
           setSidebarOpen(false)
           setInspectorOpen(true)
         }}
+        onOpenModels={() => {
+          modelsDialogTriggerRef.current = commandPaletteTriggerRef.current
+          setCommandPaletteOpen(false)
+          setModelsOpen(true)
+        }}
         onOpenCompanion={() => {
           setCommandPaletteOpen(false)
           openCompanion('command')
@@ -901,6 +897,15 @@ export default function App({ api: suppliedApi }: AppProps) {
           setPairMobileOpen(false)
           openCompanion(sidebarIsOverlay ? 'sidebar-toggle' : 'companion-button')
         }}
+      />
+
+      <ModelsDialog
+        api={api}
+        open={modelsOpen}
+        host={selectedHost}
+        currentModel={selectedRuntime.session?.model}
+        triggerRef={modelsDialogTriggerRef}
+        onClose={() => setModelsOpen(false)}
       />
 
       <MoveThreadDialog
@@ -927,8 +932,10 @@ interface SidebarProps {
   onClose: () => void
   onAddComputer: (trigger: HTMLElement) => void
   onOpenCompanion: (trigger: HTMLElement) => void
+  onOpenModels: (trigger: HTMLElement) => void
   onMoveThread: (hostId: string, trigger: HTMLElement | null) => void
   canMoveThread: boolean
+  canLoadModelCatalog: boolean
   addComputerTriggerRef: RefObject<HTMLButtonElement | null>
   companionTriggerRef: RefObject<HTMLButtonElement | null>
   environment: RendererApi['environment']
@@ -947,8 +954,10 @@ function Sidebar({
   onClose,
   onAddComputer,
   onOpenCompanion,
+  onOpenModels,
   onMoveThread,
   canMoveThread,
+  canLoadModelCatalog,
   addComputerTriggerRef,
   companionTriggerRef,
   environment,
@@ -1118,6 +1127,15 @@ function Sidebar({
             )}
           </div>
         )}
+        {canLoadModelCatalog && (
+          <button
+            className="button button--quiet button--full"
+            type="button"
+            onClick={(event) => onOpenModels(event.currentTarget)}
+          >
+            <Icon icon={Bot} /> Models &amp; accounts
+          </button>
+        )}
         <button
           ref={addComputerTriggerRef}
           className="button button--quiet button--full"
@@ -1279,6 +1297,8 @@ interface ComposerProps {
   onTextChange: (value: string) => void
   receipt: { state: ComposerReceiptState; message: string }
   canSubmit: boolean
+  modelCatalogAvailable: boolean
+  onOpenModelCatalog: (trigger: HTMLElement) => void
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
 }
 
@@ -1343,7 +1363,7 @@ function SessionContinuity({
   )
 }
 
-function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, canSubmit, onSubmit }: ComposerProps) {
+function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, canSubmit, modelCatalogAvailable, onOpenModelCatalog, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
   const effectiveMode = taskState === 'running' ? mode : 'follow_up'
   const unavailableCopy = 'Prime Agent isn’t attached to this host, so commands are unavailable.'
@@ -1411,7 +1431,21 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
         />
 
         <div className="composer__actions">
-          <span className="composer__hint" id="composer-hint">{canSubmit ? 'Ctrl or ⌘ + Enter to send' : 'Connect this host to Prime Agent to enable commands'}</span>
+          <div className="composer__secondary-actions">
+            {modelCatalogAvailable && (
+              <button
+                className="model-chip"
+                type="button"
+                aria-label={`Open models and accounts${runtime.session?.model ? `. Current model: ${runtime.session.model}` : ''}`}
+                onClick={(event) => onOpenModelCatalog(event.currentTarget)}
+              >
+                <Icon icon={Bot} size={14} />
+                <span>{runtime.session?.model ?? 'Model catalog'}</span>
+                <Icon icon={ChevronDown} size={13} />
+              </button>
+            )}
+            <span className="composer__hint" id="composer-hint">{canSubmit ? 'Ctrl or ⌘ + Enter to send' : 'Connect this host to Prime Agent to enable commands'}</span>
+          </div>
           <div className="composer__primary-actions">
             <button
               className={cx('button', 'button--primary', !text.trim() && 'button--empty')}
@@ -2005,6 +2039,7 @@ interface CommandPaletteDialogProps {
   onSelectProject: (projectId: string) => void
   onAddComputer: () => void
   onOpenInspector: () => void
+  onOpenModels: () => void
   onOpenCompanion: () => void
   onFocusComposer: () => void
 }
@@ -2029,6 +2064,7 @@ function CommandPaletteDialog({
   onSelectProject,
   onAddComputer,
   onOpenInspector,
+  onOpenModels,
   onOpenCompanion,
   onFocusComposer,
 }: CommandPaletteDialogProps) {
@@ -2078,6 +2114,15 @@ function CommandPaletteDialog({
       keywords: 'changes evidence tests agents context inspector',
       run: onOpenInspector,
     },
+    ...(snapshot.operations.modelCatalog ? [{
+      id: 'command:models',
+      label: 'Open models & accounts',
+      detail: 'Inspect provider status and the verified Prime Agent model catalog',
+      group: 'Commands' as const,
+      icon: Bot,
+      keywords: 'models providers accounts oauth login inference',
+      run: onOpenModels,
+    }] : []),
     {
       id: 'command:companion',
       label: 'Open companion preview',
@@ -2096,7 +2141,7 @@ function CommandPaletteDialog({
       keywords: 'add computer ssh host remote machine',
       run: onAddComputer,
     },
-  ], [onAddComputer, onFocusComposer, onOpenCompanion, onOpenInspector, onSelectProject, onSelectThread, snapshot])
+  ], [onAddComputer, onFocusComposer, onOpenCompanion, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
 
   const filteredItems = useMemo(() => {
     const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
@@ -2696,6 +2741,246 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
       {children}
     </dialog>
   )
+}
+
+interface ModelsDialogProps {
+  api: RendererApi
+  open: boolean
+  host: HostSummary
+  currentModel?: string
+  triggerRef: RefObject<HTMLElement | null>
+  onClose: () => void
+}
+
+function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: ModelsDialogProps) {
+  const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [query, setQuery] = useState('')
+  const [selectedProviderId, setSelectedProviderId] = useState('all')
+  const [showCompatible, setShowCompatible] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setLoading(true)
+    setError('')
+    setQuery('')
+    setSelectedProviderId('all')
+    setShowCompatible(false)
+    void api.loadRuntimeModelCatalog(host.id)
+      .then((nextCatalog) => {
+        if (!cancelled) setCatalog(nextCatalog)
+      })
+      .catch((reason: unknown) => {
+        if (cancelled) return
+        setCatalog(null)
+        setError(
+          isStaleHostAuthorityError(reason)
+            ? 'The active host changed. Close this panel and open the model catalog again.'
+            : reason instanceof Error
+              ? reason.message
+              : 'The host did not return its verified model catalog.',
+        )
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, host.id, open])
+
+  const selectedProvider = catalog?.providers.find((provider) => provider.providerId === selectedProviderId)
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const filteredModels = useMemo(() => {
+    if (!catalog) return []
+    return catalog.models.filter((model) => {
+      if (selectedProviderId !== 'all' && model.providerId !== selectedProviderId) return false
+      if (!showCompatible && !model.available) return false
+      if (!normalizedQuery) return true
+      const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
+      return `${model.name} ${model.modelId} ${model.providerId} ${provider?.displayName ?? ''}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery)
+    })
+  }, [catalog, normalizedQuery, selectedProviderId, showCompatible])
+  const visibleModels = filteredModels.slice(0, 80)
+  const availableCount = catalog?.models.filter((model) => model.available).length ?? 0
+  const scopedModelCount = selectedProvider?.modelCount ?? catalog?.models.length ?? 0
+  const scopedAvailableCount = selectedProvider?.availableModelCount ?? availableCount
+  const oauthProviders = catalog?.providers.filter((provider) => provider.oauthSupported) ?? []
+  const configuredProviders = catalog?.providers.filter((provider) => provider.configured) ?? []
+
+  return (
+    <NativeDialog
+      open={open}
+      labelledBy="models-title"
+      describedBy="models-description"
+      triggerRef={triggerRef}
+      className="models-sheet"
+      onClose={onClose}
+    >
+      <div className="sheet__surface models-sheet__surface">
+        <header className="sheet__header models-sheet__header">
+          <div className="sheet__title-group">
+            <span className="sheet__title-icon"><Icon icon={Bot} size={18} /></span>
+            <div>
+              <h2 id="models-title">Models &amp; accounts</h2>
+              <p id="models-description">Compatibility reported by Prime Agent on <bdi>{host.name}</bdi>.</p>
+            </div>
+          </div>
+          <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={onClose}>
+            <Icon icon={X} size={17} />
+          </button>
+        </header>
+
+        {loading ? (
+          <div className="models-loading" role="status">
+            <Icon icon={Loader2} size={18} />
+            <div><strong>Reading the verified runtime</strong><span>Provider status and model metadata stay scoped to {host.name}.</span></div>
+          </div>
+        ) : error ? (
+          <div className="models-error" role="alert">
+            <span><Icon icon={AlertCircle} size={17} /></span>
+            <div><strong>Model catalog unavailable</strong><p>{error}</p></div>
+          </div>
+        ) : catalog ? (
+          <div className="models-workspace">
+            <aside className="provider-rail" aria-label={`Accounts on ${host.name}`}>
+              <div className="provider-rail__summary">
+                <span className="eyebrow">Accounts on {host.name}</span>
+                <strong>{configuredProviders.length} configured</strong>
+                <small>{oauthProviders.length} OAuth-capable providers · Prime Agent {catalog.releaseVersion}</small>
+              </div>
+              <nav aria-label="Filter models by provider">
+                <button
+                  type="button"
+                  aria-pressed={selectedProviderId === 'all'}
+                  onClick={() => setSelectedProviderId('all')}
+                >
+                  <span className="provider-rail__icon"><Icon icon={Bot} size={15} /></span>
+                  <span><strong>All providers</strong><small>{catalog.providers.length} compatible</small></span>
+                  <span className="provider-rail__count tabular">{catalog.models.length}</span>
+                </button>
+                {catalog.providers.map((provider) => (
+                  <button
+                    key={provider.providerId}
+                    type="button"
+                    aria-pressed={selectedProviderId === provider.providerId}
+                    onClick={() => setSelectedProviderId(provider.providerId)}
+                  >
+                    <span className={cx('provider-rail__icon', provider.configured && 'provider-rail__icon--ready')}>
+                      <Icon icon={provider.configured ? CheckCircle2 : LockKeyhole} size={15} />
+                    </span>
+                    <span><strong>{provider.displayName}</strong><small>{provider.configured ? 'Configured' : provider.oauthSupported ? 'OAuth available' : 'Setup required'}</small></span>
+                    <span className="provider-rail__count tabular">{provider.availableModelCount}/{provider.modelCount}</span>
+                  </button>
+                ))}
+              </nav>
+            </aside>
+
+            <section className="model-catalog" aria-label="Prime Agent models">
+              <div className="model-catalog__topline">
+                <div>
+                  <span className="eyebrow">Verified catalog</span>
+                  <h3>{selectedProvider?.displayName ?? 'Models available to this host'}</h3>
+                  <p>{scopedAvailableCount} ready now · {scopedModelCount} compatible with the installed runtime</p>
+                </div>
+                <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
+              </div>
+
+              {selectedProvider && !selectedProvider.configured && (
+                <div className="provider-setup-note">
+                  <span><Icon icon={LockKeyhole} size={16} /></span>
+                  <div>
+                    <strong>{selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
+                    <p>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credentials remain on that host; Continuim only reads secret-free status.</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="model-catalog__controls">
+                <label className="model-search">
+                  <span className="sr-only">Search models</span>
+                  <Icon icon={Search} size={15} />
+                  <input
+                    type="search"
+                    value={query}
+                    placeholder="Search models"
+                    onChange={(event) => setQuery(event.target.value)}
+                  />
+                </label>
+                <div className="catalog-scope" aria-label="Model availability filter">
+                  <button type="button" aria-pressed={!showCompatible} onClick={() => setShowCompatible(false)}>Ready</button>
+                  <button type="button" aria-pressed={showCompatible} onClick={() => setShowCompatible(true)}>Compatible</button>
+                </div>
+              </div>
+
+              <div className="model-list" aria-live="polite">
+                {visibleModels.length > 0 ? visibleModels.map((model) => {
+                  const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
+                  const current = modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
+                  return (
+                    <article className={cx('model-row', current && 'model-row--current')} key={`${model.providerId}:${model.modelId}`}>
+                      <span className="model-row__icon"><Icon icon={Bot} size={16} /></span>
+                      <div className="model-row__body">
+                        <div className="model-row__title">
+                          <strong>{model.name}</strong>
+                          {current && <span className="model-badge model-badge--current">Current</span>}
+                          {model.usingOAuth && <span className="model-badge">OAuth</span>}
+                        </div>
+                        <span><bdi>{provider?.displayName ?? model.providerId}</bdi> · <bdi>{model.modelId}</bdi></span>
+                        <small>{formatTokenCapacity(model.contextWindow)} context · {formatTokenCapacity(model.maxOutputTokens)} max output{model.reasoning ? ' · Reasoning' : ''}{model.input.includes('image') ? ' · Images' : ''}</small>
+                      </div>
+                      <span className={cx('model-row__status', model.available && 'model-row__status--ready')}>
+                        <Icon icon={model.available ? CheckCircle2 : LockKeyhole} size={14} />
+                        {model.available ? 'Ready' : 'Setup required'}
+                      </span>
+                    </article>
+                  )
+                }) : (
+                  <div className="model-list__empty">
+                    <Icon icon={Search} size={18} />
+                    <strong>{showCompatible ? 'No compatible models match' : 'No configured models match'}</strong>
+                    <p>{showCompatible ? 'Try another provider or search term.' : `Configure a provider on ${host.name}, or show every compatible model.`}</p>
+                  </div>
+                )}
+              </div>
+              {filteredModels.length > visibleModels.length && (
+                <p className="model-list__limit">Showing the first {visibleModels.length} of {filteredModels.length} matches. Refine your search to narrow the catalog.</p>
+              )}
+              <footer className="model-catalog__footer">
+                <Icon icon={Info} size={14} />
+                <span>This catalog is read-only. Model changes stay disabled until the resident session can acknowledge and reconcile them authoritatively.</span>
+              </footer>
+            </section>
+          </div>
+        ) : null}
+      </div>
+    </NativeDialog>
+  )
+}
+
+function modelMatchesCurrent(providerId: string, modelId: string, modelName: string, currentModel: string | undefined): boolean {
+  if (!currentModel) return false
+  const normalizedCurrentModel = currentModel.toLocaleLowerCase()
+  return normalizedCurrentModel === modelId.toLocaleLowerCase()
+    || normalizedCurrentModel === modelName.toLocaleLowerCase()
+    || normalizedCurrentModel === `${providerId}/${modelId}`.toLocaleLowerCase()
+    || normalizedCurrentModel === `${providerId}:${modelId}`.toLocaleLowerCase()
+}
+
+function formatTokenCapacity(value: number): string {
+  if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1))}M`
+  if (value >= 1_000) return `${Number((value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1))}K`
+  return String(value)
+}
+
+function formatCatalogTime(value: string): string {
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) return 'recently'
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(parsed))
 }
 
 interface AddComputerDialogProps {

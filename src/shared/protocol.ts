@@ -44,6 +44,7 @@ export const CapabilitySchema = z
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
 
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
+export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
@@ -519,6 +520,99 @@ export const CatalogProjectionSnapshotSchema = z
     });
   });
 export type CatalogProjectionSnapshot = z.infer<typeof CatalogProjectionSnapshotSchema>;
+
+const RuntimeAuthSourceSchema = z.enum([
+  "stored",
+  "runtime",
+  "environment",
+  "prime_cli",
+  "fallback",
+  "models_json_key",
+  "models_json_command",
+  "stale",
+]);
+
+/**
+ * Secret-free provider state read from the verified Prime Agent runtime. The
+ * host never serializes credentials, token material, model base URLs, headers,
+ * or custom provider commands across this boundary.
+ */
+export const RuntimeModelProviderSchema = z
+  .object({
+    providerId: z.string().min(1).max(128),
+    displayName: z.string().min(1).max(255),
+    oauthSupported: z.boolean(),
+    oauthUsesCallbackServer: z.boolean().optional(),
+    configured: z.boolean(),
+    authSource: RuntimeAuthSourceSchema.optional(),
+    modelCount: z.number().int().nonnegative().max(10_000),
+    availableModelCount: z.number().int().nonnegative().max(10_000),
+  })
+  .strict()
+  .refine(
+    (provider) => provider.availableModelCount <= provider.modelCount,
+    "Available model count cannot exceed the provider model count",
+  );
+export type RuntimeModelProvider = z.infer<typeof RuntimeModelProviderSchema>;
+
+export const RuntimeModelOptionSchema = z
+  .object({
+    providerId: z.string().min(1).max(128),
+    modelId: z.string().min(1).max(512),
+    name: z.string().min(1).max(255),
+    api: z.string().min(1).max(128),
+    reasoning: z.boolean(),
+    input: z.array(z.enum(["text", "image"])).min(1).max(2),
+    contextWindow: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    maxOutputTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    available: z.boolean(),
+    usingOAuth: z.boolean(),
+  })
+  .strict();
+export type RuntimeModelOption = z.infer<typeof RuntimeModelOptionSchema>;
+
+export const RuntimeModelCatalogSnapshotSchema = z
+  .object({
+    runtime: z.literal("prime_agent"),
+    releaseVersion: z.string().min(1).max(64),
+    observedAt: IsoDateTimeSchema,
+    providers: z.array(RuntimeModelProviderSchema).max(128),
+    models: z.array(RuntimeModelOptionSchema).max(5_000),
+  })
+  .strict()
+  .superRefine((catalog, context) => {
+    const providerIds = new Set<string>();
+    catalog.providers.forEach((provider, index) => {
+      if (providerIds.has(provider.providerId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["providers", index, "providerId"],
+          message: "Provider identifiers must be unique",
+        });
+      }
+      providerIds.add(provider.providerId);
+    });
+    const modelKeys = new Set<string>();
+    catalog.models.forEach((model, index) => {
+      if (!providerIds.has(model.providerId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["models", index, "providerId"],
+          message: "Every model must belong to a reported provider",
+        });
+      }
+      const key = `${model.providerId}\u0000${model.modelId}`;
+      if (modelKeys.has(key)) {
+        context.addIssue({
+          code: "custom",
+          path: ["models", index, "modelId"],
+          message: "Provider model identifiers must be unique",
+        });
+      }
+      modelKeys.add(key);
+    });
+  });
+export type RuntimeModelCatalogSnapshot = z.infer<typeof RuntimeModelCatalogSnapshotSchema>;
 
 export const SnapshotTransferBeginSchema = z
   .object({
@@ -1013,6 +1107,11 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   z.object({ ...RequestBase, method: z.literal("health.get"), payload: z.object({}) }),
   z.object({
     ...RequestBase,
+    method: z.literal("runtime.model_catalog"),
+    payload: z.object({ expectedHostId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("catalog.snapshot"),
     payload: z.object({ snapshotTransfer: SnapshotTransferPreferenceSchema.optional() }),
   }),
@@ -1086,6 +1185,7 @@ const SuccessBase = {
 
 export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("health.get"), result: HealthSnapshotSchema }),
+  z.object({ ...SuccessBase, method: z.literal("runtime.model_catalog"), result: RuntimeModelCatalogSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("catalog.snapshot"), result: CatalogProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("thread.snapshot"), result: ThreadProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
@@ -1100,6 +1200,7 @@ export const HostIpcErrorResponseSchema = z.object({
   requestId: IdSchema,
   method: z.enum([
     "health.get",
+    "runtime.model_catalog",
     "catalog.snapshot",
     "thread.snapshot",
     "command.submit",

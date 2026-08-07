@@ -32,6 +32,7 @@ const bridge: PrimeBridge = {
   hostCatalog: () => invoke(IPC.hostCatalog),
   projectCatalog: (input) => invoke(IPC.projectCatalog, input),
   threadProjection: (input) => invoke(IPC.threadProjection, input),
+  runtimeModelCatalog: (input) => invoke(IPC.runtimeModelCatalog, input),
   requestSnapshot: (input) => invoke(IPC.requestSnapshot, input),
   submitCommand: (input) => invoke(IPC.submitCommand, input),
   approve: (input) => invoke(IPC.approve, input),

@@ -906,6 +906,58 @@ describe('NativeRendererApi', () => {
       }),
     ).rejects.toThrow('The destination branch has diverged.')
   })
+
+  it('loads only the verified authority model catalog through the capability-gated bridge', async () => {
+    const runtimeCatalog = {
+      runtime: 'prime_agent',
+      releaseVersion: '0.7.0',
+      observedAt: '2026-08-07T12:00:00.000Z',
+      providers: [{
+        providerId: 'openai-codex',
+        displayName: 'ChatGPT Plus/Pro (Codex Subscription)',
+        oauthSupported: true,
+        oauthUsesCallbackServer: true,
+        configured: true,
+        authSource: 'stored',
+        modelCount: 1,
+        availableModelCount: 1,
+      }],
+      models: [{
+        providerId: 'openai-codex',
+        modelId: 'gpt-5.3-codex',
+        name: 'GPT-5.3 Codex',
+        api: 'openai-codex-responses',
+        reasoning: true,
+        input: ['text'],
+        contextWindow: 400_000,
+        maxOutputTokens: 128_000,
+        available: true,
+        usingOAuth: true,
+      }],
+    }
+    const runtimeModelCatalog = vi.fn(() => ok(runtimeCatalog))
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: { version: 3, activeHostId: 'host-local', entries: {} },
+        outbox: [],
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      }),
+      runtimeModelCatalog,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    await api.loadWorkbench()
+
+    await expect(api.loadRuntimeModelCatalog('host-local')).resolves.toEqual(runtimeCatalog)
+    expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
+    await expect(api.loadRuntimeModelCatalog('host-remote')).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(runtimeModelCatalog).toHaveBeenCalledOnce()
+  })
 })
 
 function deferred<T>() {

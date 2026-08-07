@@ -127,6 +127,47 @@ describe('Prime Continuim renderer', () => {
     expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(draft)).not.toBeInTheDocument()
   })
 
+  it('waits for an authoritative host snapshot before rendering an admitted prompt', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const snapshot = await api.loadWorkbench()
+    let publish: ((next: typeof snapshot) => void) | undefined
+    api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(snapshot)))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent · durably admitted by host' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const prompt = 'Wait for the resident transcript before showing this prompt.'
+
+    await user.type(composer, prompt)
+    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+
+    await waitFor(() => expect(api.sendComposer).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer).toHaveValue(''))
+    expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
+
+    const authoritative = structuredClone(snapshot)
+    const selected = authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)
+    if (!selected) throw new Error('Expected the selected thread fixture')
+    selected.transcript.push({
+      id: 'authoritative-user-prompt',
+      kind: 'user',
+      author: 'You',
+      time: 'Now',
+      body: prompt,
+    })
+    authoritative.composerReceipt = { state: 'sent', message: 'Sent · durably admitted by host' }
+
+    await act(async () => publish?.(authoritative))
+    expect(await within(transcript).findByText(prompt)).toBeVisible()
+  })
+
   it('does not let a same-host in-flight receipt clear a newer thread draft', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -185,6 +226,43 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: /Training runs/ }))
 
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
+  })
+
+  it('shows a host-scoped, read-only model and OAuth compatibility catalog', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadRuntimeModelCatalog = vi.spyOn(api, 'loadRuntimeModelCatalog')
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    expect(await within(dialog).findByText('Accounts on devbox')).toBeVisible()
+    expect(loadRuntimeModelCatalog).toHaveBeenCalledWith('host-devbox')
+    expect(within(dialog).getByText('2 configured')).toBeVisible()
+    expect(within(dialog).getByText(/3 OAuth-capable providers · Prime Agent 0\.7\.0/)).toBeVisible()
+    expect(within(dialog).getByText('GPT-5.6 Sol')).toBeVisible()
+    expect(within(dialog).getByText('Kimi K3')).toBeVisible()
+    expect(within(dialog).getByText('Current')).toBeVisible()
+    expect(within(dialog).queryByText('Claude Opus 5')).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /connect|select/i })).not.toBeInTheDocument()
+    expect(within(dialog).getByText(/This catalog is read-only/)).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    expect(within(dialog).getByText('OAuth is supported by Prime Agent')).toBeVisible()
+    expect(within(dialog).getByText('0 ready now · 2 compatible with the installed runtime')).toBeVisible()
+    expect(within(dialog).getByText('/login')).toBeVisible()
+    expect(within(dialog).getByText(/Credentials remain on that host/)).toBeVisible()
+    expect(within(dialog).getByText('No configured models match')).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Compatible' }))
+    expect(within(dialog).getByText('Claude Opus 5')).toBeVisible()
+    expect(within(dialog).getAllByText('Setup required').length).toBeGreaterThan(0)
+
+    await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
+    await waitFor(() => expect(trigger).toHaveFocus())
   })
 
   it('shows Add computer as one keyboard-operable sheet with exact connection and install details', async () => {
@@ -827,9 +905,17 @@ describe('Prime Continuim renderer', () => {
   it('follows new transcript messages only near the bottom and resets on thread changes', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
+    const initialSnapshot = await api.loadWorkbench()
+    let authoritative = structuredClone(initialSnapshot)
+    let publish: ((next: typeof initialSnapshot) => void) | undefined
     const firstSend = deferred<{ state: 'sent'; message: string }>()
     const secondSend = deferred<{ state: 'sent'; message: string }>()
     let sendCount = 0
+    api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(initialSnapshot)))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
     api.sendComposer = vi.fn(() => sendCount++ === 0 ? firstSend.promise : secondSend.promise)
 
     render(<App api={api} />)
@@ -855,8 +941,18 @@ describe('Prime Continuim renderer', () => {
       firstSend.resolve({ state: 'sent', message: 'Sent' })
       await firstSend.promise
     })
+    expect(within(transcript).queryByText('Follow the first response.')).not.toBeInTheDocument()
+    authoritative = structuredClone(authoritative)
+    authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)?.transcript.push({
+      id: 'authoritative-follow-response',
+      kind: 'user',
+      author: 'You',
+      time: 'Now',
+      body: 'Follow the first response.',
+    })
+    await act(async () => publish?.(authoritative))
     await screen.findByText('Follow the first response.')
-    expect(scrollTop).toBe(1_200)
+    await waitFor(() => expect(scrollTop).toBe(1_200))
 
     scrollTop = 200
     fireEvent.scroll(transcript)
@@ -867,6 +963,16 @@ describe('Prime Continuim renderer', () => {
       secondSend.resolve({ state: 'sent', message: 'Sent' })
       await secondSend.promise
     })
+    expect(within(transcript).queryByText('Do not steal my reading position.')).not.toBeInTheDocument()
+    authoritative = structuredClone(authoritative)
+    authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)?.transcript.push({
+      id: 'authoritative-reading-position',
+      kind: 'user',
+      author: 'You',
+      time: 'Now',
+      body: 'Do not steal my reading position.',
+    })
+    await act(async () => publish?.(authoritative))
     await screen.findByText('Do not steal my reading position.')
     expect(scrollTop).toBe(200)
 

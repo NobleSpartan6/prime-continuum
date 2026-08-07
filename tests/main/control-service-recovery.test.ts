@@ -887,6 +887,28 @@ describe('DesktopControlService recovery', () => {
     })
     expect(await readdir(path.join(directory, 'control', 'projections'))).toHaveLength(2)
   })
+
+  it('fences the sanitized runtime model catalog to the verified host authority', async () => {
+    const runtimeCatalog = modelCatalog()
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return { ...health('host-a'), capabilities: ['runtime_model_catalog_v1'] }
+      if (method === 'runtime.model_catalog') {
+        expect(params).toEqual({ expectedHostId: 'host-a' })
+        return runtimeCatalog
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const directory = await createUserData({})
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await expect(service.runtimeModelCatalog('host-a')).resolves.toEqual(runtimeCatalog)
+    await expect(service.runtimeModelCatalog('host-b')).rejects.toMatchObject({
+      code: 'runtime.model_catalog_authority_changed'
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.model_catalog')).toHaveLength(1)
+  })
 })
 
 const timestamp = '2026-08-05T12:00:00.000Z'
@@ -935,6 +957,36 @@ function catalog(hostId = 'host-a') {
     },
     projects: [],
     threads: []
+  }
+}
+
+function modelCatalog() {
+  return {
+    runtime: 'prime_agent',
+    releaseVersion: '0.7.0',
+    observedAt: timestamp,
+    providers: [{
+      providerId: 'openai-codex',
+      displayName: 'ChatGPT Plus/Pro (Codex Subscription)',
+      oauthSupported: true,
+      oauthUsesCallbackServer: true,
+      configured: true,
+      authSource: 'stored',
+      modelCount: 1,
+      availableModelCount: 1
+    }],
+    models: [{
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+      name: 'GPT-5.3 Codex',
+      api: 'openai-codex-responses',
+      reasoning: true,
+      input: ['text'],
+      contextWindow: 400_000,
+      maxOutputTokens: 128_000,
+      available: true,
+      usingOAuth: true
+    }]
   }
 }
 

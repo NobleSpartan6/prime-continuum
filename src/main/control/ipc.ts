@@ -100,6 +100,11 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
       service.threadProjection(input.threadId, input.cursor)
   )
   handle(
+    IPC.runtimeModelCatalog,
+    z.object({ expectedHostId: id }).strict(),
+    (input: { expectedHostId: string }) => service.runtimeModelCatalog(input.expectedHostId)
+  )
+  handle(
     IPC.requestSnapshot,
     z.object({ threadId: id.optional(), cursor: cursor.optional() }).strict(),
     (input: { threadId?: string; cursor?: z.infer<typeof cursor> }) => service.requestSnapshot(input)

@@ -1,7 +1,14 @@
-import { PRIME_AGENT_COMMAND_CAPABILITY, THREAD_HANDOFF_CAPABILITY } from '../../shared/protocol'
+import {
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RuntimeModelCatalogSnapshotSchema,
+  THREAD_HANDOFF_CAPABILITY,
+  type RuntimeModelCatalogSnapshot,
+} from '../../shared/protocol'
 import { isNativeBridgeUnavailable } from './runtime'
 
 export type ConnectionState = 'online' | 'reconnecting' | 'offline'
+export type RuntimeModelCatalog = RuntimeModelCatalogSnapshot
 export type TaskState = 'idle' | 'running' | 'waiting' | 'needs_approval' | 'complete' | 'failed'
 export type ComposerReceiptState =
   | 'idle'
@@ -189,6 +196,7 @@ export interface WorkbenchSnapshot {
   operations: {
     submitCommands: boolean
     crossHostHandoff: boolean
+    modelCatalog?: boolean
   }
   composerReceipt: {
     state: ComposerReceiptState
@@ -254,6 +262,7 @@ export interface RendererApi {
   loadWorkbench(): Promise<WorkbenchSnapshot>
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
   selectThread(threadId: string): Promise<void>
+  loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   discoverComputers(): Promise<DiscoveredComputer[]>
   probeComputer(input: { alias?: string; hostname?: string; user?: string }): Promise<DiscoveredComputer>
   addComputer(input: {
@@ -341,6 +350,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
   operations: {
     submitCommands: true,
     crossHostHandoff: true,
+    modelCatalog: true,
   },
   hosts: [
     {
@@ -513,7 +523,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
       activeSessionId: 'session-seamless-remote',
       sessionId: 'session-seamless-remote',
       sessionName: 'Seamless remote experience',
-      model: 'Prime RLM',
+      model: 'GPT-5.6 Sol',
       thinkingLevel: 'High',
       isStreaming: true,
       isCompacting: false,
@@ -586,6 +596,81 @@ const discoveredComputers: DiscoveredComputer[] = [
   },
 ]
 
+const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCatalogSnapshotSchema.parse({
+  runtime: 'prime_agent',
+  releaseVersion: '0.7.0',
+  observedAt: '2026-08-07T12:00:00.000Z',
+  providers: [
+    {
+      providerId: 'openai-codex',
+      displayName: 'ChatGPT Plus/Pro (Codex Subscription)',
+      oauthSupported: true,
+      oauthUsesCallbackServer: true,
+      configured: true,
+      authSource: 'stored',
+      modelCount: 3,
+      availableModelCount: 3,
+    },
+    {
+      providerId: 'anthropic',
+      displayName: 'Anthropic (Claude Pro/Max)',
+      oauthSupported: true,
+      oauthUsesCallbackServer: true,
+      configured: false,
+      modelCount: 2,
+      availableModelCount: 0,
+    },
+    {
+      providerId: 'github-copilot',
+      displayName: 'GitHub Copilot',
+      oauthSupported: true,
+      configured: false,
+      modelCount: 1,
+      availableModelCount: 0,
+    },
+    {
+      providerId: 'prime-inference',
+      displayName: 'Prime Inference',
+      oauthSupported: false,
+      configured: true,
+      authSource: 'prime_cli',
+      modelCount: 5,
+      availableModelCount: 5,
+    },
+    {
+      providerId: 'google',
+      displayName: 'Google Gemini',
+      oauthSupported: false,
+      configured: false,
+      modelCount: 1,
+      availableModelCount: 0,
+    },
+    {
+      providerId: 'xai',
+      displayName: 'xAI',
+      oauthSupported: false,
+      configured: false,
+      modelCount: 1,
+      availableModelCount: 0,
+    },
+  ],
+  models: [
+    { providerId: 'openai-codex', modelId: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
+    { providerId: 'openai-codex', modelId: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
+    { providerId: 'openai-codex', modelId: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
+    { providerId: 'anthropic', modelId: 'claude-opus-5', name: 'Claude Opus 5', api: 'anthropic-messages', reasoning: true, input: ['text', 'image'], contextWindow: 1_000_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
+    { providerId: 'anthropic', modelId: 'claude-sonnet-5', name: 'Claude Sonnet 5', api: 'anthropic-messages', reasoning: true, input: ['text', 'image'], contextWindow: 1_000_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
+    { providerId: 'github-copilot', modelId: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', api: 'openai-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
+    { providerId: 'prime-inference', modelId: 'moonshotai/kimi-k3', name: 'Kimi K3', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 1_048_576, available: true, usingOAuth: false },
+    { providerId: 'prime-inference', modelId: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 384_000, available: true, usingOAuth: false },
+    { providerId: 'prime-inference', modelId: 'qwen/qwen3.7-flash', name: 'Qwen3.7 Flash', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_000_000, maxOutputTokens: 65_536, available: true, usingOAuth: false },
+    { providerId: 'prime-inference', modelId: 'z-ai/glm-5.2', name: 'GLM 5.2', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 262_144, available: true, usingOAuth: false },
+    { providerId: 'prime-inference', modelId: 'minimax/minimax-m3', name: 'MiniMax M3', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 524_288, maxOutputTokens: 512_000, available: true, usingOAuth: false },
+    { providerId: 'google', modelId: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', api: 'google-generative-ai', reasoning: true, input: ['text', 'image'], contextWindow: 1_048_576, maxOutputTokens: 65_536, available: false, usingOAuth: false },
+    { providerId: 'xai', modelId: 'grok-4.5', name: 'Grok 4.5', api: 'openai-completions', reasoning: true, input: ['text', 'image'], contextWindow: 500_000, maxOutputTokens: 500_000, available: false, usingOAuth: false },
+  ],
+})
+
 class BrowserPreviewApi implements RendererApi {
   readonly environment = 'preview' as const
 
@@ -597,6 +682,11 @@ class BrowserPreviewApi implements RendererApi {
   async selectThread(_threadId: string): Promise<void> {
     // Browser preview data is already materialized in memory. The native
     // adapter overrides this boundary with an authoritative host request.
+  }
+
+  async loadRuntimeModelCatalog(_hostId: string): Promise<RuntimeModelCatalogSnapshot> {
+    await delay(180)
+    return structuredClone(previewRuntimeModelCatalog)
   }
 
   async discoverComputers(): Promise<DiscoveredComputer[]> {
@@ -1383,6 +1473,11 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         selectedHostHasAuthority &&
         activePhase === 'online' &&
         advertisedCapabilities.includes(THREAD_HANDOFF_CAPABILITY),
+      ...(selectedHostHasAuthority &&
+      activePhase === 'online' &&
+      advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)
+        ? { modelCatalog: true }
+        : {}),
     },
     composerReceipt,
   }
@@ -1850,6 +1945,27 @@ export class NativeRendererApi implements RendererApi {
     this.workbenchLoaded = true
     queueMicrotask(() => void this.reconcileInBackground())
     return cachedProjection
+  }
+
+  async loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot> {
+    const generation = this.connectionGeneration
+    const connection = asRecord(this.connection)
+    const connectedHostId = asString(connection?.hostId)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (connectedHostId !== hostId) throw new StaleHostAuthorityError()
+    if (!capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)) {
+      throw new Error('The selected host has not advertised a verified Prime Agent model catalog.')
+    }
+    const raw = await this.call<unknown>('runtimeModelCatalog', { expectedHostId: hostId })
+    if (
+      generation !== this.connectionGeneration ||
+      asString(asRecord(this.connection)?.hostId) !== hostId
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    return RuntimeModelCatalogSnapshotSchema.parse(raw)
   }
 
   subscribe(listener: (snapshot: WorkbenchSnapshot) => void): () => void {

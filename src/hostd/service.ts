@@ -6,6 +6,7 @@ import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
   type HostIpcRequest,
   type HostIpcResponse,
   type HostIdentityReadiness,
@@ -27,6 +28,7 @@ import {
 } from "./pairing/host-identity-provider";
 import { HOSTD_VERSION } from "./paths";
 import { HostStore, HostStoreError } from "./store";
+import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
 
 // The durable store contains a single-process handoff harness for protocol and
 // rollback testing. Production hostd must not advertise executable handoff
@@ -42,6 +44,7 @@ const HANDOFF_COORDINATOR_WARNING = {
 
 const KNOWN_METHODS = new Set([
   "health.get",
+  "runtime.model_catalog",
   "catalog.snapshot",
   "thread.snapshot",
   "command.submit",
@@ -68,6 +71,7 @@ export interface HostServiceOptions {
   hostIdentityProvider?: HostIdentityKeyProvider;
   identityLoadTimeoutMs?: number;
   runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
+  runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
 }
 
 export interface RuntimeIntegrityReadinessProvider {
@@ -85,6 +89,7 @@ export class HostService {
   private closePromise: Promise<void> | undefined;
   private readonly identityLoadTimeoutMs: number;
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
+  private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
   readonly startedAt = new Date().toISOString();
@@ -101,6 +106,7 @@ export class HostService {
     this.hostIdentityProvider = options.hostIdentityProvider ?? new UnavailableHostIdentityKeyProvider();
     this.identityLoadTimeoutMs = options.identityLoadTimeoutMs ?? DEFAULT_IDENTITY_LOAD_TIMEOUT_MS;
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
+    this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
     if (!Number.isSafeInteger(this.identityLoadTimeoutMs) || this.identityLoadTimeoutMs < 10 || this.identityLoadTimeoutMs > 30_000) {
       throw new TypeError("Identity load timeout must be an integer from 10 to 30000 milliseconds");
     }
@@ -213,6 +219,10 @@ export class HostService {
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [PRIME_AGENT_COMMAND_CAPABILITY]
           : [];
+        const modelCatalogCapabilities = this.runtimeModelCatalogProvider &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
+          ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -221,11 +231,28 @@ export class HostService {
           serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
           host,
           capabilities: runtimeIntegrity === undefined
-            ? [...HOST_CAPABILITIES, ...executionCapabilities]
-            : [...HOST_CAPABILITIES, ...executionCapabilities, RUNTIME_INTEGRITY_CAPABILITY],
+            ? [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities]
+            : [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities, RUNTIME_INTEGRITY_CAPABILITY],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
         };
+      }
+      case "runtime.model_catalog": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "The model catalog was requested from a different host authority.",
+          );
+        }
+        const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+        if (!this.runtimeModelCatalogProvider || (runtimeIntegrity && runtimeIntegrity.status !== "ready")) {
+          throw new HostStoreError(
+            "RUNTIME_MODEL_CATALOG_UNAVAILABLE",
+            "The verified Prime Agent model catalog is not available on this host.",
+          );
+        }
+        return this.runtimeModelCatalogProvider.read();
       }
       case "catalog.snapshot":
         return this.store.getCatalogSnapshot();
@@ -471,6 +498,7 @@ function parseHostIdentityProviderResult(value: unknown): HostIdentityProviderLo
 function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
   switch (request.method) {
     case "health.get":
+    case "runtime.model_catalog":
     case "catalog.snapshot":
     case "thread.snapshot":
     case "command.reconcile":

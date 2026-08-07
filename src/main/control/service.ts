@@ -10,9 +10,11 @@ import {
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
+  RuntimeModelCatalogSnapshotSchema,
   ThreadProjectionSnapshotSchema,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
+  type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
 import type {
   ApprovalResolution,
@@ -354,6 +356,24 @@ export class DesktopControlService extends EventEmitter {
     return catalog.projects.filter(
       (project) => isRecord(project) && (project.hostId === hostId || !('hostId' in project))
     )
+  }
+
+  async runtimeModelCatalog(expectedHostId: string): Promise<RuntimeModelCatalogSnapshot> {
+    const authority = this.captureProjectionAuthority()
+    if (expectedHostId !== authority.hostId) {
+      throw new ControlError(
+        'runtime.model_catalog_authority_changed',
+        'The selected host changed before its model catalog could be loaded.',
+        { retryable: true, details: { expectedHostId, connectedHostId: authority.hostId } }
+      )
+    }
+    const result = await authority.connection.request(
+      'runtime.model_catalog',
+      { expectedHostId },
+      { timeoutMs: 45_000 }
+    )
+    this.assertProjectionAuthority(authority, 'runtime model catalog')
+    return RuntimeModelCatalogSnapshotSchema.parse(result)
   }
 
   async threadProjection(threadId: string, cursor?: SessionCursor): Promise<unknown> {
