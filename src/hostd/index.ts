@@ -12,6 +12,7 @@ import { HostService } from "./service";
 import { HostStore } from "./store";
 
 export * from "./gateway";
+export * from "./oauth-session-broker";
 export * from "./paths";
 export * from "./probe";
 export * from "./prime-agent-resident-adapter";
