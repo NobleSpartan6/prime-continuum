@@ -89,6 +89,62 @@ describe('DesktopControlService recovery', () => {
     expect(connectLocalHostd).toHaveBeenCalledOnce()
   })
 
+  it('publishes only valid capabilities from the verified host health handshake', async () => {
+    const directory = await createUserData({})
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return {
+          ...health(),
+          capabilities: ['prime_agent_commands_v1', 'invalid capability', 'prime_agent_commands_v1'],
+        }
+      }
+      if (method === 'command.reconcile') return { receipts: [], unknown: [] }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await service.bootstrap()
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({
+      phase: 'online',
+      capabilities: ['prime_agent_commands_v1'],
+    })
+  })
+
+  it('keeps the bound authority and its capabilities when a replacement binding cannot persist', async () => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const connectionA = new TestConnection((method) => {
+      if (method === 'health.get') return { ...health('host-a'), capabilities: ['old_authority_v1'] }
+      throw new Error(`Unexpected Host A request: ${method}`)
+    })
+    const connectionB = new TestConnection((method) => {
+      if (method === 'health.get') return { ...health('host-b'), capabilities: ['new_authority_v1'] }
+      throw new Error(`Unexpected Host B request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(connectionA).mockResolvedValueOnce(connectionB)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.bootstrap()
+    await expect(service.reconnect()).resolves.toMatchObject({
+      phase: 'online',
+      hostId: 'host-a',
+      capabilities: ['old_authority_v1'],
+    })
+
+    const cacheStore = (service as unknown as {
+      cache: { update: (...args: unknown[]) => Promise<unknown> }
+    }).cache
+    cacheStore.update = vi.fn(async () => {
+      throw new Error('Binding write failed')
+    })
+
+    await expect(service.reconnect()).rejects.toThrow('Binding write failed')
+    expect(service.getConnectionState()).toMatchObject({
+      phase: 'offline',
+      hostId: 'host-a',
+      capabilities: ['old_authority_v1'],
+    })
+  })
+
   it('replays only explicitly queued follow-ups the host marks unknown for the exact identity', async () => {
     const replayable = followUp('device-a', 'replay-me')
     const uncertain = followUp('device-a', 'uncertain-command')

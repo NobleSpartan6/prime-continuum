@@ -285,7 +285,8 @@ export default function App({ api: suppliedApi }: AppProps) {
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const pairMobileTriggerRef = useRef<HTMLButtonElement>(null)
-  const companionReturnTargetRef = useRef<'mobile' | 'command' | null>(null)
+  const pairMobileDialogTriggerRef = useRef<HTMLElement | null>(null)
+  const companionReturnTargetRef = useRef<'companion-button' | 'sidebar-toggle' | 'command' | null>(null)
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
@@ -309,7 +310,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     setSurface(nextSurface)
   }, [])
 
-  const openCompanion = useCallback((returnTarget: 'mobile' | 'command') => {
+  const openCompanion = useCallback((returnTarget: 'companion-button' | 'sidebar-toggle' | 'command') => {
     companionReturnTargetRef.current = returnTarget
     setWorkbenchSurface('companion')
   }, [setWorkbenchSurface])
@@ -320,7 +321,9 @@ export default function App({ api: suppliedApi }: AppProps) {
       window.requestAnimationFrame(() => {
         const target = companionReturnTargetRef.current === 'command'
           ? commandPaletteTriggerRef.current
-          : pairMobileTriggerRef.current
+          : companionReturnTargetRef.current === 'sidebar-toggle'
+            ? sidebarToggleRef.current
+            : pairMobileTriggerRef.current
         target?.focus()
         companionReturnTargetRef.current = null
       })
@@ -355,6 +358,8 @@ export default function App({ api: suppliedApi }: AppProps) {
   })
   const threadSelectionRequestRef = useRef(0)
   const activeHostIdRef = useRef<string | undefined>(undefined)
+  const activeThreadIdRef = useRef<string | undefined>(undefined)
+  const composerAuthorityGenerationRef = useRef(0)
 
   useEffect(() => {
     let cancelled = false
@@ -400,7 +405,10 @@ export default function App({ api: suppliedApi }: AppProps) {
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
+  const canSubmitCommands = snapshot?.operations.submitCommands ?? false
+  const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   activeHostIdRef.current = selectedHost?.id
+  activeThreadIdRef.current = selectedThread?.id
 
   useEffect(() => {
     if (!selectedHost || !selectedThread) return
@@ -416,6 +424,7 @@ export default function App({ api: suppliedApi }: AppProps) {
 
   const selectThread = (thread: ThreadSummary) => {
     const requestId = ++threadSelectionRequestRef.current
+    composerAuthorityGenerationRef.current += 1
     setThreadSelectionError('')
     setSelectedThreadId(thread.id)
     setSelectedProjectId(thread.projectId)
@@ -443,6 +452,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   }
 
   const openMoveThread = (destinationHostId: string, trigger: HTMLElement | null = locationTriggerRef.current) => {
+    if (!canMoveThreads) return
     if (!destinationHostId || destinationHostId === selectedHost?.id) return
     moveThreadTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
     if (sidebarIsOverlay) setSidebarOpen(false)
@@ -482,6 +492,13 @@ export default function App({ api: suppliedApi }: AppProps) {
   const submitComposer = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!snapshot || !selectedThread || !selectedHost) return
+    if (!canSubmitCommands) {
+      setComposerReceipt({
+        state: 'rejected',
+        message: 'Prime Agent isn’t attached to this host, so commands are unavailable.',
+      })
+      return
+    }
     const text = composerText.trim()
     if (!text) {
       setComposerReceipt({ state: 'rejected', message: 'Write a message before sending.' })
@@ -495,6 +512,9 @@ export default function App({ api: suppliedApi }: AppProps) {
 
     const sendWhenReconnected = selectedHost.connection !== 'online'
     const submissionHostId = selectedHost.id
+    const submissionThreadId = selectedThread.id
+    const submissionAuthorityGeneration = composerAuthorityGenerationRef.current
+    const submittedDraft = composerText
     setComposerReceipt({
       state: sendWhenReconnected ? 'waiting_for_connection' : 'sending',
       message: sendWhenReconnected ? 'Saving to this device’s outbox…' : `Sending to ${selectedHost.name}…`,
@@ -507,9 +527,14 @@ export default function App({ api: suppliedApi }: AppProps) {
         intent: effectiveComposerMode,
         sendWhenReconnected,
       })
-      if (activeHostIdRef.current !== submissionHostId) return
+      if (
+        activeHostIdRef.current !== submissionHostId ||
+        activeThreadIdRef.current !== submissionThreadId ||
+        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
+      ) return
       setComposerReceipt(receipt)
-      setComposerText('')
+      if (receipt.state === 'rejected') return
+      setComposerText((current) => current === submittedDraft ? '' : current)
       setSnapshot((current) => {
         if (!current) return current
         return {
@@ -535,7 +560,12 @@ export default function App({ api: suppliedApi }: AppProps) {
         }
       })
     } catch (error) {
-      if (isStaleHostAuthorityError(error) || activeHostIdRef.current !== submissionHostId) return
+      if (
+        isStaleHostAuthorityError(error) ||
+        activeHostIdRef.current !== submissionHostId ||
+        activeThreadIdRef.current !== submissionThreadId ||
+        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
+      ) return
       setComposerReceipt({
         state: 'uncertain',
         message: error instanceof Error ? `${error.message} Reconciling by command ID.` : 'Receipt uncertain. Reconciling by command ID.',
@@ -683,21 +713,33 @@ export default function App({ api: suppliedApi }: AppProps) {
             <kbd>{commandShortcutLabel()}</kbd>
           </button>
 
-          <label className="run-location" title={`Run this thread on ${selectedHost.name}`}>
+          <div className="run-location">
             <span className="run-location__label">Run location</span>
             <span className={cx('connection-dot', `connection-dot--${selectedHost.connection}`)} aria-hidden="true" />
-            <select
-              ref={locationTriggerRef}
-              aria-label={`Run location: ${selectedHost.name}, ${connectionLabel(selectedHost.connection)}`}
-              value={selectedHost.id}
-              onChange={(event) => openMoveThread(event.target.value, event.currentTarget)}
-            >
-              {compatibleHosts.map((host) => (
-                <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
-              ))}
-            </select>
-            <Icon icon={ChevronDown} size={14} />
-          </label>
+            {canMoveThreads ? (
+              <>
+                <select
+                  ref={locationTriggerRef}
+                  aria-label={`Run location: ${selectedHost.name}, ${connectionLabel(selectedHost.connection)}`}
+                  value={selectedHost.id}
+                  onChange={(event) => openMoveThread(event.target.value, event.currentTarget)}
+                >
+                  {compatibleHosts.map((host) => (
+                    <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
+                  ))}
+                </select>
+                <Icon icon={ChevronDown} size={14} />
+              </>
+            ) : (
+              <span
+                className="run-location__static"
+                aria-label={`Run location: ${selectedHost.name}. Moving threads between computers is unavailable`}
+              >
+                <bdi>{selectedHost.name}</bdi>
+                <small>Move unavailable</small>
+              </span>
+            )}
+          </div>
 
           <button
             ref={inspectorToggleRef}
@@ -730,8 +772,13 @@ export default function App({ api: suppliedApi }: AppProps) {
           closeSidebar()
           setAddComputerOpen(true)
         }}
-        onOpenCompanion={() => setPairMobileOpen(true)}
+        onOpenCompanion={(trigger) => {
+          pairMobileDialogTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
+          if (sidebarIsOverlay) closeSidebar()
+          setPairMobileOpen(true)
+        }}
         onMoveThread={openMoveThread}
+        canMoveThread={canMoveThreads}
         addComputerTriggerRef={addComputerTriggerRef}
         companionTriggerRef={pairMobileTriggerRef}
         environment={api.environment}
@@ -775,6 +822,7 @@ export default function App({ api: suppliedApi }: AppProps) {
           text={composerText}
           onTextChange={setComposerText}
           receipt={composerReceipt}
+          canSubmit={canSubmitCommands}
           onSubmit={submitComposer}
         />
       </main>
@@ -846,11 +894,11 @@ export default function App({ api: suppliedApi }: AppProps) {
         snapshot={snapshot}
         selectedThread={selectedThread}
         selectedHost={selectedHost}
-        triggerRef={pairMobileTriggerRef}
+        triggerRef={pairMobileDialogTriggerRef}
         onClose={() => setPairMobileOpen(false)}
         onOpenPreview={() => {
           setPairMobileOpen(false)
-          openCompanion('mobile')
+          openCompanion(sidebarIsOverlay ? 'sidebar-toggle' : 'companion-button')
         }}
       />
 
@@ -877,8 +925,9 @@ interface SidebarProps {
   onSearch: () => void
   onClose: () => void
   onAddComputer: (trigger: HTMLElement) => void
-  onOpenCompanion: () => void
+  onOpenCompanion: (trigger: HTMLElement) => void
   onMoveThread: (hostId: string, trigger: HTMLElement | null) => void
+  canMoveThread: boolean
   addComputerTriggerRef: RefObject<HTMLButtonElement | null>
   companionTriggerRef: RefObject<HTMLButtonElement | null>
   environment: RendererApi['environment']
@@ -898,6 +947,7 @@ function Sidebar({
   onAddComputer,
   onOpenCompanion,
   onMoveThread,
+  canMoveThread,
   addComputerTriggerRef,
   companionTriggerRef,
   environment,
@@ -1040,20 +1090,32 @@ function Sidebar({
 
       <div className="sidebar__footer">
         {selectedHost && compatibleHosts.length > 0 && (
-          <label className="sidebar__location">
+          <div className="sidebar__location">
             <span>Run location</span>
             <span className={cx('connection-dot', `connection-dot--${selectedHost.connection}`)} aria-hidden="true" />
-            <select
-              aria-label={`Compact run location: ${selectedHost.name}, ${connectionLabel(selectedHost.connection)}`}
-              value={selectedHost.id}
-              onChange={(event) => onMoveThread(event.target.value, event.currentTarget)}
-            >
-              {compatibleHosts.map((host) => (
-                <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
-              ))}
-            </select>
-            <Icon icon={ChevronDown} size={14} />
-          </label>
+            {canMoveThread ? (
+              <>
+                <select
+                  aria-label={`Compact run location: ${selectedHost.name}, ${connectionLabel(selectedHost.connection)}`}
+                  value={selectedHost.id}
+                  onChange={(event) => onMoveThread(event.target.value, event.currentTarget)}
+                >
+                  {compatibleHosts.map((host) => (
+                    <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
+                  ))}
+                </select>
+                <Icon icon={ChevronDown} size={14} />
+              </>
+            ) : (
+              <span
+                className="sidebar__location-static"
+                aria-label={`Compact run location: ${selectedHost.name}. Moving threads between computers is unavailable`}
+              >
+                <bdi>{selectedHost.name}</bdi>
+                <small>Move unavailable</small>
+              </span>
+            )}
+          </div>
         )}
         <button
           ref={addComputerTriggerRef}
@@ -1068,7 +1130,7 @@ function Sidebar({
           className="button button--quiet button--full"
           type="button"
           aria-haspopup="dialog"
-          onClick={onOpenCompanion}
+          onClick={(event) => onOpenCompanion(event.currentTarget)}
         >
           <Icon icon={Smartphone} /> Companion preview
         </button>
@@ -1215,6 +1277,7 @@ interface ComposerProps {
   text: string
   onTextChange: (value: string) => void
   receipt: { state: ComposerReceiptState; message: string }
+  canSubmit: boolean
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
 }
 
@@ -1225,10 +1288,11 @@ function SessionContinuity({
   runtime,
 }: Pick<ComposerProps, 'connection' | 'hostName' | 'taskState' | 'runtime'>) {
   const isFresh = connection === 'online'
-  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
-  const interruptedGoal = runtime.goals?.find((goal) => goal.state !== 'complete')
+  const reportedGoals = runtime.goals
+  const activeGoal = reportedGoals?.find((goal) => goal.state === 'active')
+  const interruptedGoal = reportedGoals?.find((goal) => goal.state !== 'complete')
   const displayedGoal = activeGoal ?? interruptedGoal
-  const goalCopy = displayedGoal?.objective ?? (runtime.goals ? 'No active goal' : 'Goal state unavailable')
+  const goalCopy = displayedGoal?.objective ?? (reportedGoals ? 'No active goal' : 'Goal state unavailable')
   const queuedActions = runtime.session?.queuedActionCount
   const hostCommands = runtime.queue?.pendingCount
   const queueStateCopy = runtime.queue?.paused
@@ -1278,21 +1342,30 @@ function SessionContinuity({
   )
 }
 
-function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, onSubmit }: ComposerProps) {
+function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, canSubmit, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
   const effectiveMode = taskState === 'running' ? mode : 'follow_up'
-  const submitLabel = disconnected ? 'Send when reconnected' : effectiveMode === 'steer' ? 'Steer next step' : 'Send follow-up'
+  const unavailableCopy = 'Prime Agent isn’t attached to this host, so commands are unavailable.'
+  const submitLabel = !canSubmit
+    ? 'Commands unavailable'
+    : disconnected
+      ? 'Send when reconnected'
+      : effectiveMode === 'steer'
+        ? 'Steer next step'
+        : 'Send follow-up'
+  const statusCopy = canSubmit ? (receipt.message || (disconnected ? 'Waiting for connection' : 'Ready to send')) : unavailableCopy
 
   return (
     <footer className="composer-wrap">
       <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
-      <form className="composer" onSubmit={onSubmit} aria-label="Message composer">
+      <form className="composer" onSubmit={onSubmit} aria-label="Message composer" aria-disabled={!canSubmit}>
         <div className="composer__toolbar">
           {taskState === 'running' ? (
             <div className="mode-control" aria-label="Message intent">
               <button
                 type="button"
                 aria-pressed={effectiveMode === 'follow_up'}
+                disabled={!canSubmit}
                 onClick={() => onModeChange('follow_up')}
               >
                 Follow up
@@ -1300,21 +1373,21 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
               <button
                 type="button"
                 aria-pressed={effectiveMode === 'steer'}
-                disabled={disconnected}
-                title={disconnected ? `Reconnect to ${hostName} to steer the running turn` : 'Deliver after the current tool calls finish'}
+                disabled={!canSubmit || disconnected}
+                title={!canSubmit ? unavailableCopy : disconnected ? `Reconnect to ${hostName} to steer the running turn` : 'Deliver after the current tool calls finish'}
                 onClick={() => onModeChange('steer')}
               >
                 Steer next step
               </button>
             </div>
           ) : <span className="composer__intent">Follow up</span>}
-          <span className={cx('composer__connection', `composer__connection--${receipt.state}`)}>
-            {receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
-            {receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
-            {receipt.state === 'sent' && <Icon icon={Check} size={13} />}
-            {receipt.state === 'uncertain' && <Icon icon={RefreshCw} size={13} />}
-            {receipt.state === 'rejected' && <Icon icon={AlertCircle} size={13} />}
-            <span>{receipt.message || (disconnected ? 'Waiting for connection' : 'Ready to send')}</span>
+          <span className={cx('composer__connection', `composer__connection--${canSubmit ? receipt.state : 'rejected'}`)}>
+            {canSubmit && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
+            {canSubmit && receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
+            {canSubmit && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
+            {canSubmit && receipt.state === 'uncertain' && <Icon icon={RefreshCw} size={13} />}
+            {(!canSubmit || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
+            <span>{statusCopy}</span>
           </span>
         </div>
 
@@ -1324,7 +1397,8 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
           name="message"
           value={text}
           rows={2}
-          placeholder="Ask Prime Agent to continue…"
+          placeholder={canSubmit ? 'Ask Prime Agent to continue…' : 'Attach Prime Agent to send commands'}
+          disabled={!canSubmit}
           onChange={(event) => onTextChange(event.target.value)}
           onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
             if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
@@ -1336,12 +1410,12 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
         />
 
         <div className="composer__actions">
-          <span className="composer__hint" id="composer-hint">Ctrl or ⌘ + Enter to send</span>
+          <span className="composer__hint" id="composer-hint">{canSubmit ? 'Ctrl or ⌘ + Enter to send' : 'Connect this host to Prime Agent to enable commands'}</span>
           <div className="composer__primary-actions">
             <button
               className={cx('button', 'button--primary', !text.trim() && 'button--empty')}
               type="submit"
-              disabled={receipt.state === 'sending'}
+              disabled={!canSubmit || receipt.state === 'sending'}
             >
               {receipt.state === 'sending' ? <Icon icon={Loader2} size={15} /> : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
               {submitLabel}
@@ -1349,7 +1423,7 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
           </div>
         </div>
         <span className="sr-only" id="composer-status" role="status" aria-live="polite" aria-atomic="true">
-          {receipt.message}
+          {statusCopy}
         </span>
       </form>
     </footer>
@@ -1566,14 +1640,23 @@ function RuntimePanel({
   const [goalLimit, setGoalLimit] = useState(RUNTIME_GOAL_INCREMENT)
   const [agentLimit, setAgentLimit] = useState(RUNTIME_AGENT_INCREMENT)
   const [scheduleLimit, setScheduleLimit] = useState(RUNTIME_SCHEDULE_INCREMENT)
-  const runningAgents = snapshot.agents.filter((agent) => agent.status === 'running').length
-  const agentsById = new Map(snapshot.agents.map((agent) => [agent.id, agent]))
-  const orderedAgents = parentFirstAgents(snapshot.agents)
+  const session = runtime.session
+  const agentsReported = runtime.agentsReported === true
+  const hasAnyRuntimeReport = Boolean(
+    session || agentsReported || runtime.goals !== undefined || runtime.schedules !== undefined,
+  )
+  const reportedAgents = agentsReported ? snapshot.agents : []
+  const runningAgents = reportedAgents.filter((agent) => agent.status === 'running').length
+  const agentsById = new Map(reportedAgents.map((agent) => [agent.id, agent]))
+  const orderedAgents = parentFirstAgents(reportedAgents)
   const visibleAgents = orderedAgents.slice(0, agentLimit)
   const visibleGoals = runtime.goals?.slice(0, goalLimit)
   const visibleSchedules = runtime.schedules?.slice(0, scheduleLimit)
   const activeGoals = runtime.goals?.filter((goal) => goal.state === 'active') ?? []
-  const session = runtime.session
+  const workSummary = [
+    runtime.goals === undefined ? 'Goals not reported' : `${activeGoals.length} active`,
+    agentsReported ? `${reportedAgents.length} agents` : 'Agents not reported',
+  ].join(' · ')
   const isFresh = host.connection === 'online'
   const sessionId = session?.activeSessionId ?? session?.sessionId
   const hostQueueCopy = runtime.queue
@@ -1600,9 +1683,15 @@ function RuntimePanel({
       <PanelHeading
         icon={Bot}
         title="Reported runtime"
-        meta={isFresh
-          ? `Current thread · ${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} running`
-          : `${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} last reported running · cached host state`}
+        meta={!hasAnyRuntimeReport
+          ? 'Current thread · runtime not reported'
+          : !session
+            ? 'Current thread · session not reported'
+            : !agentsReported
+              ? isFresh ? 'Current thread · agent activity not reported' : 'Agent activity not reported · cached host state'
+              : isFresh
+                ? `Current thread · ${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} running`
+                : `${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} last reported running · cached host state`}
       />
 
       <section className="runtime-section" aria-labelledby="runtime-session-heading">
@@ -1633,7 +1722,7 @@ function RuntimePanel({
       <section className="runtime-section" aria-labelledby="runtime-work-heading">
         <div className="runtime-section__heading">
           <h3 id="runtime-work-heading">Reported work</h3>
-          <span>{activeGoals.length} active · {snapshot.agents.length} agents</span>
+          <span>{workSummary}</span>
         </div>
         <div className="runtime-subsection" aria-labelledby="runtime-goal-heading">
           <div className="runtime-subsection__heading">
@@ -1672,9 +1761,11 @@ function RuntimePanel({
         <div className="runtime-subsection" aria-labelledby="runtime-agents-heading">
           <div className="runtime-subsection__heading">
             <h4 id="runtime-agents-heading">Agents</h4>
-            <span>{snapshot.agents.length}</span>
+            <span>{agentsReported ? reportedAgents.length : 'Not reported'}</span>
           </div>
-          {snapshot.agents.length === 0 ? (
+          {!agentsReported ? (
+            <p className="runtime-empty">Agent activity isn’t reported in this snapshot.</p>
+          ) : reportedAgents.length === 0 ? (
             <p className="runtime-empty">No retained agents are reported for this session.</p>
           ) : (
             <ul className="agent-list">
@@ -1703,9 +1794,9 @@ function RuntimePanel({
               })}
             </ul>
           )}
-          {snapshot.agents.length > agentLimit && (
+          {agentsReported && reportedAgents.length > agentLimit && (
             <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setAgentLimit((limit) => limit + RUNTIME_AGENT_INCREMENT)}>
-              Show {Math.min(RUNTIME_AGENT_INCREMENT, snapshot.agents.length - agentLimit)} more subagents
+              Show {Math.min(RUNTIME_AGENT_INCREMENT, reportedAgents.length - agentLimit)} more subagents
             </button>
           )}
         </div>
@@ -1764,7 +1855,7 @@ function RuntimePanel({
       <section className="runtime-section" aria-labelledby="runtime-usage-heading">
         <div className="runtime-section__heading">
           <h3 id="runtime-usage-heading">Usage</h3>
-          <span>Reported by the runtime</span>
+          <span>{session ? 'Reported by the runtime' : 'Not reported'}</span>
         </div>
         {session?.model || session?.context || session?.activeToolNames.length ? (
           <dl className="runtime-facts">
@@ -1903,7 +1994,7 @@ function CommandPaletteDialog({
       keywords: `${project.name} ${project.repository} ${project.branch}`,
       run: () => onSelectProject(project.id),
     })),
-    {
+    ...(snapshot.operations.submitCommands ? [{
       id: 'command:composer',
       label: 'Focus message composer',
       detail: 'Write a follow-up or steer the running thread',
@@ -1911,7 +2002,7 @@ function CommandPaletteDialog({
       icon: Command,
       keywords: 'message prompt compose send steer follow up',
       run: onFocusComposer,
-    },
+    }] : []),
     {
       id: 'command:inspector',
       label: 'Open changes and evidence',
@@ -2561,9 +2652,16 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
   const [installConsent, setInstallConsent] = useState(false)
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
+  const [copyFeedback, setCopyFeedback] = useState<{
+    id: number
+    target: 'prime-agent' | 'host-service'
+    message: string
+    failed: boolean
+  } | null>(null)
   const [invalidField, setInvalidField] = useState<'manual-host' | 'install-consent' | null>(null)
   const manualHostRef = useRef<HTMLInputElement>(null)
   const installConsentRef = useRef<HTMLInputElement>(null)
+  const copyFeedbackSequenceRef = useRef(0)
 
   useEffect(() => {
     if (!open) return
@@ -2571,6 +2669,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     setLoading(true)
     setError('')
     setInvalidField(null)
+    setCopyFeedback(null)
     setStatus('Discovering SSH aliases…')
     void api
       .discoverComputers()
@@ -2602,6 +2701,28 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     setInstallConsent(selected?.probeComplete ? !selected.requiresInstall : false)
     setError('')
     setInvalidField(null)
+  }
+
+  const copyCommand = async (
+    command: string,
+    label: string,
+    target: 'prime-agent' | 'host-service',
+  ) => {
+    const id = ++copyFeedbackSequenceRef.current
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable')
+      await navigator.clipboard.writeText(command)
+      if (id !== copyFeedbackSequenceRef.current) return
+      setCopyFeedback({ id, target, message: `${label} copied to the clipboard.`, failed: false })
+    } catch {
+      if (id !== copyFeedbackSequenceRef.current) return
+      setCopyFeedback({
+        id,
+        target,
+        message: `Couldn’t copy ${label.toLocaleLowerCase()}. Select the command and copy it manually.`,
+        failed: true,
+      })
+    }
   }
 
   const probe = async () => {
@@ -2833,11 +2954,21 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                     className="small-icon-button"
                     type="button"
                     aria-label="Copy official Prime Agent install command"
-                    onClick={() => void navigator.clipboard?.writeText(PRIME_AGENT_INSTALL_COMMAND)}
+                    onClick={() => void copyCommand(PRIME_AGENT_INSTALL_COMMAND, 'Prime Agent install command', 'prime-agent')}
                   >
                     <Icon icon={Code2} size={14} />
                   </button>
                 </div>
+                {copyFeedback?.target === 'prime-agent' && (
+                  <p
+                    key={copyFeedback.id}
+                    className={cx('command-copy-feedback', copyFeedback.failed && 'command-copy-feedback--error')}
+                    role="status"
+                  >
+                    <Icon icon={copyFeedback.failed ? AlertCircle : Check} size={13} />
+                    {copyFeedback.message}
+                  </p>
+                )}
                 <small>Prime Agent runs model-generated code with your user permissions; use an external sandbox for untrusted work.</small>
               </details>
             </section>
@@ -2878,10 +3009,25 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                 <summary>Show exact install command</summary>
                 <div className="command-block">
                   <code>{resolved.installCommand}</code>
-                  <button className="small-icon-button" type="button" aria-label="Copy exact install command" onClick={() => void navigator.clipboard?.writeText(resolved.installCommand)}>
+                  <button
+                    className="small-icon-button"
+                    type="button"
+                    aria-label="Copy exact install command"
+                    onClick={() => void copyCommand(resolved.installCommand, 'Continuim host-service install command', 'host-service')}
+                  >
                     <Icon icon={Code2} size={14} />
                   </button>
                 </div>
+                {copyFeedback?.target === 'host-service' && (
+                  <p
+                    key={copyFeedback.id}
+                    className={cx('command-copy-feedback', copyFeedback.failed && 'command-copy-feedback--error')}
+                    role="status"
+                  >
+                    <Icon icon={copyFeedback.failed ? AlertCircle : Check} size={13} />
+                    {copyFeedback.message}
+                  </p>
+                )}
               </details>
             </section>
           )}

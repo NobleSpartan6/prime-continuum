@@ -147,6 +147,7 @@ function onlineConnection() {
     path: 'local_socket',
     since: '2026-08-05T20:00:00.000Z',
     attempt: 1,
+    capabilities: ['prime_agent_commands_v1'],
   }
 }
 
@@ -203,7 +204,10 @@ describe('NativeRendererApi', () => {
           sequence: 1,
         },
       ],
+      queueState: { pendingCommandIds: [], paused: false },
       childAgents: [],
+      goals: [],
+      schedules: [],
       pendingAttention: [],
       git: { branch: 'main', stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
       evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
@@ -258,7 +262,45 @@ describe('NativeRendererApi', () => {
     })
     expect(calls).toEqual(['bootstrap', 'connect', 'hostCatalog', 'requestSnapshot'])
     expect(bridge.connect).toHaveBeenCalledWith({ kind: 'local' })
+    expect(published.at(-1)?.runtime.goals).toBeUndefined()
+    expect(published.at(-1)?.runtime.schedules).toBeUndefined()
+    expect(published.at(-1)?.operations).toEqual({ submitCommands: false, crossHostHandoff: false })
     unsubscribe()
+  })
+
+  it('keeps non-empty retained work reports when live session telemetry is absent', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = {
+      ...recoverySnapshot(catalog.threads[0], 'Persisted work remains available.'),
+      runtime: undefined,
+      childAgents: [{ agentId: 'persisted-agent', title: 'Persisted helper', state: 'waiting' }],
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 1, catalog, lastSnapshot: snapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+
+    const projected = await api.loadWorkbench()
+
+    expect(projected.runtime.session).toBeUndefined()
+    expect(projected.runtime.agentsReported).toBe(true)
+    expect(projected.agents).toEqual([expect.objectContaining({ name: 'Persisted helper', status: 'waiting' })])
+    expect(projected.runtime.goals).toEqual([
+      expect.objectContaining({ objective: 'Finish First durable thread', state: 'active' }),
+    ])
+    expect(projected.runtime.schedules).toEqual([
+      expect.objectContaining({ label: 'Review verification', state: 'active' }),
+    ])
   })
 
   it('unwraps structured bridge failures instead of treating them as projection data', async () => {
@@ -671,6 +713,7 @@ describe('NativeRendererApi', () => {
           path: 'ssh',
           since: '2026-08-05T20:00:00.000Z',
           attempt: 1,
+          capabilities: ['prime_agent_commands_v1', 'thread_handoff_v1'],
         },
         appVersion: '0.1.0',
       })),
@@ -694,6 +737,7 @@ describe('NativeRendererApi', () => {
     expect(cached.projects.map((project) => project.id).sort()).toEqual(['project-a', 'project-b'])
     expect(cached.threads.map((thread) => thread.id).sort()).toEqual(['thread-a', 'thread-b'])
     expect(cached.selectedThreadId).toBe('thread-b')
+    expect(cached.operations).toEqual({ submitCommands: true, crossHostHandoff: false })
     expect(cached.threads.find((thread) => thread.id === 'thread-b')?.transcript[0]?.body).toBe('Cached transcript B.')
 
     snapshotListener?.({ ...catalogA, host: { ...catalogA.host, displayName: 'Stale A overwrite' } })
@@ -705,13 +749,14 @@ describe('NativeRendererApi', () => {
     expect(published.at(-1)?.hosts.find((host) => host.id === 'host-a')?.name).toBe('Host A')
 
     await api.selectThread('thread-a')
+    expect(published.at(-1)?.operations).toEqual({ submitCommands: false, crossHostHandoff: false })
     expect(bridge.requestSnapshot).not.toHaveBeenCalled()
     await expect(api.sendComposer({
       threadId: 'thread-a',
       text: 'Must not cross to B',
       intent: 'follow_up',
       sendWhenReconnected: true,
-    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    })).resolves.toMatchObject({ state: 'rejected' })
     expect(bridge.submitCommand).not.toHaveBeenCalled()
     unsubscribe()
   })
@@ -732,7 +777,10 @@ describe('NativeRendererApi', () => {
             },
           },
           outbox: [],
-          connection: onlineConnection(),
+          connection: {
+            ...onlineConnection(),
+            capabilities: ['prime_agent_commands_v1', 'thread_handoff_v1'],
+          },
           appVersion: '0.1.0',
         }),
       ),

@@ -95,6 +95,8 @@ export interface ConnectionState {
   path?: 'local_socket' | 'ssh'
   since: string
   attempt: number
+  /** Versioned features advertised by the verified host health handshake. */
+  capabilities?: string[]
   error?: StructuredError
 }
 

@@ -687,6 +687,33 @@ code,
   text-overflow: ellipsis;
 }
 
+.run-location__static {
+  display: flex;
+  align-items: baseline;
+  min-inline-size: 0;
+  gap: 0.4rem;
+  padding-inline-end: 0.65rem;
+  color: var(--color-text);
+  font-size: var(--font-ui);
+  font-weight: 560;
+}
+
+.run-location__static bdi {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-location__static small,
+.sidebar__location-static small {
+  flex: 0 0 auto;
+  color: var(--color-text-faint);
+  font-size: 0.625rem;
+  font-weight: 560;
+  white-space: nowrap;
+}
+
 .connection-dot {
   flex: 0 0 auto;
   inline-size: 0.45rem;
@@ -2566,6 +2593,20 @@ dialog.sheet::backdrop {
   user-select: text;
 }
 
+.command-copy-feedback {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.4rem 0 0;
+  color: var(--color-success);
+  font-size: var(--font-caption);
+  line-height: 1.4;
+}
+
+.command-copy-feedback--error {
+  color: var(--color-danger);
+}
+
 .upstream-install > p,
 .upstream-install > small {
   color: var(--color-text-muted);
@@ -3731,6 +3772,24 @@ dialog.pair-mobile-sheet {
     text-overflow: ellipsis;
   }
 
+  .sidebar__location-static {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    min-inline-size: 0;
+    gap: 0.4rem;
+    color: var(--color-text);
+    font-size: var(--font-meta);
+    font-weight: 600;
+  }
+
+  .sidebar__location-static bdi {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .sidebar__location > svg {
     position: absolute;
     inset-inline-end: 0.65rem;
@@ -3825,7 +3884,8 @@ dialog.pair-mobile-sheet {
     align-items: center;
     justify-content: space-between;
     min-block-size: 3rem;
-    padding: 0.35rem 0.45rem 0.35rem 0.75rem;
+    padding-block: 0.35rem;
+    padding-inline: 0.75rem 0.45rem;
     border-block-end: 1px solid var(--color-border);
   }
 

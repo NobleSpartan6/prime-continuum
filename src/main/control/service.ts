@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import type { App } from 'electron'
 import {
+  CapabilitySchema,
   CatalogProjectionSnapshotSchema,
   CommandEnvelopeSchema,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
@@ -110,6 +111,7 @@ export class DesktopControlService extends EventEmitter {
   private connection?: FramedConnection
   private target?: ConnectionTarget
   private authorityHostId?: string
+  private authorityCapabilities: string[] = []
   private reconnectGeneration = 0
   private attempt = 0
   private intentionallyOffline = true
@@ -241,6 +243,9 @@ export class DesktopControlService extends EventEmitter {
     if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
     this.intentionallyOffline = false
     this.target = target
+    // A locator is not capability authority. Preserve capabilities only across
+    // automatic/manual reconnects to the already verified target.
+    this.authorityCapabilities = []
     const generation = ++this.reconnectGeneration
     const cache = await this.cache.update((current) => ({
       ...normalizeCache(current),
@@ -280,6 +285,7 @@ export class DesktopControlService extends EventEmitter {
       phase: 'offline',
       target: this.target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+      ...this.capabilityState(),
       since: now(),
       attempt: this.attempt
     })
@@ -549,12 +555,12 @@ export class DesktopControlService extends EventEmitter {
       phase,
       target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+      ...this.capabilityState(),
       since: now(),
       attempt: this.attempt
     })
 
     let candidate: FramedConnection | undefined
-    let verifiedHostId: string | undefined
     try {
       candidate = await this.latency.measure(
         target.kind === 'local' ? 'connect.local_socket' : 'connect.ssh',
@@ -575,8 +581,9 @@ export class DesktopControlService extends EventEmitter {
         throw new ControlError('connection.superseded', 'The connection attempt was superseded.')
       }
       const hostId = authorityHostIdFromHealth(health)
-      verifiedHostId = hostId
+      const capabilities = capabilitiesFromHealth(health)
       const projectionInvalidated = await this.bindAuthority(target, hostId, generation)
+      this.authorityCapabilities = capabilities
       // Publish verified authority before reconciliation or an online state so
       // a same-alias host replacement invalidates stale renderer projections.
       if (projectionInvalidated) {
@@ -585,6 +592,7 @@ export class DesktopControlService extends EventEmitter {
           target,
           hostId,
           path: target.kind === 'local' ? 'local_socket' : 'ssh',
+          ...this.capabilityState(),
           since: now(),
           attempt: this.attempt
         })
@@ -605,6 +613,7 @@ export class DesktopControlService extends EventEmitter {
           target,
           hostId,
           path: target.kind === 'local' ? 'local_socket' : 'ssh',
+          ...this.capabilityState(),
           since: now(),
           attempt: this.attempt,
           error: toStructuredError(error)
@@ -620,6 +629,7 @@ export class DesktopControlService extends EventEmitter {
         target,
         hostId,
         path: target.kind === 'local' ? 'local_socket' : 'ssh',
+        ...this.capabilityState(),
         since: now(),
         attempt: this.attempt
       })
@@ -631,7 +641,8 @@ export class DesktopControlService extends EventEmitter {
         this.setState({
           phase: 'offline',
           target,
-          ...(verifiedHostId ? { hostId: verifiedHostId } : {}),
+          ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+          ...this.capabilityState(),
           since: now(),
           attempt: this.attempt,
           error: toStructuredError(error)
@@ -683,6 +694,7 @@ export class DesktopControlService extends EventEmitter {
       phase: 'reconnecting',
       target,
       ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+      ...this.capabilityState(),
       since: now(),
       attempt: this.attempt,
       error: toStructuredError(cause)
@@ -705,6 +717,7 @@ export class DesktopControlService extends EventEmitter {
               phase: 'reconnecting',
               target,
               ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+              ...this.capabilityState(),
               since: now(),
               attempt: this.attempt,
               error: toStructuredError(lastError)
@@ -718,6 +731,12 @@ export class DesktopControlService extends EventEmitter {
   private setState(state: ConnectionState): void {
     this.state = state
     this.emit('connection-state', this.getConnectionState())
+  }
+
+  private capabilityState(): Pick<ConnectionState, 'capabilities'> | Record<string, never> {
+    return this.authorityCapabilities.length > 0
+      ? { capabilities: [...this.authorityCapabilities] }
+      : {}
   }
 
   private requireConnection(): FramedConnection {
@@ -1180,6 +1199,15 @@ function authorityHostIdFromHealth(value: unknown): string {
     throw new ControlError('protocol.host_identity_missing', 'The host health response did not include an immutable host identity.')
   }
   return hostId
+}
+
+function capabilitiesFromHealth(value: unknown): string[] {
+  if (!isRecord(value) || !Array.isArray(value.capabilities)) return []
+  const capabilities = value.capabilities.flatMap((candidate) => {
+    const parsed = CapabilitySchema.safeParse(candidate)
+    return parsed.success ? [parsed.data] : []
+  })
+  return [...new Set(capabilities)].sort()
 }
 
 function snapshotEventForAuthority(value: unknown, hostId: string): unknown {

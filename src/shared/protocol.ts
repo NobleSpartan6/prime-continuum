@@ -44,6 +44,8 @@ export const CapabilitySchema = z
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
 
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
+export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v1" as const;
+export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
 export const IsoDateTimeSchema = z
   .string()

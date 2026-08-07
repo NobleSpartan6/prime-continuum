@@ -1,3 +1,6 @@
+import { PRIME_AGENT_COMMAND_CAPABILITY, THREAD_HANDOFF_CAPABILITY } from '../../shared/protocol'
+import { isNativeBridgeUnavailable } from './runtime'
+
 export type ConnectionState = 'online' | 'reconnecting' | 'offline'
 export type TaskState = 'idle' | 'running' | 'waiting' | 'needs_approval' | 'complete' | 'failed'
 export type ComposerReceiptState =
@@ -133,6 +136,8 @@ export interface RuntimeSessionSummary {
 
 export interface RuntimeSummary {
   session?: RuntimeSessionSummary
+  /** True only when retained-agent data is reported, including an authoritative empty list. */
+  agentsReported?: boolean
   /** Undefined means the selected host snapshot did not project this capability. */
   queue?: {
     pendingCount: number
@@ -163,6 +168,10 @@ export interface WorkbenchSnapshot {
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
   runtime: RuntimeSummary
+  operations: {
+    submitCommands: boolean
+    crossHostHandoff: boolean
+  }
   composerReceipt: {
     state: ComposerReceiptState
     message?: string
@@ -311,6 +320,10 @@ const seedTranscript: TranscriptBlock[] = [
 export const previewSnapshot: WorkbenchSnapshot = {
   selectedProjectId: 'project-prime',
   selectedThreadId: 'thread-seamless',
+  operations: {
+    submitCommands: true,
+    crossHostHandoff: true,
+  },
   hosts: [
     {
       id: 'host-local',
@@ -475,6 +488,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
     { id: 'evidence-3', label: 'Sample reconnect trace', detail: 'Preview fixture · awaiting path recovery', status: 'running' },
   ],
   runtime: {
+    agentsReported: true,
     session: {
       residency: 'resident',
       appVersion: '0.18.4',
@@ -953,6 +967,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const activePhase = asString(rawConnection?.phase)
   const activeHostId = asString(rawConnection?.hostId)
   const activeTarget = asRecord(rawConnection?.target)
+  const advertisedCapabilities = Array.isArray(rawConnection?.capabilities)
+    ? rawConnection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+    : []
   const updatedAt = asString(input.updatedAt)
   const snapshotThread = asRecord(threadSnapshot?.thread)
   const snapshotLocation = asRecord(snapshotThread?.currentLocation)
@@ -1081,6 +1098,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     ''
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId)
   const selectedProjectId = selectedThread?.projectId ?? projects[0]?.id ?? ''
+  const selectedHostHasAuthority = Boolean(activeHostId && selectedThread?.hostId === activeHostId)
   const hostName = hosts.find((host) => host.id === selectedThread?.hostId)?.name ?? 'Execution host'
   const selectedSnapshotIsMaterialized = Boolean(
     snapshotThreadId &&
@@ -1166,6 +1184,8 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       }
     }
 
+    if (runtime.session || childAgents.length > 0) runtime.agentsReported = true
+
     const rawQueue = asRecord(threadSnapshot?.queueState)
     if (rawQueue && Array.isArray(rawQueue.pendingCommandIds)) {
       runtime.queue = {
@@ -1174,7 +1194,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       }
     }
 
-    if (Array.isArray(threadSnapshot?.goals)) {
+    if (Array.isArray(threadSnapshot?.goals) && (runtime.session || threadSnapshot.goals.length > 0)) {
       runtime.goals = records(threadSnapshot.goals).flatMap((goal, index) => {
         const state = asString(goal.state)
         const objective = asString(goal.objective)
@@ -1197,7 +1217,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       })
     }
 
-    if (Array.isArray(threadSnapshot?.schedules)) {
+    if (Array.isArray(threadSnapshot?.schedules) && (runtime.session || threadSnapshot.schedules.length > 0)) {
       runtime.schedules = records(threadSnapshot.schedules).flatMap((schedule, index) => {
         const state = asString(schedule.state)
         const label = asString(schedule.label)
@@ -1286,6 +1306,13 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     agents,
     evidence,
     runtime,
+    operations: {
+      submitCommands: selectedHostHasAuthority && advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY),
+      crossHostHandoff:
+        selectedHostHasAuthority &&
+        activePhase === 'online' &&
+        advertisedCapabilities.includes(THREAD_HANDOFF_CAPABILITY),
+    },
     composerReceipt,
   }
 }
@@ -1980,6 +2007,12 @@ export class NativeRendererApi implements RendererApi {
   }
 
   async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string }> {
+    if (!this.projection?.operations.submitCommands) {
+      return {
+        state: 'rejected',
+        message: 'Prime Agent isn’t attached to this host, so commands are unavailable.',
+      }
+    }
     const commandId = createStableId('command')
     const thread = this.projection?.threads.find((item) => item.id === request.threadId)
     if (!thread?.hostId) throw new Error('Refresh this thread before sending so its host identity can be verified.')
@@ -2046,6 +2079,9 @@ export class NativeRendererApi implements RendererApi {
     destinationHostId: string
     behaviorIfRunning: 'interrupt' | 'wait_for_idle'
   }): Promise<HandoffPlan> {
+    if (!this.projection?.operations.crossHostHandoff) {
+      throw new Error('Cross-host handoff is not available because the connected host has not advertised a destination coordinator.')
+    }
     const rawCatalog = asRecord(this.catalog)
     const selectedThread = this.projection?.threads.find((thread) => thread.id === input.threadId)
     const remoteThreadId = selectedThread ? protocolThreadId(selectedThread) : undefined
@@ -2145,6 +2181,9 @@ export class NativeRendererApi implements RendererApi {
     input: { handoffId: string; behaviorIfRunning: 'interrupt' | 'wait_for_idle' },
     onProgress: (phase: HandoffPhase, message: string) => void,
   ): Promise<{ destinationHostId: string; receiptId: string }> {
+    if (!this.projection?.operations.crossHostHandoff) {
+      throw new Error('Cross-host handoff is not available because the connected host has not advertised a destination coordinator.')
+    }
     this.activeProgress = onProgress
     onProgress('quiescing', input.behaviorIfRunning === 'interrupt' ? 'Interrupting the current turn safely' : 'Waiting for the current turn to finish')
     try {
@@ -2192,4 +2231,3 @@ export function createRendererApi(): RendererApi {
 export function createPreviewRendererApi(): RendererApi {
   return new BrowserPreviewApi()
 }
-import { isNativeBridgeUnavailable } from './runtime'

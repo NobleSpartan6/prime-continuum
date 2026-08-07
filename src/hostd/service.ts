@@ -3,6 +3,7 @@ import { ZodError } from "zod";
 import {
   HostIpcRequestSchema,
   HostIpcResponseSchema,
+  PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   type HostIpcRequest,
@@ -208,6 +209,9 @@ export class HostService {
       case "health.get": {
         const host = await this.store.getHost();
         const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+        const executionCapabilities = this.gateway.continuity === "resident"
+          ? [PRIME_AGENT_COMMAND_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -216,8 +220,8 @@ export class HostService {
           serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
           host,
           capabilities: runtimeIntegrity === undefined
-            ? [...HOST_CAPABILITIES]
-            : [...HOST_CAPABILITIES, RUNTIME_INTEGRITY_CAPABILITY],
+            ? [...HOST_CAPABILITIES, ...executionCapabilities]
+            : [...HOST_CAPABILITIES, ...executionCapabilities, RUNTIME_INTEGRITY_CAPABILITY],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
         };

@@ -11,6 +11,7 @@ import {
 import { HostStore } from "../../src/hostd/store";
 import {
   HealthSnapshotSchema,
+  PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
@@ -135,6 +136,17 @@ describe("HostService runtime integrity readiness", () => {
     expect(health.serviceState).toBe("ready");
     expect(health.runtimeIntegrity).toBeUndefined();
     expect(health.capabilities).not.toContain(RUNTIME_INTEGRITY_CAPABILITY);
+    expect(health.capabilities).not.toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    await service.close();
+  });
+
+  it("advertises command delivery only when a resident Prime Agent gateway is attached", async () => {
+    const gateway = residentGateway();
+    const { service } = await temporaryService(undefined, gateway);
+
+    const health = await healthSnapshot(service);
+
+    expect(health.capabilities).toContain(PRIME_AGENT_COMMAND_CAPABILITY);
     await service.close();
   });
 
@@ -261,6 +273,15 @@ function unavailableGateway(): PrimeAgentGateway & { close: ReturnType<typeof vi
     submit: vi.fn(async () => {
       throw new Error("unavailable");
     }),
+    close: vi.fn(async () => undefined),
+  };
+}
+
+function residentGateway(): PrimeAgentGateway & { close: ReturnType<typeof vi.fn> } {
+  return {
+    continuity: "resident",
+    isLive: vi.fn(async () => true),
+    submit: vi.fn(async () => ({ disposition: "accepted" as const })),
     close: vi.fn(async () => undefined),
   };
 }

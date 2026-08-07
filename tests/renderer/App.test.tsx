@@ -107,6 +107,74 @@ describe('Prime Continuim renderer', () => {
     expect(api.sendComposer).toHaveBeenCalledWith(expect.objectContaining({ intent: 'follow_up' }))
   })
 
+  it('preserves a draft when the host rejects command admission', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    api.sendComposer = vi.fn(async () => ({
+      state: 'rejected',
+      message: 'Prime Agent execution is not attached in this build.',
+    }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const draft = 'Keep this draft until execution is available.'
+    await user.type(composer, draft)
+    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+
+    await screen.findAllByText('Prime Agent execution is not attached in this build.')
+    expect(composer).toHaveValue(draft)
+    expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(draft)).not.toBeInTheDocument()
+  })
+
+  it('does not let a same-host in-flight receipt clear a newer thread draft', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const admission = deferred<{ state: 'sent'; message: string }>()
+    api.sendComposer = vi.fn(() => admission.promise)
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const firstComposer = screen.getByRole('textbox', { name: 'Message' })
+    await user.type(firstComposer, 'First thread submission')
+    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+
+    await user.click(screen.getByRole('button', { name: /Audit SSH discovery/ }))
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const secondComposer = screen.getByRole('textbox', { name: 'Message' })
+    await user.clear(secondComposer)
+    await user.type(secondComposer, 'Newer draft for the second thread')
+
+    await act(async () => {
+      admission.resolve({ state: 'sent', message: 'Sent' })
+      await admission.promise
+    })
+
+    expect(secondComposer).toHaveValue('Newer draft for the second thread')
+    expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText('First thread submission')).not.toBeInTheDocument()
+  })
+
+  it('disables native execution affordances when the host did not negotiate them', async () => {
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.operations = { submitCommands: false, crossHostHandoff: false }
+      return snapshot
+    }
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    expect(screen.getByRole('textbox', { name: 'Message' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Commands unavailable' })).toBeDisabled()
+    const location = screen.getByLabelText(/^Run location: devbox\. Moving threads between computers is unavailable$/)
+    expect(location).toHaveTextContent('devboxMove unavailable')
+    expect(screen.getAllByText(/Prime Agent isn’t attached to this host/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(api.sendComposer).not.toHaveBeenCalled()
+  })
+
   it('asks the adapter for the authoritative snapshot when a thread is selected', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -147,6 +215,88 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(sidebarToggle).toHaveFocus())
+  })
+
+  it('announces official installer clipboard results', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    try {
+      render(<App api={createPreviewRendererApi()} />)
+      await screen.findByRole('heading', { name: 'Seamless remote experience' })
+      await user.click(screen.getByRole('button', { name: 'Open sidebar' }))
+      const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+      await user.click(within(sidebar).getByRole('button', { name: 'Add computer' }))
+      const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
+      await within(dialog).findByText('Readiness check')
+      await user.click(within(dialog).getByText('Install Prime Agent on macOS or Linux'))
+      await user.click(within(dialog).getByRole('button', { name: 'Copy official Prime Agent install command' }))
+
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'))
+      expect(within(dialog).getByText('Prime Agent install command copied to the clipboard.')).toBeVisible()
+      await user.click(within(dialog).getByRole('button', { name: 'Copy official Prime Agent install command' }))
+      await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2))
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    }
+  })
+
+  it('labels absent runtime telemetry as not reported instead of zero', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.runtime = { queue: { pendingCount: 0, paused: false } }
+      snapshot.agents = []
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Goal state unavailable')).toBeVisible()
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+
+    expect(within(runtimePanel).getByText('Current thread · runtime not reported')).toBeVisible()
+    expect(within(runtimePanel).getByText('Agent activity isn’t reported in this snapshot.')).toBeVisible()
+    expect(within(runtimePanel).getByText('Goals aren’t reported in this snapshot.')).toBeVisible()
+    expect(within(runtimePanel).getByText('Schedules aren’t reported in this snapshot.')).toBeVisible()
+    expect(within(runtimePanel).getByText('Goals not reported · Agents not reported')).toBeVisible()
+    expect(within(runtimePanel).queryByText('0 active · 0 agents')).not.toBeInTheDocument()
+  })
+
+  it('renders persisted work reports independently from live session telemetry', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.runtime = {
+        agentsReported: true,
+        goals: [{ id: 'persisted-goal', objective: 'Finish the persisted review', state: 'paused' }],
+        schedules: [{ id: 'persisted-schedule', label: 'Resume the review tomorrow', state: 'paused' }],
+      }
+      snapshot.agents = [{
+        id: 'persisted-agent',
+        name: 'Review helper',
+        role: 'Retained subagent',
+        status: 'waiting',
+        hostName: 'devbox',
+      }]
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Finish the persisted review')).toBeVisible()
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+
+    expect(within(runtimePanel).getByText('Current thread · session not reported')).toBeVisible()
+    expect(within(runtimePanel).getByText('Finish the persisted review')).toBeVisible()
+    expect(within(runtimePanel).getByText('Resume the review tomorrow')).toBeVisible()
+    expect(within(runtimePanel).getByText('Review helper')).toBeVisible()
   })
 
   it('focuses and clears field-level Add computer errors as they are corrected', async () => {
@@ -374,8 +524,13 @@ describe('Prime Continuim renderer', () => {
     render(<App api={createPreviewRendererApi()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
-    await user.click(screen.getByRole('button', { name: 'Companion preview' }))
+    const sidebarToggle = screen.getByRole('button', { name: 'Open sidebar' })
+    await user.click(sidebarToggle)
+    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+    await user.click(within(sidebar).getByRole('button', { name: 'Companion preview' }))
     const dialog = await screen.findByRole('dialog', { name: 'Mobile companion' })
+    expect(screen.queryByRole('dialog', { name: 'Projects and threads' })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
     expect(within(dialog).getByRole('heading', { name: 'Phone control isn’t available in this build' })).toBeVisible()
     expect(within(dialog).getByText(/does not connect a phone or enable remote control/i)).toBeVisible()
     expect(within(dialog).queryByText('Per-device permissions')).not.toBeInTheDocument()
@@ -406,7 +561,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Desktop' }))
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Companion preview' })).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveFocus())
   })
 
   it('surfaces an uncertain command receipt in mobile Attention', async () => {
