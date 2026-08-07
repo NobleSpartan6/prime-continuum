@@ -415,6 +415,7 @@ code,
 }
 
 .topbar__thread-copy h1 {
+  inline-size: auto;
   max-inline-size: 32rem;
   margin: 0;
   overflow: hidden;
@@ -1204,7 +1205,12 @@ code,
   font-weight: 540;
 }
 
-.timeline-marker div > span {
+.timeline-marker .transcript-body--prose {
+  font-size: var(--font-meta);
+  line-height: 1.4;
+}
+
+.timeline-marker > div > span {
   display: block;
   margin-block-start: 0.12rem;
   color: var(--color-text-muted);
@@ -1269,17 +1275,114 @@ code,
   padding-inline-start: 2.25rem;
 }
 
-.message__body p {
-  margin: 0;
+.transcript-body {
+  min-inline-size: 0;
   color: var(--color-text);
-  font-size: var(--font-body);
-  line-height: 1.62;
-  text-wrap: pretty;
+  overflow-wrap: anywhere;
 }
 
-.message__body > code {
-  display: block;
-  padding: 0.7rem 0.8rem;
+.transcript-body--prose {
+  font-size: var(--font-body);
+  line-height: 1.62;
+}
+
+.transcript-body > :first-child,
+.transcript-body > :first-child > :first-child {
+  margin-block-start: 0;
+}
+
+.transcript-body > :last-child,
+.transcript-body > :last-child > :last-child {
+  margin-block-end: 0;
+}
+
+.transcript-body p {
+  margin-block: 0.65rem;
+  text-wrap: pretty;
+  white-space: pre-wrap;
+}
+
+.transcript-body h1,
+.transcript-body h2,
+.transcript-body h3,
+.transcript-body h4,
+.transcript-body h5,
+.transcript-body h6 {
+  margin-block: 1.15rem 0.45rem;
+  color: var(--color-text);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  text-wrap: balance;
+}
+
+.transcript-body h1 {
+  font-size: 1.25rem;
+}
+
+.transcript-body h2 {
+  font-size: 1.125rem;
+}
+
+.transcript-body h3,
+.transcript-body h4,
+.transcript-body h5,
+.transcript-body h6 {
+  font-size: var(--font-body);
+}
+
+.transcript-body ul,
+.transcript-body ol {
+  padding-inline-start: 1.35rem;
+  margin-block: 0.65rem;
+}
+
+.transcript-body li {
+  padding-inline-start: 0.15rem;
+}
+
+.transcript-body li + li {
+  margin-block-start: 0.25rem;
+}
+
+.transcript-body li::marker {
+  color: var(--color-text-muted);
+}
+
+.transcript-body blockquote {
+  padding-inline-start: 0.8rem;
+  margin: 0.75rem 0;
+  color: var(--color-text-secondary);
+  border-inline-start: 2px solid var(--color-border-strong);
+}
+
+.transcript-body__link-label {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-color: color-mix(in oklch, currentColor 52%, transparent);
+  text-decoration-skip-ink: auto;
+  text-underline-offset: 0.14em;
+}
+
+.transcript-body__link-target {
+  color: var(--color-text-muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.82em;
+  overflow-wrap: anywhere;
+}
+
+.transcript-body :not(pre) > code {
+  padding: 0.12rem 0.3rem;
+  background: var(--color-code);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 1px var(--color-border);
+  font-size: 0.9em;
+}
+
+.transcript-body pre {
+  max-inline-size: 100%;
+  padding: 0.75rem 0.85rem;
+  margin-block: 0.75rem;
   overflow-x: auto;
   color: var(--color-text);
   background: var(--color-code);
@@ -1287,6 +1390,29 @@ code,
   border-radius: var(--radius-md);
   font-size: var(--font-meta);
   line-height: 1.5;
+  overscroll-behavior-inline: contain;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.transcript-body pre code {
+  display: block;
+  min-inline-size: max-content;
+  color: inherit;
+  overflow-wrap: normal;
+  white-space: inherit;
+}
+
+.transcript-body__diff-line--addition {
+  color: var(--color-success);
+}
+
+.transcript-body__diff-line--deletion {
+  color: var(--color-danger);
+}
+
+.transcript-body__diff-line--context {
+  color: var(--color-accent);
 }
 
 .message__body .message__detail {
@@ -3100,19 +3226,12 @@ dialog.command-palette-sheet {
   box-shadow: var(--shadow-control);
   font-size: var(--font-caption);
   font-weight: 600;
-  transition-property: color, background-color, box-shadow, scale;
-  transition-duration: 120ms;
-  transition-timing-function: var(--ease-out);
 }
 
 .model-chip:hover {
   color: var(--color-text);
   background: var(--color-surface-hover);
   box-shadow: var(--shadow-control-hover);
-}
-
-.model-chip:active {
-  scale: 0.96;
 }
 
 .model-chip span {
@@ -3158,7 +3277,6 @@ dialog.sheet.models-sheet {
 .models-loading > svg {
   margin-block-start: 0.1rem;
   color: var(--color-accent);
-  animation: spin 900ms linear infinite;
 }
 
 .models-loading div,
@@ -3245,9 +3363,6 @@ dialog.sheet.models-sheet {
   background: transparent;
   border-radius: var(--radius-md);
   text-align: start;
-  transition-property: color, background-color;
-  transition-duration: 100ms;
-  transition-timing-function: var(--ease-out);
 }
 
 .provider-rail nav button:hover {
@@ -4082,12 +4197,28 @@ dialog.pair-mobile-sheet {
   font-size: var(--font-caption);
 }
 
-.companion-message p {
+.companion-message .transcript-body {
   margin: 0.35rem 0 0;
   color: var(--color-text-secondary);
   font-size: var(--font-meta);
   line-height: 1.55;
   overflow-wrap: anywhere;
+}
+
+.companion-message .transcript-body h1 {
+  font-size: 1.05rem;
+}
+
+.companion-message .transcript-body h2,
+.companion-message .transcript-body h3,
+.companion-message .transcript-body h4,
+.companion-message .transcript-body h5,
+.companion-message .transcript-body h6 {
+  font-size: var(--font-ui);
+}
+
+.companion-message .transcript-body pre {
+  font-size: var(--font-caption);
 }
 
 .companion-message small {
@@ -4220,8 +4351,32 @@ dialog.pair-mobile-sheet {
 
   .button:active:not(:disabled),
   .icon-button:active:not(:disabled),
-  .small-icon-button:active:not(:disabled) {
+  .small-icon-button:active:not(:disabled),
+  .model-chip:active:not(:disabled) {
     scale: 0.96;
+  }
+
+  .model-chip {
+    transition-property: color, background-color, box-shadow, scale;
+    transition-duration: 120ms;
+    transition-timing-function: var(--ease-out);
+  }
+
+  .provider-rail nav button,
+  .mode-control button,
+  .catalog-scope button {
+    transition-property: color, background-color, box-shadow;
+    transition-duration: 100ms;
+    transition-timing-function: var(--ease-out);
+  }
+
+  dialog.sheet[open] {
+    animation: sheet-enter 180ms var(--ease-out);
+  }
+
+  dialog.sheet[open]::backdrop,
+  .pane-scrim {
+    animation: scrim-enter 140ms ease-out;
   }
 
   .connection-notice--reconnecting .connection-notice__icon,
@@ -4231,9 +4386,21 @@ dialog.pair-mobile-sheet {
   .button svg.lucide-loader-2,
   .evidence-state--running svg,
   .handoff-progress li[data-state="current"] svg,
-  .load-state > svg.lucide-loader-2 {
+  .load-state > svg.lucide-loader-2,
+  .models-loading > svg {
     animation: spin 1s linear infinite;
   }
+}
+
+@keyframes sheet-enter {
+  from {
+    opacity: 0;
+    scale: 0.985;
+  }
+}
+
+@keyframes scrim-enter {
+  from { opacity: 0; }
 }
 
 @keyframes spin {
@@ -4832,6 +4999,23 @@ dialog.pair-mobile-sheet {
 }
 
 @media (max-width: 24rem) {
+  .topbar__leading {
+    gap: 0;
+    padding-inline: 0;
+  }
+
+  .topbar__leading .brand-mark {
+    display: none;
+  }
+
+  .topbar__thread {
+    padding-inline: 0.5rem;
+  }
+
+  .composer__hint {
+    display: none;
+  }
+
   .companion-result-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -4984,7 +5168,8 @@ dialog.pair-mobile-sheet {
   }
 
   .composer textarea:focus-visible,
-  .command-palette__input input:focus-visible {
+  .command-palette__input input:focus-visible,
+  .model-search input:focus-visible {
     outline: 2px solid Highlight;
     outline-offset: 2px;
   }

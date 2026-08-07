@@ -59,6 +59,7 @@ import {
   type ThreadSummary,
   type WorkbenchSnapshot,
 } from './api'
+import { TranscriptBody } from './TranscriptBody'
 import { FormEvent, KeyboardEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
@@ -108,6 +109,18 @@ function taskLabel(status: TaskState): string {
     failed: 'Failed',
   }
   return labels[status]
+}
+
+function taskIcon(status: TaskState): LucideIcon {
+  const icons: Record<TaskState, LucideIcon> = {
+    idle: Circle,
+    running: Activity,
+    waiting: Clock3,
+    needs_approval: ShieldCheck,
+    complete: CheckCircle2,
+    failed: AlertCircle,
+  }
+  return icons[status]
 }
 
 function connectionCopy(connection: ConnectionState, host: HostSummary): string {
@@ -672,8 +685,9 @@ export default function App({ api: suppliedApi }: AppProps) {
           <div
             className={cx('task-state', `task-state--${selectedThread.status}`)}
             aria-hidden="true"
+            title={`Task state: ${taskLabel(selectedThread.status)}`}
           >
-            {selectedThread.status === 'running' ? <Icon icon={Activity} size={14} /> : <Icon icon={Circle} size={11} />}
+            <Icon icon={taskIcon(selectedThread.status)} size={14} />
             <span className="task-state__label">{taskLabel(selectedThread.status)}</span>
           </div>
           <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
@@ -1252,7 +1266,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
                   <Icon icon={block.kind === 'checkpoint' ? CheckCircle2 : Info} size={14} />
                 </span>
                 <div>
-                  <p>{block.body}</p>
+                  <TranscriptBody body={block.body} kind={block.kind} />
                   {block.detail && <span>{block.detail}</span>}
                 </div>
                 <time>{block.time}</time>
@@ -1270,7 +1284,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
                 <time>{block.time}</time>
               </header>
               <div className="message__body">
-                {block.kind === 'tool' ? <code>{block.body}</code> : <p>{block.body}</p>}
+                <TranscriptBody body={block.body} kind={block.kind} />
                 {block.detail && <p className="message__detail">{block.detail}</p>}
                 {block.receipt && (
                   <span className="message__receipt">
@@ -1343,8 +1357,11 @@ function SessionContinuity({
 
   return (
     <section className="session-continuity" aria-label="Session status">
-      <span className={cx('session-continuity__state', `session-continuity__state--${taskState}`)}>
-        <Icon icon={taskState === 'running' ? Activity : Circle} size={14} />
+      <span
+        className={cx('session-continuity__state', `session-continuity__state--${taskState}`)}
+        title={`Task state: ${taskLabel(taskState)}`}
+      >
+        <Icon icon={taskIcon(taskState)} size={14} />
       </span>
       <span className="session-continuity__body">
         <span className="eyebrow">
@@ -2627,7 +2644,7 @@ function CompanionPreview({
               {selectedThread.transcript.slice(-6).map((block) => (
                 <article key={block.id} className={cx('companion-message', `companion-message--${block.kind}`)}>
                   <header><strong>{block.author ?? (block.kind === 'checkpoint' ? 'Checkpoint' : 'Prime Agent')}</strong><time>{block.time}</time></header>
-                  <p>{block.body}</p>
+                  <TranscriptBody body={block.body} kind={block.kind} />
                   {block.detail && <small>{block.detail}</small>}
                 </article>
               ))}

@@ -709,6 +709,38 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveFocus())
   })
 
+  it('reuses the safe transcript-body renderer for Companion recent activity', async () => {
+    window.history.replaceState({}, '', '/?surface=companion')
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const selected = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
+      if (!selected) throw new Error('Expected the selected thread fixture')
+      selected.transcript.push({
+        id: 'companion-markdown-fidelity',
+        kind: 'assistant',
+        author: 'Prime Agent',
+        time: 'Now',
+        body: '### Resident result\n\n- Snapshot persisted\n- Reconnect verified\n\n```ts\nconst durable = true\n```',
+      })
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    expect(await screen.findByRole('heading', { name: 'Needs you' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Threads' }))
+    await user.click(await screen.findByRole('button', { name: /Seamless remote experience/ }))
+
+    const recentActivity = await screen.findByRole('region', { name: 'Recent activity' })
+    const sharedBody = recentActivity.querySelector('[data-transcript-body-kind="assistant"]')
+    expect(sharedBody).not.toBeNull()
+    expect(within(recentActivity).getByRole('heading', { name: 'Resident result' })).toBeVisible()
+    expect(within(recentActivity).getAllByRole('listitem')).toHaveLength(2)
+    expect(recentActivity.querySelector('pre > code.language-ts')).toHaveTextContent('const durable = true')
+  })
+
   it('surfaces an uncertain command receipt in mobile Attention', async () => {
     window.history.replaceState({}, '', '/?surface=companion')
     const api = createPreviewRendererApi()
