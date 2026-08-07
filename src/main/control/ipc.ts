@@ -105,6 +105,24 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     (input: { expectedHostId: string }) => service.runtimeModelCatalog(input.expectedHostId)
   )
   handle(
+    IPC.startRuntimeOAuth,
+    z.object({ expectedHostId: id, providerId: id }).strict(),
+    (input: { expectedHostId: string; providerId: string }) =>
+      service.startRuntimeOAuth(input.expectedHostId, input.providerId)
+  )
+  handle(
+    IPC.runtimeOAuthStatus,
+    z.object({ expectedHostId: id, sessionId: id }).strict(),
+    (input: { expectedHostId: string; sessionId: string }) =>
+      service.runtimeOAuthStatus(input.expectedHostId, input.sessionId)
+  )
+  handle(
+    IPC.cancelRuntimeOAuth,
+    z.object({ expectedHostId: id, sessionId: id }).strict(),
+    (input: { expectedHostId: string; sessionId: string }) =>
+      service.cancelRuntimeOAuth(input.expectedHostId, input.sessionId)
+  )
+  handle(
     IPC.requestSnapshot,
     z.object({ threadId: id.optional(), cursor: cursor.optional() }).strict(),
     (input: { threadId?: string; cursor?: z.infer<typeof cursor> }) => service.requestSnapshot(input)

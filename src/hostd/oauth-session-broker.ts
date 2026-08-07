@@ -70,6 +70,11 @@ export interface HostOAuthStorage {
   getAuthStatus(providerId: string): Awaitable<{ readonly configured: unknown }>;
 }
 
+/** Concrete host compositions may own helper processes in addition to both ports. */
+export interface HostOAuthComposition extends HostOAuthProviderPort, HostOAuthStorage {
+  close?(): Promise<void>;
+}
+
 export type OAuthSessionPhase =
   | "starting"
   | "awaiting_user"
@@ -193,6 +198,7 @@ interface OAuthSession {
   error?: OAuthSessionSnapshot["error"];
   contractViolated?: true;
   tombstoneExpiresAtMs?: number;
+  expirationTimer?: ReturnType<typeof setTimeout>;
   runPromise?: Promise<void>;
 }
 
@@ -218,6 +224,8 @@ export class HostOAuthSessionBroker {
   private readonly idFactory: () => string;
   private readonly sessions = new Map<string, OAuthSession>();
   private readonly providerRuns = new Map<string, string>();
+  private persistenceTail: Promise<void> = Promise.resolve();
+  private closed = false;
 
   constructor(options: HostOAuthSessionBrokerOptions) {
     this.hostId = boundedIdentifier(options.hostId, "Host identifier");
@@ -241,13 +249,26 @@ export class HostOAuthSessionBroker {
   }
 
   start(request: StartOAuthSessionRequest): OAuthSessionSnapshot {
+    this.requireOpen();
     const nowMs = this.prepare(request);
     const providerId = boundedIdentifier(request.providerId, "OAuth provider identifier");
+    const authorityId = boundedIdentifier(request.authorityId, "OAuth authority identifier");
+    const activeSessionId = this.providerRuns.get(providerId);
+    if (activeSessionId) {
+      const activeSession = this.sessions.get(activeSessionId);
+      if (
+        activeSession &&
+        activeSession.authorityId === authorityId &&
+        (activeSession.phase === "starting" ||
+          activeSession.phase === "awaiting_user" ||
+          activeSession.phase === "committing")
+      ) {
+        return snapshotOf(activeSession);
+      }
+      throw new OAuthBrokerError("OAUTH_PROVIDER_BUSY", "An OAuth session for this provider is already active");
+    }
     if (this.sessions.size >= this.maxSessions || this.providerRuns.size >= this.maxSessions) {
       throw new OAuthBrokerError("OAUTH_SESSION_LIMIT", "Too many OAuth sessions are retained");
-    }
-    if (this.providerRuns.has(providerId)) {
-      throw new OAuthBrokerError("OAUTH_PROVIDER_BUSY", "An OAuth session for this provider is already active");
     }
     let provider: HostOAuthProvider | undefined;
     try {
@@ -262,7 +283,7 @@ export class HostOAuthSessionBroker {
     const session: OAuthSession = {
       sessionId,
       providerId,
-      authorityId: boundedIdentifier(request.authorityId, "OAuth authority identifier"),
+      authorityId,
       expiresAtMs: safeTimestamp(nowMs, this.activeTtlMs),
       abortController: new AbortController(),
       issuedChallengeIds: new Set(),
@@ -270,6 +291,8 @@ export class HostOAuthSessionBroker {
     };
     this.sessions.set(sessionId, session);
     this.providerRuns.set(providerId, sessionId);
+    session.expirationTimer = setTimeout(() => this.expireSession(sessionId), this.activeTtlMs);
+    session.expirationTimer.unref?.();
     session.runPromise = this.runSession(session, provider);
     return snapshotOf(session);
   }
@@ -315,6 +338,30 @@ export class HostOAuthSessionBroker {
   /** Opportunistic cleanup for hosts that want to run maintenance explicitly. */
   sweepExpired(): void {
     this.collectGarbage(this.readNow());
+  }
+
+  /**
+   * Revokes every in-flight provider helper and waits for the concrete adapter
+   * to acknowledge the abort before host runtime ownership can be released.
+   */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    const nowMs = this.readNow();
+    const runs: Promise<void>[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.phase === "starting" || session.phase === "awaiting_user") {
+        this.finish(session, "cancelled", nowMs);
+      }
+      if (session.runPromise) runs.push(session.runPromise);
+    }
+    await Promise.allSettled(runs);
+  }
+
+  private requireOpen(): void {
+    if (this.closed) {
+      throw new OAuthBrokerError("OAUTH_REQUEST_INVALID", "OAuth session broker is unavailable");
+    }
   }
 
   private prepare(request: AuthorityBinding): number {
@@ -456,6 +503,21 @@ export class HostOAuthSessionBroker {
   }
 
   private async confirmPersistence(providerId: string, credentials: OAuthCredentials): Promise<void> {
+    const previous = this.persistenceTail;
+    let release!: () => void;
+    this.persistenceTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => undefined);
+    try {
+      await this.confirmPersistenceExclusive(providerId, credentials);
+    } finally {
+      release();
+    }
+  }
+
+  /** AuthStorage has one shared error queue, so the full confirmation chain is globally serialized. */
+  private async confirmPersistenceExclusive(providerId: string, credentials: OAuthCredentials): Promise<void> {
     let unconfirmed = false;
     try {
       await this.storage.set(providerId, { ...credentials, type: "oauth" });
@@ -500,6 +562,10 @@ export class HostOAuthSessionBroker {
     session.error = error;
     session.configured = phase === "completed" ? true : undefined;
     session.tombstoneExpiresAtMs = safeTimestamp(nowMs, this.tombstoneTtlMs);
+    if (session.expirationTimer) {
+      clearTimeout(session.expirationTimer);
+      session.expirationTimer = undefined;
+    }
     if (phase !== "completed") session.abortController.abort();
     // A provider may start a manual-input race and intentionally ignore that
     // promise when a browser callback wins. Settle it successfully so expiry or
@@ -529,6 +595,28 @@ export class HostOAuthSessionBroker {
         this.sessions.delete(sessionId);
       }
     }
+  }
+
+  private expireSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || (session.phase !== "starting" && session.phase !== "awaiting_user")) return;
+    let nowMs: number;
+    try {
+      nowMs = this.readNow();
+    } catch {
+      nowMs = session.expiresAtMs;
+    }
+    if (nowMs < session.expiresAtMs) {
+      const remainingMs = session.expiresAtMs - nowMs;
+      session.expirationTimer = setTimeout(() => this.expireSession(sessionId), remainingMs);
+      session.expirationTimer.unref?.();
+      return;
+    }
+    this.finish(session, "failed", nowMs, {
+      code: "OAUTH_SESSION_EXPIRED",
+      message: "OAuth session expired before completion",
+      retryable: true,
+    });
   }
 
   private nextSessionId(): string {

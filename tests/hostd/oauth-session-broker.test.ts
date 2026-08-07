@@ -227,7 +227,13 @@ describe("host OAuth session broker", () => {
     const broker = brokerFor(provider.provider, storagePort());
     const started = broker.start(binding({ providerId: provider.provider.id }));
 
-    expect(() => broker.start(binding({ providerId: provider.provider.id }))).toThrowError(
+    // Lost start responses are reconciled by returning the same live session
+    // for the exact host + authority + provider binding.
+    expect(broker.start(binding({ providerId: provider.provider.id }))).toEqual(started);
+    expect(() => broker.start({
+      ...binding({ providerId: provider.provider.id }),
+      authorityId: "different-authority",
+    })).toThrowError(
       expect.objectContaining({ code: "OAUTH_PROVIDER_BUSY" }),
     );
     await expect(broker.cancel(binding({ sessionId: started.sessionId }))).resolves.toMatchObject({ phase: "cancelled" });
@@ -346,6 +352,102 @@ describe("host OAuth session broker", () => {
     provider.credentials.resolve(SECRET_CREDENTIALS);
     await flushMicrotasks();
     expect(storage.set).not.toHaveBeenCalled();
+  });
+
+  it("expires and aborts an idle provider from its host-owned timer without a status poll", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = pendingProvider("openai-codex");
+      const broker = new HostOAuthSessionBroker({
+        hostId: HOST_ID,
+        providers: { getProvider: () => provider.provider },
+        storage: storagePort(),
+        activeTtlMs: 100,
+        tombstoneTtlMs: 500,
+        idFactory: sequentialIds(),
+      });
+      const started = broker.start(binding({ providerId: provider.provider.id }));
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(provider.signal?.aborted).toBe(true);
+      expect(broker.status(binding({ sessionId: started.sessionId }))).toMatchObject({
+        phase: "failed",
+        error: { code: "OAUTH_SESSION_EXPIRED" },
+      });
+      provider.credentials.resolve(SECRET_CREDENTIALS);
+      await flushMicrotasks();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("revokes in-flight work and refuses new sessions after broker close", async () => {
+    const provider = pendingProvider("openai-codex");
+    const broker = brokerFor(provider.provider, storagePort());
+    broker.start(binding({ providerId: provider.provider.id }));
+
+    const closing = broker.close();
+    expect(provider.signal?.aborted).toBe(true);
+    provider.credentials.resolve(SECRET_CREDENTIALS);
+    await closing;
+
+    expect(() => broker.start(binding({ providerId: provider.provider.id }))).toThrowError(
+      expect.objectContaining({ code: "OAUTH_REQUEST_INVALID" }),
+    );
+  });
+
+  it("globally serializes the complete AuthStorage confirmation chain", async () => {
+    const firstSet = deferred<void>();
+    const calls: string[] = [];
+    const configured = new Set<string>();
+    const storage: HostOAuthStorage = {
+      set: async (providerId) => {
+        calls.push(`set:${providerId}`);
+        if (providerId === "provider-a") await firstSet.promise;
+        configured.add(providerId);
+      },
+      drainErrors: () => {
+        calls.push("drainErrors");
+        return [];
+      },
+      reload: () => {
+        calls.push("reload");
+      },
+      getAuthStatus: (providerId) => {
+        calls.push(`getAuthStatus:${providerId}`);
+        return { configured: configured.has(providerId) };
+      },
+    };
+    const providers = new Map<string, HostOAuthProvider>([
+      ["provider-a", { id: "provider-a", name: "A", login: async () => SECRET_CREDENTIALS }],
+      ["provider-b", { id: "provider-b", name: "B", login: async () => SECRET_CREDENTIALS }],
+    ]);
+    const broker = new HostOAuthSessionBroker({
+      hostId: HOST_ID,
+      providers: { getProvider: (providerId) => providers.get(providerId) },
+      storage,
+      idFactory: sequentialIds(),
+    });
+    const first = broker.start(binding({ providerId: "provider-a" }));
+    await waitFor(() => calls[0] === "set:provider-a");
+    const second = broker.start(binding({ providerId: "provider-b" }));
+    await flushMicrotasks();
+    expect(calls).toEqual(["set:provider-a"]);
+
+    firstSet.resolve();
+    await waitFor(() => broker.status(binding({ sessionId: first.sessionId })).phase === "completed");
+    await waitFor(() => broker.status(binding({ sessionId: second.sessionId })).phase === "completed");
+    expect(calls).toEqual([
+      "set:provider-a",
+      "drainErrors",
+      "reload",
+      "getAuthStatus:provider-a",
+      "set:provider-b",
+      "drainErrors",
+      "reload",
+      "getAuthStatus:provider-b",
+    ]);
   });
 });
 

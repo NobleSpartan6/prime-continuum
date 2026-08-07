@@ -25,7 +25,12 @@ import {
   type HostOwnershipLease,
   type HostOwnershipLeaseController,
 } from "./ownership-lease";
-import { TRUSTED_USER_SESSION, type HostService, type HostSessionContext } from "./service";
+import {
+  SSH_BRIDGE_SESSION,
+  TRUSTED_USER_SESSION,
+  type HostService,
+  type HostSessionContext,
+} from "./service";
 
 export type { HostOwnershipLease } from "./ownership-lease";
 
@@ -33,6 +38,10 @@ export const MAX_HOST_CONNECTIONS = 32;
 export const CONNECTION_IDLE_TIMEOUT_MS = 5 * 60_000;
 export const CONNECTION_INITIALIZATION_TIMEOUT_MS = 10_000;
 export const UNIX_ENDPOINT_OWNERSHIP_SUFFIX = ".owner";
+export const SSH_BRIDGE_SESSION_PREFACE = Object.freeze({
+  primeContinuimSession: 1,
+  transport: "ssh_bridge",
+} as const);
 
 const UNIX_OWNERSHIP_ACQUISITION_WAIT_MS = 10_250;
 const UNIX_OWNERSHIP_RETRY_DELAY_MS = 25;
@@ -305,15 +314,26 @@ export async function runFramedSession(
   context: HostSessionContext,
   assertRequestOwnership?: () => Promise<void>,
 ): Promise<void> {
+  let sessionContext = context;
+  let firstFrame = true;
   try {
     for await (const request of readJsonFrames(readable, {
       maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
       maxFramesPerChunk: 256,
     })) {
+      if (firstFrame && isSshBridgeSessionPreface(request)) {
+        if (context.transport !== "trusted_user") {
+          throw new FrameCodecError("INVALID_PAYLOAD", "Only a trusted local socket can establish an SSH bridge session");
+        }
+        sessionContext = SSH_BRIDGE_SESSION;
+        firstFrame = false;
+        continue;
+      }
+      firstFrame = false;
       // There is no await between the completed physical ownership proof and
       // HostService admission, so shutdown/loss cannot interleave this edge.
       await assertRequestOwnership?.();
-      const response = await service.handle(request, context);
+      const response = await service.handle(request, sessionContext);
       if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
         await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
       }
@@ -548,8 +568,16 @@ export async function bridgeStdioToLocalSocket(
   writable: Writable,
 ): Promise<void> {
   const socket = await connect(endpoint);
-  readable.pipe(socket);
-  socket.pipe(writable, { end: false });
+  try {
+    // Injected before remote bytes are piped, so the persistent service can
+    // structurally distinguish the official SSH bridge from a local desktop.
+    await writeJsonFrame(socket, SSH_BRIDGE_SESSION_PREFACE, DEFAULT_MAX_FRAME_BYTES);
+    readable.pipe(socket);
+    socket.pipe(writable, { end: false });
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
   await new Promise<void>((resolvePromise, reject) => {
     let settled = false;
     const finish = (error?: Error): void => {
@@ -567,6 +595,13 @@ export async function bridgeStdioToLocalSocket(
     readable.once("error", finish);
     writable.once("error", finish);
   });
+}
+
+function isSshBridgeSessionPreface(value: unknown): boolean {
+  return isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    value.primeContinuimSession === 1 &&
+    value.transport === "ssh_bridge";
 }
 
 export function validateLocalEndpoint(endpoint: string, dataDir: string): string {

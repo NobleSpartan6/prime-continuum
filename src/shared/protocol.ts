@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  CODEX_SUBSCRIPTION_PROVIDER_ID,
+  isPinnedCodexAuthorizationUrl,
+} from "./codex-oauth";
 
 /**
  * Public host protocol version. This is intentionally distinct from Prime
@@ -45,6 +49,7 @@ export const CapabilitySchema = z
 
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
+export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
@@ -355,7 +360,7 @@ export const RuntimeSessionSummarySchema = z.object({
   activeSessionId: IdSchema.optional(),
   sessionId: IdSchema.optional(),
   sessionName: z.string().min(1).max(255).optional(),
-  model: z.string().min(1).max(255).optional(),
+  model: z.string().min(1).max(641).optional(),
   thinkingLevel: z.string().min(1).max(64).optional(),
   serviceTier: z.string().min(1).max(64).optional(),
   isStreaming: z.boolean(),
@@ -614,6 +619,104 @@ export const RuntimeModelCatalogSnapshotSchema = z
   });
 export type RuntimeModelCatalogSnapshot = z.infer<typeof RuntimeModelCatalogSnapshotSchema>;
 
+const RuntimeOAuthAuthorizationUrlSchema = z
+  .string()
+  .url()
+  .max(8_192)
+  .refine((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.username === "" && url.password === "";
+    } catch {
+      return false;
+    }
+  }, "OAuth authorization URL must use HTTPS without embedded credentials");
+
+export const RuntimeOAuthChallengeSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      id: IdSchema,
+      kind: z.literal("text"),
+      message: z.string().min(1).max(2_048).regex(/^[^\0\r\n]+$/),
+      placeholder: z.string().max(255).regex(/^[^\0\r\n]*$/).optional(),
+      allowEmpty: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      id: IdSchema,
+      kind: z.literal("manual_redirect"),
+      message: z.string().min(1).max(2_048).regex(/^[^\0\r\n]+$/),
+      allowEmpty: z.literal(false),
+    })
+    .strict(),
+  z
+    .object({
+      id: IdSchema,
+      kind: z.literal("select"),
+      message: z.string().min(1).max(2_048).regex(/^[^\0\r\n]+$/),
+      options: z
+        .array(
+          z
+            .object({
+              id: IdSchema,
+              label: z.string().min(1).max(255).regex(/^[^\0\r\n]+$/),
+            })
+            .strict(),
+        )
+        .min(1)
+        .max(64),
+    })
+    .strict(),
+]);
+export type RuntimeOAuthChallenge = z.infer<typeof RuntimeOAuthChallengeSchema>;
+
+export const RuntimeOAuthSessionSnapshotSchema = z
+  .object({
+    sessionId: IdSchema,
+    providerId: IdSchema,
+    phase: z.enum(["starting", "awaiting_user", "committing", "completed", "cancelled", "failed"]),
+    expiresAt: IsoDateTimeSchema,
+    authorization: z
+      .object({
+        url: RuntimeOAuthAuthorizationUrlSchema,
+        instructions: z.string().min(1).max(2_048).regex(/^[^\0\r\n]+$/).optional(),
+      })
+      .strict()
+      .optional(),
+    challenge: RuntimeOAuthChallengeSchema.optional(),
+    progress: z.string().min(1).max(1_024).regex(/^[^\0\r\n]+$/).optional(),
+    configured: z.literal(true).optional(),
+    error: z
+      .object({
+        code: z.enum([
+          "OAUTH_SESSION_EXPIRED",
+          "OAUTH_PROVIDER_CONTRACT_INVALID",
+          "OAUTH_PROVIDER_FAILED",
+          "OAUTH_PERSISTENCE_UNCONFIRMED",
+        ]),
+        message: z.string().min(1).max(2_048).regex(/^[^\0\r\n]+$/),
+        retryable: z.boolean(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (
+      snapshot.providerId === CODEX_SUBSCRIPTION_PROVIDER_ID &&
+      snapshot.authorization &&
+      !isPinnedCodexAuthorizationUrl(snapshot.authorization.url)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["authorization", "url"],
+        message: "Codex authorization URL does not match the pinned Prime Agent provider contract",
+      });
+    }
+  });
+export type RuntimeOAuthSessionSnapshot = z.infer<typeof RuntimeOAuthSessionSnapshotSchema>;
+
 export const SnapshotTransferBeginSchema = z
   .object({
     kind: z.literal("snapshot.begin"),
@@ -693,6 +796,7 @@ export const RemoteDeviceScopeSchema = z.enum([
   "thread.steer",
   "thread.abort",
   "thread.start",
+  "model.select",
   "approval.resolve",
   "run_location.change",
   "host.admin",
@@ -702,7 +806,7 @@ export type RemoteDeviceScope = z.infer<typeof RemoteDeviceScopeSchema>;
 export const RemoteDeviceScopesSchema = z
   .array(RemoteDeviceScopeSchema)
   .min(1)
-  .max(8)
+  .max(9)
   .refine((scopes) => new Set(scopes).size === scopes.length, "Device scopes must be unique");
 
 /** Public identity metadata only. The secretRef and private key stay inside hostd. */
@@ -777,6 +881,13 @@ export const CommandPayloadSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("steer"), ...TextCommandFields }),
   z.object({ kind: z.literal("follow_up"), ...TextCommandFields }),
   z.object({ kind: z.literal("abort"), reason: z.string().max(1_024).optional() }),
+  z
+    .object({
+      kind: z.literal("model.select"),
+      providerId: z.string().min(1).max(128).regex(/^[^\0\r\n]+$/),
+      modelId: z.string().min(1).max(512).regex(/^[^\0\r\n]+$/),
+    })
+    .strict(),
   z.object({
     kind: z.literal("approval.resolve"),
     approvalId: IdSchema,
@@ -786,16 +897,26 @@ export const CommandPayloadSchema = z.discriminatedUnion("kind", [
 ]);
 export type CommandPayload = z.infer<typeof CommandPayloadSchema>;
 
-export const CommandEnvelopeSchema = z.object({
-  protocolVersion: z.literal(PROTOCOL_VERSION),
-  deviceId: IdSchema,
-  commandId: IdSchema,
-  expectedHostId: IdSchema,
-  threadId: IdSchema,
-  issuedAt: IsoDateTimeSchema,
-  expectedExecutionGenerationId: IdSchema.optional(),
-  command: CommandPayloadSchema,
-});
+export const CommandEnvelopeSchema = z
+  .object({
+    protocolVersion: z.literal(PROTOCOL_VERSION),
+    deviceId: IdSchema,
+    commandId: IdSchema,
+    expectedHostId: IdSchema,
+    threadId: IdSchema,
+    issuedAt: IsoDateTimeSchema,
+    expectedExecutionGenerationId: IdSchema.optional(),
+    command: CommandPayloadSchema,
+  })
+  .superRefine((envelope, context) => {
+    if (envelope.command.kind === "model.select" && envelope.expectedExecutionGenerationId === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedExecutionGenerationId"],
+        message: "Model selection requires an exact execution generation",
+      });
+    }
+  });
 export type CommandEnvelope = z.infer<typeof CommandEnvelopeSchema>;
 
 export const CommandReceiptStatusSchema = z.enum([
@@ -1112,6 +1233,23 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     ...RequestBase,
+    method: z.literal("oauth.session.start"),
+    payload: z
+      .object({ expectedHostId: IdSchema, authorityId: IdSchema, providerId: IdSchema })
+      .strict(),
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("oauth.session.status"),
+    payload: z.object({ expectedHostId: IdSchema, authorityId: IdSchema, sessionId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("oauth.session.cancel"),
+    payload: z.object({ expectedHostId: IdSchema, authorityId: IdSchema, sessionId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("catalog.snapshot"),
     payload: z.object({ snapshotTransfer: SnapshotTransferPreferenceSchema.optional() }),
   }),
@@ -1186,6 +1324,9 @@ const SuccessBase = {
 export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("health.get"), result: HealthSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("runtime.model_catalog"), result: RuntimeModelCatalogSnapshotSchema }),
+  z.object({ ...SuccessBase, method: z.literal("oauth.session.start"), result: RuntimeOAuthSessionSnapshotSchema }),
+  z.object({ ...SuccessBase, method: z.literal("oauth.session.status"), result: RuntimeOAuthSessionSnapshotSchema }),
+  z.object({ ...SuccessBase, method: z.literal("oauth.session.cancel"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("catalog.snapshot"), result: CatalogProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("thread.snapshot"), result: ThreadProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
@@ -1201,6 +1342,9 @@ export const HostIpcErrorResponseSchema = z.object({
   method: z.enum([
     "health.get",
     "runtime.model_catalog",
+    "oauth.session.start",
+    "oauth.session.status",
+    "oauth.session.cancel",
     "catalog.snapshot",
     "thread.snapshot",
     "command.submit",

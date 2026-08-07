@@ -215,6 +215,55 @@ const CommandJournalRecordSchema = z.object({
   envelope: CommandEnvelopeSchema.optional(),
 });
 
+const ModelSelectionAttemptSchema = z
+  .object({
+    version: z.literal(1),
+    command: CommandEnvelopeSchema,
+    binding: ResidentSessionBindingSchema,
+    state: z.enum(["admitted", "dispatching"]),
+    admittedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    dispatchStartedAt: IsoDateTimeSchema.optional(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    if (attempt.command.command.kind !== "model.select") {
+      context.addIssue({ code: "custom", path: ["command", "command"], message: "Attempt is not a model selection" });
+    }
+    if (
+      attempt.command.threadId !== attempt.binding.threadId ||
+      attempt.command.expectedExecutionGenerationId !== attempt.binding.executionGenerationId
+    ) {
+      context.addIssue({ code: "custom", message: "Model selection attempt does not match its resident binding" });
+    }
+    if ((attempt.state === "dispatching") !== (attempt.dispatchStartedAt !== undefined)) {
+      context.addIssue({ code: "custom", path: ["dispatchStartedAt"], message: "Dispatch time must match attempt state" });
+    }
+  });
+type ModelSelectionAttempt = z.infer<typeof ModelSelectionAttemptSchema>;
+
+const ModelSelectionIdentityRecordSchema = z
+  .object({
+    version: z.literal(1),
+    command: CommandEnvelopeSchema,
+    recordedAt: IsoDateTimeSchema,
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (record.command.command.kind !== "model.select") {
+      context.addIssue({
+        code: "custom",
+        path: ["command", "command"],
+        message: "Identity record is not a model selection",
+      });
+    }
+  });
+type ModelSelectionIdentityRecord = z.infer<typeof ModelSelectionIdentityRecordSchema>;
+
+export const MAX_PENDING_MODEL_SELECTION_ATTEMPTS = 10_000;
+export const MAX_MODEL_SELECTION_ATTEMPT_BYTES = 1024 * 1024;
+export const MAX_MODEL_SELECTION_IDENTITY_BYTES = 1024 * 1024;
+
 const EventJournalRecordSchema = z.object({
   version: z.literal(1),
   eventId: IdSchema,
@@ -237,6 +286,8 @@ const AdmissionTransactionSchema = z
     threadsFile: ThreadFileSchema.optional(),
     journalRecords: z.array(CommandJournalRecordSchema).min(2).max(3),
     eventRecord: EventJournalRecordSchema.optional(),
+    modelSelectionIdentity: ModelSelectionIdentityRecordSchema.optional(),
+    modelSelectionAttempt: ModelSelectionAttemptSchema.optional(),
   })
   .superRefine((transaction, context) => {
     if ((transaction.snapshot === undefined) !== (transaction.threadsFile === undefined)) {
@@ -247,6 +298,27 @@ const AdmissionTransactionSchema = z
     }
     if (transaction.snapshot && transaction.snapshot.thread.threadId !== transaction.command.threadId) {
       context.addIssue({ code: "custom", message: "Admission snapshot thread does not match its command" });
+    }
+    const requiresModelAttempt =
+      transaction.command.command.kind === "model.select" && transaction.receipt.status === "admitted";
+    const requiresModelIdentity = transaction.command.command.kind === "model.select";
+    if (requiresModelIdentity !== (transaction.modelSelectionIdentity !== undefined)) {
+      context.addIssue({ code: "custom", message: "Every model selection must bind its durable command identity" });
+    }
+    if (requiresModelAttempt !== (transaction.modelSelectionAttempt !== undefined)) {
+      context.addIssue({ code: "custom", message: "Admitted model selection must materialize one private attempt" });
+    }
+    if (
+      transaction.modelSelectionIdentity &&
+      !isDeepStrictEqual(transaction.modelSelectionIdentity.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Model selection identity does not match its admission command" });
+    }
+    if (
+      transaction.modelSelectionAttempt &&
+      !isDeepStrictEqual(transaction.modelSelectionAttempt.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Model selection attempt does not match its admission command" });
     }
   });
 type AdmissionTransaction = z.infer<typeof AdmissionTransactionSchema>;
@@ -316,6 +388,8 @@ export type AdmissionFaultPoint =
   | "after_prepare"
   | "after_snapshot"
   | "after_threads"
+  | "after_model_selection_identity"
+  | "after_model_selection_attempt"
   | "after_receipt"
   | "after_journal"
   | "after_event";
@@ -394,6 +468,8 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.staging),
         ensurePrivateDirectory(this.paths.transactions),
         ensurePrivateDirectory(this.paths.residentProjectionTransactions),
+        ensurePrivateDirectory(this.modelSelectionIdentitiesDirectory()),
+        ensurePrivateDirectory(this.modelSelectionAttemptsDirectory()),
         ensurePrivateDirectory(this.paths.receipts),
         ensurePrivateDirectory(this.paths.handoffs),
         ensurePrivateDirectory(this.paths.security),
@@ -462,6 +538,11 @@ export class HostStore {
           this.residentSubsystemFault = residentSubsystemUnavailable(error);
         }
       }
+
+      // An admitted or dispatching model mutation is deliberately never
+      // replayed by a new hostd/Prime client identity. Startup converts the
+      // incomplete receipt to `uncertain` before serving reconciliation.
+      await this.recoverInterruptedModelSelectionsUnlocked();
 
       this.initialized = true;
       if (options.seed !== true) return { seeded: false };
@@ -951,6 +1032,10 @@ export class HostStore {
     const command = CommandEnvelopeSchema.parse(commandValue);
     return this.exclusive(async () => {
       this.assertInitialized();
+      const durableModelIdentity = await this.readModelSelectionIdentityUnlocked(command);
+      if (durableModelIdentity && !isDeepStrictEqual(durableModelIdentity.command, command)) {
+        throw new HostStoreError("COMMAND_ID_REUSED", "This command identity is already bound to another payload");
+      }
       const pending = await this.readAdmissionTransactionUnlocked(command);
       if (pending) {
         if (!isDeepStrictEqual(pending.command, command)) {
@@ -967,7 +1052,21 @@ export class HostStore {
         return { receipt: pending.receipt, duplicate: true };
       }
       const existing = await this.readReceiptUnlocked(command);
-      if (existing) return { receipt: existing, duplicate: true };
+      if (existing) {
+        if (command.command.kind === "model.select" && !durableModelIdentity) {
+          throw new HostStoreError(
+            "COMMAND_ID_REUSED",
+            "This command identity already has a receipt without the exact model-selection envelope",
+          );
+        }
+        return { receipt: existing, duplicate: true };
+      }
+      if (durableModelIdentity) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_IDENTITY_ORPHANED",
+          "The durable model-selection identity has no matching transaction or receipt",
+        );
+      }
       const transaction = await this.prepareAdmissionTransactionUnlocked(
         command,
         canDispatchLive,
@@ -995,6 +1094,12 @@ export class HostStore {
   ): Promise<CommandReceipt> {
     return this.exclusive(async () => {
       this.assertInitialized();
+      if (await this.readModelSelectionAttemptUnlocked(identity)) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_RECEIPT_PATH_REQUIRED",
+          "Resident model selection must use its non-replayable receipt state machine",
+        );
+      }
       const current = await this.readReceiptUnlocked(identity);
       if (!current) throw new HostStoreError("COMMAND_NOT_FOUND", "No receipt exists for this command identity");
       const receipt = CommandReceiptSchema.parse({
@@ -1012,6 +1117,138 @@ export class HostStore {
         receipt.status,
         receipt.message,
       );
+      return receipt;
+    });
+  }
+
+  /**
+   * Persist the dispatch boundary before invoking Prime Agent. The returned
+   * binding is the exact private authority that a resident gateway must match.
+   */
+  async beginModelSelectionDispatch(commandValue: CommandEnvelope): Promise<ResidentSessionBinding> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "model.select") {
+      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This dispatch path accepts only model selection");
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readModelSelectionAttemptUnlocked(command);
+      if (!attempt || !isDeepStrictEqual(attempt.command, command)) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_MISSING",
+          "No exact durable model-selection admission exists for this command",
+        );
+      }
+      const receipt = await this.readReceiptUnlocked(command);
+      if (!receipt || receipt.status !== "admitted" || attempt.state !== "admitted") {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ALREADY_DISPATCHED",
+          "This model-selection command cannot cross the dispatch boundary again",
+        );
+      }
+
+      const binding = await this.resolveModelSelectionBindingUnlocked(command);
+      if (!isDeepStrictEqual(binding, attempt.binding)) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_CONFLICT",
+          "The resident session binding changed after model-selection admission",
+        );
+      }
+
+      const dispatchStartedAt = now();
+      const dispatching = ModelSelectionAttemptSchema.parse({
+        ...attempt,
+        state: "dispatching",
+        updatedAt: dispatchStartedAt,
+        dispatchStartedAt,
+      });
+      const running = CommandReceiptSchema.parse({
+        ...receipt,
+        status: "running",
+        queuePosition: undefined,
+        message: "Selecting the model on the resident Prime Agent session",
+        error: undefined,
+        updatedAt: dispatchStartedAt,
+      });
+      try {
+        // If hostd stops after this write, startup sees an interrupted mutation
+        // and resolves it to uncertain rather than invoking setModel again.
+        await atomicWriteJson(
+          this.modelSelectionAttemptPath(command),
+          dispatching,
+          MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+        );
+        await atomicWriteJson(this.receiptPath(command), running);
+        await this.appendModelSelectionJournalUnlocked(
+          command,
+          "running",
+          running.updatedAt,
+          running.message,
+        );
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return validateResidentSessionBinding(binding);
+    });
+  }
+
+  /** Finalize a model mutation and retire its non-replayable dispatch marker. */
+  async finalizeModelSelectionDispatch(
+    commandValue: CommandEnvelope,
+    update: Pick<CommandReceipt, "status"> & Partial<Pick<CommandReceipt, "message" | "error">>,
+  ): Promise<CommandReceipt> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "model.select") {
+      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This receipt path accepts only model selection");
+    }
+    if (update.status !== "completed" && update.status !== "failed" && update.status !== "uncertain") {
+      throw new HostStoreError(
+        "MODEL_SELECTION_STATUS_INVALID",
+        "Model selection may finish only as completed, failed, or uncertain",
+      );
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readModelSelectionAttemptUnlocked(command);
+      if (!attempt || !isDeepStrictEqual(attempt.command, command)) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_MISSING",
+          "No exact durable model-selection attempt exists for this command",
+        );
+      }
+      const current = await this.readReceiptUnlocked(command);
+      if (!current || (current.status !== "admitted" && current.status !== "running")) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ALREADY_FINALIZED",
+          "The model-selection receipt is already terminal",
+        );
+      }
+      if (update.status !== "failed" && attempt.state !== "dispatching") {
+        throw new HostStoreError(
+          "MODEL_SELECTION_NOT_DISPATCHED",
+          "Only a dispatched model selection can finish as completed or uncertain",
+        );
+      }
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        ...update,
+        queuePosition: undefined,
+        updatedAt: now(),
+      });
+      try {
+        await atomicWriteJson(this.receiptPath(command), receipt);
+        await this.appendModelSelectionJournalUnlocked(
+          command,
+          receipt.status,
+          receipt.updatedAt,
+          receipt.message,
+        );
+        await rm(this.modelSelectionAttemptPath(command), { force: true });
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
       return receipt;
     });
   }
@@ -1440,6 +1677,7 @@ export class HostStore {
     const thread = threadIndex >= 0 ? threads[threadIndex] : undefined;
     let rejection: StructuredError | undefined;
     let sourceSnapshot: ThreadProjectionSnapshot | undefined;
+    let modelSelectionBinding: ResidentSessionBinding | undefined;
 
     if (!thread) {
       rejection = structured("THREAD_NOT_FOUND", `Thread ${command.threadId} does not exist`);
@@ -1454,9 +1692,20 @@ export class HostStore {
     } else {
       sourceSnapshot = await this.readSnapshotUnlocked(command.threadId);
       rejection = dispatcherUnavailable ?? validateCommandAgainstState(command, sourceSnapshot, canDispatchLive);
+      if (!rejection && command.command.kind === "model.select") {
+        try {
+          await this.assertModelSelectionAttemptCapacityUnlocked();
+          modelSelectionBinding = await this.resolveModelSelectionBindingUnlocked(command);
+        } catch (error) {
+          rejection = error instanceof HostStoreError
+            ? error.toStructuredError()
+            : structured("RESIDENT_BINDING_UNAVAILABLE", "Resident session authority is unavailable", true);
+        }
+      }
       if (
         !rejection &&
         command.command.kind !== "abort" &&
+        command.command.kind !== "model.select" &&
         sourceSnapshot.queueState.pendingCommandIds.length >= 1_000
       ) {
         rejection = structured("COMMAND_QUEUE_FULL", "The host command queue has reached its bounded limit", true);
@@ -1466,10 +1715,20 @@ export class HostStore {
     const initialStatus: CommandReceiptStatus = rejection ? "rejected" : "admitted";
     const initialMessage =
       rejection?.message ??
-      (command.command.kind === "abort" ? "Abort admitted for live dispatch" : "Queued durably on host");
+      (command.command.kind === "abort"
+        ? "Abort admitted for live dispatch"
+        : command.command.kind === "model.select"
+          ? "Model selection admitted for live dispatch"
+          : "Queued durably on host");
     let snapshot: ThreadProjectionSnapshot | undefined;
     let threadsFile: z.infer<typeof ThreadFileSchema> | undefined;
-    if (!rejection && sourceSnapshot && thread && command.command.kind !== "abort") {
+    if (
+      !rejection &&
+      sourceSnapshot &&
+      thread &&
+      command.command.kind !== "abort" &&
+      command.command.kind !== "model.select"
+    ) {
       snapshot = applyCommand(sourceSnapshot, command, canDispatchLive);
       const updatedThreads = [...threads];
       updatedThreads[threadIndex] = snapshot.thread;
@@ -1488,7 +1747,9 @@ export class HostStore {
       executionGenerationId:
         thread?.currentLocation.executionGenerationId ?? command.expectedExecutionGenerationId ?? "unknown-generation",
       queuePosition:
-        initialStatus === "admitted" && command.command.kind !== "abort"
+        initialStatus === "admitted" &&
+        command.command.kind !== "abort" &&
+        command.command.kind !== "model.select"
           ? (sourceSnapshot?.queueState.pendingCommandIds.length ?? 0) + 1
           : undefined,
       message: initialMessage,
@@ -1539,6 +1800,29 @@ export class HostStore {
       threadsFile,
       journalRecords,
       eventRecord,
+      ...(command.command.kind === "model.select"
+        ? {
+            modelSelectionIdentity: ModelSelectionIdentityRecordSchema.parse({
+              version: 1,
+              command,
+              recordedAt: preparedAt,
+            }),
+          }
+        : {}),
+      ...(initialStatus === "admitted" &&
+        command.command.kind === "model.select" &&
+        modelSelectionBinding
+          ? {
+              modelSelectionAttempt: ModelSelectionAttemptSchema.parse({
+                version: 1,
+                command,
+                binding: modelSelectionBinding,
+                state: "admitted",
+                admittedAt: preparedAt,
+                updatedAt: preparedAt,
+              }),
+            }
+          : {}),
     });
   }
 
@@ -1552,6 +1836,50 @@ export class HostStore {
 
       await atomicWriteJson(this.paths.threads, transaction.threadsFile);
       if (injectFaults) await this.injectAdmissionFault("after_threads", transaction.transactionId);
+    }
+
+    if (transaction.modelSelectionIdentity) {
+      const identityPath = this.modelSelectionIdentityPath(transaction.command);
+      const existingIdentity = await readJsonFile(identityPath, ModelSelectionIdentityRecordSchema, {
+        optional: true,
+        maxBytes: MAX_MODEL_SELECTION_IDENTITY_BYTES,
+      });
+      if (existingIdentity && !isDeepStrictEqual(existingIdentity, transaction.modelSelectionIdentity)) {
+        throw new HostStoreError(
+          "COMMAND_ID_REUSED",
+          `Admission transaction ${transaction.transactionId} conflicts with its durable model-selection identity`,
+        );
+      }
+      await atomicWriteJson(
+        identityPath,
+        transaction.modelSelectionIdentity,
+        MAX_MODEL_SELECTION_IDENTITY_BYTES,
+      );
+      if (injectFaults) {
+        await this.injectAdmissionFault("after_model_selection_identity", transaction.transactionId);
+      }
+    }
+
+    if (transaction.modelSelectionAttempt) {
+      const attemptPath = this.modelSelectionAttemptPath(transaction.command);
+      const existingAttempt = await readJsonFile(attemptPath, ModelSelectionAttemptSchema, {
+        optional: true,
+        maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+      });
+      if (existingAttempt && !isDeepStrictEqual(existingAttempt, transaction.modelSelectionAttempt)) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_CONFLICT",
+          `Admission transaction ${transaction.transactionId} conflicts with its durable model-selection attempt`,
+        );
+      }
+      await atomicWriteJson(
+        attemptPath,
+        transaction.modelSelectionAttempt,
+        MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+      );
+      if (injectFaults) {
+        await this.injectAdmissionFault("after_model_selection_attempt", transaction.transactionId);
+      }
     }
 
     const existingReceipt = await this.readReceiptUnlocked(transaction.command);
@@ -1619,12 +1947,171 @@ export class HostStore {
     }
   }
 
+  private async recoverInterruptedModelSelectionsUnlocked(): Promise<void> {
+    const directory = this.modelSelectionAttemptsDirectory();
+    const entries = await readdir(directory, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_MODEL_SELECTION_ATTEMPTS) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_ATTEMPT_LIMIT",
+        `Model-selection attempt directory exceeds ${MAX_PENDING_MODEL_SELECTION_ATTEMPTS} entries`,
+      );
+    }
+
+    const attemptNames: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt directory contains a non-file entry",
+        );
+      }
+      if (entry.name.endsWith(".json")) {
+        attemptNames.push(entry.name);
+        continue;
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        await rm(join(directory, entry.name), { force: true });
+        continue;
+      }
+      throw new HostStoreError(
+        "MODEL_SELECTION_ATTEMPT_INVALID",
+        `Unexpected model-selection attempt file ${entry.name}`,
+      );
+    }
+
+    attemptNames.sort();
+    for (const name of attemptNames) {
+      const path = join(directory, name);
+      const attempt = await readJsonFile(path, ModelSelectionAttemptSchema, {
+        maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+      });
+      if (!attempt) {
+        throw new HostStoreError("MODEL_SELECTION_ATTEMPT_INVALID", `Missing model-selection attempt ${name}`);
+      }
+      const expectedName = `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`;
+      if (name !== expectedName) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt filename does not match its command identity",
+        );
+      }
+      const current = await this.readReceiptUnlocked(attempt.command);
+      if (!current) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt has no durable command receipt",
+        );
+      }
+      if (
+        current.deviceId !== attempt.command.deviceId ||
+        current.commandId !== attempt.command.commandId ||
+        current.threadId !== attempt.command.threadId ||
+        current.executionGenerationId !== attempt.binding.executionGenerationId
+      ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt conflicts with its durable receipt",
+        );
+      }
+      if (
+        (current.status === "running" && attempt.state !== "dispatching") ||
+        ((current.status === "completed" || current.status === "uncertain") &&
+          attempt.state !== "dispatching") ||
+        current.status === "received" ||
+        current.status === "rejected" ||
+        current.status === "cancelled"
+      ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt state conflicts with its receipt lifecycle",
+        );
+      }
+      if (
+        current.status === "completed" ||
+        current.status === "failed" ||
+        current.status === "uncertain"
+      ) {
+        await this.appendModelSelectionJournalUnlocked(
+          attempt.command,
+          current.status,
+          current.updatedAt,
+          current.message,
+        );
+        await rm(path, { force: true });
+        continue;
+      }
+
+      const recovered = CommandReceiptSchema.parse({
+        ...current,
+        status: "uncertain",
+        queuePosition: undefined,
+        message: "Host service restarted before model selection could be authoritatively reconciled",
+        error: {
+          code: "MODEL_SELECTION_RESTART_UNCERTAIN",
+          message: "Model selection was not replayed after the host service or Prime client identity changed",
+          retryable: false,
+        },
+        updatedAt: now(),
+      });
+      await atomicWriteJson(this.receiptPath(attempt.command), recovered);
+      await this.appendModelSelectionJournalUnlocked(
+        attempt.command,
+        "uncertain",
+        recovered.updatedAt,
+        recovered.message,
+      );
+      await rm(path, { force: true });
+    }
+  }
+
+  private async assertModelSelectionAttemptCapacityUnlocked(): Promise<void> {
+    const entries = await readdir(this.modelSelectionAttemptsDirectory(), { withFileTypes: true });
+    const attempts = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+    if (attempts.length >= MAX_PENDING_MODEL_SELECTION_ATTEMPTS) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_ATTEMPT_LIMIT",
+        "The host is already tracking the maximum number of non-replayable model selections",
+        true,
+      );
+    }
+    if (
+      entries.some(
+        (entry) =>
+          !entry.isFile() ||
+          (!entry.name.endsWith(".json") && !entry.name.includes(".json.tmp-")),
+      )
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_ATTEMPT_INVALID",
+        "Model-selection attempt storage contains an unexpected entry",
+      );
+    }
+  }
+
   private async readAdmissionTransactionUnlocked(
     command: CommandIdentity,
   ): Promise<AdmissionTransaction | undefined> {
     return readJsonFile(this.admissionTransactionPath(command), AdmissionTransactionSchema, {
       optional: true,
       maxBytes: MAX_ADMISSION_TRANSACTION_BYTES,
+    });
+  }
+
+  private async readModelSelectionAttemptUnlocked(
+    command: CommandIdentity,
+  ): Promise<ModelSelectionAttempt | undefined> {
+    return readJsonFile(this.modelSelectionAttemptPath(command), ModelSelectionAttemptSchema, {
+      optional: true,
+      maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+    });
+  }
+
+  private async readModelSelectionIdentityUnlocked(
+    command: CommandIdentity,
+  ): Promise<ModelSelectionIdentityRecord | undefined> {
+    return readJsonFile(this.modelSelectionIdentityPath(command), ModelSelectionIdentityRecordSchema, {
+      optional: true,
+      maxBytes: MAX_MODEL_SELECTION_IDENTITY_BYTES,
     });
   }
 
@@ -1760,6 +2247,53 @@ export class HostStore {
       threadId: thread.threadId,
       executionGenerationId: location.executionGenerationId,
     });
+  }
+
+  private async resolveModelSelectionBindingUnlocked(command: CommandEnvelope): Promise<ResidentSessionBinding> {
+    if (command.command.kind !== "model.select" || command.expectedExecutionGenerationId === undefined) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_AUTHORITY_INVALID",
+        "Model selection requires an exact thread execution generation",
+      );
+    }
+    this.assertResidentSubsystemAvailable();
+    const host = await this.readHostUnlocked();
+    if (command.expectedHostId !== host.hostId) {
+      throw new HostStoreError(
+        "HOST_AUTHORITY_MISMATCH",
+        "The model selection was composed for a different host authority",
+      );
+    }
+    const scope = await this.currentWorkspaceScopeUnlocked(
+      command.threadId,
+      command.expectedExecutionGenerationId,
+    );
+    const snapshot = await this.readSnapshotUnlocked(command.threadId);
+    if (
+      snapshot.thread.threadId !== scope.threadId ||
+      snapshot.thread.currentLocation.hostId !== scope.hostId ||
+      snapshot.thread.currentLocation.projectId !== scope.projectId ||
+      snapshot.thread.currentLocation.workspaceId !== scope.workspaceId ||
+      snapshot.thread.currentLocation.executionGenerationId !== scope.executionGenerationId
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_AUTHORITY_INVALID",
+        "The authoritative thread snapshot does not match model-selection admission",
+      );
+    }
+    const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+    const binding = (await this.readResidentSessionBindingsUnlocked()).find(
+      (candidate) => candidate.threadId === scope.threadId,
+    );
+    if (!binding) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_NOT_FOUND",
+        "No active resident Prime Agent session is bound to this execution generation",
+        true,
+      );
+    }
+    this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+    return validateResidentSessionBinding(binding);
   }
 
   private async resolveWorkspaceDirectoryUnlocked(scope: CurrentWorkspaceScope): Promise<string> {
@@ -1986,6 +2520,41 @@ export class HostStore {
     );
   }
 
+  private async appendModelSelectionJournalUnlocked(
+    command: CommandEnvelope,
+    status: CommandReceiptStatus,
+    recordedAt: string,
+    message?: string,
+  ): Promise<void> {
+    if (command.command.kind !== "model.select") {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMAND_REQUIRED",
+        "The model-selection journal accepts only exact model-selection envelopes",
+      );
+    }
+    await appendJsonLineOnce(
+      this.paths.commandJournal,
+      CommandJournalRecordSchema.parse({
+        version: 1,
+        journalId: deterministicId(
+          "journal",
+          "model-selection",
+          command.deviceId,
+          command.commandId,
+          status,
+        ),
+        recordedAt,
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        commandKind: command.command.kind,
+        status,
+        message,
+      }),
+      "journalId",
+    );
+  }
+
   private async appendEventUnlocked(event: {
     type: string;
     threadId?: string;
@@ -2119,6 +2688,28 @@ export class HostStore {
 
   private receiptPath(identity: CommandIdentity): string {
     return join(this.paths.receipts, `${storageKey(identity.deviceId, identity.commandId)}.json`);
+  }
+
+  private modelSelectionAttemptsDirectory(): string {
+    return join(this.paths.root, "model-selection-attempts");
+  }
+
+  private modelSelectionIdentitiesDirectory(): string {
+    return join(this.paths.root, "model-selection-identities");
+  }
+
+  private modelSelectionIdentityPath(identity: CommandIdentity): string {
+    return join(
+      this.modelSelectionIdentitiesDirectory(),
+      `${storageKey(identity.deviceId, identity.commandId)}.json`,
+    );
+  }
+
+  private modelSelectionAttemptPath(identity: CommandIdentity): string {
+    return join(
+      this.modelSelectionAttemptsDirectory(),
+      `${storageKey(identity.deviceId, identity.commandId)}.json`,
+    );
   }
 
   private handoffPath(handoffId: string): string {
@@ -2293,6 +2884,10 @@ function applyCommand(
     case "abort":
       recap = "Waiting for Prime Agent to acknowledge the stop request.";
       break;
+    case "model.select":
+      // Selection becomes visible only through a fresh authoritative resident
+      // projection after Prime Agent has applied and verified the mutation.
+      break;
     case "approval.resolve": {
       const approvalCommand = envelope.command;
       const approvalIndex = approvals.findIndex((approval) => approval.approvalId === approvalCommand.approvalId);
@@ -2335,6 +2930,9 @@ function validateCommandAgainstState(
   }
   if (envelope.command.kind === "abort" && !canDispatchLive) {
     return structured("LIVE_CONNECTION_REQUIRED", "Stopping requires a live Prime Agent session", true);
+  }
+  if (envelope.command.kind === "model.select" && !canDispatchLive) {
+    return structured("LIVE_CONNECTION_REQUIRED", "Model selection requires a live resident Prime Agent session", true);
   }
   if (envelope.command.kind === "approval.resolve") {
     const approvalCommand = envelope.command;

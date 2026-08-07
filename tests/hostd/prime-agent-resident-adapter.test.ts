@@ -15,6 +15,8 @@ import {
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
+import { GatewayError } from "../../src/hostd/gateway";
+import { PROTOCOL_VERSION, type CommandEnvelope } from "../../src/shared/protocol";
 
 const RUNTIME_NODE = resolve("test-runtime", "node.exe");
 const RUNTIME_CLI = resolve("test-runtime", "prime-agent", "dist", "bundle", "cli.js");
@@ -159,6 +161,10 @@ interface HarnessState {
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
   snapshotHandler?: () => Promise<unknown> | unknown;
+  availableModelsCalls: number;
+  setModelCalls: Array<{ providerId: string; modelId: string }>;
+  availableModelsHandler?: () => Promise<unknown> | unknown;
+  setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
 }
@@ -179,6 +185,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     persistCalls: [],
     completeCalls: [],
     projectionCalls: [],
+    availableModelsCalls: 0,
+    setModelCalls: [],
     ...overrides,
   };
 
@@ -236,6 +244,20 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           return state.snapshotHandler
             ? state.snapshotHandler()
             : validSnapshot();
+        },
+        getAvailableModels: async () => {
+          state.availableModelsCalls += 1;
+          state.chronology.push("models:available");
+          return state.availableModelsHandler
+            ? state.availableModelsHandler()
+            : [{ provider: "openai", id: "gpt-5", secretMetadata: "discarded" }];
+        },
+        setModel: async (providerId, modelId) => {
+          state.setModelCalls.push({ providerId, modelId });
+          state.chronology.push(`model:set:${providerId}/${modelId}`);
+          return state.setModelHandler
+            ? state.setModelHandler(providerId, modelId)
+            : { provider: providerId, id: modelId, rawCredential: "discarded" };
         },
         subscribe: (listener) => {
           state.eventListeners.add(listener);
@@ -334,6 +356,19 @@ function binding(overrides: Partial<ResidentSessionBinding> = {}): ResidentSessi
     boundAt: "2026-08-06T16:00:00.000Z",
     runtime: validateResidentDaemonHello(validHello()),
     ...overrides,
+  };
+}
+
+function modelSelectionCommand(commandId = "select-model-1"): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "device-1",
+    commandId,
+    expectedHostId: "host-1",
+    threadId: "thread-1",
+    issuedAt: "2026-08-06T17:00:00.000Z",
+    expectedExecutionGenerationId: "generation-1",
+    command: { kind: "model.select", providerId: "openai", modelId: "gpt-5" },
   };
 }
 
@@ -737,5 +772,235 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(state.disposeCalls).toBe(1);
     expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["create"]);
     expect(adapter.getLifecycle().state).toBe("closed");
+  });
+});
+
+describe("PrimeAgentResidentAdapter model-selection gateway", () => {
+  it("prechecks, mutates once, and publishes a fresh authoritative projection", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const command = modelSelectionCommand();
+
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).resolves.toMatchObject({
+      disposition: "handled",
+      message: "Prime Agent selected and verified the requested model",
+    });
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).resolves.toMatchObject({
+      disposition: "handled",
+    });
+
+    expect(state.availableModelsCalls).toBe(1);
+    expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(3);
+    expect(state.projectionCalls).toHaveLength(2);
+    expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("trusts only the fresh snapshot, never the raw setModel response DTO", async () => {
+    const { adapter, state } = createHarness({
+      setModelHandler: () => ({
+        provider: "untrusted-response-provider",
+        id: "untrusted-response-model",
+        credential: "must-never-cross-the-adapter-boundary",
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    const result = await adapter.submit(modelSelectionCommand("select-with-untrusted-result"), {
+      residentBinding: connection.binding,
+    });
+
+    expect(result).toEqual({
+      disposition: "handled",
+      message: "Prime Agent selected and verified the requested model",
+    });
+    expect(JSON.stringify(result)).not.toContain("untrusted-response");
+    expect(JSON.stringify(result)).not.toContain("credential");
+    expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("marks reconciliation uncertain when authoritative snapshot cursors never stabilize", async () => {
+    let snapshotRead = 0;
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ cursorSequence: 4 + snapshotRead++ }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(
+      adapter.submit(modelSelectionCommand("select-with-unstable-snapshot"), {
+        residentBinding: connection.binding,
+      }),
+    ).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+      retryable: false,
+    });
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(5);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("fails before mutation when the live sanitized catalog lacks the exact model", async () => {
+    const { adapter, state } = createHarness({
+      availableModelsHandler: () => [{ provider: "anthropic", id: "claude-opus-4" }],
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand(), { residentBinding: connection.binding })).rejects.toMatchObject({
+      name: "GatewayError",
+      code: "MODEL_NOT_AVAILABLE",
+      uncertain: false,
+    });
+    expect(state.setModelCalls).toHaveLength(0);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("marks an ambiguous setModel rejection uncertain and never retries it", async () => {
+    const { adapter, state } = createHarness({
+      setModelHandler: async () => {
+        throw new Error("credential-and-upstream-detail-must-not-escape");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const command = modelSelectionCommand();
+
+    const first = adapter.submit(command, { residentBinding: connection.binding });
+    await expect(first).rejects.toMatchObject({
+      name: "GatewayError",
+      code: "MODEL_SELECTION_OUTCOME_UNKNOWN",
+      uncertain: true,
+      retryable: false,
+    });
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_OUTCOME_UNKNOWN",
+      message: "Prime Agent may have changed the model, but no authoritative result is available",
+    });
+
+    expect(state.availableModelsCalls).toBe(1);
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("serializes model mutations per resident session", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstMutation = new Promise<void>((resolvePromise) => {
+      releaseFirst = resolvePromise;
+    });
+    const { adapter, state } = createHarness({
+      setModelHandler: async (providerId, modelId) => {
+        if (state.setModelCalls.length === 1) await firstMutation;
+        return { provider: providerId, id: modelId };
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const first = adapter.submit(modelSelectionCommand("select-model-serial-1"), {
+      residentBinding: connection.binding,
+    });
+    while (state.setModelCalls.length === 0) await Promise.resolve();
+    const second = adapter.submit(modelSelectionCommand("select-model-serial-2"), {
+      residentBinding: connection.binding,
+    });
+    await Promise.resolve();
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.availableModelsCalls).toBe(1);
+    releaseFirst?.();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(state.setModelCalls).toHaveLength(2);
+    expect(state.availableModelsCalls).toBe(2);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rechecks the exact binding when a queued selection reaches the mutation boundary", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstMutation = new Promise<void>((resolvePromise) => {
+      releaseFirst = resolvePromise;
+    });
+    const { adapter, state, emit } = createHarness({
+      setModelHandler: async (providerId, modelId) => {
+        if (state.setModelCalls.length === 1) await firstMutation;
+        return { provider: providerId, id: modelId };
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const first = adapter.submit(modelSelectionCommand("select-before-binding-refresh"), {
+      residentBinding: connection.binding,
+    });
+    while (state.setModelCalls.length === 0) await Promise.resolve();
+    const second = adapter.submit(modelSelectionCommand("select-after-binding-refresh"), {
+      residentBinding: connection.binding,
+    });
+
+    await emit({ type: "connection_status", status: "reconnecting" });
+    state.hello = validHello({ supervisorGeneration: "supervisor-model-refresh" });
+    await emit({ type: "session_resynced", snapshot: validSnapshot() });
+    await emit({ type: "connection_status", status: "connected" });
+    releaseFirst?.();
+
+    await expect(first).resolves.toMatchObject({ disposition: "handled" });
+    await expect(second).rejects.toMatchObject({
+      code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+      uncertain: false,
+    });
+    expect(state.setModelCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("lets a terminal action drain one in-flight mutation but cancels queued mutations before setModel", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstMutation = new Promise<void>((resolvePromise) => {
+      releaseFirst = resolvePromise;
+    });
+    const { adapter, state } = createHarness({
+      setModelHandler: async (providerId, modelId) => {
+        if (state.setModelCalls.length === 1) await firstMutation;
+        return { provider: providerId, id: modelId };
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const first = adapter.submit(modelSelectionCommand("select-before-detach"), {
+      residentBinding: connection.binding,
+    });
+    while (state.setModelCalls.length === 0) await Promise.resolve();
+    const second = adapter
+      .submit(modelSelectionCommand("select-queued-before-detach"), { residentBinding: connection.binding })
+      .catch((error: unknown) => error);
+    const detached = connection.detach();
+    releaseFirst?.();
+
+    await expect(first).resolves.toMatchObject({ disposition: "handled" });
+    await expect(second).resolves.toMatchObject({
+      code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+      uncertain: false,
+    });
+    await expect(detached).resolves.toBeUndefined();
+    expect(state.setModelCalls).toHaveLength(1);
+    await adapter.close();
+  });
+
+  it("requires the exact durable binding before reaching private model APIs", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const wrong = binding({ executionGenerationId: "generation-forged" });
+
+    await expect(adapter.submit(modelSelectionCommand(), { residentBinding: wrong })).rejects.toBeInstanceOf(
+      GatewayError,
+    );
+    expect(state.availableModelsCalls).toBe(0);
+    expect(state.setModelCalls).toHaveLength(0);
+    await connection.detach();
+    await adapter.close();
   });
 });

@@ -291,8 +291,8 @@ const SessionActionsSchema = z
 
 const ModelSchema = z
   .object({
-    provider: z.string().min(1).max(120).refine(noControlCharacters),
-    id: z.string().min(1).max(120).refine(noControlCharacters),
+    provider: z.string().min(1).max(128).refine(noControlCharacters),
+    id: z.string().min(1).max(512).refine(noControlCharacters),
   })
   .passthrough();
 

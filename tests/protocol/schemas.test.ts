@@ -9,6 +9,7 @@ import {
   PairedDeviceSchema,
   PairingTicketDescriptorSchema,
   PROTOCOL_VERSION,
+  RemoteDeviceScopesSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
   ThreadProjectionSnapshotSchema,
@@ -107,6 +108,59 @@ describe("host protocol schemas", () => {
       CommandEnvelopeSchema.safeParse({ ...base, command: { kind: "prompt", text: "x".repeat(65_537) } }).success,
     ).toBe(false);
     expect(CommandEnvelopeSchema.safeParse({ ...base, protocolVersion: 2, command: { kind: "abort" } }).success).toBe(false);
+  });
+
+  it("bounds model selection and requires an exact execution generation", () => {
+    const base = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: "device-1",
+      commandId: "model-command-1",
+      expectedHostId: "host-1",
+      threadId: "thread-1",
+      issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "execution-1",
+    } as const;
+    const command = { kind: "model.select", providerId: "openai", modelId: "gpt-5.6-sol" } as const;
+
+    expect(CommandEnvelopeSchema.safeParse({ ...base, command }).success).toBe(true);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        expectedExecutionGenerationId: undefined,
+        command,
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        command: { ...command, providerId: "p".repeat(129) },
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        command: { ...command, modelId: "m".repeat(513) },
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        command: { ...command, modelId: "gpt-5\nforged-journal-line" },
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        command: { ...command, credential: "must-not-cross-the-command-boundary" },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("authorizes model selection with its own least-privilege mobile scope", () => {
+    expect(RemoteDeviceScopesSchema.parse(["projection.read", "model.select"])).toEqual([
+      "projection.read",
+      "model.select",
+    ]);
   });
 
   it("exposes one discriminated IPC request surface", () => {

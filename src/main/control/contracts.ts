@@ -6,7 +6,11 @@
  * between renderer-safe values and host protocol frames.
  */
 
-import type { RuntimeIntegritySnapshot, RuntimeModelCatalogSnapshot } from '../../shared/protocol'
+import type {
+  RuntimeIntegritySnapshot,
+  RuntimeModelCatalogSnapshot,
+  RuntimeOAuthSessionSnapshot
+} from '../../shared/protocol'
 
 export const IPC = {
   bootstrap: 'prime:bootstrap',
@@ -21,6 +25,9 @@ export const IPC = {
   projectCatalog: 'prime:catalog:projects',
   threadProjection: 'prime:thread:projection',
   runtimeModelCatalog: 'prime:runtime:model-catalog',
+  startRuntimeOAuth: 'prime:runtime:oauth:start',
+  runtimeOAuthStatus: 'prime:runtime:oauth:status',
+  cancelRuntimeOAuth: 'prime:runtime:oauth:cancel',
   requestSnapshot: 'prime:thread:snapshot',
   submitCommand: 'prime:command:submit',
   approve: 'prime:approval:resolve',
@@ -135,6 +142,20 @@ export interface ClientCommand {
   expectedExecutionGenerationId?: string
 }
 
+/** Renderer-safe OAuth state. Authorization URLs and challenge responses stay in main/hostd. */
+export interface RuntimeOAuthSessionView {
+  sessionId: string
+  providerId: string
+  phase: RuntimeOAuthSessionSnapshot['phase']
+  expiresAt: string
+  interaction?:
+    | { kind: 'browser'; state: 'opened' }
+    | { kind: 'manual'; state: 'unavailable' }
+    | { kind: 'selection'; state: 'unavailable' }
+  configured?: true
+  error?: RuntimeOAuthSessionSnapshot['error']
+}
+
 export type CommandJournalStatus =
   | 'received'
   | 'admitted'
@@ -235,6 +256,9 @@ export interface PrimeBridge {
   projectCatalog(input: { hostId: string }): Promise<Result<unknown>>
   threadProjection(input: { threadId: string; cursor?: SessionCursor }): Promise<Result<unknown>>
   runtimeModelCatalog(input: { expectedHostId: string }): Promise<Result<RuntimeModelCatalogSnapshot>>
+  startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
+  runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
+  cancelRuntimeOAuth(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
   requestSnapshot(input: { threadId?: string; cursor?: SessionCursor }): Promise<Result<unknown>>
   submitCommand(input: ClientCommand): Promise<Result<CommandReceipt>>
   approve(input: ApprovalResolution): Promise<Result<CommandReceipt>>

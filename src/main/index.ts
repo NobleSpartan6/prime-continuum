@@ -1,16 +1,18 @@
-import { app, BrowserWindow, ipcMain, type Session } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, type Session } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerControlIpc } from './control/ipc'
 import type { ConnectionState } from './control/contracts'
 import { stopPackageSmokeHostds } from './control/local-hostd'
 import { DesktopControlService } from './control/service'
+import { installOrderlyQuitDrain } from './orderly-quit'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
 
 let mainWindow: BrowserWindow | undefined
 let trustedRendererUrl = ''
 let unregisterIpc: (() => void) | undefined
+let unregisterOrderlyQuit: (() => void) | undefined
 const configuredSessions = new WeakSet<Session>()
 const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
 
@@ -187,7 +189,26 @@ async function waitForPackageSmokeConnection(window: BrowserWindow): Promise<voi
 
 void app.whenReady().then(async () => {
   app.setAppUserModelId('ai.primeintellect.continuim')
-  const service = new DesktopControlService({ app })
+  const service = new DesktopControlService({
+    app,
+    openExternal: async (url) => {
+      await shell.openExternal(url)
+    }
+  })
+  unregisterOrderlyQuit = installOrderlyQuitDrain(app, {
+    drain: () => service.shutdown(),
+    cleanup: () => {
+      unregisterIpc?.()
+      unregisterIpc = undefined
+      unregisterOrderlyQuit?.()
+      unregisterOrderlyQuit = undefined
+    },
+    onError: (error) => {
+      process.stderr.write(
+        `Prime Continuim could not confirm sign-in shutdown: ${error instanceof Error ? error.message : 'unknown error'}\n`
+      )
+    }
+  })
   const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
   mainWindow = createWindow(false, !packageSmoke)
   unregisterIpc = registerControlIpc({
@@ -230,9 +251,4 @@ app.on('web-contents-created', (_event, contents) => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
-})
-
-app.once('before-quit', () => {
-  unregisterIpc?.()
-  unregisterIpc = undefined
 })

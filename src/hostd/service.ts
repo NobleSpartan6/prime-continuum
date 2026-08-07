@@ -7,6 +7,7 @@ import {
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
   type HostIpcRequest,
   type HostIpcResponse,
   type HostIdentityReadiness,
@@ -27,6 +28,11 @@ import {
   type HostIdentityProviderLoadResult,
 } from "./pairing/host-identity-provider";
 import { HOSTD_VERSION } from "./paths";
+import {
+  HostOAuthSessionBroker,
+  OAuthBrokerError,
+  type HostOAuthComposition,
+} from "./oauth-session-broker";
 import { HostStore, HostStoreError } from "./store";
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
 
@@ -45,6 +51,9 @@ const HANDOFF_COORDINATOR_WARNING = {
 const KNOWN_METHODS = new Set([
   "health.get",
   "runtime.model_catalog",
+  "oauth.session.start",
+  "oauth.session.status",
+  "oauth.session.cancel",
   "catalog.snapshot",
   "thread.snapshot",
   "command.submit",
@@ -55,6 +64,7 @@ const KNOWN_METHODS = new Set([
 
 export type HostSessionContext =
   | { transport: "trusted_user"; scopes: "*" }
+  | { transport: "ssh_bridge"; scopes: "*" }
   | {
       transport: "relay";
       channel: AuthenticatedChannelLease;
@@ -62,6 +72,10 @@ export type HostSessionContext =
 
 export const TRUSTED_USER_SESSION: HostSessionContext = Object.freeze({
   transport: "trusted_user",
+  scopes: "*",
+});
+export const SSH_BRIDGE_SESSION: HostSessionContext = Object.freeze({
+  transport: "ssh_bridge",
   scopes: "*",
 });
 
@@ -72,6 +86,7 @@ export interface HostServiceOptions {
   identityLoadTimeoutMs?: number;
   runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
   runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
+  runtimeOAuthComposition?: HostOAuthComposition;
 }
 
 export interface RuntimeIntegrityReadinessProvider {
@@ -90,6 +105,8 @@ export class HostService {
   private readonly identityLoadTimeoutMs: number;
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
+  private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
+  private oauthSessionBroker: HostOAuthSessionBroker | undefined;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
   readonly startedAt = new Date().toISOString();
@@ -107,6 +124,7 @@ export class HostService {
     this.identityLoadTimeoutMs = options.identityLoadTimeoutMs ?? DEFAULT_IDENTITY_LOAD_TIMEOUT_MS;
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
+    this.runtimeOAuthComposition = options.runtimeOAuthComposition;
     if (!Number.isSafeInteger(this.identityLoadTimeoutMs) || this.identityLoadTimeoutMs < 10 || this.identityLoadTimeoutMs > 30_000) {
       throw new TypeError("Identity load timeout must be an integer from 10 to 30000 milliseconds");
     }
@@ -115,6 +133,13 @@ export class HostService {
   async initialize(options: { seed?: boolean } = {}): Promise<void> {
     await this.store.initialize(options);
     const host = await this.store.getHost();
+    if (this.runtimeOAuthComposition && !this.oauthSessionBroker) {
+      this.oauthSessionBroker = new HostOAuthSessionBroker({
+        hostId: host.hostId,
+        providers: this.runtimeOAuthComposition,
+        storage: this.runtimeOAuthComposition,
+      });
+    }
     const authority = await this.pairingAuthority.initialize({ hostId: host.hostId });
     this.pairingIdentity = authority.identity
       ? await this.loadConfiguredHostIdentity(host.hostId, authority.identity)
@@ -123,13 +148,23 @@ export class HostService {
 
   close(): Promise<void> {
     this.closePromise ??= (async () => {
+      // OAuth helpers can hold freshly verified runtime handles. Revoke and
+      // drain them before the integrity coordinator releases that authority.
+      // If helper exit cannot be positively observed, fail closed here and do
+      // not release any of the verified runtime ownership below.
+      await this.oauthSessionBroker?.close();
+      // Broker close waits for each abort-triggered login run. Only afterwards
+      // can the composition surface a helper termination failure latched by
+      // that run; starting these two closes concurrently would race the latch.
+      await this.runtimeOAuthComposition?.close?.();
       const closeResults = await Promise.allSettled([
         Promise.resolve().then(() => this.runtimeIntegrityProvider?.close?.()),
         Promise.resolve().then(() => this.pairingAuthority.close()),
         Promise.resolve().then(() => (this.hostIdentityProviderUsed ? this.hostIdentityProvider.close() : undefined)),
         Promise.resolve().then(() => this.gateway.close()),
       ]);
-      const failures = closeResults.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+      const failures = closeResults
+        .flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
       if (failures.length > 0) {
         throw new AggregateError(failures, "One or more host service resources failed to close");
       }
@@ -169,7 +204,14 @@ export class HostService {
   }
 
   private async authorizeAndDispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
-    if (context.transport === "trusted_user") return this.dispatch(request);
+    if (context.transport === "trusted_user") return this.dispatch(request, context);
+    if (isOAuthRequest(request)) {
+      throw new PairingAuthorityError(
+        "REMOTE_OAUTH_FORBIDDEN",
+        "Provider sign-in is available only to the trusted desktop on the provider host",
+      );
+    }
+    if (context.transport === "ssh_bridge") return this.dispatch(request, context);
     if (this.pairingIdentity.state !== "ready") {
       throw new PairingAuthorityError(
         "REMOTE_IDENTITY_UNAVAILABLE",
@@ -182,7 +224,7 @@ export class HostService {
       this.assertRelayRequestIdentity(request, device.deviceId);
       // Admission is linearized under the authority lock; dispatch runs after
       // the lock is released so revocation can commit while admitted work ends.
-      return this.dispatch(request);
+      return this.dispatch(request, context);
     });
   }
 
@@ -210,7 +252,7 @@ export class HostService {
     }
   }
 
-  private async dispatch(request: HostIpcRequest): Promise<unknown> {
+  private async dispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
     switch (request.method) {
       case "health.get": {
         const host = await this.store.getHost();
@@ -223,6 +265,10 @@ export class HostService {
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
           : [];
+        const oauthCapabilities = context.transport === "trusted_user" && this.oauthSessionBroker &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
+          ? [RUNTIME_OAUTH_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -231,8 +277,14 @@ export class HostService {
           serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
           host,
           capabilities: runtimeIntegrity === undefined
-            ? [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities]
-            : [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities, RUNTIME_INTEGRITY_CAPABILITY],
+            ? [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities, ...oauthCapabilities]
+            : [
+                ...HOST_CAPABILITIES,
+                ...executionCapabilities,
+                ...modelCatalogCapabilities,
+                ...oauthCapabilities,
+                RUNTIME_INTEGRITY_CAPABILITY,
+              ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
         };
@@ -253,6 +305,18 @@ export class HostService {
           );
         }
         return this.runtimeModelCatalogProvider.read();
+      }
+      case "oauth.session.start": {
+        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
+        return broker.start(request.payload);
+      }
+      case "oauth.session.status": {
+        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
+        return broker.status(request.payload);
+      }
+      case "oauth.session.cancel": {
+        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
+        return broker.cancel(request.payload);
       }
       case "catalog.snapshot":
         return this.store.getCatalogSnapshot();
@@ -287,19 +351,81 @@ export class HostService {
         const thread = catalog.threads.find((item) => item.threadId === command.threadId);
         const generationId =
           command.expectedExecutionGenerationId ?? thread?.currentLocation.executionGenerationId ?? "unknown-generation";
-        const live = await this.gateway.isLive(command.threadId, generationId);
+        let live = false;
+        let liveCheckFailure: StructuredError | undefined;
+        try {
+          live = await this.gateway.isLive(command.threadId, generationId);
+        } catch (error) {
+          if (command.command.kind !== "model.select") throw error;
+          liveCheckFailure = {
+            code: "MODEL_SELECTION_LIVE_CHECK_FAILED",
+            message: "The resident Prime Agent session could not be verified as live",
+            retryable: true,
+          };
+        }
+        const gatewayUnavailable = this.gateway instanceof UnavailablePrimeAgentGateway
+          ? {
+              code: "GATEWAY_UNAVAILABLE",
+              message: "Prime Agent execution is not attached in this build; the command was not queued.",
+              retryable: true,
+            }
+          : liveCheckFailure;
         const admission = await this.store.admitCommand(
           command,
           live,
-          this.gateway instanceof UnavailablePrimeAgentGateway
-            ? {
-                code: "GATEWAY_UNAVAILABLE",
-                message: "Prime Agent execution is not attached in this build; the command was not queued.",
-                retryable: true,
-              }
-            : undefined,
+          gatewayUnavailable,
         );
         if (admission.duplicate || admission.receipt.status !== "admitted" || !live) return admission.receipt;
+
+        if (command.command.kind === "model.select") {
+          let binding: Awaited<ReturnType<HostStore["beginModelSelectionDispatch"]>>;
+          try {
+            binding = await this.store.beginModelSelectionDispatch(command);
+          } catch (error) {
+            const storeError = error instanceof HostStoreError ? error : undefined;
+            return this.store.finalizeModelSelectionDispatch(command, {
+              status: "failed",
+              message: storeError?.message.slice(0, 1_024) ?? "Model selection lost resident authority before dispatch",
+              error: {
+                code: storeError?.code ?? "MODEL_SELECTION_DISPATCH_REJECTED",
+                message: storeError?.message.slice(0, 2_048) ?? "Model selection lost resident authority before dispatch",
+                retryable: storeError?.retryable ?? true,
+              },
+            });
+          }
+
+          try {
+            const gatewayAdmission = await this.gateway.submit(command, { residentBinding: binding });
+            if (gatewayAdmission.disposition !== "handled") {
+              return this.store.finalizeModelSelectionDispatch(command, {
+                status: "uncertain",
+                message: "Prime Agent returned an invalid model-selection acknowledgement",
+                error: {
+                  code: "MODEL_SELECTION_ACK_INVALID",
+                  message: "The model mutation may have run, but no authoritative completed acknowledgement was received",
+                  retryable: false,
+                },
+              });
+            }
+            return this.store.finalizeModelSelectionDispatch(command, {
+              status: "completed",
+              message: gatewayAdmission.message?.slice(0, 1_024) ?? "Prime Agent selected and verified the model",
+            });
+          } catch (error) {
+            const gatewayError = error instanceof GatewayError ? error : undefined;
+            const uncertain = gatewayError?.uncertain ?? true;
+            const message = gatewayError?.message.slice(0, 1_024) ?? "Prime Agent model selection could not be reconciled";
+            return this.store.finalizeModelSelectionDispatch(command, {
+              status: uncertain ? "uncertain" : "failed",
+              message,
+              error: {
+                code: gatewayError?.code ?? "MODEL_SELECTION_OUTCOME_UNKNOWN",
+                message,
+                retryable: uncertain ? false : (gatewayError?.retryable ?? true),
+              },
+            });
+          }
+        }
 
         try {
           const gatewayAdmission = await this.gateway.submit(command);
@@ -377,6 +503,24 @@ export class HostService {
         );
       }
     }
+  }
+
+  private async requireRuntimeOAuthBroker(expectedHostId: string): Promise<HostOAuthSessionBroker> {
+    const host = await this.store.getHost();
+    if (expectedHostId !== host.hostId) {
+      throw new HostStoreError(
+        "HOST_AUTHORITY_MISMATCH",
+        "The OAuth session targets a different host authority.",
+      );
+    }
+    const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+    if (!this.oauthSessionBroker || (runtimeIntegrity && runtimeIntegrity.status !== "ready")) {
+      throw new HostStoreError(
+        "RUNTIME_OAUTH_UNAVAILABLE",
+        "The verified Prime Agent OAuth runtime is not available on this host.",
+      );
+    }
+    return this.oauthSessionBroker;
   }
 
   private async loadConfiguredHostIdentity(
@@ -503,6 +647,12 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
     case "thread.snapshot":
     case "command.reconcile":
       return "projection.read";
+    case "oauth.session.start":
+    case "oauth.session.status":
+    case "oauth.session.cancel":
+      // Relay requests are rejected before scope evaluation. This branch keeps
+      // the protocol switch exhaustive without granting remote OAuth access.
+      return "host.admin";
     case "handoff.plan":
     case "handoff.commit":
       return "run_location.change";
@@ -516,6 +666,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
           return "thread.steer";
         case "abort":
           return "thread.abort";
+        case "model.select":
+          return "model.select";
         case "approval.resolve":
           return "approval.resolve";
       }
@@ -592,6 +744,9 @@ function toStructuredError(error: unknown): StructuredError {
   if (error instanceof GatewayError) {
     return { code: error.code, message: error.message, retryable: error.retryable };
   }
+  if (error instanceof OAuthBrokerError) {
+    return { code: error.code, message: error.message, retryable: error.code === "OAUTH_PROVIDER_BUSY" };
+  }
   if (error instanceof ZodError) {
     return { code: "INVALID_STATE", message: "Durable host state failed schema validation", retryable: false };
   }
@@ -602,6 +757,12 @@ function toStructuredError(error: unknown): StructuredError {
     retryable: true,
     diagnosticId,
   };
+}
+
+function isOAuthRequest(request: HostIpcRequest): boolean {
+  return request.method === "oauth.session.start" ||
+    request.method === "oauth.session.status" ||
+    request.method === "oauth.session.cancel";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

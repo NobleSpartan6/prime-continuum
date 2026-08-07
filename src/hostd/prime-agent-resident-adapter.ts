@@ -1,7 +1,15 @@
 import { spawn } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
+import { CommandEnvelopeSchema, type CommandEnvelope } from "../shared/protocol";
+import {
+  GatewayError,
+  type GatewayAdmission,
+  type GatewayDispatchContext,
+  type PrimeAgentGateway,
+} from "./gateway";
 import {
   ResidentProjectionError,
   normalizeResidentProjectionSnapshot,
@@ -30,6 +38,9 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RUNTIME_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 const MAX_LIVE_SESSIONS = 10_000;
+const MAX_AVAILABLE_MODELS = 5_000;
+const MAX_MODEL_SELECTION_IDENTITIES = 10_000;
+const MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS = 4;
 
 const WireStringSchema = z.string().min(1).max(4_096);
 const SessionActionsSchema = z
@@ -80,7 +91,44 @@ const InitialSnapshotSchema = z
   })
   .passthrough();
 
+const ModelSelectionIdentitySchema = z
+  .object({
+    provider: z.string().min(1).max(128).regex(/^[^\0\r\n]+$/),
+    id: z.string().min(1).max(512).regex(/^[^\0\r\n]+$/),
+  })
+  .strip();
+
+const ModelSelectionSnapshotSchema = z
+  .object({
+    state: z
+      .object({
+        activeSessionId: WireStringSchema,
+        sessionId: WireStringSchema,
+        sessionFile: WireStringSchema.optional(),
+        cwd: WireStringSchema,
+        model: ModelSelectionIdentitySchema,
+      })
+      .passthrough(),
+    lastEventSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    lastEventCursor: z
+      .object({
+        generation: z.string().min(1).max(256),
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      })
+      .strict(),
+  })
+  .passthrough()
+  .refine(
+    (snapshot) => snapshot.lastEventSequence === snapshot.lastEventCursor.sequence,
+    "Model-selection snapshot cursor is inconsistent",
+  );
+
 type LiveSessionSummary = z.infer<typeof LiveSessionSummarySchema>;
+
+interface SanitizedResidentModelIdentity {
+  readonly providerId: string;
+  readonly modelId: string;
+}
 
 interface PrimeDaemonResponseSuccess {
   readonly type: "response";
@@ -111,6 +159,9 @@ export interface PrimeDaemonClientPublic {
 /** Narrow structural view of the pinned package's public connection export. */
 export interface PrimeDaemonAgentConnectionPublic {
   getInitialSnapshot(): Promise<unknown>;
+  /** Pinned public AgentConnection methods; guarded at the mutation boundary. */
+  getAvailableModels?(): Promise<unknown>;
+  setModel?(provider: string, modelId: string): Promise<unknown>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
 }
@@ -261,10 +312,19 @@ class LifecycleController {
  * lifetime. Runtime installation and checksum verification remain a separate
  * composition boundary.
  */
-export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
+export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeAgentGateway {
+  readonly continuity = "resident" as const;
   private readonly options: ResolvedOptions;
   private readonly lifecycle: LifecycleController;
   private readonly connections = new Map<string, ManagedResidentRuntimeConnection>();
+  private readonly modelSelectionAttempts = new Map<
+    string,
+    Readonly<{
+      command: CommandEnvelope;
+      binding: ResidentSessionBinding;
+      result: Promise<GatewayAdmission>;
+    }>
+  >();
   private modulePromise: Promise<PrimeAgentPublicModule> | undefined;
   private daemonEnsurePromise: Promise<ResidentRuntimeCompatibility> | undefined;
   private operationTail: Promise<void> = Promise.resolve();
@@ -437,6 +497,94 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
     });
   }
 
+  async isLive(threadId: string, executionGenerationId: string): Promise<boolean> {
+    if (this.closeRequested || this.closed) return false;
+    const connection = [...this.connections.values()].find(
+      (candidate) =>
+        candidate.binding.threadId === threadId &&
+        candidate.binding.executionGenerationId === executionGenerationId,
+    );
+    return connection?.isLive() ?? false;
+  }
+
+  submit(commandValue: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "model.select") {
+      return Promise.reject(
+        new GatewayError(
+          "RESIDENT_COMMAND_UNSUPPORTED",
+          "This resident adapter checkpoint dispatches only model selection",
+        ),
+      );
+    }
+    const binding = context?.residentBinding;
+    if (!binding) {
+      return Promise.reject(
+        new GatewayError(
+          "MODEL_SELECTION_DURABLE_AUTHORITY_REQUIRED",
+          "Model selection requires a durable resident dispatch authority",
+        ),
+      );
+    }
+    const durableBinding = validateResidentSessionBinding(binding);
+    if (
+      command.threadId !== durableBinding.threadId ||
+      command.expectedExecutionGenerationId !== durableBinding.executionGenerationId
+    ) {
+      return Promise.reject(
+        new GatewayError(
+          "MODEL_SELECTION_AUTHORITY_MISMATCH",
+          "Model selection does not match its durable resident authority",
+        ),
+      );
+    }
+    const connection = this.connections.get(durableBinding.activeSessionId);
+    if (!connection || !isDeepStrictEqual(connection.binding, durableBinding)) {
+      return Promise.reject(
+        new GatewayError(
+          "MODEL_SELECTION_BINDING_MISMATCH",
+          "The live Prime Agent connection does not match the admitted resident binding",
+          true,
+        ),
+      );
+    }
+
+    const identity = JSON.stringify([command.deviceId, command.commandId]);
+    const existing = this.modelSelectionAttempts.get(identity);
+    if (existing) {
+      if (
+        !isDeepStrictEqual(existing.command, command) ||
+        !isDeepStrictEqual(existing.binding, durableBinding)
+      ) {
+        return Promise.reject(
+          new GatewayError("COMMAND_ID_REUSED", "This command identity is already bound to another model selection"),
+        );
+      }
+      return existing.result;
+    }
+    if (this.modelSelectionAttempts.size >= MAX_MODEL_SELECTION_IDENTITIES) {
+      return Promise.reject(
+        new GatewayError(
+          "MODEL_SELECTION_IDENTITY_LIMIT",
+          "The resident model-selection identity ledger reached its bounded limit",
+          true,
+        ),
+      );
+    }
+
+    const result = connection
+      .selectModel(command.command.providerId, command.command.modelId, durableBinding)
+      .then(() => ({
+        disposition: "handled" as const,
+        message: "Prime Agent selected and verified the requested model",
+      }));
+    this.modelSelectionAttempts.set(
+      identity,
+      Object.freeze({ command: Object.freeze(command), binding: durableBinding, result }),
+    );
+    return result;
+  }
+
   close(): Promise<void> {
     this.closeRequested = true;
     this.closePromise ??= this.enqueue(async () => {
@@ -448,6 +596,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
         if (outcome.status === "rejected") connections[index]?.forceClose();
       });
       this.connections.clear();
+      this.modelSelectionAttempts.clear();
       this.closed = true;
       const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
       if (failure) {
@@ -641,6 +790,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private bindingValue: ResidentSessionBinding;
   private unsubscribeUpstream: () => void = () => undefined;
   private eventTail: Promise<void> = Promise.resolve();
+  private modelSelectionTail: Promise<void> = Promise.resolve();
   private terminalAction: "detach" | "end" | undefined;
   private terminalPromise: Promise<void> | undefined;
   private workerEnded = false;
@@ -685,6 +835,32 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
 
   subscribeLifecycle(listener: ResidentRuntimeLifecycleListener): () => void {
     return this.lifecycle.subscribe(listener);
+  }
+
+  isLive(): boolean {
+    return (
+      !this.locallyClosed &&
+      !this.terminalAction &&
+      this.options.client.isConnected !== false &&
+      this.lifecycle.get().state === "ready"
+    );
+  }
+
+  selectModel(
+    providerId: string,
+    modelId: string,
+    expectedBinding: ResidentSessionBinding,
+  ): Promise<SanitizedResidentModelIdentity> {
+    const selection = ModelSelectionIdentitySchema.parse({ provider: providerId, id: modelId });
+    const durableBinding = validateResidentSessionBinding(expectedBinding);
+    const operation = this.modelSelectionTail.then(() =>
+      this.selectModelOnce(selection.provider, selection.id, durableBinding),
+    );
+    this.modelSelectionTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   detach(): Promise<void> {
@@ -743,7 +919,10 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       );
     }
     this.terminalAction = action;
-    this.terminalPromise = operation().then(
+    // A terminal transition closes admission immediately, then waits for any
+    // already-running selection. Queued selections observe terminalAction and
+    // fail before setModel can be invoked.
+    this.terminalPromise = this.modelSelectionTail.then(operation).then(
       () => {
         if (this.locallyClosed) return;
         this.locallyClosed = true;
@@ -762,6 +941,90 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       },
     );
     return this.terminalPromise;
+  }
+
+  private async selectModelOnce(
+    providerId: string,
+    modelId: string,
+    expectedBinding: ResidentSessionBinding,
+  ): Promise<SanitizedResidentModelIdentity> {
+    this.assertModelSelectionLive(expectedBinding);
+    const getAvailableModels = this.options.attached.getAvailableModels;
+    const setModel = this.options.attached.setModel;
+    if (typeof getAvailableModels !== "function" || typeof setModel !== "function") {
+      throw new GatewayError(
+        "MODEL_SELECTION_UNSUPPORTED",
+        "The verified Prime Agent connection does not support resident model selection",
+      );
+    }
+
+    let availableModels: readonly SanitizedResidentModelIdentity[];
+    try {
+      availableModels = sanitizeAvailableModels(await getAvailableModels.call(this.options.attached));
+    } catch {
+      throw new GatewayError(
+        "MODEL_CATALOG_UNAVAILABLE",
+        "Prime Agent's live model catalog could not be safely validated",
+        true,
+      );
+    }
+    if (!availableModels.some((model) => model.providerId === providerId && model.modelId === modelId)) {
+      throw new GatewayError(
+        "MODEL_NOT_AVAILABLE",
+        "The requested model is not available on this live Prime Agent session",
+      );
+    }
+
+    // This second live check is intentionally adjacent to the one and only
+    // mutation call. Any failure before it is known not to have mutated state.
+    this.assertModelSelectionLive(expectedBinding);
+    try {
+      // Ignore the upstream DTO entirely. Resolution is only permission to
+      // perform the fresh authoritative read below; it is not completion
+      // evidence and never crosses this private boundary.
+      await setModel.call(this.options.attached, providerId, modelId);
+    } catch {
+      // A rejected promise can represent a lost daemon response after commit.
+      // The public connection cannot force-refresh its snapshot on this path,
+      // so reconciliation would be unsafe and no retry is permitted.
+      throw new GatewayError(
+        "MODEL_SELECTION_OUTCOME_UNKNOWN",
+        "Prime Agent may have changed the model, but no authoritative result is available",
+        false,
+        true,
+      );
+    }
+
+    try {
+      // A resolved setModel invalidates the pinned connection's snapshot cache;
+      // consecutive equal cursor/projection reads additionally prove that the
+      // pinned multi-RPC snapshot did not race a concurrent daemon event.
+      const projection = await readStableModelSelectionProjection(
+        this.options.attached,
+        expectedBinding,
+        providerId,
+        modelId,
+      );
+      await publishProjection(this.options.publishProjection, expectedBinding, projection);
+    } catch {
+      throw new GatewayError(
+        "MODEL_SELECTION_RECONCILIATION_FAILED",
+        "Prime Agent accepted the model mutation, but its authoritative state could not be reconciled",
+        false,
+        true,
+      );
+    }
+
+    return Object.freeze({ providerId, modelId });
+  }
+
+  private assertModelSelectionLive(expectedBinding: ResidentSessionBinding): void {
+    if (this.isLive() && isDeepStrictEqual(this.binding, expectedBinding)) return;
+    throw new GatewayError(
+      "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+      "The admitted resident Prime Agent session is no longer live under the exact durable authority",
+      true,
+    );
   }
 
   private async handleUpstreamEvent(event: unknown): Promise<void> {
@@ -973,6 +1236,85 @@ function normalizeProjection(
     }
     throw error;
   }
+}
+
+function sanitizeAvailableModels(value: unknown): readonly SanitizedResidentModelIdentity[] {
+  assertBoundedJson(value, 8 * 1024 * 1024, "available model catalog");
+  if (!Array.isArray(value) || value.length > MAX_AVAILABLE_MODELS) {
+    throw invalidResponse("available model catalog");
+  }
+  const identities: SanitizedResidentModelIdentity[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value) {
+    const parsed = ModelSelectionIdentitySchema.safeParse(candidate);
+    if (!parsed.success) throw invalidResponse("available model catalog");
+    const identity = Object.freeze({ providerId: parsed.data.provider, modelId: parsed.data.id });
+    const key = JSON.stringify([identity.providerId, identity.modelId]);
+    if (seen.has(key)) throw invalidResponse("available model catalog");
+    seen.add(key);
+    identities.push(identity);
+  }
+  return Object.freeze(identities);
+}
+
+async function readStableModelSelectionProjection(
+  connection: PrimeDaemonAgentConnectionPublic,
+  binding: ResidentSessionBinding,
+  providerId: string,
+  modelId: string,
+): Promise<ResidentProjectionSnapshot> {
+  let previous:
+    | Readonly<{
+        cursor: Readonly<{ generation: string; sequence: number }>;
+        projection: ResidentProjectionSnapshot;
+      }>
+    | undefined;
+  for (let read = 0; read < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS; read += 1) {
+    const snapshot = await connection.getInitialSnapshot();
+    const cursor = assertSelectedModelSnapshot(snapshot, binding, providerId, modelId);
+    const projection = normalizeProjection(snapshot, binding);
+    if (
+      previous &&
+      isDeepStrictEqual(previous.cursor, cursor) &&
+      isDeepStrictEqual(previous.projection, projection)
+    ) {
+      return projection;
+    }
+    previous = Object.freeze({ cursor, projection });
+  }
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_RESPONSE_INVALID",
+    "Prime Agent state changed throughout authoritative model-selection reconciliation.",
+  );
+}
+
+function assertSelectedModelSnapshot(
+  snapshot: unknown,
+  binding: ResidentSessionBinding,
+  providerId: string,
+  modelId: string,
+): Readonly<{ generation: string; sequence: number }> {
+  assertBoundedJson(snapshot, MAX_RUNTIME_SNAPSHOT_BYTES, "model-selection snapshot");
+  const parsed = ModelSelectionSnapshotSchema.safeParse(snapshot);
+  if (!parsed.success) throw invalidResponse("model-selection snapshot");
+  const state = parsed.data.state;
+  if (
+    state.activeSessionId !== binding.activeSessionId ||
+    state.sessionId !== binding.sessionId ||
+    (binding.sessionFile !== undefined && state.sessionFile !== binding.sessionFile) ||
+    !sameWorkspacePath(state.cwd, binding.workspaceDirectory) ||
+    state.model.provider !== providerId ||
+    state.model.id !== modelId
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SESSION_MISMATCH",
+      "The authoritative model-selection snapshot does not match its durable resident authority.",
+    );
+  }
+  return Object.freeze({
+    generation: parsed.data.lastEventCursor.generation,
+    sequence: parsed.data.lastEventCursor.sequence,
+  });
 }
 
 async function publishProjection(

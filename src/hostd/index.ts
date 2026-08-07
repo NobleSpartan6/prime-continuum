@@ -7,6 +7,7 @@ import { PairingAuthority, type ChannelCloseFailureDiagnostic } from "./pairing/
 import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
 import { RuntimeInitializationCoordinator } from "./runtime-initialization-coordinator";
 import { VerifiedRuntimeModelCatalog } from "./runtime-model-catalog";
+import { VerifiedRuntimeOAuthComposition } from "./runtime-oauth";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
 import { HostService } from "./service";
 import { HostStore } from "./store";
@@ -21,6 +22,7 @@ export * from "./runtime-attestation";
 export * from "./runtime-initialization-coordinator";
 export * from "./runtime-integrity-manager";
 export * from "./runtime-model-catalog";
+export * from "./runtime-oauth";
 export * from "./server";
 export * from "./service";
 export * from "./store";
@@ -111,6 +113,9 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
     const runtimeModelCatalog = runtimeInitialization
       ? new VerifiedRuntimeModelCatalog({ runtimeHandles: runtimeInitialization })
       : undefined;
+    const runtimeOAuthComposition = runtimeInitialization && plaintextRuntimeOAuthDevelopmentEnabled(process.env)
+      ? new VerifiedRuntimeOAuthComposition({ runtimeHandles: runtimeInitialization })
+      : undefined;
     const service = new HostService(
       store,
       undefined,
@@ -120,6 +125,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
       {
         runtimeIntegrityProvider: runtimeInitialization,
         runtimeModelCatalogProvider: runtimeModelCatalog,
+        runtimeOAuthComposition,
       },
     );
     const endpoint = options.socket ?? target.endpoint;
@@ -149,6 +155,17 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
     // Remove the otherwise-live signal listeners so that failure can exit.
     termination.cancel();
   }
+}
+
+/**
+ * Prime Agent v0.7.0 stores OAuth credentials in plaintext auth.json. Keep the
+ * checkpoint unreachable in normal production startup until keyring custody
+ * and durable restart receipts exist.
+ */
+export function plaintextRuntimeOAuthDevelopmentEnabled(
+  environment: Readonly<NodeJS.ProcessEnv>,
+): boolean {
+  return environment.PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV === "1";
 }
 
 function reportChannelCloseFailure(diagnostic: ChannelCloseFailureDiagnostic): void {

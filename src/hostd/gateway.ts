@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { TextDecoder } from "node:util";
 import type { CommandEnvelope } from "../shared/protocol";
+import type { ResidentSessionBinding } from "./resident-runtime";
 
 export const PRIME_RPC_MAX_COMMAND_BYTES = 128 * 1024;
 export const PRIME_RPC_MAX_PENDING_REQUESTS = 256;
@@ -30,6 +31,14 @@ export interface PrimeAgentGatewayEvent {
 }
 
 /**
+ * Private authority passed only after HostStore has durably admitted a command.
+ * It never crosses the host protocol or renderer boundary.
+ */
+export interface GatewayDispatchContext {
+  readonly residentBinding?: ResidentSessionBinding;
+}
+
+/**
  * Adapter boundary only. The host framed protocol is not Prime Agent's wire
  * protocol. Implementations translate durable host commands into a particular
  * local AgentConnection, daemon, or RPC transport.
@@ -38,7 +47,7 @@ export interface PrimeAgentGateway {
   /** Only durable resident adapters may be installed in HostService. */
   readonly continuity: "resident" | "unavailable";
   isLive(threadId: string, executionGenerationId: string): Promise<boolean>;
-  submit(command: CommandEnvelope): Promise<GatewayAdmission>;
+  submit(command: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission>;
   close(): Promise<void>;
 }
 
@@ -99,6 +108,11 @@ export function mapHostCommandToPrimeRpc(command: CommandEnvelope): PrimeRpcRequ
       throw new GatewayError(
         "RPC_COMMAND_UNSUPPORTED",
         "Approval resolution requires a daemon adapter with approval-object support",
+      );
+    case "model.select":
+      throw new GatewayError(
+        "RPC_COMMAND_UNSUPPORTED",
+        "Model selection requires an authority-bound resident daemon adapter",
       );
   }
 }

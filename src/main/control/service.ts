@@ -9,13 +9,20 @@ import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
   RuntimeModelCatalogSnapshotSchema,
+  RuntimeOAuthSessionSnapshotSchema,
   ThreadProjectionSnapshotSchema,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
+  type RuntimeOAuthSessionSnapshot,
 } from '../../shared/protocol'
+import {
+  CODEX_SUBSCRIPTION_PROVIDER_ID,
+  isPinnedCodexAuthorizationUrl
+} from '../../shared/codex-oauth'
 import type {
   ApprovalResolution,
   BootstrapPayload,
@@ -30,6 +37,7 @@ import type {
   HostRuntimeReadiness,
   HostInstallPlan,
   OutboxEntry,
+  RuntimeOAuthSessionView,
   SessionCursor,
   SshHostAlias,
   SshProbe,
@@ -89,6 +97,24 @@ interface CapturedProjectionAuthority {
   generation: number
 }
 
+interface ActiveRuntimeOAuthSession {
+  readonly authority: CapturedProjectionAuthority
+  readonly sessionId: string
+  readonly providerId: string
+  closing: boolean
+  cancellationPromise?: Promise<RuntimeOAuthSessionSnapshot>
+}
+
+interface OpeningRuntimeOAuthSession {
+  readonly url: string
+  readonly promise: Promise<void>
+}
+
+interface AmbiguousRuntimeOAuthStart {
+  readonly authority: CapturedProjectionAuthority
+  readonly providerId: string
+}
+
 interface HealthLineage {
   hostId: string
   hostdVersion: string
@@ -109,9 +135,12 @@ interface HealthObservation {
 interface ServiceOptions {
   app: App
   sshExecutable?: string
+  openExternal?: (url: string) => Promise<void>
 }
 
 const RECONNECT_DELAYS_MS = [500, 1_500, 3_500, 8_000, 15_000, 30_000] as const
+const OAUTH_START_REGISTRATION_TIMEOUT_MS = 35_000
+const OAUTH_DRAIN_TIMEOUT_MS = 15_000
 const HEALTH_POLL_INITIALIZING_MS = 500
 const HEALTH_POLL_STEADY_MS = 15_000
 const HEALTH_POLL_TIMEOUT_MS = 10_000
@@ -130,6 +159,16 @@ const TERMINAL_OR_DURABLE = new Set([
 export class DesktopControlService extends EventEmitter {
   private readonly app: App
   private readonly sshExecutable: string
+  private readonly openExternal: ((url: string) => Promise<void>) | undefined
+  private readonly oauthAuthorityId = `desktop-oauth-${randomUUID()}`
+  private readonly openedOAuthSessions = new Set<string>()
+  private readonly activeOAuthSessions = new Map<string, ActiveRuntimeOAuthSession>()
+  private readonly openingOAuthSessions = new Map<string, OpeningRuntimeOAuthSession>()
+  private readonly oauthStartRegistrations = new Set<Promise<void>>()
+  private readonly ambiguousOAuthStarts = new Map<string, AmbiguousRuntimeOAuthStart>()
+  private oauthTransitionBlockCount = 0
+  private oauthTransitionGeneration = 0
+  private oauthDrainPromise: Promise<void> | undefined
   private readonly cache: IndexedProjectionCacheStore<CacheEnvelope>
   private readonly outbox: AtomicJsonStore<OutboxEntry[]>
   private readonly latency = new LatencyRecorder()
@@ -156,6 +195,7 @@ export class DesktopControlService extends EventEmitter {
     super()
     this.app = options.app
     this.sshExecutable = options.sshExecutable ?? 'ssh'
+    this.openExternal = options.openExternal
     const stateDirectory = path.join(this.app.getPath('userData'), 'control')
     const emptyCache = (): CacheEnvelope => ({ version: 3, entries: {}, targetHostBindings: [] })
     this.cache = new IndexedProjectionCacheStore(
@@ -271,70 +311,108 @@ export class DesktopControlService extends EventEmitter {
   }
 
   async connect(target: ConnectionTarget): Promise<ConnectionState> {
-    if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
-    const intentGeneration = ++this.controlIntentGeneration
-    const cache = await this.cache.update((current) => ({
-      ...normalizeCache(current),
-      lastAttemptedTarget: target,
-      lastAttemptedAt: now()
-    }))
-    if (intentGeneration !== this.controlIntentGeneration) {
-      throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
-    }
+    this.beginOAuthConnectionTransition()
+    try {
+      if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
+      const intentGeneration = ++this.controlIntentGeneration
+      const cache = await this.cache.update((current) => ({
+        ...normalizeCache(current),
+        lastAttemptedTarget: target,
+        lastAttemptedAt: now()
+      }))
+      if (intentGeneration !== this.controlIntentGeneration) {
+        throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
+      }
 
-    // Persist the locator attempt before changing any live connection state.
-    // A failed cache write must leave the existing connection, poll lineage,
-    // and renderer authority internally consistent.
-    this.intentionallyOffline = false
-    const targetChanged = !this.target || !sameTarget(this.target, target)
-    if (targetChanged) {
-      this.authorityHostId = undefined
-      this.authorityCapabilities = []
-      this.authorityRuntimeReadiness = undefined
-      this.authorityHealthLineage = undefined
+      // The exact old authority must acknowledge cancellation before its
+      // transport is replaced. New OAuth admission remains blocked throughout.
+      await this.drainActiveRuntimeOAuthSessions()
+      if (intentGeneration !== this.controlIntentGeneration) {
+        throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
+      }
+
+      // Persist the locator attempt before changing any live connection state.
+      // A failed cache write or OAuth drain must leave the existing connection,
+      // poll lineage, and renderer authority internally consistent.
+      this.intentionallyOffline = false
+      const targetChanged = !this.target || !sameTarget(this.target, target)
+      if (targetChanged) {
+        this.authorityHostId = undefined
+        this.authorityCapabilities = []
+        this.authorityRuntimeReadiness = undefined
+        this.authorityHealthLineage = undefined
+      }
+      this.target = target
+      const generation = ++this.reconnectGeneration
+      if (
+        generation !== this.reconnectGeneration ||
+        this.intentionallyOffline ||
+        !this.target ||
+        !sameTarget(this.target, target)
+      ) {
+        throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
+      }
+      // A locator is never itself authority. It may restore only a binding that
+      // was learned from this target's prior health handshake.
+      this.authorityHostId = findBoundHostId(cache, target)
+      return await this.establish(target, 'connecting', generation)
+    } finally {
+      this.endOAuthConnectionTransition()
     }
-    this.target = target
-    const generation = ++this.reconnectGeneration
-    if (
-      generation !== this.reconnectGeneration ||
-      this.intentionallyOffline ||
-      !this.target ||
-      !sameTarget(this.target, target)
-    ) {
-      throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
-    }
-    // A locator is never itself authority. It may restore only a binding that
-    // was learned from this target's prior health handshake.
-    this.authorityHostId = findBoundHostId(cache, target)
-    return await this.establish(target, 'connecting', generation)
   }
 
   async reconnect(): Promise<ConnectionState> {
-    if (!this.target) {
-      throw new ControlError('connection.no_target', 'There is no previous host to reconnect to.')
+    this.beginOAuthConnectionTransition()
+    try {
+      const target = this.target
+      if (!target) {
+        throw new ControlError('connection.no_target', 'There is no previous host to reconnect to.')
+      }
+      this.controlIntentGeneration += 1
+      this.intentionallyOffline = false
+      const generation = ++this.reconnectGeneration
+      await this.drainActiveRuntimeOAuthSessions()
+      if (
+        generation !== this.reconnectGeneration ||
+        this.intentionallyOffline ||
+        !this.target ||
+        !sameTarget(this.target, target)
+      ) {
+        throw new ControlError('connection.superseded', 'The reconnection attempt was superseded.', { retryable: true })
+      }
+      return await this.establish(target, 'reconnecting', generation)
+    } finally {
+      this.endOAuthConnectionTransition()
     }
-    this.controlIntentGeneration += 1
-    this.intentionallyOffline = false
-    this.reconnectGeneration += 1
-    return await this.establish(this.target, 'reconnecting', this.reconnectGeneration)
   }
 
   async disconnect(): Promise<void> {
-    this.intentionallyOffline = true
-    this.controlIntentGeneration += 1
-    this.reconnectGeneration += 1
-    this.stopHealthPolling()
-    const connection = this.connection
-    this.connection = undefined
-    connection?.close()
-    this.setState({
-      phase: 'offline',
-      target: this.target,
-      ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
-      ...this.authorityObservationState(),
-      since: now(),
-      attempt: this.attempt
-    })
+    this.beginOAuthConnectionTransition()
+    try {
+      this.intentionallyOffline = true
+      this.controlIntentGeneration += 1
+      this.reconnectGeneration += 1
+      this.stopHealthPolling()
+      await this.drainActiveRuntimeOAuthSessions()
+      const connection = this.connection
+      this.connection = undefined
+      connection?.close()
+      this.setState({
+        phase: 'offline',
+        target: this.target,
+        ...(this.authorityHostId ? { hostId: this.authorityHostId } : {}),
+        ...this.authorityObservationState(),
+        since: now(),
+        attempt: this.attempt
+      })
+    } finally {
+      this.endOAuthConnectionTransition()
+    }
+  }
+
+  /** Orderly application shutdown uses the same host-confirmed drain as disconnect. */
+  async shutdown(): Promise<void> {
+    await this.disconnect()
   }
 
   async hostCatalog(): Promise<unknown> {
@@ -374,6 +452,496 @@ export class DesktopControlService extends EventEmitter {
     )
     this.assertProjectionAuthority(authority, 'runtime model catalog')
     return RuntimeModelCatalogSnapshotSchema.parse(result)
+  }
+
+  async startRuntimeOAuth(expectedHostId: string, providerId: string): Promise<RuntimeOAuthSessionView> {
+    this.assertRuntimeOAuthAdmissionOpen()
+    if (providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID) {
+      throw new ControlError('runtime.oauth_provider_unavailable', 'This desktop checkpoint supports ChatGPT sign-in only.')
+    }
+    let releaseRegistration!: () => void
+    let registrationReleased = false
+    const registration = new Promise<void>((resolve) => {
+      releaseRegistration = () => {
+        if (registrationReleased) return
+        registrationReleased = true
+        resolve()
+      }
+    })
+    this.oauthStartRegistrations.add(registration)
+    let active: ActiveRuntimeOAuthSession | undefined
+    try {
+      const authority = this.captureLocalOAuthAuthority(expectedHostId)
+      const transitionGeneration = this.oauthTransitionGeneration
+      const ambiguityKey = this.runtimeOAuthAmbiguityKey(authority, providerId)
+      let raw: unknown
+      try {
+        raw = await authority.connection.request(
+          'oauth.session.start',
+          { expectedHostId, authorityId: this.oauthAuthorityId, providerId },
+          { timeoutMs: 30_000 }
+        )
+      } catch (firstError) {
+        // The host may have admitted the session even when its response was
+        // lost. Broker start is idempotent for this exact authority/provider,
+        // so retry only that binding to recover the original session id.
+        try {
+          raw = await authority.connection.request(
+            'oauth.session.start',
+            { expectedHostId, authorityId: this.oauthAuthorityId, providerId },
+            { timeoutMs: 10_000, priority: 'urgent' }
+          )
+        } catch (reconciliationError) {
+          this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
+          throw new ControlError(
+            'runtime.oauth_start_ambiguous',
+            'The host may have started sign-in, but its session identity could not be recovered. Retry sign-in on this host before disconnecting.',
+            { retryable: true, cause: new AggregateError([firstError, reconciliationError]) }
+          )
+        }
+      }
+      // Until the returned identity is parsed and bound, treat the admitted
+      // start as ambiguous so a protocol violation cannot permit disconnect.
+      this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
+      const recoveredIdentity = recoverRuntimeOAuthIdentity(raw)
+      if (recoveredIdentity) {
+        active = this.registerActiveRuntimeOAuthSession(authority, recoveredIdentity)
+        this.ambiguousOAuthStarts.delete(ambiguityKey)
+      }
+      let snapshot = RuntimeOAuthSessionSnapshotSchema.parse(raw)
+      const sessionId = snapshot.sessionId
+      this.assertRuntimeOAuthSnapshotBinding(snapshot, sessionId, providerId)
+      active ??= this.registerActiveRuntimeOAuthSession(authority, snapshot)
+      this.ambiguousOAuthStarts.delete(ambiguityKey)
+      releaseRegistration()
+      this.assertProjectionAuthority(authority, 'OAuth session start')
+      if (
+        transitionGeneration !== this.oauthTransitionGeneration ||
+        this.oauthTransitionBlockCount > 0 ||
+        active.closing
+      ) {
+        throw new ControlError(
+          'runtime.oauth_transition_in_progress',
+          'Sign-in was cancelled because the host connection is changing.',
+          { retryable: true }
+        )
+      }
+
+      // Provider login starts asynchronously. Give the verified helper a
+      // bounded window to publish its browser URL. Every poll remains bound to
+      // the original session/provider before its result may affect main.
+      const deadline = Date.now() + 5_000
+      while (
+        !snapshot.authorization &&
+        !snapshot.challenge &&
+        (snapshot.phase === 'starting' || snapshot.phase === 'awaiting_user') &&
+        Date.now() < deadline
+      ) {
+        await delay(50)
+        if (active.closing) {
+          throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
+        }
+        this.assertProjectionAuthority(authority, 'OAuth session start')
+        const polledSnapshot = RuntimeOAuthSessionSnapshotSchema.parse(
+          await authority.connection.request(
+            'oauth.session.status',
+            { expectedHostId, authorityId: this.oauthAuthorityId, sessionId },
+            { timeoutMs: 10_000 }
+          )
+        )
+        this.assertRuntimeOAuthSnapshotBinding(polledSnapshot, sessionId, providerId)
+        snapshot = polledSnapshot
+      }
+      return await this.presentRuntimeOAuthSnapshot(active, snapshot)
+    } catch (error) {
+      if (active && !active.closing) {
+        // Protocol/authority failures after the host created a session must not
+        // leave that exact helper eligible to commit credentials unnoticed.
+        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
+      }
+      throw error
+    } finally {
+      releaseRegistration()
+      this.oauthStartRegistrations.delete(registration)
+    }
+  }
+
+  async runtimeOAuthStatus(expectedHostId: string, sessionId: string): Promise<RuntimeOAuthSessionView> {
+    this.assertRuntimeOAuthAdmissionOpen()
+    const active = this.requireActiveRuntimeOAuthSession(expectedHostId, sessionId)
+    if (active.closing) {
+      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
+    }
+    const raw = await active.authority.connection.request(
+      'oauth.session.status',
+      { expectedHostId, authorityId: this.oauthAuthorityId, sessionId },
+      { timeoutMs: 10_000 }
+    )
+    this.assertProjectionAuthority(active.authority, 'OAuth session status')
+    const snapshot = RuntimeOAuthSessionSnapshotSchema.parse(raw)
+    this.assertRuntimeOAuthSnapshotBinding(snapshot, sessionId, active.providerId)
+    return await this.presentRuntimeOAuthSnapshot(active, snapshot)
+  }
+
+  async cancelRuntimeOAuth(expectedHostId: string, sessionId: string): Promise<RuntimeOAuthSessionView> {
+    const active = this.requireActiveRuntimeOAuthSession(expectedHostId, sessionId)
+    active.closing = true
+    try {
+      const snapshot = await this.requestActiveRuntimeOAuthCancellation(active, 15_000)
+      this.assertProjectionAuthority(active.authority, 'OAuth session cancellation')
+      return await this.presentRuntimeOAuthSnapshot(active, snapshot)
+    } catch (error) {
+      if (this.activeOAuthSessions.get(this.runtimeOAuthSessionKey(active.authority.hostId, sessionId)) === active) {
+        active.closing = false
+      }
+      throw error
+    }
+  }
+
+  private captureLocalOAuthAuthority(expectedHostId: string): CapturedProjectionAuthority {
+    const authority = this.captureProjectionAuthority()
+    if (authority.hostId !== expectedHostId) {
+      throw new ControlError(
+        'runtime.oauth_authority_changed',
+        'The selected host changed before sign-in could start.',
+        { retryable: true, details: { expectedHostId, connectedHostId: authority.hostId } }
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'runtime.oauth_local_required',
+        'ChatGPT sign-in currently requires Prime Continuim and Prime Agent to run on the same computer.'
+      )
+    }
+    if (!this.authorityCapabilities.includes(RUNTIME_OAUTH_CAPABILITY)) {
+      throw new ControlError(
+        'runtime.oauth_unavailable',
+        'The connected host does not expose the verified Prime Agent sign-in capability.',
+        { retryable: true }
+      )
+    }
+    return authority
+  }
+
+  private async presentRuntimeOAuthSnapshot(
+    active: ActiveRuntimeOAuthSession,
+    snapshot: RuntimeOAuthSessionSnapshot
+  ): Promise<RuntimeOAuthSessionView> {
+    const authority = active.authority
+    const sessionKey = this.runtimeOAuthSessionKey(authority.hostId, snapshot.sessionId)
+    if (snapshot.authorization && !this.openedOAuthSessions.has(sessionKey)) {
+      if (
+        snapshot.providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID ||
+        !isPinnedCodexAuthorizationUrl(snapshot.authorization.url)
+      ) {
+        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
+        throw new ControlError(
+          'protocol.oauth_authorization_invalid',
+          'The host returned an authorization destination outside the verified Codex provider contract.'
+        )
+      }
+      const existingOpening = this.openingOAuthSessions.get(sessionKey)
+      if (existingOpening && existingOpening.url !== snapshot.authorization.url) {
+        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
+        throw new ControlError(
+          'protocol.oauth_authorization_changed',
+          'The host changed the authorization destination for an active sign-in session.'
+        )
+      }
+      let opening = existingOpening
+      if (!opening) {
+        const url = snapshot.authorization.url
+        let promise!: Promise<void>
+        promise = (async () => {
+          try {
+            await this.openRuntimeOAuthAuthorization(active, url)
+          } finally {
+            const retained = this.openingOAuthSessions.get(sessionKey)
+            if (retained?.promise === promise) this.openingOAuthSessions.delete(sessionKey)
+          }
+        })()
+        opening = { url, promise }
+        this.openingOAuthSessions.set(sessionKey, opening)
+      }
+      // All concurrent callers await the one opening promise. No renderer sees
+      // "opened" until the shell succeeds and the original authority remains.
+      await opening.promise
+    }
+
+    if (isTerminalRuntimeOAuthPhase(snapshot.phase)) {
+      this.openedOAuthSessions.delete(sessionKey)
+      if (this.activeOAuthSessions.get(sessionKey) === active) this.activeOAuthSessions.delete(sessionKey)
+    }
+    const interaction: RuntimeOAuthSessionView['interaction'] = snapshot.authorization && this.openedOAuthSessions.has(sessionKey)
+      ? { kind: 'browser', state: 'opened' }
+      : snapshot.challenge?.kind === 'select'
+        ? { kind: 'selection', state: 'unavailable' }
+        : snapshot.challenge
+          ? { kind: 'manual', state: 'unavailable' }
+          : undefined
+    return Object.freeze({
+      sessionId: snapshot.sessionId,
+      providerId: snapshot.providerId,
+      phase: snapshot.phase,
+      expiresAt: snapshot.expiresAt,
+      ...(interaction ? { interaction } : {}),
+      ...(snapshot.configured ? { configured: true as const } : {}),
+      ...(snapshot.error ? { error: Object.freeze({ ...snapshot.error }) } : {})
+    })
+  }
+
+  private assertRuntimeOAuthSnapshotBinding(
+    snapshot: RuntimeOAuthSessionSnapshot,
+    expectedSessionId: string,
+    expectedProviderId: string
+  ): void {
+    if (snapshot.sessionId !== expectedSessionId) {
+      throw new ControlError('protocol.oauth_session_mismatch', 'The host returned a different OAuth session.')
+    }
+    if (snapshot.providerId !== expectedProviderId) {
+      throw new ControlError('protocol.oauth_provider_mismatch', 'The host returned an OAuth session for another provider.')
+    }
+  }
+
+  private async openRuntimeOAuthAuthorization(
+    active: ActiveRuntimeOAuthSession,
+    url: string
+  ): Promise<void> {
+    const sessionKey = this.runtimeOAuthSessionKey(active.authority.hostId, active.sessionId)
+    this.assertProjectionAuthority(active.authority, 'OAuth browser launch')
+    if (active.closing || this.activeOAuthSessions.get(sessionKey) !== active) {
+      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
+    }
+    if (!this.openExternal) {
+      throw new ControlError('runtime.oauth_browser_unavailable', 'The system browser is unavailable for sign-in.')
+    }
+    try {
+      await this.openExternal(url)
+    } catch {
+      await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
+      throw new ControlError('runtime.oauth_browser_failed', 'The system browser could not open the sign-in page.', {
+        retryable: true
+      })
+    }
+    if (active.closing || this.activeOAuthSessions.get(sessionKey) !== active) {
+      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session closed while its browser opened.', {
+        retryable: true
+      })
+    }
+    try {
+      this.assertProjectionAuthority(active.authority, 'OAuth browser launch')
+    } catch (error) {
+      await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
+      throw error
+    }
+    this.openedOAuthSessions.add(sessionKey)
+  }
+
+  private registerActiveRuntimeOAuthSession(
+    authority: CapturedProjectionAuthority,
+    snapshot: Pick<RuntimeOAuthSessionSnapshot, 'sessionId' | 'providerId'>
+  ): ActiveRuntimeOAuthSession {
+    const sessionKey = this.runtimeOAuthSessionKey(authority.hostId, snapshot.sessionId)
+    const existing = this.activeOAuthSessions.get(sessionKey)
+    if (existing) {
+      if (
+        existing.providerId !== snapshot.providerId ||
+        existing.authority.connection !== authority.connection ||
+        existing.authority.generation !== authority.generation ||
+        !sameTarget(existing.authority.target, authority.target)
+      ) {
+        throw new ControlError('protocol.oauth_session_ambiguous', 'The host reused an OAuth session outside its authority.')
+      }
+      return existing
+    }
+    const active: ActiveRuntimeOAuthSession = {
+      authority,
+      sessionId: snapshot.sessionId,
+      providerId: snapshot.providerId,
+      closing: false
+    }
+    this.activeOAuthSessions.set(sessionKey, active)
+    return active
+  }
+
+  private async cancelAndRetireActiveRuntimeOAuthSession(
+    active: ActiveRuntimeOAuthSession
+  ): Promise<void> {
+    active.closing = true
+    await this.requestActiveRuntimeOAuthCancellation(active, 5_000)
+    const sessionKey = this.runtimeOAuthSessionKey(active.authority.hostId, active.sessionId)
+    if (this.activeOAuthSessions.get(sessionKey) === active) this.activeOAuthSessions.delete(sessionKey)
+    this.openedOAuthSessions.delete(sessionKey)
+  }
+
+  private async requestActiveRuntimeOAuthCancellation(
+    active: ActiveRuntimeOAuthSession,
+    timeoutMs: number
+  ): Promise<RuntimeOAuthSessionSnapshot> {
+    if (!active.cancellationPromise) {
+      const cancellation = (async () => {
+        const raw = await active.authority.connection.request(
+          'oauth.session.cancel',
+          {
+            expectedHostId: active.authority.hostId,
+            authorityId: this.oauthAuthorityId,
+            sessionId: active.sessionId
+          },
+          { timeoutMs, priority: 'urgent' }
+        )
+        const snapshot = RuntimeOAuthSessionSnapshotSchema.parse(raw)
+        this.assertRuntimeOAuthSnapshotBinding(snapshot, active.sessionId, active.providerId)
+        if (!isTerminalRuntimeOAuthPhase(snapshot.phase)) {
+          throw new ControlError('protocol.oauth_cancel_not_terminal', 'The host did not confirm sign-in cancellation.')
+        }
+        return snapshot
+      })()
+      active.cancellationPromise = cancellation
+      void cancellation.catch(() => {
+        if (active.cancellationPromise === cancellation) active.cancellationPromise = undefined
+      })
+    }
+    return active.cancellationPromise
+  }
+
+  private requireActiveRuntimeOAuthSession(
+    expectedHostId: string,
+    sessionId: string
+  ): ActiveRuntimeOAuthSession {
+    const sessionKey = this.runtimeOAuthSessionKey(expectedHostId, sessionId)
+    const active = this.activeOAuthSessions.get(sessionKey)
+    if (!active) {
+      throw new ControlError(
+        'runtime.oauth_session_untracked',
+        'This app process does not own the requested sign-in session. Start sign-in again.',
+        { retryable: true }
+      )
+    }
+    const authority = this.captureLocalOAuthAuthority(expectedHostId)
+    if (
+      authority.connection !== active.authority.connection ||
+      authority.generation !== active.authority.generation ||
+      !sameTarget(authority.target, active.authority.target)
+    ) {
+      throw new ControlError('runtime.oauth_authority_changed', 'The sign-in session belongs to an older host authority.', {
+        retryable: true
+      })
+    }
+    return active
+  }
+
+  private runtimeOAuthSessionKey(hostId: string, sessionId: string): string {
+    return `${hostId}\u0000${sessionId}`
+  }
+
+  private runtimeOAuthAmbiguityKey(authority: CapturedProjectionAuthority, providerId: string): string {
+    return `${authority.hostId}\u0000${providerId}`
+  }
+
+  private assertRuntimeOAuthAdmissionOpen(): void {
+    if (this.oauthTransitionBlockCount > 0) {
+      throw new ControlError(
+        'runtime.oauth_transition_in_progress',
+        'Sign-in is unavailable while the host connection is changing.',
+        { retryable: true }
+      )
+    }
+  }
+
+  private beginOAuthConnectionTransition(): void {
+    this.oauthTransitionBlockCount += 1
+    this.oauthTransitionGeneration += 1
+  }
+
+  private endOAuthConnectionTransition(): void {
+    this.oauthTransitionBlockCount = Math.max(0, this.oauthTransitionBlockCount - 1)
+  }
+
+  private drainActiveRuntimeOAuthSessions(): Promise<void> {
+    this.oauthDrainPromise ??= this.performRuntimeOAuthDrain().finally(() => {
+      this.oauthDrainPromise = undefined
+    })
+    return this.oauthDrainPromise
+  }
+
+  private async performRuntimeOAuthDrain(): Promise<void> {
+    const registrations = [...this.oauthStartRegistrations]
+    if (registrations.length > 0) {
+      await withOperationBound(
+        Promise.all(registrations).then(() => undefined),
+        OAUTH_START_REGISTRATION_TIMEOUT_MS,
+        () => new ControlError(
+          'runtime.oauth_drain_unconfirmed',
+          'An in-flight sign-in could not be bound before the host transition.',
+          { retryable: true }
+        )
+      )
+    }
+
+    if (this.ambiguousOAuthStarts.size > 0) {
+      throw new ControlError(
+        'runtime.oauth_drain_unconfirmed',
+        'A sign-in start has no confirmed session identity. Retry sign-in on the same host before changing connections.',
+        { retryable: true }
+      )
+    }
+
+    const sessions = [...this.activeOAuthSessions.values()]
+    if (sessions.length === 0) return
+    for (const session of sessions) session.closing = true
+
+    const cancellations = await Promise.allSettled(sessions.map(async (session) => {
+      await this.requestActiveRuntimeOAuthCancellation(session, 10_000)
+    }))
+    const cancellationFailures = cancellations.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : []
+    )
+    if (cancellationFailures.length > 0) {
+      throw new ControlError(
+        'runtime.oauth_drain_unconfirmed',
+        'The host did not confirm every active sign-in session as closed.',
+        { retryable: true, cause: new AggregateError(cancellationFailures) }
+      )
+    }
+
+    const openings = sessions.flatMap((session) => {
+      const opening = this.openingOAuthSessions.get(
+        this.runtimeOAuthSessionKey(session.authority.hostId, session.sessionId)
+      )
+      return opening ? [opening.promise] : []
+    })
+    if (openings.length > 0) {
+      await withOperationBound(
+        Promise.allSettled(openings).then(() => undefined),
+        OAUTH_DRAIN_TIMEOUT_MS,
+        () => new ControlError(
+          'runtime.oauth_drain_unconfirmed',
+          'The system browser launch did not settle before the host transition.',
+          { retryable: true }
+        )
+      )
+    }
+
+    for (const session of sessions) {
+      const sessionKey = this.runtimeOAuthSessionKey(session.authority.hostId, session.sessionId)
+      if (this.activeOAuthSessions.get(sessionKey) === session) this.activeOAuthSessions.delete(sessionKey)
+      this.openedOAuthSessions.delete(sessionKey)
+    }
+  }
+
+  private abandonRuntimeOAuthSessionsForConnection(connection: FramedConnection): void {
+    // An unexpected transport loss cannot be acknowledged by the host. Forget
+    // only main's local handles; hostd retains authority and expires helpers by
+    // its bounded TTL. Explicit disconnect/switch never takes this path.
+    for (const [sessionKey, session] of this.activeOAuthSessions) {
+      if (session.authority.connection !== connection) continue
+      session.closing = true
+      this.activeOAuthSessions.delete(sessionKey)
+      this.openedOAuthSessions.delete(sessionKey)
+    }
+    for (const [ambiguityKey, start] of this.ambiguousOAuthStarts) {
+      if (start.authority.connection === connection) this.ambiguousOAuthStarts.delete(ambiguityKey)
+    }
   }
 
   async threadProjection(threadId: string, cursor?: SessionCursor): Promise<unknown> {
@@ -761,6 +1329,7 @@ export class DesktopControlService extends EventEmitter {
       if (this.connection !== connection) return
       this.stopHealthPolling()
       this.connection = undefined
+      this.abandonRuntimeOAuthSessionsForConnection(connection)
       if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
       this.beginAutomaticReconnect(target, error)
     })
@@ -1632,6 +2201,13 @@ function isHostId(value: unknown): value is string {
   )
 }
 
+function recoverRuntimeOAuthIdentity(
+  value: unknown
+): Pick<RuntimeOAuthSessionSnapshot, 'sessionId' | 'providerId'> | undefined {
+  if (!isRecord(value) || !isHostId(value.sessionId) || !isHostId(value.providerId)) return undefined
+  return { sessionId: value.sessionId, providerId: value.providerId }
+}
+
 function isConnectionTarget(value: unknown): value is ConnectionTarget {
   if (!isRecord(value)) return false
   return value.kind === 'local' || (value.kind === 'ssh' && typeof value.alias === 'string' && value.alias.length > 0)
@@ -1650,6 +2226,29 @@ async function delay(milliseconds: number): Promise<void> {
     const timer = setTimeout(resolve, milliseconds)
     timer.unref?.()
   })
+}
+
+function isTerminalRuntimeOAuthPhase(phase: RuntimeOAuthSessionSnapshot['phase']): boolean {
+  return phase === 'completed' || phase === 'cancelled' || phase === 'failed'
+}
+
+async function withOperationBound<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutError: () => Error
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(timeoutError()), timeoutMs)
+        timer.unref?.()
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function withJitter(milliseconds: number): number {
