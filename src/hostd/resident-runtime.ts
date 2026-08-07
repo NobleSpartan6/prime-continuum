@@ -456,7 +456,7 @@ const ResidentRuntimeCompatibilitySchema = z
   })
   .strict();
 
-const ResidentSessionBindingSchema = z
+export const ResidentSessionBindingSchema = z
   .object({
     bindingVersion: z.literal(1),
     lifecycle: z.literal("resident"),

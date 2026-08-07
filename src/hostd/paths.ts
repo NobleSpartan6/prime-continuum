@@ -27,6 +27,8 @@ export interface HostDataPaths {
   journals: string;
   eventJournal: string;
   commandJournal: string;
+  workspaceAuthorities: string;
+  residentSessionBindings: string;
 }
 
 export function resolveHostDataDir(
@@ -85,5 +87,7 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     journals,
     eventJournal: join(journals, "events.jsonl"),
     commandJournal: join(journals, "commands.jsonl"),
+    workspaceAuthorities: join(root, "workspace-authorities.json"),
+    residentSessionBindings: join(root, "resident-session-bindings.json"),
   };
 }
