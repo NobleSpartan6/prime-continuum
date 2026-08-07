@@ -11,6 +11,7 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import {
   AtomicWriteAmbiguousCommitError,
@@ -145,6 +146,28 @@ export interface InstalledRuntimeIntegrityIdentity extends InstalledPointer {
   readonly hostRuntime: RuntimeHostIdentity;
   readonly fileCount: number;
   readonly totalBytes: number;
+}
+
+declare const verifiedInstalledRuntimeHandleBrand: unique symbol;
+
+/**
+ * Process-local proof that the exact installed runtime tree was freshly
+ * verified while this host still owned its endpoint generation.
+ *
+ * The private brand keeps path-bearing launch material out of structural IPC
+ * contracts. This value must stay inside hostd and be acquired immediately
+ * before constructing a resident adapter.
+ */
+export interface VerifiedInstalledRuntimeHandle {
+  readonly [verifiedInstalledRuntimeHandleBrand]: never;
+  /** Path-free identity suitable for comparison and diagnostics. */
+  readonly identity: InstalledRuntimeIntegrityIdentity;
+  /** Absolute path of the identity-checked Electron RunAsNode host. */
+  readonly executable: string;
+  /** Absolute file URL of the verified Prime Agent module entrypoint. */
+  readonly moduleUrl: string;
+  /** Absolute path of the verified Prime Agent CLI entrypoint. */
+  readonly cliEntrypoint: string;
 }
 
 export const RUNTIME_INTEGRITY_CANCELLED = "RUNTIME_INTEGRITY_CANCELLED" as const;
@@ -309,6 +332,29 @@ export class RuntimeIntegrityManager {
     throwIfRuntimeIntegrityCancelled(this.ownershipLease.signal);
     this.reportProgress("verifying");
     return await this.verifyInstalledUnderLease();
+  }
+
+  /**
+   * Re-hashes the complete installed image and proves active endpoint
+   * ownership before materializing the private paths required for resident
+   * launch. No successful initialization result or earlier handle is reused.
+   *
+   * This remains a development-integrity proof: these are verified path
+   * strings, not race-free native file handles. Ordinary Node filesystem APIs
+   * cannot close the documented same-user Windows reparse-point/TOCTOU window;
+   * production authorization still requires a signed outer chain and native
+   * handle verifier.
+   */
+  async acquireVerifiedRuntimeHandle(): Promise<VerifiedInstalledRuntimeHandle> {
+    this.assertManagerUsable();
+    await this.ownershipLease.assertActive();
+    throwIfRuntimeIntegrityCancelled(this.ownershipLease.signal);
+    const identity = await this.verifyInstalledUnderLease();
+
+    // verifyInstalledUnderLease performs the final physical ownership proof.
+    // Keep path derivation synchronous so there is no additional asynchronous
+    // gap between that proof and returning the process-local capability.
+    return this.runtimeHandle(identity);
   }
 
   private async verifyInstalledUnderLease(): Promise<InstalledRuntimeIntegrityIdentity> {
@@ -705,6 +751,25 @@ export class RuntimeIntegrityManager {
       totalBytes: manifest.tree.totalBytes,
     });
   }
+
+  private runtimeHandle(identity: InstalledRuntimeIntegrityIdentity): VerifiedInstalledRuntimeHandle {
+    const executable = boundedAbsoluteRuntimeLocation(process.execPath, "runtime host executable");
+    const finalDirectory = this.finalDirectory();
+    const moduleEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.module, "module");
+    const cliEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.cli, "CLI");
+    return Object.freeze({
+      identity,
+      executable,
+      moduleUrl: pathToFileURL(moduleEntrypoint).href,
+      cliEntrypoint,
+    }) as VerifiedInstalledRuntimeHandle;
+  }
+
+  private entrypointLocation(directory: string, relativePath: string, label: string): string {
+    const location = join(directory, ...relativePath.split("/"));
+    assertContainedPath(directory, location, `runtime ${label} entrypoint`);
+    return boundedAbsoluteRuntimeLocation(location, `runtime ${label} entrypoint`);
+  }
 }
 
 type PublicationOutcome =
@@ -720,6 +785,13 @@ function isPublicationUncertain(error: unknown): boolean {
 
 function asError(error: unknown, message: string): Error {
   return error instanceof Error ? error : new Error(message, { cause: error });
+}
+
+function boundedAbsoluteRuntimeLocation(value: string, label: string): string {
+  if (!isAbsolute(value) || value.length === 0 || value.length > 4_096 || /[\0\r\n]/.test(value)) {
+    throw new Error(`${label} must be a bounded absolute path`);
+  }
+  return value;
 }
 
 function classifyRuntimeRepairFailure(

@@ -16,6 +16,7 @@ import {
   type InstalledRuntimeIntegrityIdentity,
   type RuntimeIntegrityManagerOptions,
   type RuntimeIntegrityProgressPhase,
+  type VerifiedInstalledRuntimeHandle,
 } from "./runtime-integrity-manager";
 import {
   RuntimeIntegritySnapshotSchema,
@@ -28,6 +29,16 @@ const MAX_AUTOMATIC_RUNTIME_INITIALIZATION_ATTEMPTS = 2;
 
 export interface RuntimeIntegrityInstaller {
   ensureInstalled(seedRoot?: string): Promise<InstalledRuntimeIntegrityIdentity>;
+  acquireVerifiedRuntimeHandle(): Promise<VerifiedInstalledRuntimeHandle>;
+}
+
+export class RuntimeIntegrityHandleUnavailableError extends Error {
+  readonly code = "RUNTIME_VERIFIED_HANDLE_UNAVAILABLE" as const;
+
+  constructor() {
+    super("A verified runtime handle is available only while runtime integrity is ready");
+    this.name = "RuntimeIntegrityHandleUnavailableError";
+  }
 }
 
 export type RuntimeIntegrityManagerFactory = (
@@ -65,6 +76,7 @@ export class RuntimeInitializationCoordinator {
   private seedRoot: string | undefined;
   private manager: RuntimeIntegrityInstaller | undefined;
   private activeAttempt: Promise<void> | undefined;
+  private readonly activeHandleAcquisitions = new Set<Promise<VerifiedInstalledRuntimeHandle>>();
   private attempt = 0;
   private started = false;
   private closed = false;
@@ -128,9 +140,85 @@ export class RuntimeInitializationCoordinator {
     return true;
   }
 
+  /**
+   * Returns host-only launch material only from a ready generation. Every call
+   * causes a fresh installed-tree verification; a byte, identity, or ownership
+   * drift revokes readiness before the error is returned.
+   */
+  acquireVerifiedRuntimeHandle(): Promise<VerifiedInstalledRuntimeHandle> {
+    const lease = this.lease;
+    const manager = this.manager;
+    if (
+      this.closed ||
+      !lease ||
+      !manager ||
+      lease.signal.aborted ||
+      this.currentSnapshot.status !== "ready"
+    ) {
+      return Promise.reject(runtimeHandleUnavailable());
+    }
+
+    const generation = lease.generation;
+    const attempt = this.attempt;
+    const acquisition = this.acquireReadyRuntimeHandle(manager, lease, generation, attempt);
+    this.activeHandleAcquisitions.add(acquisition);
+    const clear = (): void => {
+      this.activeHandleAcquisitions.delete(acquisition);
+    };
+    void acquisition.then(clear, clear);
+    return acquisition;
+  }
+
   async close(): Promise<void> {
     this.closed = true;
-    await this.activeAttempt;
+    await Promise.allSettled([
+      ...(this.activeAttempt ? [this.activeAttempt] : []),
+      ...this.activeHandleAcquisitions,
+    ]);
+  }
+
+  private async acquireReadyRuntimeHandle(
+    manager: RuntimeIntegrityInstaller,
+    lease: HostOwnershipLease,
+    generation: string,
+    attempt: number,
+  ): Promise<VerifiedInstalledRuntimeHandle> {
+    try {
+      const handle = await manager.acquireVerifiedRuntimeHandle();
+      assertIdentityMatchesTarget(handle.identity, this.target);
+      // The manager proves ownership after its full scan. This independent
+      // coordinator proof closes the handoff window for alternate factories
+      // and ensures the public ready state still names this generation.
+      await lease.assertActive();
+      if (!this.isReadyForHandle(lease, generation, attempt)) {
+        throw runtimeHandleUnavailable();
+      }
+      return handle;
+    } catch (error) {
+      if (this.isReadyForHandle(lease, generation, attempt)) {
+        try {
+          this.onFailure?.(error);
+        } catch {
+          // Private diagnostics cannot alter fail-closed readiness.
+        }
+        this.currentSnapshot = this.parseSnapshot({
+          ...this.baseSnapshot(),
+          status: "failed",
+          ...classifyInitializationFailure(error),
+        });
+      }
+      throw error;
+    }
+  }
+
+  private isReadyForHandle(lease: HostOwnershipLease, generation: string, attempt: number): boolean {
+    return (
+      !this.closed &&
+      this.lease === lease &&
+      lease.generation === generation &&
+      this.attempt === attempt &&
+      this.currentSnapshot.status === "ready"
+    );
   }
 
   private beginAttempt(): void {
@@ -348,6 +436,10 @@ function errorChainHasCode(error: unknown): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+function runtimeHandleUnavailable(): RuntimeIntegrityHandleUnavailableError {
+  return new RuntimeIntegrityHandleUnavailableError();
 }
 
 function deepFreeze<T>(value: T): T {

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AtomicWriteAmbiguousCommitError, atomicWriteJson } from "../../src/hostd/atomic-files";
 import {
@@ -64,6 +65,66 @@ describe("runtime integrity manager", () => {
 
     await rm(fixture.seedRoot, { recursive: true, force: true });
     await expect(createManager(fixture).ensureInstalled()).resolves.toEqual(installed);
+  });
+
+  it("issues a host-only launch handle only after a fresh full-tree verification", async () => {
+    const fixture = await createFixture();
+    const installed = await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    const finalDirectory = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    let fullVerifications = 0;
+    const verifier = createManager(fixture, {
+      faultInjector(point) {
+        if (point === "before_final_verify") fullVerifications += 1;
+      },
+    });
+
+    const first = await verifier.acquireVerifiedRuntimeHandle();
+    expect(first.identity).toEqual(installed);
+    expect(first.executable).toBe(process.execPath);
+    expect(isAbsolute(first.executable)).toBe(true);
+    expect(first.moduleUrl).toBe(pathToFileURL(join(
+      finalDirectory,
+      "node_modules",
+      "prime-agent",
+      "dist",
+      "index.js",
+    )).href);
+    expect(first.cliEntrypoint).toBe(join(
+      finalDirectory,
+      "node_modules",
+      "prime-agent",
+      "dist",
+      "bundle",
+      "cli.js",
+    ));
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first.identity)).toBe(true);
+    expect(JSON.stringify(first.identity)).not.toContain(fixture.root);
+    expect(fullVerifications).toBe(1);
+
+    await expect(verifier.acquireVerifiedRuntimeHandle()).resolves.toMatchObject({ identity: installed });
+    expect(fullVerifications).toBe(2);
+
+    await writeFile(first.cliEntrypoint, "export const cli = 'tampered';\n");
+    await expect(verifier.acquireVerifiedRuntimeHandle()).rejects.toBeInstanceOf(
+      RuntimeIntegrityInstalledCorruptionError,
+    );
+    expect(fullVerifications).toBe(3);
+  });
+
+  it("returns no launch handle when ownership drifts after the fresh tree scan", async () => {
+    const fixture = await createFixture();
+    await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    let ownershipChecks = 0;
+    const ownershipLease = createTestOwnershipLease(async () => {
+      ownershipChecks += 1;
+      if (ownershipChecks === 2) throw new Error("simulated post-verification ownership loss");
+    });
+
+    await expect(createManager(fixture, { ownershipLease }).acquireVerifiedRuntimeHandle()).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_LOST",
+    });
+    expect(ownershipChecks).toBe(2);
   });
 
   it("recreates only a missing attested final when a durable pointer and seed remain", async () => {

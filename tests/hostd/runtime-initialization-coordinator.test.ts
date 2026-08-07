@@ -16,6 +16,7 @@ import {
   RuntimeIntegrityTransientVerificationError,
   type InstalledRuntimeIntegrityIdentity,
   type RuntimeIntegrityManagerOptions,
+  type VerifiedInstalledRuntimeHandle,
 } from "../../src/hostd/runtime-integrity-manager";
 
 describe("RuntimeInitializationCoordinator", () => {
@@ -28,7 +29,7 @@ describe("RuntimeInitializationCoordinator", () => {
       schedule: (work) => scheduled.push(work),
       managerFactory: (options) => {
         managerOptions = options;
-        return { ensureInstalled };
+        return { ensureInstalled, acquireVerifiedRuntimeHandle: async () => verifiedHandle() };
       },
     });
     const lease = createLease();
@@ -65,6 +66,110 @@ describe("RuntimeInitializationCoordinator", () => {
     expect(Object.isFrozen(coordinator.snapshot())).toBe(true);
   });
 
+  it("exposes fresh verified handles only while the owned generation is ready", async () => {
+    const scheduled: Array<() => void> = [];
+    const acquireVerifiedRuntimeHandle = vi.fn(async () => verifiedHandle());
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle,
+      }),
+    });
+
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toMatchObject({
+      code: "RUNTIME_VERIFIED_HANDLE_UNAVAILABLE",
+    });
+    coordinator.start(createLease());
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toMatchObject({
+      code: "RUNTIME_VERIFIED_HANDLE_UNAVAILABLE",
+    });
+    scheduled.shift()?.();
+    await flushMicrotasks();
+
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).resolves.toMatchObject({
+      identity: installedIdentity(),
+    });
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).resolves.toMatchObject({
+      cliEntrypoint: expect.stringContaining("prime-agent"),
+    });
+    expect(acquireVerifiedRuntimeHandle).toHaveBeenCalledTimes(2);
+    expect(coordinator.snapshot().status).toBe("ready");
+    expect(JSON.stringify(coordinator.snapshot())).not.toMatch(/Prime Continuim|cli\.js|file:\/\//);
+  });
+
+  it("revokes readiness when fresh pre-use verification detects installed-byte drift", async () => {
+    const scheduled: Array<() => void> = [];
+    const acquireVerifiedRuntimeHandle = vi.fn(async () => {
+      throw new RuntimeIntegrityInstalledCorruptionError(new Error("C:\\private\\runtime\\cli.js drifted"));
+    });
+    const onFailure = vi.fn();
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle,
+      }),
+      onFailure,
+    });
+    coordinator.start(createLease());
+    scheduled.shift()?.();
+    await flushMicrotasks();
+
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toBeInstanceOf(
+      RuntimeIntegrityInstalledCorruptionError,
+    );
+    expect(coordinator.snapshot()).toMatchObject({
+      status: "failed",
+      code: "RUNTIME_INSTALLED_CORRUPTION",
+      retryable: false,
+      recoveryAction: "repair_application",
+    });
+    expect(JSON.stringify(coordinator.snapshot())).not.toMatch(/private|cli\.js|drifted/i);
+    expect(onFailure).toHaveBeenCalledOnce();
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toMatchObject({
+      code: "RUNTIME_VERIFIED_HANDLE_UNAVAILABLE",
+    });
+    expect(acquireVerifiedRuntimeHandle).toHaveBeenCalledOnce();
+  });
+
+  it("revokes readiness when final coordinator ownership proof drifts", async () => {
+    const scheduled: Array<() => void> = [];
+    const lease = createLease();
+    let ownershipChecks = 0;
+    lease.assertActive = async () => {
+      ownershipChecks += 1;
+      if (ownershipChecks === 2) {
+        throw new HostOwnershipLeaseError(
+          "HOST_OWNERSHIP_LOST",
+          lease.generation,
+          "simulated listener ownership replacement",
+        );
+      }
+    };
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
+      }),
+    });
+    coordinator.start(lease);
+    scheduled.shift()?.();
+    await flushMicrotasks();
+    expect(coordinator.snapshot().status).toBe("ready");
+
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toMatchObject({
+      code: "HOST_OWNERSHIP_LOST",
+    });
+    expect(ownershipChecks).toBe(2);
+    expect(coordinator.snapshot()).toMatchObject({
+      status: "failed",
+      code: "RUNTIME_OWNERSHIP_INTERRUPTED",
+      retryable: false,
+    });
+  });
+
   it("fully re-verifies one explicitly transient failure, then exposes no raw error and fences a manual retry", async () => {
     const scheduled: Array<() => void> = [];
     const attempts = [
@@ -75,6 +180,7 @@ describe("RuntimeInitializationCoordinator", () => {
     let call = 0;
     const installer: RuntimeIntegrityInstaller = {
       ensureInstalled: vi.fn(() => attempts[call++]!.promise),
+      acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
     };
     let managerOptions: RuntimeIntegrityManagerOptions | undefined;
     const onFailure = vi.fn();
@@ -231,7 +337,7 @@ describe("RuntimeInitializationCoordinator", () => {
     });
     const coordinator = createCoordinator({
       schedule: (work) => scheduled.push(work),
-      managerFactory: () => ({ ensureInstalled }),
+      managerFactory: () => ({ ensureInstalled, acquireVerifiedRuntimeHandle: async () => verifiedHandle() }),
     });
 
     coordinator.start(createLease(), "C:\\runtime-seed");
@@ -249,6 +355,7 @@ describe("RuntimeInitializationCoordinator", () => {
       schedule: (work) => scheduled.push(work),
       managerFactory: () => ({
         ensureInstalled: async () => ({ ...installedIdentity(), treeSha256: "f".repeat(64) }),
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
       }),
     });
     coordinator.start(createLease());
@@ -296,7 +403,10 @@ describe("RuntimeInitializationCoordinator", () => {
     };
     const coordinator = createCoordinator({
       schedule: (work) => scheduled.push(work),
-      managerFactory: () => ({ ensureInstalled: async () => installedIdentity() }),
+      managerFactory: () => ({
+        ensureInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
+      }),
     });
 
     coordinator.start(lease);
@@ -315,7 +425,10 @@ describe("RuntimeInitializationCoordinator", () => {
     const install = deferred<InstalledRuntimeIntegrityIdentity>();
     const coordinator = createCoordinator({
       schedule: (work) => scheduled.push(work),
-      managerFactory: () => ({ ensureInstalled: () => install.promise }),
+      managerFactory: () => ({
+        ensureInstalled: () => install.promise,
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
+      }),
     });
     coordinator.start(createLease());
     scheduled.shift()?.();
@@ -339,7 +452,7 @@ describe("RuntimeInitializationCoordinator", () => {
     const ensureInstalled = vi.fn(async () => installedIdentity());
     const coordinator = createCoordinator({
       schedule: (work) => scheduled.push(work),
-      managerFactory: () => ({ ensureInstalled }),
+      managerFactory: () => ({ ensureInstalled, acquireVerifiedRuntimeHandle: async () => verifiedHandle() }),
     });
     const lease = createLease();
 
@@ -465,6 +578,17 @@ function installedIdentity(): InstalledRuntimeIntegrityIdentity {
     fileCount: 3,
     totalBytes: 42,
   };
+}
+
+function verifiedHandle(
+  identity: InstalledRuntimeIntegrityIdentity = installedIdentity(),
+): VerifiedInstalledRuntimeHandle {
+  return Object.freeze({
+    identity,
+    executable: "C:\\Prime Continuim\\Prime Continuim.exe",
+    moduleUrl: "file:///C:/Prime%20Continuim/runtime/node_modules/prime-agent/dist/index.js",
+    cliEntrypoint: "C:\\Prime Continuim\\runtime\\node_modules\\prime-agent\\dist\\bundle\\cli.js",
+  }) as unknown as VerifiedInstalledRuntimeHandle;
 }
 
 function deferred<T>(): {
