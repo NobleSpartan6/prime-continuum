@@ -79,6 +79,34 @@ describe('Prime Continuim renderer', () => {
     expect((await screen.findAllByText(/saved in this device’s outbox/i)).some((element) => !element.classList.contains('sr-only'))).toBe(true)
   })
 
+  it('cannot retain a hidden steer intent after selecting a non-running thread', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const devbox = snapshot.hosts.find((host) => host.id === 'host-devbox')
+      if (devbox) devbox.connection = 'online'
+      return snapshot
+    }
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const steerIntent = screen.getByRole('button', { name: 'Steer now' })
+    await user.click(steerIntent)
+    expect(steerIntent).toHaveAttribute('aria-pressed', 'true')
+
+    await user.click(screen.getByRole('button', { name: /Frame protocol boundaries/ }))
+    expect(await screen.findByRole('heading', { name: 'Frame protocol boundaries' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Steer now' })).not.toBeInTheDocument()
+    expect(screen.getByText('Follow up', { selector: '.composer__intent' })).toBeVisible()
+
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Summarize the approval boundary.')
+    await user.click(screen.getByRole('button', { name: 'Send follow-up' }))
+    expect(api.sendComposer).toHaveBeenCalledWith(expect.objectContaining({ intent: 'follow_up' }))
+  })
+
   it('asks the adapter for the authoritative snapshot when a thread is selected', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -212,7 +240,7 @@ describe('Prime Continuim renderer', () => {
     expect(within(contextPanel).queryByText('Running')).not.toBeInTheDocument()
   })
 
-  it('renders controls without backing operations as honestly unavailable', async () => {
+  it('omits controls that do not have backing operations', async () => {
     render(<App api={createPreviewRendererApi()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
@@ -220,8 +248,8 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('button', { name: 'New thread' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Running.*Seamless remote experience/i })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Search projects and threads' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Attach files' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
   })
 
   it('labels verification-only host identity results without inventing a fingerprint', async () => {
@@ -307,7 +335,7 @@ describe('Prime Continuim renderer', () => {
     expect(await screen.findByText('Prime Continuim')).toBeVisible()
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Needs you' })).toHaveFocus())
     expect(screen.getByText('Browser preview · sample data')).toBeVisible()
-    expect(screen.getByRole('note')).toHaveTextContent(/Preview only.*Secure mobile relay is not available/i)
+    expect(screen.getByRole('note')).toHaveTextContent(/Read-only preview.*Secure relay unavailable/i)
     expect(screen.getByRole('navigation', { name: 'Companion navigation' })).toBeVisible()
 
     await user.click(screen.getByRole('button', { name: 'Threads' }))
@@ -411,7 +439,6 @@ describe('Prime Continuim renderer', () => {
     const threadView = document.querySelector('.thread-view')
     expect(threadView).not.toBeNull()
     expect(Array.from(threadView?.children ?? []).map((element) => element.className)).toEqual([
-      'thread-header',
       'thread-notices',
       'transcript',
       'composer-wrap',

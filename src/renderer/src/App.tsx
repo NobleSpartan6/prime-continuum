@@ -30,13 +30,11 @@ import {
   Network,
   PanelLeftClose,
   PanelRightClose,
-  Paperclip,
   RefreshCw,
   Search,
   Server,
   ShieldCheck,
   Smartphone,
-  Square,
   Terminal,
   TestTube2,
   Wifi,
@@ -403,14 +401,16 @@ export default function App({ api: suppliedApi }: AppProps) {
   activeHostIdRef.current = selectedHost?.id
 
   useEffect(() => {
-    if (!selectedHost) return
+    if (!selectedHost || !selectedThread) return
     if (selectedHost.connection !== 'online') {
       setComposerReceipt((current) =>
         current.state === 'idle' ? { state: 'waiting_for_connection', message: 'Waiting for connection' } : current,
       )
-      if (composerMode === 'steer') setComposerMode('follow_up')
     }
-  }, [composerMode, selectedHost])
+    if (composerMode === 'steer' && (selectedHost.connection !== 'online' || selectedThread.status !== 'running')) {
+      setComposerMode('follow_up')
+    }
+  }, [composerMode, selectedHost, selectedThread])
 
   const selectThread = (thread: ThreadSummary) => {
     const requestId = ++threadSelectionRequestRef.current
@@ -485,7 +485,8 @@ export default function App({ api: suppliedApi }: AppProps) {
       setComposerReceipt({ state: 'rejected', message: 'Write a message before sending.' })
       return
     }
-    if (composerMode === 'steer' && selectedHost.connection !== 'online') {
+    const effectiveComposerMode = selectedThread.status === 'running' ? composerMode : 'follow_up'
+    if (effectiveComposerMode === 'steer' && selectedHost.connection !== 'online') {
       setComposerReceipt({ state: 'rejected', message: `Reconnect to ${selectedHost.name} before steering this turn.` })
       return
     }
@@ -501,7 +502,7 @@ export default function App({ api: suppliedApi }: AppProps) {
       const receipt = await api.sendComposer({
         threadId: selectedThread.id,
         text,
-        intent: composerMode,
+        intent: effectiveComposerMode,
         sendWhenReconnected,
       })
       if (activeHostIdRef.current !== submissionHostId) return
@@ -624,6 +625,7 @@ export default function App({ api: suppliedApi }: AppProps) {
             className="icon-button topbar__mobile-control"
             type="button"
             aria-label={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
+            title={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
             aria-expanded={sidebarOpen}
             aria-controls="project-sidebar"
             onClick={() => {
@@ -635,19 +637,52 @@ export default function App({ api: suppliedApi }: AppProps) {
           </button>
           <BrandMark />
           <strong className="topbar__brand-name">Prime Continuim</strong>
-          <div className="topbar__project">
-            <span className="eyebrow">Project</span>
-            <strong>{selectedProject.name}</strong>
+        </div>
+
+        <div className="topbar__thread">
+          <span className="topbar__thread-icon"><Icon icon={FolderGit2} size={16} /></span>
+          <div className="topbar__thread-copy">
+            <h1 id="thread-heading" tabIndex={-1}>{selectedThread.title}</h1>
+            <span>{selectedProject.name} <span aria-hidden="true">·</span> {selectedProject.branch}</span>
           </div>
         </div>
 
         <div className="topbar__controls">
+          <button
+            className="thread-summary-button"
+            type="button"
+            aria-label={`Open evidence: ${snapshot.changes.length} changed files and ${snapshot.evidence.length} evidence items`}
+            title="Open changes and verification"
+            onClick={() => {
+              setSidebarOpen(false)
+              setInspectorTab('Changes')
+              setInspectorOpen(true)
+            }}
+          >
+            <Icon icon={ListChecks} size={14} />
+            <span>{snapshot.changes.length} changes</span>
+            <span aria-hidden="true">·</span>
+            <span>{snapshot.evidence.length} checks</span>
+          </button>
+
+          <div
+            className={cx('task-state', `task-state--${selectedThread.status}`)}
+            aria-hidden="true"
+          >
+            {selectedThread.status === 'running' ? <Icon icon={Activity} size={14} /> : <Icon icon={Circle} size={11} />}
+            <span className="task-state__label">{taskLabel(selectedThread.status)}</span>
+          </div>
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            Task state: {taskLabel(selectedThread.status)}
+          </span>
+
           <button
             ref={commandPaletteTriggerRef}
             className="command-trigger"
             type="button"
             aria-label="Search projects, threads, and commands"
             aria-haspopup="dialog"
+            title="Search projects, threads, and commands"
             onClick={openCommandPalette}
           >
             <Icon icon={Search} size={15} />
@@ -659,7 +694,9 @@ export default function App({ api: suppliedApi }: AppProps) {
             ref={pairMobileTriggerRef}
             className="button button--quiet topbar__pair-control"
             type="button"
+            aria-label="Mobile"
             aria-haspopup="dialog"
+            title="Open mobile companion"
             onClick={() => setPairMobileOpen(true)}
           >
             <Icon icon={Smartphone} size={16} />
@@ -687,6 +724,7 @@ export default function App({ api: suppliedApi }: AppProps) {
             className="icon-button topbar__inspector-control"
             type="button"
             aria-label={inspectorOpen ? 'Close inspector' : 'Open inspector'}
+            title={inspectorOpen ? 'Close inspector' : 'Open inspector'}
             aria-expanded={inspectorOpen}
             aria-controls="thread-inspector"
             onClick={() => {
@@ -719,42 +757,6 @@ export default function App({ api: suppliedApi }: AppProps) {
       />
 
       <main className="thread-view" id="main" tabIndex={-1} inert={sidebarIsModal || inspectorIsModal ? true : undefined}>
-        <header className="thread-header">
-          <div className="thread-header__title">
-            <div className="thread-header__breadcrumb">
-              <span>{selectedProject.name}</span>
-              <ChevronRight aria-hidden="true" size={13} />
-              <span>{selectedProject.branch}</span>
-            </div>
-            <h1 id="thread-heading" tabIndex={-1}>{selectedThread.title}</h1>
-          </div>
-          <div className="thread-header__actions">
-            <button
-              className="thread-summary-button"
-              type="button"
-              aria-label={`Open evidence: ${snapshot.changes.length} changed files and ${snapshot.evidence.length} evidence items`}
-              onClick={() => {
-                setSidebarOpen(false)
-                setInspectorTab('Changes')
-                setInspectorOpen(true)
-              }}
-            >
-              <Icon icon={ListChecks} size={14} />
-              <span>{snapshot.changes.length} changes</span>
-              <span aria-hidden="true">·</span>
-              <span>{snapshot.evidence.length} checks</span>
-            </button>
-            <div
-              className={cx('task-state', `task-state--${selectedThread.status}`)}
-              role="status"
-              aria-label={`Task state: ${taskLabel(selectedThread.status)}`}
-            >
-              {selectedThread.status === 'running' ? <Icon icon={Activity} size={14} /> : <Icon icon={Circle} size={11} />}
-              <span className="task-state__label">{taskLabel(selectedThread.status)}</span>
-            </div>
-          </div>
-        </header>
-
         <div className="thread-notices">
           {isDisconnected && (
             <div className={cx('connection-notice', `connection-notice--${selectedHost.connection}`)}>
@@ -1268,31 +1270,34 @@ function SessionContinuity({
 
 function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
-  const submitLabel = disconnected ? 'Send when reconnected' : mode === 'steer' ? 'Steer now' : 'Send follow-up'
+  const effectiveMode = taskState === 'running' ? mode : 'follow_up'
+  const submitLabel = disconnected ? 'Send when reconnected' : effectiveMode === 'steer' ? 'Steer now' : 'Send follow-up'
 
   return (
     <footer className="composer-wrap">
       <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
       <form className="composer" onSubmit={onSubmit} aria-label="Message composer">
         <div className="composer__toolbar">
-          <div className="mode-control" aria-label="Message intent">
-            <button
-              type="button"
-              aria-pressed={mode === 'follow_up'}
-              onClick={() => onModeChange('follow_up')}
-            >
-              Follow up
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === 'steer'}
-              disabled={disconnected || taskState !== 'running'}
-              title={disconnected ? `Reconnect to ${hostName} to steer the running turn` : undefined}
-              onClick={() => onModeChange('steer')}
-            >
-              Steer now
-            </button>
-          </div>
+          {taskState === 'running' ? (
+            <div className="mode-control" aria-label="Message intent">
+              <button
+                type="button"
+                aria-pressed={effectiveMode === 'follow_up'}
+                onClick={() => onModeChange('follow_up')}
+              >
+                Follow up
+              </button>
+              <button
+                type="button"
+                aria-pressed={effectiveMode === 'steer'}
+                disabled={disconnected}
+                title={disconnected ? `Reconnect to ${hostName} to steer the running turn` : undefined}
+                onClick={() => onModeChange('steer')}
+              >
+                Steer now
+              </button>
+            </div>
+          ) : <span className="composer__intent">Follow up</span>}
           <span className={cx('composer__connection', `composer__connection--${receipt.state}`)}>
             {receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
             {receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
@@ -1321,35 +1326,8 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
         />
 
         <div className="composer__actions">
-          <div className="composer__attachments">
-            <button
-              className="icon-button"
-              type="button"
-              aria-label="Attach files"
-              aria-describedby="attachments-help"
-              title="File attachments are not available in this build"
-              disabled
-            >
-              <Icon icon={Paperclip} size={17} />
-            </button>
-            <span className="sr-only" id="attachments-help">File attachments are not available in this build.</span>
-            <span id="composer-hint">Ctrl or ⌘ + Enter to send</span>
-          </div>
+          <span className="composer__hint" id="composer-hint">Ctrl or ⌘ + Enter to send</span>
           <div className="composer__primary-actions">
-            {taskState === 'running' && (
-              <button
-                className="button button--quiet composer__stop"
-                type="button"
-                disabled
-                aria-describedby="stop-turn-help"
-                title="Stopping a running turn is not available in this build"
-              >
-                <Icon icon={Square} size={13} strokeWidth={2} /> Stop
-              </button>
-            )}
-            {taskState === 'running' && (
-              <span className="sr-only" id="stop-turn-help">Stopping a running turn is not available in this build.</span>
-            )}
             <button
               className={cx('button', 'button--primary', !text.trim() && 'button--empty')}
               type="submit"
@@ -2289,7 +2267,7 @@ function CompanionPreview({
 
       <div className="companion-preview-notice" role="note">
         <Icon icon={LockKeyhole} size={15} />
-        <span><strong>Preview only.</strong> Secure mobile relay is not available in this build.</span>
+        <span><strong>Read-only preview.</strong> Secure relay unavailable.</span>
       </div>
 
       <main ref={mainRef} className="companion-main" id="companion-main" tabIndex={-1}>
