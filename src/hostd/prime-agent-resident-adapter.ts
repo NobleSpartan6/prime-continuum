@@ -3,6 +3,11 @@ import { resolve as resolvePath } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import {
+  ResidentProjectionError,
+  normalizeResidentProjectionSnapshot,
+  type ResidentProjectionSnapshot,
+} from "./resident-projection";
+import {
   ResidentRuntimeContractError,
   buildResidentDaemonCreateRequest,
   buildResidentDaemonStartInvocation,
@@ -157,6 +162,11 @@ export interface PrimeAgentResidentAdapterOptions {
   readonly persistBinding: (binding: ResidentSessionBinding) => Promise<void>;
   /** Durable host transition performed only after an explicit kill is confirmed. */
   readonly completeBinding: (binding: ResidentSessionBinding) => Promise<void>;
+  /** Durable host publication of a normalized authoritative runtime snapshot. */
+  readonly publishProjection: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   readonly spawnFactory?: ResidentDaemonSpawn;
   readonly connectTimeoutMs?: number;
   readonly startupTimeoutMs?: number;
@@ -171,6 +181,10 @@ interface ResolvedOptions {
   readonly loadRuntimeModule: PrimeAgentPublicModuleLoader;
   readonly persistBinding: (binding: ResidentSessionBinding) => Promise<void>;
   readonly completeBinding: (binding: ResidentSessionBinding) => Promise<void>;
+  readonly publishProjection: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   readonly spawnFactory: ResidentDaemonSpawn;
   readonly connectTimeoutMs: number;
   readonly startupTimeoutMs: number;
@@ -272,6 +286,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       loadRuntimeModule: options.loadRuntimeModule,
       persistBinding: options.persistBinding,
       completeBinding: options.completeBinding,
+      publishProjection: options.publishProjection,
       spawnFactory: options.spawnFactory ?? defaultResidentDaemonSpawn,
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
       startupTimeoutMs: boundedTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, "startupTimeoutMs"),
@@ -353,7 +368,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
         this.assertOpen();
         this.lifecycle.transition("attaching", { binding });
         attached = await this.attachPublicConnection(runtimeModule, client, binding.activeSessionId);
-        await validateInitialSnapshot(attached, binding);
+        await publishInitialProjection(attached, binding, this.options.publishProjection);
         this.assertOpen();
         const connection = this.registerConnection(binding, client, attached);
         client = undefined;
@@ -407,7 +422,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
           );
         });
         attached = await this.attachPublicConnection(runtimeModule, client, refreshedBinding.activeSessionId);
-        await validateInitialSnapshot(attached, refreshedBinding);
+        await publishInitialProjection(attached, refreshedBinding, this.options.publishProjection);
         this.assertOpen();
         const connection = this.registerConnection(refreshedBinding, client, attached);
         client = undefined;
@@ -603,6 +618,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter {
       expectedEntrypointPath: this.options.invocation.argv[0],
       persistBinding: this.options.persistBinding,
       completeBinding: this.options.completeBinding,
+      publishProjection: this.options.publishProjection,
       onClosed: () => {
         if (this.connections.get(binding.activeSessionId) === connection) {
           this.connections.delete(binding.activeSessionId);
@@ -643,6 +659,10 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       expectedEntrypointPath: string;
       persistBinding: (binding: ResidentSessionBinding) => Promise<void>;
       completeBinding: (binding: ResidentSessionBinding) => Promise<void>;
+      publishProjection: (
+        binding: ResidentSessionBinding,
+        projection: ResidentProjectionSnapshot,
+      ) => Promise<void>;
       onClosed: () => void;
     }>,
   ) {
@@ -776,7 +796,8 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
           expectedExecutablePath: this.options.expectedExecutablePath,
           expectedEntrypointPath: this.options.expectedEntrypointPath,
         });
-        validateInitialSnapshotValue(event.snapshot, this.binding);
+        const projection = normalizeProjection(event.snapshot, this.binding);
+        await publishProjection(this.options.publishProjection, this.binding, projection);
         await this.refreshRuntimeBinding(compatibility);
         this.resyncValidated = true;
         return;
@@ -917,9 +938,13 @@ function parseLiveSessionList(value: unknown): LiveSessionSummary[] {
   return value.sessions.map((summary) => parseLiveSessionSummary(summary, "list"));
 }
 
-async function validateInitialSnapshot(
+async function publishInitialProjection(
   connection: PrimeDaemonAgentConnectionPublic,
   binding: ResidentSessionBinding,
+  publisher: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>,
 ): Promise<void> {
   const snapshot = await connection.getInitialSnapshot().catch((error) => {
     throw new ResidentRuntimeContractError(
@@ -928,7 +953,45 @@ async function validateInitialSnapshot(
       { retryable: true, details: { cause: errorMessage(error) }, cause: error },
     );
   });
-  validateInitialSnapshotValue(snapshot, binding);
+  const projection = normalizeProjection(snapshot, binding);
+  await publishProjection(publisher, binding, projection);
+}
+
+function normalizeProjection(
+  snapshot: unknown,
+  binding: ResidentSessionBinding,
+): ResidentProjectionSnapshot {
+  try {
+    return normalizeResidentProjectionSnapshot(snapshot, binding);
+  } catch (error) {
+    if (error instanceof ResidentProjectionError) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_RESPONSE_INVALID",
+        "Prime Agent returned an invalid authoritative projection snapshot.",
+        { details: { projectionCode: error.code }, cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+async function publishProjection(
+  publisher: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>,
+  binding: ResidentSessionBinding,
+  projection: ResidentProjectionSnapshot,
+): Promise<void> {
+  try {
+    await publisher(binding, projection);
+  } catch (error) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
+      "The authoritative Prime Agent projection could not be saved before the session became ready.",
+      { retryable: true, cause: error },
+    );
+  }
 }
 
 function validateInitialSnapshotValue(snapshot: unknown, binding: ResidentSessionBinding): void {

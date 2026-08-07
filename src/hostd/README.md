@@ -49,5 +49,12 @@ unfinished transactions byte-for-byte; JSONL audit records use deterministic
 IDs and atomic append-with-deduplication, so replay cannot create extra blocks,
 queue entries, command states, or events.
 
+Resident runtime snapshots use the same write-ahead discipline in
+`resident-projection-transactions/`. A prepared publication contains the exact
+public snapshot and thread catalog, is fenced to the still-active resident
+binding and execution generation, and is replayed before startup serves any
+reader. The catalog summary's recap, timestamp, and cursor therefore advance
+with the authoritative runtime projection instead of lagging behind it.
+
 Approval objects require a daemon adapter that supports claims and leases; the
 minimal RPC adapter rejects that mapping instead of inventing semantics.

@@ -14,6 +14,7 @@ import {
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
+import { normalizeResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import { HostStore } from "../../src/hostd/store";
 
 const THREAD_ID = "demo-thread";
@@ -220,17 +221,53 @@ class SharedFakePrimeDaemon {
         snapshot: Object.freeze({
           state: Object.freeze({
             activeSessionId: ACTIVE_SESSION_ID,
-            sessionId: SESSION_ID,
-            sessionFile,
             cwd: this.workspaceDirectory,
+            model: Object.freeze({ provider: "openai", id: "gpt-5" }),
+            thinkingLevel: "medium",
+            serviceTier: "standard",
+            availableThinkingLevels: Object.freeze(["low", "medium", "high"]),
             isStreaming: false,
+            isCompacting: false,
+            isBashRunning: false,
+            retryAttempt: 0,
+            steeringMode: "all",
+            followUpMode: "all",
+            sessionFile,
+            sessionId: SESSION_ID,
+            sessionName: SESSION_NAME,
+            sessionDir: join(this.workspaceDirectory, ".prime-agent"),
+            leafId: null,
+            autoCompactionEnabled: true,
+            messageCount: 1,
+            sessionActions: Object.freeze({ queuedCount: 0, steering: [], followUps: [] }),
+            compactionCount: 0,
+            goal: Object.freeze({
+              active: false,
+              status: "idle",
+              tokensUsed: 0,
+              timeUsedSeconds: 0,
+              continuationsUsed: 0,
+            }),
+            scopedModels: Object.freeze([]),
+            activeToolNames: Object.freeze([]),
+            contextUsage: Object.freeze({ tokens: 1_024, contextWindow: 200_000, percent: 0.512 }),
+            recap: SNAPSHOT_MARKER,
           }),
           messages: Object.freeze([
-            Object.freeze({ id: "continuity-message-1", role: "assistant", text: SNAPSHOT_MARKER }),
+            Object.freeze({
+              role: "assistant",
+              content: Object.freeze([Object.freeze({ type: "text", text: SNAPSHOT_MARKER })]),
+              api: "openai-responses",
+              provider: "openai",
+              model: "gpt-5",
+              usage: Object.freeze({}),
+              stopReason: "stop",
+              timestamp: FIXED_TIME.getTime(),
+            }),
           ]),
+          children: Object.freeze([]),
           lastEventSequence: 19,
           lastEventCursor: Object.freeze({ generation: EVENT_GENERATION, sequence: 19 }),
-          continuityMarker: SNAPSHOT_MARKER,
         }),
       });
       return { type: "response", command: "create", success: true, data: this.session.summary };
@@ -280,6 +317,10 @@ function createAdapter(
     loadRuntimeModule: async () => runtimeModule,
     persistBinding: (binding) => daemon.persistThrough(store, binding),
     completeBinding: (binding) => daemon.completeThrough(store, binding),
+    publishProjection: async (binding, projection) => {
+      await store.publishResidentProjectionSnapshot(binding, projection);
+      daemon.chronology.push(`store:projection:${binding.activeSessionId}`);
+    },
     spawnFactory: () => daemon.spawnLauncher(),
     connectTimeoutMs: 100,
     startupTimeoutMs: 100,
@@ -361,8 +402,37 @@ describe("resident continuity across hostd/store relaunch", () => {
     expect(firstSnapshot).toMatchObject({
       state: { sessionId: SESSION_ID, cwd: workspaceDirectory },
       lastEventCursor: { generation: EVENT_GENERATION, sequence: 19 },
-      continuityMarker: SNAPSHOT_MARKER,
+      messages: [{ role: "assistant", content: [{ type: "text", text: SNAPSHOT_MARKER }] }],
     });
+    const firstPublishedProjection = await firstStore.getThreadSnapshot(THREAD_ID);
+    expect(firstPublishedProjection).toMatchObject({
+      materializedRecentBlocks: [{ kind: "assistant", text: SNAPSHOT_MARKER, sequence: 0 }],
+      runtime: {
+        runtime: "prime_agent",
+        residency: "resident",
+        activeSessionId: ACTIVE_SESSION_ID,
+        sessionId: SESSION_ID,
+        messageCount: 1,
+      },
+      latestCursor: {
+        threadId: THREAD_ID,
+        executionGenerationId: EXECUTION_GENERATION_ID,
+        generation: EVENT_GENERATION,
+        sequence: 19,
+      },
+    });
+    const publicProjectionJson = JSON.stringify(firstPublishedProjection);
+    const privateSessionFile = (firstSnapshot.state as { sessionFile: string }).sessionFile;
+    expect(publicProjectionJson).not.toContain(JSON.stringify(workspaceDirectory).slice(1, -1));
+    expect(publicProjectionJson).not.toContain(JSON.stringify(privateSessionFile).slice(1, -1));
+    expect(publicProjectionJson).not.toContain("sessionFile");
+    expect(publicProjectionJson).not.toContain("workspaceDirectory");
+    const normalizedProjection = normalizeResidentProjectionSnapshot(firstSnapshot, exactBinding);
+    await expect(firstStore.publishResidentProjectionSnapshot(
+      { ...exactBinding, boundAt: "2026-08-07T16:00:01.000Z" },
+      normalizedProjection,
+    )).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_BINDING_MISMATCH" });
+    expect(await firstStore.getThreadSnapshot(THREAD_ID)).toEqual(firstPublishedProjection);
     expect(await firstStore.getResidentSessionBinding(THREAD_ID, EXECUTION_GENERATION_ID)).toEqual(exactBinding);
     expect(daemon.chronology.indexOf(`store:persist:${ACTIVE_SESSION_ID}`)).toBeLessThan(
       daemon.chronology.indexOf(`daemon:attach:${ACTIVE_SESSION_ID}`),
@@ -377,6 +447,8 @@ describe("resident continuity across hostd/store relaunch", () => {
 
     const relaunchedStore = new HostStore(dataDirectory);
     await relaunchedStore.initialize();
+    const recoveredProjection = await relaunchedStore.getThreadSnapshot(THREAD_ID);
+    expect(recoveredProjection).toEqual(firstPublishedProjection);
     const reloadedBinding = await relaunchedStore.getResidentSessionBinding(THREAD_ID, EXECUTION_GENERATION_ID);
     expect(reloadedBinding).toEqual(exactBinding);
     if (!reloadedBinding) throw new Error("hostd relaunch did not restore the exact active resident binding");
@@ -395,8 +467,18 @@ describe("resident continuity across hostd/store relaunch", () => {
     expect(secondSnapshot).toMatchObject({
       state: { sessionId: SESSION_ID, cwd: workspaceDirectory },
       lastEventCursor: { generation: EVENT_GENERATION, sequence: 19 },
-      continuityMarker: SNAPSHOT_MARKER,
+      messages: [{ role: "assistant", content: [{ type: "text", text: SNAPSHOT_MARKER }] }],
     });
+    const republishedProjection = await relaunchedStore.getThreadSnapshot(THREAD_ID);
+    expect(republishedProjection.thread.updatedAt).toBe(republishedProjection.generatedAt);
+    expect({
+      ...republishedProjection,
+      generatedAt: firstPublishedProjection.generatedAt,
+      thread: {
+        ...republishedProjection.thread,
+        updatedAt: firstPublishedProjection.thread.updatedAt,
+      },
+    }).toEqual(firstPublishedProjection);
     expect(daemon.attachActiveSessionIds).toEqual([ACTIVE_SESSION_ID, exactBinding.activeSessionId]);
     expect(daemon.attachOptions).toEqual([
       expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
@@ -404,6 +486,9 @@ describe("resident continuity across hostd/store relaunch", () => {
     ]);
     expect(daemon.createCount).toBe(1);
     expect(daemon.listCount).toBe(1);
+    expect(daemon.chronology.indexOf(`daemon:snapshot:${ACTIVE_SESSION_ID}`)).toBeLessThan(
+      daemon.chronology.indexOf(`store:projection:${ACTIVE_SESSION_ID}`),
+    );
 
     await connectionB.detach();
     await adapterB.close();

@@ -14,6 +14,7 @@ import {
   validateResidentDaemonHello,
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
+import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 
 const RUNTIME_NODE = resolve("test-runtime", "node.exe");
 const RUNTIME_CLI = resolve("test-runtime", "prime-agent", "dist", "bundle", "cli.js");
@@ -79,6 +80,58 @@ function liveSummary(overrides: Record<string, unknown> = {}): Record<string, un
   };
 }
 
+function validSnapshot(options: {
+  state?: Record<string, unknown>;
+  messages?: unknown[];
+  cursorGeneration?: string;
+  cursorSequence?: number;
+} = {}): Record<string, unknown> {
+  const messages = options.messages ?? [];
+  const cursorGeneration = options.cursorGeneration ?? "events-1";
+  const cursorSequence = options.cursorSequence ?? 4;
+  return {
+    state: {
+      activeSessionId: "active-1",
+      cwd: "C:\\work\\project",
+      model: { provider: "openai", id: "gpt-5" },
+      thinkingLevel: "medium",
+      serviceTier: "standard",
+      availableThinkingLevels: ["low", "medium", "high"],
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      steeringMode: "all",
+      followUpMode: "all",
+      sessionFile: "C:\\sessions\\session-1.jsonl",
+      sessionId: "session-1",
+      sessionName: "Prime Continuim",
+      sessionDir: "C:\\sessions",
+      leafId: null,
+      autoCompactionEnabled: true,
+      messageCount: messages.length,
+      sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+      compactionCount: 0,
+      goal: {
+        active: false,
+        status: "idle",
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        continuationsUsed: 0,
+      },
+      scopedModels: [],
+      activeToolNames: [],
+      contextUsage: { tokens: 0, contextWindow: 200_000, percent: 0 },
+      recap: "Resident session is ready.",
+      ...options.state,
+    },
+    messages,
+    children: [],
+    lastEventSequence: cursorSequence,
+    lastEventCursor: { generation: cursorGeneration, sequence: cursorSequence },
+  };
+}
+
 interface HarnessState {
   connectOutcomes: Array<"ok" | "fail" | "timeout">;
   hello: unknown;
@@ -94,9 +147,17 @@ interface HarnessState {
   launcherExit?: readonly [number | null, string | null];
   persistCalls: ResidentSessionBinding[];
   completeCalls: ResidentSessionBinding[];
+  projectionCalls: Array<{
+    binding: ResidentSessionBinding;
+    projection: ResidentProjectionSnapshot;
+  }>;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
   persistHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   completeHandler?: (binding: ResidentSessionBinding) => Promise<void>;
+  publishProjectionHandler?: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   snapshotHandler?: () => Promise<unknown> | unknown;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
@@ -117,6 +178,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     launcherUnrefs: 0,
     persistCalls: [],
     completeCalls: [],
+    projectionCalls: [],
     ...overrides,
   };
 
@@ -173,18 +235,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           state.chronology.push("snapshot");
           return state.snapshotHandler
             ? state.snapshotHandler()
-            : {
-                state: {
-                  activeSessionId: "active-1",
-                  sessionId: "session-1",
-                  sessionFile: "C:\\sessions\\session-1.jsonl",
-                  cwd: "C:\\work\\project",
-                  isStreaming: false,
-                },
-                messages: [],
-                lastEventSequence: 4,
-                lastEventCursor: { generation: "events-1", sequence: 4 },
-              };
+            : validSnapshot();
         },
         subscribe: (listener) => {
           state.eventListeners.add(listener);
@@ -236,6 +287,11 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       state.completeCalls.push(binding);
       state.chronology.push("complete");
       await state.completeHandler?.(binding);
+    },
+    publishProjection: async (projectionBinding, projection) => {
+      state.projectionCalls.push({ binding: projectionBinding, projection });
+      state.chronology.push("projection:publish");
+      await state.publishProjectionHandler?.(projectionBinding, projection);
     },
     spawnFactory: (executable, argv, options) => {
       state.spawnCalls.push({ executable, argv, options });
@@ -399,6 +455,16 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     });
     expect(state.chronology.indexOf("persist")).toBeLessThan(state.chronology.indexOf("attach"));
     expect(state.chronology.indexOf("attach")).toBeLessThan(state.chronology.indexOf("snapshot"));
+    expect(state.chronology.indexOf("snapshot")).toBeLessThan(state.chronology.indexOf("projection:publish"));
+    expect(state.projectionCalls).toHaveLength(1);
+    expect(state.projectionCalls[0]).toMatchObject({
+      binding: { activeSessionId: "active-1", sessionId: "session-1" },
+      projection: {
+        cursor: { generation: "events-1", sequence: 4 },
+        identity: { activeSessionId: "active-1", sessionId: "session-1" },
+        runtime: { runtime: "prime_agent", residency: "resident" },
+      },
+    });
     expect(state.attachCalls[0]).toMatchObject({
       activeSessionId: "active-1",
       options: {
@@ -476,6 +542,28 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     await adapter.close();
   });
 
+  it("fails attach readiness and disposes the client when authoritative publication fails", async () => {
+    const { adapter, state } = createHarness({
+      publishProjectionHandler: async () => {
+        throw new Error("snapshot storage unavailable");
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createResident(createInput()),
+      "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
+    );
+
+    expect(error.retryable).toBe(true);
+    expect(state.persistCalls).toHaveLength(1);
+    expect(state.projectionCalls).toHaveLength(1);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["create"]);
+    expect(state.chronology.indexOf("snapshot")).toBeLessThan(state.chronology.indexOf("projection:publish"));
+    expect(state.chronology.indexOf("projection:publish")).toBeLessThan(state.chronology.indexOf("dispose"));
+    await adapter.close();
+  });
+
   it("marks a lost create response as outcome-unknown and never suggests a blind retry", async () => {
     const { adapter, state } = createHarness({
       requestHandler: async (command) => {
@@ -534,21 +622,15 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
 
   it("re-proves session identity from the attached snapshot instead of trusting the list precheck", async () => {
     const { adapter, state } = createHarness({
-      snapshotHandler: async () => ({
-        state: {
-          activeSessionId: "active-1",
-          sessionId: "reused-session-id",
-          sessionFile: "C:\\sessions\\session-1.jsonl",
-          cwd: "C:\\work\\project",
-        },
-        messages: [],
-        lastEventSequence: 8,
-        lastEventCursor: { generation: "events-1", sequence: 8 },
+      snapshotHandler: async () => validSnapshot({
+        state: { sessionId: "reused-session-id" },
+        cursorSequence: 8,
       }),
     });
 
-    await expectRuntimeError(adapter.attachResident(binding()), "PRIME_RUNTIME_SESSION_MISMATCH");
+    const error = await expectRuntimeError(adapter.attachResident(binding()), "PRIME_RUNTIME_RESPONSE_INVALID");
 
+    expect(error.details).toEqual({ projectionCode: "PRIME_PROJECTION_IDENTITY_MISMATCH" });
     expect(state.attachCalls).toHaveLength(1);
     expect(state.disposeCalls).toBe(1);
     await adapter.close();
@@ -585,23 +667,15 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     state.hello = validHello({ supervisorGeneration: "supervisor-2" });
     await emit({
       type: "session_resynced",
-      snapshot: {
-        state: {
-          activeSessionId: "active-1",
-          sessionId: "session-1",
-          sessionFile: "C:\\sessions\\session-1.jsonl",
-          cwd: "C:\\work\\project",
-        },
-        messages: [],
-        lastEventCursor: { generation: "events-2", sequence: 5 },
-        lastEventSequence: 5,
-      },
+      snapshot: validSnapshot({ cursorGeneration: "events-2", cursorSequence: 5 }),
     });
     await emit({ type: "connection_status", status: "connected" });
 
     expect(connection.getLifecycle().state).toBe("ready");
     expect(connection.binding.runtime.supervisorGeneration).toBe("supervisor-2");
     expect(state.persistCalls.at(-1)?.runtime.supervisorGeneration).toBe("supervisor-2");
+    expect(state.projectionCalls).toHaveLength(2);
+    expect(state.projectionCalls.at(-1)?.projection.cursor).toEqual({ generation: "events-2", sequence: 5 });
     await connection.detach();
     await adapter.close();
   });

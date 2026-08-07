@@ -47,6 +47,7 @@ import {
   readJsonFile,
 } from "./atomic-files";
 import { getHostDataPaths, type HostDataPaths } from "./paths";
+import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
   ResidentSessionBindingSchema,
   validateResidentSessionBinding,
@@ -253,6 +254,64 @@ type AdmissionTransaction = z.infer<typeof AdmissionTransactionSchema>;
 export const MAX_PENDING_ADMISSION_TRANSACTIONS = 1_024;
 export const MAX_ADMISSION_TRANSACTION_BYTES = 64 * 1024 * 1024;
 
+const ResidentProjectionTransactionSchema = z
+  .object({
+    version: z.literal(1),
+    kind: z.literal("resident_projection_publication"),
+    transactionId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    binding: ResidentSessionBindingSchema,
+    snapshot: ThreadProjectionSnapshotSchema,
+    threadsFile: ThreadFileSchema,
+  })
+  .strict()
+  .superRefine((transaction, context) => {
+    const { binding, snapshot, threadsFile } = transaction;
+    if (
+      snapshot.thread.threadId !== binding.threadId ||
+      snapshot.thread.currentLocation.executionGenerationId !== binding.executionGenerationId ||
+      snapshot.latestCursor.threadId !== binding.threadId ||
+      snapshot.latestCursor.executionGenerationId !== binding.executionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection transaction does not belong to its binding authority",
+      });
+    }
+    if (
+      snapshot.generatedAt !== snapshot.thread.updatedAt ||
+      !isDeepStrictEqual(snapshot.thread.lastKnownCursor, snapshot.latestCursor)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection thread metadata must match its authoritative snapshot cursor",
+      });
+    }
+    if (
+      !snapshot.runtime ||
+      snapshot.runtime.residency !== "resident" ||
+      snapshot.runtime.activeSessionId !== binding.activeSessionId ||
+      snapshot.runtime.sessionId !== binding.sessionId ||
+      snapshot.thread.recap !== snapshot.runtime.recap
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection runtime identity and recap must match its binding and thread",
+      });
+    }
+    const catalogThread = threadsFile.threads.find((thread) => thread.threadId === binding.threadId);
+    if (!catalogThread || !isDeepStrictEqual(catalogThread, snapshot.thread)) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection snapshot and thread catalog must materialize together",
+      });
+    }
+  });
+type ResidentProjectionTransaction = z.infer<typeof ResidentProjectionTransactionSchema>;
+
+export const MAX_PENDING_RESIDENT_PROJECTION_TRANSACTIONS = 1_024;
+export const MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES = 64 * 1024 * 1024;
+
 export type AdmissionFaultPoint =
   | "after_prepare"
   | "after_snapshot"
@@ -261,10 +320,16 @@ export type AdmissionFaultPoint =
   | "after_journal"
   | "after_event";
 
+export type ResidentProjectionFaultPoint = "after_prepare" | "after_snapshot" | "after_threads";
+
 export type HandoffCheckpointWriter = (path: string, checkpoint: HandoffCheckpoint) => Promise<boolean>;
 
 export interface HostStoreOptions {
   admissionFaultInjector?: (point: AdmissionFaultPoint, transactionId: string) => void | Promise<void>;
+  residentProjectionFaultInjector?: (
+    point: ResidentProjectionFaultPoint,
+    transactionId: string,
+  ) => void | Promise<void>;
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
 
@@ -328,6 +393,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.checkpoints),
         ensurePrivateDirectory(this.paths.staging),
         ensurePrivateDirectory(this.paths.transactions),
+        ensurePrivateDirectory(this.paths.residentProjectionTransactions),
         ensurePrivateDirectory(this.paths.receipts),
         ensurePrivateDirectory(this.paths.handoffs),
         ensurePrivateDirectory(this.paths.security),
@@ -368,9 +434,33 @@ export class HostStore {
             MAX_RESIDENT_SESSION_BINDING_FILE_BYTES,
           );
         }
-        await this.validateResidentStateUnlocked();
       } catch (error) {
         this.residentSubsystemFault = residentSubsystemUnavailable(error);
+      }
+      if (this.residentSubsystemFault) {
+        const pendingProjection = (await readdir(this.paths.residentProjectionTransactions, {
+          withFileTypes: true,
+        })).some((entry) => entry.isFile() && entry.name.endsWith(".json"));
+        if (pendingProjection) {
+          throw new HostStoreError(
+            "RESIDENT_PROJECTION_RECOVERY_UNAVAILABLE",
+            "A prepared resident projection cannot be recovered while its private authority state is unavailable",
+            false,
+            { cause: this.residentSubsystemFault },
+          );
+        }
+      }
+      if (!this.residentSubsystemFault) {
+        // A prepared projection may have made exactly one of its two public
+        // files visible. Replay must finish before this store serves readers;
+        // unlike an unrelated resident-state degradation, replay failure is a
+        // global public-consistency failure and therefore aborts initialize().
+        await this.recoverResidentProjectionTransactionsUnlocked();
+        try {
+          await this.validateResidentStateUnlocked();
+        } catch (error) {
+          this.residentSubsystemFault = residentSubsystemUnavailable(error);
+        }
       }
 
       this.initialized = true;
@@ -667,6 +757,148 @@ export class HostStore {
         records.push(activeRecord);
       }
       await this.writeResidentSessionBindingRecordsUnlocked(records);
+    });
+  }
+
+  /**
+   * Crash-consistently replaces the public snapshot and thread catalog from
+   * one exact, active resident binding. Private session paths never cross into
+   * either public DTO.
+   */
+  async publishResidentProjectionSnapshot(
+    bindingValue: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ): Promise<ThreadProjectionSnapshot> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const binding = validateResidentSessionBinding(bindingValue);
+      const scope = await this.currentWorkspaceScopeUnlocked(
+        binding.threadId,
+        binding.executionGenerationId,
+      );
+      const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+      this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+
+      const records = await this.readResidentSessionBindingRecordsUnlocked();
+      const active = records.find(
+        (record) => record.state === "active" && record.binding.threadId === binding.threadId,
+      );
+      if (!active) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_BINDING_NOT_FOUND",
+          "No active resident binding exists for this projection",
+        );
+      }
+      if (!isDeepStrictEqual(active.binding, binding)) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_BINDING_MISMATCH",
+          "Only the exact active resident binding may publish a projection",
+        );
+      }
+      if (
+        projection.projectionVersion !== 1 ||
+        projection.identity.activeSessionId !== binding.activeSessionId ||
+        projection.identity.sessionId !== binding.sessionId ||
+        projection.identity.sessionFile !== binding.sessionFile ||
+        !sameCanonicalPath(projection.identity.workspaceDirectory, binding.workspaceDirectory)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_IDENTITY_MISMATCH",
+          "The resident projection does not belong to its durable binding",
+        );
+      }
+
+      const source = await this.readSnapshotUnlocked(binding.threadId);
+      if (
+        source.thread.threadId !== binding.threadId ||
+        source.thread.currentLocation.executionGenerationId !== binding.executionGenerationId
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_AUTHORITY_MISMATCH",
+          "The durable thread projection belongs to a different execution authority",
+        );
+      }
+      const threads = await this.readThreadsUnlocked();
+      const threadIndex = threads.findIndex((thread) => thread.threadId === binding.threadId);
+      const catalogThread = threadIndex >= 0 ? threads[threadIndex] : undefined;
+      if (!catalogThread || !isDeepStrictEqual(catalogThread, source.thread)) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_CATALOG_MISMATCH",
+          "The durable snapshot and thread catalog must agree before publishing resident state",
+        );
+      }
+      const generatedAt = now();
+      const latestCursor = {
+        threadId: binding.threadId,
+        executionGenerationId: binding.executionGenerationId,
+        generation: projection.cursor.generation,
+        sequence: projection.cursor.sequence,
+      };
+      const threadValue: ThreadSummary = {
+        ...source.thread,
+        updatedAt: generatedAt,
+        lastKnownCursor: latestCursor,
+      };
+      if (projection.runtime.recap === undefined) delete threadValue.recap;
+      else threadValue.recap = projection.runtime.recap;
+      const thread = ThreadSummarySchema.parse(threadValue);
+      const published = ThreadProjectionSnapshotSchema.parse({
+        snapshotVersion: SNAPSHOT_VERSION,
+        generatedAt,
+        thread,
+        transcriptBlockIndex: projection.transcript.map((block) => ({
+          blockId: block.blockId,
+          kind: block.kind,
+          sequence: block.sequence,
+          byteLength: Buffer.byteLength(block.text, "utf8"),
+          materialized: true,
+        })),
+        materializedRecentBlocks: projection.transcript,
+        ...(projection.stream ? { inProgressStream: projection.stream } : {}),
+        queueState: source.queueState,
+        approvals: source.approvals,
+        childAgents: projection.childAgents,
+        goals: projection.goal ? [projection.goal] : [],
+        schedules: source.schedules,
+        runtime: projection.runtime,
+        git: source.git,
+        evidence: source.evidence,
+        pendingAttention: source.pendingAttention,
+        latestCursor,
+      });
+      const updatedThreads = [...threads];
+      updatedThreads[threadIndex] = published.thread;
+      const transaction = ResidentProjectionTransactionSchema.parse({
+        version: 1,
+        kind: "resident_projection_publication",
+        transactionId: deterministicId(
+          "resident-projection",
+          binding.threadId,
+          binding.executionGenerationId,
+          projection.cursor.generation,
+          String(projection.cursor.sequence),
+        ),
+        preparedAt: generatedAt,
+        binding,
+        snapshot: published,
+        threadsFile: ThreadFileSchema.parse({ version: 1, threads: updatedThreads }),
+      });
+      try {
+        await atomicWriteJson(
+          this.residentProjectionTransactionPath(binding),
+          transaction,
+          MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES,
+        );
+        await this.injectResidentProjectionFault("after_prepare", transaction.transactionId);
+        await this.materializeResidentProjectionTransactionUnlocked(transaction, true);
+      } catch (error) {
+        // Readers must never observe a half-published resident projection from
+        // this process. Startup replay is the only path back to a live store.
+        this.initialized = false;
+        throw error;
+      }
+      return published;
     });
   }
 
@@ -1063,6 +1295,139 @@ export class HostStore {
     });
   }
 
+  private async materializeResidentProjectionTransactionUnlocked(
+    transaction: ResidentProjectionTransaction,
+    injectFaults: boolean,
+  ): Promise<void> {
+    const binding = validateResidentSessionBinding(transaction.binding);
+    const scope = await this.currentWorkspaceScopeUnlocked(
+      binding.threadId,
+      binding.executionGenerationId,
+    );
+    const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+    this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+    const targetLocation = transaction.snapshot.thread.currentLocation;
+    if (
+      targetLocation.hostId !== scope.hostId ||
+      targetLocation.projectId !== scope.projectId ||
+      targetLocation.workspaceId !== scope.workspaceId ||
+      targetLocation.executionGenerationId !== scope.executionGenerationId
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_AUTHORITY_MISMATCH",
+        "A pending resident projection does not match the current host, project, workspace, and execution authority",
+      );
+    }
+
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const active = records.find(
+      (record) => record.state === "active" && record.binding.threadId === binding.threadId,
+    );
+    if (!active) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_BINDING_NOT_FOUND",
+        "A pending resident projection has no active resident binding",
+      );
+    }
+    if (!isDeepStrictEqual(active.binding, binding)) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_BINDING_MISMATCH",
+        "A pending resident projection no longer belongs to the exact active binding",
+      );
+    }
+
+    const currentSnapshot = await this.readSnapshotUnlocked(binding.threadId);
+    if (
+      currentSnapshot.thread.threadId !== binding.threadId ||
+      currentSnapshot.thread.currentLocation.executionGenerationId !== binding.executionGenerationId
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_AUTHORITY_MISMATCH",
+        "A pending resident projection belongs to a superseded execution authority",
+      );
+    }
+
+    await atomicWriteJson(this.snapshotPath(binding.threadId), transaction.snapshot);
+    if (injectFaults) {
+      await this.injectResidentProjectionFault("after_snapshot", transaction.transactionId);
+    }
+    await atomicWriteJson(this.paths.threads, transaction.threadsFile);
+    if (injectFaults) {
+      await this.injectResidentProjectionFault("after_threads", transaction.transactionId);
+    }
+    await rm(this.residentProjectionTransactionPath(binding), { force: true });
+  }
+
+  private async recoverResidentProjectionTransactionsUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentProjectionTransactions, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_PROJECTION_TRANSACTIONS) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_TRANSACTION_LIMIT",
+        `Resident projection transaction directory exceeds ${MAX_PENDING_RESIDENT_PROJECTION_TRANSACTIONS} entries`,
+      );
+    }
+
+    const transactionNames: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+          "Resident projection transaction directory contains a non-file entry",
+        );
+      }
+      if (entry.name.endsWith(".json")) {
+        transactionNames.push(entry.name);
+        continue;
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        await rm(join(this.paths.residentProjectionTransactions, entry.name), { force: true });
+        continue;
+      }
+      throw new HostStoreError(
+        "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+        `Unexpected resident projection transaction file ${entry.name}`,
+      );
+    }
+
+    transactionNames.sort();
+    for (const name of transactionNames) {
+      const path = join(this.paths.residentProjectionTransactions, name);
+      const transaction = await readJsonFile(path, ResidentProjectionTransactionSchema, {
+        maxBytes: MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES,
+      });
+      if (!transaction) {
+        throw new HostStoreError(
+          "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+          `Missing resident projection transaction ${name}`,
+        );
+      }
+      const expectedName = `${storageKey(
+        transaction.binding.threadId,
+        transaction.binding.executionGenerationId,
+      )}.json`;
+      if (name !== expectedName) {
+        throw new HostStoreError(
+          "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+          `Resident projection transaction filename does not match ${transaction.transactionId}`,
+        );
+      }
+      const expectedTransactionId = deterministicId(
+        "resident-projection",
+        transaction.binding.threadId,
+        transaction.binding.executionGenerationId,
+        transaction.snapshot.latestCursor.generation,
+        String(transaction.snapshot.latestCursor.sequence),
+      );
+      if (transaction.transactionId !== expectedTransactionId) {
+        throw new HostStoreError(
+          "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+          "Resident projection transaction identity does not match its authoritative cursor",
+        );
+      }
+      await this.materializeResidentProjectionTransactionUnlocked(transaction, false);
+    }
+  }
+
   private async prepareAdmissionTransactionUnlocked(
     command: CommandEnvelope,
     canDispatchLive: boolean,
@@ -1265,6 +1630,13 @@ export class HostStore {
 
   private async injectAdmissionFault(point: AdmissionFaultPoint, transactionId: string): Promise<void> {
     await this.options.admissionFaultInjector?.(point, transactionId);
+  }
+
+  private async injectResidentProjectionFault(
+    point: ResidentProjectionFaultPoint,
+    transactionId: string,
+  ): Promise<void> {
+    await this.options.residentProjectionFaultInjector?.(point, transactionId);
   }
 
   private async seedIfEmptyUnlocked(): Promise<SeedResult> {
@@ -1765,6 +2137,15 @@ export class HostStore {
     return join(this.paths.transactions, `${storageKey(identity.deviceId, identity.commandId)}.json`);
   }
 
+  private residentProjectionTransactionPath(
+    binding: Pick<ResidentSessionBinding, "threadId" | "executionGenerationId">,
+  ): string {
+    return join(
+      this.paths.residentProjectionTransactions,
+      `${storageKey(binding.threadId, binding.executionGenerationId)}.json`,
+    );
+  }
+
   private assertInitialized(): void {
     if (!this.initialized) throw new HostStoreError("STORE_NOT_INITIALIZED", "HostStore.initialize() must run first");
   }
@@ -1896,26 +2277,20 @@ function applyCommand(
   canDispatchLive: boolean,
 ): ThreadProjectionSnapshot {
   const timestamp = now();
-  const sequence = snapshot.latestCursor.sequence + 1;
   const queue = [...snapshot.queueState.pendingCommandIds];
   let taskStatus = snapshot.thread.status;
   let recap = snapshot.thread.recap;
   let approvals = [...snapshot.approvals];
-  let blockText: string;
-  let blockKind: "user" | "status" = "status";
 
   switch (envelope.command.kind) {
     case "prompt":
     case "follow_up":
     case "steer":
-      blockText = envelope.command.text;
-      blockKind = "user";
       queue.push(envelope.commandId);
       taskStatus = canDispatchLive && envelope.command.kind !== "follow_up" ? "running" : "waiting";
       recap = canDispatchLive ? "Command admitted to Prime Agent." : "Command queued durably; Prime Agent is not attached.";
       break;
     case "abort":
-      blockText = envelope.command.reason ? `Stop requested: ${envelope.command.reason}` : "Stop requested.";
       recap = "Waiting for Prime Agent to acknowledge the stop request.";
       break;
     case "approval.resolve": {
@@ -1925,44 +2300,25 @@ function applyCommand(
         const approval = approvals[approvalIndex];
         if (approval) approvals[approvalIndex] = { ...approval, state: approvalCommand.decision === "approve" ? "approved" : "rejected" };
       }
-      blockText = `Approval ${approvalCommand.decision === "approve" ? "granted" : "rejected"}.`;
       taskStatus = "running";
-      recap = blockText;
+      recap = `Approval ${approvalCommand.decision === "approve" ? "granted" : "rejected"}.`;
       break;
     }
   }
 
-  const blockId = randomId("block");
-  const block = { blockId, kind: blockKind, text: blockText, createdAt: timestamp, sequence };
-  const recent = [...snapshot.materializedRecentBlocks, block].slice(-2_000);
-  const index = [
-    ...snapshot.transcriptBlockIndex,
-    {
-      blockId,
-      kind: blockKind,
-      sequence,
-      byteLength: Buffer.byteLength(blockText, "utf8"),
-      materialized: true,
-    },
-  ].slice(-20_000);
-  const cursor = { ...snapshot.latestCursor, sequence };
   const thread: ThreadSummary = {
     ...snapshot.thread,
     status: taskStatus,
     recap,
     updatedAt: timestamp,
-    lastKnownCursor: cursor,
   };
 
   return ThreadProjectionSnapshotSchema.parse({
     ...snapshot,
     generatedAt: timestamp,
     thread,
-    transcriptBlockIndex: index,
-    materializedRecentBlocks: recent,
     queueState: { ...snapshot.queueState, pendingCommandIds: queue },
     approvals,
-    latestCursor: cursor,
   });
 }
 

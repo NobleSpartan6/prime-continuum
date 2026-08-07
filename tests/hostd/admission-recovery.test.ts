@@ -23,6 +23,7 @@ afterEach(async () => {
 describe("command admission crash recovery", () => {
   it.each(faultPoints)("recovers exact materialization after a crash at %s", async (faultPoint) => {
     const directory = await createSeededDirectory();
+    const before = await baselineSnapshot(directory);
     const command = promptCommand(`recovery-${faultPoint}`);
     let injected = false;
     const crashing = new HostStore(directory, {
@@ -61,7 +62,10 @@ describe("command admission crash recovery", () => {
     expect(reconciliation.receipts).toEqual([transaction.receipt]);
 
     const snapshot = await recovered.getThreadSnapshot(command.threadId);
-    expect(snapshot.materializedRecentBlocks.filter((block) => block.text === command.command.text)).toHaveLength(1);
+    expect(snapshot.materializedRecentBlocks.some((block) => block.text === command.command.text)).toBe(false);
+    expect(snapshot.materializedRecentBlocks).toEqual(before.materializedRecentBlocks);
+    expect(snapshot.transcriptBlockIndex).toEqual(before.transcriptBlockIndex);
+    expect(snapshot.latestCursor).toEqual(before.latestCursor);
     expect(snapshot.queueState.pendingCommandIds.filter((id) => id === command.commandId)).toHaveLength(1);
     expect(snapshot).toEqual(transaction.snapshot);
     const catalog = await recovered.getCatalogSnapshot();
@@ -142,6 +146,12 @@ describe("command admission crash recovery", () => {
     expect(await readdir(recoveredStore.paths.transactions)).toEqual([]);
   });
 });
+
+async function baselineSnapshot(directory: string) {
+  const baseline = new HostStore(directory);
+  await baseline.initialize();
+  return baseline.getThreadSnapshot("demo-thread");
+}
 
 async function createSeededDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "prime-hostd-admission-recovery-"));
