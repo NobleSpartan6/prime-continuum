@@ -13,17 +13,35 @@ import {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOSTD_PATH = resolve(REPO_ROOT, "out", "hostd", "hostd.cjs");
-const SEED_ROOT = resolve(REPO_ROOT, "out", "runtime");
+const SEED_ROOT = resolve(process.env.PRIME_CONTINUIM_RUNTIME_SEED_ROOT ?? resolve(REPO_ROOT, "out", "runtime"));
 const ATTESTATION_PATH = resolve(REPO_ROOT, "out", "main", "runtime-attestation.json");
 const FIRST_HEALTH_DEADLINE_MS = 10_000;
 const HEALTH_REQUEST_DEADLINE_MS = 3_000;
+const MODEL_CATALOG_REQUEST_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 180_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
-const EXPECTED_HEALTH_CAPABILITIES = Object.freeze([
+const BASE_HEALTH_CAPABILITIES = Object.freeze([
   "runtime_integrity_v1",
   "snapshot_chunks_v1",
 ].sort());
+const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
+const EXPECTED_MODEL_CATALOG = Object.freeze({
+  releaseVersion: "0.7.0",
+  providers: 32,
+  models: 1_169,
+  requiredModels: Object.freeze([
+    "gpt-5.6-sol",
+    "claude-opus-5",
+    "gemini-3.6-flash",
+    "deepseek/deepseek-v4-pro",
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.2",
+    "qwen/qwen3.6-35b-a3b",
+    "minimax/minimax-m3",
+    "openai/gpt-oss-120b",
+  ]),
+});
 
 const require = createRequire(import.meta.url);
 const electronExecutable = resolve(require("electron"));
@@ -156,6 +174,13 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
   if (!readyHealth) throw new Error("Runtime initialization did not reach ready within the smoke deadline");
   const readyMs = Date.now() - launchStartedAt;
   const identity = readyHealth.runtimeIntegrity;
+  const modelCatalog = await requestHost(
+    endpoint,
+    "runtime.model_catalog",
+    { expectedHostId: readyHealth.host?.hostId },
+    MODEL_CATALOG_REQUEST_DEADLINE_MS,
+  );
+  const catalogSummary = assertRuntimeModelCatalog(modelCatalog.result, readyHealth);
   const installedPointer = JSON.parse(await readFile(join(dataDirectory, "runtime", "current.json"), "utf8"));
   for (const key of [
     "releaseVersion",
@@ -171,7 +196,11 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     }
   }
 
-  await stopChild(child);
+  try {
+    await stopChild(child);
+  } catch (error) {
+    throw new Error(`${errorMessage(error)}; ${stderrTail.toString("utf8")}`.slice(0, 16 * 1024), { cause: error });
+  }
   child = undefined;
   return {
     expectCleanInstall,
@@ -182,6 +211,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     samples: latencies.length,
     phases: [...phases],
     identity,
+    modelCatalog: catalogSummary,
   };
 }
 
@@ -194,8 +224,11 @@ function assertRuntimeHealth(health, expectedStatus) {
   if (!Array.isArray(health.capabilities) || health.capabilities.some((capability) => typeof capability !== "string")) {
     throw new Error("Runtime health capabilities are invalid");
   }
+  const expectedCapabilities = expectedStatus === "ready"
+    ? [...BASE_HEALTH_CAPABILITIES, MODEL_CATALOG_CAPABILITY].sort()
+    : BASE_HEALTH_CAPABILITIES;
   const actualCapabilities = [...health.capabilities].sort();
-  if (JSON.stringify(actualCapabilities) !== JSON.stringify(EXPECTED_HEALTH_CAPABILITIES)) {
+  if (JSON.stringify(actualCapabilities) !== JSON.stringify(expectedCapabilities)) {
     throw new Error(
       `Runtime health capabilities differ from the exact release contract: ${actualCapabilities.join(", ")}`,
     );
@@ -228,13 +261,67 @@ function assertRuntimeHealth(health, expectedStatus) {
   }
 }
 
+function assertRuntimeModelCatalog(catalog, health) {
+  if (!catalog || catalog.runtime !== "prime_agent") {
+    throw new Error("Runtime model catalog has an invalid contract identity");
+  }
+  if (catalog.releaseVersion !== EXPECTED_MODEL_CATALOG.releaseVersion) {
+    throw new Error(`Runtime model catalog release changed: ${catalog.releaseVersion ?? "missing"}`);
+  }
+  if (!Array.isArray(catalog.providers) || catalog.providers.length !== EXPECTED_MODEL_CATALOG.providers) {
+    throw new Error(`Runtime model provider count changed: ${catalog.providers?.length ?? "invalid"}`);
+  }
+  if (!Array.isArray(catalog.models) || catalog.models.length !== EXPECTED_MODEL_CATALOG.models) {
+    throw new Error(`Runtime model route count changed: ${catalog.models?.length ?? "invalid"}`);
+  }
+  if (!health.capabilities.includes(MODEL_CATALOG_CAPABILITY)) {
+    throw new Error("Ready health omitted the verified model catalog capability");
+  }
+  const routeKeys = new Set(catalog.models.map((model) => model.modelId));
+  const missing = EXPECTED_MODEL_CATALOG.requiredModels
+    .filter((modelId) => !routeKeys.has(modelId));
+  if (missing.length > 0) {
+    throw new Error(`Runtime model catalog lost required frontier routes: ${missing.join(", ")}`);
+  }
+  assertNoSecretBearingCatalogFields(catalog);
+  return Object.freeze({
+    releaseVersion: catalog.releaseVersion,
+    observedAt: catalog.observedAt,
+    providers: catalog.providers.length,
+    models: catalog.models.length,
+    requiredModels: EXPECTED_MODEL_CATALOG.requiredModels.length,
+    secretBearingPropertiesPresent: false,
+  });
+}
+
+function assertNoSecretBearingCatalogFields(value) {
+  const forbidden = /^(api[-_]?key|access[-_]?token|refresh[-_]?token|authorization|credential|credentials|headers?|secret|base[-_]?url)$/i;
+  const pending = [value];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object") continue;
+    if (seen.has(candidate)) throw new Error("Runtime model catalog contains a cyclic object graph");
+    seen.add(candidate);
+    for (const [key, child] of Object.entries(candidate)) {
+      if (forbidden.test(key)) throw new Error(`Runtime model catalog exposed a secret-bearing field: ${key}`);
+      if (child && typeof child === "object") pending.push(child);
+    }
+  }
+}
+
 async function requestHealth(socketPath, timeoutMs) {
+  const response = await requestHost(socketPath, "health.get", {}, timeoutMs);
+  return { health: response.result, latencyMs: response.latencyMs };
+}
+
+async function requestHost(socketPath, method, requestPayload, timeoutMs) {
   const requestId = `runtime-smoke-${randomUUID()}`;
   const payload = Buffer.from(JSON.stringify({
     protocolVersion: 1,
     requestId,
-    method: "health.get",
-    payload: {},
+    method,
+    payload: requestPayload,
   }), "utf8");
   const frame = Buffer.allocUnsafe(4 + payload.byteLength);
   frame.writeUInt32BE(payload.byteLength, 0);
@@ -253,30 +340,31 @@ async function requestHealth(socketPath, timeoutMs) {
       if (error) rejectPromise(error);
       else resolvePromise(value);
     };
-    const timer = setTimeout(() => finish(new Error("health request timed out")), timeoutMs);
+    const timer = setTimeout(() => finish(new Error(`${method} request timed out`)), timeoutMs);
     timer.unref?.();
     socket.once("connect", () => socket.write(frame));
     socket.on("data", (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.byteLength > MAX_FRAME_BYTES + 4) return finish(new Error("health response exceeded its frame bound"));
+      if (buffer.byteLength > MAX_FRAME_BYTES + 4) return finish(new Error(`${method} response exceeded its frame bound`));
       if (buffer.byteLength < 4) return;
       const length = buffer.readUInt32BE(0);
-      if (length < 1 || length > MAX_FRAME_BYTES) return finish(new Error("health frame length is invalid"));
+      if (length < 1 || length > MAX_FRAME_BYTES) return finish(new Error(`${method} frame length is invalid`));
       if (buffer.byteLength < 4 + length) return;
       let response;
       try {
         response = JSON.parse(buffer.subarray(4, 4 + length).toString("utf8"));
       } catch (error) {
-        return finish(new Error("health response is not valid JSON", { cause: error }));
+        return finish(new Error(`${method} response is not valid JSON`, { cause: error }));
       }
-      if (!response?.ok || response.requestId !== requestId || response.method !== "health.get") {
-        return finish(new Error("health response identity is invalid"));
+      if (!response?.ok || response.requestId !== requestId || response.method !== method) {
+        const detail = response?.error?.message ? `: ${response.error.message}` : "";
+        return finish(new Error(`${method} response identity is invalid${detail}`));
       }
-      finish(undefined, { health: response.result, latencyMs: Date.now() - startedAt });
+      finish(undefined, { result: response.result, latencyMs: Date.now() - startedAt });
     });
     socket.once("error", (error) => finish(error));
     socket.once("close", () => {
-      if (!settled) finish(new Error("hostd closed before returning health"));
+      if (!settled) finish(new Error(`hostd closed before returning ${method}`));
     });
   });
 }
@@ -400,7 +488,11 @@ function hostdSmokeWrapperSource() {
     "process.stdin.resume();",
     "void Promise.resolve(hostd.runHostdCli(hostdArguments)).then(",
     "  (code) => { process.exitCode = code; process.stdin.destroy(); },",
-    "  () => { process.stderr.write(\"Hostd smoke wrapper failed\\n\"); process.exitCode = 1; process.stdin.destroy(); },",
+    "  (error) => {",
+    "    const errors = error instanceof AggregateError ? [error, ...error.errors] : [error];",
+    "    const details = errors.map((value) => value instanceof Error ? `${value.name}: ${value.message}` : String(value)).join(\" <- \").slice(0, 8192);",
+    "    process.stderr.write(`Hostd smoke wrapper failed: ${details}\\n`); process.exitCode = 1; process.stdin.destroy();",
+    "  },",
     ");",
     "",
   ].join("\n");
