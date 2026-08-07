@@ -62,6 +62,7 @@ import { FormEvent, KeyboardEvent, ReactNode, RefObject, useCallback, useEffect,
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type WorkbenchSurface = 'desktop' | 'companion'
+const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
   { phase: 'quiescing', label: 'Prepare source' },
@@ -277,6 +278,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     message: '',
   })
   const addComputerTriggerRef = useRef<HTMLButtonElement>(null)
+  const addComputerReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
@@ -442,7 +444,7 @@ export default function App({ api: suppliedApi }: AppProps) {
 
   const openMoveThread = (destinationHostId: string, trigger: HTMLElement | null = locationTriggerRef.current) => {
     if (!destinationHostId || destinationHostId === selectedHost?.id) return
-    moveThreadTriggerRef.current = trigger
+    moveThreadTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
     if (sidebarIsOverlay) setSidebarOpen(false)
     if (inspectorIsOverlay) setInspectorOpen(false)
     setMoveDestinationId(destinationHostId)
@@ -578,7 +580,15 @@ export default function App({ api: suppliedApi }: AppProps) {
               ? 'Start a thread after the host finishes loading this project catalog.'
               : 'Add an SSH computer, or connect the local host service, to open projects and start durable threads.'}
           </p>
-          <button ref={addComputerTriggerRef} className="button button--primary" type="button" onClick={() => setAddComputerOpen(true)}>
+          <button
+            ref={addComputerTriggerRef}
+            className="button button--primary"
+            type="button"
+            onClick={(event) => {
+              addComputerReturnTargetRef.current = event.currentTarget
+              setAddComputerOpen(true)
+            }}
+          >
             <Icon icon={Computer} /> Add computer
           </button>
           <small>No sample projects or threads are added in the native app.</small>
@@ -587,7 +597,7 @@ export default function App({ api: suppliedApi }: AppProps) {
           api={api}
           open={addComputerOpen}
           onClose={() => setAddComputerOpen(false)}
-          triggerRef={addComputerTriggerRef}
+          triggerRef={addComputerReturnTargetRef}
         />
       </div>
     )
@@ -648,23 +658,6 @@ export default function App({ api: suppliedApi }: AppProps) {
         </div>
 
         <div className="topbar__controls">
-          <button
-            className="thread-summary-button"
-            type="button"
-            aria-label={`Open evidence: ${snapshot.changes.length} changed files and ${snapshot.evidence.length} evidence items`}
-            title="Open changes and verification"
-            onClick={() => {
-              setSidebarOpen(false)
-              setInspectorTab('Changes')
-              setInspectorOpen(true)
-            }}
-          >
-            <Icon icon={ListChecks} size={14} />
-            <span>{snapshot.changes.length} changes</span>
-            <span aria-hidden="true">·</span>
-            <span>{snapshot.evidence.length} checks</span>
-          </button>
-
           <div
             className={cx('task-state', `task-state--${selectedThread.status}`)}
             aria-hidden="true"
@@ -688,19 +681,6 @@ export default function App({ api: suppliedApi }: AppProps) {
             <Icon icon={Search} size={15} />
             <span>Search or run…</span>
             <kbd>{commandShortcutLabel()}</kbd>
-          </button>
-
-          <button
-            ref={pairMobileTriggerRef}
-            className="button button--quiet topbar__pair-control"
-            type="button"
-            aria-label="Mobile"
-            aria-haspopup="dialog"
-            title="Open mobile companion"
-            onClick={() => setPairMobileOpen(true)}
-          >
-            <Icon icon={Smartphone} size={16} />
-            <span>Mobile</span>
           </button>
 
           <label className="run-location" title={`Run this thread on ${selectedHost.name}`}>
@@ -744,12 +724,16 @@ export default function App({ api: suppliedApi }: AppProps) {
         onSelectProject={selectProject}
         onSelectThread={selectThread}
         onSearch={openCommandPalette}
-        onAddComputer={() => {
+        onClose={closeSidebar}
+        onAddComputer={(trigger) => {
+          addComputerReturnTargetRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
           closeSidebar()
           setAddComputerOpen(true)
         }}
+        onOpenCompanion={() => setPairMobileOpen(true)}
         onMoveThread={openMoveThread}
         addComputerTriggerRef={addComputerTriggerRef}
+        companionTriggerRef={pairMobileTriggerRef}
         environment={api.environment}
         containerRef={sidebarPanelRef}
         modal={sidebarIsModal}
@@ -779,7 +763,7 @@ export default function App({ api: suppliedApi }: AppProps) {
           )}
         </div>
 
-        <Transcript thread={selectedThread} host={selectedHost} />
+        <Transcript thread={selectedThread} />
 
         <Composer
           connection={selectedHost.connection}
@@ -825,7 +809,7 @@ export default function App({ api: suppliedApi }: AppProps) {
         api={api}
         open={addComputerOpen}
         onClose={() => setAddComputerOpen(false)}
-        triggerRef={addComputerTriggerRef}
+        triggerRef={addComputerReturnTargetRef}
       />
 
       <CommandPaletteDialog
@@ -837,6 +821,7 @@ export default function App({ api: suppliedApi }: AppProps) {
         onSelectThread={selectThread}
         onSelectProject={selectProject}
         onAddComputer={() => {
+          addComputerReturnTargetRef.current = commandPaletteTriggerRef.current
           setCommandPaletteOpen(false)
           setAddComputerOpen(true)
         }}
@@ -890,9 +875,12 @@ interface SidebarProps {
   onSelectProject: (projectId: string) => void
   onSelectThread: (thread: ThreadSummary) => void
   onSearch: () => void
-  onAddComputer: () => void
+  onClose: () => void
+  onAddComputer: (trigger: HTMLElement) => void
+  onOpenCompanion: () => void
   onMoveThread: (hostId: string, trigger: HTMLElement | null) => void
   addComputerTriggerRef: RefObject<HTMLButtonElement | null>
+  companionTriggerRef: RefObject<HTMLButtonElement | null>
   environment: RendererApi['environment']
   containerRef: RefObject<HTMLElement | null>
   modal: boolean
@@ -906,9 +894,12 @@ function Sidebar({
   onSelectProject,
   onSelectThread,
   onSearch,
+  onClose,
   onAddComputer,
+  onOpenCompanion,
   onMoveThread,
   addComputerTriggerRef,
+  companionTriggerRef,
   environment,
   containerRef,
   modal,
@@ -932,6 +923,12 @@ function Sidebar({
       inert={inert ? true : undefined}
     >
       <div className="sidebar__scroll">
+        <div className="sidebar__drawer-header">
+          <strong>Projects and threads</strong>
+          <button className="icon-button" type="button" aria-label="Close sidebar" onClick={onClose}>
+            <Icon icon={X} size={17} />
+          </button>
+        </div>
         <div className="sidebar__new-row">
           <button
             className="button button--quiet button--full sidebar__search"
@@ -1058,8 +1055,22 @@ function Sidebar({
             <Icon icon={ChevronDown} size={14} />
           </label>
         )}
-        <button ref={addComputerTriggerRef} className="button button--quiet button--full" type="button" onClick={onAddComputer}>
+        <button
+          ref={addComputerTriggerRef}
+          className="button button--quiet button--full"
+          type="button"
+          onClick={(event) => onAddComputer(event.currentTarget)}
+        >
           <Icon icon={Computer} /> Add computer
+        </button>
+        <button
+          ref={companionTriggerRef}
+          className="button button--quiet button--full"
+          type="button"
+          aria-haspopup="dialog"
+          onClick={onOpenCompanion}
+        >
+          <Icon icon={Smartphone} /> Companion preview
         </button>
         {environment === 'preview' && <span className="preview-label">Browser preview · sample data</span>}
       </div>
@@ -1069,7 +1080,7 @@ function Sidebar({
 
 const TRANSCRIPT_BLOCK_INCREMENT = 200
 
-function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary }) {
+function Transcript({ thread }: { thread: ThreadSummary }) {
   const scrollRef = useRef<HTMLElement>(null)
   const previousThreadIdRef = useRef('')
   const shouldFollowRef = useRef(true)
@@ -1112,7 +1123,6 @@ function Transcript({ thread, host }: { thread: ThreadSummary; host: HostSummary
       ref={scrollRef}
       className="transcript"
       aria-label="Thread transcript"
-      aria-busy={host.connection === 'reconnecting'}
       onScroll={(event) => {
         const scroller = event.currentTarget
         const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
@@ -1237,7 +1247,7 @@ function SessionContinuity({
     : `Cached · ${queueStateCopy}`
   const residencyCopy = runtime.session?.residency === 'resident'
     ? isFresh
-      ? `Continues on ${hostName} when this window closes`
+      ? `Reported resident on ${hostName}`
       : `Last reported resident on ${hostName} · current status unverified`
     : runtime.session?.residency === 'client_owned'
       ? isFresh
@@ -1247,7 +1257,7 @@ function SessionContinuity({
   const taskCopy = isFresh ? taskLabel(taskState) : `Last reported ${taskLabel(taskState).toLocaleLowerCase()}`
 
   return (
-    <section className="session-continuity" aria-label="Session continuity">
+    <section className="session-continuity" aria-label="Session status">
       <span className={cx('session-continuity__state', `session-continuity__state--${taskState}`)}>
         <Icon icon={taskState === 'running' ? Activity : Circle} size={14} />
       </span>
@@ -1255,7 +1265,7 @@ function SessionContinuity({
         <span className="eyebrow">
           {displayedGoal
             ? `Goal · ${isFresh ? runtimeStateLabel(displayedGoal.state) : `last reported ${runtimeStateLabel(displayedGoal.state).toLocaleLowerCase()}`}`
-            : 'Session continuity'}
+            : 'Session status'}
         </span>
         <strong title={displayedGoal?.objective}>{goalCopy}</strong>
         <small>Run location: <bdi>{hostName}</bdi> · {taskCopy}{residencyCopy ? ` · ${residencyCopy}` : ''}</small>
@@ -1271,7 +1281,7 @@ function SessionContinuity({
 function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, receipt, onSubmit }: ComposerProps) {
   const disconnected = connection !== 'online'
   const effectiveMode = taskState === 'running' ? mode : 'follow_up'
-  const submitLabel = disconnected ? 'Send when reconnected' : effectiveMode === 'steer' ? 'Steer now' : 'Send follow-up'
+  const submitLabel = disconnected ? 'Send when reconnected' : effectiveMode === 'steer' ? 'Steer next step' : 'Send follow-up'
 
   return (
     <footer className="composer-wrap">
@@ -1291,10 +1301,10 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
                 type="button"
                 aria-pressed={effectiveMode === 'steer'}
                 disabled={disconnected}
-                title={disconnected ? `Reconnect to ${hostName} to steer the running turn` : undefined}
+                title={disconnected ? `Reconnect to ${hostName} to steer the running turn` : 'Deliver after the current tool calls finish'}
                 onClick={() => onModeChange('steer')}
               >
-                Steer now
+                Steer next step
               </button>
             </div>
           ) : <span className="composer__intent">Follow up</span>}
@@ -1570,34 +1580,34 @@ function RuntimePanel({
     ? runtime.queue.paused
       ? `${runtime.queue.pendingCount} pending · paused`
       : runtime.queue.pendingCount === 0
-        ? 'Empty'
+        ? 'No pending commands'
         : `${runtime.queue.pendingCount} pending`
-    : 'Unavailable'
+    : 'Not reported'
   const residencyCopy = session?.residency === 'resident'
     ? isFresh
-      ? 'Resident on host'
+      ? 'Reported resident on host'
       : 'Last reported resident · current status unverified'
     : session?.residency === 'client_owned'
       ? isFresh
-        ? 'Client-owned'
+        ? 'Reported client-owned'
         : 'Last reported client-owned · current status unverified'
       : session
-        ? 'Unknown'
-        : 'Unavailable'
+        ? 'Not reported'
+        : 'No session report'
 
   return (
     <div className="inspector-content">
       <PanelHeading
         icon={Bot}
-        title="RLM runtime"
+        title="Reported runtime"
         meta={isFresh
-          ? `${runningAgents} ${runningAgents === 1 ? 'subagent' : 'subagents'} running · ${taskLabel(thread.status)}`
-          : `${runningAgents} last reported running · cached host state`}
+          ? `Current thread · ${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} running`
+          : `${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} last reported running · cached host state`}
       />
 
       <section className="runtime-section" aria-labelledby="runtime-session-heading">
         <div className="runtime-section__heading">
-          <h3 id="runtime-session-heading">Session continuity</h3>
+          <h3 id="runtime-session-heading">Status</h3>
           {!isFresh && session && <span className="runtime-badge runtime-badge--warning">Cached state</span>}
           {isFresh && session && (session.isStreaming || session.isBashRunning || session.isCompacting || session.retryAttempt > 0) && (
             <span className="runtime-badges" aria-label="Runtime activity">
@@ -1610,141 +1620,170 @@ function RuntimePanel({
         </div>
         <dl className="runtime-facts">
           <div><dt>Run location</dt><dd><bdi>{host.name}</bdi></dd></div>
+          <div><dt>Connection</dt><dd>{connectionLabel(host.connection)}</dd></div>
           <div><dt>Turn</dt><dd>{taskLabel(thread.status)}</dd></div>
           <div><dt>Residency</dt><dd>{residencyCopy}</dd></div>
           {sessionId && <div><dt>Session</dt><dd><bdi>{sessionId}</bdi></dd></div>}
           {thread.executionGenerationId && <div><dt>Execution</dt><dd><bdi>{thread.executionGenerationId}</bdi></dd></div>}
           {thread.workspaceId && <div><dt>Workspace</dt><dd><bdi>{thread.workspaceId}</bdi></dd></div>}
-          <div><dt>Session actions</dt><dd className="tabular">{session ? session.queuedActionCount : 'Unavailable'}</dd></div>
-          <div><dt>Host commands</dt><dd>{hostQueueCopy}</dd></div>
-          {session?.model && <div><dt>Model</dt><dd><bdi>{session.model}</bdi>{session.thinkingLevel ? ` · ${session.thinkingLevel}` : ''}{session.serviceTier ? ` · ${session.serviceTier}` : ''}</dd></div>}
-          {session && session.activeToolNames.length > 0 && <div><dt>Active tools</dt><dd>{session.activeToolNames.join(', ')}</dd></div>}
-          {session?.context && (
-            <div>
-              <dt>Context</dt>
-              <dd className="tabular">
-                {session.context.usedTokens.toLocaleString()}
-                {session.context.maxTokens ? ` of ${session.context.maxTokens.toLocaleString()} tokens` : ' tokens'}
-              </dd>
-            </div>
-          )}
         </dl>
-        {!session && <p className="runtime-empty">Live Prime Agent session details are unavailable in this snapshot.</p>}
+        {!session && <p className="runtime-empty">This snapshot doesn’t report live Prime Agent session activity.</p>}
       </section>
 
-      <section className="runtime-section" aria-labelledby="runtime-goal-heading">
+      <section className="runtime-section" aria-labelledby="runtime-work-heading">
         <div className="runtime-section__heading">
-          <h3 id="runtime-goal-heading">Goals</h3>
-          {runtime.goals && <span>{isFresh ? `${activeGoals.length} active` : `Cached · ${activeGoals.length} active`}</span>}
+          <h3 id="runtime-work-heading">Reported work</h3>
+          <span>{activeGoals.length} active · {snapshot.agents.length} agents</span>
         </div>
-        {runtime.goals === undefined ? (
-          <p className="runtime-empty">Goal state is unavailable in this snapshot.</p>
-        ) : runtime.goals.length === 0 ? (
-          <p className="runtime-empty">No goal is active for this session.</p>
-        ) : (
-          <>
-            <ul className="runtime-list">
-              {visibleGoals?.map((goal) => (
-                <li key={goal.id}>
-                  <span className={cx('runtime-state', `runtime-state--${goal.state}`)} aria-hidden="true" />
-                  <span className="runtime-list__body">
-                    <strong>{goal.objective}</strong>
-                    <small>
-                      {runtimeStateLabel(goal.state)}
-                      {goal.tokensUsed !== undefined ? ` · ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` of ${goal.tokenBudget.toLocaleString()}` : ''} tokens` : ''}
-                    </small>
-                    {goal.detail && <span>{goal.detail}</span>}
-                  </span>
-                </li>
-              ))}
-            </ul>
-            {runtime.goals.length > goalLimit && (
-              <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setGoalLimit((limit) => limit + RUNTIME_GOAL_INCREMENT)}>
-                Show {Math.min(RUNTIME_GOAL_INCREMENT, runtime.goals.length - goalLimit)} more goals
-              </button>
-            )}
-          </>
-        )}
-      </section>
-
-      <section className="runtime-section" aria-labelledby="runtime-agents-heading">
-        <div className="runtime-section__heading">
-          <h3 id="runtime-agents-heading">Retained subagents</h3>
-          <span>{snapshot.agents.length}</span>
-        </div>
-        {snapshot.agents.length === 0 ? (
-          <p className="runtime-empty">No retained subagents in this session.</p>
-        ) : (
-          <ul className="agent-list">
-            {visibleAgents.map((agent) => {
-              const hierarchy = agentHierarchy(agent, agentsById)
-              return (
-                <li data-runtime-agent key={agent.id} style={{ marginInlineStart: `${hierarchy.depth * 0.75}rem` }}>
-                  <span className={cx('agent-state', `agent-state--${agent.status}`)}>
-                    <Icon icon={agent.status === 'complete' ? Check : agent.status === 'running' ? Activity : agent.status === 'failed' ? AlertCircle : Clock3} size={14} />
-                  </span>
-                  <span className="agent-list__body">
-                    <strong>{agent.name}</strong>
-                    {hierarchy.parent && <span className="agent-list__parent">Subagent of {hierarchy.parent.name}</span>}
-                    <span>{agent.activity ?? agent.recap ?? agent.role}</span>
-                    <small>
-                      <bdi>{agent.hostName}</bdi> · {isFresh ? runtimeStateLabel(agent.status) : `Last reported ${runtimeStateLabel(agent.status).toLocaleLowerCase()}`}
-                      {agent.model ? ` · ${agent.model}` : ''}
-                      {agent.durationMs !== undefined ? ` · ${compactDuration(agent.durationMs)}` : ''}
-                      {agent.toolUseCount !== undefined ? ` · ${agent.toolUseCount.toLocaleString()} tool ${agent.toolUseCount === 1 ? 'use' : 'uses'}` : ''}
-                      {agent.tokenCount !== undefined ? ` · ${agent.tokenCount.toLocaleString()} tokens` : ''}
-                    </small>
-                    {agent.error && <span className="runtime-error">{agent.error}</span>}
-                  </span>
-                </li>
-              )
-            })}
-          </ul>
-        )}
-        {snapshot.agents.length > agentLimit && (
-          <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setAgentLimit((limit) => limit + RUNTIME_AGENT_INCREMENT)}>
-            Show {Math.min(RUNTIME_AGENT_INCREMENT, snapshot.agents.length - agentLimit)} more subagents
-          </button>
-        )}
-      </section>
-
-      <section className="runtime-section" aria-labelledby="runtime-schedules-heading">
-        <div className="runtime-section__heading">
-          <h3 id="runtime-schedules-heading">Schedules</h3>
-          {runtime.schedules && <span>{runtime.schedules.length}</span>}
-        </div>
-        {runtime.schedules === undefined ? (
-          <p className="runtime-empty">Schedule state is unavailable in this snapshot.</p>
-        ) : runtime.schedules.length === 0 ? (
-          <p className="runtime-empty">No schedules are configured for this session.</p>
-        ) : (
-          <>
-            <ul className="runtime-list">
-              {visibleSchedules?.map((schedule) => {
-                const nextRun = scheduleTime(schedule.nextRunAt)
-                return (
-                  <li key={schedule.id}>
-                    <span className={cx('runtime-state', `runtime-state--${schedule.state}`)} aria-hidden="true" />
+        <div className="runtime-subsection" aria-labelledby="runtime-goal-heading">
+          <div className="runtime-subsection__heading">
+            <h4 id="runtime-goal-heading">Goals</h4>
+            {runtime.goals && <span>{isFresh ? `${activeGoals.length} active` : `Cached · ${activeGoals.length} active`}</span>}
+          </div>
+          {runtime.goals === undefined ? (
+            <p className="runtime-empty">Goals aren’t reported in this snapshot.</p>
+          ) : runtime.goals.length === 0 ? (
+            <p className="runtime-empty">No goal is active for this session.</p>
+          ) : (
+            <>
+              <ul className="runtime-list">
+                {visibleGoals?.map((goal) => (
+                  <li key={goal.id}>
+                    <span className={cx('runtime-state', `runtime-state--${goal.state}`)} aria-hidden="true" />
                     <span className="runtime-list__body">
-                      <strong>{schedule.label}</strong>
+                      <strong>{goal.objective}</strong>
                       <small>
-                        {runtimeStateLabel(schedule.state)}
-                        {schedule.source ? ` · ${runtimeStateLabel(schedule.source)}` : schedule.kind ? ` · ${runtimeStateLabel(schedule.kind)}` : ''}
-                        {nextRun ? ` · Next ${nextRun}` : ''}
+                        {runtimeStateLabel(goal.state)}
+                        {goal.tokensUsed !== undefined ? ` · ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` of ${goal.tokenBudget.toLocaleString()}` : ''} tokens` : ''}
                       </small>
-                      {schedule.detail && <span>{schedule.detail}</span>}
+                      {goal.detail && <span>{goal.detail}</span>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {runtime.goals.length > goalLimit && (
+                <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setGoalLimit((limit) => limit + RUNTIME_GOAL_INCREMENT)}>
+                  Show {Math.min(RUNTIME_GOAL_INCREMENT, runtime.goals.length - goalLimit)} more goals
+                </button>
+              )}
+            </>
+          )}
+        </div>
+        <div className="runtime-subsection" aria-labelledby="runtime-agents-heading">
+          <div className="runtime-subsection__heading">
+            <h4 id="runtime-agents-heading">Agents</h4>
+            <span>{snapshot.agents.length}</span>
+          </div>
+          {snapshot.agents.length === 0 ? (
+            <p className="runtime-empty">No retained agents are reported for this session.</p>
+          ) : (
+            <ul className="agent-list">
+              {visibleAgents.map((agent) => {
+                const hierarchy = agentHierarchy(agent, agentsById)
+                return (
+                  <li data-runtime-agent key={agent.id} style={{ marginInlineStart: `${hierarchy.depth * 0.75}rem` }}>
+                    <span className={cx('agent-state', `agent-state--${agent.status}`)}>
+                      <Icon icon={agent.status === 'complete' ? Check : agent.status === 'running' ? Activity : agent.status === 'failed' ? AlertCircle : Clock3} size={14} />
+                    </span>
+                    <span className="agent-list__body">
+                      <strong>{agent.name}</strong>
+                      {hierarchy.parent && <span className="agent-list__parent">Subagent of {hierarchy.parent.name}</span>}
+                      <span>{agent.activity ?? agent.recap ?? agent.role}</span>
+                      <small>
+                        <bdi>{agent.hostName}</bdi> · {isFresh ? runtimeStateLabel(agent.status) : `Last reported ${runtimeStateLabel(agent.status).toLocaleLowerCase()}`}
+                        {agent.model ? ` · ${agent.model}` : ''}
+                        {agent.durationMs !== undefined ? ` · ${compactDuration(agent.durationMs)}` : ''}
+                        {agent.toolUseCount !== undefined ? ` · ${agent.toolUseCount.toLocaleString()} tool ${agent.toolUseCount === 1 ? 'use' : 'uses'}` : ''}
+                        {agent.tokenCount !== undefined ? ` · ${agent.tokenCount.toLocaleString()} tokens` : ''}
+                      </small>
+                      {agent.error && <span className="runtime-error">{agent.error}</span>}
                     </span>
                   </li>
                 )
               })}
             </ul>
-            {runtime.schedules.length > scheduleLimit && (
-              <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setScheduleLimit((limit) => limit + RUNTIME_SCHEDULE_INCREMENT)}>
-                Show {Math.min(RUNTIME_SCHEDULE_INCREMENT, runtime.schedules.length - scheduleLimit)} more schedules
-              </button>
+          )}
+          {snapshot.agents.length > agentLimit && (
+            <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setAgentLimit((limit) => limit + RUNTIME_AGENT_INCREMENT)}>
+              Show {Math.min(RUNTIME_AGENT_INCREMENT, snapshot.agents.length - agentLimit)} more subagents
+            </button>
+          )}
+        </div>
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-delivery-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-delivery-heading">Delivery</h3>
+          <span>{runtime.queue?.paused ? 'Paused' : host.connection === 'online' ? 'Connected' : 'Cached'}</span>
+        </div>
+        <dl className="runtime-facts">
+          <div><dt>Session actions</dt><dd className="tabular">{session ? session.queuedActionCount : 'Not reported'}</dd></div>
+          <div><dt>Host commands</dt><dd>{hostQueueCopy}</dd></div>
+        </dl>
+        <p className="runtime-note">Prime reconciles command receipts before retrying after a disconnect.</p>
+        <div className="runtime-subsection" aria-labelledby="runtime-schedules-heading">
+          <div className="runtime-subsection__heading">
+            <h4 id="runtime-schedules-heading">Scheduled work</h4>
+            {runtime.schedules && <span>{runtime.schedules.length}</span>}
+          </div>
+          {runtime.schedules === undefined ? (
+            <p className="runtime-empty">Schedules aren’t reported in this snapshot.</p>
+          ) : runtime.schedules.length === 0 ? (
+            <p className="runtime-empty">No schedules are reported for this session.</p>
+          ) : (
+            <>
+              <ul className="runtime-list">
+                {visibleSchedules?.map((schedule) => {
+                  const nextRun = scheduleTime(schedule.nextRunAt)
+                  return (
+                    <li key={schedule.id}>
+                      <span className={cx('runtime-state', `runtime-state--${schedule.state}`)} aria-hidden="true" />
+                      <span className="runtime-list__body">
+                        <strong>{schedule.label}</strong>
+                        <small>
+                          {runtimeStateLabel(schedule.state)}
+                          {schedule.source ? ` · ${runtimeStateLabel(schedule.source)}` : schedule.kind ? ` · ${runtimeStateLabel(schedule.kind)}` : ''}
+                          {nextRun ? ` · Next ${nextRun}` : ''}
+                        </small>
+                        {schedule.detail && <span>{schedule.detail}</span>}
+                      </span>
+                    </li>
+                  )
+                })}
+              </ul>
+              {runtime.schedules.length > scheduleLimit && (
+                <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setScheduleLimit((limit) => limit + RUNTIME_SCHEDULE_INCREMENT)}>
+                  Show {Math.min(RUNTIME_SCHEDULE_INCREMENT, runtime.schedules.length - scheduleLimit)} more schedules
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-usage-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-usage-heading">Usage</h3>
+          <span>Reported by the runtime</span>
+        </div>
+        {session?.model || session?.context || session?.activeToolNames.length ? (
+          <dl className="runtime-facts">
+            {session?.model && <div><dt>Model</dt><dd><bdi>{session.model}</bdi>{session.thinkingLevel ? ` · ${session.thinkingLevel}` : ''}{session.serviceTier ? ` · ${session.serviceTier}` : ''}</dd></div>}
+            {session?.context && (
+              <div>
+                <dt>Context</dt>
+                <dd className="tabular">
+                  {session.context.usedTokens.toLocaleString()}
+                  {session.context.maxTokens ? ` of ${session.context.maxTokens.toLocaleString()} tokens` : ' tokens'}
+                </dd>
+              </div>
             )}
-          </>
+            {session && session.activeToolNames.length > 0 && <div><dt>Active tools</dt><dd>{session.activeToolNames.join(', ')}</dd></div>}
+          </dl>
+        ) : (
+          <p className="runtime-empty">Model, tool, and context usage aren’t reported for this session.</p>
         )}
+        <p className="runtime-note">Token counts may be reported here. Prices and spend aren’t calculated in this build.</p>
       </section>
     </div>
   )
@@ -1761,6 +1800,7 @@ function EvidencePanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
               <Icon icon={evidence.status === 'passed' ? CheckCircle2 : evidence.status === 'running' ? Loader2 : AlertCircle} size={15} />
             </span>
             <span>
+              <span className="sr-only">{runtimeStateLabel(evidence.status)}. </span>
               <strong>{evidence.label}</strong>
               <small>{evidence.detail}</small>
             </span>
@@ -2084,11 +2124,10 @@ function PairMobileDialog({
           <section className="relay-gate" aria-labelledby="relay-gate-title">
             <span className="relay-gate__icon"><Icon icon={LockKeyhole} size={20} /></span>
             <div>
-              <span className="eyebrow">Pairing unavailable</span>
-              <h3 id="relay-gate-title">Phone control is not ready yet</h3>
+              <span className="eyebrow">Preview only</span>
+              <h3 id="relay-gate-title">Phone control isn’t available in this build</h3>
               <p>
-                Remote control stays off until encrypted pairing and per-device revocation are complete. You can still
-                preview the mobile experience using data already on this computer.
+                This shows the companion layout on this computer. It does not connect a phone or enable remote control.
               </p>
             </div>
           </section>
@@ -2097,7 +2136,7 @@ function PairMobileDialog({
             <div className="section-heading-row">
               <div>
                 <h3 id="companion-preview-heading">Preview on this device</h3>
-                <p>Uses the thread data already loaded here. It creates no credential or network connection.</p>
+                <p>Uses the thread data already loaded here. No relay, credential, or encrypted device connection is created.</p>
               </div>
               <span className="verification-mark">
                 <Icon icon={Eye} size={14} />
@@ -2114,7 +2153,7 @@ function PairMobileDialog({
         </div>
 
         <footer className="sheet__footer">
-          <p>The preview stays on this device and cannot send commands.</p>
+          <p>The preview stays on this device and cannot pair a phone or send commands.</p>
           <div className="sheet__footer-actions">
             <button className="button button--quiet" type="button" onClick={onClose}>Close</button>
             <button className="button button--primary" type="button" onClick={onOpenPreview}>
@@ -2373,7 +2412,10 @@ function CompanionPreview({
               {snapshot.evidence.slice(0, 3).map((item) => (
                 <div className="companion-evidence-row" key={item.id}>
                   <Icon icon={item.status === 'passed' ? CheckCircle2 : item.status === 'running' ? Loader2 : AlertCircle} size={15} />
-                  <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+                  <span>
+                    <span className="sr-only">{runtimeStateLabel(item.status)}. </span>
+                    <strong>{item.label}</strong><small>{item.detail}</small>
+                  </span>
                 </div>
               ))}
             </section>
@@ -2519,12 +2561,16 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
   const [installConsent, setInstallConsent] = useState(false)
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
+  const [invalidField, setInvalidField] = useState<'manual-host' | 'install-consent' | null>(null)
+  const manualHostRef = useRef<HTMLInputElement>(null)
+  const installConsentRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (!open) return
     let cancelled = false
     setLoading(true)
     setError('')
+    setInvalidField(null)
     setStatus('Discovering SSH aliases…')
     void api
       .discoverComputers()
@@ -2555,12 +2601,16 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     setManualMode(false)
     setInstallConsent(selected?.probeComplete ? !selected.requiresInstall : false)
     setError('')
+    setInvalidField(null)
   }
 
   const probe = async () => {
     setError('')
+    setInvalidField(null)
     if (manualMode && !manualHost.trim()) {
       setError('Enter a hostname or SSH alias to run the connection check.')
+      setInvalidField('manual-host')
+      window.requestAnimationFrame(() => manualHostRef.current?.focus())
       return
     }
     setProbing(true)
@@ -2586,14 +2636,21 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     event.preventDefault()
     if (!selectedComputer?.probeComplete) {
       setError('Select a discovered alias or check a manually entered host first.')
+      if (manualMode) {
+        setInvalidField('manual-host')
+        window.requestAnimationFrame(() => manualHostRef.current?.focus())
+      }
       return
     }
     if (selectedComputer.requiresInstall && !installConsent) {
-      setError(`Allow installation of the Prime Agent host service on ${selectedComputer.alias} to continue.`)
+      setError(`Allow installation of the Continuim host service on ${selectedComputer.alias} to continue.`)
+      setInvalidField('install-consent')
+      window.requestAnimationFrame(() => installConsentRef.current?.focus())
       return
     }
     setSubmitting(true)
     setError('')
+    setInvalidField(null)
     setStatus(selectedComputer.requiresInstall ? `Installing the host service on ${selectedComputer.alias}…` : `Adding ${selectedComputer.alias}…`)
     try {
       await api.addComputer({
@@ -2679,12 +2736,22 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                   <label>
                     <span>Hostname or SSH alias</span>
                     <input
+                      ref={manualHostRef}
+                      id="manual-host"
                       type="text"
                       name="manual-host"
                       value={manualHost}
                       placeholder="build.example.com"
                       spellCheck={false}
-                      onChange={(event) => setManualHost(event.target.value)}
+                      aria-invalid={invalidField === 'manual-host'}
+                      aria-describedby={invalidField === 'manual-host' ? 'add-computer-error' : undefined}
+                      onChange={(event) => {
+                        setManualHost(event.target.value)
+                        if (invalidField === 'manual-host') {
+                          setInvalidField(null)
+                          setError('')
+                        }
+                      }}
                     />
                   </label>
                   <label>
@@ -2754,6 +2821,25 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                 <ProbeRow label="Prime Agent" value={resolved.agentVersion} />
                 <ProbeRow label="Host service" value={resolved.hostServiceVersion ?? 'Not installed'} warning={resolved.requiresInstall} />
               </ul>
+              <details className="command-disclosure upstream-install">
+                <summary>Install Prime Agent on macOS or Linux</summary>
+                <p>
+                  This is the official upstream installer. Review it, then run it in a terminal on the computer you
+                  want to use. Prime Continuim never runs this command automatically.
+                </p>
+                <div className="command-block">
+                  <code>{PRIME_AGENT_INSTALL_COMMAND}</code>
+                  <button
+                    className="small-icon-button"
+                    type="button"
+                    aria-label="Copy official Prime Agent install command"
+                    onClick={() => void navigator.clipboard?.writeText(PRIME_AGENT_INSTALL_COMMAND)}
+                  >
+                    <Icon icon={Code2} size={14} />
+                  </button>
+                </div>
+                <small>Prime Agent runs model-generated code with your user permissions; use an external sandbox for untrusted work.</small>
+              </details>
             </section>
           )}
 
@@ -2762,13 +2848,28 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
               <div className="install-consent__copy">
                 <span className="install-consent__icon"><Icon icon={HardDrive} size={17} /></span>
                 <div>
-                  <h3 id="install-heading">Install the host service</h3>
-                  <p>It runs under your user account on <bdi>{resolved.alias}</bdi> and lets threads continue when this app disconnects. Root access is not required.</p>
+                  <h3 id="install-heading">Install the Continuim host service</h3>
+                  <p>A compatible host service is required for durable thread state on <bdi>{resolved.alias}</bdi>. Root access is not required.</p>
                 </div>
               </div>
               <label className="consent-row">
-                <input type="checkbox" checked={installConsent} disabled={!resolved.installAvailable} onChange={(event) => setInstallConsent(event.target.checked)} />
-                <span>Install the signed Prime Agent host service on <bdi>{resolved.alias}</bdi></span>
+                <input
+                  ref={installConsentRef}
+                  id="install-consent"
+                  type="checkbox"
+                  checked={installConsent}
+                  disabled={!resolved.installAvailable}
+                  aria-invalid={invalidField === 'install-consent'}
+                  aria-describedby={invalidField === 'install-consent' ? 'add-computer-error' : undefined}
+                  onChange={(event) => {
+                    setInstallConsent(event.target.checked)
+                    if (invalidField === 'install-consent') {
+                      setInvalidField(null)
+                      setError('')
+                    }
+                  }}
+                />
+                <span>Install the signed Continuim host service on <bdi>{resolved.alias}</bdi></span>
               </label>
               {!resolved.installAvailable && (
                 <p className="install-unavailable"><Icon icon={AlertCircle} size={14} /> {resolved.installDeferredReason ?? 'The signed installer is unavailable in this build.'}</p>
@@ -2785,7 +2886,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
             </section>
           )}
 
-          {error && <p className="inline-error" role="alert"><Icon icon={AlertCircle} size={15} /> {error}</p>}
+          {error && <p className="inline-error" id="add-computer-error" role="alert"><Icon icon={AlertCircle} size={15} /> {error}</p>}
           <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{status}</div>
         </div>
 
@@ -2852,6 +2953,25 @@ function MoveThreadDialog({ api, open, thread, sourceHost, destinationHost, trig
   const [progressMessage, setProgressMessage] = useState('')
   const [error, setError] = useState('')
   const [completeReceipt, setCompleteReceipt] = useState('')
+  const progressHeadingRef = useRef<HTMLHeadingElement>(null)
+  const continueButtonRef = useRef<HTMLButtonElement>(null)
+  const focusedProgressRef = useRef(false)
+
+  useEffect(() => {
+    if (open) return
+    focusedProgressRef.current = false
+  }, [open])
+
+  useEffect(() => {
+    if (!phase || phase === 'complete' || focusedProgressRef.current) return
+    focusedProgressRef.current = true
+    window.requestAnimationFrame(() => progressHeadingRef.current?.focus())
+  }, [phase])
+
+  useEffect(() => {
+    if (phase !== 'complete') return
+    window.requestAnimationFrame(() => continueButtonRef.current?.focus())
+  }, [phase])
 
   useEffect(() => {
     if (!open || !destinationHost) return
@@ -2996,7 +3116,7 @@ function MoveThreadDialog({ api, open, thread, sourceHost, destinationHost, trig
                 <section className="handoff-progress" aria-labelledby="handoff-progress-heading">
                   <div className="section-heading-row">
                     <div>
-                      <h3 id="handoff-progress-heading">Move progress</h3>
+                      <h3 ref={progressHeadingRef} id="handoff-progress-heading" tabIndex={-1}>Move progress</h3>
                       <p>{progressMessage}</p>
                     </div>
                     <span className="tabular">{Math.max(0, currentPhaseIndex + 1)} / {HANDOFF_PHASES.length}</span>
@@ -3005,9 +3125,14 @@ function MoveThreadDialog({ api, open, thread, sourceHost, destinationHost, trig
                     {HANDOFF_PHASES.map((item, index) => {
                       const state = index < currentPhaseIndex || isComplete ? 'complete' : index === currentPhaseIndex ? 'current' : 'pending'
                       return (
-                        <li key={item.phase} data-state={state}>
-                          <span>{state === 'complete' ? <Icon icon={Check} size={13} /> : state === 'current' ? <Icon icon={Loader2} size={13} /> : <span aria-hidden="true" />}</span>
-                          {item.label}
+                        <li key={item.phase} data-state={state} aria-current={state === 'current' ? 'step' : undefined}>
+                          <span className="handoff-progress__marker">
+                            {state === 'complete' ? <Icon icon={Check} size={13} /> : state === 'current' ? <Icon icon={Loader2} size={13} /> : <span aria-hidden="true" />}
+                          </span>
+                          <span className="handoff-progress__label">
+                            <span className="sr-only">{runtimeStateLabel(state)}: </span>
+                            {item.label}
+                          </span>
                         </li>
                       )
                     })}
@@ -3037,7 +3162,7 @@ function MoveThreadDialog({ api, open, thread, sourceHost, destinationHost, trig
           <div className="sheet__footer-actions">
             {!isComplete && <button className="button button--quiet" type="button" autoFocus onClick={onClose} disabled={moving}>Cancel</button>}
             {isComplete ? (
-              <button className="button button--primary" type="button" onClick={onClose}><Icon icon={ArrowRight} size={15} /> Continue thread</button>
+              <button ref={continueButtonRef} className="button button--primary" type="button" onClick={onClose}><Icon icon={ArrowRight} size={15} /> Continue thread</button>
             ) : (
               <button className="button button--primary" type="submit" disabled={!plan || moving || loading}>
                 {moving ? <Icon icon={Loader2} size={15} /> : <Icon icon={RefreshCw} size={15} />}

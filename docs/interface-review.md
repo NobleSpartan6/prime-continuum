@@ -2,7 +2,7 @@
 
 Verdict: **Pass for the Phase 0/Phase 1 desktop and read-only mobile-supervision foundation; not a production remote-release approval.** The workbench is coherent, accessible, and honest about inactive capabilities. Production phone control remains gated by the engineering items in `implementation-status.md`.
 
-Review order followed the requested `better-interface` workflow: accessibility → layout → writing → typography → colors → UI polish, followed by the animation standards review.
+Review order followed the requested `make-interfaces-feel-better` workflow, with `better-layout` and `better-accessibility` applied to responsive structure and interaction semantics.
 
 ## Findings
 
@@ -26,6 +26,11 @@ Review order followed the requested `better-interface` workflow: accessibility �
 | P1 | Responsive layering | Sidebar, inspector, and palette could stack independent focus traps at narrow widths. | Resolved with mutually exclusive layer state, modal dialog semantics, inert backing content, and one full-screen scrim; regression-tested. |
 | P1 | Thread layout | Simultaneous connection and refresh notices could create implicit grid rows and displace the transcript/composer. | Resolved with one permanent notice grid region that contains both messages. |
 | P2 | Navigation and scroll | Companion route changes, palette keyboard movement, and transcript updates did not consistently expose the new content. | Resolved with destination heading focus/scroll reset, active-option `scrollIntoView`, thread-change reset, and near-bottom-only transcript following; regression-tested. |
+| P1 | Runtime truth | Infrastructure concepts risked becoming global product destinations or implying fleet-wide health. | Resolved by keeping them scoped to the active thread and organizing the contextual Runtime panel around Status, Reported work, Delivery, and Usage. Cached and unreported states remain explicit. |
+| P1 | Upstream trust | Prime Agent installation could be confused with Continuim host installation or sandboxing. | Resolved with the official macOS/Linux installer as terminal-only help, a separately named Continuim host service, and an explicit user-permissions / not-a-security-sandbox warning. |
+| P1 | Keyboard and high contrast | Corrected Add computer fields could retain stale alerts, and forced-colors mode could suppress composer and palette focus. | Resolved by clearing field-local errors on correction and restoring 2 px `Highlight` outlines under forced colors; regression-tested. |
+| P2 | Drawer operation | The narrow project drawer relied on Escape or the scrim for dismissal. | Resolved with an in-drawer Close action that participates in the focus loop and restores the opener. |
+| P2 | Visual hierarchy | The persistent header and mobile preview competed with the active thread. | Resolved by demoting Companion Preview to the sidebar, removing duplicate evidence counts from the header, flattening nested cards, and framing the desktop Companion Preview at phone width. |
 
 ## Research basis and information architecture
 
@@ -36,10 +41,12 @@ The implementation follows durable patterns from primary platform guidance:
 - [Material 3 adaptive layouts](https://m3.material.io/foundations/layout/canonical-examples/overview) informed a separate compact supervision projection rather than shrinking the complete desktop workbench onto a phone.
 - [WCAG 2.2 target-size guidance](https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum) and [focus-appearance guidance](https://www.w3.org/WAI/WCAG22/Understanding/focus-appearance) informed coarse-pointer hit areas, visible focus, and keyboard operation.
 - [Apple's Human Interface Guidelines](https://developer.apple.com/design/human-interface-guidelines) reinforced clear hierarchy, platform-familiar controls, and safe-area-aware mobile navigation.
+- [Hermes Desktop's design notes](https://github.com/NousResearch/hermes-agent/blob/main/apps/desktop/DESIGN.md) reinforced chat as home, flat composition, non-focus-stealing background updates, persistent expensive panes, and explicit keyboard ownership.
+- [Prime Agent's architecture](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/architecture.md) and [RPC reference](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/rpc.md) informed truthful client/runtime ownership, steering, recovery snapshots, schedules, and reported usage.
 
 The resulting desktop defaults to navigation plus the active durable thread. The inspector is closed until evidence or context is requested. Mobile is a bounded supervision workflow: **Attention** for exceptional decisions, **Threads** for status/recaps/results, and **Hosts** for reachability. Execution location stays metadata instead of becoming a separate product mode.
 
-GPT Pro was used as a read-only architecture, taste, and ship reviewer. Its final scope-separated verdict was **GO** for the honest desktop/Companion Preview foundation, **conditional GO** for the inert Phase 3A and isolated relay foundation, and **NO-GO** for production phone control. It specifically rejected a LAN listener and simulated pairing artifacts, and retained real Linux/macOS process integration as a release condition. GPT Pro also stated that its visual and source claims were based only on supplied evidence; Codex independently inspected the current source, projection path, authorization checks, tests, DOM, browser geometry, and console before acting on the review.
+GPT Pro was used as a read-only architecture, taste, and ship reviewer. Its final scope-separated verdict was **GO** for committing the honest desktop/Companion Preview foundation and **NO-GO** for production remote/mobile positioning. It specifically rejected a LAN listener, simulated pairing artifacts, invented infrastructure telemetry, and treating terminal installer guidance as provisioning. It retained real phone control, relay/E2EE pairing, resident close/relaunch/reattach proof, committed cross-host handoff, signed remote provisioning, and native release-candidate QA as capability gates. GPT Pro's review was based only on supplied evidence; Codex independently inspected the current source, official upstream architecture, projection path, authorization checks, full tests, production build, DOM, browser geometry, and console before accepting the verdict.
 
 ## Accessibility and interaction coverage
 
@@ -69,7 +76,7 @@ GPT Pro was used as a read-only architecture, taste, and ship reviewer. Its fina
 | Drawer easing | `cubic-bezier(0.32, 0.72, 0, 1)` |
 | Interaction duration | 100–120 ms |
 | Drawer duration | 180 ms |
-| Press feedback | `scale: 0.98` |
+| Press feedback | `scale: 0.96` |
 | Expensive animated properties | None; transitions use scale, translate, color, background, border, shadow, and visibility |
 | `transition: all` | None |
 | Reduced motion | All transitions and spinners are inside `prefers-reduced-motion: no-preference` |

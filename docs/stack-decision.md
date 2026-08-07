@@ -6,11 +6,18 @@
 
 - Prime Agent is a Node/TypeScript runtime with a persistent Python/IPython execution layer. Tauri, Flutter, Qt, and platform-native shells still need that runtime or a Node sidecar.
 - Electron embeds Node 24.18.1, above Prime Agent's Node 22.8 minimum, and gives the renderer one deterministic Chromium target across desktop platforms.
+- Hermes Desktop independently validates the same Electron + React boundary for a polished, cross-platform agent client. Its strongest reusable ideas are architectural—chat as home, contextual panes, direct manipulation, persistent expensive views, and strict focus ownership—not its dependency breadth or pane editor.
 - At commit `20f4058`, the measured renderer is 831,898 bytes raw and 154,595 bytes gzip. That is a 5.0% gzip increase from the pre-workbench baseline and remains below the 200 KiB release budget, so bundle size is not the current bottleneck.
 - The renderer now bounds transcript and runtime-list mounting, but the current host-event hot path still replaces the whole workbench snapshot and root React state. Delta publication and consumption remain the next dataflow optimization; that is not an Electron limitation.
 - A rewrite would replace thousands of lines of working renderer, main-process, hostd, and protocol code while preserving the difficult daemon/Python boundary.
 
 The strongest contrary case is Electron's idle memory and security surface. That is a real cost. A thin Tauri remote-only client becomes worth testing if, after projection normalization and bounded rendering, Electron itself is the measured cause of missed startup, memory, or security budgets.
+
+## Client and runtime boundary
+
+The current Prime Agent architecture reinforces the chosen split: the UI owns rendering, input, and local preferences; `AgentConnection` fronts a local daemon supervisor; workers own root session trees, schedulers, kernels, and descendants. Continuim should adapt that client intent model into stable host-owned DTOs rather than import upstream runtime objects into the renderer.
+
+Prime Agent's local daemon protocol is not a hosted or mobile gateway. Remote control therefore continues through Continuim's authenticated host transport and eventual end-to-end encrypted relay. The interface must not expose a daemon socket, imply that Prime Agent ships remote access, or label worker/kernel process separation as a security sandbox.
 
 ## Upstream runtime pin
 
@@ -25,6 +32,14 @@ The first supported integration target is the official Prime Agent v0.7.0 releas
 - schema ID: `protocol-7-schema-13-816309b1cd50`
 
 The npm registry does not contain this version. Install and upgrade work must consume the official release asset, verify the published checksum before extraction, and never depend on a mutable source checkout. The runtime package remains host-only and must not enter renderer bundles.
+
+The public stable installer is a separate distribution path for macOS and Linux:
+
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+```
+
+It downloads a versioned release and verifies SHA-256. Continuim may show this as reviewed terminal guidance, but must not silently execute it or present it as the signed Continuim host-service installer. Windows setup currently requires Bash upstream; no native PowerShell or MSI claim is allowed.
 
 ## Performance budgets
 

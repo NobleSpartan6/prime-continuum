@@ -524,14 +524,14 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '186 GB free',
     gitVersion: 'Git 2.45.2',
     pythonStatus: 'Python 3.12 · IPython ready',
-    agentVersion: 'Prime Agent 0.18.4',
+    agentVersion: 'Prime Agent 0.7.0',
     hostServiceVersion: 'Not installed',
     requiresInstall: true,
-    installCommand:
-      "ssh devbox 'mkdir -p ~/.local/bin && prime-agent bootstrap --host-service --version 0.1.0 --user'",
+    installCommand: 'No signed host-service installer is available in this build.',
     recentProjects: ['~/work/prime-agent-native', '~/work/control-plane'],
     probeComplete: true,
-    installAvailable: true,
+    installAvailable: false,
+    installDeferredReason: 'The signed Continuim host-service installer is not bundled in this build.',
   },
   {
     alias: 'build-linux',
@@ -543,7 +543,7 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '92 GB free',
     gitVersion: 'Git 2.47.1',
     pythonStatus: 'Python 3.13 · IPython ready',
-    agentVersion: 'Prime Agent 0.18.4',
+    agentVersion: 'Prime Agent 0.7.0',
     hostServiceVersion: 'Host service 0.1.0 · running',
     requiresInstall: false,
     installCommand:

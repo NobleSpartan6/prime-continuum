@@ -8,6 +8,14 @@ Cross-platform desktop control plane for durable [Prime Agent](https://github.co
 - pnpm 11 (`pnpm install` also provides the reviewed, build-only npm 10.9.8 runtime assembler)
 - System OpenSSH client
 
+For a standalone Prime Agent installation on macOS or Linux, the official stable installer is:
+
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+```
+
+Review the installer before running it. Prime Continuim never runs that command automatically, and it does not replace Continuim's separately verified host service. Prime Agent executes model-generated Python and project commands with the host user's permissions; its worker and kernel processes provide lifecycle isolation, not a security sandbox. Use an external sandbox for untrusted work. See the upstream [quickstart](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/quickstart.md) and [Windows guidance](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/windows.md).
+
 ## Development
 
 ```powershell
@@ -21,9 +29,9 @@ Run the renderer by itself for browser-based visual checks:
 pnpm dev:web
 ```
 
-The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search real projects and threads or run available commands. The evidence inspector is contextual and closed by default.
+The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search real projects and threads or run available commands. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
 
-Open **Mobile** to inspect the pairing requirements and launch the read-only Companion Preview. For a direct browser preview of that compact projection, visit:
+Open **Companion preview** from the sidebar to inspect the pairing requirements and launch the read-only phone projection. For a direct browser preview, visit:
 
 ```text
 http://127.0.0.1:5173/?surface=companion

@@ -56,7 +56,7 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).toHaveClass('button--empty')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
-    const continuity = screen.getByRole('region', { name: 'Session continuity' })
+    const continuity = screen.getByRole('region', { name: 'Session status' })
     expect(within(continuity).getByText(/Last reported resident on devbox · current status unverified/i)).toBeVisible()
     expect(within(continuity).queryByText(/Continues on devbox when this window closes/i)).not.toBeInTheDocument()
   })
@@ -93,13 +93,13 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    const steerIntent = screen.getByRole('button', { name: 'Steer now' })
+    const steerIntent = screen.getByRole('button', { name: 'Steer next step' })
     await user.click(steerIntent)
     expect(steerIntent).toHaveAttribute('aria-pressed', 'true')
 
     await user.click(screen.getByRole('button', { name: /Frame protocol boundaries/ }))
     expect(await screen.findByRole('heading', { name: 'Frame protocol boundaries' })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Steer now' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Steer next step' })).not.toBeInTheDocument()
     expect(screen.getByText('Follow up', { selector: '.composer__intent' })).toBeVisible()
 
     await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Summarize the approval boundary.')
@@ -123,7 +123,10 @@ describe('Prime Continuim renderer', () => {
     const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    const trigger = screen.getByRole('button', { name: 'Add computer' })
+    const sidebarToggle = screen.getByRole('button', { name: 'Open sidebar' })
+    await user.click(sidebarToggle)
+    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+    const trigger = within(sidebar).getByRole('button', { name: 'Add computer' })
 
     await user.click(trigger)
     const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
@@ -136,11 +139,60 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText('Readiness check')).toBeVisible()
 
     await user.click(within(dialog).getByText('Show exact install command'))
-    expect(within(dialog).getByText(/prime-agent bootstrap --host-service/)).toBeVisible()
-    expect(within(dialog).getByRole('checkbox', { name: /Install the signed Prime Agent host service/ })).toBeEnabled()
+    expect(within(dialog).getByText(/No signed host-service installer is available in this build/)).toBeVisible()
+    expect(within(dialog).getByRole('checkbox', { name: /Install the signed Continuim host service/ })).toBeDisabled()
+    await user.click(within(dialog).getByText('Install Prime Agent on macOS or Linux'))
+    expect(within(dialog).getByText('curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh')).toBeVisible()
+    expect(within(dialog).getByText(/never runs this command automatically/i)).toBeVisible()
 
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
-    await waitFor(() => expect(trigger).toHaveFocus())
+    await waitFor(() => expect(sidebarToggle).toHaveFocus())
+  })
+
+  it('focuses and clears field-level Add computer errors as they are corrected', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const previewProbe = api.probeComputer.bind(api)
+    api.probeComputer = vi.fn(async (input) => ({
+      ...(await previewProbe(input)),
+      installAvailable: true,
+      installCommand: "ssh build-preview 'continuim-hostd install --user'",
+      installDeferredReason: undefined,
+    }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Open sidebar' }))
+    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+    await user.click(within(sidebar).getByRole('button', { name: 'Add computer' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
+
+    await user.click(within(dialog).getByText('Preview a manual host'))
+    const host = within(dialog).getByRole('textbox', { name: 'Hostname or SSH alias' })
+    await user.click(within(dialog).getByRole('button', { name: 'Check preview host' }))
+    expect(host).toHaveFocus()
+    expect(host).toHaveAttribute('aria-invalid', 'true')
+    expect(host).toHaveAttribute('aria-describedby', 'add-computer-error')
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/Enter a hostname or SSH alias/i)
+
+    await user.type(host, 'build-preview')
+    expect(host).toHaveAttribute('aria-invalid', 'false')
+    expect(host).not.toHaveAttribute('aria-describedby')
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Check preview host' }))
+
+    const consent = await within(dialog).findByRole('checkbox', { name: /Install the signed Continuim host service/ })
+    await waitFor(() => expect(consent).toBeEnabled())
+    await user.click(within(dialog).getByRole('button', { name: /Install and add/ }))
+    expect(consent).toHaveFocus()
+    expect(consent).toHaveAttribute('aria-invalid', 'true')
+    expect(consent).toHaveAttribute('aria-describedby', 'add-computer-error')
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/Allow installation/i)
+
+    await user.click(consent)
+    expect(consent).toHaveAttribute('aria-invalid', 'false')
+    expect(consent).not.toHaveAttribute('aria-describedby')
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('reviews and completes a checkpoint handoff without changing the reviewed source', async () => {
@@ -180,7 +232,7 @@ describe('Prime Continuim renderer', () => {
 
     expect(screen.getByRole('tab', { name: 'Runtime' })).toHaveAttribute('aria-selected', 'true')
     const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
-    expect(within(runtimePanel).getByRole('heading', { name: 'RLM runtime' })).toBeVisible()
+    expect(within(runtimePanel).getByRole('heading', { name: 'Reported runtime' })).toBeVisible()
     expect(within(runtimePanel).getByText('Implement the seamless remote workbench')).toBeVisible()
     expect(within(runtimePanel).getByText('Review overnight verification')).toBeVisible()
     expect(within(runtimePanel).getAllByText('Subagent of Workbench lead')).toHaveLength(2)
@@ -266,7 +318,7 @@ describe('Prime Continuim renderer', () => {
         diskFree: '80 GB free',
         gitVersion: 'Git 2.45.2',
         pythonStatus: 'Python 3.12',
-        agentVersion: 'Prime Agent 0.18.4',
+        agentVersion: 'Prime Agent 0.7.0',
         hostServiceVersion: 'Host service 0.1.0',
         requiresInstall: false,
         installCommand: "ssh verification-only 'prime-agent-hostd install --user'",
@@ -322,10 +374,10 @@ describe('Prime Continuim renderer', () => {
     render(<App api={createPreviewRendererApi()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
-    await user.click(screen.getByRole('button', { name: 'Mobile' }))
+    await user.click(screen.getByRole('button', { name: 'Companion preview' }))
     const dialog = await screen.findByRole('dialog', { name: 'Mobile companion' })
-    expect(within(dialog).getByRole('heading', { name: 'Phone control is not ready yet' })).toBeVisible()
-    expect(within(dialog).getByText(/Remote control stays off until encrypted pairing/i)).toBeVisible()
+    expect(within(dialog).getByRole('heading', { name: 'Phone control isn’t available in this build' })).toBeVisible()
+    expect(within(dialog).getByText(/does not connect a phone or enable remote control/i)).toBeVisible()
     expect(within(dialog).queryByText('Per-device permissions')).not.toBeInTheDocument()
     expect(within(dialog).queryByText('relay_pairing_v1')).not.toBeInTheDocument()
     expect(within(dialog).getByText('Browser preview · sample data')).toBeVisible()
@@ -354,7 +406,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Desktop' }))
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Mobile' })).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Companion preview' })).toHaveFocus())
   })
 
   it('surfaces an uncertain command receipt in mobile Attention', async () => {
@@ -390,6 +442,9 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => expect(moveButton).toBeEnabled())
     await user.click(moveButton)
     await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Moving thread…' })).toBeDisabled())
+    const progressHeading = within(dialog).getByRole('heading', { name: 'Move progress' })
+    await waitFor(() => expect(progressHeading).toHaveFocus())
+    expect(within(dialog).getByText('Prepare source').closest('li')).toHaveAttribute('aria-current', 'step')
 
     fireEvent(dialog, new Event('cancel', { bubbles: false, cancelable: true }))
     fireEvent.click(dialog)
@@ -401,7 +456,9 @@ describe('Prime Continuim renderer', () => {
       handoff.resolve({ destinationHostId: 'host-local', receiptId: 'handoff_receipt_guarded' })
       await handoff.promise
     })
-    expect(await within(dialog).findByRole('button', { name: 'Continue thread' })).toBeEnabled()
+    const continueThread = await within(dialog).findByRole('button', { name: 'Continue thread' })
+    expect(continueThread).toBeEnabled()
+    await waitFor(() => expect(continueThread).toHaveFocus())
   })
 
   it('keeps responsive drawers mutually exclusive when a sidebar command opens the inspector', async () => {
@@ -643,13 +700,18 @@ describe('Prime Continuim renderer', () => {
     await user.click(sidebarToggle)
     const sidebar = screen.getByRole('dialog', { name: 'Projects and threads' })
     expect(sidebar).toHaveAttribute('aria-modal', 'true')
-    const firstSidebarAction = within(sidebar).getByRole('button', { name: 'Search projects and threads' })
+    const firstSidebarAction = within(sidebar).getByRole('button', { name: 'Close sidebar' })
     await waitFor(() => expect(firstSidebarAction).toHaveFocus())
     await user.keyboard('{Shift>}{Tab}{/Shift}')
     expect(within(sidebar).getByRole('combobox', { name: /Compact run location/ })).toHaveFocus()
     await user.keyboard('{Escape}')
     await waitFor(() => expect(sidebarToggle).toHaveFocus())
     expect(sidebarToggle).toHaveAttribute('aria-expanded', 'false')
+
+    await user.click(sidebarToggle)
+    const reopenedSidebar = screen.getByRole('dialog', { name: 'Projects and threads' })
+    await user.click(within(reopenedSidebar).getByRole('button', { name: 'Close sidebar' }))
+    await waitFor(() => expect(sidebarToggle).toHaveFocus())
 
     const inspectorToggle = screen.getByRole('button', { name: 'Open inspector' })
     await user.click(inspectorToggle)
