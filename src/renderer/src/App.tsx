@@ -3572,7 +3572,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                 <span>Install the signed Continuim host service on <bdi>{resolved.alias}</bdi></span>
               </label>
               {!resolved.installAvailable && (
-                <p className="install-unavailable"><Icon icon={AlertCircle} size={14} /> {resolved.installDeferredReason ?? 'The signed installer is unavailable in this build.'}</p>
+                <p className="install-unavailable" id="add-computer-install-unavailable"><Icon icon={AlertCircle} size={14} /> {resolved.installDeferredReason ?? 'The signed installer is unavailable in this build.'}</p>
               )}
               <details className="command-disclosure">
                 <summary>Show exact install command</summary>
@@ -3617,17 +3617,28 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
           </p>
           <div className="sheet__footer-actions">
             <button className="button button--quiet" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-            <button className="button button--primary" type="submit" disabled={loading || probing || submitting || Boolean(resolved?.requiresInstall && !resolved.installAvailable)}>
-              {loading || submitting ? <Icon icon={Loader2} size={15} /> : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
+            <button
+              className="button button--primary"
+              type="submit"
+              aria-describedby={resolved?.requiresInstall && !resolved.installAvailable ? 'add-computer-install-unavailable' : undefined}
+              disabled={loading || probing || submitting || Boolean(resolved?.requiresInstall && !resolved.installAvailable)}
+            >
+              {loading || submitting
+                ? <Icon icon={Loader2} size={15} />
+                : resolved?.requiresInstall && !resolved.installAvailable
+                  ? <Icon icon={AlertCircle} size={15} />
+                  : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
               {submitting
                 ? resolved?.requiresInstall
                   ? `Installing on ${resolved.alias}…`
                   : `Adding ${resolved?.alias ?? 'computer'}…`
-                : resolved?.requiresInstall
-                  ? `Install and add ${resolved.alias}`
-                  : resolved
-                    ? `Add ${resolved.alias}`
-                    : 'Add computer'}
+                : resolved?.requiresInstall && !resolved.installAvailable
+                  ? 'Host-service installer unavailable'
+                  : resolved?.requiresInstall
+                    ? `Install and add ${resolved.alias}`
+                    : resolved
+                      ? `Add ${resolved.alias}`
+                      : 'Add computer'}
             </button>
           </div>
         </footer>
