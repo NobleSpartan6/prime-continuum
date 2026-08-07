@@ -1,6 +1,10 @@
 # Prime Continuim
 
-Cross-platform desktop control plane for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions that can run locally or over SSH without changing the project and conversation experience.
+Development-stage native control-plane foundation for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
+
+> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release. Production resident commands, remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
+
+The intended product is a cross-platform workbench that preserves one project-and-conversation experience across local and SSH-backed hosts. The current build provides the security, protocol, persistence, and interface seams needed to continue that work without presenting the deferred execution paths as available.
 
 ## Requirements
 
@@ -29,7 +33,7 @@ Run the renderer by itself for browser-based visual checks:
 pnpm dev:web
 ```
 
-The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search real projects and threads or run available commands. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
+The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search the active host projection and open controls that its negotiated capabilities allow. The production composition does not yet advertise resident command execution or cross-host handoff. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
 
 Open **Models & accounts** to inspect the secret-free compatibility catalog reported by the verified Prime Agent runtime on the selected host. The exact Prime Agent v0.7.0 artifact currently projects 1,169 model routes across 32 providers, including current GPT-5.6, Claude 5, Gemini 3.6, DeepSeek V4, Kimi K3, GLM-5.2, Qwen3.6, MiniMax M3, Mistral, and gpt-oss families. This list is generated from the installed runtime rather than maintained as a renderer allow-list. The runtime reports OAuth compatibility metadata for ChatGPT Plus/Pro (Codex), Claude Pro/Max, and GitHub Copilot. The catalog is host-scoped and read-only: authenticate by running `/login` in Prime Agent on that host. In-app OAuth and model switching are not implemented yet.
 
@@ -59,8 +63,9 @@ pnpm build:runtime
 pnpm verify:runtime:smoke
 ```
 
-`pnpm package` keeps Windows executable resource editing and ASAR integrity
-enabled, then rejects a truncated PE image, missing hardening fuses, any
+On the verified Windows x64 development path, `pnpm package` keeps Windows
+executable resource editing and ASAR integrity enabled, then rejects a
+truncated PE image, missing hardening fuses, any
 main/preload/renderer ASAR byte that differs from the current build, a packaged
 host daemon mismatch, or a Prime Agent runtime seed that differs from the exact
 pointer, manifest, file list, and tree built in that run. The verifier also
@@ -70,7 +75,8 @@ main/preload/renderer/hostd for host-only dependency leakage, starts the
 packaged Prime Agent daemon through Electron's RunAsNode mode, checks its
 pinned protocol identity, and requires a clean shutdown. The current unsigned
 artifact labels this assurance `development-integrity`; it does not claim
-adversarial authentication.
+adversarial authentication. No equivalent macOS or Linux package has been
+verified yet.
 Leave enough local disk space for Electron's executable rewrite; synced folders
 can otherwise defer the out-of-space failure until after Electron Builder exits.
 If Electron Builder 26.8.1 cannot create two unused macOS symlinks in its helper
@@ -88,10 +94,11 @@ unexpected cache target. Do not work around the cache defect by disabling
 `win.signAndEditExecutable`, and do not share this writable cache across trust
 boundaries.
 
-Signed distribution still requires the product icon, platform signing identities, and release metadata.
+Signed distribution still requires the product icon, platform signing identities, release metadata, and platform-native packaging verification.
 
-The current repository is a verified Phase 0/Phase 1 foundation with an inert
-Phase 3A pairing-authority seam and an isolated relay package. Neither is wired
-to the renderer, so this is not a production remote release. See
+The current repository is a Phase 0/Phase 1 protocol/UI foundation with verified
+development components, an inert Phase 3A pairing-authority seam, and an
+isolated relay package. Neither Phase 3A seam is wired to the renderer, so this
+is not a production remote release. See
 `docs/implementation-status.md` for the executable boundary and explicit
 deferrals.

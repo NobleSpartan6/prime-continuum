@@ -68,6 +68,7 @@ type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type WorkbenchSurface = 'desktop' | 'companion'
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Write a message before sending.'
+const MODEL_REVEAL_INCREMENT = 80
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
   { phase: 'quiescing', label: 'Prepare source' },
@@ -1790,7 +1791,7 @@ function runtimeReadinessCopy(readiness: HostRuntimeReadiness | undefined): {
       ? 'Production authenticated'
       : readiness.assurance === 'development-integrity'
         ? 'Development integrity'
-        : 'Runtime ready'
+        : 'Runtime files verified'
     return { summary: `${prefix}${assurance}`, cached, ...observation, ...(cached ? { tone: 'muted' as const } : {}) }
   }
   const detail = readiness.recovery === 'restart'
@@ -2856,22 +2857,33 @@ interface ModelsDialogProps {
   onClose: () => void
 }
 
+type ModelsCatalogError = {
+  kind: 'retryable' | 'stale-authority'
+  message: string
+}
+
 function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: ModelsDialogProps) {
   const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<ModelsCatalogError | null>(null)
   const [query, setQuery] = useState('')
   const [selectedProviderId, setSelectedProviderId] = useState('all')
-  const [showCompatible, setShowCompatible] = useState(false)
+  const [showAllModels, setShowAllModels] = useState(false)
+  const [visibleModelLimit, setVisibleModelLimit] = useState(MODEL_REVEAL_INCREMENT)
+  const [loadAttempt, setLoadAttempt] = useState(0)
+  const providerNavRef = useRef<HTMLElement>(null)
+  const providerRailHorizontal = useMediaQueryMatch('(max-width: 75rem)')
 
   useEffect(() => {
     if (!open) return
     let cancelled = false
     setLoading(true)
-    setError('')
+    setError(null)
+    setCatalog(null)
     setQuery('')
     setSelectedProviderId('all')
-    setShowCompatible(false)
+    setShowAllModels(false)
+    setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
     void api.loadRuntimeModelCatalog(host.id)
       .then((nextCatalog) => {
         if (!cancelled) setCatalog(nextCatalog)
@@ -2881,10 +2893,16 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
         setCatalog(null)
         setError(
           isStaleHostAuthorityError(reason)
-            ? 'The active host changed. Close this panel and open the model catalog again.'
-            : reason instanceof Error
-              ? reason.message
-              : 'The host did not return its verified model catalog.',
+            ? {
+                kind: 'stale-authority',
+                message: 'The active host changed. Close this dialog, confirm the active computer, then reopen Models & accounts.',
+              }
+            : {
+                kind: 'retryable',
+                message: reason instanceof Error
+                  ? reason.message
+                  : `Unable to read the runtime model catalog from ${host.name}. Check the host connection, then try again.`,
+              },
         )
       })
       .finally(() => {
@@ -2893,7 +2911,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
     return () => {
       cancelled = true
     }
-  }, [api, host.id, open])
+  }, [api, host.id, host.name, loadAttempt, open])
 
   const selectedProvider = catalog?.providers.find((provider) => provider.providerId === selectedProviderId)
   const normalizedQuery = query.trim().toLocaleLowerCase()
@@ -2901,20 +2919,56 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
     if (!catalog) return []
     return catalog.models.filter((model) => {
       if (selectedProviderId !== 'all' && model.providerId !== selectedProviderId) return false
-      if (!showCompatible && !model.available) return false
+      if (!showAllModels && !model.available) return false
       if (!normalizedQuery) return true
       const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
       return `${model.name} ${model.modelId} ${model.providerId} ${provider?.displayName ?? ''}`
         .toLocaleLowerCase()
         .includes(normalizedQuery)
     })
-  }, [catalog, normalizedQuery, selectedProviderId, showCompatible])
-  const visibleModels = filteredModels.slice(0, 80)
+  }, [catalog, normalizedQuery, selectedProviderId, showAllModels])
+  const visibleModels = filteredModels.slice(0, visibleModelLimit)
+  const remainingModelCount = Math.max(0, filteredModels.length - visibleModels.length)
   const availableCount = catalog?.models.filter((model) => model.available).length ?? 0
   const scopedModelCount = selectedProvider?.modelCount ?? catalog?.models.length ?? 0
   const scopedAvailableCount = selectedProvider?.availableModelCount ?? availableCount
   const oauthProviders = catalog?.providers.filter((provider) => provider.oauthSupported) ?? []
   const configuredProviders = catalog?.providers.filter((provider) => provider.configured) ?? []
+  const providerIds = catalog ? ['all', ...catalog.providers.map((provider) => provider.providerId)] : []
+
+  const selectProvider = (providerId: string) => {
+    setSelectedProviderId(providerId)
+    setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+  }
+
+  const handleProviderKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    const previousKey = providerRailHorizontal
+      ? document.documentElement.dir === 'rtl' ? 'ArrowRight' : 'ArrowLeft'
+      : 'ArrowUp'
+    const nextKey = providerRailHorizontal
+      ? document.documentElement.dir === 'rtl' ? 'ArrowLeft' : 'ArrowRight'
+      : 'ArrowDown'
+    if (![previousKey, nextKey, 'Home', 'End'].includes(event.key)) return
+
+    const buttons = Array.from(providerNavRef.current?.querySelectorAll<HTMLButtonElement>('[data-provider-filter]') ?? [])
+    if (buttons.length === 0) return
+    event.preventDefault()
+    const focusedIndex = buttons.indexOf(event.target as HTMLButtonElement)
+    const selectedIndex = Math.max(0, providerIds.indexOf(selectedProviderId))
+    const currentIndex = focusedIndex >= 0 ? focusedIndex : selectedIndex
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? buttons.length - 1
+        : event.key === nextKey
+          ? (currentIndex + 1) % buttons.length
+          : (currentIndex - 1 + buttons.length) % buttons.length
+    const nextButton = buttons[nextIndex]
+    const nextProviderId = providerIds[nextIndex]
+    if (!nextButton || !nextProviderId) return
+    selectProvider(nextProviderId)
+    nextButton.focus()
+  }
 
   return (
     <NativeDialog
@@ -2931,7 +2985,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <span className="sheet__title-icon"><Icon icon={Bot} size={18} /></span>
             <div>
               <h2 id="models-title">Models &amp; accounts</h2>
-              <p id="models-description">Compatibility reported by Prime Agent on <bdi>{host.name}</bdi>.</p>
+              <p id="models-description">Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.</p>
             </div>
           </div>
           <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={onClose}>
@@ -2942,12 +2996,23 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
         {loading ? (
           <div className="models-loading" role="status">
             <Icon icon={Loader2} size={18} />
-            <div><strong>Reading the verified runtime</strong><span>Provider status and model metadata stay scoped to {host.name}.</span></div>
+            <div><strong>Reading the runtime catalog</strong><span>Provider status and model metadata stay scoped to {host.name}.</span></div>
           </div>
         ) : error ? (
           <div className="models-error" role="alert">
             <span><Icon icon={AlertCircle} size={17} /></span>
-            <div><strong>Model catalog unavailable</strong><p>{error}</p></div>
+            <div>
+              <strong>Model catalog unavailable</strong>
+              <p>{error.message}</p>
+              {error.kind === 'retryable' ? (
+                <button className="button button--secondary" type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+                  <Icon icon={RefreshCw} size={14} />
+                  Retry loading catalog
+                </button>
+              ) : (
+                <button className="button button--secondary" type="button" onClick={onClose}>Close dialog</button>
+              )}
+            </div>
           </div>
         ) : catalog ? (
           <div className="models-workspace">
@@ -2957,14 +3022,29 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                 <strong>{configuredProviders.length} configured</strong>
                 <small>{oauthProviders.length} OAuth-capable providers · Prime Agent {catalog.releaseVersion}</small>
               </div>
-              <nav aria-label="Filter models by provider">
+              <p className="sr-only" id="provider-filter-instructions">
+                {providerRailHorizontal
+                  ? 'Use Left and Right Arrow keys to select a provider. Use Home and End to jump to the first or last provider.'
+                  : 'Use Up and Down Arrow keys to select a provider. Use Home and End to jump to the first or last provider.'}
+              </p>
+              <nav
+                ref={providerNavRef}
+                aria-describedby="provider-filter-instructions"
+                aria-label="Filter models by provider"
+                aria-orientation={providerRailHorizontal ? 'horizontal' : 'vertical'}
+                role="toolbar"
+                onKeyDown={handleProviderKeyDown}
+              >
                 <button
                   type="button"
                   aria-pressed={selectedProviderId === 'all'}
-                  onClick={() => setSelectedProviderId('all')}
+                  data-provider-filter
+                  data-provider-id="all"
+                  tabIndex={selectedProviderId === 'all' ? 0 : -1}
+                  onClick={() => selectProvider('all')}
                 >
                   <span className="provider-rail__icon"><Icon icon={Bot} size={15} /></span>
-                  <span><strong>All providers</strong><small>{catalog.providers.length} compatible</small></span>
+                  <span><strong>All providers</strong><small>{catalog.providers.length} in catalog</small></span>
                   <span className="provider-rail__count tabular">{catalog.models.length}</span>
                 </button>
                 {catalog.providers.map((provider) => (
@@ -2972,7 +3052,10 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                     key={provider.providerId}
                     type="button"
                     aria-pressed={selectedProviderId === provider.providerId}
-                    onClick={() => setSelectedProviderId(provider.providerId)}
+                    data-provider-filter
+                    data-provider-id={provider.providerId}
+                    tabIndex={selectedProviderId === provider.providerId ? 0 : -1}
+                    onClick={() => selectProvider(provider.providerId)}
                   >
                     <span className={cx('provider-rail__icon', provider.configured && 'provider-rail__icon--ready')}>
                       <Icon icon={provider.configured ? CheckCircle2 : LockKeyhole} size={15} />
@@ -2987,9 +3070,9 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <section className="model-catalog" aria-label="Prime Agent models">
               <div className="model-catalog__topline">
                 <div>
-                  <span className="eyebrow">Verified catalog</span>
-                  <h3>{selectedProvider?.displayName ?? 'Models available to this host'}</h3>
-                  <p>{scopedAvailableCount} ready now · {scopedModelCount} compatible with the installed runtime</p>
+                  <span className="eyebrow">Runtime catalog</span>
+                  <h3>{selectedProvider?.displayName ?? 'Models reported by this host'}</h3>
+                  <p>{scopedAvailableCount} available with current setup · {scopedModelCount} listed by the runtime</p>
                 </div>
                 <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
               </div>
@@ -3012,16 +3095,39 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                     type="search"
                     value={query}
                     placeholder="Search models"
-                    onChange={(event) => setQuery(event.target.value)}
+                    onChange={(event) => {
+                      setQuery(event.target.value)
+                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+                    }}
                   />
                 </label>
                 <div className="catalog-scope" aria-label="Model availability filter">
-                  <button type="button" aria-pressed={!showCompatible} onClick={() => setShowCompatible(false)}>Ready</button>
-                  <button type="button" aria-pressed={showCompatible} onClick={() => setShowCompatible(true)}>Compatible</button>
+                  <button
+                    type="button"
+                    aria-pressed={!showAllModels}
+                    onClick={() => {
+                      setShowAllModels(false)
+                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+                    }}
+                  >Available</button>
+                  <button
+                    type="button"
+                    aria-pressed={showAllModels}
+                    onClick={() => {
+                      setShowAllModels(true)
+                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+                    }}
+                  >All models</button>
                 </div>
               </div>
 
-              <div className="model-list" aria-live="polite">
+              <p className="model-results-count tabular" role="status" aria-live="polite" aria-atomic="true">
+                {filteredModels.length === 0
+                  ? 'No models match'
+                  : `Showing ${visibleModels.length} of ${filteredModels.length} ${filteredModels.length === 1 ? 'model' : 'models'}`}
+              </p>
+
+              <div className="model-list">
                 {visibleModels.length > 0 ? visibleModels.map((model) => {
                   const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
                   const current = modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
@@ -3039,24 +3145,32 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                       </div>
                       <span className={cx('model-row__status', model.available && 'model-row__status--ready')}>
                         <Icon icon={model.available ? CheckCircle2 : LockKeyhole} size={14} />
-                        {model.available ? 'Ready' : 'Setup required'}
+                        {model.available ? 'Available' : 'Setup required'}
                       </span>
                     </article>
                   )
                 }) : (
                   <div className="model-list__empty">
                     <Icon icon={Search} size={18} />
-                    <strong>{showCompatible ? 'No compatible models match' : 'No configured models match'}</strong>
-                    <p>{showCompatible ? 'Try another provider or search term.' : `Configure a provider on ${host.name}, or show every compatible model.`}</p>
+                    <strong>{showAllModels ? 'No catalog models match' : 'No available models match'}</strong>
+                    <p>{showAllModels ? 'Try another provider or search term.' : `Configure a provider on ${host.name}, or show all models.`}</p>
                   </div>
                 )}
               </div>
-              {filteredModels.length > visibleModels.length && (
-                <p className="model-list__limit">Showing the first {visibleModels.length} of {filteredModels.length} matches. Refine your search to narrow the catalog.</p>
+              {remainingModelCount > 0 && (
+                <div className="model-list__reveal">
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={() => setVisibleModelLimit((limit) => limit + MODEL_REVEAL_INCREMENT)}
+                  >
+                    Show {Math.min(MODEL_REVEAL_INCREMENT, remainingModelCount)} more {Math.min(MODEL_REVEAL_INCREMENT, remainingModelCount) === 1 ? 'model' : 'models'}
+                  </button>
+                </div>
               )}
               <footer className="model-catalog__footer">
                 <Icon icon={Info} size={14} />
-                <span>This catalog is read-only. Model changes stay disabled until the resident session can acknowledge and reconcile them authoritatively.</span>
+                <span>This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.</span>
               </footer>
             </section>
           </div>

@@ -301,14 +301,15 @@ export function isStaleHostAuthorityError(value: unknown): value is StaleHostAut
 type NativePrimeBridge = object
 
 const delay = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds))
+const previewSimulation = (message: string) => `Preview simulation · ${message}`
 
 const seedTranscript: TranscriptBlock[] = [
   {
     id: 'block-1',
     kind: 'checkpoint',
     time: '9:42 AM',
-    body: 'Resumed on devbox from an authoritative host snapshot.',
-    detail: 'Cached transcript replaced atomically · no commands replayed',
+    body: previewSimulation('resumed from a sample checkpoint; no host snapshot was read.'),
+    detail: previewSimulation('sample transcript replaced in memory; no commands were replayed'),
   },
   {
     id: 'block-2',
@@ -331,8 +332,8 @@ const seedTranscript: TranscriptBlock[] = [
     author: 'Renderer checks',
     time: '9:48 AM',
     body: 'pnpm test -- renderer',
-    detail: 'Sample passing receipt · browser preview data',
-    receipt: 'preview_receipt',
+    detail: previewSimulation('sample passing receipt; no host check ran'),
+    receipt: 'preview_simulation_receipt',
   },
   {
     id: 'block-5',
@@ -552,7 +553,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
       },
     ],
   },
-  composerReceipt: { state: 'waiting_for_connection', message: 'Waiting for connection' },
+  composerReceipt: { state: 'waiting_for_connection', message: previewSimulation('waiting for a sample connection') },
 }
 
 const discoveredComputers: DiscoveredComputer[] = [
@@ -734,9 +735,12 @@ class BrowserPreviewApi implements RendererApi {
   async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string }> {
     await delay(240)
     if (request.sendWhenReconnected) {
-      return { state: 'waiting_for_connection', message: 'Waiting for connection · saved in this device’s outbox' }
+      return {
+        state: 'waiting_for_connection',
+        message: previewSimulation('command saved only in the in-memory preview outbox'),
+      }
     }
-    return { state: 'sent', message: 'Sent · durably admitted by host' }
+    return { state: 'sent', message: previewSimulation('command not sent to a host') }
   }
 
   async planHandoff(input: {
@@ -750,7 +754,7 @@ class BrowserPreviewApi implements RendererApi {
     const destination = previewSnapshot.hosts.find((host) => host.id === input.destinationHostId)
 
     return {
-      handoffId: 'handoff_01J8WR50M5WQ',
+      handoffId: 'preview_simulation_handoff_01J8WR50M5WQ',
       sourceHostId: source?.id ?? 'host-devbox',
       sourceName: source?.name ?? 'devbox',
       destinationHostId: destination?.id ?? input.destinationHostId,
@@ -763,7 +767,10 @@ class BrowserPreviewApi implements RendererApi {
       transferSize: '4.8 MB',
       repositoryMatch: 'exact',
       runtimeLosses: ['Python variables', 'Running subprocesses', 'Active child processes'],
-      warnings: ['Secrets and ignored files are excluded from the transfer.'],
+      warnings: [
+        previewSimulation('no host checkpoint or transfer will run'),
+        'Secrets and ignored files are excluded from the sample transfer.',
+      ],
     }
   }
 
@@ -772,19 +779,19 @@ class BrowserPreviewApi implements RendererApi {
     onProgress: (phase: HandoffPhase, message: string) => void,
   ): Promise<{ destinationHostId: string; receiptId: string }> {
     const phases: Array<[HandoffPhase, string]> = [
-      ['quiescing', input.behaviorIfRunning === 'interrupt' ? 'Interrupting the current turn safely' : 'Waiting for the current turn to finish'],
-      ['checkpointing', 'Creating an immutable source checkpoint'],
-      ['transferring', 'Transferring 4.8 MB of Git and thread state'],
-      ['materializing', 'Creating the destination worktree'],
-      ['verifying', 'Verifying hashes and Git status equivalence'],
-      ['switching_authority', 'Making the destination authoritative'],
-      ['complete', 'Thread moved and verified'],
+      ['quiescing', previewSimulation(input.behaviorIfRunning === 'interrupt' ? 'simulating an interrupted turn' : 'simulating a completed turn')],
+      ['checkpointing', previewSimulation('simulating a source checkpoint; no checkpoint is created')],
+      ['transferring', previewSimulation('simulating a 4.8 MB state transfer; no bytes are sent')],
+      ['materializing', previewSimulation('simulating a destination worktree; no files are created')],
+      ['verifying', previewSimulation('simulating hash and Git-status checks')],
+      ['switching_authority', previewSimulation('simulating an authority switch; host authority is unchanged')],
+      ['complete', previewSimulation('sample handoff complete; no host state changed')],
     ]
     for (const [phase, message] of phases) {
       await delay(260)
       onProgress(phase, message)
     }
-    return { destinationHostId: 'host-local', receiptId: 'handoff_receipt_01J8WR8NB2' }
+    return { destinationHostId: 'host-local', receiptId: 'preview_simulation_handoff_receipt_01J8WR8NB2' }
   }
 }
 

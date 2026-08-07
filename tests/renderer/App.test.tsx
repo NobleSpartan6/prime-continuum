@@ -5,7 +5,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import App from '../../src/renderer/src/App'
-import { createPreviewRendererApi, type HostRuntimeReadiness } from '../../src/renderer/src/api'
+import {
+  createPreviewRendererApi,
+  StaleHostAuthorityError,
+  type HostRuntimeReadiness,
+  type RuntimeModelCatalog,
+} from '../../src/renderer/src/api'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -15,6 +20,32 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
+}
+
+function withLargeModelCatalog(catalog: RuntimeModelCatalog): RuntimeModelCatalog {
+  const providers = catalog.providers.slice(0, 2).map((provider) => ({
+    ...provider,
+    configured: true,
+    modelCount: 90,
+    availableModelCount: 90,
+  }))
+  const template = catalog.models.find((model) => model.available)!
+  return {
+    ...catalog,
+    providers,
+    models: Array.from({ length: 180 }, (_, index) => {
+      const provider = providers[index < 90 ? 0 : 1]!
+      const sequence = String(index + 1).padStart(3, '0')
+      return {
+        ...template,
+        providerId: provider.providerId,
+        modelId: `catalog-model-${sequence}`,
+        name: `Catalog model ${sequence}`,
+        available: true,
+        usingOAuth: provider.oauthSupported,
+      }
+    }),
+  }
 }
 
 beforeAll(() => {
@@ -76,7 +107,7 @@ describe('Prime Continuim renderer', () => {
     await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Send the benchmark recap when the host returns.')
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).not.toHaveClass('button--empty')
     await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
-    expect((await screen.findAllByText(/saved in this device’s outbox/i)).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect((await screen.findAllByText(/Preview simulation · command saved only in the in-memory preview outbox/i)).some((element) => !element.classList.contains('sr-only'))).toBe(true)
   })
 
   it('cannot retain a hidden steer intent after selecting a non-running thread', async () => {
@@ -252,7 +283,7 @@ describe('Prime Continuim renderer', () => {
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
   })
 
-  it('shows a host-scoped, read-only model and OAuth compatibility catalog', async () => {
+  it('shows a host-scoped, read-only model registry with OAuth metadata', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
     const loadRuntimeModelCatalog = vi.spyOn(api, 'loadRuntimeModelCatalog')
@@ -272,21 +303,122 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText('Current')).toBeVisible()
     expect(within(dialog).queryByText('Claude Opus 5')).not.toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: /connect|select/i })).not.toBeInTheDocument()
-    expect(within(dialog).getByText(/This catalog is read-only/)).toBeVisible()
+    expect(within(dialog).getByText(/This registry view is read-only/)).toBeVisible()
+    expect(within(dialog).getByText(/no inference smoke test was run/i)).toBeVisible()
+
+    const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
+    const allProviders = within(providerToolbar).getByRole('button', { name: /All providers/ })
+    const codexProvider = within(providerToolbar).getByRole('button', { name: /ChatGPT Plus\/Pro/ })
+    expect(providerToolbar).toHaveAttribute('aria-orientation', 'horizontal')
+    expect(providerToolbar).toHaveAccessibleDescription(/Use Left and Right Arrow keys to select a provider/)
+    expect(allProviders).toHaveAttribute('tabindex', '0')
+    expect(codexProvider).toHaveAttribute('tabindex', '-1')
+    allProviders.focus()
+    await user.keyboard('{ArrowRight}')
+    expect(codexProvider).toHaveFocus()
+    expect(codexProvider).toHaveAttribute('aria-pressed', 'true')
+    expect(codexProvider).toHaveAttribute('tabindex', '0')
+    await user.keyboard('{End}')
+    expect(within(providerToolbar).getByRole('button', { name: /^xAI/ })).toHaveFocus()
+    await user.keyboard('{Home}')
+    expect(allProviders).toHaveFocus()
 
     await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
     expect(within(dialog).getByText('OAuth is supported by Prime Agent')).toBeVisible()
-    expect(within(dialog).getByText('0 ready now · 2 compatible with the installed runtime')).toBeVisible()
+    expect(within(dialog).getByText('0 available with current setup · 2 listed by the runtime')).toBeVisible()
     expect(within(dialog).getByText('/login')).toBeVisible()
     expect(within(dialog).getByText(/Credentials remain on that host/)).toBeVisible()
-    expect(within(dialog).getByText('No configured models match')).toBeVisible()
+    expect(within(dialog).getByText('No available models match')).toBeVisible()
 
-    await user.click(within(dialog).getByRole('button', { name: 'Compatible' }))
+    await user.click(within(dialog).getByRole('button', { name: 'All models' }))
     expect(within(dialog).getByText('Claude Opus 5')).toBeVisible()
     expect(within(dialog).getAllByText('Setup required').length).toBeGreaterThan(0)
+    expect(dialog.querySelector('.model-list')).not.toHaveAttribute('aria-live')
+    expect(within(dialog).getByRole('status')).toHaveAttribute('aria-atomic', 'true')
 
     await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
     await waitFor(() => expect(trigger).toHaveFocus())
+  })
+
+  it('reveals every matching model in explicit batches and resets the batch when filters or the dialog change', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const catalog = withLargeModelCatalog(await api.loadRuntimeModelCatalog('host-devbox'))
+    api.loadRuntimeModelCatalog = vi.fn(async () => structuredClone(catalog))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+
+    let dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    expect(await within(dialog).findByText('Showing 80 of 180 models')).toBeVisible()
+    expect(within(dialog).getByText('Catalog model 080')).toBeVisible()
+    expect(within(dialog).queryByText('Catalog model 081')).not.toBeInTheDocument()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Show 80 more models' }))
+    expect(within(dialog).getByText('Showing 160 of 180 models')).toBeVisible()
+    expect(within(dialog).getByText('Catalog model 160')).toBeVisible()
+    expect(within(dialog).getByRole('button', { name: 'Show 20 more models' })).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+    expect(within(dialog).getByText('Showing 80 of 90 models')).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Show 10 more models' }))
+    expect(within(dialog).getByText('Showing 90 of 90 models')).toBeVisible()
+
+    await user.type(within(dialog).getByRole('searchbox', { name: 'Search models' }), 'Catalog')
+    expect(within(dialog).getByText('Showing 80 of 90 models')).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Show 10 more models' }))
+    await user.click(within(dialog).getByRole('button', { name: 'All models' }))
+    expect(within(dialog).getByText('Showing 80 of 90 models')).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
+    await user.click(trigger)
+    dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    expect(await within(dialog).findByText('Showing 80 of 180 models')).toBeVisible()
+    expect(api.loadRuntimeModelCatalog).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a recoverable catalog load without enabling model mutation controls', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const catalog = await api.loadRuntimeModelCatalog('host-devbox')
+    const loadRuntimeModelCatalog = vi.fn()
+      .mockRejectedValueOnce(new Error('The catalog request timed out.'))
+      .mockResolvedValue(catalog)
+    api.loadRuntimeModelCatalog = loadRuntimeModelCatalog
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    expect(await within(dialog).findByText('The catalog request timed out.')).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Retry loading catalog' }))
+    expect(await within(dialog).findByText('Models reported by this host')).toBeVisible()
+    expect(loadRuntimeModelCatalog).toHaveBeenCalledTimes(2)
+    expect(within(dialog).queryByRole('button', { name: /select model|use model|switch model/i })).not.toBeInTheDocument()
+  })
+
+  it('does not retry a catalog request captured for stale host authority', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadRuntimeModelCatalog = vi.fn(async () => {
+      throw new StaleHostAuthorityError()
+    })
+    api.loadRuntimeModelCatalog = loadRuntimeModelCatalog
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    expect(await within(dialog).findByText(/Close this dialog, confirm the active computer, then reopen Models & accounts/)).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: /Retry/ })).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Close dialog' }))
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(loadRuntimeModelCatalog).toHaveBeenCalledOnce()
   })
 
   it('shows Add computer as one keyboard-operable sheet with exact connection and install details', async () => {
@@ -402,7 +534,7 @@ describe('Prime Continuim renderer', () => {
     [
       'ready runtime without an assurance claim',
       { kind: 'reported', freshness: 'live', status: 'ready' },
-      'Runtime ready',
+      'Runtime files verified',
       undefined,
     ],
   ] satisfies Array<[string, HostRuntimeReadiness, string, string | undefined]>) (

@@ -25,6 +25,11 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.composer__primary-actions \.button\s*{[^}]*max-inline-size:\s*100%;[^}]*min-inline-size:\s*0;[^}]*white-space:\s*normal;/s)
     expect(narrowLayout).toMatch(/\.command-palette__input\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
     expect(narrowLayout).toMatch(/\.command-palette__shortcut\s*{[^}]*display:\s*none;/s)
+    expect(narrowLayout).toMatch(/\.provider-rail\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*max-block-size:\s*10\.5rem;/s)
+    expect(narrowLayout).toMatch(/\.provider-rail__summary\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);[^}]*border-inline-end:\s*0;/s)
+    expect(narrowLayout).toMatch(/\.model-catalog\s*{[^}]*overflow-y:\s*auto;/s)
+    expect(narrowLayout).toMatch(/\.model-list\s*{[^}]*flex:\s*none;[^}]*overflow-y:\s*visible;/s)
+    expect(narrowLayout).toMatch(/\.model-search input,\s*\.command-palette__input input\s*{[^}]*font-size:\s*1rem;/s)
   })
 
   it('preserves a readable thread title and primary composer actions at 320 CSS pixels', async () => {
@@ -39,6 +44,7 @@ describe('renderer style contracts', () => {
     )
 
     expect(css).toMatch(/\.topbar__thread-copy h1\s*{[^}]*inline-size:\s*auto;[^}]*text-overflow:\s*ellipsis;/s)
+    expect(css).toMatch(/\.models-sheet__surface\s*{[^}]*block-size:\s*min\(calc\(100dvh - 2rem\), 48rem\);/s)
     expect(css).toMatch(/\.transcript-jump__button\s*{[^}]*min-inline-size:\s*0;[^}]*max-inline-size:\s*100%;[^}]*white-space:\s*normal;/s)
     expect(minimumLayout).toMatch(/\.topbar__leading \.brand-mark\s*{[^}]*display:\s*none;/s)
     expect(minimumLayout).toMatch(/\.composer__hint\s*{[^}]*display:\s*none;/s)

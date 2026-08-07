@@ -3328,6 +3328,11 @@ dialog.sheet.models-sheet {
   gap: 0.25rem;
 }
 
+.models-error .button {
+  justify-self: start;
+  margin-block-start: 0.35rem;
+}
+
 .models-loading strong,
 .models-error strong {
   color: var(--color-text);
@@ -3627,10 +3632,20 @@ dialog.sheet.models-sheet {
 }
 
 .model-list {
+  flex: 1 1 0;
   min-block-size: 0;
   overflow-y: auto;
   border-block: 1px solid var(--color-border);
   overscroll-behavior: contain;
+}
+
+.model-results-count {
+  min-block-size: 1.25rem;
+  margin: 0 0 0.35rem;
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
 }
 
 .model-row {
@@ -3727,8 +3742,7 @@ dialog.sheet.models-sheet {
   font-size: var(--font-ui);
 }
 
-.model-list__empty p,
-.model-list__limit {
+.model-list__empty p {
   margin: 0;
   color: var(--color-text-muted);
   font-size: var(--font-caption);
@@ -3736,9 +3750,14 @@ dialog.sheet.models-sheet {
   text-wrap: pretty;
 }
 
-.model-list__limit {
-  padding-block-start: 0.5rem;
-  text-align: center;
+.model-list__reveal {
+  display: flex;
+  justify-content: center;
+  padding-block-start: 0.45rem;
+}
+
+.model-list__reveal .button {
+  color: var(--color-text-secondary);
 }
 
 .model-catalog__footer {
@@ -4861,7 +4880,6 @@ dialog.pair-mobile-sheet {
   }
 
   .models-sheet__surface {
-    block-size: calc(100dvh - 0.75rem);
     min-block-size: 0;
   }
 
@@ -4869,8 +4887,42 @@ dialog.pair-mobile-sheet {
     padding: 0.75rem;
   }
 
+  .provider-rail {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    max-block-size: 10.5rem;
+  }
+
+  .provider-rail__summary {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: baseline;
+    gap: 0.2rem 0.65rem;
+    padding: 0.65rem 0.75rem;
+    border-inline-end: 0;
+    border-block-end: 1px solid var(--color-border);
+  }
+
+  .provider-rail__summary .eyebrow {
+    grid-column: 1 / -1;
+  }
+
+  .provider-rail__summary small {
+    min-inline-size: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .provider-rail nav button {
+    flex-basis: min(13.5rem, calc(100vw - 2.5rem));
+  }
+
   .model-catalog {
     padding: 0.75rem;
+    overflow-y: auto;
+  }
+
+  .model-list {
+    flex: none;
+    overflow-y: visible;
   }
 
   .model-catalog__topline {
@@ -4882,6 +4934,11 @@ dialog.pair-mobile-sheet {
   .model-catalog__controls {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .model-search input,
+  .command-palette__input input {
+    font-size: 1rem;
   }
 
   .catalog-scope button {
