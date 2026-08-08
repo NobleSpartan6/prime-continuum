@@ -1585,6 +1585,47 @@ export class HostStore {
     });
   }
 
+  /**
+   * Reports whether the public thread snapshot is backed by the private cursor
+   * lineage for this exact active resident authority. The gateway additionally
+   * requires a fresh post-attach publication epoch before granting readiness.
+   */
+  async hasExactResidentProjection(bindingValue: ResidentSessionBinding): Promise<boolean> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const binding = validateResidentSessionBinding(bindingValue);
+      const active = (await this.readResidentSessionBindingsUnlocked()).find(
+        (candidate) => candidate.threadId === binding.threadId,
+      );
+      if (
+        !active ||
+        residentDispatchAuthorityFingerprint(active) !== residentDispatchAuthorityFingerprint(binding)
+      ) {
+        return false;
+      }
+
+      const lineage = await this.readResidentProjectionLineageUnlocked(
+        residentProjectionAuthorityFromBinding(binding),
+      );
+      if (!lineage) return false;
+      const snapshot = await this.readSnapshotUnlocked(binding.threadId);
+      // Host-owned admission may update status/queue fields after publication,
+      // so readiness follows the exact private lineage and its still-current
+      // cursor/identity rather than requiring the full public digest to remain
+      // byte-equivalent to the last upstream projection.
+      return snapshot.thread.threadId === binding.threadId &&
+        snapshot.thread.currentLocation.executionGenerationId === binding.executionGenerationId &&
+        snapshot.latestCursor.threadId === binding.threadId &&
+        snapshot.latestCursor.executionGenerationId === binding.executionGenerationId &&
+        snapshot.latestCursor.generation === lineage.current.generation &&
+        snapshot.latestCursor.sequence === lineage.current.sequence &&
+        snapshot.runtime?.residency === "resident" &&
+        snapshot.runtime.activeSessionId === binding.activeSessionId &&
+        snapshot.runtime.sessionId === binding.sessionId;
+    });
+  }
+
   async persistResidentSessionBinding(bindingValue: ResidentSessionBinding): Promise<void> {
     await this.exclusive(async () => {
       this.assertInitialized();

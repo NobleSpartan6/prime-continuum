@@ -58,6 +58,26 @@ type ResidentGatewayAdapter = PrimeAgentGateway & {
   ): Promise<ResidentAbortIdleAuthorityEvidence>;
 };
 
+interface DesiredResidentBinding {
+  readonly binding: ResidentSessionBinding;
+  readonly fingerprint: string;
+}
+
+interface AttachedResidentBinding extends DesiredResidentBinding {
+  readonly connection: ResidentRuntimeConnection;
+  readonly publicationBaseline: number;
+}
+
+interface ResidentBindingPreparationJob {
+  readonly fingerprint: string;
+  readonly promise: Promise<void>;
+}
+
+interface ResidentBindingProjectionJob {
+  readonly attached: AttachedResidentBinding;
+  readonly promise: Promise<void>;
+}
+
 export interface VerifiedResidentGatewayOptions {
   readonly store: HostStore;
   readonly runtimeHandles: VerifiedRuntimeHandleProvider;
@@ -87,10 +107,15 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   private readonly abortIdleListeners = new Set<(event: ResidentAbortIdleObservedEvent) => void>();
   private readonly promptReconciliationJobs = new Map<string, Promise<void>>();
   private readonly abortReconciliationJobs = new Map<string, Promise<void>>();
+  private desiredBindings = new Map<string, DesiredResidentBinding>();
+  private readonly attachedBindings = new Map<string, AttachedResidentBinding>();
+  private readonly preparedBindings = new Map<string, AttachedResidentBinding>();
+  private readonly bindingPreparationJobs = new Map<string, ResidentBindingPreparationJob>();
+  private readonly bindingProjectionJobs = new Map<string, ResidentBindingProjectionJob>();
+  private readonly bindingRetirementJobs = new Map<string, Promise<void>>();
+  private readonly bindingPublicationRevisions = new Map<string, number>();
   private adapter: ResidentGatewayAdapter | undefined;
   private adapterPromise: Promise<ResidentGatewayAdapter> | undefined;
-  private preparationPromise: Promise<boolean> | undefined;
-  private preparedBindingSetFingerprint: string | undefined;
   private promptReconciliationDiscovery: Promise<void> | undefined;
   private abortReconciliationDiscovery: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
@@ -108,46 +133,52 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   async isLive(threadId: string, executionGenerationId: string): Promise<boolean> {
     if (this.closed) return false;
     const binding = await this.store.getResidentSessionBinding(threadId, executionGenerationId);
-    if (!binding) return false;
-    const expectedSet = await this.currentBindingSetFingerprint();
-    if (!expectedSet || expectedSet !== this.preparedBindingSetFingerprint || !this.adapter) return false;
+    const slot = residentBindingSlotKey(threadId, executionGenerationId);
+    if (!binding) {
+      this.retireAttachedBinding(slot);
+      return false;
+    }
+    const fingerprint = residentDispatchAuthorityFingerprint(binding);
+    const attached = this.attachedBindings.get(slot);
+    if (!attached || attached.fingerprint !== fingerprint || !this.adapter) {
+      if (attached) this.retireAttachedBinding(slot, attached);
+      return false;
+    }
+    const prepared = this.preparedBindings.get(slot);
+    if (prepared !== attached) return false;
     try {
       const live = await this.adapter.isLive(threadId, executionGenerationId);
-      if (!live) this.preparedBindingSetFingerprint = undefined;
+      if (!live) this.retireAttachedBinding(slot, attached);
       return !this.closed && live;
     } catch (error) {
-      this.preparedBindingSetFingerprint = undefined;
+      this.retireAttachedBinding(slot, attached);
       if (isDefinitivelyUnavailableResident(error)) return false;
       throw error;
     }
   }
 
   /**
-   * Nonblocking health gate. The first call for a new exact binding set starts
-   * verified reattachment and returns false. A later call returns true only
-   * after every durable binding attached and the set remained unchanged.
+   * Nonblocking health gate. Each durable binding attaches and recovers in its
+   * own authority slot. The global command capability is advertised when at
+   * least one current exact binding is ready; an unrelated failed binding
+   * cannot poison a healthy session.
    */
   async capabilityReady(): Promise<boolean> {
     if (this.closed) return false;
     const bindings = await this.store.listResidentSessionBindings();
-    if (bindings.length === 0) {
-      this.preparedBindingSetFingerprint = undefined;
-      return false;
+    this.synchronizeDesiredBindings(bindings);
+    for (const desired of this.desiredBindings.values()) {
+      this.scheduleBindingPreparation(desired);
     }
-    const fingerprint = residentBindingSetFingerprint(bindings);
-    if (fingerprint === this.preparedBindingSetFingerprint && this.adapter) {
+    for (const attached of this.attachedBindings.values()) {
+      this.scheduleProjectionReadinessCheck(attached);
+    }
+    const ready = this.hasPreparedBinding();
+    if (ready) {
       this.schedulePromptReconciliationDiscovery();
       this.scheduleAbortReconciliationDiscovery();
-      return true;
     }
-    if (!this.preparationPromise) {
-      const attempt = this.prepareBindings(bindings, fingerprint);
-      this.preparationPromise = attempt;
-      void attempt.finally(() => {
-        if (this.preparationPromise === attempt) this.preparationPromise = undefined;
-      });
-    }
-    return false;
+    return ready;
   }
 
   subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
@@ -219,10 +250,19 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       throw new GatewayError("GATEWAY_CLOSED", "The resident Prime Agent gateway is closed", false);
     }
     const adapter = this.adapter;
-    if (!adapter || !this.preparedBindingSetFingerprint) {
+    const binding = dispatchBindingFor(command, context, this.preparedBindings);
+    if (!adapter || !binding || !this.isPreparedBinding(binding)) {
       throw new GatewayError(
         "RESIDENT_SESSION_NOT_ATTACHED",
-        "Every durable resident Prime Agent session must be attached before dispatch",
+        "The exact durable resident Prime Agent session must be attached before dispatch",
+        true,
+      );
+    }
+    if (!(await this.isCurrentBinding(binding))) {
+      this.retireAttachedBinding(residentBindingSlotKeyFor(binding));
+      throw new GatewayError(
+        "RESIDENT_SESSION_NOT_ATTACHED",
+        "The exact durable resident Prime Agent session must be attached before dispatch",
         true,
       );
     }
@@ -237,8 +277,9 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       // Closing the owned adapter first rejects any blocked pinned idle barrier;
       // reconciliation jobs are drained only after that terminal fence.
       await pendingAdapter?.close().catch(() => undefined);
-      const preparation = this.preparationPromise;
-      if (preparation) await preparation.catch(() => undefined);
+      await Promise.allSettled([...this.bindingPreparationJobs.values()].map((job) => job.promise));
+      await Promise.allSettled([...this.bindingProjectionJobs.values()].map((job) => job.promise));
+      await Promise.allSettled([...this.bindingRetirementJobs.values()]);
       const discovery = this.promptReconciliationDiscovery;
       if (discovery) await discovery.catch(() => undefined);
       const abortDiscovery = this.abortReconciliationDiscovery;
@@ -249,6 +290,10 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       this.projectionListeners.clear();
       this.promptIdleListeners.clear();
       this.abortIdleListeners.clear();
+      this.desiredBindings.clear();
+      this.attachedBindings.clear();
+      this.preparedBindings.clear();
+      this.bindingPublicationRevisions.clear();
     })();
     return this.closePromise;
   }
@@ -271,34 +316,195 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     return attempt;
   }
 
-  private async prepareBindings(
-    bindings: readonly ResidentSessionBinding[],
-    fingerprint: string,
-  ): Promise<boolean> {
-    this.preparedBindingSetFingerprint = undefined;
-    try {
-      const adapter = await this.ensureAdapter();
-      for (const binding of bindings) {
-        if (this.closed) return false;
-        await adapter.attachResident(binding);
-      }
-      const current = await this.currentBindingSetFingerprint();
-      if (this.closed || current !== fingerprint) return false;
-      this.preparedBindingSetFingerprint = fingerprint;
-      this.schedulePromptReconciliationDiscovery();
-      this.scheduleAbortReconciliationDiscovery();
-      return true;
-    } catch {
-      this.preparedBindingSetFingerprint = undefined;
-      return false;
+  private synchronizeDesiredBindings(bindings: readonly ResidentSessionBinding[]): void {
+    const next = new Map<string, DesiredResidentBinding>();
+    for (const binding of bindings) {
+      const slot = residentBindingSlotKeyFor(binding);
+      next.set(slot, {
+        binding,
+        fingerprint: residentDispatchAuthorityFingerprint(binding),
+      });
     }
+    this.desiredBindings = next;
+    for (const [slot, attached] of this.attachedBindings) {
+      const desired = next.get(slot);
+      if (!desired || desired.fingerprint !== attached.fingerprint) {
+        this.retireAttachedBinding(slot, attached);
+      }
+    }
+  }
+
+  private scheduleBindingPreparation(desired: DesiredResidentBinding): void {
+    if (this.closed) return;
+    const slot = residentBindingSlotKeyFor(desired.binding);
+    if (this.attachedBindings.get(slot)?.fingerprint === desired.fingerprint) return;
+    if (this.bindingPreparationJobs.has(slot)) return;
+    const retirement = this.bindingRetirementJobs.get(slot);
+    const promise = this.prepareBinding(slot, desired, retirement);
+    const job = Object.freeze({ fingerprint: desired.fingerprint, promise });
+    this.bindingPreparationJobs.set(slot, job);
+    promise.then(
+      () => this.finishBindingPreparation(slot, job),
+      () => this.finishBindingPreparation(slot, job),
+    );
+  }
+
+  private finishBindingPreparation(slot: string, job: ResidentBindingPreparationJob): void {
+    if (this.bindingPreparationJobs.get(slot) !== job) return;
+    this.bindingPreparationJobs.delete(slot);
+    const desired = this.desiredBindings.get(slot);
+    // A replacement observed while an old attach was in flight proceeds only
+    // after the stale connection has been detached by that old job.
+    if (!this.closed && desired && desired.fingerprint !== job.fingerprint) {
+      this.scheduleBindingPreparation(desired);
+    }
+  }
+
+  private async prepareBinding(
+    slot: string,
+    desired: DesiredResidentBinding,
+    retirement: Promise<void> | undefined,
+  ): Promise<void> {
+    let connection: ResidentRuntimeConnection | undefined;
+    try {
+      await retirement;
+      const adapter = await this.ensureAdapter();
+      if (this.closed || !this.isDesiredBinding(slot, desired.fingerprint)) return;
+      // A prior durable projection proves historical authority, not that this
+      // newly attached connection obtained a stable current snapshot. Capture
+      // the slot revision immediately before attach so both an initial publish
+      // inside attach and a later async refresh can cross this exact baseline.
+      const publicationBaseline = this.bindingPublicationRevisions.get(slot) ?? 0;
+      connection = await adapter.attachResident(desired.binding);
+      if (
+        this.closed ||
+        !this.isDesiredBinding(slot, desired.fingerprint) ||
+        !(await this.isCurrentBinding(desired.binding))
+      ) {
+        await connection.detach().catch(() => undefined);
+        return;
+      }
+      const attached = {
+        binding: connection.binding,
+        fingerprint: desired.fingerprint,
+        connection,
+        publicationBaseline,
+      } satisfies AttachedResidentBinding;
+      this.attachedBindings.set(slot, attached);
+      this.scheduleProjectionReadinessCheck(attached);
+    } catch {
+      // Attachment and retirement failures poison only this exact authority.
+      // A later readiness poll may retry it without disturbing other slots.
+      if (connection) {
+        const attached = this.attachedBindings.get(slot);
+        if (attached?.connection === connection) {
+          this.attachedBindings.delete(slot);
+          if (this.preparedBindings.get(slot) === attached) this.preparedBindings.delete(slot);
+        }
+        await connection.detach().catch(() => undefined);
+      }
+    }
+  }
+
+  private retireAttachedBinding(slot: string, expected?: AttachedResidentBinding): void {
+    const attached = this.attachedBindings.get(slot);
+    if (!attached || (expected && attached !== expected)) return;
+    this.attachedBindings.delete(slot);
+    if (this.preparedBindings.get(slot) === attached) this.preparedBindings.delete(slot);
+    const previous = this.bindingRetirementJobs.get(slot);
+    const retirement = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      .then(() => attached.connection.detach());
+    this.bindingRetirementJobs.set(slot, retirement);
+    retirement.then(
+      () => {
+        if (this.bindingRetirementJobs.get(slot) === retirement) {
+          this.bindingRetirementJobs.delete(slot);
+        }
+      },
+      () => {
+        if (this.bindingRetirementJobs.get(slot) === retirement) {
+          this.bindingRetirementJobs.delete(slot);
+        }
+      },
+    );
+  }
+
+  private scheduleProjectionReadinessCheck(attached: AttachedResidentBinding): void {
+    if (this.closed) return;
+    const slot = residentBindingSlotKeyFor(attached.binding);
+    if (
+      this.preparedBindings.get(slot) === attached ||
+      this.bindingProjectionJobs.has(slot) ||
+      (this.bindingPublicationRevisions.get(slot) ?? 0) <= attached.publicationBaseline
+    ) {
+      return;
+    }
+    const promise = this.store.hasExactResidentProjection(attached.binding).then((projected) => {
+      if (projected) this.promoteAttachedBinding(attached.binding);
+    });
+    const job = Object.freeze({ attached, promise });
+    this.bindingProjectionJobs.set(slot, job);
+    promise.then(
+      () => this.finishProjectionReadinessCheck(slot, job),
+      () => this.finishProjectionReadinessCheck(slot, job),
+    );
+  }
+
+  private finishProjectionReadinessCheck(slot: string, job: ResidentBindingProjectionJob): void {
+    if (this.bindingProjectionJobs.get(slot) !== job) return;
+    this.bindingProjectionJobs.delete(slot);
+    const current = this.attachedBindings.get(slot);
+    if (current && current !== job.attached) this.scheduleProjectionReadinessCheck(current);
+  }
+
+  private promoteAttachedBinding(binding: ResidentSessionBinding): void {
+    if (this.closed) return;
+    const slot = residentBindingSlotKeyFor(binding);
+    const fingerprint = residentDispatchAuthorityFingerprint(binding);
+    const attached = this.attachedBindings.get(slot);
+    if (
+      !attached ||
+      attached.fingerprint !== fingerprint ||
+      !this.isDesiredBinding(slot, fingerprint) ||
+      (this.bindingPublicationRevisions.get(slot) ?? 0) <= attached.publicationBaseline
+    ) {
+      return;
+    }
+    this.preparedBindings.set(slot, attached);
+    this.schedulePromptReconciliationDiscovery();
+    this.scheduleAbortReconciliationDiscovery();
+  }
+
+  private isDesiredBinding(slot: string, fingerprint: string): boolean {
+    return this.desiredBindings.get(slot)?.fingerprint === fingerprint;
+  }
+
+  private isPreparedBinding(binding: ResidentSessionBinding): boolean {
+    const prepared = this.preparedBindings.get(residentBindingSlotKeyFor(binding));
+    return prepared?.fingerprint === residentDispatchAuthorityFingerprint(binding);
+  }
+
+  private hasPreparedBinding(): boolean {
+    for (const [slot, prepared] of this.preparedBindings) {
+      if (this.desiredBindings.get(slot)?.fingerprint === prepared.fingerprint) return true;
+    }
+    return false;
+  }
+
+  private async isCurrentBinding(binding: ResidentSessionBinding): Promise<boolean> {
+    const current = await this.store.getResidentSessionBinding(
+      binding.threadId,
+      binding.executionGenerationId,
+    );
+    return current !== undefined &&
+      residentDispatchAuthorityFingerprint(current) === residentDispatchAuthorityFingerprint(binding);
   }
 
   private schedulePromptReconciliationDiscovery(): void {
     if (
       this.closed ||
       !this.adapter ||
-      !this.preparedBindingSetFingerprint ||
+      !this.hasPreparedBinding() ||
       this.promptReconciliationDiscovery
     ) {
       return;
@@ -326,7 +532,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (
       this.closed ||
       !this.adapter ||
-      !this.preparedBindingSetFingerprint ||
+      !this.hasPreparedBinding() ||
       this.abortReconciliationDiscovery
     ) {
       return;
@@ -352,9 +558,11 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
 
   private async reconcileResidentPrompt(lease: ResidentPromptReconciliationLease): Promise<void> {
     const adapter = this.adapter;
-    if (this.closed || !adapter || !this.preparedBindingSetFingerprint) return;
+    if (this.closed || !adapter || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) {
+      return;
+    }
     const evidence = await adapter.reconcileAcknowledgedPromptIdle(lease);
-    if (this.closed) return;
+    if (this.closed || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) return;
     const observation = await this.store.completeResidentPromptReconciliation(lease, evidence);
     if (this.closed) return;
     for (const listener of this.promptIdleListeners) {
@@ -382,9 +590,11 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
 
   private async reconcileResidentAbort(lease: ResidentAbortReconciliationLease): Promise<void> {
     const adapter = this.adapter;
-    if (this.closed || !adapter || !this.preparedBindingSetFingerprint) return;
+    if (this.closed || !adapter || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) {
+      return;
+    }
     const evidence = await adapter.reconcileAcknowledgedAbortIdle(lease);
-    if (this.closed) return;
+    if (this.closed || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) return;
     // Store alone may replace a lagging active view at the same upstream
     // cursor, and only under this exact branded acknowledged-Stop lease.
     await this.store.publishResidentProjectionSnapshot(lease.binding, evidence.projection, lease);
@@ -412,11 +622,6 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     }
   }
 
-  private async currentBindingSetFingerprint(): Promise<string | undefined> {
-    const bindings = await this.store.listResidentSessionBindings();
-    return bindings.length === 0 ? undefined : residentBindingSetFingerprint(bindings);
-  }
-
   private async createAdapter(): Promise<ResidentGatewayAdapter> {
     const handle = await this.runtimeHandles.acquireVerifiedRuntimeHandle();
     const daemonWorkingDirectory = residentDaemonWorkingDirectory(this.store.paths.root);
@@ -435,8 +640,16 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       persistBinding: (binding) => this.store.persistResidentSessionBinding(binding),
       completeBinding: (binding) => this.store.completeResidentSessionBinding(binding),
       publishProjection: async (binding, projection) => {
+        if (this.closed || !(await this.isCurrentBinding(binding))) return;
         await this.store.publishResidentProjectionSnapshot(binding, projection);
-        if (this.closed) return;
+        if (this.closed || !(await this.isCurrentBinding(binding))) return;
+        const slot = residentBindingSlotKeyFor(binding);
+        this.bindingPublicationRevisions.set(
+          slot,
+          (this.bindingPublicationRevisions.get(slot) ?? 0) + 1,
+        );
+        const attached = this.attachedBindings.get(slot);
+        if (attached) this.scheduleProjectionReadinessCheck(attached);
         const change = Object.freeze({
           threadId: binding.threadId,
           executionGenerationId: binding.executionGenerationId,
@@ -588,13 +801,33 @@ function samePath(left: string, right: string): boolean {
     : normalizedLeft === normalizedRight;
 }
 
-function residentBindingSetFingerprint(bindings: readonly ResidentSessionBinding[]): string {
-  const canonical = [...bindings]
-    // Readiness tracks the same stable resident authority as durable dispatch.
-    // A verified attach may refresh supervisor metadata or reorder an equal
-    // capability set without changing which session owns command authority.
-    .map((binding) => residentDispatchAuthorityFingerprint(binding))
-    .sort()
-    .join("\n");
-  return createHash("sha256").update(canonical).digest("hex");
+function residentBindingSlotKeyFor(binding: ResidentSessionBinding): string {
+  return residentBindingSlotKey(binding.threadId, binding.executionGenerationId);
+}
+
+function residentBindingSlotKey(threadId: string, executionGenerationId: string): string {
+  return JSON.stringify([threadId, executionGenerationId]);
+}
+
+function dispatchBindingFor(
+  command: CommandEnvelope,
+  context: GatewayDispatchContext | undefined,
+  preparedBindings: ReadonlyMap<string, AttachedResidentBinding>,
+): ResidentSessionBinding | undefined {
+  const contextual = command.command.kind === "prompt" || command.command.kind === "abort"
+    ? context?.residentDispatch?.binding
+    : command.command.kind === "model.select"
+      ? context?.residentBinding
+      : context?.residentDispatch?.binding ?? context?.residentBinding;
+  const binding = contextual ?? preparedBindings.get(
+    residentBindingSlotKey(command.threadId, command.expectedExecutionGenerationId),
+  )?.binding;
+  if (
+    !binding ||
+    binding.threadId !== command.threadId ||
+    binding.executionGenerationId !== command.expectedExecutionGenerationId
+  ) {
+    return undefined;
+  }
+  return binding;
 }

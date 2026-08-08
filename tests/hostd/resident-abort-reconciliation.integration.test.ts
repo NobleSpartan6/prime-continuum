@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { UnavailablePrimeAgentGateway } from "../../src/hostd/gateway";
+import type { PrimeAgentResidentAdapterOptions } from "../../src/hostd/prime-agent-resident-adapter";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
@@ -114,8 +115,11 @@ describe("verified resident Stop idle reconciliation", () => {
 
     const restartedStore = new HostStore(base.directory);
     await restartedStore.initialize();
-    const fixture = gatewayFixture(restartedStore, async (lease) =>
-      evidence(lease, projection(lease.binding, "abort-proof-restart", 1, false)));
+    const fixture = gatewayFixture(
+      restartedStore,
+      async (lease) => evidence(lease, projection(lease.binding, "abort-proof-restart", 1, false)),
+      active,
+    );
 
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
     await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
@@ -163,7 +167,12 @@ async function initializedStore() {
   return { directory, workspaceDirectory, store, hostId, binding: residentBinding };
 }
 
-function gatewayFixture(store: HostStore, reconcile: ReconcileHandler) {
+function gatewayFixture(
+  store: HostStore,
+  reconcile: ReconcileHandler,
+  attachProjection?: ResidentProjectionSnapshot,
+) {
+  let adapterOptions!: PrimeAgentResidentAdapterOptions;
   const adapter = {
     continuity: "resident" as const,
     isLive: vi.fn(async () => true),
@@ -172,7 +181,13 @@ function gatewayFixture(store: HostStore, reconcile: ReconcileHandler) {
       message: "Prime Agent accepted Stop; waiting for idle proof",
     })),
     close: vi.fn(async () => undefined),
-    attachResident: vi.fn(async (candidate: ResidentSessionBinding) => ({ binding: candidate }) as ResidentRuntimeConnection),
+    attachResident: vi.fn(async (candidate: ResidentSessionBinding) => {
+      await adapterOptions.publishProjection(
+        candidate,
+        attachProjection ?? projection(candidate, `attach-${candidate.threadId}`, 0, false),
+      );
+      return { binding: candidate } as ResidentRuntimeConnection;
+    }),
     reconcileAcknowledgedPromptIdle: vi.fn(async () => {
       throw new Error("No prompt reconciliation lease was configured for this Stop fixture");
     }),
@@ -186,7 +201,10 @@ function gatewayFixture(store: HostStore, reconcile: ReconcileHandler) {
     runtimeHandles,
     platform: "win32",
     environment: {},
-    adapterFactory: () => adapter,
+    adapterFactory: (options) => {
+      adapterOptions = options;
+      return adapter;
+    },
     moduleLoaderFactory: () => async () => ({}),
   });
   return { gateway, adapter, runtimeHandles };

@@ -8,6 +8,7 @@ import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projec
 import {
   PINNED_PRIME_AGENT_RUNTIME,
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
+  ResidentRuntimeContractError,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentRuntimeConnection,
   type ResidentSessionBinding,
@@ -91,6 +92,10 @@ describe("verified resident prompt idle reconciliation", () => {
 
   it("discovers an acknowledged running lock after host restart and performs only the read-only proof", async () => {
     const base = await initializedStore();
+    await base.store.publishResidentProjectionSnapshot(
+      base.binding,
+      projection(base.binding, "proof-prior-exact-idle", 1),
+    );
     const command = promptCommand(base.hostId, "proof-restart-prompt");
     const admission = await base.store.admitCommand(command, true);
     expect(admission.receipt.status).toBe("admitted");
@@ -102,11 +107,12 @@ describe("verified resident prompt idle reconciliation", () => {
 
     const restartedStore = new HostStore(base.directory);
     await restartedStore.initialize();
+    const priorProjection = projection(base.binding, "proof-prior-exact-idle", 1);
     const fixture = gatewayFixture(restartedStore, async (lease, options) => {
       const idle = projection(lease.binding, "proof-restart-idle", 1);
       await options.publishProjection(lease.binding, idle);
       return evidence(lease, idle);
-    });
+    }, undefined, () => priorProjection);
 
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
     await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
@@ -114,6 +120,89 @@ describe("verified resident prompt idle reconciliation", () => {
     await vi.waitFor(async () => expect((await restartedStore.reconcileCommands([command])).receipts[0]?.status).toBe("completed"));
     expect(fixture.adapter.submit).not.toHaveBeenCalled();
     expect(await restartedStore.listResidentPromptReconciliationLeases()).toEqual([]);
+
+    await fixture.gateway.close();
+  });
+
+  it("proves a retained healthy prompt idle while an unrelated durable binding is missing", async () => {
+    const base = await initializedStore();
+    const missingWorkspacePath = join(base.directory, "missing-workspace");
+    await mkdir(missingWorkspacePath, { recursive: true });
+    const missingWorkspaceDirectory = await realpath(missingWorkspacePath);
+    const sourceSnapshot = await base.store.getThreadSnapshot(base.binding.threadId);
+    const missingThread = {
+      ...sourceSnapshot.thread,
+      threadId: "missing-thread",
+      title: "Missing resident peer",
+      currentLocation: {
+        ...sourceSnapshot.thread.currentLocation,
+        executionGenerationId: "missing-execution-1",
+      },
+      lastKnownCursor: sourceSnapshot.thread.lastKnownCursor
+        ? {
+            ...sourceSnapshot.thread.lastKnownCursor,
+            threadId: "missing-thread",
+            executionGenerationId: "missing-execution-1",
+          }
+        : undefined,
+    };
+    await base.store.upsertThread(missingThread, {
+      ...sourceSnapshot,
+      thread: missingThread,
+      latestCursor: {
+        ...sourceSnapshot.latestCursor,
+        threadId: missingThread.threadId,
+        executionGenerationId: missingThread.currentLocation.executionGenerationId,
+      },
+    });
+    const missingBinding = binding(
+      missingWorkspaceDirectory,
+      missingThread.threadId,
+      missingThread.currentLocation.executionGenerationId,
+      "missing-active-session",
+    );
+    await base.store.registerWorkspaceAuthority({
+      threadId: missingBinding.threadId,
+      executionGenerationId: missingBinding.executionGenerationId,
+      workspaceDirectory: missingBinding.workspaceDirectory,
+    });
+    await base.store.persistResidentSessionBinding(missingBinding);
+
+    const command = promptCommand(base.hostId, "proof-healthy-with-missing-peer");
+    expect((await base.store.admitCommand(command, true)).receipt.status).toBe("admitted");
+    const dispatch = await base.store.beginResidentDispatch(command);
+    await base.store.finalizeResidentDispatch(dispatch, {
+      status: "running",
+      message: "Prime Agent owns the retained exact prompt",
+    });
+
+    const fixture = gatewayFixture(
+      base.store,
+      async (lease, options) => {
+        const idle = projection(lease.binding, "proof-healthy-isolated", 1);
+        await options.publishProjection(lease.binding, idle);
+        return evidence(lease, idle);
+      },
+      async (candidate) => {
+        if (candidate.threadId === missingBinding.threadId) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_SESSION_NOT_FOUND",
+            "The unrelated resident worker is missing.",
+          );
+        }
+        return { binding: candidate } as ResidentRuntimeConnection;
+      },
+    );
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(() => expect(fixture.adapter.attachResident).toHaveBeenCalledTimes(2));
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledOnce());
+    await vi.waitFor(async () => expect((await base.store.reconcileCommands([command])).receipts[0]?.status)
+      .toBe("completed"));
+    await expect(fixture.gateway.isLive(base.binding.threadId, base.binding.executionGenerationId)).resolves.toBe(true);
+    await expect(fixture.gateway.isLive(missingBinding.threadId, missingBinding.executionGenerationId)).resolves.toBe(false);
+    expect(fixture.adapter.submit).not.toHaveBeenCalled();
 
     await fixture.gateway.close();
   });
@@ -147,20 +236,32 @@ async function initializedStore() {
     executionGenerationId: "demo-execution-1",
     workspaceDirectory,
   });
-  await store.persistResidentSessionBinding(binding(workspaceDirectory));
+  const residentBinding = binding(workspaceDirectory);
+  await store.persistResidentSessionBinding(residentBinding);
   const hostId = (await store.getHost()).hostId;
   await service.close();
-  return { directory, workspaceDirectory, store, hostId };
+  return { directory, workspaceDirectory, store, hostId, binding: residentBinding };
 }
 
-function gatewayFixture(store: HostStore, reconcile: ReconcileHandler) {
+function gatewayFixture(
+  store: HostStore,
+  reconcile: ReconcileHandler,
+  attachResident: (binding: ResidentSessionBinding) => Promise<ResidentRuntimeConnection> =
+    async (candidate) => ({ binding: candidate }) as ResidentRuntimeConnection,
+  attachProjection: (binding: ResidentSessionBinding) => ResidentProjectionSnapshot =
+    (candidate) => projection(candidate, `attach-${candidate.threadId}`, 0),
+) {
   let adapterOptions!: PrimeAgentResidentAdapterOptions;
   const adapter = {
     continuity: "resident" as const,
     isLive: vi.fn(async () => true),
     submit: vi.fn(async () => ({ disposition: "accepted" as const, message: "Prime Agent owns the prompt" })),
     close: vi.fn(async () => undefined),
-    attachResident: vi.fn(async (candidate: ResidentSessionBinding) => ({ binding: candidate }) as ResidentRuntimeConnection),
+    attachResident: vi.fn(async (candidate: ResidentSessionBinding) => {
+      const connection = await attachResident(candidate);
+      await adapterOptions.publishProjection(connection.binding, attachProjection(connection.binding));
+      return connection;
+    }),
     reconcileAcknowledgedPromptIdle: vi.fn(async (lease: ResidentPromptReconciliationLease) =>
       reconcile(lease, adapterOptions)),
     reconcileAcknowledgedAbortIdle: vi.fn(async () => {
@@ -184,16 +285,21 @@ function gatewayFixture(store: HostStore, reconcile: ReconcileHandler) {
   return { gateway, adapter, runtimeHandles };
 }
 
-function binding(workspaceDirectory: string): ResidentSessionBinding {
+function binding(
+  workspaceDirectory: string,
+  threadId = "demo-thread",
+  executionGenerationId = "demo-execution-1",
+  activeSessionId = "active-proof-session",
+): ResidentSessionBinding {
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId,
+    executionGenerationId,
     workspaceDirectory,
-    activeSessionId: "active-proof-session",
-    sessionId: "proof-session",
-    sessionFile: join(workspaceDirectory, ".prime-agent", "proof-session.jsonl"),
+    activeSessionId,
+    sessionId: `proof-session-${threadId}`,
+    sessionFile: join(workspaceDirectory, ".prime-agent", `proof-session-${threadId}.jsonl`),
     boundAt: "2026-08-07T22:00:00.000Z",
     runtime: {
       releaseVersion: PINNED_PRIME_AGENT_RUNTIME.releaseVersion,
