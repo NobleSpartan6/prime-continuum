@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
 import {
   GatewayError,
   type GatewayAdmission,
@@ -15,6 +14,10 @@ import {
   type PrimeAgentPublicModuleLoader,
   type PrimeAgentResidentAdapterOptions,
 } from "./prime-agent-resident-adapter";
+import {
+  createPrimeAgentResidentWorkerModuleLoader,
+  type PrimeAgentResidentWorkerModuleLoader,
+} from "./prime-agent-resident-worker-proxy";
 import {
   ResidentRuntimeContractError,
   type ResidentAbortIdleAuthorityEvidence,
@@ -35,16 +38,6 @@ import {
   type ResidentPromptReconciliationLease,
 } from "./store";
 import type { CommandEnvelope } from "../shared/protocol";
-
-const PROCESS_HANDLER_EVENTS = [
-  "SIGINT",
-  "SIGTERM",
-  "SIGHUP",
-  "beforeExit",
-  "exit",
-  "uncaughtException",
-  "unhandledRejection",
-] as const;
 
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
 
@@ -116,6 +109,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   private readonly bindingPublicationRevisions = new Map<string, number>();
   private adapter: ResidentGatewayAdapter | undefined;
   private adapterPromise: Promise<ResidentGatewayAdapter> | undefined;
+  private runtimeModuleLoader: PrimeAgentResidentWorkerModuleLoader | undefined;
   private promptReconciliationDiscovery: Promise<void> | undefined;
   private abortReconciliationDiscovery: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
@@ -277,6 +271,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       // Closing the owned adapter first rejects any blocked pinned idle barrier;
       // reconciliation jobs are drained only after that terminal fence.
       await pendingAdapter?.close().catch(() => undefined);
+      await this.runtimeModuleLoader?.close().catch(() => undefined);
+      this.runtimeModuleLoader = undefined;
       await Promise.allSettled([...this.bindingPreparationJobs.values()].map((job) => job.promise));
       await Promise.allSettled([...this.bindingProjectionJobs.values()].map((job) => job.promise));
       await Promise.allSettled([...this.bindingRetirementJobs.values()]);
@@ -630,44 +626,54 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (this.platform !== "win32") await ensurePrivateRuntimeDirectory(dirname(socketPath));
     if (this.closed) throw new GatewayError("GATEWAY_CLOSED", "The resident gateway closed during runtime verification");
 
-    const adapter = this.adapterFactory({
-      executable: handle.executable,
-      cliEntrypoint: handle.cliEntrypoint,
-      socketPath,
-      daemonWorkingDirectory,
-      environment: this.environment,
-      loadRuntimeModule: this.moduleLoaderFactory(handle),
-      persistBinding: (binding) => this.store.persistResidentSessionBinding(binding),
-      completeBinding: (binding) => this.store.completeResidentSessionBinding(binding),
-      publishProjection: async (binding, projection) => {
-        if (this.closed || !(await this.isCurrentBinding(binding))) return;
-        await this.store.publishResidentProjectionSnapshot(binding, projection);
-        if (this.closed || !(await this.isCurrentBinding(binding))) return;
-        const slot = residentBindingSlotKeyFor(binding);
-        this.bindingPublicationRevisions.set(
-          slot,
-          (this.bindingPublicationRevisions.get(slot) ?? 0) + 1,
-        );
-        const attached = this.attachedBindings.get(slot);
-        if (attached) this.scheduleProjectionReadinessCheck(attached);
-        const change = Object.freeze({
-          threadId: binding.threadId,
-          executionGenerationId: binding.executionGenerationId,
-        });
-        for (const listener of this.projectionListeners) {
-          try {
-            listener(change);
-          } catch {
-            // Projection publication is already durable. One observer cannot
-            // roll it back or prevent another connection from refreshing.
+    const moduleLoader = this.moduleLoaderFactory(handle);
+    const closeableModuleLoader = isCloseableResidentModuleLoader(moduleLoader) ? moduleLoader : undefined;
+    let adapter: ResidentGatewayAdapter;
+    try {
+      adapter = this.adapterFactory({
+        executable: handle.executable,
+        cliEntrypoint: handle.cliEntrypoint,
+        socketPath,
+        daemonWorkingDirectory,
+        environment: this.environment,
+        loadRuntimeModule: moduleLoader,
+        persistBinding: (binding) => this.store.persistResidentSessionBinding(binding),
+        completeBinding: (binding) => this.store.completeResidentSessionBinding(binding),
+        publishProjection: async (binding, projection) => {
+          if (this.closed || !(await this.isCurrentBinding(binding))) return;
+          await this.store.publishResidentProjectionSnapshot(binding, projection);
+          if (this.closed || !(await this.isCurrentBinding(binding))) return;
+          const slot = residentBindingSlotKeyFor(binding);
+          this.bindingPublicationRevisions.set(
+            slot,
+            (this.bindingPublicationRevisions.get(slot) ?? 0) + 1,
+          );
+          const attached = this.attachedBindings.get(slot);
+          if (attached) this.scheduleProjectionReadinessCheck(attached);
+          const change = Object.freeze({
+            threadId: binding.threadId,
+            executionGenerationId: binding.executionGenerationId,
+          });
+          for (const listener of this.projectionListeners) {
+            try {
+              listener(change);
+            } catch {
+              // Projection publication is already durable. One observer cannot
+              // roll it back or prevent another connection from refreshing.
+            }
           }
-        }
-      },
-    });
+        },
+      });
+    } catch (error) {
+      await closeableModuleLoader?.close().catch(() => undefined);
+      throw error;
+    }
     if (this.closed) {
       await adapter.close().catch(() => undefined);
+      await closeableModuleLoader?.close().catch(() => undefined);
       throw new GatewayError("GATEWAY_CLOSED", "The resident gateway closed while its adapter was starting");
     }
+    this.runtimeModuleLoader = closeableModuleLoader;
     return adapter;
   }
 }
@@ -699,47 +705,14 @@ export function residentDaemonEndpoint(
 }
 
 /**
- * Import only the two verified daemon transport modules, not Prime Agent's
- * broad root barrel. The latter eagerly loads CLI/kernel modules that register
- * process handlers and must remain outside long-lived hostd.
+ * Keep Prime Agent's public transport objects and their dependency-side
+ * process mutations inside a bounded Worker. The host retains authority over
+ * the freshly verified module URL and loads no upstream runtime code itself.
  */
 export function createVerifiedResidentModuleLoader(
   handle: VerifiedInstalledRuntimeHandle,
-): PrimeAgentPublicModuleLoader {
-  let load: Promise<unknown> | undefined;
-  return () => {
-    load ??= loadVerifiedResidentModules(handle);
-    return load;
-  };
-}
-
-async function loadVerifiedResidentModules(handle: VerifiedInstalledRuntimeHandle): Promise<unknown> {
-  const moduleUrl = new URL(handle.moduleUrl);
-  if (moduleUrl.protocol !== "file:" || moduleUrl.username || moduleUrl.password || moduleUrl.search || moduleUrl.hash) {
-    throw new Error("Verified Prime Agent module URL is invalid");
-  }
-  const rootEntrypoint = fileURLToPath(moduleUrl);
-  const distDirectory = dirname(rootEntrypoint);
-  const daemonClientPath = join(distDirectory, "modes", "daemon", "daemon-client.js");
-  const daemonConnectionPath = join(distDirectory, "modes", "agent-connection", "daemon-agent-connection.js");
-  assertPathWithin(distDirectory, daemonClientPath);
-  assertPathWithin(distDirectory, daemonConnectionPath);
-
-  const before = snapshotProcessHandlers();
-  const [clientModule, connectionModule] = await Promise.all([
-    import(pathToFileURL(daemonClientPath).href),
-    import(pathToFileURL(daemonConnectionPath).href),
-  ]);
-  if (!processHandlersEqual(before, snapshotProcessHandlers())) {
-    // Never remove listeners here: another subsystem may have installed one
-    // concurrently and attribution would be unsafe. The memoized loader stays
-    // rejected, so the altered import can never authorize resident commands.
-    throw new Error("Verified Prime Agent transport modules modified host process handlers");
-  }
-  return Object.freeze({
-    DaemonClient: clientModule.DaemonClient,
-    DaemonAgentConnection: connectionModule.DaemonAgentConnection,
-  });
+): PrimeAgentResidentWorkerModuleLoader {
+  return createPrimeAgentResidentWorkerModuleLoader(handle);
 }
 
 async function ensurePrivateRuntimeDirectory(path: string): Promise<void> {
@@ -770,27 +743,10 @@ function isDefinitivelyUnavailableResident(error: unknown): boolean {
   );
 }
 
-function assertPathWithin(parent: string, child: string): void {
-  const childRelative = relative(resolve(parent), resolve(child));
-  if (childRelative === "" || childRelative === ".." || childRelative.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
-    throw new Error("Verified resident module path escaped its runtime dist directory");
-  }
-}
-
-type ProcessHandlerSnapshot = ReadonlyMap<string, readonly Function[]>;
-
-function snapshotProcessHandlers(): ProcessHandlerSnapshot {
-  return new Map(PROCESS_HANDLER_EVENTS.map((event) => [event, [...process.rawListeners(event)]]));
-}
-
-function processHandlersEqual(left: ProcessHandlerSnapshot, right: ProcessHandlerSnapshot): boolean {
-  for (const event of PROCESS_HANDLER_EVENTS) {
-    const leftHandlers = left.get(event) ?? [];
-    const rightHandlers = right.get(event) ?? [];
-    if (leftHandlers.length !== rightHandlers.length) return false;
-    if (leftHandlers.some((handler, index) => handler !== rightHandlers[index])) return false;
-  }
-  return true;
+function isCloseableResidentModuleLoader(
+  loader: PrimeAgentPublicModuleLoader,
+): loader is PrimeAgentResidentWorkerModuleLoader {
+  return typeof (loader as PrimeAgentPublicModuleLoader & { close?: unknown }).close === "function";
 }
 
 function samePath(left: string, right: string): boolean {

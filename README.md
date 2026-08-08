@@ -2,7 +2,7 @@
 
 Development-stage native control-plane foundation for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
 
-> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release. Production resident commands are not authorized or available out of the box. The release-attested local composition contains a fail-closed gateway for reattaching an existing durable Prime Agent binding and exposing generation-fenced **Run prompt** and **Stop** controls; focused adapter/store/service tests cover that contract, but the packaged-runtime smoke has not yet exercised a real resident binding or prompt. The app still cannot create or provision that binding for a fresh project. Remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
+> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release. Production resident commands are not authorized or available out of the box. The release-attested local composition contains a fail-closed gateway for reattaching an existing durable Prime Agent binding and exposing generation-fenced **Run prompt** and **Stop** controls. Focused adapter/store/service tests cover that contract, and a credential-free release smoke now creates one real resident binding through a harness-only adapter path, loads it through the attested Worker isolation boundary, restarts hostd, and proves exact reattachment without mutating the parent process. It intentionally sends no model prompt or Stop and does not exercise client-owned escrow creation or promotion. The app still cannot provision a fresh project through its user interface. Remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
 
 The intended product is a cross-platform workbench that preserves one project-and-conversation experience across local and SSH-backed hosts. The current build provides the security, protocol, persistence, and interface seams needed to continue that work without presenting the deferred execution paths as available.
 
@@ -64,8 +64,11 @@ pnpm build:runtime
 pnpm verify:runtime:smoke
 pnpm build:release
 pnpm verify:hostd-runtime:smoke
+pnpm verify:hostd-resident:smoke
 pnpm verify:renderer-visual
 ```
+
+`verify:hostd-resident:smoke` requires the current release build and runtime seed. It uses an isolated empty Prime Agent home, creates one real resident session through a harness-only adapter path, closes the Worker loader explicitly, restarts hostd, and verifies the authoritative resident projection. It also freezes the isolation regression by proving that loading, attaching, and closing the upstream runtime in the Worker does not change the parent process's raw `SIGINT`/`SIGTERM` listeners, `process.emit`, or `process.reallyExit`. No user credential is read and no provider prompt is sent. Client-owned escrow provisioning and explicit promotion remain a separate, not-yet-production-wired verification gate.
 
 `verify:renderer-visual` rebuilds the complete attested release tree before capturing the browser-preview fixture through real Electron at 1600×1000 plus exact 390×844 and 320×704 desktop/Companion viewports. It fails on page or surface-level horizontal overflow and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
 

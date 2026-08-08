@@ -1,5 +1,6 @@
 import { basename, isAbsolute, resolve } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
+import { isMainThread } from "node:worker_threads";
 import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
 import { resolveHostDataDir } from "./paths";
 import { collectHostProbe } from "./probe";
@@ -18,6 +19,9 @@ export * from "./oauth-session-broker";
 export * from "./paths";
 export * from "./probe";
 export * from "./prime-agent-resident-adapter";
+export * from "./prime-agent-resident-worker-entry";
+export * from "./prime-agent-resident-worker-protocol";
+export * from "./prime-agent-resident-worker-proxy";
 export * from "./resident-runtime";
 export * from "./runtime-attestation";
 export * from "./runtime-initialization-coordinator";
@@ -299,14 +303,17 @@ function waitForTermination(): { promise: Promise<void>; cancel(): void } {
   return { promise, cancel: finish };
 }
 
-function isDirectInvocation(): boolean {
-  const script = process.argv[1];
+export function isDirectHostdInvocation(
+  script: string | undefined = process.argv[1],
+  mainThread = isMainThread,
+): boolean {
+  if (!mainThread) return false;
   if (!script) return false;
   const name = basename(script).toLowerCase();
   return name === "hostd.cjs" || name === "prime-agent-hostd" || name === "prime-agent-hostd.exe";
 }
 
-if (isDirectInvocation()) {
+if (isDirectHostdInvocation()) {
   void runHostdCli().then(
     (code) => {
       process.exitCode = code;
