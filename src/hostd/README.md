@@ -33,11 +33,14 @@ An RPC success acknowledges admission only. Later execution failure is an event,
 not a second response to the command ID. Host-level `(deviceId, commandId)`
 receipts remain durable and authoritative across adapter or client restarts.
 
-The release-attested composition now constructs this resident adapter and
-reattaches only bindings that were already durably recorded by `HostStore`.
-It advertises `prime_agent_commands_v2` only after every current binding has
-attached exactly; a fresh store with no binding remains unavailable because
-session creation is not part of this checkpoint.
+The release-attested composition constructs this resident adapter inside an
+isolated Worker. With no binding, it advertises lifecycle setup only after the
+Worker and pinned public modules preflight successfully. Native provisioning
+then bootstraps exact workspace/thread authority, creates a `client_owned`
+session, persists its candidate before promotion, publishes a stable initial
+projection, and commits the binding. `prime_agent_commands_v2` is advertised
+only while at least one current exact binding is projection-ready; each command
+and proof still checks its selected binding independently.
 
 The detached daemon is a user-trusted coding runtime, not a credential sandbox.
 Its environment inherits the launching hostd's provider and project-tool

@@ -9,6 +9,7 @@ import {
   createPreviewRendererApi,
   StaleHostAuthorityError,
   type HostRuntimeReadiness,
+  type ResidentLifecycleOperationSummary,
   type RuntimeModelCatalog,
 } from '../../src/renderer/src/api'
 
@@ -80,6 +81,67 @@ function createIdleResidentApi() {
   return api
 }
 
+function lifecycleOperation(
+  state: ResidentLifecycleOperationSummary['state'],
+): ResidentLifecycleOperationSummary {
+  return {
+    operationId: 'resident-operation-one',
+    expectedHostId: 'host-local',
+    projectId: 'resident-project-one',
+    workspaceId: 'resident-workspace-one',
+    threadId: 'resident-thread-one',
+    executionGenerationId: 'resident-generation-one',
+    projectDisplayName: 'Prime GUI',
+    threadTitle: 'Prime GUI thread',
+    createdAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+    state,
+  }
+}
+
+function createResidentProvisioningApi(operation?: ResidentLifecycleOperationSummary) {
+  const api = createPreviewRendererApi()
+  const loadWorkbench = api.loadWorkbench.bind(api)
+  api.loadWorkbench = async () => {
+    const snapshot = await loadWorkbench()
+    snapshot.selectedProjectId = ''
+    snapshot.selectedThreadId = ''
+    snapshot.projects = []
+    snapshot.threads = []
+    snapshot.residentLifecycleOperations = operation ? [operation] : []
+    snapshot.operations = {
+      ...snapshot.operations,
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      provisionResident: true,
+    }
+    return snapshot
+  }
+  api.selectResidentWorkspace = vi.fn(async () => ({
+    selectionToken: 'resident-selection-one',
+    operationId: 'resident-operation-one',
+    expectedHostId: 'host-local',
+    suggestedName: 'Prime GUI',
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }))
+  api.provisionResident = vi.fn(async () => ({
+    version: 1 as const,
+    kind: 'provision' as const,
+    operationId: 'resident-operation-one',
+    phase: 'prepared' as const,
+    expectedHostId: 'host-local',
+    projectId: 'resident-project-one',
+    workspaceId: 'resident-workspace-one',
+    threadId: 'resident-thread-one',
+    executionGenerationId: 'resident-generation-one',
+    preparedAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+  }))
+  api.residentLifecycleStatus = vi.fn(async () => null)
+  return api
+}
+
 beforeAll(() => {
   Object.defineProperty(window, 'requestAnimationFrame', {
     configurable: true,
@@ -110,6 +172,333 @@ afterEach(() => {
 })
 
 describe('Prime Continuim renderer', () => {
+  it('resumes only the exact lifecycle operation selected from a recovery card', async () => {
+    const user = userEvent.setup()
+    const operation = lifecycleOperation('requires_reselection')
+    const api = createResidentProvisioningApi(operation)
+    render(<App api={api} />)
+
+    await screen.findByRole('heading', { name: 'Workspace confirmation needed' })
+    expect(api.selectResidentWorkspace).not.toHaveBeenCalled()
+    expect(api.provisionResident).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Choose original folder' }))
+
+    expect(api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+    expect(api.selectResidentWorkspace).toHaveBeenCalledWith({
+      resumeOperationId: operation.operationId,
+    })
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
+    expect(await screen.findByRole('dialog', { name: 'Start resident thread' })).toBeVisible()
+  })
+
+  it('checks the exact uncertain lifecycle status without reselecting or retrying provision', async () => {
+    const user = userEvent.setup()
+    const operation = lifecycleOperation('outcome_unknown')
+    const api = createResidentProvisioningApi(operation)
+    api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: operation.operationId,
+      phase: 'prepared' as const,
+      expectedHostId: operation.expectedHostId,
+      projectId: operation.projectId,
+      workspaceId: operation.workspaceId,
+      threadId: operation.threadId,
+      executionGenerationId: operation.executionGenerationId,
+      preparedAt: operation.createdAt,
+      updatedAt: operation.updatedAt,
+    }))
+    render(<App api={api} />)
+
+    await screen.findByRole('heading', { name: 'Setup outcome needs inspection' })
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
+    const checkStatus = screen.getByRole('button', { name: 'Check status' })
+    await user.click(checkStatus)
+
+    expect(api.residentLifecycleStatus).toHaveBeenCalledTimes(1)
+    expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: operation.expectedHostId,
+      operationId: operation.operationId,
+    })
+    expect(api.selectResidentWorkspace).not.toHaveBeenCalled()
+    expect(api.provisionResident).not.toHaveBeenCalled()
+    expect(screen.getByText('Status checked. The durable setup is still in progress and no mutation was replayed.')).toBeInTheDocument()
+    expect(checkStatus).toHaveFocus()
+  })
+
+  it('keeps an older unresolved lifecycle operation visible after an unrelated setup commits', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    const unresolved = lifecycleOperation('outcome_unknown')
+    const olderRecovery = {
+      ...lifecycleOperation('requires_reselection'),
+      operationId: 'resident-operation-older',
+      projectId: 'resident-project-older',
+      workspaceId: 'resident-workspace-older',
+      threadId: 'resident-thread-older',
+      executionGenerationId: 'resident-generation-older',
+      updatedAt: '2026-08-05T19:59:00.000Z',
+    }
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.operations.provisionResident = true
+      const projectedThread = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId) ?? snapshot.threads[0]!
+      const projectedThreadId = projectedThread.remoteId ?? projectedThread.id
+      const projectedGenerationId = projectedThread.executionGenerationId!
+      const projectedWorkspaceId = projectedThread.workspaceId ?? 'workspace-projected'
+      snapshot.residentLifecycleOperations = [
+        {
+          ...lifecycleOperation('terminal'),
+          operationId: 'resident-operation-newer',
+          expectedHostId: projectedThread.hostId,
+          projectId: projectedThread.projectId,
+          workspaceId: projectedWorkspaceId,
+          threadId: projectedThreadId,
+          executionGenerationId: projectedGenerationId,
+          updatedAt: '2026-08-05T20:05:00.000Z',
+          lastStatus: {
+            version: 1,
+            kind: 'provision',
+            operationId: 'resident-operation-newer',
+            phase: 'committed',
+            expectedHostId: projectedThread.hostId,
+            projectId: projectedThread.projectId,
+            workspaceId: projectedWorkspaceId,
+            threadId: projectedThreadId,
+            executionGenerationId: projectedGenerationId,
+            preparedAt: '2026-08-05T20:04:00.000Z',
+            updatedAt: '2026-08-05T20:05:00.000Z',
+            terminalAt: '2026-08-05T20:05:00.000Z',
+          },
+        },
+        unresolved,
+        olderRecovery,
+      ]
+      return snapshot
+    }
+    api.residentLifecycleStatus = vi.fn(async () => null)
+    render(<App api={api} />)
+
+    await screen.findByRole('heading', { name: 'Setup outcome needs inspection' })
+    await user.click(screen.getByText('1 other setup needs attention'))
+    expect(screen.getByRole('button', { name: 'Choose original folder' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Check status' }))
+    expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: unresolved.expectedHostId,
+      operationId: unresolved.operationId,
+    })
+  })
+
+  it('labels and validates resident setup, keeps paths hidden, and cancels without mutation', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    render(<App api={api} />)
+
+    const trigger = await screen.findByRole('button', { name: 'Choose workspace folder' })
+    await user.click(trigger)
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    expect(dialog).toHaveAccessibleDescription(/verified local host keeps its folder location/i)
+    expect(document.body).not.toHaveTextContent('C:\\Users\\operator\\secret-workspace')
+
+    const projectName = within(dialog).getByRole('textbox', { name: /^Project name/ })
+    const threadTitle = within(dialog).getByRole('textbox', { name: /^Thread title/ })
+    expect(projectName).toHaveValue('Prime GUI')
+    expect(threadTitle).toHaveValue('Prime GUI thread')
+    await waitFor(() => expect(projectName).toHaveFocus())
+
+    await user.clear(projectName)
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    expect(projectName).toHaveAttribute('aria-invalid', 'true')
+    expect(projectName.getAttribute('aria-describedby')).toContain('resident-provision-error')
+    expect(projectName).toHaveFocus()
+    expect(within(dialog).getByText('Enter a project name between 1 and 255 characters.')).toBeVisible()
+    expect(api.provisionResident).not.toHaveBeenCalled()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start resident thread' })).not.toBeInTheDocument())
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(api.provisionResident).not.toHaveBeenCalled()
+  })
+
+  it('keeps one submitting dialog across catalog materialization and focuses the exact committed thread', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    const initial = await api.loadWorkbench()
+    api.loadWorkbench = vi.fn(async () => structuredClone(initial))
+    let publishSnapshot: ((snapshot: typeof initial) => void) | undefined
+    api.subscribe = vi.fn((listener) => {
+      publishSnapshot = listener
+      return () => undefined
+    })
+    const committedStatus = {
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'resident-operation-one',
+      phase: 'committed' as const,
+      expectedHostId: 'host-local',
+      projectId: 'resident-project-one',
+      workspaceId: 'resident-workspace-one',
+      threadId: 'resident-thread-one',
+      executionGenerationId: 'resident-generation-one',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      terminalAt: '2026-08-05T20:00:02.000Z',
+    }
+    const provision = deferred<typeof committedStatus>()
+    api.provisionResident = vi.fn(() => provision.promise)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    expect(within(dialog).getByRole('button', { name: 'Starting…' })).toBeDisabled()
+
+    const projected = structuredClone(initial)
+    projected.projects = [{
+      id: committedStatus.projectId,
+      name: 'Prime GUI',
+      repository: 'prime-gui',
+      hostIds: [committedStatus.expectedHostId],
+      branch: 'main',
+      dirtyFiles: 0,
+    }]
+    projected.threads = [{
+      id: 'host-local:resident-thread-one',
+      remoteId: committedStatus.threadId,
+      projectId: committedStatus.projectId,
+      workspaceId: committedStatus.workspaceId,
+      title: 'Prime GUI thread',
+      recap: 'Resident thread ready',
+      hostId: committedStatus.expectedHostId,
+      status: 'idle',
+      updatedAt: committedStatus.updatedAt,
+      executionGenerationId: committedStatus.executionGenerationId,
+      transcript: [],
+    }]
+    projected.selectedProjectId = committedStatus.projectId
+    projected.selectedThreadId = projected.threads[0]!.id
+    act(() => publishSnapshot?.(projected))
+
+    expect(screen.getByRole('dialog', { name: 'Start resident thread' })).toBe(dialog)
+    expect(within(dialog).getByRole('button', { name: 'Starting…' })).toBeDisabled()
+    await act(async () => provision.resolve(committedStatus))
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start resident thread' })).not.toBeInTheDocument())
+    const heading = await screen.findByRole('heading', { name: 'Prime GUI thread' })
+    await waitFor(() => expect(heading).toHaveFocus())
+    expect(api.provisionResident).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a path-free recovery route when a nonterminal status returns before ledger hydration', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    expect(await within(dialog).findByText(/setup is durably recorded/i)).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+
+    expect(await screen.findByRole('heading', { name: 'Setup paused safely' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Choose original folder' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    expect(api.provisionResident).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles an ambiguous provision failure without automatically retrying it', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    api.provisionResident = vi.fn(async () => {
+      throw new Error('The resident setup outcome is unknown.')
+    })
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+
+    expect(await within(dialog).findByText('The resident setup outcome is unknown.')).toBeVisible()
+    const result = within(dialog).getByRole('status')
+    expect(result).toHaveTextContent('Check the durable recovery state before trying again.')
+    await waitFor(() => expect(result).toHaveFocus())
+    expect(within(dialog).queryByRole('button', { name: 'Start resident thread' })).not.toBeInTheDocument()
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(api.provisionResident).toHaveBeenCalledTimes(1)
+    expect(api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+    await screen.findByRole('heading', { name: 'Setup outcome needs inspection' })
+    await user.click(screen.getByRole('button', { name: 'Check status' }))
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Setup outcome needs inspection' })).not.toBeInTheDocument())
+    expect(screen.getByText('No durable setup was found. You can start a new resident thread.')).toBeInTheDocument()
+    expect(api.residentLifecycleStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not invent a recovery operation for a definitive pre-record failure', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    api.provisionResident = vi.fn(async () => {
+      throw Object.assign(new Error('Enter a project name between 1 and 255 characters.'), {
+        code: 'resident.provision_label_invalid',
+      })
+    })
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    expect(await within(dialog).findByText(/correct the issue, and choose the workspace folder again/i)).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+
+    expect(screen.queryByRole('heading', { name: 'Setup outcome needs inspection' })).not.toBeInTheDocument()
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a copyable path-free diagnostic for quarantined setup instead of a no-op retry', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => undefined)
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+    const operation: ResidentLifecycleOperationSummary = {
+      ...lifecycleOperation('terminal'),
+      lastStatus: {
+        version: 1,
+        kind: 'provision',
+        operationId: 'resident-operation-one',
+        phase: 'quarantined',
+        expectedHostId: 'host-local',
+        projectId: 'resident-project-one',
+        workspaceId: 'resident-workspace-one',
+        threadId: 'resident-thread-one',
+        executionGenerationId: 'resident-generation-one',
+        preparedAt: '2026-08-05T20:00:00.000Z',
+        updatedAt: '2026-08-05T20:00:01.000Z',
+        quarantinedFrom: 'promotion_dispatching',
+        quarantineReason: 'external_outcome_unknown',
+      },
+    }
+    const api = createResidentProvisioningApi(operation)
+    render(<App api={api} />)
+
+    await screen.findByRole('heading', { name: 'Setup needs manual recovery' })
+    expect(screen.getByText(/external mutation boundary whose outcome cannot be proven/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Copy diagnostic' }))
+
+    expect(writeText).toHaveBeenCalledTimes(1)
+    expect(writeText.mock.calls[0]?.[0]).toContain('RESIDENT_LIFECYCLE_QUARANTINED')
+    expect(writeText.mock.calls[0]?.[0]).toContain('Operation ID: resident-operation-one')
+    expect(writeText.mock.calls[0]?.[0]).not.toMatch(/[A-Z]:\\|\/Users\//)
+  })
+
   it('shows a copyable durable diagnostic with explicit no-retry guidance', async () => {
     const user = userEvent.setup()
     const writeText = vi.fn(async () => undefined)

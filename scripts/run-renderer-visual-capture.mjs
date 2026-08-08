@@ -16,6 +16,11 @@ const expectedTargets = [
   ['desktop-prompt-proof-390', 390, 844, 'prompt-awaiting-idle-proof', undefined],
   ['desktop-stop-proof-390', 390, 844, 'stop-awaiting-idle-proof', undefined],
   ['desktop-uncertain-320', 320, 704, 'nonretryable-uncertainty', undefined],
+  ['resident-start-1600', 1600, 1000, 'resident-start', undefined],
+  ['resident-dialog-390', 390, 844, 'resident-start', undefined],
+  ['resident-dialog-short-320', 320, 256, 'resident-start', undefined],
+  ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
+  ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
   ['companion-attention-390', 390, 844, 'nonretryable-uncertainty', 'companion'],
   ['companion-attention-320', 320, 704, 'nonretryable-uncertainty', 'companion'],
 ]
@@ -76,7 +81,10 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     result.visualState !== visualState ||
     result.surface !== surface ||
     result.stateEvidence?.expectedTextPresent !== true ||
-    (name.startsWith('desktop-') && name !== 'desktop-idle' && result.stateEvidence?.composerStatusVisible !== true)
+    (name.startsWith('desktop-') && name !== 'desktop-idle' && result.stateEvidence?.composerStatusVisible !== true) ||
+    ((name === 'resident-dialog-390' || name === 'resident-dialog-short-320') && result.stateEvidence?.residentDialogOpen !== true) ||
+    (name === 'resident-dialog-short-320' && result.stateEvidence?.residentDialogContentReachable !== true) ||
+    (name === 'resident-recovery-short-320' && result.stateEvidence?.emptyMainScrollable !== true)
   ) {
     throw new Error(`Renderer visual capture returned invalid evidence for ${name}`)
   }

@@ -1,8 +1,12 @@
 import {
   PRIME_AGENT_COMMAND_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  ResidentLifecycleLookupResultSchema,
+  ResidentLifecycleStatusSchema,
   RuntimeModelCatalogSnapshotSchema,
   THREAD_HANDOFF_CAPABILITY,
+  type ResidentLifecycleStatus,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
 import { isNativeBridgeUnavailable } from './runtime'
@@ -199,10 +203,13 @@ export interface WorkbenchSnapshot {
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
   runtime: RuntimeSummary
+  /** Bounded, path-free desktop ledger for fresh resident lifecycle recovery. */
+  residentLifecycleOperations: ResidentLifecycleOperationSummary[]
   operations: {
     submitCommands: boolean
     startResidentTurn?: boolean
     stopResidentTurn?: boolean
+    provisionResident?: boolean
     crossHostHandoff: boolean
     modelCatalog?: boolean
   }
@@ -212,6 +219,37 @@ export interface WorkbenchSnapshot {
     operation?: 'prompt' | 'abort'
     retryable?: boolean
   }
+}
+
+export type ResidentLifecycleOperationState =
+  | 'submitted'
+  | 'outcome_unknown'
+  | 'requires_reselection'
+  | 'terminal_refresh_pending'
+  | 'terminal'
+
+export interface ResidentLifecycleOperationSummary {
+  operationId: string
+  expectedHostId: string
+  projectId: string
+  workspaceId: string
+  threadId: string
+  executionGenerationId: string
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+  createdAt: string
+  updatedAt: string
+  state: ResidentLifecycleOperationState
+  lastStatus?: ResidentLifecycleStatus
+}
+
+export interface ResidentWorkspaceSelection {
+  selectionToken: string
+  operationId: string
+  expectedHostId: string
+  suggestedName: string
+  expiresAt: string
 }
 
 export interface DiscoveredComputer {
@@ -271,6 +309,17 @@ export interface RendererApi {
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
   selectThread(threadId: string): Promise<void>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
+  selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
+  provisionResident(input: {
+    selectionToken: string
+    projectDisplayName: string
+    threadTitle: string
+    sessionName?: string
+  }): Promise<ResidentLifecycleStatus>
+  residentLifecycleStatus(input: {
+    expectedHostId: string
+    operationId: string
+  }): Promise<ResidentLifecycleStatus | null>
   discoverComputers(): Promise<DiscoveredComputer[]>
   probeComputer(input: { alias?: string; hostname?: string; user?: string }): Promise<DiscoveredComputer>
   addComputer(input: {
@@ -357,6 +406,7 @@ const seedTranscript: TranscriptBlock[] = [
 export const previewSnapshot: WorkbenchSnapshot = {
   selectedProjectId: 'project-prime',
   selectedThreadId: 'thread-seamless',
+  residentLifecycleOperations: [],
   operations: {
     submitCommands: true,
     startResidentTurn: false,
@@ -574,6 +624,8 @@ export type PreviewVisualState =
   | 'prompt-awaiting-idle-proof'
   | 'stop-awaiting-idle-proof'
   | 'nonretryable-uncertainty'
+  | 'resident-start'
+  | 'resident-recovery'
 
 const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
@@ -582,6 +634,8 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'prompt-awaiting-idle-proof',
   'stop-awaiting-idle-proof',
   'nonretryable-uncertainty',
+  'resident-start',
+  'resident-recovery',
 ])
 
 function previewVisualStateFromSearch(search: string): PreviewVisualState {
@@ -594,6 +648,47 @@ function previewVisualStateFromSearch(search: string): PreviewVisualState {
 function previewSnapshotForVisualState(visualState: PreviewVisualState): WorkbenchSnapshot {
   const snapshot = structuredClone(previewSnapshot)
   if (visualState === 'reconnecting') return snapshot
+
+  if (visualState === 'resident-start' || visualState === 'resident-recovery') {
+    const host = snapshot.hosts[0]
+    if (host) {
+      host.kind = 'local'
+      host.connection = 'online'
+      host.connectionPath = 'Local socket'
+      host.latencyMs = 2
+      delete host.lastSynchronized
+    }
+    snapshot.selectedProjectId = ''
+    snapshot.selectedThreadId = ''
+    snapshot.projects = []
+    snapshot.threads = []
+    snapshot.attention = []
+    snapshot.runtime = {}
+    snapshot.operations = {
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+      provisionResident: true,
+    }
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready to start a resident thread' }
+    snapshot.residentLifecycleOperations = visualState === 'resident-recovery'
+      ? [{
+          operationId: 'resident-preview-recovery',
+          expectedHostId: host?.id ?? 'local-preview',
+          projectId: 'project-preview-recovery',
+          workspaceId: 'workspace-preview-recovery',
+          threadId: 'thread-preview-recovery',
+          executionGenerationId: 'execution-preview-recovery',
+          projectDisplayName: 'Continuim desktop',
+          threadTitle: 'Resident setup',
+          createdAt: '2026-08-07T12:00:00.000Z',
+          updatedAt: '2026-08-07T12:01:00.000Z',
+          state: 'requires_reselection',
+        }]
+      : []
+    return snapshot
+  }
 
   const selectedThread = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
   const selectedHost = snapshot.hosts.find((host) => host.id === selectedThread?.hostId)
@@ -830,6 +925,35 @@ class BrowserPreviewApi implements RendererApi {
   async loadRuntimeModelCatalog(_hostId: string): Promise<RuntimeModelCatalogSnapshot> {
     await delay(180)
     return structuredClone(previewRuntimeModelCatalog)
+  }
+
+  async selectResidentWorkspace(_input: { resumeOperationId?: string } = {}): Promise<ResidentWorkspaceSelection> {
+    if (this.visualState === 'resident-start' || this.visualState === 'resident-recovery') {
+      return {
+        selectionToken: 'preview-selection-token',
+        operationId: _input.resumeOperationId ?? 'resident-preview-create',
+        expectedHostId: previewSnapshot.hosts[0]?.id ?? 'local-preview',
+        suggestedName: 'Continuim desktop',
+        expiresAt: '2099-08-07T12:05:00.000Z',
+      }
+    }
+    throw new Error('Resident workspace selection is available only in the native desktop app.')
+  }
+
+  async provisionResident(_input: {
+    selectionToken: string
+    projectDisplayName: string
+    threadTitle: string
+    sessionName?: string
+  }): Promise<ResidentLifecycleStatus> {
+    throw new Error('Resident provisioning is unavailable in the browser preview.')
+  }
+
+  async residentLifecycleStatus(_input: {
+    expectedHostId: string
+    operationId: string
+  }): Promise<ResidentLifecycleStatus | null> {
+    return null
   }
 
   async discoverComputers(): Promise<DiscoveredComputer[]> {
@@ -1108,6 +1232,45 @@ function unwrapResult<T>(raw: unknown): T {
   throw new Error('The native Prime bridge returned an invalid result envelope.')
 }
 
+const RESIDENT_WORKSPACE_SELECTION_KEYS = new Set([
+  'selectionToken',
+  'operationId',
+  'expectedHostId',
+  'suggestedName',
+  'expiresAt',
+])
+
+function residentWorkspaceSelectionFromNative(value: unknown): ResidentWorkspaceSelection {
+  const raw = asRecord(value)
+  const selectionToken = asString(raw?.selectionToken)
+  const operationId = asString(raw?.operationId)
+  const expectedHostId = asString(raw?.expectedHostId)
+  const suggestedName = asString(raw?.suggestedName)
+  const expiresAt = asString(raw?.expiresAt)
+  if (
+    !raw ||
+    Object.keys(raw).some((key) => !RESIDENT_WORKSPACE_SELECTION_KEYS.has(key)) ||
+    !selectionToken ||
+    selectionToken.length > 512 ||
+    /[\0\r\n]/.test(selectionToken) ||
+    !operationId ||
+    operationId.length > 512 ||
+    /[\0\r\n]/.test(operationId) ||
+    !expectedHostId ||
+    expectedHostId.length > 512 ||
+    /[\0\r\n]/.test(expectedHostId) ||
+    !suggestedName ||
+    suggestedName.length > 255 ||
+    /[\0\r\n/\\]/.test(suggestedName) ||
+    /^[A-Za-z]:/.test(suggestedName) ||
+    !expiresAt ||
+    !Number.isFinite(Date.parse(expiresAt))
+  ) {
+    throw new Error('The native workspace picker returned an invalid path-free selection receipt.')
+  }
+  return { selectionToken, operationId, expectedHostId, suggestedName, expiresAt }
+}
+
 function createStableId(prefix: string): string {
   const uuid = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
   return `${prefix}:${uuid}`
@@ -1150,10 +1313,88 @@ interface NativeProjectionInput {
   outbox?: unknown
   quarantinedOutboxCount?: unknown
   durableUncertainReceipts?: unknown
+  residentLifecycleOperations?: unknown
   updatedAt?: unknown
   selectedThreadId?: string
   deviceId?: string
   mutationAuthorityReady?: boolean
+}
+
+const RESIDENT_LIFECYCLE_OPERATION_STATES = new Set<ResidentLifecycleOperationState>([
+  'submitted',
+  'outcome_unknown',
+  'requires_reselection',
+  'terminal_refresh_pending',
+  'terminal',
+])
+
+function residentLifecycleOperationsFromNative(
+  value: unknown,
+  activeHostId: string | undefined,
+): ResidentLifecycleOperationSummary[] {
+  return records(value)
+    .slice(-128)
+    .flatMap((entry): ResidentLifecycleOperationSummary[] => {
+      const operationId = asString(entry.operationId)
+      const expectedHostId = asString(entry.expectedHostId)
+      const projectId = asString(entry.projectId)
+      const workspaceId = asString(entry.workspaceId)
+      const threadId = asString(entry.threadId)
+      const executionGenerationId = asString(entry.executionGenerationId)
+      const projectDisplayName = asString(entry.projectDisplayName)
+      const threadTitle = asString(entry.threadTitle)
+      const sessionName = asString(entry.sessionName)
+      const createdAt = asString(entry.createdAt)
+      const updatedAt = asString(entry.updatedAt)
+      const state = asString(entry.state) as ResidentLifecycleOperationState | undefined
+      const parsedStatus = entry.lastStatus === undefined
+        ? undefined
+        : ResidentLifecycleStatusSchema.safeParse(entry.lastStatus)
+      if (
+        !operationId ||
+        !expectedHostId ||
+        expectedHostId !== activeHostId ||
+        !projectId ||
+        !workspaceId ||
+        !threadId ||
+        !executionGenerationId ||
+        !projectDisplayName ||
+        !threadTitle ||
+        !createdAt ||
+        !updatedAt ||
+        !state ||
+        !RESIDENT_LIFECYCLE_OPERATION_STATES.has(state) ||
+        (parsedStatus !== undefined && !parsedStatus.success)
+      ) return []
+      return [{
+        operationId,
+        expectedHostId,
+        projectId,
+        workspaceId,
+        threadId,
+        executionGenerationId,
+        projectDisplayName,
+        threadTitle,
+        ...(sessionName ? { sessionName } : {}),
+        createdAt,
+        updatedAt,
+        state,
+        ...(parsedStatus?.success ? { lastStatus: parsedStatus.data } : {}),
+      }]
+    })
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+}
+
+function residentLifecycleMaterializationKey(value: unknown): string {
+  const entry = asRecord(value)
+  return JSON.stringify([
+    asString(entry?.operationId) ?? '',
+    asString(entry?.expectedHostId) ?? '',
+    asString(entry?.projectId) ?? '',
+    asString(entry?.workspaceId) ?? '',
+    asString(entry?.threadId) ?? '',
+    asString(entry?.executionGenerationId) ?? '',
+  ])
 }
 
 interface NativeProjectionCacheEntry {
@@ -1905,6 +2146,17 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     runtime.session.activeSessionId &&
     runtime.session.sessionId,
   )
+  const residentLifecycleOperations = residentLifecycleOperationsFromNative(
+    input.residentLifecycleOperations,
+    activeHostId,
+  )
+  const residentProvisioningReady = Boolean(
+    input.mutationAuthorityReady !== false &&
+    activePhase === 'online' &&
+    asString(activeTarget?.kind) === 'local' &&
+    asString(rawConnection?.path) === 'local_socket' &&
+    advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
+  )
   const residentTurnActive = Boolean(
     selectedThread?.status === 'running' ||
     runtime.session?.isStreaming ||
@@ -1923,6 +2175,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     agents,
     evidence,
     runtime,
+    residentLifecycleOperations,
     operations: {
       submitCommands: residentSessionReady,
       startResidentTurn:
@@ -1934,6 +2187,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         selectedThread?.status !== 'waiting' &&
         selectedThread?.status !== 'needs_approval',
       stopResidentTurn: residentSessionReady && !abortCommandPending && (residentTurnActive || retainedPromptOwned),
+      ...(residentProvisioningReady ? { provisionResident: true } : {}),
       crossHostHandoff:
         selectedHostHasAuthority &&
         activePhase === 'online' &&
@@ -2039,11 +2293,14 @@ export class NativeRendererApi implements RendererApi {
   private outbox?: unknown
   private quarantinedOutboxCount = 0
   private durableUncertainReceipts: unknown = []
+  private residentLifecycleOperations: unknown = []
   private cacheUpdatedAt?: unknown
   private projection?: WorkbenchSnapshot
   private activeProgress?: (phase: HandoffPhase, message: string) => void
   private readonly installPlans = new Map<string, UnknownRecord>()
   private readonly discoveredComputers = new Map<string, DiscoveredComputer>()
+  private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelection>()
+  private readonly pendingResidentMaterializations = new Set<string>()
   private readonly handoffDestinations = new Map<string, string>()
   private readonly handoffSources = new Map<string, string>()
   private readonly composerCommands = new Map<string, string>()
@@ -2104,6 +2361,7 @@ export class NativeRendererApi implements RendererApi {
       outbox: this.outbox,
       quarantinedOutboxCount: this.quarantinedOutboxCount,
       durableUncertainReceipts: this.durableUncertainReceipts,
+      residentLifecycleOperations: this.residentLifecycleOperations,
       updatedAt: this.cacheUpdatedAt,
       selectedThreadId: this.selectedThreadId,
       deviceId: this.deviceId,
@@ -2327,6 +2585,7 @@ export class NativeRendererApi implements RendererApi {
 
   private clearAuthorityMutationState(): void {
     this.outbox = []
+    this.residentLifecycleOperations = []
     this.composerOverride = undefined
     this.composerCommands.clear()
     this.composerDevices.clear()
@@ -2341,6 +2600,8 @@ export class NativeRendererApi implements RendererApi {
     this.composerIdentityConflicts.clear()
     this.handoffDestinations.clear()
     this.handoffSources.clear()
+    this.residentWorkspaceSelections.clear()
+    this.pendingResidentMaterializations.clear()
     this.activeProgress = undefined
     this.mutationAuthorityReadyHostId = undefined
     this.threadSelectionGeneration += 1
@@ -2405,12 +2666,41 @@ export class NativeRendererApi implements RendererApi {
         asString(asRecord(this.connection)?.hostId) !== hostId ||
         bootstrapHostId !== hostId
       ) throw new StaleHostAuthorityError()
+      const bootstrapEntry = projectionEntriesFromCache(asRecord(bootstrap?.cache))[hostId]
+      if (bootstrapEntry) {
+        for (const [threadId, generations] of Object.entries(bootstrapEntry.retiredExecutionGenerations ?? {})) {
+          for (const generationId of generations) {
+            if (!this.retireRendererExecutionGeneration(hostId, threadId, generationId)) {
+              throw new StaleHostAuthorityError()
+            }
+          }
+        }
+        if (bootstrapEntry.catalog !== undefined) {
+          this.replaceCatalogEntry(hostId, bootstrapEntry.catalog, bootstrapEntry.updatedAt)
+        }
+        if (bootstrapEntry.lastSnapshot !== undefined) {
+          this.replaceSnapshotEntry(hostId, bootstrapEntry.lastSnapshot, bootstrapEntry.updatedAt)
+          this.threadSnapshot = this.projectionEntries[hostId]?.lastSnapshot
+        }
+        this.rebuildCatalog()
+      }
       this.outbox = bootstrap?.outbox
       this.quarantinedOutboxCount = asNumber(bootstrap?.quarantinedOutboxCount) ?? 0
       this.durableUncertainReceipts = bootstrap?.durableUncertainReceipts
+      this.residentLifecycleOperations = bootstrap?.residentLifecycleOperations
+      this.applyPendingResidentMaterializations()
       this.hydrateComposerCommands(this.outbox)
       this.mutationAuthorityReadyHostId = hostId
       this.projectionRevision += 1
+      const hydratedThreadId = snapshotThreadId(this.threadSnapshot)
+      const hydratedGenerationId = snapshotExecutionGenerationId(this.threadSnapshot)
+      if (hydratedThreadId && hydratedGenerationId) {
+        this.selectedThreadId = this.updateProjection().threads.find((thread) =>
+          thread.hostId === hostId &&
+          protocolThreadId(thread) === hydratedThreadId &&
+          thread.executionGenerationId === hydratedGenerationId,
+        )?.id ?? this.selectedThreadId
+      }
       this.publish()
     })()
     this.mutationAuthorityHydrationGeneration = generation
@@ -2890,6 +3180,158 @@ export class NativeRendererApi implements RendererApi {
     return refresh
   }
 
+  private setResidentLifecycleProjectionState(
+    status: ResidentLifecycleStatus,
+    state: ResidentLifecycleOperationState,
+  ): boolean {
+    const identityKey = residentLifecycleMaterializationKey(status)
+    if (state === 'terminal_refresh_pending') {
+      this.pendingResidentMaterializations.delete(identityKey)
+      this.pendingResidentMaterializations.add(identityKey)
+      while (this.pendingResidentMaterializations.size > 128) {
+        const oldest = this.pendingResidentMaterializations.values().next().value as string | undefined
+        if (!oldest) break
+        this.pendingResidentMaterializations.delete(oldest)
+      }
+    } else if (state === 'terminal') {
+      this.pendingResidentMaterializations.delete(identityKey)
+    }
+    let changed = false
+    this.residentLifecycleOperations = records(this.residentLifecycleOperations).map((entry) => {
+      if (
+        asString(entry.operationId) !== status.operationId ||
+        asString(entry.expectedHostId) !== status.expectedHostId ||
+        asString(entry.projectId) !== status.projectId ||
+        asString(entry.workspaceId) !== status.workspaceId ||
+        asString(entry.threadId) !== status.threadId ||
+        asString(entry.executionGenerationId) !== status.executionGenerationId
+      ) return entry
+      changed = true
+      return { ...entry, state, lastStatus: status }
+    })
+    if (changed) this.projectionRevision += 1
+    return changed
+  }
+
+  private applyPendingResidentMaterializations(): void {
+    this.residentLifecycleOperations = records(this.residentLifecycleOperations).map((entry) =>
+      this.pendingResidentMaterializations.has(residentLifecycleMaterializationKey(entry)) &&
+      asString(asRecord(entry.lastStatus)?.phase) === 'committed'
+        ? { ...entry, state: 'terminal_refresh_pending' }
+        : entry
+    )
+  }
+
+  private projectedResidentThread(status: ResidentLifecycleStatus): ThreadSummary | undefined {
+    return this.projection?.threads.find((thread) =>
+      thread.hostId === status.expectedHostId &&
+      protocolThreadId(thread) === status.threadId &&
+      thread.executionGenerationId === status.executionGenerationId
+    )
+  }
+
+  private async performCommittedResidentMaterialization(
+    status: ResidentLifecycleStatus,
+    authority: { expectedHostId: string; generation: number },
+  ): Promise<void> {
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    const catalog = await this.call<unknown>('hostCatalog')
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (!catalogHostIds(catalog).includes(authority.expectedHostId)) {
+      throw new StaleHostAuthorityError()
+    }
+    const exactLineage = catalogGenerationLineages(catalog, authority.expectedHostId).get(status.threadId)
+    if (exactLineage?.generationId !== status.executionGenerationId) {
+      throw new Error(
+        'The committed resident thread is not present in the authoritative catalog yet. Check its durable status and try again.',
+      )
+    }
+    if (!this.replaceCatalogEntry(authority.expectedHostId, catalog)) {
+      throw new Error(
+        'The authoritative catalog could not safely materialize the committed resident thread. Check its durable status and try again.',
+      )
+    }
+    this.publish()
+    const projectedThread = this.projectedResidentThread(status)
+    if (!projectedThread) {
+      throw new Error(
+        'The committed resident thread could not be selected from the authoritative catalog. Check its durable status and try again.',
+      )
+    }
+
+    const selectionGeneration = this.threadSelectionGeneration
+    const snapshot = await this.call<unknown>('requestSnapshot', { threadId: status.threadId })
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
+    const currentThread = this.projectedResidentThread(status)
+    const snapshotLocation = asRecord(asRecord(asRecord(snapshot)?.thread)?.currentLocation)
+    if (
+      !currentThread ||
+      currentThread.id !== projectedThread.id ||
+      snapshotThreadId(snapshot) !== status.threadId ||
+      snapshotHostId(snapshot) !== status.expectedHostId ||
+      snapshotExecutionGenerationId(snapshot) !== status.executionGenerationId ||
+      asString(snapshotLocation?.projectId) !== status.projectId ||
+      asString(snapshotLocation?.workspaceId) !== status.workspaceId
+    ) {
+      throw new Error(
+        'The host returned a snapshot for a different resident thread. Check the durable setup status before trying again.',
+      )
+    }
+
+    let materializedSnapshot = snapshot
+    if (!this.replaceSnapshotEntry(authority.expectedHostId, snapshot)) {
+      const retained = this.projectionEntries[authority.expectedHostId]?.lastSnapshot
+      if (
+        snapshotThreadId(retained) !== status.threadId ||
+        snapshotHostId(retained) !== status.expectedHostId ||
+        snapshotExecutionGenerationId(retained) !== status.executionGenerationId
+      ) {
+        throw new Error(
+          'The committed resident snapshot could not be materialized safely. Check its durable setup status before trying again.',
+        )
+      }
+      materializedSnapshot = retained
+    }
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
+    const finalThread = this.projectedResidentThread(status)
+    if (!finalThread || finalThread.id !== projectedThread.id) throw new StaleHostAuthorityError()
+
+    this.selectedThreadId = finalThread.id
+    this.threadSelectionGeneration += 1
+    this.threadSnapshot = materializedSnapshot
+    this.setResidentLifecycleProjectionState(status, 'terminal')
+    this.publish()
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+  }
+
+  private forceCommittedResidentMaterialization(
+    status: ResidentLifecycleStatus,
+    authority: { expectedHostId: string; generation: number },
+  ): Promise<void> {
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (this.setResidentLifecycleProjectionState(status, 'terminal_refresh_pending')) this.publish()
+    const previous = this.authoritativeRefreshPromise
+    const refresh = (async () => {
+      // A refresh that started before the committed reply cannot prove the new
+      // thread exists. Let it drain, fence its authority, then issue a distinct
+      // catalog + exact-thread observation after the reply.
+      if (previous) await previous.catch(() => undefined)
+      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      await this.performCommittedResidentMaterialization(status, authority)
+    })()
+    this.authoritativeRefreshGeneration = authority.generation
+    this.authoritativeRefreshPromise = refresh
+    void refresh.finally(() => {
+      if (this.authoritativeRefreshPromise === refresh) {
+        this.authoritativeRefreshPromise = undefined
+        this.authoritativeRefreshGeneration = undefined
+      }
+    }).catch(() => undefined)
+    return refresh
+  }
+
   private async reconcileInBackground(): Promise<void> {
     if (this.reconciliationStarted) return
     this.reconciliationStarted = true
@@ -2984,6 +3426,8 @@ export class NativeRendererApi implements RendererApi {
     this.outbox = bootstrap?.outbox
     this.quarantinedOutboxCount = asNumber(bootstrap?.quarantinedOutboxCount) ?? 0
     this.durableUncertainReceipts = bootstrap?.durableUncertainReceipts
+    this.residentLifecycleOperations = bootstrap?.residentLifecycleOperations
+    this.applyPendingResidentMaterializations()
     this.hydrateComposerCommands(this.outbox)
     this.mutationAuthorityReadyHostId = connectionHostId
     this.cacheUpdatedAt = connectionHostId
@@ -3015,6 +3459,150 @@ export class NativeRendererApi implements RendererApi {
       throw new StaleHostAuthorityError()
     }
     return RuntimeModelCatalogSnapshotSchema.parse(raw)
+  }
+
+  private residentLifecycleAuthority(options: { requireCapability: boolean }): {
+    expectedHostId: string
+    generation: number
+  } {
+    const connection = asRecord(this.connection)
+    const expectedHostId = asString(connection?.hostId)
+    const phase = asString(connection?.phase)
+    const target = asRecord(connection?.target)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (
+      !expectedHostId ||
+      phase !== 'online' ||
+      asString(target?.kind) !== 'local' ||
+      asString(connection?.path) !== 'local_socket' ||
+      this.mutationAuthorityReadyHostId !== expectedHostId ||
+      (options.requireCapability && !capabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY))
+    ) {
+      throw new Error(options.requireCapability
+        ? 'Resident thread creation is not ready on this verified local host.'
+        : 'Reconnect this local host before checking resident setup recovery.')
+    }
+    return { expectedHostId, generation: this.connectionGeneration }
+  }
+
+  private assertResidentLifecycleAuthority(expectedHostId: string, generation: number): void {
+    const connection = asRecord(this.connection)
+    if (
+      generation !== this.connectionGeneration ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== expectedHostId ||
+      asString(asRecord(connection?.target)?.kind) !== 'local' ||
+      asString(connection?.path) !== 'local_socket'
+    ) throw new StaleHostAuthorityError()
+  }
+
+  async selectResidentWorkspace(
+    input: { resumeOperationId?: string } = {},
+  ): Promise<ResidentWorkspaceSelection> {
+    const authority = this.residentLifecycleAuthority({ requireCapability: true })
+    const selection = residentWorkspaceSelectionFromNative(
+      await this.call<unknown>('selectResidentWorkspace', input),
+    )
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (selection.expectedHostId !== authority.expectedHostId || Date.parse(selection.expiresAt) <= Date.now()) {
+      throw new StaleHostAuthorityError()
+    }
+    for (const [token, retained] of this.residentWorkspaceSelections) {
+      if (Date.parse(retained.expiresAt) <= Date.now()) this.residentWorkspaceSelections.delete(token)
+    }
+    if (this.residentWorkspaceSelections.size >= 32) {
+      const oldestToken = [...this.residentWorkspaceSelections.entries()]
+        .sort((left, right) => Date.parse(left[1].expiresAt) - Date.parse(right[1].expiresAt))[0]?.[0]
+      if (oldestToken) this.residentWorkspaceSelections.delete(oldestToken)
+    }
+    this.residentWorkspaceSelections.set(selection.selectionToken, selection)
+    return { ...selection }
+  }
+
+  async provisionResident(input: {
+    selectionToken: string
+    projectDisplayName: string
+    threadTitle: string
+    sessionName?: string
+  }): Promise<ResidentLifecycleStatus> {
+    const authority = this.residentLifecycleAuthority({ requireCapability: true })
+    const selection = this.residentWorkspaceSelections.get(input.selectionToken)
+    if (
+      !selection ||
+      selection.expectedHostId !== authority.expectedHostId ||
+      Date.parse(selection.expiresAt) <= Date.now()
+    ) throw new Error('Choose the workspace folder again before starting this resident thread.')
+
+    // The main process consumes this receipt at the invocation boundary. Drop
+    // the renderer copy first so no UI retry can replay an ambiguous mutation.
+    this.residentWorkspaceSelections.delete(input.selectionToken)
+    let status: ResidentLifecycleStatus | undefined
+    let statusAccepted = false
+    try {
+      status = ResidentLifecycleStatusSchema.parse(
+        await this.call<unknown>('provisionResident', input),
+      )
+      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      if (
+        status.operationId !== selection.operationId ||
+        status.expectedHostId !== authority.expectedHostId ||
+        status.kind !== 'provision'
+      ) throw new StaleHostAuthorityError()
+      statusAccepted = true
+    } finally {
+      // Main persists an exact path-free recovery entry before an ambiguous
+      // outcome is returned. Rehydrate it even on error so the same open app
+      // cannot lose the only safe recovery route or invent a new operation.
+      if (
+        authority.generation === this.connectionGeneration &&
+        asString(asRecord(this.connection)?.hostId) === authority.expectedHostId
+      ) {
+        const hydration = this.rehydrateAuthorityMutationState(
+          authority.expectedHostId,
+          authority.generation,
+        )
+        if (statusAccepted && status?.phase === 'committed') await hydration
+        else await hydration.catch(() => undefined)
+      }
+    }
+    if (!status) throw new Error('The native resident provision response was unavailable.')
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (status.phase === 'committed') {
+      await this.forceCommittedResidentMaterialization(status, authority)
+    }
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    return status
+  }
+
+  async residentLifecycleStatus(input: {
+    expectedHostId: string
+    operationId: string
+  }): Promise<ResidentLifecycleStatus | null> {
+    const authority = this.residentLifecycleAuthority({ requireCapability: false })
+    if (input.expectedHostId !== authority.expectedHostId) throw new StaleHostAuthorityError()
+    const result = ResidentLifecycleLookupResultSchema.parse(
+      await this.call<unknown>('residentLifecycleStatus', input),
+    )
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (
+      result.status &&
+      (result.status.expectedHostId !== authority.expectedHostId || result.status.operationId !== input.operationId)
+    ) throw new StaleHostAuthorityError()
+
+    const hydration = this.rehydrateAuthorityMutationState(
+      authority.expectedHostId,
+      authority.generation,
+    )
+    if (result.status?.phase === 'committed') await hydration
+    else await hydration.catch(() => undefined)
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (result.status?.phase === 'committed') {
+      await this.forceCommittedResidentMaterialization(result.status, authority)
+    }
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    return result.status
   }
 
   subscribe(listener: (snapshot: WorkbenchSnapshot) => void): () => void {

@@ -158,6 +158,101 @@ function onlineConnection() {
   }
 }
 
+function residentLifecycleConnection() {
+  return {
+    ...onlineConnection(),
+    capabilities: ['prime_agent_commands_v2', 'resident_lifecycle_v1'],
+  }
+}
+
+function residentSelection() {
+  return {
+    selectionToken: 'resident-selection-one',
+    operationId: 'resident-operation-one',
+    expectedHostId: 'host-local',
+    suggestedName: 'Prime GUI',
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }
+}
+
+function residentLifecycleOperation(state: 'submitted' | 'outcome_unknown' | 'requires_reselection' = 'outcome_unknown') {
+  return {
+    operationId: 'resident-operation-one',
+    expectedHostId: 'host-local',
+    projectId: 'resident-project-one',
+    workspaceId: 'resident-workspace-one',
+    threadId: 'resident-thread-one',
+    executionGenerationId: 'resident-generation-one',
+    projectDisplayName: 'Prime GUI',
+    threadTitle: 'Prime GUI thread',
+    createdAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+    state,
+  }
+}
+
+function committedResidentLifecycleStatus() {
+  return {
+    version: 1 as const,
+    kind: 'provision' as const,
+    operationId: 'resident-operation-one',
+    phase: 'committed' as const,
+    expectedHostId: 'host-local',
+    projectId: 'resident-project-one',
+    workspaceId: 'resident-workspace-one',
+    threadId: 'resident-thread-one',
+    executionGenerationId: 'resident-generation-one',
+    preparedAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:02.000Z',
+    terminalAt: '2026-08-05T20:00:02.000Z',
+  }
+}
+
+function catalogWithCommittedResidentThread() {
+  const catalog = recoveryCatalog()
+  return {
+    ...catalog,
+    generatedAt: '2026-08-05T20:00:03.000Z',
+    projects: [
+      ...catalog.projects,
+      {
+        projectId: 'resident-project-one',
+        hostId: 'host-local',
+        workspaceId: 'resident-workspace-one',
+        displayName: 'Prime GUI resident',
+        lastOpenedAt: '2026-08-05T20:00:03.000Z',
+      },
+    ],
+    threads: [
+      ...catalog.threads,
+      {
+        threadId: 'resident-thread-one',
+        title: 'Prime GUI thread',
+        projectIdentity: 'resident-project-one',
+        currentLocation: {
+          hostId: 'host-local',
+          projectId: 'resident-project-one',
+          workspaceId: 'resident-workspace-one',
+          executionGenerationId: 'resident-generation-one',
+        },
+        status: 'idle',
+        recap: 'Resident thread is ready.',
+        unread: false,
+        updatedAt: '2026-08-05T20:00:03.000Z',
+      },
+    ],
+  }
+}
+
+function committedResidentSnapshot(body = 'Authoritative committed resident thread.') {
+  const catalog = catalogWithCommittedResidentThread()
+  const thread = catalog.threads.find((candidate) => candidate.threadId === 'resident-thread-one')!
+  return {
+    ...recoverySnapshot(thread, body),
+    generatedAt: '2026-08-05T20:00:04.000Z',
+  }
+}
+
 describe('NativeRendererApi', () => {
   it('returns an empty cold cache immediately, then publishes the local catalog and thread snapshot', async () => {
     const catalog = {
@@ -336,6 +431,451 @@ describe('NativeRendererApi', () => {
     })
 
     await expect(api.loadWorkbench()).rejects.toThrow(/Unable to read the projection cache.*receipt receipt-123/)
+  })
+
+  it('accepts only path-free workspace receipts and fences a picker result when authority changes', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident picker authority.')
+    const selectionResult = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      selectResidentWorkspace: vi.fn(() => selectionResult.promise),
+      provisionResident: vi.fn(),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+
+    const leakedReceipt = api.selectResidentWorkspace()
+    selectionResult.resolve(ok({
+      ...residentSelection(),
+      workspaceDirectory: 'C:\\Users\\operator\\secret-workspace',
+    }))
+    await expect(leakedReceipt).rejects.toThrow(/invalid path-free selection receipt/i)
+
+    const fencedSelection = deferred<unknown>()
+    bridge.selectResidentWorkspace.mockImplementationOnce(() => fencedSelection.promise)
+    const pending = api.selectResidentWorkspace()
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'ssh', alias: 'replacement-host' },
+      since: '2026-08-05T20:00:02.000Z',
+      attempt: 2,
+    })
+    fencedSelection.resolve(ok(residentSelection()))
+
+    await expect(pending).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.provisionResident).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('rehydrates an ambiguous resident provision as outcome unknown without replaying the mutation', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident provision recovery.')
+    let bootstrapReads = 0
+    const provisionResident = vi.fn(() => Promise.resolve({
+      ok: false as const,
+      error: {
+        code: 'RESIDENT_PROVISION_OUTCOME_UNKNOWN',
+        message: 'The durable outcome must be checked.',
+        retryable: false,
+      },
+    }))
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1 ? [] : [residentLifecycleOperation('outcome_unknown')],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      selectResidentWorkspace: vi.fn(() => ok(residentSelection())),
+      provisionResident,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((next) => published.push(next))
+    await api.loadWorkbench()
+    const selection = await api.selectResidentWorkspace()
+
+    const request = {
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Prime GUI',
+      threadTitle: 'Prime GUI thread',
+    }
+    await expect(api.provisionResident(request)).rejects.toThrow(/durable outcome must be checked/i)
+    await vi.waitFor(() => {
+      expect(published.at(-1)?.residentLifecycleOperations).toEqual([
+        expect.objectContaining({
+          operationId: 'resident-operation-one',
+          expectedHostId: 'host-local',
+          state: 'outcome_unknown',
+        }),
+      ])
+    })
+    expect(provisionResident).toHaveBeenCalledTimes(1)
+
+    await expect(api.provisionResident(request)).rejects.toThrow(/choose the workspace folder again/i)
+    expect(provisionResident).toHaveBeenCalledTimes(1)
+    unsubscribe()
+  })
+
+  it('rejects a completed provision when authority changes during ledger rehydration', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident authority refresh fence.')
+    const rehydration = deferred<unknown>()
+    let bootstrapReads = 0
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return bootstrapReads === 1
+          ? ok({
+              cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+              outbox: [],
+              quarantinedOutboxCount: 0,
+              durableUncertainReceipts: [],
+              residentLifecycleOperations: [],
+              connection: residentLifecycleConnection(),
+              appVersion: '0.1.0',
+            })
+          : rehydration.promise
+      }),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('No post-authority refresh expected.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('No post-authority refresh expected.'))),
+      selectResidentWorkspace: vi.fn(() => ok(residentSelection())),
+      provisionResident: vi.fn(() => ok(committedResidentLifecycleStatus())),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+    const selection = await api.selectResidentWorkspace()
+    bridge.hostCatalog.mockClear()
+    bridge.requestSnapshot.mockClear()
+
+    const pending = api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Prime GUI',
+      threadTitle: 'Prime GUI thread',
+    })
+    await vi.waitFor(() => expect(bridge.bootstrap).toHaveBeenCalledTimes(2))
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'ssh', alias: 'replacement-host' },
+      since: '2026-08-05T20:00:03.000Z',
+      attempt: 2,
+    })
+    rehydration.resolve(ok({
+      cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+      outbox: [],
+      quarantinedOutboxCount: 0,
+      durableUncertainReceipts: [],
+      residentLifecycleOperations: [{
+        ...residentLifecycleOperation('submitted'),
+        state: 'terminal',
+        lastStatus: committedResidentLifecycleStatus(),
+      }],
+      connection: residentLifecycleConnection(),
+      appVersion: '0.1.0',
+    }))
+
+    await expect(pending).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.hostCatalog).not.toHaveBeenCalled()
+    expect(bridge.requestSnapshot).not.toHaveBeenCalled()
+    expect(bridge.provisionResident).toHaveBeenCalledTimes(1)
+    unsubscribe()
+  })
+
+  it('drains a refresh started before commit and then forces a fresh exact resident observation', async () => {
+    const catalog = recoveryCatalog()
+    const oldSnapshot = recoverySnapshot(catalog.threads[0], 'Pre-commit selected thread.')
+    const committedCatalog = catalogWithCommittedResidentThread()
+    const committedSnapshot = committedResidentSnapshot()
+    const staleCatalog = deferred<unknown>()
+    let bootstrapReads = 0
+    let catalogReads = 0
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: oldSnapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1
+            ? []
+            : [{
+                ...residentLifecycleOperation('submitted'),
+                state: 'terminal',
+                lastStatus: committedResidentLifecycleStatus(),
+              }],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => {
+        catalogReads += 1
+        return catalogReads === 1 ? staleCatalog.promise : ok(committedCatalog)
+      }),
+      requestSnapshot: vi.fn((input: unknown) =>
+        ok((input as { threadId?: string }).threadId === 'resident-thread-one'
+          ? committedSnapshot
+          : oldSnapshot),
+      ),
+      selectResidentWorkspace: vi.fn(() => ok(residentSelection())),
+      provisionResident: vi.fn(() => ok(committedResidentLifecycleStatus())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.hostCatalog).toHaveBeenCalledTimes(1))
+    const selection = await api.selectResidentWorkspace()
+    const provision = api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Prime GUI',
+      threadTitle: 'Prime GUI thread',
+    })
+    await vi.waitFor(() => expect(bridge.bootstrap).toHaveBeenCalledTimes(2))
+    expect(bridge.hostCatalog).toHaveBeenCalledTimes(1)
+
+    staleCatalog.resolve(ok(catalog))
+    await expect(provision).resolves.toEqual(committedResidentLifecycleStatus())
+    expect(bridge.hostCatalog).toHaveBeenCalledTimes(2)
+    expect(bridge.requestSnapshot.mock.calls.map(([input]) => input)).toEqual([
+      { threadId: 'thread-one' },
+      { threadId: 'resident-thread-one' },
+    ])
+    const view = published.at(-1)!
+    expect(view.selectedThreadId).toBe('resident-thread-one')
+    expect(view.threads.find((thread) => thread.id === 'resident-thread-one')?.transcript[0]?.body)
+      .toBe('Authoritative committed resident thread.')
+    unsubscribe()
+  })
+
+  it('selects the exact committed resident thread instead of the previously selected thread', async () => {
+    const catalog = recoveryCatalog()
+    const oldSnapshot = recoverySnapshot(catalog.threads[0], 'Existing selected thread.')
+    const committedCatalog = catalogWithCommittedResidentThread()
+    const committedSnapshot = committedResidentSnapshot('New committed resident thread.')
+    let bootstrapReads = 0
+    let liveCatalog: unknown = catalog
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: oldSnapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1
+            ? []
+            : [{
+                ...residentLifecycleOperation('submitted'),
+                state: 'terminal',
+                lastStatus: committedResidentLifecycleStatus(),
+              }],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => ok(liveCatalog)),
+      requestSnapshot: vi.fn((input: unknown) =>
+        ok((input as { threadId?: string }).threadId === 'resident-thread-one'
+          ? committedSnapshot
+          : oldSnapshot),
+      ),
+      residentLifecycleStatus: vi.fn(() => ok({ status: committedResidentLifecycleStatus() })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const initial = await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledTimes(1))
+    expect(initial.selectedThreadId).toBe('thread-one')
+    bridge.hostCatalog.mockClear()
+    bridge.requestSnapshot.mockClear()
+    liveCatalog = committedCatalog
+
+    await expect(api.residentLifecycleStatus({
+      expectedHostId: 'host-local',
+      operationId: 'resident-operation-one',
+    })).resolves.toEqual(committedResidentLifecycleStatus())
+    expect(bridge.hostCatalog).toHaveBeenCalledTimes(1)
+    expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'resident-thread-one' })
+    const view = published.at(-1)!
+    expect(view.selectedThreadId).toBe('resident-thread-one')
+    expect(view.threads.find((thread) => thread.id === view.selectedThreadId)).toMatchObject({
+      hostId: 'host-local',
+      executionGenerationId: 'resident-generation-one',
+    })
+    unsubscribe()
+  })
+
+  it('fences committed resident selection when authority changes during the exact snapshot request', async () => {
+    const catalog = recoveryCatalog()
+    const oldSnapshot = recoverySnapshot(catalog.threads[0], 'Original authority thread.')
+    const committedCatalog = catalogWithCommittedResidentThread()
+    const committedSnapshot = committedResidentSnapshot()
+    const exactSnapshot = deferred<unknown>()
+    let bootstrapReads = 0
+    let postLoad = false
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: oldSnapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1
+            ? []
+            : [{
+                ...residentLifecycleOperation('submitted'),
+                state: 'terminal',
+                lastStatus: committedResidentLifecycleStatus(),
+              }],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => ok(postLoad ? committedCatalog : catalog)),
+      requestSnapshot: vi.fn((input: unknown) =>
+        (input as { threadId?: string }).threadId === 'resident-thread-one'
+          ? exactSnapshot.promise
+          : ok(oldSnapshot),
+      ),
+      selectResidentWorkspace: vi.fn(() => ok(residentSelection())),
+      provisionResident: vi.fn(() => ok(committedResidentLifecycleStatus())),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledTimes(1))
+    postLoad = true
+    const selection = await api.selectResidentWorkspace()
+    const provision = api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Prime GUI',
+      threadTitle: 'Prime GUI thread',
+    })
+    await vi.waitFor(() => {
+      expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'resident-thread-one' })
+    })
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'ssh', alias: 'replacement-host' },
+      since: '2026-08-05T20:00:05.000Z',
+      attempt: 2,
+    })
+    exactSnapshot.resolve(ok(committedSnapshot))
+
+    await expect(provision).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(published.at(-1)?.selectedThreadId).not.toBe('resident-thread-one')
+    unsubscribe()
+  })
+
+  it('keeps a committed ledger actionable when the exact resident snapshot cannot materialize', async () => {
+    const catalog = recoveryCatalog()
+    const oldSnapshot = recoverySnapshot(catalog.threads[0], 'Still selected old thread.')
+    const committedCatalog = catalogWithCommittedResidentThread()
+    let bootstrapReads = 0
+    let liveCatalog: unknown = catalog
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: oldSnapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1
+            ? []
+            : [{
+                ...residentLifecycleOperation('submitted'),
+                state: 'terminal',
+                lastStatus: committedResidentLifecycleStatus(),
+              }],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => ok(liveCatalog)),
+      requestSnapshot: vi.fn(() => ok(oldSnapshot)),
+      residentLifecycleStatus: vi.fn(() => ok({ status: committedResidentLifecycleStatus() })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledTimes(1))
+    bridge.requestSnapshot.mockClear()
+    liveCatalog = committedCatalog
+
+    await expect(api.residentLifecycleStatus({
+      expectedHostId: 'host-local',
+      operationId: 'resident-operation-one',
+    })).rejects.toThrow(/different resident thread/i)
+    expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'resident-thread-one' })
+    expect(published.at(-1)?.selectedThreadId).toBe('thread-one')
+    expect(published.at(-1)?.residentLifecycleOperations).toEqual([
+      expect.objectContaining({
+        operationId: 'resident-operation-one',
+        state: 'terminal_refresh_pending',
+        lastStatus: committedResidentLifecycleStatus(),
+      }),
+    ])
+    unsubscribe()
   })
 
   it('refreshes the catalog and selected snapshot once after an offline-to-online transition', async () => {

@@ -29,6 +29,6 @@
 ## Explicitly deferred
 
 - Installing a signed production `hostd` package on arbitrary remote distributions.
-- Fresh resident-session provisioning, production authorization, durable per-binding quarantine/recovery UX, and a packaged real-binding Prime Agent execution E2E beyond the existing-binding development checkpoint.
+- Production authorization; packaged desktop/coordinator escrow creation and provider-backed Prompt/Stop/end E2E; automatic recovery or verified retirement for quarantined and genuinely uncertain resident operations; and durable lifecycle compaction beyond the current bounded development ledgers.
 - End-to-end relay, device pairing/revocation, native mobile control, and managed compute; Companion remains a read-only preview.
 - Git object negotiation for production-scale handoff; the milestone preserves the transactional state machine and receipt contract.

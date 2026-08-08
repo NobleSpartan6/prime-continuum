@@ -29,6 +29,10 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.provider-rail__summary\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);[^}]*border-inline-end:\s*0;/s)
     expect(narrowLayout).toMatch(/\.model-catalog\s*{[^}]*overflow-y:\s*auto;/s)
     expect(narrowLayout).toMatch(/\.model-list\s*{[^}]*flex:\s*none;[^}]*overflow-y:\s*visible;/s)
+    expect(narrowLayout).toMatch(/\.resident-recovery\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
+    expect(narrowLayout).toMatch(/\.resident-recovery > \.button\s*{[^}]*grid-column:\s*1 \/ -1;[^}]*inline-size:\s*100%;/s)
+    expect(narrowLayout).toMatch(/\.empty-workbench__actions\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*inline-size:\s*100%;/s)
+    expect(narrowLayout).toMatch(/\.empty-workbench__actions \.button,\s*\.sheet--resident \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;/s)
     expect(narrowLayout).toMatch(/\.model-search input,\s*\.command-palette__input input\s*{[^}]*font-size:\s*1rem;/s)
     expect(css).toMatch(/body:has\(dialog\[open\]\) :is\(\.sidebar__scroll, \.transcript__scroller, \.inspector__panel\)\s*{[^}]*overflow-y:\s*hidden;/s)
     expect(css).toMatch(/\.task-state--stale\s*{[^}]*color:\s*var\(--color-text-muted\);/s)
@@ -56,6 +60,19 @@ describe('renderer style contracts', () => {
     expect(css).toMatch(/\.composer--compact\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;/s)
     expect(css).toMatch(/\.composer-wrap--compact \.session-continuity\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
     expect(css).toMatch(/\.companion-card-list strong\s*{[^}]*-webkit-line-clamp:\s*2;[^}]*line-clamp:\s*2;/s)
+  })
+
+  it('keeps resident setup controls reachable in a short zoomed viewport', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const shortLayout = css.slice(
+      css.indexOf('@media (max-height: 28rem)'),
+      css.indexOf('@media (min-width: 38.001rem)'),
+    )
+
+    expect(shortLayout).toMatch(/dialog\.sheet--resident\s*{[^}]*max-block-size:\s*calc\(100dvh - 0\.5rem\);/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__scroll\s*{[^}]*max-block-size:\s*none;[^}]*padding:\s*0\.65rem 0\.75rem;/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;[^}]*min-block-size:\s*2\.25rem;/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {

@@ -56,6 +56,8 @@ import {
   type HostRuntimeReadiness,
   type HostSummary,
   type RendererApi,
+  type ResidentLifecycleOperationSummary,
+  type ResidentWorkspaceSelection,
   type RuntimeModelCatalog,
   type RuntimeSummary,
   type TaskState,
@@ -63,7 +65,7 @@ import {
   type WorkbenchSnapshot,
 } from './api'
 import { TranscriptBody } from './TranscriptBody'
-import { FormEvent, KeyboardEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
@@ -78,6 +80,19 @@ type ComposerLocalAction = {
   sequence: number
   operation: 'prompt' | 'abort'
 }
+type ResidentLifecycleRecoveryReference = {
+  operationId: string
+  expectedHostId: string
+  suggestedName: string
+  threadId?: string
+  executionGenerationId?: string
+  status?: ResidentLifecycleStatusResult
+}
+type ResidentLifecycleStatusResult = NonNullable<Awaited<ReturnType<RendererApi['residentLifecycleStatus']>>>
+type ResidentThreadFocusTarget = Pick<
+  ResidentLifecycleStatusResult,
+  'expectedHostId' | 'threadId' | 'executionGenerationId'
+>
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Write a prompt before running Prime Agent.'
 const MODEL_REVEAL_INCREMENT = 80
@@ -161,6 +176,68 @@ function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'
 
 function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): string {
   return `${hostId}\u0000${thread.id}\u0000${thread.executionGenerationId ?? ''}`
+}
+
+function actionableResidentLifecycleOperations(
+  operations: ResidentLifecycleOperationSummary[],
+  threads: ThreadSummary[],
+): ResidentLifecycleOperationSummary[] {
+  return operations.filter((operation, index) => {
+    if (operation.lastStatus?.phase === 'quarantined') return true
+    if (operation.state !== 'terminal') return true
+    if (operation.lastStatus?.phase === 'committed') {
+      return !threads.some((thread) =>
+        thread.hostId === operation.expectedHostId &&
+        (thread.remoteId ?? thread.id) === operation.threadId &&
+        thread.executionGenerationId === operation.executionGenerationId,
+      )
+    }
+    if (operation.lastStatus?.phase !== 'completed') return false
+    // A later committed successor over the same immutable workspace identity
+    // resolves a prior clean pre-effect failure. Uncertain or unresolved
+    // entries are never hidden by an unrelated successful setup.
+    return !operations.slice(0, index).some((newer) =>
+      newer.lastStatus?.phase === 'committed' &&
+      newer.projectId === operation.projectId &&
+      newer.workspaceId === operation.workspaceId &&
+      newer.threadId === operation.threadId &&
+      newer.executionGenerationId === operation.executionGenerationId,
+    )
+  })
+}
+
+const RESIDENT_PROVISION_ERRORS_WITHOUT_DURABLE_OPERATION = new Set([
+  'resident.lifecycle_authority_changed',
+  'resident.lifecycle_local_required',
+  'resident.lifecycle_unavailable',
+  'resident.workspace_selection_expired',
+  'resident.workspace_selection_superseded',
+  'resident.workspace_selection_authority_changed',
+  'resident.workspace_selection_completed',
+  'resident.workspace_selection_unknown',
+  'resident.provision_label_invalid',
+  'resident.provision_metadata_missing',
+])
+
+function residentProvisionMayNeedRecovery(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return typeof code !== 'string' || !RESIDENT_PROVISION_ERRORS_WITHOUT_DURABLE_OPERATION.has(code)
+}
+
+function residentLifecycleAnnouncement(status: ResidentLifecycleStatusResult | null): string {
+  if (!status) return 'No durable setup was found. You can start a new resident thread.'
+  if (status.phase === 'committed') {
+    return 'Resident thread created. Opening its authoritative host snapshot.'
+  }
+  if (status.phase === 'quarantined') {
+    return 'Status checked. This setup needs manual recovery; automatic retry remains blocked.'
+  }
+  if (status.phase === 'completed') {
+    return status.completionReason === 'owned_create_cleaned'
+      ? 'Status checked. The temporary session was cleaned up and no resident session remains.'
+      : 'Status checked. Prime Agent did not create a resident session.'
+  }
+  return 'Status checked. The durable setup is still in progress and no mutation was replayed.'
 }
 
 function Icon({ icon: IconComponent, size = 16, strokeWidth = 1.75 }: { icon: LucideIcon; size?: number; strokeWidth?: number }) {
@@ -366,6 +443,14 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [pairMobileOpen, setPairMobileOpen] = useState(false)
   const [addComputerOpen, setAddComputerOpen] = useState(false)
+  const [residentWorkspaceSelection, setResidentWorkspaceSelection] = useState<ResidentWorkspaceSelection | null>(null)
+  const [residentProvisionOrigin, setResidentProvisionOrigin] = useState<'empty' | 'workbench' | null>(null)
+  const [residentWorkspacePicking, setResidentWorkspacePicking] = useState(false)
+  const [residentStatusChecking, setResidentStatusChecking] = useState(false)
+  const [residentWorkspaceError, setResidentWorkspaceError] = useState('')
+  const [residentLifecycleFeedback, setResidentLifecycleFeedback] = useState('')
+  const [residentRecoveryReference, setResidentRecoveryReference] = useState<ResidentLifecycleRecoveryReference | null>(null)
+  const [residentThreadFocusTarget, setResidentThreadFocusTarget] = useState<ResidentThreadFocusTarget | null>(null)
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [moveDestinationId, setMoveDestinationId] = useState('')
@@ -377,6 +462,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   })
   const addComputerTriggerRef = useRef<HTMLButtonElement>(null)
   const addComputerReturnTargetRef = useRef<HTMLElement | null>(null)
+  const residentProvisionReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
@@ -521,6 +607,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     snapshot?.projects.find((project) => project.id === selectedProjectId) ??
     snapshot?.projects[0]
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
+  const activeLocalHostId = snapshot?.hosts.find((host) => host.kind === 'local' && host.connection === 'online')?.id
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
   const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
@@ -528,6 +615,66 @@ export default function App({ api: suppliedApi }: AppProps) {
   const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   const canLoadModelCatalog = snapshot?.operations.modelCatalog ?? false
+  const canProvisionResident = snapshot?.operations.provisionResident ?? false
+  const residentLifecycleOperations = snapshot
+    ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
+    : []
+
+  useEffect(() => {
+    if (
+      residentRecoveryReference &&
+      (
+        snapshot?.residentLifecycleOperations.some((operation) =>
+          operation.operationId === residentRecoveryReference.operationId &&
+          operation.expectedHostId === residentRecoveryReference.expectedHostId,
+        ) ||
+        (
+          residentRecoveryReference.threadId &&
+          residentRecoveryReference.executionGenerationId &&
+          snapshot?.threads.some((thread) =>
+            thread.hostId === residentRecoveryReference.expectedHostId &&
+            (thread.remoteId ?? thread.id) === residentRecoveryReference.threadId &&
+            thread.executionGenerationId === residentRecoveryReference.executionGenerationId,
+          )
+        )
+      )
+    ) setResidentRecoveryReference(null)
+  }, [residentRecoveryReference, snapshot])
+
+  useEffect(() => {
+    if (residentWorkspaceSelection && residentWorkspaceSelection.expectedHostId !== activeLocalHostId) {
+      setResidentWorkspaceSelection(null)
+      setResidentProvisionOrigin(null)
+    }
+    if (
+      activeLocalHostId &&
+      residentRecoveryReference &&
+      residentRecoveryReference.expectedHostId !== activeLocalHostId
+    ) {
+      setResidentRecoveryReference(null)
+    }
+    if (
+      activeLocalHostId &&
+      residentThreadFocusTarget &&
+      residentThreadFocusTarget.expectedHostId !== activeLocalHostId
+    ) {
+      setResidentThreadFocusTarget(null)
+    }
+  }, [activeLocalHostId, residentRecoveryReference, residentThreadFocusTarget, residentWorkspaceSelection])
+
+  useEffect(() => {
+    if (!snapshot || !residentThreadFocusTarget) return
+    const exactThread = snapshot.threads.find((thread) =>
+      thread.hostId === residentThreadFocusTarget.expectedHostId &&
+      (thread.remoteId ?? thread.id) === residentThreadFocusTarget.threadId &&
+      thread.executionGenerationId === residentThreadFocusTarget.executionGenerationId,
+    )
+    if (!exactThread || snapshot.selectedThreadId !== exactThread.id) return
+    setResidentThreadFocusTarget(null)
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#thread-heading')?.focus())
+    })
+  }, [residentThreadFocusTarget, snapshot])
   activeHostIdRef.current = selectedHost?.id
   activeThreadIdRef.current = selectedThread?.id
 
@@ -727,6 +874,107 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
   }
 
+  const chooseResidentWorkspace = async (
+    trigger: HTMLElement,
+    resumeOperationId?: string,
+  ) => {
+    residentProvisionReturnTargetRef.current = trigger
+    setResidentProvisionOrigin(!selectedThread || !selectedProject || !selectedHost ? 'empty' : 'workbench')
+    setResidentWorkspaceError('')
+    setResidentWorkspacePicking(true)
+    try {
+      const selection = await api.selectResidentWorkspace(
+        resumeOperationId ? { resumeOperationId } : undefined,
+      )
+      setResidentWorkspaceSelection(selection)
+    } catch (error) {
+      setResidentProvisionOrigin(null)
+      if ((error as { code?: string })?.code !== 'resident.workspace_selection_cancelled') {
+        setResidentWorkspaceError(error instanceof Error
+          ? error.message
+          : 'The workspace picker could not be opened.')
+      }
+      window.requestAnimationFrame(() => trigger.focus())
+    } finally {
+      setResidentWorkspacePicking(false)
+    }
+  }
+
+  const checkResidentLifecycle = async (operation: ResidentLifecycleOperationSummary) => {
+    setResidentWorkspaceError('')
+    setResidentLifecycleFeedback('Checking the durable resident setup status…')
+    setResidentStatusChecking(true)
+    try {
+      const status = await api.residentLifecycleStatus({
+        expectedHostId: operation.expectedHostId,
+        operationId: operation.operationId,
+      })
+      setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+      if (status?.phase === 'committed') {
+        setResidentThreadFocusTarget({
+          expectedHostId: status.expectedHostId,
+          threadId: status.threadId,
+          executionGenerationId: status.executionGenerationId,
+        })
+      }
+    } catch (error) {
+      setResidentWorkspaceError(error instanceof Error ? error.message : 'Recovery status is unavailable.')
+      setResidentLifecycleFeedback('The durable resident setup status could not be checked.')
+    } finally {
+      setResidentStatusChecking(false)
+    }
+  }
+
+  const checkResidentRecoveryReference = async (reference: ResidentLifecycleRecoveryReference) => {
+    setResidentWorkspaceError('')
+    setResidentLifecycleFeedback('Checking the durable resident setup status…')
+    setResidentStatusChecking(true)
+    try {
+      const status = await api.residentLifecycleStatus({
+        expectedHostId: reference.expectedHostId,
+        operationId: reference.operationId,
+      })
+      setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+      if (!status) {
+        setResidentRecoveryReference((current) =>
+          current?.operationId === reference.operationId && current.expectedHostId === reference.expectedHostId
+            ? null
+            : current,
+        )
+      } else {
+        setResidentRecoveryReference({
+          operationId: status.operationId,
+          expectedHostId: status.expectedHostId,
+          suggestedName: reference.suggestedName,
+          threadId: status.threadId,
+          executionGenerationId: status.executionGenerationId,
+          status,
+        })
+        if (status.phase === 'committed') {
+          setResidentThreadFocusTarget({
+            expectedHostId: status.expectedHostId,
+            threadId: status.threadId,
+            executionGenerationId: status.executionGenerationId,
+          })
+        }
+      }
+    } catch (error) {
+      setResidentWorkspaceError(error instanceof Error ? error.message : 'Recovery status is unavailable.')
+      setResidentLifecycleFeedback('The durable resident setup status could not be checked.')
+    } finally {
+      setResidentStatusChecking(false)
+    }
+  }
+
+  const residentProvisionCommitted = (status: ResidentLifecycleStatusResult) => {
+    setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+    setResidentThreadFocusTarget({
+      expectedHostId: status.expectedHostId,
+      threadId: status.threadId,
+      executionGenerationId: status.executionGenerationId,
+    })
+  }
+
   if (loadError) {
     return (
       <div className="load-state" role="alert">
@@ -749,34 +997,102 @@ export default function App({ api: suppliedApi }: AppProps) {
     )
   }
 
-  if (!selectedThread || !selectedProject || !selectedHost) {
+  const holdEmptyProvisionSurface = residentProvisionOrigin === 'empty' && (
+    residentWorkspacePicking || residentWorkspaceSelection !== null
+  )
+  if (holdEmptyProvisionSurface || !selectedThread || !selectedProject || !selectedHost) {
+    const actionableLifecycleOperations = actionableResidentLifecycleOperations(
+      snapshot.residentLifecycleOperations,
+      snapshot.threads,
+    )
+    const lifecycleOperations = actionableLifecycleOperations.length > 0
+      ? actionableLifecycleOperations
+      : snapshot.residentLifecycleOperations[0]
+        ? [snapshot.residentLifecycleOperations[0]]
+        : []
+    const canProvisionResident = snapshot.operations.provisionResident === true
     return (
       <div className="empty-workbench">
         <header className="empty-workbench__topbar">
           <BrandMark />
           <strong>Prime Continuim</strong>
         </header>
+        <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {residentLifecycleFeedback}
+        </p>
         <main className="empty-workbench__main" id="main">
-          <span className="empty-workbench__icon"><Icon icon={Inbox} size={22} /></span>
-          <h1>{snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet'}</h1>
+          <span className="empty-workbench__icon"><Icon icon={canProvisionResident ? FolderGit2 : Inbox} size={22} /></span>
+          <h1>{canProvisionResident ? 'Start a resident thread' : snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet'}</h1>
           <p>
-            {snapshot.projects.length > 0
-              ? 'Thread creation is not available in this build. Open a durable thread already projected by a verified host.'
-              : 'Connect a configured host to inspect its existing projects and durable threads. First-session creation is not available in this build.'}
+            {canProvisionResident
+              ? 'Choose a workspace folder, confirm its names, and Prime Agent will keep the thread available after this window closes.'
+              : snapshot.projects.length > 0
+                ? 'Reconnect the verified local host to start a resident thread, or open a durable thread that is already available.'
+                : 'Connect a verified local host to start a resident thread from one of your workspace folders.'}
           </p>
-          <button
-            ref={addComputerTriggerRef}
-            className="button button--primary"
-            type="button"
-            onClick={(event) => {
-              addComputerReturnTargetRef.current = event.currentTarget
-              setAddComputerOpen(true)
-            }}
-          >
-            <Icon icon={Computer} /> Add computer
-          </button>
-          <small>No sample projects or threads are added in the native app.</small>
+          {residentRecoveryReference && (
+            <ResidentLifecycleFallbackCard
+              reference={residentRecoveryReference}
+              capable={canProvisionResident}
+              checkable={snapshot.hosts.some((host) =>
+                host.id === residentRecoveryReference.expectedHostId && host.kind === 'local' && host.connection === 'online',
+              )}
+              busy={residentWorkspacePicking || residentStatusChecking}
+              onChoose={(event) => void chooseResidentWorkspace(event.currentTarget, residentRecoveryReference.operationId)}
+              onCheck={() => void checkResidentRecoveryReference(residentRecoveryReference)}
+            />
+          )}
+          {lifecycleOperations.length > 0 && (
+            <ResidentLifecycleRecoveryList
+              operations={lifecycleOperations}
+              capable={canProvisionResident}
+              isCheckable={(operation) => snapshot.hosts.some((host) =>
+                host.id === operation.expectedHostId && host.kind === 'local' && host.connection === 'online',
+              )}
+              busy={residentWorkspacePicking || residentStatusChecking}
+              onChoose={(operation, event) => void chooseResidentWorkspace(event.currentTarget, operation.operationId)}
+              onCheck={(operation) => void checkResidentLifecycle(operation)}
+            />
+          )}
+          <div className="empty-workbench__actions">
+            {canProvisionResident && (
+              <button
+                className="button button--primary"
+                type="button"
+                disabled={residentWorkspacePicking}
+                aria-busy={residentWorkspacePicking}
+                onClick={(event) => void chooseResidentWorkspace(event.currentTarget)}
+              >
+                <Icon icon={residentWorkspacePicking ? Loader2 : FolderGit2} />
+                {residentWorkspacePicking ? 'Opening folder picker…' : 'Choose workspace folder'}
+              </button>
+            )}
+            <button
+              ref={addComputerTriggerRef}
+              className={cx('button', canProvisionResident ? 'button--secondary' : 'button--primary')}
+              type="button"
+              onClick={(event) => {
+                addComputerReturnTargetRef.current = event.currentTarget
+                setAddComputerOpen(true)
+              }}
+            >
+              <Icon icon={Computer} /> Add computer
+            </button>
+          </div>
+          <p className="form-error empty-workbench__error" role="alert">{residentWorkspaceError}</p>
+          <small>Your verified local host uses this folder for the workspace. Prime Continuim does not display its location or send it to another computer.</small>
         </main>
+        <ResidentProvisionDialog
+          api={api}
+          selection={residentWorkspaceSelection}
+          triggerRef={residentProvisionReturnTargetRef}
+          onClose={() => {
+            setResidentWorkspaceSelection(null)
+            setResidentProvisionOrigin(null)
+          }}
+          onRecoveryRequired={setResidentRecoveryReference}
+          onCommitted={residentProvisionCommitted}
+        />
         <AddComputerDialog
           api={api}
           open={addComputerOpen}
@@ -815,6 +1131,9 @@ export default function App({ api: suppliedApi }: AppProps) {
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {isDisconnected ? connectionCopy(selectedHost.connection, selectedHost) : ''}
       </div>
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {residentLifecycleFeedback}
+      </p>
 
       <header className="topbar" inert={sidebarIsModal || inspectorIsModal ? true : undefined}>
         <div className="topbar__leading">
@@ -931,6 +1250,23 @@ export default function App({ api: suppliedApi }: AppProps) {
           closeSidebar()
           setAddComputerOpen(true)
         }}
+        onProvisionResident={(trigger) => {
+          const returnTarget = sidebarIsOverlay ? sidebarToggleRef.current : trigger
+          closeSidebar()
+          if (returnTarget) void chooseResidentWorkspace(returnTarget)
+        }}
+        onRecoverResident={(operation, trigger) => {
+          const returnTarget = sidebarIsOverlay ? sidebarToggleRef.current : trigger
+          closeSidebar()
+          if (returnTarget) void chooseResidentWorkspace(returnTarget, operation.operationId)
+        }}
+        onCheckResident={(operation) => void checkResidentLifecycle(operation)}
+        onRecoverResidentReference={(reference, trigger) => {
+          const returnTarget = sidebarIsOverlay ? sidebarToggleRef.current : trigger
+          closeSidebar()
+          if (returnTarget) void chooseResidentWorkspace(returnTarget, reference.operationId)
+        }}
+        onCheckResidentReference={(reference) => void checkResidentRecoveryReference(reference)}
         onOpenCompanion={(trigger) => {
           pairMobileDialogTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
           if (sidebarIsOverlay) closeSidebar()
@@ -944,6 +1280,10 @@ export default function App({ api: suppliedApi }: AppProps) {
         onMoveThread={openMoveThread}
         canMoveThread={canMoveThreads}
         canLoadModelCatalog={canLoadModelCatalog}
+        canProvisionResident={canProvisionResident}
+        residentLifecycleOperations={residentLifecycleOperations}
+        residentRecoveryReference={residentRecoveryReference}
+        residentLifecycleBusy={residentWorkspacePicking || residentStatusChecking}
         addComputerTriggerRef={addComputerTriggerRef}
         companionTriggerRef={pairMobileTriggerRef}
         environment={api.environment}
@@ -971,6 +1311,14 @@ export default function App({ api: suppliedApi }: AppProps) {
               <span className="connection-notice__icon"><Icon icon={AlertCircle} size={14} /></span>
               <span>{threadSelectionError}</span>
               <span className="connection-notice__detail">The cached thread summary remains available.</span>
+            </div>
+          )}
+
+          {residentWorkspaceError && (
+            <div className="connection-notice connection-notice--offline" role="alert">
+              <span className="connection-notice__icon"><Icon icon={AlertCircle} size={14} /></span>
+              <span>Resident setup needs attention</span>
+              <span className="connection-notice__detail">{residentWorkspaceError}</span>
             </div>
           )}
         </div>
@@ -1032,6 +1380,18 @@ export default function App({ api: suppliedApi }: AppProps) {
         open={addComputerOpen}
         onClose={() => setAddComputerOpen(false)}
         triggerRef={addComputerReturnTargetRef}
+      />
+
+      <ResidentProvisionDialog
+        api={api}
+        selection={residentWorkspaceSelection}
+        triggerRef={residentProvisionReturnTargetRef}
+        onClose={() => {
+          setResidentWorkspaceSelection(null)
+          setResidentProvisionOrigin(null)
+        }}
+        onRecoveryRequired={setResidentRecoveryReference}
+        onCommitted={residentProvisionCommitted}
       />
 
       <CommandPaletteDialog
@@ -1117,11 +1477,20 @@ interface SidebarProps {
   onSearch: () => void
   onClose: () => void
   onAddComputer: (trigger: HTMLElement) => void
+  onProvisionResident: (trigger: HTMLElement) => void
+  onRecoverResident: (operation: ResidentLifecycleOperationSummary, trigger: HTMLElement) => void
+  onCheckResident: (operation: ResidentLifecycleOperationSummary) => void
+  onRecoverResidentReference: (reference: ResidentLifecycleRecoveryReference, trigger: HTMLElement) => void
+  onCheckResidentReference: (reference: ResidentLifecycleRecoveryReference) => void
   onOpenCompanion: (trigger: HTMLElement) => void
   onOpenModels: (trigger: HTMLElement) => void
   onMoveThread: (hostId: string, trigger: HTMLElement | null) => void
   canMoveThread: boolean
   canLoadModelCatalog: boolean
+  canProvisionResident: boolean
+  residentLifecycleOperations: ResidentLifecycleOperationSummary[]
+  residentRecoveryReference: ResidentLifecycleRecoveryReference | null
+  residentLifecycleBusy: boolean
   addComputerTriggerRef: RefObject<HTMLButtonElement | null>
   companionTriggerRef: RefObject<HTMLButtonElement | null>
   environment: RendererApi['environment']
@@ -1139,11 +1508,20 @@ function Sidebar({
   onSearch,
   onClose,
   onAddComputer,
+  onProvisionResident,
+  onRecoverResident,
+  onCheckResident,
+  onRecoverResidentReference,
+  onCheckResidentReference,
   onOpenCompanion,
   onOpenModels,
   onMoveThread,
   canMoveThread,
   canLoadModelCatalog,
+  canProvisionResident,
+  residentLifecycleOperations,
+  residentRecoveryReference,
+  residentLifecycleBusy,
   addComputerTriggerRef,
   companionTriggerRef,
   environment,
@@ -1175,6 +1553,42 @@ function Sidebar({
             <Icon icon={X} size={17} />
           </button>
         </div>
+        {canProvisionResident && (
+          <button
+            className="button button--primary button--full sidebar__create-resident"
+            type="button"
+            disabled={residentLifecycleBusy}
+            aria-busy={residentLifecycleBusy}
+            onClick={(event) => onProvisionResident(event.currentTarget)}
+          >
+            <Icon icon={residentLifecycleBusy ? Loader2 : FolderGit2} size={16} />
+            {residentLifecycleBusy ? 'Working…' : 'New resident thread'}
+          </button>
+        )}
+        {residentRecoveryReference && (
+          <ResidentLifecycleFallbackCard
+            reference={residentRecoveryReference}
+            capable={canProvisionResident}
+            checkable={snapshot.hosts.some((host) =>
+              host.id === residentRecoveryReference.expectedHostId && host.kind === 'local' && host.connection === 'online',
+            )}
+            busy={residentLifecycleBusy}
+            onChoose={(event) => onRecoverResidentReference(residentRecoveryReference, event.currentTarget)}
+            onCheck={() => onCheckResidentReference(residentRecoveryReference)}
+          />
+        )}
+        {residentLifecycleOperations.length > 0 && (
+          <ResidentLifecycleRecoveryList
+            operations={residentLifecycleOperations}
+            capable={canProvisionResident}
+            isCheckable={(operation) => snapshot.hosts.some((host) =>
+              host.id === operation.expectedHostId && host.kind === 'local' && host.connection === 'online',
+            )}
+            busy={residentLifecycleBusy}
+            onChoose={(operation, event) => onRecoverResident(operation, event.currentTarget)}
+            onCheck={onCheckResident}
+          />
+        )}
         <div className="sidebar__new-row">
           <button
             className="button button--quiet button--full sidebar__search"
@@ -1252,7 +1666,7 @@ function Sidebar({
             ) : (
               <li className="empty-list">
                 <span>No threads in this project</span>
-                <small>Thread creation isn’t available in this build.</small>
+                <small>{canProvisionResident ? 'Choose New resident thread to add one.' : 'Reconnect the verified local host to add one.'}</small>
               </li>
             )}
           </ul>
@@ -3096,7 +3510,8 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
       if (typeof dialog.showModal === 'function') dialog.showModal()
       else dialog.setAttribute('open', '')
       window.requestAnimationFrame(() => {
-        const focusTarget = dialog.querySelector<HTMLElement>('[autofocus], button, [href], input, select, textarea')
+        const focusTarget = dialog.querySelector<HTMLElement>('[data-dialog-autofocus], [autofocus]') ??
+          dialog.querySelector<HTMLElement>('button, [href], input, select, textarea')
         focusTarget?.focus()
       })
     } else if (!open && dialog.open) {
@@ -3129,6 +3544,552 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
     >
       {children}
     </dialog>
+  )
+}
+
+function residentLifecycleQuarantineStatusDetail(status: ResidentLifecycleStatusResult | undefined): string {
+  if (status?.quarantineReason === 'owned_client_lost') {
+    return 'The temporary Prime Agent owner disconnected before promotion could be proven. Automatic retry is blocked.'
+  }
+  if (status?.quarantineReason === 'authority_changed') {
+    return 'The verified host authority changed while setup was being recorded. Automatic retry is blocked.'
+  }
+  if (status?.quarantineReason === 'explicit_reconciliation_required') {
+    return 'The durable lifecycle record needs manual reconciliation before this workspace can continue.'
+  }
+  return 'Prime Agent may have crossed an external mutation boundary whose outcome cannot be proven. Automatic retry is blocked.'
+}
+
+function residentLifecycleQuarantineDetail(operation: ResidentLifecycleOperationSummary): string {
+  return residentLifecycleQuarantineStatusDetail(operation.lastStatus)
+}
+
+function residentLifecycleQuarantineDiagnostic(operation: ResidentLifecycleOperationSummary): string {
+  const status = operation.lastStatus
+  return [
+    'RESIDENT_LIFECYCLE_QUARANTINED',
+    `Operation ID: ${operation.operationId}`,
+    `Host ID: ${operation.expectedHostId}`,
+    `Thread ID: ${operation.threadId}`,
+    `Execution generation: ${operation.executionGenerationId}`,
+    `Reason: ${status?.quarantineReason ?? 'not_reported'}`,
+    `Quarantined from: ${status?.quarantinedFrom ?? 'not_reported'}`,
+    `Updated at: ${status?.updatedAt ?? operation.updatedAt}`,
+  ].join('\n')
+}
+
+function residentLifecycleFallbackQuarantineDiagnostic(reference: ResidentLifecycleRecoveryReference): string {
+  const status = reference.status
+  return [
+    'RESIDENT_LIFECYCLE_QUARANTINED',
+    `Operation ID: ${reference.operationId}`,
+    `Host ID: ${reference.expectedHostId}`,
+    `Thread ID: ${status?.threadId ?? reference.threadId ?? 'not_reported'}`,
+    `Execution generation: ${status?.executionGenerationId ?? reference.executionGenerationId ?? 'not_reported'}`,
+    `Reason: ${status?.quarantineReason ?? 'not_reported'}`,
+    `Quarantined from: ${status?.quarantinedFrom ?? 'not_reported'}`,
+    `Updated at: ${status?.updatedAt ?? 'not_reported'}`,
+  ].join('\n')
+}
+
+function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSummary): {
+  label: string
+  detail: string
+  tone: 'neutral' | 'warning' | 'success'
+  action?: 'choose' | 'check' | 'copy'
+  actionLabel?: string
+  diagnostic?: string
+} {
+  const status = operation.lastStatus
+  if (operation.state === 'requires_reselection') {
+    return {
+      label: 'Workspace confirmation needed',
+      detail: 'Choose the same folder again so Prime Continuim can safely resume this exact setup.',
+      tone: 'warning',
+      action: 'choose',
+      actionLabel: 'Choose original folder',
+    }
+  }
+  if (status?.phase === 'completed' && status.completionReason === 'owned_create_failed_before_effect') {
+    return {
+      label: 'Resident setup did not start',
+      detail: 'Prime Agent did not create a session. Choose the same folder to try a new setup safely.',
+      tone: 'warning',
+      action: 'choose',
+      actionLabel: 'Choose folder and try again',
+    }
+  }
+  if (status?.phase === 'completed' && status.completionReason === 'owned_create_cleaned') {
+    return {
+      label: 'Temporary session cleaned up',
+      detail: 'Prime Agent removed the temporary session before resident setup completed. No resident session remains.',
+      tone: 'warning',
+      action: 'choose',
+      actionLabel: 'Choose folder and try again',
+    }
+  }
+  if (
+    operation.state === 'submitted' &&
+    (status?.phase === 'prepared' || status?.phase === 'promoted_observed' || status?.phase === 'projection_committed')
+  ) {
+    return {
+      label: 'Setup paused safely',
+      detail: 'Choose the original folder to continue this exact operation. Prime Continuim will not repeat a completed mutation.',
+      tone: 'warning',
+      action: 'choose',
+      actionLabel: 'Choose original folder',
+    }
+  }
+  if (status?.phase === 'quarantined') {
+    return {
+      label: 'Setup needs manual recovery',
+      detail: residentLifecycleQuarantineDetail(operation),
+      tone: 'warning',
+      action: 'copy',
+      actionLabel: 'Copy diagnostic',
+      diagnostic: residentLifecycleQuarantineDiagnostic(operation),
+    }
+  }
+  if (operation.state === 'outcome_unknown') {
+    return {
+      label: 'Setup outcome needs inspection',
+      detail: 'Prime Continuim will not retry this operation automatically because the resident session outcome is not proven.',
+      tone: 'warning',
+      action: 'check',
+      actionLabel: 'Check status',
+    }
+  }
+  if (operation.state === 'terminal_refresh_pending' || status?.phase === 'committed') {
+    return {
+      label: 'Resident thread created',
+      detail: 'The durable setup is complete. Prime Continuim is refreshing the thread before opening it.',
+      tone: 'success',
+      action: 'check',
+      actionLabel: 'Refresh status',
+    }
+  }
+  return {
+    label: 'Resident setup in progress',
+    detail: 'Prime Continuim is checking the durable host record. It will not replay a mutation while the outcome is unknown.',
+    tone: 'neutral',
+    action: 'check',
+    actionLabel: 'Check status',
+  }
+}
+
+function ResidentLifecycleRecoveryList({
+  operations,
+  capable,
+  isCheckable,
+  busy,
+  onChoose,
+  onCheck,
+}: {
+  operations: ResidentLifecycleOperationSummary[]
+  capable: boolean
+  isCheckable: (operation: ResidentLifecycleOperationSummary) => boolean
+  busy: boolean
+  onChoose: (operation: ResidentLifecycleOperationSummary, event: ReactMouseEvent<HTMLButtonElement>) => void
+  onCheck: (operation: ResidentLifecycleOperationSummary) => void
+}) {
+  const [first, ...remaining] = operations
+  if (!first) return null
+  const card = (operation: ResidentLifecycleOperationSummary) => (
+    <ResidentLifecycleRecoveryCard
+      key={operation.operationId}
+      operation={operation}
+      capable={capable}
+      checkable={isCheckable(operation)}
+      busy={busy}
+      onChoose={(event) => onChoose(operation, event)}
+      onCheck={() => onCheck(operation)}
+    />
+  )
+  return (
+    <div className="resident-recovery-list">
+      {card(first)}
+      {remaining.length > 0 && (
+        <details className="resident-recovery-list__more">
+          <summary>{remaining.length} other {remaining.length === 1 ? 'setup needs' : 'setups need'} attention</summary>
+          <div>{remaining.map(card)}</div>
+        </details>
+      )}
+    </div>
+  )
+}
+
+function ResidentLifecycleFallbackCard({
+  reference,
+  capable,
+  checkable,
+  busy,
+  onChoose,
+  onCheck,
+}: {
+  reference: ResidentLifecycleRecoveryReference
+  capable: boolean
+  checkable: boolean
+  busy: boolean
+  onChoose: (event: ReactMouseEvent<HTMLButtonElement>) => void
+  onCheck: () => void
+}) {
+  const [diagnosticCopied, setDiagnosticCopied] = useState(false)
+  const status = reference.status
+  const safelyReselectable = status?.phase === 'prepared' ||
+    status?.phase === 'promoted_observed' ||
+    status?.phase === 'projection_committed' ||
+    status?.phase === 'completed'
+  const quarantined = status?.phase === 'quarantined'
+  const committed = status?.phase === 'committed'
+  const label = quarantined
+    ? 'Setup needs manual recovery'
+    : safelyReselectable
+      ? status?.phase === 'completed' ? 'Resident setup ended safely' : 'Setup paused safely'
+      : committed
+        ? 'Resident thread created'
+        : 'Setup outcome needs inspection'
+  const detail = quarantined
+    ? residentLifecycleQuarantineStatusDetail(status)
+    : safelyReselectable
+      ? status?.phase === 'completed'
+        ? status.completionReason === 'owned_create_cleaned'
+          ? 'Prime Agent cleaned up the temporary session. Choose the original folder to start a new setup.'
+          : 'Prime Agent did not create a session. Choose the original folder to try again.'
+        : 'Choose the original folder to continue this exact operation without replaying a completed mutation.'
+      : committed
+        ? 'The durable setup is complete. Prime Continuim is refreshing its authoritative thread snapshot.'
+        : 'The setup request ended before its durable record could be displayed. Prime Continuim will not retry it automatically.'
+  return (
+    <section
+      className="resident-recovery resident-recovery--warning resident-recovery--fallback"
+      aria-labelledby={`resident-recovery-fallback-${reference.operationId}`}
+    >
+      <span className="resident-recovery__icon"><Icon icon={AlertCircle} size={17} /></span>
+      <div className="resident-recovery__body">
+        <h2 id={`resident-recovery-fallback-${reference.operationId}`}>{label}</h2>
+        <p>{detail}</p>
+        <small><bdi>{reference.suggestedName}</bdi></small>
+      </div>
+      <div className="resident-recovery__actions">
+        {(quarantined || (!status || safelyReselectable === false)) && (
+          quarantined ? (
+            <button
+              className="button button--secondary button--small"
+              type="button"
+              onClick={() => {
+                void writeClipboardText(residentLifecycleFallbackQuarantineDiagnostic(reference)).then(() => {
+                  setDiagnosticCopied(true)
+                  window.setTimeout(() => setDiagnosticCopied(false), 1_600)
+                }).catch(() => setDiagnosticCopied(false))
+              }}
+            >
+              <Icon icon={diagnosticCopied ? Check : Copy} size={14} />
+              {diagnosticCopied ? 'Diagnostic copied' : 'Copy diagnostic'}
+              <span className="sr-only" aria-live="polite">{diagnosticCopied ? 'Diagnostic copied' : ''}</span>
+            </button>
+          ) : (
+            <button className="button button--secondary button--small" type="button" disabled={!checkable || busy} onClick={onCheck}>
+              <Icon icon={RefreshCw} size={14} /> {busy ? 'Checking…' : committed ? 'Refresh status' : 'Check status'}
+            </button>
+          )
+        )}
+        {(!status || safelyReselectable) && (
+          <button className="button button--secondary button--small" type="button" disabled={!capable || busy} onClick={onChoose}>
+            <Icon icon={FolderGit2} size={14} /> Choose original folder
+          </button>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function ResidentLifecycleRecoveryCard({
+  operation,
+  capable,
+  checkable,
+  busy,
+  onChoose,
+  onCheck,
+}: {
+  operation: ResidentLifecycleOperationSummary
+  capable: boolean
+  checkable: boolean
+  busy: boolean
+  onChoose: (event: ReactMouseEvent<HTMLButtonElement>) => void
+  onCheck: () => void
+}) {
+  const presentation = residentLifecycleRecoveryCopy(operation)
+  const [diagnosticCopied, setDiagnosticCopied] = useState(false)
+  const canAct = presentation.action === 'check'
+    ? checkable
+    : presentation.action === 'copy'
+      ? true
+      : capable
+  const performAction = presentation.action === 'choose'
+    ? onChoose
+    : presentation.action === 'copy'
+      ? () => {
+          if (!presentation.diagnostic) return
+          void writeClipboardText(presentation.diagnostic).then(() => {
+            setDiagnosticCopied(true)
+            window.setTimeout(() => setDiagnosticCopied(false), 1_600)
+          }).catch(() => setDiagnosticCopied(false))
+        }
+      : onCheck
+  return (
+    <section
+      className={cx('resident-recovery', `resident-recovery--${presentation.tone}`)}
+      aria-labelledby={`resident-recovery-${operation.operationId}`}
+    >
+      <span className="resident-recovery__icon">
+        <Icon icon={presentation.tone === 'success' ? CheckCircle2 : presentation.tone === 'warning' ? AlertCircle : Clock3} size={17} />
+      </span>
+      <div className="resident-recovery__body">
+        <h2 id={`resident-recovery-${operation.operationId}`}>{presentation.label}</h2>
+        <p>{presentation.detail}</p>
+        <small><bdi>{operation.projectDisplayName}</bdi> · <bdi>{operation.threadTitle}</bdi></small>
+      </div>
+      {presentation.action && (
+        <button
+          className="button button--secondary button--small"
+          type="button"
+          disabled={!canAct || (presentation.action !== 'copy' && busy)}
+          onClick={performAction}
+        >
+          <Icon icon={presentation.action === 'choose' ? FolderGit2 : presentation.action === 'copy' ? diagnosticCopied ? Check : Copy : RefreshCw} size={14} />
+          {presentation.action === 'copy'
+            ? diagnosticCopied ? 'Diagnostic copied' : presentation.actionLabel
+            : busy ? presentation.action === 'choose' ? 'Opening…' : 'Checking…' : presentation.actionLabel}
+          {presentation.action === 'copy' && (
+            <span className="sr-only" aria-live="polite">{diagnosticCopied ? 'Diagnostic copied' : ''}</span>
+          )}
+        </button>
+      )}
+    </section>
+  )
+}
+
+function ResidentProvisionDialog({
+  api,
+  selection,
+  triggerRef,
+  onClose,
+  onRecoveryRequired,
+  onCommitted,
+}: {
+  api: RendererApi
+  selection: ResidentWorkspaceSelection | null
+  triggerRef: RefObject<HTMLElement | null>
+  onClose: () => void
+  onRecoveryRequired: (reference: ResidentLifecycleRecoveryReference) => void
+  onCommitted: (status: ResidentLifecycleStatusResult) => void
+}) {
+  const [projectDisplayName, setProjectDisplayName] = useState('')
+  const [threadTitle, setThreadTitle] = useState('')
+  const [invalidField, setInvalidField] = useState<'project' | 'thread' | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [settled, setSettled] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const projectRef = useRef<HTMLInputElement>(null)
+  const threadRef = useRef<HTMLInputElement>(null)
+  const resultRef = useRef<HTMLParagraphElement>(null)
+
+  useEffect(() => {
+    if (!selection) return
+    setProjectDisplayName(selection.suggestedName)
+    setThreadTitle(`${selection.suggestedName} thread`)
+    setInvalidField(null)
+    setSubmitting(false)
+    setSettled(false)
+    setMessage('')
+    setError('')
+  }, [selection])
+
+  useEffect(() => {
+    if (!selection || !settled) return
+    window.requestAnimationFrame(() => resultRef.current?.focus())
+  }, [selection, settled])
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!selection || submitting || settled) return
+    const project = projectDisplayName.trim()
+    const thread = threadTitle.trim()
+    if (!project || project.length > 255 || /[\0\r\n]/.test(project)) {
+      setInvalidField('project')
+      setError('Enter a project name between 1 and 255 characters.')
+      projectRef.current?.focus()
+      return
+    }
+    if (!thread || thread.length > 255 || /[\0\r\n]/.test(thread)) {
+      setInvalidField('thread')
+      setError('Enter a thread title between 1 and 255 characters.')
+      threadRef.current?.focus()
+      return
+    }
+    setInvalidField(null)
+    setError('')
+    setMessage('Creating the durable resident thread…')
+    setSubmitting(true)
+    try {
+      const status = await api.provisionResident({
+        selectionToken: selection.selectionToken,
+        projectDisplayName: project,
+        threadTitle: thread,
+      })
+      setSettled(true)
+      onRecoveryRequired({
+        operationId: status.operationId,
+        expectedHostId: status.expectedHostId,
+        suggestedName: selection.suggestedName,
+        threadId: status.threadId,
+        executionGenerationId: status.executionGenerationId,
+        status,
+      })
+      if (status.phase === 'committed') {
+        setMessage('Resident thread created. Opening its authoritative host snapshot…')
+        onClose()
+        onCommitted(status)
+        return
+      }
+      if (status.phase === 'completed') {
+        setMessage(status.completionReason === 'owned_create_cleaned'
+          ? 'Prime Agent cleaned up the temporary session. No resident session remains; choose the original folder when you are ready to try again.'
+          : 'Prime Agent did not create a session. Choose the original folder again when you are ready to retry.')
+      } else if (status.phase === 'quarantined') {
+        setError('The setup outcome is not proven. Prime Continuim will not retry it automatically; inspect the durable host state first.')
+        setMessage('Resident setup stopped at an uncertain mutation boundary.')
+      } else {
+        setMessage('Setup is durably recorded. Choose the original folder again if recovery asks for it.')
+      }
+    } catch (reason) {
+      setSettled(true)
+      if (residentProvisionMayNeedRecovery(reason)) {
+        onRecoveryRequired({
+          operationId: selection.operationId,
+          expectedHostId: selection.expectedHostId,
+          suggestedName: selection.suggestedName,
+        })
+      }
+      setError(reason instanceof Error
+        ? reason.message
+        : 'Resident setup did not finish. Prime Continuim will not retry it automatically.')
+      setMessage(residentProvisionMayNeedRecovery(reason)
+        ? 'Check the durable recovery state before trying again.'
+        : 'Close this dialog, correct the issue, and choose the workspace folder again.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <NativeDialog
+      open={selection !== null}
+      labelledBy="resident-provision-title"
+      describedBy="resident-provision-description"
+      triggerRef={triggerRef}
+      onClose={onClose}
+      className="sheet--resident"
+      dismissible={!submitting}
+    >
+      <form className="sheet__frame" onSubmit={submit} aria-busy={submitting}>
+        <header className="sheet__header">
+          <div className="sheet__title-group">
+            <span className="sheet__title-icon"><Icon icon={FolderGit2} size={18} /></span>
+            <div>
+              <h2 id="resident-provision-title">Start resident thread</h2>
+              <p id="resident-provision-description">
+                Confirm how this workspace appears in Prime Continuim. The verified local host keeps its folder location.
+              </p>
+            </div>
+          </div>
+          <button className="icon-button" type="button" aria-label="Close resident setup" onClick={onClose} disabled={submitting}>
+            <Icon icon={X} size={17} />
+          </button>
+        </header>
+
+        <div className="sheet__scroll resident-provision__fields">
+          <div className="form-field">
+            <label htmlFor="resident-project-name">Project name</label>
+            <input
+              ref={projectRef}
+              id="resident-project-name"
+              type="text"
+              value={projectDisplayName}
+              maxLength={255}
+              autoFocus
+              data-dialog-autofocus
+              autoComplete="off"
+              aria-invalid={invalidField === 'project'}
+              aria-describedby={invalidField === 'project'
+                ? 'resident-project-help resident-provision-error'
+                : 'resident-project-help'}
+              disabled={submitting || settled}
+              onChange={(event) => {
+                setProjectDisplayName(event.target.value)
+                if (invalidField === 'project') {
+                  setInvalidField(null)
+                  setError('')
+                }
+              }}
+            />
+            <small id="resident-project-help">Shown in the project list.</small>
+          </div>
+          <div className="form-field">
+            <label htmlFor="resident-thread-title">Thread title</label>
+            <input
+              ref={threadRef}
+              id="resident-thread-title"
+              type="text"
+              value={threadTitle}
+              maxLength={255}
+              autoComplete="off"
+              aria-invalid={invalidField === 'thread'}
+              aria-describedby={invalidField === 'thread'
+                ? 'resident-thread-help resident-provision-error'
+                : 'resident-thread-help'}
+              disabled={submitting || settled}
+              onChange={(event) => {
+                setThreadTitle(event.target.value)
+                if (invalidField === 'thread') {
+                  setInvalidField(null)
+                  setError('')
+                }
+              }}
+            />
+            <small id="resident-thread-help">Shown in the thread list and window title.</small>
+          </div>
+          <div className="resident-provision__privacy">
+            <Icon icon={LockKeyhole} size={15} />
+            <span>Prime Continuim does not display this folder location or send it to another computer. The verified local host uses it for this workspace.</span>
+          </div>
+          <p id="resident-provision-error" className="form-error" role="alert">{error}</p>
+          <p
+            ref={resultRef}
+            className="form-status"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            tabIndex={settled ? -1 : undefined}
+          >
+            {message}
+          </p>
+        </div>
+
+        <footer className="sheet__footer">
+          <button className="button button--secondary" type="button" onClick={onClose} disabled={submitting}>
+            {settled ? 'Close' : 'Cancel'}
+          </button>
+          {!settled && (
+            <button className="button button--primary" type="submit" disabled={submitting}>
+              <Icon icon={submitting ? Loader2 : FolderGit2} />
+              {submitting ? 'Starting…' : 'Start resident thread'}
+            </button>
+          )}
+        </footer>
+      </form>
+    </NativeDialog>
   )
 }
 
