@@ -1,5 +1,7 @@
 # Prime Continuim
 
+[![Cross-platform source gates](https://github.com/NobleSpartan6/prime-continuum/actions/workflows/cross-platform-source.yml/badge.svg)](https://github.com/NobleSpartan6/prime-continuum/actions/workflows/cross-platform-source.yml)
+
 A native desktop workbench for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
 
 The current Windows development build follows one local-first path: start the
@@ -11,7 +13,10 @@ Production resident commands that invoke a provider, remote SSH installation
 and upgrades, cross-host handoff, relay connectivity, mobile control, signed
 distribution, and automatic updates remain unavailable. Those controls are
 omitted or disabled instead of being represented by demo data. Packaging is
-verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging require platform CI and release verification.
+verified only as an unsigned Windows x64 development artifact. Linux x64,
+Windows x64, and macOS arm64 source gates run on separate GitHub-hosted VMs,
+but macOS and Linux packaging require native artifact and lifecycle verification
+and remain unverified.
 
 ## Windows development installer
 
