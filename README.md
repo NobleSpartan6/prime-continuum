@@ -67,7 +67,7 @@ pnpm verify:hostd-runtime:smoke
 pnpm verify:renderer-visual
 ```
 
-`verify:renderer-visual` builds the renderer, captures the browser-preview fixture through real Electron at 1600×1000 plus exact 390×844 and 320×704 desktop/Companion viewports, and fails on page or surface-level horizontal overflow. It writes reviewable PNGs and layout metrics under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
+`verify:renderer-visual` rebuilds the complete attested release tree before capturing the browser-preview fixture through real Electron at 1600×1000 plus exact 390×844 and 320×704 desktop/Companion viewports. It fails on page or surface-level horizontal overflow and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
 
 On the verified Windows x64 development path, `pnpm package` keeps Windows
 executable resource editing and ASAR integrity enabled, then rejects a
