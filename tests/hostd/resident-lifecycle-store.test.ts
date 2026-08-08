@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -148,7 +149,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     await addSecondThread(fixture.store);
     await fixture.store.registerWorkspaceAuthority({
       threadId: "second-thread",
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
       workspaceDirectory: fixture.workspaceDirectory,
     });
     const input = operationInput(fixture, "provision-fences");
@@ -159,14 +160,14 @@ describe("HostStore resident provisioning lifecycle", () => {
     });
     await expect(
       fixture.store.createHandoffPlan({
-        threadId: "demo-thread",
-        sourceGenerationId: "demo-execution-1",
+        threadId: "test-thread",
+        sourceGenerationId: "test-execution-1",
         destinationHostId: "other-host",
         destinationProjectId: "other-project",
         behaviorIfRunning: "wait_for_idle",
       }),
     ).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_IN_PROGRESS" });
-    const command = promptCommand(fixture.hostId, "fenced-prompt", "demo-thread", "demo-execution-1");
+    const command = promptCommand(fixture.hostId, "fenced-prompt", "test-thread", "test-execution-1");
     expect((await fixture.store.admitCommand(command, true)).receipt).toMatchObject({
       status: "rejected",
       error: { code: "RESIDENT_LIFECYCLE_IN_PROGRESS" },
@@ -182,7 +183,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     await addSecondThread(fixture.store);
     await fixture.store.registerWorkspaceAuthority({
       threadId: "second-thread",
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
       workspaceDirectory: fixture.workspaceDirectory,
     });
     const input = operationInput(fixture, "provision-unknown");
@@ -205,7 +206,7 @@ describe("HostStore resident provisioning lifecycle", () => {
       operationId: "second-thread-provision",
       threadId: "second-thread",
       requestDigest: "d".repeat(64),
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
     };
     expect((await restarted.prepareResidentProvision(secondInput)).phase).toBe("prepared");
   });
@@ -220,7 +221,7 @@ describe("HostStore resident provisioning lifecycle", () => {
 
     vi.setSystemTime("2020-09-10T12:00:00.000Z");
     const restarted = new HostStore(fixture.directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     expect(await restarted.getResidentLifecycleStatus(input.operationId)).toMatchObject({
       phase: "quarantined",
       quarantinedFrom: "owned_create_dispatching",
@@ -260,7 +261,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     const endInput = await endOperationInput(fixture, "resident-end", "e");
     expect((await fixture.store.prepareResidentEnd(endInput, active)).phase).toBe("ending");
     expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
-    const command = promptCommand(fixture.hostId, "after-end-prompt", "demo-thread", "demo-execution-1");
+    const command = promptCommand(fixture.hostId, "after-end-prompt", "test-thread", "test-execution-1");
     expect((await fixture.store.admitCommand(command, true)).receipt).toMatchObject({
       status: "rejected",
       error: { code: "RESIDENT_LIFECYCLE_IN_PROGRESS" },
@@ -425,7 +426,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
 
     const restarted = new HostStore(fixture.directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     expect(await restarted.getResidentLifecycleStatus(provision.input.operationId)).toMatchObject({
       phase: "committed",
     });
@@ -449,7 +450,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
 
     const restarted = new HostStore(fixture.directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     expect(await restarted.getResidentLifecycleStatus(endInput.operationId)).toMatchObject({ phase: "ending" });
     expect(await restarted.listResidentSessionBindings()).toEqual([]);
     await expect(restarted.acquireResidentProvisionRecoveryLease(provision.input)).rejects.toMatchObject({
@@ -488,7 +489,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     await expect(fixture.store.getCatalogSnapshot()).resolves.toBeDefined();
 
     const restarted = new HostStore(fixture.directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     expect(await restarted.listResidentSessionBindings()).toEqual([active]);
     await expect(restarted.acquireResidentProvisionRecoveryLease(input)).rejects.toMatchObject({
       code: "RESIDENT_LIFECYCLE_RECOVERY_UNAVAILABLE",
@@ -989,7 +990,7 @@ describe("HostStore resident lifecycle durable validation", () => {
     await fixture.store.persistResidentSessionBinding(active);
     await fixture.store.completeResidentSessionBinding(active);
     const legacyRestart = new HostStore(fixture.directory);
-    await expect(legacyRestart.initialize()).resolves.toEqual({ seeded: false });
+    await expect(legacyRestart.initialize()).resolves.toBeUndefined();
 
     const second = await createFixture();
     const input = operationInput(second, "corrupt-quarantine");
@@ -1045,7 +1046,7 @@ describe("HostStore resident lifecycle durable validation", () => {
         "utf8",
       );
       const restarted = new HostStore(fixture.directory);
-      await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+      await expect(restarted.initialize()).resolves.toBeUndefined();
       await expect(restarted.listResidentSessionBindings()).rejects.toMatchObject({
         code: "RESIDENT_SUBSYSTEM_DEGRADED",
       });
@@ -1112,7 +1113,7 @@ describe("HostStore resident lifecycle durable validation", () => {
         "utf8",
       );
       const restarted = new HostStore(fixture.directory);
-      await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+      await expect(restarted.initialize()).resolves.toBeUndefined();
       await expect(restarted.listResidentSessionBindings()).rejects.toMatchObject({
         code: "RESIDENT_SUBSYSTEM_DEGRADED",
       });
@@ -1134,10 +1135,11 @@ async function createFixture(options: HostStoreOptions = {}): Promise<Fixture> {
   await mkdir(workspace, { recursive: true });
   const workspaceDirectory = await realpath(workspace);
   const store = new HostStore(directory, options);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   return { directory, workspaceDirectory, store, hostId: (await store.getHost()).hostId };
@@ -1147,10 +1149,10 @@ function operationInput(fixture: Fixture, operationId: string, digest = "a"): Re
   return {
     operationId,
     expectedHostId: fixture.hostId,
-    projectId: "demo-project",
-    workspaceId: "demo-workspace",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    projectId: "test-project",
+    workspaceId: "test-workspace",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     requestDigest: digest.repeat(64),
   };
 }
@@ -1161,7 +1163,7 @@ async function endOperationInput(
   digest = "a",
   store: HostStore = fixture.store,
 ): Promise<ResidentEndLifecycleOperationInput> {
-  const snapshot = await store.getThreadSnapshot("demo-thread");
+  const snapshot = await store.getThreadSnapshot("test-thread");
   return {
     ...operationInput(fixture, operationId, digest),
     expectedSourceCursor: snapshot.latestCursor,
@@ -1185,8 +1187,8 @@ function legacyBinding(fixture: Fixture, suffix = "legacy"): ResidentSessionBind
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory: fixture.workspaceDirectory,
     activeSessionId: `active-${suffix}`,
     sessionId: `session-${suffix}`,
@@ -1272,8 +1274,8 @@ function projection(binding: ResidentSessionBinding, sequence: number): Resident
 }
 
 async function addSecondThread(store: HostStore): Promise<void> {
-  const source = await store.getThreadSnapshot("demo-thread");
-  const snapshot = snapshotWithThread(source, "second-thread", "demo-execution-2");
+  const source = await store.getThreadSnapshot("test-thread");
+  const snapshot = snapshotWithThread(source, "second-thread", "test-execution-2");
   await store.upsertThread(snapshot.thread, snapshot);
 }
 

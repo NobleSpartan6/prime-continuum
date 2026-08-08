@@ -7,10 +7,14 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import App from '../../src/renderer/src/App'
 import {
   createPreviewRendererApi,
+  previewSnapshot,
   StaleHostAuthorityError,
   type HostRuntimeReadiness,
+  type LocalSetupSummary,
+  type RendererApi,
   type ResidentLifecycleOperationSummary,
   type RuntimeModelCatalog,
+  type WorkbenchSnapshot,
 } from '../../src/renderer/src/api'
 
 function deferred<T>() {
@@ -21,6 +25,24 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
+}
+
+function asNativeFixture<T extends RendererApi>(api: T): T {
+  Object.defineProperty(api, 'environment', { configurable: true, value: 'native' })
+  return api
+}
+
+function createNativeUiFixture(): RendererApi {
+  const api = asNativeFixture(createPreviewRendererApi())
+  const discoverComputers = api.discoverComputers.bind(api)
+  const probeComputer = api.probeComputer.bind(api)
+  const verified = <T extends Awaited<ReturnType<RendererApi['probeComputer']>>>(computer: T): T => ({
+    ...computer,
+    fingerprint: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+  })
+  api.discoverComputers = async () => (await discoverComputers()).map(verified)
+  api.probeComputer = async (input) => verified(await probeComputer(input))
+  return api
 }
 
 function withLargeModelCatalog(catalog: RuntimeModelCatalog): RuntimeModelCatalog {
@@ -140,6 +162,52 @@ function createResidentProvisioningApi(operation?: ResidentLifecycleOperationSum
   }))
   api.residentLifecycleStatus = vi.fn(async () => null)
   return api
+}
+
+function createLocalSetupHarness(
+  initialSetup: LocalSetupSummary,
+  options: { lifecycleOperations?: ResidentLifecycleOperationSummary[] } = {},
+) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  let snapshot: WorkbenchSnapshot = structuredClone(previewSnapshot)
+  snapshot = {
+    ...snapshot,
+    selectedProjectId: '',
+    selectedThreadId: '',
+    projects: [],
+    threads: [],
+    hosts: [],
+    runtime: {},
+    localSetup: initialSetup,
+    residentLifecycleOperations: options.lifecycleOperations ?? [],
+    operations: {
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      ...(initialSetup.stage === 'choose_workspace' ? { provisionResident: true } : {}),
+      crossHostHandoff: false,
+    },
+    composerReceipt: { state: 'idle' },
+  }
+  const listeners = new Set<(next: WorkbenchSnapshot) => void>()
+  api.loadWorkbench = vi.fn(async () => snapshot)
+  api.subscribe = (listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  }
+  api.retryLocalSetup = vi.fn(async () => undefined)
+  const publish = (setup: LocalSetupSummary) => {
+    snapshot = {
+      ...snapshot,
+      localSetup: setup,
+      operations: {
+        ...snapshot.operations,
+        provisionResident: setup.stage === 'choose_workspace' ? true : undefined,
+      },
+    }
+    listeners.forEach((listener) => listener(snapshot))
+  }
+  return { api: api as RendererApi, publish }
 }
 
 function residentEndStatus(phase: 'ending' | 'completed' = 'ending') {
@@ -512,6 +580,243 @@ describe('Prime Continuim renderer', () => {
       expectedHostId: unresolved.expectedHostId,
       operationId: unresolved.operationId,
     })
+  })
+
+  it('moves a fresh empty workbench through local service, runtime verification, and workspace choice', async () => {
+    const harness = createLocalSetupHarness({ stage: 'starting_local_service' })
+    render(<App api={harness.api} />)
+
+    const main = await screen.findByRole('main')
+    expect(main).toHaveAttribute('data-local-setup-stage', 'starting_local_service')
+    expect(screen.getByRole('heading', { name: 'Getting Prime Continuim ready' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'No projects yet' })).not.toBeInTheDocument()
+    expect(within(main).getByRole('status')).toHaveTextContent('Starting the local service')
+    expect(screen.queryByRole('button', { name: 'Choose workspace folder' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Use another computer' })).toHaveClass('button--secondary')
+    expect(within(main).getByText('Start local service').closest('li')).toHaveAttribute('aria-current', 'step')
+
+    act(() => harness.publish({
+      stage: 'preparing_runtime',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'initializing',
+        phase: 'copying',
+      },
+    }))
+    expect(main).toHaveAttribute('data-local-setup-stage', 'preparing_runtime')
+    expect(within(main).getByRole('status')).toHaveTextContent('Installing verified files')
+    expect(within(main).getByText('Verify Prime Agent runtime').closest('li')).toHaveAttribute('aria-current', 'step')
+
+    act(() => harness.publish({
+      stage: 'choose_workspace',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    }))
+    expect(main).toHaveAttribute('data-local-setup-stage', 'choose_workspace')
+    expect(screen.getByRole('heading', { name: 'Choose a workspace' })).toBeVisible()
+    expect(within(main).getByRole('status')).toHaveTextContent('bundled Prime Agent runtime is verified')
+    const chooseWorkspace = screen.getByRole('button', { name: 'Choose workspace folder' })
+    await waitFor(() => expect(chooseWorkspace).toHaveFocus())
+  })
+
+  it('announces and focuses a terminal local-service failure, then retries only the local connection', async () => {
+    const user = userEvent.setup()
+    const harness = createLocalSetupHarness({ stage: 'starting_local_service' })
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Getting Prime Continuim ready' })
+
+    act(() => harness.publish({
+      stage: 'needs_attention',
+      issue: {
+        area: 'local_service',
+        action: 'retry_connection',
+        message: 'The local service did not become ready in time.',
+        retryable: true,
+        code: 'hostd.start_timeout',
+      },
+    }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('hostd.start_timeout')
+    await waitFor(() => expect(alert).toHaveFocus())
+    const retry = screen.getByRole('button', { name: 'Retry local service' })
+    await user.click(retry)
+    expect(harness.api.retryLocalSetup).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Use another computer' })).toHaveClass('button--secondary')
+  })
+
+  it('offers one explicit runtime verification retry and exposes its busy state', async () => {
+    const user = userEvent.setup()
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'failed',
+        retryable: true,
+        recovery: 'retry',
+      },
+      issue: {
+        area: 'runtime',
+        action: 'retry_runtime',
+        message: 'Runtime verification did not finish. Retry verification to run the same checks again.',
+        retryable: true,
+        code: 'RUNTIME_TRANSIENT_VERIFICATION',
+      },
+    })
+    const retry = deferred<void>()
+    harness.api.retryLocalSetup = vi.fn(() => retry.promise)
+    render(<App api={harness.api} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Runtime verification stopped')
+    expect(alert).toHaveTextContent('RUNTIME_TRANSIENT_VERIFICATION')
+    await waitFor(() => expect(alert).toHaveFocus())
+    const button = screen.getByRole('button', { name: 'Retry runtime verification' })
+    await user.click(button)
+    expect(harness.api.retryLocalSetup).toHaveBeenCalledOnce()
+    expect(screen.getByRole('button', { name: 'Retrying verification…' })).toBeDisabled()
+
+    retry.resolve()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry runtime verification' })).toBeEnabled())
+    expect(harness.api.retryLocalSetup).toHaveBeenCalledOnce()
+  })
+
+  it('keeps runtime corruption recovery manual and does not promise that reinstall will clear it', async () => {
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'failed',
+        recovery: 'repair',
+      },
+      issue: {
+        area: 'runtime',
+        action: 'manual_recovery',
+        message: 'The installed runtime did not pass verification. Record the diagnostic code and contact support before changing local runtime data; this screen will not replace it.',
+        retryable: false,
+        code: 'RUNTIME_INSTALLED_CORRUPTION',
+      },
+    })
+    render(<App api={harness.api} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('contact support')
+    expect(alert).toHaveTextContent('this screen will not replace it')
+    await waitFor(() => expect(alert).toHaveFocus())
+    expect(screen.queryByRole('button', { name: /retry|repair|reinstall/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Use another computer' })).toBeVisible()
+  })
+
+  it('copies a bounded path-free diagnostic from an initial nonretryable setup state with the keyboard', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => undefined)
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      issue: {
+        area: 'local_service',
+        action: 'review_diagnostics',
+        message: 'Private native cause: C:\\Users\\operator\\secret-workspace\\host.sock with session-key-one.',
+        retryable: false,
+        code: 'hostd.bundle_missing',
+      },
+    })
+    render(<App api={harness.api} />)
+
+    const alert = await screen.findByRole('alert')
+    await waitFor(() => expect(alert).toHaveFocus())
+    await user.tab()
+    const copy = screen.getByRole('button', { name: 'Copy setup diagnostic' })
+    expect(copy).toHaveFocus()
+    expect(copy).toHaveClass('button--primary')
+    await user.keyboard('{Enter}')
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledOnce())
+    const diagnostic = writeText.mock.calls[0]?.[0]
+    expect(diagnostic).toBe([
+      'PRIME_CONTINUIM_SETUP_DIAGNOSTIC',
+      'Stage: needs_attention',
+      'Area: local_service',
+      'Code: hostd.bundle_missing',
+      'Next step: Share this diagnostic with Prime Continuim support.',
+    ].join('\n'))
+    expect(diagnostic).not.toMatch(/[A-Z]:\\|\/Users\/|operator|secret-workspace|host\.sock|session-key-one/i)
+    expect(screen.getByText('Setup diagnostic copied. Share it with Prime Continuim support.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Setup diagnostic copied' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Use another computer' })).toHaveClass('button--secondary')
+    expect(screen.queryByRole('button', { name: /restart|repair|reinstall/i })).not.toBeInTheDocument()
+  })
+
+  it('reveals and selects the bounded diagnostic when clipboard copy fails', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => {
+      throw new Error('Clipboard denied')
+    })
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'failed',
+        recovery: 'repair',
+      },
+      issue: {
+        area: 'runtime',
+        action: 'manual_recovery',
+        message: 'The installed runtime did not pass verification.',
+        retryable: false,
+        code: 'RUNTIME_INSTALLED_CORRUPTION',
+      },
+    })
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Copy setup diagnostic' }))
+    const diagnostic = await screen.findByRole('textbox', { name: 'Setup diagnostic' })
+    await waitFor(() => expect(diagnostic).toHaveFocus())
+    expect(diagnostic).toHaveValue([
+      'PRIME_CONTINUIM_SETUP_DIAGNOSTIC',
+      'Stage: needs_attention',
+      'Area: runtime',
+      'Code: RUNTIME_INSTALLED_CORRUPTION',
+      'Next step: Share this diagnostic with Prime Continuim support.',
+    ].join('\n'))
+    expect((diagnostic as HTMLTextAreaElement).selectionStart).toBe(0)
+    expect((diagnostic as HTMLTextAreaElement).selectionEnd).toBe((diagnostic as HTMLTextAreaElement).value.length)
+    expect(screen.getByText(/Unable to copy the setup diagnostic.*copy it manually.*share it with Prime Continuim support/i)).toBeInTheDocument()
+    expect(screen.getByText('Clipboard unavailable')).toBeVisible()
+    expect(screen.queryByRole('button', { name: /restart|repair|reinstall/i })).not.toBeInTheDocument()
+  })
+
+  it('puts durable resident recovery before onboarding and withholds a second create mutation', async () => {
+    const operation = lifecycleOperation('outcome_unknown')
+    const harness = createLocalSetupHarness({
+      stage: 'choose_workspace',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    }, { lifecycleOperations: [operation] })
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByRole('heading', { name: 'Finish resident setup' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Setup outcome needs inspection' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Choose workspace folder' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Use another computer' })).toBeVisible()
   })
 
   it('labels and validates resident setup, keeps paths hidden, and cancels without mutation', async () => {
@@ -1262,9 +1567,9 @@ describe('Prime Continuim renderer', () => {
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
   })
 
-  it('labels the browser model registry as illustrative while preserving its read-only metadata controls', async () => {
+  it('shows only the native runtime-backed model registry and preserves its read-only metadata controls', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = asNativeFixture(createPreviewRendererApi())
     const loadRuntimeModelCatalog = vi.spyOn(api, 'loadRuntimeModelCatalog')
 
     render(<App api={api} />)
@@ -1273,19 +1578,18 @@ describe('Prime Continuim renderer', () => {
     await user.click(trigger)
 
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    expect(await within(dialog).findByText('Sample accounts')).toBeVisible()
-    expect(within(dialog).getByText(/Illustrative sample catalog.*No Prime Agent host was queried/i)).toBeVisible()
-    expect(within(dialog).queryByText(/reported by Prime Agent on devbox/i)).not.toBeInTheDocument()
+    expect(await within(dialog).findByRole('complementary', { name: 'Accounts on devbox' })).toBeVisible()
+    expect(dialog.querySelector('#models-description')).toHaveTextContent(/reported by Prime Agent on devbox/i)
+    expect(within(dialog).queryByText(/illustrative|sample catalog|browser preview/i)).not.toBeInTheDocument()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledWith('host-devbox')
     expect(within(dialog).getByText('2 configured')).toBeVisible()
-    expect(within(dialog).getByText(/Browser preview · illustrative Prime Agent 0\.7\.0 fixture/)).toBeVisible()
+    expect(within(dialog).getByText(/OAuth-capable providers · Prime Agent 0\.7\.0/)).toBeVisible()
     expect(within(dialog).getByText('GPT-5.6 Sol')).toBeVisible()
     expect(within(dialog).getByText('Kimi K3')).toBeVisible()
     expect(within(dialog).getByText('Current')).toBeVisible()
     expect(within(dialog).queryByText('Claude Opus 5')).not.toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: /connect|select/i })).not.toBeInTheDocument()
-    expect(within(dialog).getByText(/Illustrative sample only/)).toBeVisible()
-    expect(within(dialog).getByText(/model names and availability are not host evidence/i)).toBeVisible()
+    expect(within(dialog).getByText(/This registry view is read-only/)).toBeVisible()
 
     const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
     const allProviders = within(providerToolbar).getByRole('button', { name: /All providers/ })
@@ -1306,9 +1610,9 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
     expect(within(dialog).getByText('OAuth is supported by Prime Agent')).toBeVisible()
-    expect(within(dialog).getByText('0 shown as available · 2 listed in this sample')).toBeVisible()
+    expect(within(dialog).getByText('0 available with current setup · 2 listed by the runtime')).toBeVisible()
     expect(within(dialog).getByText('/login')).toBeVisible()
-    expect(within(dialog).getByText(/This sample never reads or stores credentials/)).toBeVisible()
+    expect(within(dialog).getByText(/Credential material stays on this host/)).toBeVisible()
     expect(within(dialog).getByText('No available models match')).toBeVisible()
 
     await user.click(within(dialog).getByRole('button', { name: 'All models' }))
@@ -1323,7 +1627,7 @@ describe('Prime Continuim renderer', () => {
 
   it('reveals every matching model in explicit batches and resets the batch when filters or the dialog change', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = asNativeFixture(createPreviewRendererApi())
     const catalog = withLargeModelCatalog(await api.loadRuntimeModelCatalog('host-devbox'))
     api.loadRuntimeModelCatalog = vi.fn(async () => structuredClone(catalog))
 
@@ -1362,7 +1666,7 @@ describe('Prime Continuim renderer', () => {
 
   it('retries a recoverable catalog load without enabling model mutation controls', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = asNativeFixture(createPreviewRendererApi())
     const catalog = await api.loadRuntimeModelCatalog('host-devbox')
     const loadRuntimeModelCatalog = vi.fn()
       .mockRejectedValueOnce(new Error('The catalog request timed out.'))
@@ -1376,14 +1680,14 @@ describe('Prime Continuim renderer', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
     expect(await within(dialog).findByText('The catalog request timed out.')).toBeVisible()
     await user.click(within(dialog).getByRole('button', { name: 'Retry loading catalog' }))
-    expect(await within(dialog).findByText('Illustrative sample models')).toBeVisible()
+    expect(await within(dialog).findByText('Models reported by this host')).toBeVisible()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledTimes(2)
     expect(within(dialog).queryByRole('button', { name: /select model|use model|switch model/i })).not.toBeInTheDocument()
   })
 
   it('does not retry a catalog request captured for stale host authority', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = asNativeFixture(createPreviewRendererApi())
     const loadRuntimeModelCatalog = vi.fn(async () => {
       throw new StaleHostAuthorityError()
     })
@@ -1404,7 +1708,7 @@ describe('Prime Continuim renderer', () => {
 
   it('shows Add computer as one keyboard-operable sheet with exact connection and install details', async () => {
     const user = userEvent.setup()
-    render(<App api={createPreviewRendererApi()} />)
+    render(<App api={createNativeUiFixture()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     const sidebarToggle = screen.getByRole('button', { name: 'Open sidebar' })
     await user.click(sidebarToggle)
@@ -1415,10 +1719,9 @@ describe('Prime Continuim renderer', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
     expect(within(dialog).getByText('Discovered aliases')).toBeVisible()
     expect((await within(dialog).findAllByText('ebene@devbox.internal:22')).length).toBeGreaterThan(0)
-    expect(within(dialog).getByText('Preview sample')).toBeVisible()
-    expect(within(dialog).getByText('Host verification')).toBeVisible()
-    expect(within(dialog).getAllByText(/Sample browser preview only; no live host key was checked/i).length).toBeGreaterThan(0)
-    expect(within(dialog).queryByText('Host-key fingerprint')).not.toBeInTheDocument()
+    expect(within(dialog).getByText('Verified by OpenSSH')).toBeVisible()
+    expect(within(dialog).getByText('Host-key fingerprint')).toBeVisible()
+    expect(within(dialog).queryByText(/sample|browser preview|manual host/i)).not.toBeInTheDocument()
     expect(within(dialog).getByText('Readiness check')).toBeVisible()
 
     await user.click(within(dialog).getByText('Show exact install command'))
@@ -1440,7 +1743,7 @@ describe('Prime Continuim renderer', () => {
     const writeText = vi.fn(async () => undefined)
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
     try {
-      render(<App api={createPreviewRendererApi()} />)
+      render(<App api={createNativeUiFixture()} />)
       await screen.findByRole('heading', { name: 'Seamless remote experience' })
       await user.click(screen.getByRole('button', { name: 'Open sidebar' }))
       const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
@@ -1507,7 +1810,7 @@ describe('Prime Continuim renderer', () => {
         recovery: 'repair',
       },
       'Last reported · Runtime verification failed',
-      'Repair or reinstall Prime Continuim on this computer.',
+      'Record diagnostics and contact support before changing local runtime data.',
     ],
     [
       'ready development integrity',
@@ -1584,16 +1887,18 @@ describe('Prime Continuim renderer', () => {
     expect(within(runtimePanel).getByText('Review helper')).toBeVisible()
   })
 
-  it('focuses and clears field-level Add computer errors as they are corrected', async () => {
+  it('omits arbitrary host entry and focuses and clears install-consent errors', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
-    const previewProbe = api.probeComputer.bind(api)
-    api.probeComputer = vi.fn(async (input) => ({
-      ...(await previewProbe(input)),
+    const api = createNativeUiFixture()
+    const discoverComputers = api.discoverComputers.bind(api)
+    api.discoverComputers = vi.fn(async () => (await discoverComputers()).map((computer, index) => ({
+      ...computer,
+      probeComplete: true,
+      requiresInstall: index === 0,
       installAvailable: true,
-      installCommand: "ssh build-preview 'continuim-hostd install --user'",
+      installCommand: "ssh devbox 'continuim-hostd install --user'",
       installDeferredReason: undefined,
-    }))
+    })))
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
@@ -1602,19 +1907,8 @@ describe('Prime Continuim renderer', () => {
     await user.click(within(sidebar).getByRole('button', { name: 'Add computer' }))
     const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
 
-    await user.click(within(dialog).getByText('Preview a manual host'))
-    const host = within(dialog).getByRole('textbox', { name: 'Hostname or SSH alias' })
-    await user.click(within(dialog).getByRole('button', { name: 'Check preview host' }))
-    expect(host).toHaveFocus()
-    expect(host).toHaveAttribute('aria-invalid', 'true')
-    expect(host).toHaveAttribute('aria-describedby', 'add-computer-error')
-    expect(within(dialog).getByRole('alert')).toHaveTextContent(/Enter a hostname or SSH alias/i)
-
-    await user.type(host, 'build-preview')
-    expect(host).toHaveAttribute('aria-invalid', 'false')
-    expect(host).not.toHaveAttribute('aria-describedby')
-    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument()
-    await user.click(within(dialog).getByRole('button', { name: 'Check preview host' }))
+    expect(within(dialog).queryByRole('textbox', { name: 'Hostname or SSH alias' })).not.toBeInTheDocument()
+    expect(within(dialog).getByText('Alias not listed?')).toBeVisible()
 
     const consent = await within(dialog).findByRole('checkbox', { name: /Install the signed Continuim host service/ })
     await waitFor(() => expect(consent).toBeEnabled())
@@ -1741,7 +2035,7 @@ describe('Prime Continuim renderer', () => {
 
   it('labels verification-only host identity results without inventing a fingerprint', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = asNativeFixture(createPreviewRendererApi())
     api.discoverComputers = async () => [
       {
         alias: 'verification-only',
@@ -1770,7 +2064,8 @@ describe('Prime Continuim renderer', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Add computer' })
     expect(await within(dialog).findByText('Host verification')).toBeVisible()
     expect(within(dialog).queryByText('Host-key fingerprint')).not.toBeInTheDocument()
-    expect(within(dialog).getAllByText(/Sample browser preview only; no live host key was checked/i).length).toBeGreaterThan(0)
+    expect(within(dialog).getByText(/Host identity was checked by system OpenSSH/)).toBeVisible()
+    expect(within(dialog).queryByText(/sample|browser preview/i)).not.toBeInTheDocument()
   })
 
   it('opens a real command palette and navigates to a matching durable thread', async () => {
@@ -1795,18 +2090,28 @@ describe('Prime Continuim renderer', () => {
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
 
     await user.keyboard('{Control>}k{/Control}')
-    const companionPalette = await screen.findByRole('dialog', { name: 'Search and commands' })
-    const companionSearch = within(companionPalette).getByRole('combobox', { name: 'Search projects, threads, and commands' })
-    await user.type(companionSearch, 'Companion Preview')
-    await user.click(within(companionPalette).getByRole('option', { name: /Open companion preview/i }))
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Needs you' })).toHaveFocus())
-    await user.click(screen.getByRole('button', { name: 'Desktop' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Search projects, threads, and commands' })).toHaveFocus())
+    const reopenedPalette = await screen.findByRole('dialog', { name: 'Search and commands' })
+    const reopenedSearch = within(reopenedPalette).getByRole('combobox', { name: 'Search projects, threads, and commands' })
+    await user.type(reopenedSearch, 'Companion')
+    expect(within(reopenedPalette).getByText('No matching thread, project, or available command.')).toBeVisible()
+    expect(within(reopenedPalette).queryByRole('option', { name: /companion|mobile|phone/i })).not.toBeInTheDocument()
+  })
+
+  it('does not expose deferred mobile controls or honor the retired Companion route', async () => {
+    window.history.replaceState({}, '', '/?surface=companion')
+    const user = userEvent.setup()
+    render(<App api={createPreviewRendererApi()} />)
+
+    expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Needs you' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Open sidebar' }))
+    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
+    expect(within(sidebar).queryByRole('button', { name: /companion|mobile|phone/i })).not.toBeInTheDocument()
   })
 
   it('closes the command palette with an explicit touch target and ignores its shortcut over another sheet', async () => {
     const user = userEvent.setup()
-    render(<App api={createPreviewRendererApi()} />)
+    render(<App api={createNativeUiFixture()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
     const sidebarTrigger = screen.getByRole('button', { name: 'Open sidebar' })
@@ -1835,99 +2140,6 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getAllByRole('dialog')).toHaveLength(1)
     expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
   })
-
-  it('shows an honest pairing gate and a sample, read-only Companion Preview with stable focus', async () => {
-    const user = userEvent.setup()
-    render(<App api={createPreviewRendererApi()} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
-
-    const sidebarToggle = screen.getByRole('button', { name: 'Open sidebar' })
-    await user.click(sidebarToggle)
-    const sidebar = await screen.findByRole('dialog', { name: 'Projects and threads' })
-    await user.click(within(sidebar).getByRole('button', { name: 'Companion preview' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Mobile companion' })
-    expect(screen.queryByRole('dialog', { name: 'Projects and threads' })).not.toBeInTheDocument()
-    expect(screen.getAllByRole('dialog')).toHaveLength(1)
-    expect(within(dialog).getByRole('heading', { name: 'Phone control isn’t available in this build' })).toBeVisible()
-    expect(within(dialog).getByText(/does not connect a phone or enable remote control/i)).toBeVisible()
-    expect(within(dialog).queryByText('Per-device permissions')).not.toBeInTheDocument()
-    expect(within(dialog).queryByText('relay_pairing_v1')).not.toBeInTheDocument()
-    expect(within(dialog).getByText('Browser preview · sample data')).toBeVisible()
-    expect(within(dialog).queryByRole('button', { name: 'Start pairing' })).not.toBeInTheDocument()
-
-    await user.click(within(dialog).getByRole('button', { name: 'Open companion preview' }))
-    expect(await screen.findByText('Prime Continuim')).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Needs you' })).toHaveFocus())
-    expect(screen.getByText('Browser preview · sample data')).toBeVisible()
-    expect(screen.getByRole('note')).toHaveTextContent(/Read-only preview.*Secure relay unavailable/i)
-    expect(screen.getByRole('navigation', { name: 'Companion navigation' })).toBeVisible()
-
-    await user.click(screen.getByRole('button', { name: 'Threads' }))
-    const selectedThreadRow = screen.getByRole('button', { name: /Seamless remote experience/ })
-    await user.click(selectedThreadRow)
-    const companionThreadHeading = await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await waitFor(() => expect(companionThreadHeading).toHaveFocus())
-    expect(screen.getByText('Replies are read-only in this preview')).toBeVisible()
-    expect(screen.getByText(/This preview never sends a command/i)).toBeVisible()
-    expect(screen.queryByRole('textbox', { name: 'Mobile message' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument()
-
-    const threadArticle = screen.getByRole('article', { name: 'Seamless remote experience' })
-    await user.click(within(threadArticle).getByRole('button', { name: 'Threads' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: /Seamless remote experience/ })).toHaveFocus())
-
-    await user.click(screen.getByRole('button', { name: 'Desktop' }))
-    expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveFocus())
-  })
-
-  it('reuses the safe transcript-body renderer for Companion recent activity', async () => {
-    window.history.replaceState({}, '', '/?surface=companion')
-    const user = userEvent.setup()
-    const api = createPreviewRendererApi()
-    const loadWorkbench = api.loadWorkbench.bind(api)
-    api.loadWorkbench = async () => {
-      const snapshot = await loadWorkbench()
-      const selected = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
-      if (!selected) throw new Error('Expected the selected thread fixture')
-      selected.transcript.push({
-        id: 'companion-markdown-fidelity',
-        kind: 'assistant',
-        author: 'Prime Agent',
-        time: 'Now',
-        body: '### Resident result\n\n- Snapshot persisted\n- Reconnect verified\n\n```ts\nconst durable = true\n```',
-      })
-      return snapshot
-    }
-
-    render(<App api={api} />)
-    expect(await screen.findByRole('heading', { name: 'Needs you' })).toBeVisible()
-    await user.click(screen.getByRole('button', { name: 'Threads' }))
-    await user.click(await screen.findByRole('button', { name: /Seamless remote experience/ }))
-
-    const recentActivity = await screen.findByRole('region', { name: 'Recent activity' })
-    const sharedBody = recentActivity.querySelector('[data-transcript-body-kind="assistant"]')
-    expect(sharedBody).not.toBeNull()
-    expect(within(recentActivity).getByRole('heading', { name: 'Resident result' })).toBeVisible()
-    expect(within(recentActivity).getAllByRole('listitem')).toHaveLength(2)
-    expect(recentActivity.querySelector('pre > code.language-ts')).toHaveTextContent('const durable = true')
-  })
-
-  it('surfaces an uncertain command receipt in mobile Attention', async () => {
-    window.history.replaceState({}, '', '/?surface=companion')
-    const api = createPreviewRendererApi()
-    const loadWorkbench = api.loadWorkbench.bind(api)
-    api.loadWorkbench = async () => ({
-      ...(await loadWorkbench()),
-      composerReceipt: { state: 'uncertain', message: 'Receipt uncertain · verifying with host' },
-    })
-
-    render(<App api={api} />)
-
-    expect(await screen.findByRole('heading', { name: 'Needs you' })).toBeVisible()
-    expect(screen.getByRole('button', { name: /Receipt uncertain · verifying with host/ })).toBeVisible()
-  })
-
   it('keeps an in-flight handoff visible when Escape or the backdrop is used', async () => {
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
@@ -2005,26 +2217,6 @@ describe('Prime Continuim renderer', () => {
       'composer-wrap',
     ])
     expect(threadView?.querySelectorAll('.thread-notices .connection-notice')).toHaveLength(2)
-  })
-
-  it('resets companion scroll and focuses each destination heading', async () => {
-    window.history.replaceState({}, '', '/?surface=companion')
-    const user = userEvent.setup()
-    render(<App api={createPreviewRendererApi()} />)
-    await screen.findByRole('heading', { name: 'Needs you' })
-
-    await user.click(screen.getByRole('button', { name: 'Threads' }))
-    const threadsHeading = await screen.findByRole('heading', { name: 'Threads' })
-    await waitFor(() => expect(threadsHeading).toHaveFocus())
-    await user.click(screen.getByRole('button', { name: /Seamless remote experience/ }))
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Seamless remote experience' })).toHaveFocus())
-
-    const main = screen.getByRole('main')
-    main.scrollTop = 320
-    await user.click(screen.getByRole('button', { name: 'Hosts' }))
-    const hostsHeading = await screen.findByRole('heading', { name: 'Hosts' })
-    await waitFor(() => expect(hostsHeading).toHaveFocus())
-    expect(main.scrollTop).toBe(0)
   })
 
   it('scrolls the command palette active descendant into view during keyboard navigation', async () => {

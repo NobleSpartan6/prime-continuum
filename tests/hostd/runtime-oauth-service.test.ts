@@ -37,7 +37,7 @@ describe("HostService runtime OAuth boundary", () => {
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     try {
-      await service.initialize({ seed: true });
+      await service.initialize();
       const health = await service.handle({
         protocolVersion: PROTOCOL_VERSION,
         requestId: "oauth-disabled-health",
@@ -275,7 +275,7 @@ describe("HostService runtime OAuth boundary", () => {
         close: integrityClose,
       },
     });
-    await service.initialize({ seed: true });
+    await service.initialize();
     const hostId = (await store.getHost()).hostId;
     await service.handle({
       protocolVersion: PROTOCOL_VERSION,
@@ -309,7 +309,7 @@ async function temporaryService(): Promise<{
   const service = new HostService(store, undefined, undefined, {
     runtimeOAuthComposition: composition,
   });
-  await service.initialize({ seed: true });
+  await service.initialize();
   return { service, hostId: (await store.getHost()).hostId, directory, composition };
 }
 

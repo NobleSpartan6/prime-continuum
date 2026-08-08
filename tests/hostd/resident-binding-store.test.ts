@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +24,8 @@ async function fixture(): Promise<{ store: HostStore; directory: string; workspa
   const workspace = join(directory, "workspace");
   await mkdir(workspace, { recursive: true });
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory: workspace });
   return { store, directory, workspaceDirectory: await realpath(workspace) };
 }
 
@@ -34,8 +36,8 @@ function binding(
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-session-1",
     sessionId: "session-1",
@@ -70,10 +72,10 @@ async function captureStoreError(operation: Promise<unknown>, code: string): Pro
   return expectStoreError(operation, code);
 }
 
-async function registerDemoWorkspace(store: HostStore, workspaceDirectory: string): Promise<string> {
+async function registerTestWorkspace(store: HostStore, workspaceDirectory: string): Promise<string> {
   return store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
 }
@@ -81,10 +83,10 @@ async function registerDemoWorkspace(store: HostStore, workspaceDirectory: strin
 describe("HostStore resident workspace authority", () => {
   it("persists a canonical private binding, refreshes it, and never resurrects it after completion", async () => {
     const { store, directory, workspaceDirectory } = await fixture();
-    const canonical = await registerDemoWorkspace(store, workspaceDirectory);
+    const canonical = await registerTestWorkspace(store, workspaceDirectory);
     expect(canonical).toBe(workspaceDirectory);
-    await expect(store.resolveWorkspaceDirectory("demo-thread", "demo-execution-1")).resolves.toBe(canonical);
-    await expect(store.getResidentSessionBinding("demo-thread", "demo-execution-1")).resolves.toBeUndefined();
+    await expect(store.resolveWorkspaceDirectory("test-thread", "test-execution-1")).resolves.toBe(canonical);
+    await expect(store.getResidentSessionBinding("test-thread", "test-execution-1")).resolves.toBeUndefined();
 
     const initial = binding(canonical);
     await store.persistResidentSessionBinding(initial);
@@ -92,7 +94,7 @@ describe("HostStore resident workspace authority", () => {
 
     const restarted = new HostStore(directory);
     await restarted.initialize();
-    const restored = await restarted.getResidentSessionBinding("demo-thread", "demo-execution-1");
+    const restored = await restarted.getResidentSessionBinding("test-thread", "test-execution-1");
     expect(restored).toEqual(initial);
     expect(Object.isFrozen(restored)).toBe(true);
 
@@ -107,7 +109,7 @@ describe("HostStore resident workspace authority", () => {
 
     const afterEndRestart = new HostStore(directory);
     await afterEndRestart.initialize();
-    expect(await afterEndRestart.getResidentSessionBinding("demo-thread", "demo-execution-1")).toBeUndefined();
+    expect(await afterEndRestart.getResidentSessionBinding("test-thread", "test-execution-1")).toBeUndefined();
     expect(await afterEndRestart.listResidentSessionBindings()).toEqual([]);
     await expectStoreError(afterEndRestart.persistResidentSessionBinding(refreshed), "RESIDENT_BINDING_COMPLETED");
 
@@ -126,13 +128,14 @@ describe("HostStore resident workspace authority", () => {
 
   it("rejects stale generations, unavailable paths, and workspace-path substitution", async () => {
     const { store, directory, workspaceDirectory } = await fixture();
+    await atomicWriteJson(store.paths.workspaceAuthorities, { version: 1, authorities: [] });
     await expectStoreError(
-      store.resolveWorkspaceDirectory("demo-thread", "demo-execution-1"),
+      store.resolveWorkspaceDirectory("test-thread", "test-execution-1"),
       "WORKSPACE_AUTHORITY_NOT_FOUND",
     );
     await expectStoreError(
       store.registerWorkspaceAuthority({
-        threadId: "demo-thread",
+        threadId: "test-thread",
         executionGenerationId: "stale-generation",
         workspaceDirectory,
       }),
@@ -141,21 +144,21 @@ describe("HostStore resident workspace authority", () => {
     await expectStoreError(
       store.registerWorkspaceAuthority({
         threadId: "missing-thread",
-        executionGenerationId: "demo-execution-1",
+        executionGenerationId: "test-execution-1",
         workspaceDirectory,
       }),
       "THREAD_NOT_FOUND",
     );
     await expectStoreError(
       store.registerWorkspaceAuthority({
-        threadId: "demo-thread",
-        executionGenerationId: "demo-execution-1",
+        threadId: "test-thread",
+        executionGenerationId: "test-execution-1",
         workspaceDirectory: join(directory, "missing-workspace"),
       }),
       "WORKSPACE_PATH_UNAVAILABLE",
     );
 
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     const otherWorkspace = join(directory, "other-workspace");
     await mkdir(otherWorkspace);
     await expectStoreError(
@@ -170,11 +173,11 @@ describe("HostStore resident workspace authority", () => {
 
   it("rejects cross-thread session reuse and completes only the exact active binding", async () => {
     const { store, workspaceDirectory } = await fixture();
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     await addSecondThread(store);
     await store.registerWorkspaceAuthority({
       threadId: "second-thread",
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
       workspaceDirectory,
     });
 
@@ -182,7 +185,7 @@ describe("HostStore resident workspace authority", () => {
     await store.persistResidentSessionBinding(first);
     const reused = binding(workspaceDirectory, {
       threadId: "second-thread",
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
       sessionId: "different-session",
       sessionFile: join(workspaceDirectory, ".prime-agent", "different-session.jsonl"),
     });
@@ -190,7 +193,7 @@ describe("HostStore resident workspace authority", () => {
 
     const second = binding(workspaceDirectory, {
       threadId: "second-thread",
-      executionGenerationId: "demo-execution-2",
+      executionGenerationId: "test-execution-2",
       activeSessionId: "active-session-2",
       sessionId: "session-2",
       sessionFile: join(workspaceDirectory, ".prime-agent", "session-2.jsonl"),
@@ -209,11 +212,11 @@ describe("HostStore resident workspace authority", () => {
 
   it("degrades only resident continuity when an active binding is stale against durable thread authority", async () => {
     const { store, directory, workspaceDirectory } = await fixture();
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     await store.persistResidentSessionBinding(binding(workspaceDirectory));
     const catalog = await store.getCatalogSnapshot();
     const thread = catalog.threads[0];
-    if (!thread) throw new Error("seed thread missing");
+    if (!thread) throw new Error("test thread missing");
     const changedGeneration = "unexpected-execution-generation";
     await atomicWriteJson(store.paths.threads, {
       version: 1,
@@ -229,11 +232,11 @@ describe("HostStore resident workspace authority", () => {
     });
 
     const restarted = new HostStore(directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     expect((await restarted.getCatalogSnapshot()).threads[0]?.currentLocation.executionGenerationId).toBe(
       changedGeneration,
     );
-    await expect(restarted.getThreadSnapshot("demo-thread")).resolves.toBeDefined();
+    await expect(restarted.getThreadSnapshot("test-thread")).resolves.toBeDefined();
     await expectStoreError(restarted.listResidentSessionBindings(), "RESIDENT_SUBSYSTEM_DEGRADED");
   });
 
@@ -243,13 +246,13 @@ describe("HostStore resident workspace authority", () => {
     await writeFile(store.paths.residentSessionBindings, malformed);
 
     const restarted = new HostStore(directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     await expect(restarted.getCatalogSnapshot()).resolves.toMatchObject({
-      projects: [expect.objectContaining({ projectId: "demo-project" })],
-      threads: [expect.objectContaining({ threadId: "demo-thread" })],
+      projects: [expect.objectContaining({ projectId: "test-project" })],
+      threads: [expect.objectContaining({ threadId: "test-thread" })],
     });
-    await expect(restarted.getThreadSnapshot("demo-thread")).resolves.toMatchObject({
-      thread: { threadId: "demo-thread" },
+    await expect(restarted.getThreadSnapshot("test-thread")).resolves.toMatchObject({
+      thread: { threadId: "test-thread" },
     });
     expect(await readFile(store.paths.residentSessionBindings)).toEqual(malformed);
 
@@ -259,9 +262,9 @@ describe("HostStore resident workspace authority", () => {
     );
     const candidate = binding(workspaceDirectory);
     const operations: Array<() => Promise<unknown>> = [
-      () => registerDemoWorkspace(restarted, workspaceDirectory),
-      () => restarted.resolveWorkspaceDirectory("demo-thread", "demo-execution-1"),
-      () => restarted.getResidentSessionBinding("demo-thread", "demo-execution-1"),
+      () => registerTestWorkspace(restarted, workspaceDirectory),
+      () => restarted.resolveWorkspaceDirectory("test-thread", "test-execution-1"),
+      () => restarted.getResidentSessionBinding("test-thread", "test-execution-1"),
       () => restarted.persistResidentSessionBinding(candidate),
       () => restarted.completeResidentSessionBinding(candidate),
     ];
@@ -277,18 +280,18 @@ describe("HostStore resident workspace authority", () => {
 
   it("retains an unavailable active workspace fault until repair and restart without taking down base state", async () => {
     const { store, directory, workspaceDirectory } = await fixture();
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     const active = binding(workspaceDirectory);
     await store.persistResidentSessionBinding(active);
     await rm(workspaceDirectory, { recursive: true, force: true });
 
     const restarted = new HostStore(directory);
-    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    await expect(restarted.initialize()).resolves.toBeUndefined();
     await expect(restarted.getCatalogSnapshot()).resolves.toMatchObject({
-      projects: [expect.objectContaining({ projectId: "demo-project" })],
-      threads: [expect.objectContaining({ threadId: "demo-thread" })],
+      projects: [expect.objectContaining({ projectId: "test-project" })],
+      threads: [expect.objectContaining({ threadId: "test-thread" })],
     });
-    await expect(restarted.getThreadSnapshot("demo-thread")).resolves.toBeDefined();
+    await expect(restarted.getThreadSnapshot("test-thread")).resolves.toBeDefined();
     const retained = await captureStoreError(
       restarted.listResidentSessionBindings(),
       "RESIDENT_SUBSYSTEM_DEGRADED",
@@ -309,13 +312,13 @@ describe("HostStore resident workspace authority", () => {
 
   it("prevents an active resident thread from changing execution generation", async () => {
     const { store, workspaceDirectory } = await fixture();
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     await store.persistResidentSessionBinding(binding(workspaceDirectory));
-    const snapshot = await store.getThreadSnapshot("demo-thread");
-    const changed = snapshotWithThread(snapshot, "demo-thread", "changed-execution-generation");
+    const snapshot = await store.getThreadSnapshot("test-thread");
+    const changed = snapshotWithThread(snapshot, "test-thread", "changed-execution-generation");
     await expectStoreError(store.upsertThread(changed.thread, changed), "RESIDENT_SESSION_ACTIVE");
-    expect((await store.getThreadSnapshot("demo-thread")).thread.currentLocation.executionGenerationId).toBe(
-      "demo-execution-1",
+    expect((await store.getThreadSnapshot("test-thread")).thread.currentLocation.executionGenerationId).toBe(
+      "test-execution-1",
     );
   });
 });
@@ -323,17 +326,17 @@ describe("HostStore resident workspace authority", () => {
 describe("HostStore abort admission", () => {
   it("rejects offline and idle aborts, then uses the resident lease path for an owned prompt", async () => {
     const { store, workspaceDirectory } = await fixture();
-    await registerDemoWorkspace(store, workspaceDirectory);
+    await registerTestWorkspace(store, workspaceDirectory);
     await store.persistResidentSessionBinding(binding(workspaceDirectory));
     const host = await store.getHost();
-    const before = await store.getThreadSnapshot("demo-thread");
+    const before = await store.getThreadSnapshot("test-thread");
     const offline = abortCommand(host.hostId, "offline-abort");
     const offlineAdmission = await store.admitCommand(offline, false);
     expect(offlineAdmission.receipt).toMatchObject({
       status: "rejected",
       error: { code: "LIVE_CONNECTION_REQUIRED", retryable: true },
     });
-    expect(await store.getThreadSnapshot("demo-thread")).toEqual(before);
+    expect(await store.getThreadSnapshot("test-thread")).toEqual(before);
 
     const live = abortCommand(host.hostId, "live-abort");
     const liveAdmission = await store.admitCommand(live, true);
@@ -341,7 +344,7 @@ describe("HostStore abort admission", () => {
       status: "rejected",
       error: { code: "RESIDENT_SESSION_IDLE" },
     });
-    expect(await store.getThreadSnapshot("demo-thread")).toEqual(before);
+    expect(await store.getThreadSnapshot("test-thread")).toEqual(before);
 
     const ownedPrompt: CommandEnvelope = {
       ...live,
@@ -393,8 +396,8 @@ describe("HostStore abort admission", () => {
 });
 
 async function addSecondThread(store: HostStore): Promise<void> {
-  const source = await store.getThreadSnapshot("demo-thread");
-  const snapshot = snapshotWithThread(source, "second-thread", "demo-execution-2");
+  const source = await store.getThreadSnapshot("test-thread");
+  const snapshot = snapshotWithThread(source, "second-thread", "test-execution-2");
   await store.upsertThread(snapshot.thread, snapshot);
 }
 
@@ -430,9 +433,9 @@ function abortCommand(hostId: string, commandId: string): CommandEnvelope {
     deviceId: "device-test",
     commandId,
     expectedHostId: hostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: new Date().toISOString(),
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: { kind: "abort", reason: "Stop the active task" },
   };
 }

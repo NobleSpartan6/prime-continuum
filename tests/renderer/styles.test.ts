@@ -59,7 +59,7 @@ describe('renderer style contracts', () => {
     expect(compactMinimumLayout).toMatch(/\.composer__connection--validation\s*{[^}]*display:\s*inline-flex;/s)
     expect(css).toMatch(/\.composer--compact\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;/s)
     expect(css).toMatch(/\.composer-wrap--compact \.session-continuity\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
-    expect(css).toMatch(/\.companion-card-list strong\s*{[^}]*-webkit-line-clamp:\s*2;[^}]*line-clamp:\s*2;/s)
+    expect(css).not.toMatch(/\.companion-|\.pair-mobile-/)
   })
 
   it('keeps resident setup controls reachable in a short zoomed viewport', async () => {

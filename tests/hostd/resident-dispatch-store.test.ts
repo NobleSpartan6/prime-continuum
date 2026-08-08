@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1104,10 +1105,11 @@ async function createFixture(): Promise<{
   await mkdir(workspace, { recursive: true });
   const workspaceDirectory = await realpath(workspace);
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const residentBinding = binding(workspaceDirectory);
@@ -1119,8 +1121,8 @@ function binding(workspaceDirectory: string): ResidentSessionBinding {
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-session-dispatch-1",
     sessionId: "session-dispatch-1",
@@ -1149,9 +1151,9 @@ function residentCommand(
     deviceId: "resident-device-1",
     commandId,
     expectedHostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-07T20:01:00.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: kind === "prompt"
       ? { kind, text: "Inspect the current workspace through the resident session." }
       : { kind, reason: "Stop the current resident turn." },
@@ -1284,7 +1286,7 @@ async function commandStatuses(store: HostStore, commandId: string): Promise<str
 }
 
 async function residentIdleEvents(store: HostStore): Promise<unknown[]> {
-  const body = await readFile(store.paths.eventJournal, "utf8");
+  const body = await readEventJournal(store);
   return body
     .split("\n")
     .filter(Boolean)
@@ -1293,12 +1295,21 @@ async function residentIdleEvents(store: HostStore): Promise<unknown[]> {
 }
 
 async function residentAbortIdleEvents(store: HostStore): Promise<unknown[]> {
-  const body = await readFile(store.paths.eventJournal, "utf8");
+  const body = await readEventJournal(store);
   return body
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line) as { type: string })
     .filter((record) => record.type === "resident.abort_idle_observed");
+}
+
+async function readEventJournal(store: HostStore): Promise<string> {
+  try {
+    return await readFile(store.paths.eventJournal, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return "";
+    throw error;
+  }
 }
 
 async function mutateReceipt(

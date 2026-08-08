@@ -5,10 +5,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway } from "../../src/hostd/gateway";
 import {
   HostService,
+  SSH_BRIDGE_SESSION,
   TRUSTED_USER_SESSION,
+  type HostSessionContext,
   type RuntimeIntegrityReadinessProvider,
 } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
@@ -18,6 +21,7 @@ import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
   type CommandEnvelope,
   type HealthSnapshot,
@@ -115,6 +119,101 @@ describe("runtime integrity health contract", () => {
 });
 
 describe("HostService runtime integrity readiness", () => {
+  it("advertises and consumes one trusted-local retry without replay", async () => {
+    let current = runtimeSnapshot("failed");
+    const retry = vi.fn(() => {
+      current = runtimeSnapshot("initializing");
+      return true;
+    });
+    const provider: RuntimeIntegrityReadinessProvider = {
+      snapshot: () => current,
+      retry,
+    };
+    const { service, store } = await temporaryService(provider);
+    const host = await store.getHost();
+
+    expect((await healthSnapshot(service)).capabilities).toContain(RUNTIME_INTEGRITY_RETRY_CAPABILITY);
+    expect((await healthSnapshot(service, SSH_BRIDGE_SESSION)).capabilities).not.toContain(
+      RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+    );
+
+    expect(await retryRuntimeIntegrity(service, host.hostId)).toMatchObject({
+      ok: true,
+      method: "runtime.integrity.retry",
+      result: { status: "initializing" },
+    });
+    expect(retry).toHaveBeenCalledOnce();
+    expect((await healthSnapshot(service)).capabilities).not.toContain(RUNTIME_INTEGRITY_RETRY_CAPABILITY);
+
+    expect(await retryRuntimeIntegrity(service, host.hostId)).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_INTEGRITY_RETRY_UNAVAILABLE", retryable: false },
+    });
+    expect(retry).toHaveBeenCalledOnce();
+    await service.close();
+  });
+
+  it("rejects runtime retry from SSH, relay, or a different host before invoking the provider", async () => {
+    const retry = vi.fn(() => true);
+    const provider: RuntimeIntegrityReadinessProvider = {
+      snapshot: () => runtimeSnapshot("failed"),
+      retry,
+    };
+    const { service, store } = await temporaryService(provider);
+    const host = await store.getHost();
+    const relay = { transport: "relay", channel: {} } as HostSessionContext;
+
+    for (const context of [SSH_BRIDGE_SESSION, relay]) {
+      expect(await retryRuntimeIntegrity(service, host.hostId, context)).toMatchObject({
+        ok: false,
+        error: { code: "REMOTE_RUNTIME_INTEGRITY_RETRY_FORBIDDEN", retryable: false },
+      });
+    }
+    expect(await retryRuntimeIntegrity(service, "different-host")).toMatchObject({
+      ok: false,
+      error: { code: "HOST_AUTHORITY_MISMATCH", retryable: false },
+    });
+    expect(retry).not.toHaveBeenCalled();
+    await service.close();
+  });
+
+  it("withholds retry capability when the callback or retryable failed state is absent", async () => {
+    const retry = vi.fn(() => false);
+    const providers: RuntimeIntegrityReadinessProvider[] = [
+      { snapshot: () => runtimeSnapshot("failed") },
+      { snapshot: () => runtimeSnapshot("ready"), retry },
+    ];
+    for (const provider of providers) {
+      const { service, store } = await temporaryService(provider);
+      const host = await store.getHost();
+      expect((await healthSnapshot(service)).capabilities).not.toContain(RUNTIME_INTEGRITY_RETRY_CAPABILITY);
+      expect(await retryRuntimeIntegrity(service, host.hostId)).toMatchObject({
+        ok: false,
+        error: { code: "RUNTIME_INTEGRITY_RETRY_UNAVAILABLE" },
+      });
+      await service.close();
+    }
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("reports a provider race without invoking the retry callback again", async () => {
+    const retry = vi.fn(() => false);
+    const provider: RuntimeIntegrityReadinessProvider = {
+      snapshot: () => runtimeSnapshot("failed"),
+      retry,
+    };
+    const { service, store } = await temporaryService(provider);
+    const host = await store.getHost();
+
+    expect((await healthSnapshot(service)).capabilities).toContain(RUNTIME_INTEGRITY_RETRY_CAPABILITY);
+    expect(await retryRuntimeIntegrity(service, host.hostId)).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_INTEGRITY_RETRY_REJECTED", retryable: true },
+    });
+    expect(retry).toHaveBeenCalledOnce();
+    await service.close();
+  });
+
   it.each([
     ["initializing", "starting"],
     ["ready", "ready"],
@@ -334,21 +433,22 @@ async function temporaryService(
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
   const service = new HostService(store, gateway, undefined, { runtimeIntegrityProvider });
-  await service.initialize({ seed: true });
+  await service.initialize();
   if (gateway?.continuity === "resident") {
     const workspacePath = join(directory, "workspace");
     await mkdir(workspacePath, { recursive: true });
     const workspaceDirectory = await realpath(workspacePath);
+    await bootstrapTestWorkspace(store, { workspaceDirectory });
     await store.registerWorkspaceAuthority({
-      threadId: "demo-thread",
-      executionGenerationId: "demo-execution-1",
+      threadId: "test-thread",
+      executionGenerationId: "test-execution-1",
       workspaceDirectory,
     });
     await store.persistResidentSessionBinding({
       bindingVersion: 1,
       lifecycle: "resident",
-      threadId: "demo-thread",
-      executionGenerationId: "demo-execution-1",
+      threadId: "test-thread",
+      executionGenerationId: "test-execution-1",
       workspaceDirectory,
       activeSessionId: "runtime-health-active-session",
       sessionId: "runtime-health-session",
@@ -369,7 +469,10 @@ async function temporaryService(
   return { service, store };
 }
 
-async function healthSnapshot(service: HostService): Promise<HealthSnapshot> {
+async function healthSnapshot(
+  service: HostService,
+  context: HostSessionContext = TRUSTED_USER_SESSION,
+): Promise<HealthSnapshot> {
   const response = await service.handle(
     {
       protocolVersion: PROTOCOL_VERSION,
@@ -377,10 +480,26 @@ async function healthSnapshot(service: HostService): Promise<HealthSnapshot> {
       method: "health.get",
       payload: {},
     },
-    TRUSTED_USER_SESSION,
+    context,
   );
   if (!response.ok || response.method !== "health.get") throw new Error("health request failed");
   return response.result;
+}
+
+async function retryRuntimeIntegrity(
+  service: HostService,
+  expectedHostId: string,
+  context: HostSessionContext = TRUSTED_USER_SESSION,
+) {
+  return service.handle(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "runtime-integrity-retry",
+      method: "runtime.integrity.retry",
+      payload: { expectedHostId },
+    },
+    context,
+  );
 }
 
 function runtimeCommand(hostId: string, commandId: string): CommandEnvelope {
@@ -389,9 +508,9 @@ function runtimeCommand(hostId: string, commandId: string): CommandEnvelope {
     deviceId: "runtime-readiness-device",
     commandId,
     expectedHostId: hostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-06T00:00:02.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: { kind: "prompt", text: "Run only through a verified Prime Agent runtime." },
   };
 }

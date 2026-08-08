@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -299,11 +300,12 @@ async function createFixture(): Promise<{
   const workspace = join(directory, "workspace");
   await mkdir(workspace, { recursive: true });
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
   const workspaceDirectory = await realpath(workspace);
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const residentBinding = binding(workspaceDirectory);
@@ -315,8 +317,8 @@ function binding(workspaceDirectory: string): ResidentSessionBinding {
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-session-model-1",
     sessionId: "session-model-1",
@@ -338,14 +340,14 @@ function binding(workspaceDirectory: string): ResidentSessionBinding {
 function modelSelectionCommand(
   expectedHostId: string,
   commandId: string,
-  executionGenerationId = "demo-execution-1",
+  executionGenerationId = "test-execution-1",
 ): CommandEnvelope {
   return {
     protocolVersion: PROTOCOL_VERSION,
     deviceId: "model-device-1",
     commandId,
     expectedHostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-07T18:01:00.000Z",
     expectedExecutionGenerationId: executionGenerationId,
     command: { kind: "model.select", providerId: "openai", modelId: "gpt-5" },

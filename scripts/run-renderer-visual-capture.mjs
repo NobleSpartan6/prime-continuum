@@ -24,8 +24,6 @@ const expectedTargets = [
   ['resident-end-dialog-short-320', 320, 256, 'resident-end-review', undefined],
   ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
-  ['companion-attention-390', 390, 844, 'nonretryable-uncertainty', 'companion'],
-  ['companion-attention-320', 320, 704, 'nonretryable-uncertainty', 'companion'],
 ]
 const obsoleteCaptures = [
   'desktop.png',
@@ -33,6 +31,8 @@ const obsoleteCaptures = [
   'desktop-320.png',
   'companion-390.png',
   'companion-320.png',
+  'companion-attention-390.png',
+  'companion-attention-320.png',
 ]
 
 // Electron's RunAsNode mode is required by the packaged hostd launcher, but a

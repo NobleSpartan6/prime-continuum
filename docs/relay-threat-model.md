@@ -454,7 +454,7 @@ A public relay additionally requires:
 Until the relevant gates pass, Prime Agent must not claim that:
 
 - a phone or another desktop can control a host;
-- the Companion Preview is a paired client;
+- a desktop-only renderer surface is a paired client;
 - a displayed pairing policy is a working pairing protocol;
 - Phase 3A generated, accepted, or stored a host private key, ticket PSK, or ticket verifier;
 - the recommended Noise patterns or candidate dependencies are selected, installed, audited, interoperable, or shipped;
@@ -470,7 +470,7 @@ Until the relevant gates pass, Prime Agent must not claim that:
 - public relay availability, anonymity, traffic-analysis resistance, or malicious-relay availability has been proven; or
 - endpoint compromise can be repaired by transport cryptography.
 
-The current product-honest state remains a read-only same-device Companion Preview with pairing and mobile mutations disabled.
+The current product-honest state exposes no mobile surface. Pairing and mobile mutations remain disabled.
 
 ## Open security decisions
 

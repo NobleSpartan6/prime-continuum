@@ -48,6 +48,7 @@ export const CapabilitySchema = z
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
 
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
+export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
@@ -1270,6 +1271,19 @@ export const HealthSnapshotSchema = z
         message: `${RUNTIME_INTEGRITY_CAPABILITY} must be advertised if and only if runtimeIntegrity is present`,
       });
     }
+    const advertisesRuntimeIntegrityRetry = health.capabilities.includes(
+      RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+    );
+    if (
+      advertisesRuntimeIntegrityRetry &&
+      (health.runtimeIntegrity?.status !== "failed" || !health.runtimeIntegrity.retryable)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["capabilities"],
+        message: `${RUNTIME_INTEGRITY_RETRY_CAPABILITY} requires a retryable failed runtime integrity snapshot`,
+      });
+    }
     if (!health.runtimeIntegrity) return;
     const expectedServiceState = health.runtimeIntegrity.status === "initializing"
       ? "starting"
@@ -1532,6 +1546,11 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   z.object({ ...RequestBase, method: z.literal("health.get"), payload: z.object({}) }),
   z.object({
     ...RequestBase,
+    method: z.literal("runtime.integrity.retry"),
+    payload: z.object({ expectedHostId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("runtime.model_catalog"),
     payload: z.object({ expectedHostId: IdSchema }).strict(),
   }),
@@ -1652,6 +1671,11 @@ const SuccessBase = {
 
 export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("health.get"), result: HealthSnapshotSchema }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("runtime.integrity.retry"),
+    result: RuntimeIntegritySnapshotSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("runtime.model_catalog"), result: RuntimeModelCatalogSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.start"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.status"), result: RuntimeOAuthSessionSnapshotSchema }),
@@ -1677,6 +1701,7 @@ export const HostIpcErrorResponseSchema = z.object({
   requestId: IdSchema,
   method: z.enum([
     "health.get",
+    "runtime.integrity.retry",
     "runtime.model_catalog",
     "oauth.session.start",
     "oauth.session.status",

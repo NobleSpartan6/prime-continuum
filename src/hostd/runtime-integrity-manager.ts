@@ -24,6 +24,11 @@ import {
 } from "./ownership-lease";
 import { getHostDataPaths, type HostDataPaths } from "./paths";
 import type { EmbeddedRuntimeAttestation } from "./runtime-attestation";
+import {
+  assertSameRuntimeFileIdentity,
+  isCtimeOnlyRuntimeFileIdentityChange,
+  retryOnceAfterCtimeOnlyIdentityChange,
+} from "./runtime-file-identity";
 
 const MAX_RUNTIME_POINTER_BYTES = 64 * 1024;
 const MAX_RUNTIME_MANIFEST_BYTES = 256 * 1024;
@@ -563,7 +568,12 @@ export class RuntimeIntegrityManager {
       return await verifyRuntimeDirectory(finalDirectory, this.attestation, undefined, signal);
     } catch (error) {
       const cause = asError(error, "Installed runtime verification failed");
-      if (error instanceof RuntimeIntegrityCancelledError) throw error;
+      if (
+        error instanceof RuntimeIntegrityCancelledError ||
+        error instanceof RuntimeIntegrityTransientVerificationError
+      ) {
+        throw error;
+      }
       if (isTransientRuntimeFilesystemError(error)) {
         throw new RuntimeIntegrityTransientVerificationError("filesystem_contention", cause);
       }
@@ -1125,6 +1135,17 @@ async function hashRegularFile(
   destinationPath?: string,
   signal?: AbortSignal,
 ): Promise<{ size: number }> {
+  return await retryCtimeRefreshOnce(async () =>
+    await hashRegularFileOnce(sourcePath, expectedSha256, destinationPath, signal)
+  );
+}
+
+async function hashRegularFileOnce(
+  sourcePath: string,
+  expectedSha256: string,
+  destinationPath?: string,
+  signal?: AbortSignal,
+): Promise<{ size: number }> {
   if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const pathBefore = await requirePlainRegularFile(sourcePath, "runtime payload file", signal);
   if (pathBefore.size > BigInt(MAX_RUNTIME_FILE_BYTES)) throw new Error(`Runtime payload file exceeds its bound: ${sourcePath}`);
@@ -1134,7 +1155,7 @@ async function hashRegularFile(
   try {
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const sourceBefore = await source.stat({ bigint: true });
-    assertSameFileIdentity(pathBefore, sourceBefore, "Runtime payload changed before open");
+    assertSameRuntimeFileIdentity(pathBefore, sourceBefore, "Runtime payload changed before open");
     if (destinationPath) {
       destination = await open(destinationPath, "wx", 0o600);
       destinationCreated = true;
@@ -1169,8 +1190,8 @@ async function hashRegularFile(
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const sourceAfter = await source.stat({ bigint: true });
     const pathAfter = await requirePlainRegularFile(sourcePath, "runtime payload file", signal);
-    assertSameFileIdentity(sourceBefore, sourceAfter, "Runtime payload changed while hashing");
-    assertSameFileIdentity(sourceBefore, pathAfter, "Runtime payload path changed while hashing");
+    assertSameRuntimeFileIdentity(sourceBefore, sourceAfter, "Runtime payload changed while hashing");
+    assertSameRuntimeFileIdentity(sourceBefore, pathAfter, "Runtime payload path changed while hashing");
     return { size };
   } catch (error) {
     await destination?.close().catch(() => undefined);
@@ -1209,6 +1230,17 @@ async function readBoundedRegularFile(
   label: string,
   signal?: AbortSignal,
 ): Promise<Buffer> {
+  return await retryCtimeRefreshOnce(async () =>
+    await readBoundedRegularFileOnce(path, maxBytes, label, signal)
+  );
+}
+
+async function readBoundedRegularFileOnce(
+  path: string,
+  maxBytes: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
   if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const pathBefore = await requirePlainRegularFile(path, label, signal);
   if (pathBefore.size <= 0n || pathBefore.size > BigInt(maxBytes)) {
@@ -1218,13 +1250,13 @@ async function readBoundedRegularFile(
   try {
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const before = await handle.stat({ bigint: true });
-    assertSameFileIdentity(pathBefore, before, `${label} changed before open`);
+    assertSameRuntimeFileIdentity(pathBefore, before, `${label} changed before open`);
     const bytes = await handle.readFile();
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
     const after = await handle.stat({ bigint: true });
     const pathAfter = await requirePlainRegularFile(path, label, signal);
-    assertSameFileIdentity(before, after, `${label} changed while reading`);
-    assertSameFileIdentity(before, pathAfter, `${label} path changed while reading`);
+    assertSameRuntimeFileIdentity(before, after, `${label} changed while reading`);
+    assertSameRuntimeFileIdentity(before, pathAfter, `${label} path changed while reading`);
     if (bytes.byteLength !== Number(before.size)) throw new Error(`${label} changed size while reading`);
     return bytes;
   } finally {
@@ -1408,17 +1440,14 @@ function assertContainedPath(root: string, target: string, label: string): void 
   }
 }
 
-function assertSameFileIdentity(left: BigIntStats, right: BigIntStats, message: string): void {
-  if (
-    !right.isFile() ||
-    right.nlink !== 1n ||
-    left.dev !== right.dev ||
-    left.ino !== right.ino ||
-    left.size !== right.size ||
-    left.mtimeNs !== right.mtimeNs ||
-    left.ctimeNs !== right.ctimeNs
-  ) {
-    throw new Error(message);
+async function retryCtimeRefreshOnce<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await retryOnceAfterCtimeOnlyIdentityChange(operation);
+  } catch (error) {
+    if (isCtimeOnlyRuntimeFileIdentityChange(error)) {
+      throw new RuntimeIntegrityTransientVerificationError("filesystem_contention", error);
+    }
+    throw error;
   }
 }
 

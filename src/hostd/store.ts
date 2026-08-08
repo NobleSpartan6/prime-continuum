@@ -2047,12 +2047,6 @@ export interface HostStoreOptions {
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
 
-export interface SeedResult {
-  seeded: boolean;
-  project?: SavedProject;
-  thread?: ThreadSummary;
-}
-
 export interface CommandAdmission {
   receipt: CommandReceipt;
   duplicate: boolean;
@@ -2120,9 +2114,9 @@ export class HostStore {
     this.residentProjectionLineageLimit = lineageLimit;
   }
 
-  async initialize(options: { seed?: boolean } = {}): Promise<SeedResult> {
+  async initialize(): Promise<void> {
     return this.exclusive(async () => {
-      if (this.initialized) return { seeded: false };
+      if (this.initialized) return;
       await Promise.all([
         ensurePrivateDirectory(this.paths.root),
         ensurePrivateDirectory(this.paths.snapshots),
@@ -2251,15 +2245,6 @@ export class HostStore {
       await this.recoverInterruptedResidentDispatchesUnlocked();
 
       this.initialized = true;
-      if (options.seed !== true) return { seeded: false };
-      return this.seedIfEmptyUnlocked();
-    });
-  }
-
-  async seedIfEmpty(): Promise<SeedResult> {
-    return this.exclusive(async () => {
-      this.assertInitialized();
-      return this.seedIfEmptyUnlocked();
     });
   }
 
@@ -7332,86 +7317,6 @@ export class HostStore {
       this.initialized = false;
       throw error;
     }
-  }
-
-  private async seedIfEmptyUnlocked(): Promise<SeedResult> {
-    const [host, projects, threads] = await Promise.all([
-      this.readHostUnlocked(),
-      this.readProjectsUnlocked(),
-      this.readThreadsUnlocked(),
-    ]);
-    if (projects.length !== 0 || threads.length !== 0) return { seeded: false };
-
-    const createdAt = now();
-    const project = SavedProjectSchema.parse({
-      projectId: "demo-project",
-      hostId: host.hostId,
-      workspaceId: "demo-workspace",
-      displayName: "Prime Agent Demo",
-      lastOpenedAt: createdAt,
-    });
-    const location = {
-      hostId: host.hostId,
-      projectId: project.projectId,
-      workspaceId: project.workspaceId,
-      executionGenerationId: "demo-execution-1",
-    };
-    const cursor = {
-      threadId: "demo-thread",
-      executionGenerationId: location.executionGenerationId,
-      generation: "demo-generation-1",
-      sequence: 1,
-    };
-    const thread = ThreadSummarySchema.parse({
-      threadId: "demo-thread",
-      title: "Welcome to Prime Agent",
-      projectIdentity: project.projectId,
-      currentLocation: location,
-      status: "idle",
-      recap: "Host service is ready. No agent run has started.",
-      unread: false,
-      updatedAt: createdAt,
-      lastKnownCursor: cursor,
-    });
-    const text =
-      "This is a local demonstration thread created by prime-agent-hostd. It contains no simulated agent output or repository changes.";
-    const block = {
-      blockId: "demo-status-1",
-      kind: "system" as const,
-      text,
-      createdAt,
-      sequence: 1,
-    };
-    const snapshot = ThreadProjectionSnapshotSchema.parse({
-      snapshotVersion: SNAPSHOT_VERSION,
-      generatedAt: createdAt,
-      thread,
-      transcriptBlockIndex: [
-        {
-          blockId: block.blockId,
-          kind: block.kind,
-          sequence: block.sequence,
-          byteLength: Buffer.byteLength(block.text, "utf8"),
-          materialized: true,
-        },
-      ],
-      materializedRecentBlocks: [block],
-      queueState: { pendingCommandIds: [], paused: false },
-      approvals: [],
-      childAgents: [],
-      goals: [],
-      schedules: [],
-      git: { stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
-      evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
-      pendingAttention: [],
-      latestCursor: cursor,
-    });
-
-    await atomicWriteJson(this.paths.projects, { version: 1, projects: [project] });
-    await atomicWriteJson(this.paths.threads, { version: 1, threads: [thread] });
-    await atomicWriteJson(this.snapshotPath(thread.threadId), snapshot);
-    await this.appendEventUnlocked({ type: "catalog.seeded", threadId: thread.threadId });
-    return { seeded: true, project, thread };
   }
 
   private async currentWorkspaceScopeUnlocked(

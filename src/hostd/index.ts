@@ -33,7 +33,7 @@ export * from "./server";
 export * from "./service";
 export * from "./store";
 
-type CliMode = "serve" | "connect" | "probe" | "seed";
+type CliMode = "serve" | "connect" | "probe";
 
 export interface HostdCliOptions {
   mode: CliMode;
@@ -51,36 +51,6 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : "Invalid arguments"}\n${usage()}\n`);
     return 2;
-  }
-
-  if (options.mode === "seed") {
-    const target = await resolveCanonicalLocalHostTarget(options.dataDir, { create: true });
-    const store = new HostStore(target.dataDirectory);
-    const service = new HostService(store);
-    let result: Awaited<ReturnType<HostStore["seedIfEmpty"]>> | undefined;
-    let server: Awaited<ReturnType<typeof serveLocalSocket>> | undefined;
-    try {
-      server = await serveLocalSocket({
-        endpoint: target.endpoint,
-        dataDir: target.dataDirectory,
-        service,
-        onOwned: async () => {
-          // Seed is a durable store mutation, so it must run behind the same
-          // endpoint ownership boundary as the persistent service. A live
-          // daemon wins and this callback is never reached.
-          result = await store.initialize({ seed: true });
-        },
-      });
-      await server.close();
-    } finally {
-      // serveLocalSocket owns service shutdown after a successful listen. A
-      // contender can fail before that point, so close the uninitialized
-      // service here as an idempotent fallback.
-      await service.close();
-    }
-    if (!result) throw new Error("Seed did not run under endpoint ownership");
-    stdout.write(`${JSON.stringify({ version: 1, ...result })}\n`);
-    return 0;
   }
 
   if (options.mode === "connect") {
@@ -153,7 +123,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         // Core authority recovery remains the bounded startup gate. Runtime
         // verification publishes an initializing snapshot synchronously, then
         // starts on the next event-loop turn without delaying health sessions.
-        await service.initialize({ seed: false });
+        await service.initialize();
         runtimeInitialization?.start(lease, options.runtimeSeed);
       },
     });
@@ -219,7 +189,7 @@ export function parseHostdCli(argv: string[]): HostdCliOptions {
     throw new Error("A bounded hostd mode and arguments are required");
   }
   const mode = argv[0];
-  if (mode !== "serve" && mode !== "connect" && mode !== "probe" && mode !== "seed") {
+  if (mode !== "serve" && mode !== "connect" && mode !== "probe") {
     throw new Error(`Unknown hostd mode: ${mode ?? "(missing)"}`);
   }
 
@@ -281,7 +251,6 @@ function usage(): string {
     "  prime-agent-hostd serve [--socket <local-endpoint>] [--data-dir <directory>] [--runtime-seed <absolute-directory>]",
     "  prime-agent-hostd connect --stdio [--data-dir <directory>]",
     "  prime-agent-hostd probe --json [--data-dir <directory>]",
-    "  prime-agent-hostd seed [--data-dir <directory>]",
   ].join("\n");
 }
 

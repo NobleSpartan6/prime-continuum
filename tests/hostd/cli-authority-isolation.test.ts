@@ -1,7 +1,7 @@
 import { access, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stdout } from "node:process";
+import { stderr, stdout } from "node:process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runHostdCli } from "../../src/hostd/index";
 import { resolveCanonicalLocalHostTarget } from "../../src/shared/local-host-target";
@@ -10,6 +10,7 @@ import { defaultLocalEndpoint, getHostDataPaths } from "../../src/hostd/paths";
 import { serveLocalSocket } from "../../src/hostd/server";
 import { HostService } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 
 const temporaryDirectories: string[] = [];
 
@@ -39,7 +40,8 @@ describe("hostd CLI authority isolation", () => {
     temporaryDirectories.push(directory);
     const store = new HostStore(directory);
     const service = new HostService(store);
-    await service.initialize({ seed: true });
+    await service.initialize();
+    await bootstrapTestWorkspace(store);
     const server = await serveLocalSocket({
       endpoint: defaultLocalEndpoint(directory),
       dataDir: directory,
@@ -55,19 +57,20 @@ describe("hostd CLI authority isolation", () => {
         recentProjects: Array<{ projectId: string }>;
       };
       expect(probe.hostd).toMatchObject({ status: "running", runningVersion: expect.any(String) });
-      expect(probe.recentProjects).toContainEqual(expect.objectContaining({ projectId: "demo-project" }));
+      expect(probe.recentProjects).toContainEqual(expect.objectContaining({ projectId: "test-project" }));
       expect(initialize).not.toHaveBeenCalled();
     } finally {
       await server.close();
     }
   });
 
-  it("does not initialize seed state while a live serve process owns the endpoint", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-seed-contender-"));
+  it("rejects the removed fixture mode without touching a live service", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-removed-mode-"));
     temporaryDirectories.push(directory);
     const store = new HostStore(directory);
     const service = new HostService(store);
-    await service.initialize({ seed: true });
+    await service.initialize();
+    await bootstrapTestWorkspace(store);
     const server = await serveLocalSocket({
       endpoint: defaultLocalEndpoint(directory),
       dataDir: directory,
@@ -75,9 +78,10 @@ describe("hostd CLI authority isolation", () => {
     });
     const initialize = vi.spyOn(HostStore.prototype, "initialize");
     const output = captureStdout();
+    vi.spyOn(stderr, "write").mockImplementation(() => true);
 
     try {
-      await expect(runHostdCli(["seed", "--data-dir", directory])).rejects.toBeInstanceOf(Error);
+      await expect(runHostdCli(["seed", "--data-dir", directory])).resolves.toBe(2);
       expect(initialize).not.toHaveBeenCalled();
       expect(output.read()).toBe("");
       expect((await store.getCatalogSnapshot()).projects).toHaveLength(1);
@@ -114,7 +118,8 @@ describe("hostd CLI authority isolation", () => {
         dataDir: physicalDirectory,
         service: ownerService,
         onOwned: async () => {
-          await ownerService.initialize({ seed: true });
+          await ownerService.initialize();
+          await bootstrapTestWorkspace(ownerStore);
         },
       });
 
@@ -138,7 +143,7 @@ describe("hostd CLI authority isolation", () => {
     },
   );
 
-  it("does not initialize or cancel live pairing state during probe or seed", async () => {
+  it("does not initialize or cancel live pairing state during probe", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-authority-"));
     temporaryDirectories.push(directory);
     const stateFile = getHostDataPaths(directory).pairingAuthority;
@@ -163,9 +168,6 @@ describe("hostd CLI authority isolation", () => {
     vi.spyOn(stdout, "write").mockImplementation(() => true);
 
     await expect(runHostdCli(["probe", "--json", "--data-dir", directory])).resolves.toBe(0);
-    expect(await readFile(stateFile, "utf8")).toBe(before);
-
-    await expect(runHostdCli(["seed", "--data-dir", directory])).resolves.toBe(0);
     expect(await readFile(stateFile, "utf8")).toBe(before);
   });
 });

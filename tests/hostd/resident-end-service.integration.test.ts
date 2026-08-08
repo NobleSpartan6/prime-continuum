@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -239,17 +240,18 @@ async function serviceFixture(): Promise<ServiceFixture> {
   await mkdir(workspacePath, { recursive: true });
   const workspaceDirectory = await realpath(workspacePath);
   const store = new HostStore(dataDirectory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const binding: ResidentSessionBinding = {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "resident-end-service-active",
     sessionId: "resident-end-service-session",
@@ -272,8 +274,8 @@ async function serviceFixture(): Promise<ServiceFixture> {
   const endRequest: ResidentEndRequest = {
     operationId: "resident-end-service-operation",
     expectedHostId: (await store.getHost()).hostId,
-    projectId: "demo-project",
-    workspaceId: "demo-workspace",
+    projectId: "test-project",
+    workspaceId: "test-workspace",
     threadId: binding.threadId,
     executionGenerationId: binding.executionGenerationId,
     expectedSourceCursor: sourceSnapshot.latestCursor,

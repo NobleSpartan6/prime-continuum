@@ -123,22 +123,6 @@ const targets = [
     expectedText: 'Workspace confirmation needed',
     expectScrollableEmpty: true,
   },
-  {
-    name: 'companion-attention-390',
-    width: 390,
-    height: 844,
-    surface: 'companion',
-    visualState: 'nonretryable-uncertainty',
-    expectedText: 'Outcome unknown · recovery required; this Stop will not be replayed',
-  },
-  {
-    name: 'companion-attention-320',
-    width: 320,
-    height: 704,
-    surface: 'companion',
-    visualState: 'nonretryable-uncertainty',
-    expectedText: 'Outcome unknown · recovery required; this Stop will not be replayed',
-  },
 ]
 
 function invariant(condition, message) {
@@ -146,11 +130,9 @@ function invariant(condition, message) {
 }
 
 async function waitForSurface(browserWindow, target) {
-  const selector = target.surface === 'companion'
-    ? '.companion-shell'
-    : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
-      ? '.empty-workbench'
-      : '.app-shell'
+  const selector = target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
+    ? '.empty-workbench'
+    : '.app-shell'
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     const found = await browserWindow.webContents.executeJavaScript(
@@ -229,7 +211,6 @@ async function capture(target, rendererOrigin) {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1',
     )
     const rendererUrl = new URL('/', rendererOrigin)
-    if (target.surface) rendererUrl.searchParams.set('surface', target.surface)
     if (target.visualState) rendererUrl.searchParams.set('visualState', target.visualState)
     await browserWindow.loadURL(rendererUrl.href)
     await waitForSurface(browserWindow, target)
@@ -290,11 +271,9 @@ async function capture(target, rendererOrigin) {
       }
       await delay(300)
     }
-    const selector = target.surface === 'companion'
-      ? '.companion-shell'
-      : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
-        ? '.empty-workbench'
-        : '.app-shell'
+    const selector = target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
+      ? '.empty-workbench'
+      : '.app-shell'
     const layout = await browserWindow.webContents.executeJavaScript(`({
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -317,8 +296,6 @@ async function capture(target, rendererOrigin) {
     const stateEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
       const status = document.querySelector('.composer__connection')
       const statusStyle = status ? window.getComputedStyle(status) : undefined
-      const firstAttentionTitle = document.querySelector('.companion-card-list strong')
-      const attentionStyle = firstAttentionTitle ? window.getComputedStyle(firstAttentionTitle) : undefined
       const residentDialog = document.querySelector('dialog[aria-labelledby="resident-provision-title"]')
       const residentDialogStyle = residentDialog ? window.getComputedStyle(residentDialog) : undefined
       const residentDialogRect = residentDialog?.getBoundingClientRect()
@@ -336,7 +313,6 @@ async function capture(target, rendererOrigin) {
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
         composerStatusVisible: Boolean(status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0),
-        attentionTitleLineClamp: attentionStyle?.webkitLineClamp,
         residentDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-provision-title"]')),
         residentDialogModal: Boolean(residentDialog?.matches(':modal')),
         residentDialogDisplay: residentDialogStyle?.display,
@@ -388,9 +364,6 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectCompactStatus) {
       invariant(stateEvidence.compactComposer, `${target.name} did not render the compact resident composer`)
-    }
-    if (target.surface === 'companion') {
-      invariant(stateEvidence.attentionTitleLineClamp === '2', `${target.name} did not preserve two-line Attention titles`)
     }
     if (target.openResidentDialog) {
       invariant(stateEvidence.residentDialogOpen, `${target.name} did not open the resident setup dialog`)

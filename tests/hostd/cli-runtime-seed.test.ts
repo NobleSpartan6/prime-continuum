@@ -21,7 +21,7 @@ describe("hostd runtime seed CLI authority", () => {
     [["serve", "--runtime-seed", seed, "--runtime-seed", seed], "only once"],
     [["connect", "--stdio", "--runtime-seed", seed], "valid only with serve"],
     [["probe", "--json", "--runtime-seed", seed], "valid only with serve"],
-    [["seed", "--runtime-seed", seed], "valid only with serve"],
+    [["seed", "--runtime-seed", seed], "Unknown hostd mode"],
   ] as const)("rejects invalid seed authority %#", (argv, message) => {
     expect(() => parseHostdCli([...argv])).toThrow(message);
   });

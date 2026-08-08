@@ -12,6 +12,7 @@ import {
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
@@ -652,6 +653,80 @@ export class DesktopControlService extends EventEmitter {
     )
     this.assertProjectionAuthority(authority, 'runtime model catalog')
     return RuntimeModelCatalogSnapshotSchema.parse(result)
+  }
+
+  async retryRuntimeIntegrity(expectedHostId: string): Promise<RuntimeIntegritySnapshot> {
+    const authority = this.captureProjectionAuthority()
+    if (expectedHostId !== authority.hostId) {
+      throw new ControlError(
+        'runtime.integrity_retry_authority_changed',
+        'The selected host changed before runtime verification could be retried.',
+        { retryable: true, details: { expectedHostId, connectedHostId: authority.hostId } }
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'runtime.integrity_retry_local_required',
+        'Runtime verification can be retried only on this computer.'
+      )
+    }
+    if (!this.authorityCapabilities.includes(RUNTIME_INTEGRITY_RETRY_CAPABILITY)) {
+      throw new ControlError(
+        'runtime.integrity_retry_unavailable',
+        'The current host state does not allow runtime verification to be retried.'
+      )
+    }
+    const currentReadiness = this.authorityRuntimeReadiness
+    if (
+      currentReadiness?.kind !== 'reported' ||
+      currentReadiness.hostId !== expectedHostId ||
+      currentReadiness.snapshot.status !== 'failed' ||
+      !currentReadiness.snapshot.retryable
+    ) {
+      throw new ControlError(
+        'runtime.integrity_retry_state_changed',
+        'Runtime verification is no longer in a retryable failed state.',
+        { retryable: true }
+      )
+    }
+    const previousSnapshot = currentReadiness.snapshot
+    const raw = await authority.connection.request(
+      'runtime.integrity.retry',
+      { expectedHostId },
+      { timeoutMs: 10_000, priority: 'urgent' }
+    )
+    this.assertProjectionAuthority(authority, 'runtime integrity retry')
+    const parsed = RuntimeIntegritySnapshotSchema.safeParse(raw)
+    if (
+      !parsed.success ||
+      parsed.data.status !== 'initializing' ||
+      !sameRuntimeIntegrityLineage(previousSnapshot, parsed.data)
+    ) {
+      const error = new ControlError(
+        'protocol.runtime_integrity_retry_invalid',
+        'The host returned an invalid runtime verification retry state.'
+      )
+      authority.connection.terminate(error)
+      throw error
+    }
+    const snapshot = parsed.data
+    this.authorityCapabilities = this.authorityCapabilities.filter(
+      (capability) => capability !== RUNTIME_INTEGRITY_RETRY_CAPABILITY
+    )
+    this.authorityRuntimeReadiness = {
+      ...currentReadiness,
+      observedAt: now(),
+      snapshot,
+    }
+    const { capabilities: _capabilities, runtimeReadiness: _runtimeReadiness, ...base } = this.state
+    this.setState({ ...base, ...this.authorityObservationState() })
+    this.scheduleHealthPoll(
+      authority.connection,
+      authority.target,
+      authority.hostId,
+      authority.generation,
+    )
+    return snapshot
   }
 
   async startRuntimeOAuth(expectedHostId: string, providerId: string): Promise<RuntimeOAuthSessionView> {
@@ -5052,6 +5127,16 @@ function observationFromHealth(value: unknown): HealthObservation {
   const runtimeIntegrity: RuntimeIntegritySnapshot | undefined = parsedRuntimeIntegrity?.success
     ? parsedRuntimeIntegrity.data
     : undefined
+  const advertisesRuntimeIntegrityRetry = capabilities.includes(RUNTIME_INTEGRITY_RETRY_CAPABILITY)
+  if (
+    advertisesRuntimeIntegrityRetry &&
+    (runtimeIntegrity?.status !== 'failed' || !runtimeIntegrity.retryable)
+  ) {
+    throw new ControlError(
+      'protocol.runtime_integrity_retry_contract_mismatch',
+      'The host runtime retry capability did not match its failed integrity state.',
+    )
+  }
   if (
     runtimeIntegrity &&
     runtimeIntegrity.status !== 'ready' &&
@@ -5122,6 +5207,17 @@ function runtimeReadinessSemanticKey(readiness: HostRuntimeReadiness | undefined
     return JSON.stringify({ ...semantic, snapshot })
   }
   return JSON.stringify(semantic)
+}
+
+function sameRuntimeIntegrityLineage(
+  current: RuntimeIntegritySnapshot,
+  next: RuntimeIntegritySnapshot,
+): boolean {
+  return (
+    current.contractVersion === next.contractVersion &&
+    current.trustAnchorId === next.trustAnchorId &&
+    isDeepStrictEqual(current.target, next.target)
+  )
 }
 
 function sameStringArray(left: string[], right: string[]): boolean {

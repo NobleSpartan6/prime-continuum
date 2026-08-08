@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -364,10 +365,11 @@ async function serviceFixture(gateway: FakeResidentGateway): Promise<{
   const workspaceDirectory = await realpath(workspacePath);
   const store = new HostStore(directory);
   const service = new HostService(store, gateway);
-  await service.initialize({ seed: true });
+  await service.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const residentBinding = binding(workspaceDirectory);
@@ -406,8 +408,8 @@ function binding(workspaceDirectory: string): ResidentSessionBinding {
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-session-service-1",
     sessionId: "session-service-1",
@@ -436,9 +438,9 @@ function residentCommand(
     deviceId: "resident-service-device",
     commandId,
     expectedHostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-07T21:01:00.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: kind === "prompt"
       ? { kind, text: "Inspect the resident workspace through the durable session." }
       : { kind, reason: "Stop the current resident turn." },

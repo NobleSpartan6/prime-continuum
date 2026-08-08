@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -19,6 +20,7 @@ import {
   validateRuntimeInputs,
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
+  verifyReleaseAssets,
   writeCurrentPointer,
 } from "../../scripts/prime-agent-runtime-lib.mjs";
 
@@ -98,6 +100,56 @@ describe("Prime Agent runtime build policy", () => {
     expect(environment).not.toHaveProperty("PRIME_CONTINUIM_NPM_CLI");
   });
 });
+
+describe("Prime Agent runtime asset download liveness", () => {
+  it("aborts a release fetch that never produces response headers", async () => {
+    const cache = await temporaryDirectory("prime-runtime-fetch-timeout-");
+    const inputs = downloadInputs(Buffer.from("pinned asset"));
+    const fetchImpl = (() => new Promise<Response>(() => undefined)) as typeof fetch;
+
+    await expect(verifyReleaseAssets(inputs as never, cache, {
+      fetchImpl,
+      totalTimeoutMs: 25,
+      noProgressTimeoutMs: 10,
+    })).rejects.toThrow("Download timed out for asset.tgz; check the network or proxy and retry")
+    expect(await readdir(cache)).toEqual([]);
+  });
+
+  it("aborts a response body that stops making progress", async () => {
+    const cache = await temporaryDirectory("prime-runtime-body-timeout-");
+    const inputs = downloadInputs(Buffer.from("pinned asset"));
+    const fetchImpl = (async () => new Response(new ReadableStream({ start: () => undefined }), {
+      status: 200,
+    })) as typeof fetch;
+
+    await expect(verifyReleaseAssets(inputs as never, cache, {
+      fetchImpl,
+      totalTimeoutMs: 250,
+      noProgressTimeoutMs: 25,
+    })).rejects.toThrow("Download made no progress for asset.tgz; check the network or proxy and retry")
+    expect(await readdir(cache)).toEqual([]);
+  });
+});
+
+function downloadInputs(bytes: Buffer) {
+  return {
+    sources: {
+      allowedDownloadHosts: ["downloads.example.test"],
+      assets: [{
+        fileName: "asset.tgz",
+        url: "https://downloads.example.test/asset.tgz",
+        size: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      }],
+    },
+  };
+}
+
+async function temporaryDirectory(prefix: string) {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}
 
 describe("Prime Agent runtime tree attestation", () => {
   it("uses file URLs for special paths and fails after any tree mutation", async () => {

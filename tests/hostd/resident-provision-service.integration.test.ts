@@ -130,7 +130,7 @@ describe("HostService resident provisioning boundary", () => {
     await mkdir(workspacePath, { recursive: true });
     const workspaceDirectory = await realpath(workspacePath);
     const store = new HostStore(join(directory, "data"));
-    await store.initialize({ seed: false });
+    await store.initialize();
     const host = await store.getHost();
     let cachedImportFailure: Promise<never> | undefined;
     const moduleLoader = Object.assign(
@@ -262,7 +262,7 @@ async function provisionFixture(): Promise<{
   await mkdir(workspacePath, { recursive: true });
   const workspaceDirectory = await realpath(workspacePath);
   const store = new HostStore(join(directory, "data"));
-  await store.initialize({ seed: false });
+  await store.initialize();
   const host = await store.getHost();
   const gateway = residentLifecycleGateway(store);
   const service = new HostService(store, gateway);

@@ -278,11 +278,15 @@ function packageSmokeHostdWrapperSource(): string {
     'if (!hostdPath) throw new Error("missing hostd smoke path");',
     'const hostd = require(hostdPath);',
     'process.stdin.setEncoding("utf8");',
-    'process.stdin.once("data", () => process.emit("SIGTERM"));',
+    'let terminal = false;',
+    'const terminate = () => { if (terminal) return; terminal = true; process.emit("SIGTERM"); };',
+    'process.stdin.once("data", terminate);',
+    'process.stdin.once("end", terminate);',
+    'process.stdin.once("close", terminate);',
     'process.stdin.resume();',
     'void Promise.resolve(hostd.runHostdCli(hostdArguments)).then(',
-    '  (code) => { process.exitCode = code; process.stdin.destroy(); },',
-    '  (error) => { process.stderr.write(`Package-smoke hostd failed: ${error instanceof Error ? error.message : String(error)}\\n`); process.exitCode = 1; process.stdin.destroy(); },',
+    '  (code) => { terminal = true; process.exitCode = code; process.stdin.destroy(); },',
+    '  (error) => { terminal = true; process.stderr.write(`Package-smoke hostd failed: ${error instanceof Error ? error.message : String(error)}\\n`); process.exitCode = 1; process.stdin.destroy(); },',
     ');'
   ].join('\n')
 }

@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -134,17 +135,18 @@ async function gatewayFixture(outcome: "success" | "unknown") {
   await mkdir(workspacePath, { recursive: true });
   const workspaceDirectory = await realpath(workspacePath);
   const store = new HostStore(dataDirectory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const binding: ResidentSessionBinding = {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: `resident-end-gateway-active-${outcome}`,
     sessionId: `resident-end-gateway-session-${outcome}`,
@@ -167,8 +169,8 @@ async function gatewayFixture(outcome: "success" | "unknown") {
   const request: ResidentEndRequest = {
     operationId: `resident-end-gateway-operation-${outcome}`,
     expectedHostId: (await store.getHost()).hostId,
-    projectId: "demo-project",
-    workspaceId: "demo-workspace",
+    projectId: "test-project",
+    workspaceId: "test-workspace",
     threadId: binding.threadId,
     executionGenerationId: binding.executionGenerationId,
     expectedSourceCursor: sourceSnapshot.latestCursor,

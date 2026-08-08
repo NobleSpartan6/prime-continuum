@@ -22,9 +22,10 @@ vi.mock('electron', () => ({
 }))
 
 let isPackageSmokeRuntimeReady: typeof import('../../src/main/index').isPackageSmokeRuntimeReady
+let isPackageSmokeFirstRunAuthorityReady: typeof import('../../src/main/index').isPackageSmokeFirstRunAuthorityReady
 
 beforeAll(async () => {
-  ;({ isPackageSmokeRuntimeReady } = await import('../../src/main/index'))
+  ;({ isPackageSmokeRuntimeReady, isPackageSmokeFirstRunAuthorityReady } = await import('../../src/main/index'))
 })
 
 describe('packaged runtime smoke readiness', () => {
@@ -57,6 +58,21 @@ describe('packaged runtime smoke readiness', () => {
     }
   ])('rejects incomplete readiness evidence %#', (overrides) => {
     expect(isPackageSmokeRuntimeReady(readyConnection(overrides))).toBe(false)
+  })
+
+  it('accepts first-run readiness only for the same live local authority with resident setup capability', () => {
+    const connection = readyConnection({
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+    })
+    expect(isPackageSmokeFirstRunAuthorityReady(connection, 'host-a')).toBe(true)
+    expect(isPackageSmokeFirstRunAuthorityReady(connection, 'host-b')).toBe(false)
+    expect(isPackageSmokeFirstRunAuthorityReady({ ...connection, phase: 'reconnecting' }, 'host-a')).toBe(false)
+    expect(
+      isPackageSmokeFirstRunAuthorityReady(
+        readyConnection({ capabilities: ['runtime_integrity_v1'] }),
+        'host-a',
+      ),
+    ).toBe(false)
   })
 })
 

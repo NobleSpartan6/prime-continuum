@@ -34,7 +34,11 @@ export function validateRuntimeInputs(inputs: {
   sources: JsonRecord;
   policy: JsonRecord;
 }): void;
-export function verifyReleaseAssets(inputs: RuntimeInputs, cacheDirectory: string): Promise<readonly string[]>;
+export function verifyReleaseAssets(inputs: RuntimeInputs, cacheDirectory: string, options?: {
+  fetchImpl?: typeof fetch;
+  totalTimeoutMs?: number;
+  noProgressTimeoutMs?: number;
+}): Promise<readonly string[]>;
 export function discoverNpmCli(explicitPath?: string): Promise<string>;
 export function installLockedRuntime(options: {
   inputs: RuntimeInputs;

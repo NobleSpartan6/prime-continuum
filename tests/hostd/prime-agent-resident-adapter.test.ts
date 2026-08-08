@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -457,9 +458,10 @@ async function issueResidentKillLease(
   const workspaceDirectory = join(directory, "workspace");
   await mkdir(workspaceDirectory);
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   const host = await store.getHost();
-  const snapshot = await store.getThreadSnapshot("demo-thread");
+  const snapshot = await store.getThreadSnapshot("test-thread");
   const canonicalWorkspace = await store.registerWorkspaceAuthority({
     threadId: snapshot.thread.threadId,
     executionGenerationId: snapshot.thread.currentLocation.executionGenerationId,

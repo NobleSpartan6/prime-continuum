@@ -10,7 +10,7 @@ export interface CanonicalLocalHostTarget {
 }
 
 export interface ResolveCanonicalLocalHostTargetOptions {
-  /** Creates only the root directory needed by serve/seed before resolving it. */
+  /** Creates only the root directory needed by serve before resolving it. */
   create?: boolean;
   platform?: NodeJS.Platform;
 }

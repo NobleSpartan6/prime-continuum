@@ -378,7 +378,7 @@ function classifyInitializationFailure(error: unknown): {
     return {
       code: "RUNTIME_TRANSIENT_VERIFICATION",
       retryable: true,
-      recoveryAction: "restart_host_service",
+      recoveryAction: "retry_runtime_verification",
     };
   }
   if (error instanceof RuntimeIntegrityRepairRequiredError) {
@@ -421,10 +421,7 @@ function classifyInitializationFailure(error: unknown): {
   return {
     code: "RUNTIME_INTEGRITY_FAILED",
     retryable: true,
-    // No production IPC/UI surface invokes retry() yet. Keep the public action
-    // honest until that control exists; a fresh host-service generation is the
-    // currently available retry boundary.
-    recoveryAction: "restart_host_service",
+    recoveryAction: "retry_runtime_verification",
   };
 }
 

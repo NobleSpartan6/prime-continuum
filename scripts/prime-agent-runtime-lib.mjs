@@ -33,6 +33,8 @@ const RUNTIME_METADATA_FILES = new Set(["files.sha256", "runtime.json"]);
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
+const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNTIME_TEMPLATE_DIRECTORY = join(REPO_ROOT, "runtime", "prime-agent");
@@ -185,7 +187,7 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   }
 }
 
-export async function verifyReleaseAssets(inputs, cacheDirectory) {
+export async function verifyReleaseAssets(inputs, cacheDirectory, options = {}) {
   await mkdir(cacheDirectory, { recursive: true });
   const allowedHosts = new Set(inputs.sources.allowedDownloadHosts);
   const verified = [];
@@ -196,24 +198,40 @@ export async function verifyReleaseAssets(inputs, cacheDirectory) {
       continue;
     }
     await rm(destination, { force: true });
-    await downloadVerifiedAsset(asset, destination, allowedHosts);
+    await downloadVerifiedAsset(asset, destination, allowedHosts, options);
     verified.push(destination);
   }
   return Object.freeze(verified);
 }
 
-async function downloadVerifiedAsset(asset, destination, allowedHosts) {
+async function downloadVerifiedAsset(asset, destination, allowedHosts, options) {
   const partial = `${destination}.partial-${randomUUID()}`;
   let handle;
   try {
-    const response = await fetchAllowed(asset.url, allowedHosts);
+    const controller = new AbortController();
+    const limits = {
+      startedAt: Date.now(),
+      totalTimeoutMs: options.totalTimeoutMs ?? DOWNLOAD_TOTAL_TIMEOUT_MS,
+      noProgressTimeoutMs: options.noProgressTimeoutMs ?? DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
+      controller,
+    };
+    const response = await awaitDownloadProgress(
+      fetchAllowed(asset.url, allowedHosts, { fetchImpl: options.fetchImpl ?? fetch, signal: controller.signal }),
+      limits,
+      asset.fileName,
+      true,
+    );
     if (!response.ok || !response.body) {
       throw buildError(`Could not download ${asset.fileName}: HTTP ${response.status}.`);
     }
     handle = await open(partial, "wx", 0o600);
     const digest = createHash("sha256");
     let bytes = 0;
-    for await (const chunk of response.body) {
+    const reader = response.body.getReader();
+    while (true) {
+      const result = await awaitDownloadProgress(reader.read(), limits, asset.fileName, false);
+      if (result.done) break;
+      const chunk = result.value;
       const buffer = Buffer.from(chunk);
       bytes += buffer.byteLength;
       if (bytes > asset.size || bytes > MAX_ASSET_BYTES) {
@@ -237,15 +255,16 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts) {
   }
 }
 
-async function fetchAllowed(url, allowedHosts) {
+async function fetchAllowed(url, allowedHosts, { fetchImpl, signal }) {
   let current = new URL(url);
   for (let redirects = 0; redirects <= DOWNLOAD_REDIRECT_LIMIT; redirects += 1) {
     if (current.protocol !== "https:" || !allowedHosts.has(current.hostname)) {
       throw buildError(`Download redirected to a non-allowlisted host: ${current.hostname}.`);
     }
-    const response = await fetch(current, {
+    const response = await fetchImpl(current, {
       redirect: "manual",
       headers: { "User-Agent": "Prime-Continuim-Runtime-Builder/0.1" },
+      signal,
     });
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
     const location = response.headers.get("location");
@@ -253,6 +272,33 @@ async function fetchAllowed(url, allowedHosts) {
     current = new URL(location, current);
   }
   throw buildError("Release asset exceeded the redirect limit.");
+}
+
+async function awaitDownloadProgress(operation, limits, fileName, totalOnly) {
+  const elapsed = Date.now() - limits.startedAt;
+  const remainingTotal = limits.totalTimeoutMs - elapsed;
+  const timeoutMs = totalOnly ? remainingTotal : Math.min(remainingTotal, limits.noProgressTimeoutMs);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    limits.controller.abort();
+    throw buildError(`Download timed out for ${fileName}; check the network or proxy and retry.`);
+  }
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const totalExpired = Date.now() - limits.startedAt >= limits.totalTimeoutMs;
+          reject(buildError(totalExpired
+            ? `Download timed out for ${fileName}; check the network or proxy and retry.`
+            : `Download made no progress for ${fileName}; check the network or proxy and retry.`));
+          limits.controller.abort();
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function discoverNpmCli(explicitPath) {

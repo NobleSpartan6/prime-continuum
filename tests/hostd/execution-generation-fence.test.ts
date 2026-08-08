@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +32,7 @@ const commandCases: ReadonlyArray<readonly [string, CommandPayload]> = [
 
 describe("exact execution-generation fencing", () => {
   it.each(commandCases)("rejects stale %s commands and binds the receipt to the composed generation", async (label, payload) => {
-    const { store, hostId } = await seededStore();
+    const { store, hostId } = await workspaceStore();
     const command = envelope(hostId, `stale-${label}`, payload, "stale-generation-g1");
 
     const first = await store.admitCommand(command, true);
@@ -44,14 +45,14 @@ describe("exact execution-generation fencing", () => {
 
     await expect(
       store.admitCommand(
-        { ...command, expectedExecutionGenerationId: "demo-execution-1" },
+        { ...command, expectedExecutionGenerationId: "test-execution-1" },
         true,
       ),
     ).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
   });
 
   it("proves the complete envelope for duplicate submit and reconcile before and after restart", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const command = envelope(hostId, "exact-envelope", { kind: "prompt", text: "Inspect the repository." });
     const first = await store.admitCommand(command, false);
     const terminal = await store.updateCommandReceipt(command, {
@@ -89,7 +90,7 @@ describe("exact execution-generation fencing", () => {
   });
 
   it("passes only the command's explicit generation to the gateway live check", async () => {
-    const { store, hostId } = await seededStore();
+    const { store, hostId } = await workspaceStore();
     const isLive = vi.fn(async () => false);
     const gateway: PrimeAgentGateway = {
       continuity: "resident",
@@ -125,12 +126,12 @@ describe("exact execution-generation fencing", () => {
         error: { code: "STALE_EXECUTION_GENERATION" },
       },
     });
-    expect(isLive).toHaveBeenCalledWith("demo-thread", "stale-generation-g1");
+    expect(isLive).toHaveBeenCalledWith("test-thread", "stale-generation-g1");
     await service.close();
   });
 
   it("resolves exact known retries before changed gateway state, including after restart", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const command = envelope(hostId, "known-before-gateway", {
       kind: "prompt",
       text: "Persist this exact command once.",
@@ -185,7 +186,7 @@ describe("exact execution-generation fencing", () => {
   });
 
   it("does not mutate a snapshot whose authority diverges from the matching catalog generation", async () => {
-    const { store, hostId } = await seededStore();
+    const { store, hostId } = await workspaceStore();
     const snapshotName = (await readdir(store.paths.snapshots)).find((name) => name.endsWith(".json"));
     if (!snapshotName) throw new Error("seed snapshot missing");
     const snapshotPath = join(store.paths.snapshots, snapshotName);
@@ -202,7 +203,7 @@ describe("exact execution-generation fencing", () => {
     const admission = await store.admitCommand(command, false);
     expect(admission.receipt).toMatchObject({
       status: "rejected",
-      executionGenerationId: "demo-execution-1",
+      executionGenerationId: "test-execution-1",
       error: { code: "SNAPSHOT_AUTHORITY_MISMATCH" },
     });
     expect((await store.getThreadSnapshot(command.threadId)).queueState.pendingCommandIds).not.toContain(
@@ -211,7 +212,7 @@ describe("exact execution-generation fencing", () => {
   });
 
   it("never lets an old model-only identity be overwritten by a different command kind", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const model = envelope(
       hostId,
       "legacy-model-identity",
@@ -236,7 +237,7 @@ describe("exact execution-generation fencing", () => {
 
 describe("legacy admission recovery", () => {
   it("finishes a validated generation-less v1 transaction but never makes it replayable", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const command = envelope(hostId, "legacy-generationless", {
       kind: "prompt",
       text: "Recover prepared host records only.",
@@ -279,7 +280,7 @@ describe("legacy admission recovery", () => {
   });
 
   it("recovers the old stale-rejection receipt shape without rebinding or replaying it", async () => {
-    const { directory, hostId } = await seededStore();
+    const { directory, hostId } = await workspaceStore();
     const command = envelope(
       hostId,
       "legacy-stale-rejection",
@@ -292,7 +293,7 @@ describe("legacy admission recovery", () => {
       delete transaction.commandIdentity;
       // The pre-fence host reported the current generation on a stale G1
       // rejection. Recovery accepts that exact historical shape only.
-      transaction.receipt.executionGenerationId = "demo-execution-1";
+      transaction.receipt.executionGenerationId = "test-execution-1";
     });
 
     const recovered = new HostStore(directory);
@@ -306,7 +307,7 @@ describe("legacy admission recovery", () => {
   });
 
   it("fails closed when a legacy transaction tampers with an unrelated catalog thread", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const threadFile = JSON.parse(await readFile(store.paths.threads, "utf8")) as Record<string, any>;
     const unrelated = structuredClone(threadFile.threads[0]);
     unrelated.threadId = "unrelated-thread";
@@ -342,7 +343,7 @@ describe("legacy admission recovery", () => {
   });
 
   it("fails closed when a v2 transaction tampers with an unrelated catalog thread", async () => {
-    const { store, directory, hostId } = await seededStore();
+    const { store, directory, hostId } = await workspaceStore();
     const threadFile = JSON.parse(await readFile(store.paths.threads, "utf8")) as Record<string, any>;
     const unrelated = structuredClone(threadFile.threads[0]);
     unrelated.threadId = "unrelated-v2-thread";
@@ -371,11 +372,12 @@ describe("legacy admission recovery", () => {
   });
 });
 
-async function seededStore(): Promise<{ store: HostStore; directory: string; hostId: string }> {
+async function workspaceStore(): Promise<{ store: HostStore; directory: string; hostId: string }> {
   const directory = await mkdtemp(join(tmpdir(), "prime-generation-fence-"));
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store);
   return { store, directory, hostId: (await store.getHost()).hostId };
 }
 
@@ -383,14 +385,14 @@ function envelope(
   hostId: string,
   commandId: string,
   command: CommandPayload,
-  expectedExecutionGenerationId = "demo-execution-1",
+  expectedExecutionGenerationId = "test-execution-1",
 ): CommandEnvelope {
   return {
     protocolVersion: PROTOCOL_VERSION,
     deviceId: "generation-fence-device",
     commandId,
     expectedHostId: hostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-07T12:00:00.000Z",
     expectedExecutionGenerationId,
     command,

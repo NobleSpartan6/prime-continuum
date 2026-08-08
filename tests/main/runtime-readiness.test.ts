@@ -28,6 +28,7 @@ const DIGEST_C = 'c'.repeat(64)
 
 interface RequestRecord {
   method: string
+  params?: unknown
   options?: { timeoutMs?: number; priority?: 'urgent' | 'normal' }
 }
 
@@ -41,14 +42,15 @@ class TestConnection extends EventEmitter {
       method: string,
       requestIndex: number,
       options?: RequestRecord['options'],
+      params?: unknown,
     ) => unknown,
   ) {
     super()
   }
 
-  async request(method: string, _params: unknown, options?: RequestRecord['options']): Promise<unknown> {
-    this.requests.push({ method, options })
-    return await this.respond(method, this.requests.length - 1, options)
+  async request(method: string, params: unknown, options?: RequestRecord['options']): Promise<unknown> {
+    this.requests.push({ method, params, options })
+    return await this.respond(method, this.requests.length - 1, options, params)
   }
 
   close(): void {
@@ -80,6 +82,92 @@ afterEach(async () => {
 })
 
 describe('DesktopControlService runtime readiness', () => {
+  it('sends one local runtime retry and immediately fences the new initializing observation', async () => {
+    const failed = runtimeSnapshot('failed')
+    const initializing = { ...runtimeSnapshot('initializing'), changedAt: '2026-08-07T12:00:01.000Z', attempt: 2 }
+    const connection = new TestConnection((method, _requestIndex, options, params) => {
+      if (method === 'health.get') {
+        return health({ runtime: failed, capabilities: ['runtime_integrity_retry_v1'] })
+      }
+      if (method === 'runtime.integrity.retry') {
+        expect(params).toEqual({ expectedHostId: 'host-a' })
+        expect(options).toEqual({ timeoutMs: 10_000, priority: 'urgent' })
+        return initializing
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest()
+    await service.connect({ kind: 'local' })
+
+    await expect(service.retryRuntimeIntegrity('host-a')).resolves.toEqual(initializing)
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.retry')).toHaveLength(1)
+    expect(service.getConnectionState()).toMatchObject({
+      phase: 'online',
+      hostId: 'host-a',
+      path: 'local_socket',
+      runtimeReadiness: { kind: 'reported', snapshot: { status: 'initializing', attempt: 2 } },
+    })
+    expect(service.getConnectionState().capabilities).not.toContain('runtime_integrity_retry_v1')
+
+    await expect(service.retryRuntimeIntegrity('host-a')).rejects.toMatchObject({
+      code: 'runtime.integrity_retry_unavailable',
+    })
+    await expect(service.retryRuntimeIntegrity('host-b')).rejects.toMatchObject({
+      code: 'runtime.integrity_retry_authority_changed',
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.retry')).toHaveLength(1)
+    await service.disconnect()
+  })
+
+  it('refuses a retry capability received over an SSH target without sending the mutation', async () => {
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return health({ runtime: runtimeSnapshot('failed'), capabilities: ['runtime_integrity_retry_v1'] })
+      }
+      throw new Error(`Runtime retry must not cross SSH: ${method}`)
+    })
+    connectSshHost.mockReturnValue(connection)
+    const service = await serviceForTest()
+    ;(service as unknown as { discoveredAliases: Set<string> }).discoveredAliases.add('remote')
+    await service.connect({ kind: 'ssh', alias: 'remote' })
+
+    await expect(service.retryRuntimeIntegrity('host-a')).rejects.toMatchObject({
+      code: 'runtime.integrity_retry_local_required',
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.retry')).toHaveLength(0)
+    await service.disconnect()
+  })
+
+  it('terminates the connection when a retry response changes the verified runtime lineage', async () => {
+    const failed = runtimeSnapshot('failed')
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return health({ runtime: failed, capabilities: ['runtime_integrity_retry_v1'] })
+      }
+      if (method === 'runtime.integrity.retry') {
+        const initializing = runtimeSnapshot('initializing')
+        return {
+          ...initializing,
+          target: { ...initializing.target, treeSha256: DIGEST_A },
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest()
+    await service.connect({ kind: 'local' })
+
+    await expect(service.retryRuntimeIntegrity('host-a')).rejects.toMatchObject({
+      code: 'protocol.runtime_integrity_retry_invalid',
+    })
+    expect(connection.terminatedWith).toMatchObject({
+      code: 'protocol.runtime_integrity_retry_invalid',
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.retry')).toHaveLength(1)
+    await service.disconnect()
+  })
+
   it('publishes readiness and capabilities atomically, then suppresses heartbeat-only events', async () => {
     const samples = [
       health({ runtime: runtimeSnapshot('initializing', { phase: 'preparing' }), checkedAt: '2026-08-07T12:00:00.000Z' }),

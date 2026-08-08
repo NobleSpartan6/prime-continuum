@@ -274,7 +274,7 @@ describe("runtime model catalog", () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-service-"));
     try {
       const store = new HostStore(directory);
-      await store.initialize({ seed: true });
+      await store.initialize();
       const host = await store.getHost();
       const catalog = sanitizeRuntimeCatalog(
         { getOAuthProviders: () => [] },

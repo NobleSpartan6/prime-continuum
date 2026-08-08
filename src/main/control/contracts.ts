@@ -26,6 +26,7 @@ export const IPC = {
   hostCatalog: 'prime:catalog:hosts',
   projectCatalog: 'prime:catalog:projects',
   threadProjection: 'prime:thread:projection',
+  retryRuntimeIntegrity: 'prime:runtime:integrity:retry',
   runtimeModelCatalog: 'prime:runtime:model-catalog',
   startRuntimeOAuth: 'prime:runtime:oauth:start',
   runtimeOAuthStatus: 'prime:runtime:oauth:status',
@@ -406,6 +407,7 @@ export interface PrimeBridge {
   hostCatalog(): Promise<Result<unknown>>
   projectCatalog(input: { hostId: string }): Promise<Result<unknown>>
   threadProjection(input: { threadId: string; cursor?: SessionCursor }): Promise<Result<unknown>>
+  retryRuntimeIntegrity(input: { expectedHostId: string }): Promise<Result<RuntimeIntegritySnapshot>>
   runtimeModelCatalog(input: { expectedHostId: string }): Promise<Result<RuntimeModelCatalogSnapshot>>
   startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
   runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>

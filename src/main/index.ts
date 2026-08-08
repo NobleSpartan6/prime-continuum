@@ -8,6 +8,7 @@ import { DesktopControlService } from './control/service'
 import { installOrderlyQuitDrain } from './orderly-quit'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
+import { RESIDENT_LIFECYCLE_CAPABILITY } from '../shared/protocol'
 
 let mainWindow: BrowserWindow | undefined
 let trustedRendererUrl = ''
@@ -121,7 +122,8 @@ async function runPackageSmoke(window: BrowserWindow, service: DesktopControlSer
   try {
     await loadRenderer(window)
     await waitForPackageSmokeConnection(window)
-    await waitForPackageSmokeRuntimeReady(service)
+    const readyHostId = await waitForPackageSmokeRuntimeReady(service)
+    await waitForPackageSmokeFirstRunReady(window, service, readyHostId)
   } finally {
     await service.disconnect()
     await stopPackageSmokeHostds()
@@ -130,12 +132,48 @@ async function runPackageSmoke(window: BrowserWindow, service: DesktopControlSer
   app.quit()
 }
 
-async function waitForPackageSmokeRuntimeReady(service: DesktopControlService): Promise<void> {
+async function waitForPackageSmokeFirstRunReady(
+  window: BrowserWindow,
+  service: DesktopControlService,
+  expectedHostId: string,
+): Promise<void> {
+  const deadline = Date.now() + 180_000
+  while (Date.now() < deadline) {
+    const before = service.getConnectionState()
+    const stage = await window.webContents.executeJavaScript(
+      "document.querySelector('[data-local-setup-stage]')?.getAttribute('data-local-setup-stage') ?? null",
+      true
+    )
+    const after = service.getConnectionState()
+    if (
+      stage === 'choose_workspace' &&
+      isPackageSmokeFirstRunAuthorityReady(before, expectedHostId) &&
+      isPackageSmokeFirstRunAuthorityReady(after, expectedHostId)
+    ) return
+    if (
+      (before.hostId && before.hostId !== expectedHostId) ||
+      (after.hostId && after.hostId !== expectedHostId)
+    ) {
+      throw new Error('The packaged first-run setup changed local host authority before workspace setup was ready.')
+    }
+    if (
+      stage === 'needs_attention' &&
+      isPackageSmokeTerminalRuntimeFailure(before, expectedHostId) &&
+      isPackageSmokeTerminalRuntimeFailure(after, expectedHostId)
+    ) {
+      throw new Error('The packaged first-run setup entered a needs-attention state.')
+    }
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250))
+  }
+  throw new Error('The packaged first-run setup did not reach the workspace step within its deadline.')
+}
+
+async function waitForPackageSmokeRuntimeReady(service: DesktopControlService): Promise<string> {
   const deadline = Date.now() + 180_000
   while (Date.now() < deadline) {
     const connection = service.getConnectionState()
     const readiness = connection.runtimeReadiness
-    if (isPackageSmokeRuntimeReady(connection)) return
+    if (isPackageSmokeRuntimeReady(connection)) return connection.hostId as string
     if (
       readiness?.kind === 'reported' &&
       (readiness.snapshot.status === 'failed' || readiness.snapshot.status === 'unavailable')
@@ -164,6 +202,30 @@ export function isPackageSmokeRuntimeReady(connection: ConnectionState): boolean
     readiness.hostId === connection.hostId &&
     readiness.snapshot.status === 'ready' &&
     connection.capabilities?.includes('runtime_integrity_v1') === true
+  )
+}
+
+export function isPackageSmokeFirstRunAuthorityReady(
+  connection: ConnectionState,
+  expectedHostId: string,
+): boolean {
+  return (
+    connection.hostId === expectedHostId &&
+    isPackageSmokeRuntimeReady(connection) &&
+    connection.capabilities?.includes(RESIDENT_LIFECYCLE_CAPABILITY) === true
+  )
+}
+
+function isPackageSmokeTerminalRuntimeFailure(
+  connection: ConnectionState,
+  expectedHostId: string,
+): boolean {
+  const readiness = connection.runtimeReadiness
+  return (
+    connection.hostId === expectedHostId &&
+    readiness?.kind === 'reported' &&
+    readiness.hostId === expectedHostId &&
+    (readiness.snapshot.status === 'failed' || readiness.snapshot.status === 'unavailable')
   )
 }
 

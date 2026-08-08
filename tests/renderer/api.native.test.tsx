@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { NativeRendererApi } from '../../src/renderer/src/api'
+import { NativeRendererApi, StaleHostAuthorityError } from '../../src/renderer/src/api'
 
 const ok = <T,>(value: T) => Promise.resolve({ ok: true as const, value })
 
@@ -162,7 +162,45 @@ function residentLifecycleConnection() {
   return {
     ...onlineConnection(),
     capabilities: ['prime_agent_commands_v2', 'resident_lifecycle_v1'],
+    runtimeReadiness: {
+      kind: 'reported',
+      hostId: 'host-local',
+      hostdVersion: '0.1.0',
+      startedAt: '2026-08-05T19:59:00.000Z',
+      observedAt: '2026-08-05T20:00:00.000Z',
+      snapshot: {
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    },
   }
+}
+
+function runtimeIntegritySnapshot(status: 'failed' | 'initializing') {
+  const base = {
+    contractVersion: 1 as const,
+    changedAt: status === 'failed' ? '2026-08-05T20:00:00.000Z' : '2026-08-05T20:00:01.000Z',
+    trustAnchorId: 'a'.repeat(64),
+    target: {
+      runtime: 'prime-agent' as const,
+      releaseVersion: '0.7.0',
+      runtimeBuildId: 'fixture-build-1',
+      platform: 'win32',
+      arch: 'x64',
+      manifestSha256: 'a'.repeat(64),
+      treeSha256: 'b'.repeat(64),
+      filesSha256: 'c'.repeat(64),
+    },
+  }
+  return status === 'failed'
+    ? {
+        ...base,
+        status,
+        code: 'RUNTIME_INTEGRITY_FAILED',
+        retryable: true,
+        recoveryAction: 'retry_runtime_verification',
+      }
+    : { ...base, status, phase: 'preparing' as const, attempt: 2 }
 }
 
 function residentSelection() {
@@ -1705,6 +1743,496 @@ describe('NativeRendererApi', () => {
       text: 'Must not cross to B',
     })).resolves.toMatchObject({ state: 'rejected' })
     expect(bridge.submitCommand).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('projects fresh local setup only from exact live runtime and local lifecycle authority', async () => {
+    const readyRuntime = (hostId = 'host-local') => ({
+      kind: 'reported',
+      hostId,
+      hostdVersion: '0.1.0',
+      startedAt: '2026-08-05T19:59:00.000Z',
+      observedAt: '2026-08-05T20:00:00.000Z',
+      snapshot: {
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    })
+    const load = async (connection: Record<string, unknown>) => {
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 3, entries: {} },
+          outbox: [],
+          connection,
+          appVersion: '0.1.0',
+        })),
+        connect: vi.fn(() => new Promise<never>(() => undefined)),
+        hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      }
+      const api = new NativeRendererApi(bridge)
+      return await api.loadWorkbench()
+    }
+    const exactConnection = {
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-local',
+      path: 'local_socket',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+      runtimeReadiness: readyRuntime(),
+    }
+
+    const exact = await load(exactConnection)
+    expect(exact.localSetup).toMatchObject({
+      stage: 'choose_workspace',
+      runtimeReadiness: { kind: 'reported', freshness: 'live', status: 'ready' },
+    })
+    expect(exact.operations.provisionResident).toBe(true)
+
+    const missingLifecycle = await load({
+      ...exactConnection,
+      capabilities: ['runtime_integrity_v1'],
+    })
+    expect(missingLifecycle.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { code: 'resident_lifecycle_unavailable', action: 'review_diagnostics' },
+    })
+    expect(missingLifecycle.operations.provisionResident).toBeUndefined()
+
+    const degraded = await load({ ...exactConnection, phase: 'degraded' })
+    expect(degraded.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { area: 'local_service', action: 'review_diagnostics' },
+    })
+    expect(degraded.operations.provisionResident).toBeUndefined()
+
+    const wrongRuntimeAuthority = await load({
+      ...exactConnection,
+      runtimeReadiness: readyRuntime('host-other'),
+    })
+    expect(wrongRuntimeAuthority.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { code: 'runtime_readiness_unavailable', action: 'review_diagnostics' },
+    })
+    expect(wrongRuntimeAuthority.operations.provisionResident).toBeUndefined()
+
+    const wrongPath = await load({ ...exactConnection, path: 'ssh' })
+    expect(wrongPath.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { code: 'local_socket_required', action: 'review_diagnostics' },
+    })
+    expect(wrongPath.operations.provisionResident).toBeUndefined()
+  })
+
+  it('keeps local setup connection failures path-free and ignores native error details', async () => {
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'offline',
+          target: { kind: 'local' },
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          error: {
+            code: 'hostd.start_timeout',
+            message: 'Timed out at C:\\Users\\operator\\private\\host.sock',
+            retryable: true,
+            details: {
+              endpoint: 'C:\\Users\\operator\\private\\host.sock',
+              hostdScript: 'C:\\Program Files\\Prime Continuim\\resources\\hostd.cjs',
+            },
+          },
+        },
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const view = await new NativeRendererApi(bridge).loadWorkbench()
+    expect(view.localSetup).toEqual({
+      stage: 'needs_attention',
+      issue: {
+        area: 'local_service',
+        action: 'retry_connection',
+        message: 'The local service did not become ready in time.',
+        retryable: true,
+        code: 'hostd.start_timeout',
+      },
+    })
+    expect(JSON.stringify(view.localSetup)).not.toContain('operator')
+    expect(JSON.stringify(view.localSetup)).not.toContain('host.sock')
+    expect(JSON.stringify(view.localSetup)).not.toContain('Program Files')
+  })
+
+  it('retries only an explicitly retryable local setup connection through the existing local target', async () => {
+    const offline = {
+      phase: 'offline',
+      target: { kind: 'local' },
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      error: { code: 'hostd.start_timeout', message: 'Timed out.', retryable: true },
+    }
+    const connected = {
+      ...residentLifecycleConnection(),
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+    }
+    const connect = vi.fn()
+      .mockRejectedValueOnce(new Error('Automatic retry remains visible as failed.'))
+      .mockReturnValueOnce(ok(connected))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: offline,
+        appVersion: '0.1.0',
+      })),
+      connect,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+    expect(view.localSetup?.issue?.action).toBe('retry_connection')
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1))
+
+    await expect(api.retryLocalSetup()).resolves.toBeUndefined()
+    expect(connect).toHaveBeenNthCalledWith(1, { kind: 'local' })
+    expect(connect).toHaveBeenNthCalledWith(2, { kind: 'local' })
+  })
+
+  it('offers and sends one exact runtime retry only for the negotiated local failed authority', async () => {
+    const failed = runtimeIntegritySnapshot('failed')
+    const initializing = runtimeIntegritySnapshot('initializing')
+    const retryRuntimeIntegrity = vi.fn(() => ok(initializing))
+    const connect = vi.fn()
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'online',
+          target: { kind: 'local' },
+          hostId: 'host-local',
+          path: 'local_socket',
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          capabilities: ['runtime_integrity_v1', 'runtime_integrity_retry_v1'],
+          runtimeReadiness: {
+            kind: 'reported',
+            hostId: 'host-local',
+            hostdVersion: '0.1.0',
+            startedAt: '2026-08-05T19:59:00.000Z',
+            observedAt: '2026-08-05T20:00:00.000Z',
+            snapshot: failed,
+          },
+        },
+        appVersion: '0.1.0',
+      })),
+      connect,
+      retryRuntimeIntegrity,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const view = await api.loadWorkbench()
+    expect(view.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      runtimeReadiness: { status: 'failed', retryable: true, recovery: 'retry' },
+      issue: { area: 'runtime', action: 'retry_runtime', retryable: true },
+    })
+
+    await expect(api.retryLocalSetup()).resolves.toBeUndefined()
+    expect(retryRuntimeIntegrity).toHaveBeenCalledOnce()
+    expect(retryRuntimeIntegrity).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
+    expect(connect).not.toHaveBeenCalled()
+    expect(published.at(-1)?.localSetup).toMatchObject({
+      stage: 'preparing_runtime',
+      runtimeReadiness: { status: 'initializing', phase: 'preparing' },
+    })
+    expect(published.at(-1)?.localSetup?.issue).toBeUndefined()
+    unsubscribe()
+  })
+
+  it('does not offer runtime retry without the exact negotiated capability', async () => {
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'online',
+          target: { kind: 'local' },
+          hostId: 'host-local',
+          path: 'local_socket',
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          capabilities: ['runtime_integrity_v1'],
+          runtimeReadiness: {
+            kind: 'reported',
+            hostId: 'host-local',
+            hostdVersion: '0.1.0',
+            startedAt: '2026-08-05T19:59:00.000Z',
+            observedAt: '2026-08-05T20:00:00.000Z',
+            snapshot: runtimeIntegritySnapshot('failed'),
+          },
+        },
+        appVersion: '0.1.0',
+      })),
+      retryRuntimeIntegrity: vi.fn(),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+    expect(view.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { action: 'review_diagnostics', retryable: false },
+    })
+    await expect(api.retryLocalSetup()).rejects.toThrow('does not allow a retry')
+    expect(bridge.retryRuntimeIntegrity).not.toHaveBeenCalled()
+  })
+
+  it('does not let a delayed background local-connect reply overwrite a newer reconnecting observation', async () => {
+    const connectResult = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const hostCatalog = vi.fn(() => new Promise<never>(() => undefined))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'offline',
+          target: { kind: 'local' },
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+        },
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(() => connectResult.promise),
+      hostCatalog,
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const initial = await api.loadWorkbench()
+    expect(initial.localSetup?.stage).toBe('starting_local_service')
+    await vi.waitFor(() => expect(bridge.connect).toHaveBeenCalledTimes(1))
+
+    connectionListener?.({
+      phase: 'reconnecting',
+      target: { kind: 'local' },
+      path: 'local_socket',
+      since: '2026-08-05T20:00:01.000Z',
+      attempt: 2,
+    })
+    expect(published.at(-1)?.localSetup?.stage).toBe('starting_local_service')
+
+    connectResult.resolve(ok({
+      ...residentLifecycleConnection(),
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+    }))
+    await connectResult.promise
+    await Promise.resolve()
+
+    expect(published.some((snapshot) => snapshot.localSetup?.stage === 'choose_workspace')).toBe(false)
+    expect(published.at(-1)?.localSetup?.stage).toBe('starting_local_service')
+    expect(published.at(-1)?.operations.provisionResident).toBeUndefined()
+    expect(hostCatalog).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('does not let a delayed user retry overwrite a newer SSH observation', async () => {
+    const retryResult = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const offline = {
+      phase: 'offline',
+      target: { kind: 'local' },
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      error: { code: 'hostd.start_timeout', message: 'Timed out.', retryable: true },
+    }
+    const connect = vi.fn()
+      .mockRejectedValueOnce(new Error('Automatic retry remains visible as failed.'))
+      .mockImplementationOnce(() => retryResult.promise)
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: offline,
+        appVersion: '0.1.0',
+      })),
+      connect,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const initial = await api.loadWorkbench()
+    expect(initial.localSetup?.issue?.action).toBe('retry_connection')
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1))
+
+    const retry = api.retryLocalSetup()
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2))
+    connectionListener?.({
+      phase: 'reconnecting',
+      target: { kind: 'ssh', alias: 'devbox' },
+      path: 'ssh',
+      since: '2026-08-05T20:00:01.000Z',
+      attempt: 2,
+    })
+    retryResult.resolve(ok({
+      ...residentLifecycleConnection(),
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+    }))
+    await expect(retry).resolves.toBeUndefined()
+
+    expect(published.some((snapshot) => snapshot.localSetup?.stage === 'choose_workspace')).toBe(false)
+    expect(published.at(-1)?.localSetup).toBeUndefined()
+    expect(published.at(-1)?.operations.provisionResident).toBeUndefined()
+    unsubscribe()
+  })
+
+  it('rejects a delayed Add computer SSH reply after a newer local observation', async () => {
+    const sshResult = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const connect = vi.fn(() => sshResult.promise)
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      connect,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+
+    const adding = api.addComputer({
+      alias: 'devbox',
+      installHostService: false,
+      installCommandAcknowledged: false,
+    })
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledWith({ kind: 'ssh', alias: 'devbox' }))
+    connectionListener?.({
+      ...residentLifecycleConnection(),
+      since: '2026-08-05T20:00:02.000Z',
+      attempt: 2,
+    })
+    expect(published.at(-1)?.localSetup?.stage).toBe('choose_workspace')
+
+    sshResult.resolve(ok({
+      phase: 'online',
+      target: { kind: 'ssh', alias: 'devbox' },
+      hostId: 'host-remote',
+      path: 'ssh',
+      since: '2026-08-05T20:00:01.000Z',
+      attempt: 1,
+    }))
+
+    await expect(adding).rejects.toBeInstanceOf(StaleHostAuthorityError)
+    expect(published.at(-1)?.localSetup?.stage).toBe('choose_workspace')
+    expect(published.at(-1)?.operations.provisionResident).toBe(true)
+    unsubscribe()
+  })
+
+  it('accepts its own connecting and online SSH events before the Add computer reply', async () => {
+    const sshResult = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const remoteCatalog = {
+      snapshotVersion: 1,
+      generatedAt: '2026-08-05T20:00:03.000Z',
+      host: {
+        hostId: 'host-remote',
+        displayName: 'devbox',
+        kind: 'ssh',
+        reachability: 'online',
+        compatibility: 'update_available',
+        connectionPaths: [{ kind: 'ssh', priority: 0, state: 'available', latencyMs: 24 }],
+      },
+      projects: [],
+      threads: [],
+    }
+    const sshConnection = {
+      phase: 'online',
+      target: { kind: 'ssh', alias: 'devbox' },
+      hostId: 'host-remote',
+      path: 'ssh',
+      since: '2026-08-05T20:00:02.000Z',
+      attempt: 1,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(() => sshResult.promise),
+      hostCatalog: vi.fn(() => ok(remoteCatalog)),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+
+    const adding = api.addComputer({
+      alias: 'devbox',
+      installHostService: false,
+      installCommandAcknowledged: false,
+    })
+    await vi.waitFor(() => expect(bridge.connect).toHaveBeenCalledWith({ kind: 'ssh', alias: 'devbox' }))
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'ssh', alias: 'devbox' },
+      path: 'ssh',
+      since: '2026-08-05T20:00:01.000Z',
+      attempt: 1,
+    })
+    connectionListener?.(sshConnection)
+    sshResult.resolve(ok(sshConnection))
+
+    await expect(adding).resolves.toEqual({
+      host: {
+        id: 'host-remote',
+        name: 'devbox',
+        kind: 'ssh',
+        connection: 'online',
+        connectionPath: 'SSH',
+        latencyMs: 24,
+        compatibility: 'update_available',
+      },
+    })
+    expect(bridge.hostCatalog).toHaveBeenCalled()
     unsubscribe()
   })
 

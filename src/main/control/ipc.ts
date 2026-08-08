@@ -129,6 +129,11 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
       service.threadProjection(input.threadId, input.cursor)
   )
   handle(
+    IPC.retryRuntimeIntegrity,
+    z.object({ expectedHostId: id }).strict(),
+    (input: { expectedHostId: string }) => service.retryRuntimeIntegrity(input.expectedHostId)
+  )
+  handle(
     IPC.runtimeModelCatalog,
     z.object({ expectedHostId: id }).strict(),
     (input: { expectedHostId: string }) => service.runtimeModelCatalog(input.expectedHostId)

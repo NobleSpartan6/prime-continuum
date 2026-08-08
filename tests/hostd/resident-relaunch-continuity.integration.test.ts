@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,8 +18,8 @@ import {
 import { normalizeResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import { HostStore } from "../../src/hostd/store";
 
-const THREAD_ID = "demo-thread";
-const EXECUTION_GENERATION_ID = "demo-execution-1";
+const THREAD_ID = "test-thread";
+const EXECUTION_GENERATION_ID = "test-execution-1";
 const ACTIVE_SESSION_ID = "resident-active-session-continuity-1";
 const SESSION_ID = "resident-session-continuity-1";
 const SUPERVISOR_GENERATION = "resident-supervisor-generation-1";
@@ -341,7 +342,8 @@ describe("resident continuity across hostd/store relaunch", () => {
     });
 
     const firstStore = new HostStore(dataDirectory);
-    await firstStore.initialize({ seed: true });
+    await firstStore.initialize();
+    await bootstrapTestWorkspace(firstStore, { workspaceDirectory });
     await expect(firstStore.registerWorkspaceAuthority({
       threadId: THREAD_ID,
       executionGenerationId: EXECUTION_GENERATION_ID,
@@ -500,8 +502,8 @@ describe("resident continuity across hostd/store relaunch", () => {
     const endInput = {
       operationId: "resident-relaunch-explicit-end",
       expectedHostId: hostId,
-      projectId: "demo-project",
-      workspaceId: "demo-workspace",
+      projectId: "test-project",
+      workspaceId: "test-workspace",
       threadId: THREAD_ID,
       executionGenerationId: EXECUTION_GENERATION_ID,
       requestDigest: "e".repeat(64),

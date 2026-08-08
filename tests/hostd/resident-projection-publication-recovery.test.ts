@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,9 +32,9 @@ afterEach(async () => {
 describe("resident projection publication recovery", () => {
   it.each(faultPoints)("repairs snapshot/catalog consistency after a crash at %s", async (faultPoint) => {
     const fixture = await createFixture();
-    const baselineSnapshot = await fixture.bootstrap.getThreadSnapshot("demo-thread");
+    const baselineSnapshot = await fixture.bootstrap.getThreadSnapshot("test-thread");
     const baselineCatalogThread = (await fixture.bootstrap.getCatalogSnapshot()).threads.find(
-      (thread) => thread.threadId === "demo-thread",
+      (thread) => thread.threadId === "test-thread",
     );
     let injected = false;
     const crashing = new HostStore(fixture.directory, {
@@ -55,8 +56,8 @@ describe("resident projection publication recovery", () => {
     await expect(crashing.getCatalogSnapshot()).rejects.toMatchObject({ code: "STORE_NOT_INITIALIZED" });
 
     const transaction = await readPendingProjectionTransaction(crashing);
-    const onDiskSnapshot = await readSnapshot(crashing, "demo-thread");
-    const onDiskCatalogThread = await readCatalogThread(crashing, "demo-thread");
+    const onDiskSnapshot = await readSnapshot(crashing, "test-thread");
+    const onDiskCatalogThread = await readCatalogThread(crashing, "test-thread");
     if (faultPoint === "after_prepare" || faultPoint === "after_lineage") {
       expect(onDiskSnapshot).toEqual(baselineSnapshot);
       expect(onDiskCatalogThread).toEqual(baselineCatalogThread);
@@ -70,9 +71,9 @@ describe("resident projection publication recovery", () => {
 
     const recovered = new HostStore(fixture.directory);
     await recovered.initialize();
-    const recoveredSnapshot = await recovered.getThreadSnapshot("demo-thread");
+    const recoveredSnapshot = await recovered.getThreadSnapshot("test-thread");
     const recoveredCatalogThread = (await recovered.getCatalogSnapshot()).threads.find(
-      (thread) => thread.threadId === "demo-thread",
+      (thread) => thread.threadId === "test-thread",
     );
     expect(recoveredSnapshot).toEqual(transaction.snapshot);
     expect(recoveredCatalogThread).toEqual(recoveredSnapshot.thread);
@@ -97,7 +98,7 @@ describe("resident projection publication recovery", () => {
       projection(fixture.binding, 79),
     );
     const catalogThread = (await fixture.bootstrap.getCatalogSnapshot()).threads.find(
-      (thread) => thread.threadId === "demo-thread",
+      (thread) => thread.threadId === "test-thread",
     );
     expect(second.thread).not.toHaveProperty("recap");
     expect(second.thread.updatedAt).toBe(second.generatedAt);
@@ -110,7 +111,7 @@ describe("resident projection publication recovery", () => {
 
   it("refuses to replay a prepared projection after the exact active binding changes", async () => {
     const fixture = await createFixture();
-    const baselineSnapshot = await fixture.bootstrap.getThreadSnapshot("demo-thread");
+    const baselineSnapshot = await fixture.bootstrap.getThreadSnapshot("test-thread");
     let injected = false;
     const crashing = new HostStore(fixture.directory, {
       residentProjectionFaultInjector(point) {
@@ -141,7 +142,7 @@ describe("resident projection publication recovery", () => {
     await expect(restarted.initialize()).rejects.toMatchObject({
       code: "RESIDENT_PROJECTION_BINDING_MISMATCH",
     });
-    expect(await readSnapshot(restarted, "demo-thread")).toEqual(baselineSnapshot);
+    expect(await readSnapshot(restarted, "test-thread")).toEqual(baselineSnapshot);
     expect(await readdir(restarted.paths.residentProjectionTransactions)).toHaveLength(1);
   });
 
@@ -225,7 +226,7 @@ describe("resident projection publication recovery", () => {
     const host = await fixture.bootstrap.getHost();
     const queued = promptCommand(host.hostId, "offline-speculative-prompt");
     expect((await fixture.bootstrap.admitCommand(queued, false)).receipt.status).toBe("admitted");
-    const speculative = await fixture.bootstrap.getThreadSnapshot("demo-thread");
+    const speculative = await fixture.bootstrap.getThreadSnapshot("test-thread");
     expect(speculative.thread.status).toBe("waiting");
     expect(speculative.queueState.pendingCommandIds).toEqual([queued.commandId]);
 
@@ -298,17 +299,18 @@ async function createFixture(options: HostStoreOptions = {}): Promise<{
   await mkdir(workspace, { recursive: true });
   const workspaceDirectory = await realpath(workspace);
   const bootstrap = new HostStore(directory, options);
-  await bootstrap.initialize({ seed: true });
+  await bootstrap.initialize();
+  await bootstrapTestWorkspace(bootstrap, { workspaceDirectory });
   await bootstrap.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const binding: ResidentSessionBinding = {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-session-1",
     sessionId: "session-1",
@@ -390,9 +392,9 @@ function promptCommand(expectedHostId: string, commandId: string): CommandEnvelo
     deviceId: "projection-test-device",
     commandId,
     expectedHostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-07T12:00:03.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: { kind: "prompt", text: "Queue this only in speculative host state." },
   };
 }

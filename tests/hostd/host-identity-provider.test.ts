@@ -148,7 +148,7 @@ async function serviceFixture(options: {
   const directory = await mkdtemp(join(tmpdir(), "prime-host-identity-provider-"));
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
-  await store.initialize({ seed: false });
+  await store.initialize();
   const host = await store.getHost();
   const authority = new PairingAuthority(store.paths.pairingAuthority);
   const configuredIdentity = options.configuredIdentity ?? true;
@@ -178,7 +178,7 @@ async function serviceFixture(options: {
     hostIdentityProvider: provider,
     identityLoadTimeoutMs: options.identityLoadTimeoutMs,
   });
-  await service.initialize({ seed: false });
+  await service.initialize();
   return { service, store, authority, provider, snapshot };
 }
 

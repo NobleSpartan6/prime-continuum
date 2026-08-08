@@ -84,9 +84,9 @@ All transports carry the same bounded, length-prefixed JSON frames. Dynamic valu
 - SSH: `ssh <alias> prime-agent-hostd connect --stdio`, passed as an argument array without shell interpolation.
 - Relay: future outbound, end-to-end encrypted transport implementing the same interface.
 
-## Mobile companion boundary
+## Mobile capability boundary
 
-The compact Companion Preview is a renderer surface, not a second client architecture. `?surface=companion` consumes the same selected thread, catalogs, connection status, snapshot, and evidence projection as the desktop. It is read-only in this milestone; informational gates explain that pairing and phone commands are unavailable, and the preview creates no credential, command, or network request.
+The desktop exposes no mobile destination, pairing flow, phone projection, or mobile command while the required transport and identity stack is unavailable. Real phone control must use the same host authority rules; it cannot be represented by seeded renderer data or a same-device stand-in.
 
 Real phone control must preserve the desktop authority rules through this topology:
 

@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from '../hostd/test-workspace-fixture'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -62,10 +63,11 @@ describe('native ↔ hostd framed protocol', () => {
     temporaryDirectories.push(dataDirectory)
     const store = new HostStore(dataDirectory)
     const service = new HostService(store)
-    await service.initialize({ seed: true })
+    await service.initialize()
+    await bootstrapTestWorkspace(store)
     const catalog = await store.getCatalogSnapshot()
     const thread = catalog.threads[0]
-    if (!thread) throw new Error('seed thread missing')
+    if (!thread) throw new Error('test thread missing')
     const original = await store.getThreadSnapshot(thread.threadId)
     const materializedRecentBlocks = Array.from({ length: 5 }, (_, index) => ({
       blockId: `large-block-${index}`,

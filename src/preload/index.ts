@@ -32,6 +32,7 @@ const bridge: PrimeBridge = {
   hostCatalog: () => invoke(IPC.hostCatalog),
   projectCatalog: (input) => invoke(IPC.projectCatalog, input),
   threadProjection: (input) => invoke(IPC.threadProjection, input),
+  retryRuntimeIntegrity: (input) => invoke(IPC.retryRuntimeIntegrity, input),
   runtimeModelCatalog: (input) => invoke(IPC.runtimeModelCatalog, input),
   startRuntimeOAuth: (input) => invoke(IPC.startRuntimeOAuth, input),
   runtimeOAuthStatus: (input) => invoke(IPC.runtimeOAuthStatus, input),

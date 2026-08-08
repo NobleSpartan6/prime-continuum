@@ -144,7 +144,7 @@ describe('browser preview evidence labels', () => {
     const reconnectThread = reconnectSnapshot.threads.find((thread) => thread.id === reconnectSnapshot.selectedThreadId)
     const reconnectHost = reconnectSnapshot.hosts.find((host) => host.id === reconnectThread?.hostId)
     expect(reconnectHost?.connection).toBe('reconnecting')
-    expect(reconnectSnapshot.composerReceipt.message).toBe(`${previewPrefix} waiting for a sample connection`)
+    expect(reconnectSnapshot.composerReceipt.message).toBe(`${previewPrefix} waiting for a fixture connection`)
   })
 
   it('labels the handoff plan, progress, checkpoint, and receipt as a simulation', async () => {

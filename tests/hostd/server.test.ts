@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { access, mkdir, mkdtemp, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -172,7 +173,8 @@ describe("hostd local transport", () => {
       },
     });
     const service = new HostService(store);
-    await service.initialize({ seed: true });
+    await service.initialize();
+    await bootstrapTestWorkspace(store);
     const host = await store.getHost();
     const endpoint = defaultLocalEndpoint(directory);
     const server = await serveLocalSocket({ endpoint, dataDir: directory, service });
@@ -181,9 +183,9 @@ describe("hostd local transport", () => {
       deviceId: "device-admitted-before-close",
       commandId: "command-admitted-before-close",
       expectedHostId: host.hostId,
-      threadId: "demo-thread",
+      threadId: "test-thread",
       issuedAt: new Date().toISOString(),
-      expectedExecutionGenerationId: "demo-execution-1",
+      expectedExecutionGenerationId: "test-execution-1",
       command: { kind: "prompt", text: "Finish this admitted publication before handoff." },
     } as const;
     const requestOutcome = request(endpoint, {
@@ -428,7 +430,7 @@ describe("hostd local transport", () => {
             deviceId: "device-after-ownership-loss",
             commandId: "command-after-ownership-loss",
             expectedHostId: host.hostId,
-            threadId: "demo-thread",
+            threadId: "test-thread",
             issuedAt: new Date().toISOString(),
             command: { kind: "prompt", text: "This mutation must never be admitted." },
           },

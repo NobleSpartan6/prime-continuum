@@ -225,7 +225,7 @@ describe("RuntimeInitializationCoordinator", () => {
       status: "failed",
       code: "RUNTIME_TRANSIENT_VERIFICATION",
       retryable: true,
-      recoveryAction: "restart_host_service",
+      recoveryAction: "retry_runtime_verification",
     });
     expect(JSON.stringify(coordinator.snapshot())).not.toMatch(/private|secret|token/i);
     expect(onFailure).toHaveBeenCalledTimes(2);
@@ -262,7 +262,7 @@ describe("RuntimeInitializationCoordinator", () => {
       failure: {
         code: "RUNTIME_INTEGRITY_FAILED",
         retryable: true,
-        recoveryAction: "restart_host_service",
+        recoveryAction: "retry_runtime_verification",
       },
     },
     {
@@ -280,7 +280,7 @@ describe("RuntimeInitializationCoordinator", () => {
       failure: {
         code: "RUNTIME_INTEGRITY_FAILED",
         retryable: true,
-        recoveryAction: "restart_host_service",
+        recoveryAction: "retry_runtime_verification",
       },
     },
     {
@@ -291,7 +291,7 @@ describe("RuntimeInitializationCoordinator", () => {
       failure: {
         code: "RUNTIME_INTEGRITY_FAILED",
         retryable: true,
-        recoveryAction: "restart_host_service",
+        recoveryAction: "retry_runtime_verification",
       },
     },
     {

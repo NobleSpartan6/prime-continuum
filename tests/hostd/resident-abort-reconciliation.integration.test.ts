@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,10 +155,11 @@ async function initializedStore() {
   const workspaceDirectory = await realpath(workspacePath);
   const store = new HostStore(directory);
   const service = new HostService(store, new UnavailablePrimeAgentGateway());
-  await service.initialize({ seed: true });
+  await service.initialize();
+  await bootstrapTestWorkspace(store, { workspaceDirectory });
   await store.registerWorkspaceAuthority({
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
   });
   const residentBinding = binding(workspaceDirectory);
@@ -214,8 +216,8 @@ function binding(workspaceDirectory: string): ResidentSessionBinding {
   return {
     bindingVersion: 1,
     lifecycle: "resident",
-    threadId: "demo-thread",
-    executionGenerationId: "demo-execution-1",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
     workspaceDirectory,
     activeSessionId: "active-abort-proof-session",
     sessionId: "abort-proof-session",
@@ -241,9 +243,9 @@ function abortCommand(expectedHostId: string, commandId: string): CommandEnvelop
     deviceId: "abort-proof-device",
     commandId,
     expectedHostId,
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-08T01:01:00.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: { kind: "abort", reason: "Verify the exact acknowledged Stop idle boundary." },
   };
 }

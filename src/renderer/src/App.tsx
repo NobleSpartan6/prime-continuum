@@ -3,7 +3,6 @@ import {
   AlertCircle,
   ArrowDown,
   ArrowRight,
-  Bell,
   Bot,
   Check,
   CheckCircle2,
@@ -15,7 +14,6 @@ import {
   Command,
   Computer,
   Copy,
-  Eye,
   FileCode2,
   FolderGit2,
   GitBranch,
@@ -36,11 +34,9 @@ import {
   Search,
   Server,
   ShieldCheck,
-  Smartphone,
   Square,
   Terminal,
   TestTube2,
-  Wifi,
   WifiOff,
   X,
   type LucideIcon,
@@ -55,6 +51,8 @@ import {
   type HandoffPlan,
   type HostRuntimeReadiness,
   type HostSummary,
+  type LocalSetupStage,
+  type LocalSetupSummary,
   type RendererApi,
   type ResidentEndPreparation,
   type ResidentLifecycleOperationSummary,
@@ -70,7 +68,6 @@ import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, Ref
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
-type WorkbenchSurface = 'desktop' | 'companion'
 type ComposerReceiptView = {
   state: ComposerReceiptState
   message: string
@@ -81,6 +78,7 @@ type ComposerLocalAction = {
   sequence: number
   operation: 'prompt' | 'abort'
 }
+type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
 type ResidentLifecycleRecoveryReference = {
   operationId: string
   expectedHostId: string
@@ -157,6 +155,23 @@ async function writeClipboardText(text: string): Promise<void> {
   const copied = document.execCommand('copy')
   field.remove()
   if (!copied) throw new Error('Clipboard copy was rejected')
+}
+
+function localSetupDiagnosticText(setup: LocalSetupSummary): string {
+  const stage = setup.stage === 'needs_attention' ? setup.stage : 'unknown'
+  const area = setup.issue?.area === 'local_service' || setup.issue?.area === 'runtime'
+    ? setup.issue.area
+    : 'unknown'
+  const code = setup.issue?.code && /^[A-Za-z0-9._-]{1,96}$/.test(setup.issue.code)
+    ? setup.issue.code
+    : 'not_reported'
+  return [
+    'PRIME_CONTINUIM_SETUP_DIAGNOSTIC',
+    `Stage: ${stage}`,
+    `Area: ${area}`,
+    `Code: ${code}`,
+    'Next step: Share this diagnostic with Prime Continuim support.',
+  ].join('\n')
 }
 
 function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'][number] }) {
@@ -266,6 +281,120 @@ function residentLifecycleAnnouncement(status: ResidentLifecycleStatusResult | n
 
 function Icon({ icon: IconComponent, size = 16, strokeWidth = 1.75 }: { icon: LucideIcon; size?: number; strokeWidth?: number }) {
   return <IconComponent aria-hidden="true" focusable="false" size={size} strokeWidth={strokeWidth} />
+}
+
+type LocalSetupStepState = 'pending' | 'current' | 'complete' | 'error' | 'action'
+
+function localSetupPresentation(setup: LocalSetupSummary): {
+  heading: string
+  description: string
+  status: string
+  icon: LucideIcon
+} {
+  if (setup.stage === 'choose_workspace') {
+    return {
+      heading: 'Choose a workspace',
+      description: 'Choose a folder and Prime Continuim will create a durable resident thread for it.',
+      status: 'The bundled Prime Agent runtime is verified.',
+      icon: FolderGit2,
+    }
+  }
+  if (setup.stage === 'needs_attention') {
+    return {
+      heading: 'Setup needs attention',
+      description: 'Your files are unchanged. Resolve the local setup issue before choosing a workspace.',
+      status: 'Local setup is paused.',
+      icon: AlertCircle,
+    }
+  }
+  if (setup.stage === 'preparing_runtime') {
+    const readiness = runtimeReadinessCopy(setup.runtimeReadiness)
+    return {
+      heading: 'Getting Prime Continuim ready',
+      description: 'Prime Continuim is verifying its bundled Prime Agent runtime. This can take a moment the first time.',
+      status: setup.runtimeReadiness?.kind === 'reported' && setup.runtimeReadiness.status === 'ready'
+        ? 'Finishing local setup…'
+        : readiness?.summary ?? 'Checking the bundled Prime Agent runtime…',
+      icon: ShieldCheck,
+    }
+  }
+  return {
+    heading: 'Getting Prime Continuim ready',
+    description: 'Prime Continuim is starting its private local service. This can take a moment the first time.',
+    status: 'Starting the local service…',
+    icon: Server,
+  }
+}
+
+function localSetupStepStates(setup: LocalSetupSummary): [LocalSetupStepState, LocalSetupStepState, LocalSetupStepState] {
+  if (setup.stage === 'choose_workspace') return ['complete', 'complete', 'action']
+  if (setup.stage === 'preparing_runtime') return ['complete', 'current', 'pending']
+  if (setup.stage === 'needs_attention') {
+    return setup.issue?.area === 'runtime'
+      ? ['complete', 'error', 'pending']
+      : ['error', 'pending', 'pending']
+  }
+  return ['current', 'pending', 'pending']
+}
+
+function LocalSetupProgress({ setup }: { setup: LocalSetupSummary }) {
+  const states = localSetupStepStates(setup)
+  const readiness = runtimeReadinessCopy(setup.runtimeReadiness)
+  const steps: Array<{ label: string; detail: string; state: LocalSetupStepState }> = [
+    {
+      label: 'Start local service',
+      detail: states[0] === 'complete' ? 'Connected on this computer' : states[0] === 'error' ? 'Could not start safely' : 'Starting on this computer',
+      state: states[0],
+    },
+    {
+      label: 'Verify Prime Agent runtime',
+      detail: states[1] === 'complete'
+        ? 'Bundled runtime verified'
+        : states[1] === 'error'
+          ? 'Verification paused'
+          : states[1] === 'current'
+            ? readiness?.summary ?? 'Checking bundled files'
+            : 'Available after the local service starts',
+      state: states[1],
+    },
+    {
+      label: 'Choose a workspace',
+      detail: states[2] === 'action' ? 'Ready for your folder' : 'Available after verification',
+      state: states[2],
+    },
+  ]
+  return (
+    <section className="local-setup" aria-labelledby="local-setup-progress-title">
+      <h2 className="sr-only" id="local-setup-progress-title">Local setup progress</h2>
+      <ol className="local-setup__steps">
+        {steps.map((step) => {
+          const StepIcon = step.state === 'complete'
+            ? Check
+            : step.state === 'error'
+              ? AlertCircle
+              : step.state === 'current'
+                ? Loader2
+                : step.state === 'action'
+                  ? ArrowRight
+                  : Circle
+          return (
+            <li
+              className={cx('local-setup__step', `local-setup__step--${step.state}`)}
+              data-state={step.state}
+              aria-current={step.state === 'current' || step.state === 'action' ? 'step' : undefined}
+              key={step.label}
+            >
+              <span className="local-setup__step-icon"><Icon icon={StepIcon} size={16} /></span>
+              <span className="local-setup__step-copy">
+                <strong>{step.label}</strong>
+                <small>{step.detail}</small>
+              </span>
+            </li>
+          )
+        })}
+      </ol>
+    </section>
+  )
 }
 
 function BrandMark() {
@@ -453,9 +582,6 @@ interface AppProps {
 
 export default function App({ api: suppliedApi }: AppProps) {
   const api = useMemo(() => suppliedApi ?? createRendererApi(), [suppliedApi])
-  const [surface, setSurface] = useState<WorkbenchSurface>(() =>
-    new URLSearchParams(window.location.search).get('surface') === 'companion' ? 'companion' : 'desktop',
-  )
   const [snapshot, setSnapshot] = useState<WorkbenchSnapshot | null>(null)
   const [loadError, setLoadError] = useState('')
   const [threadSelectionError, setThreadSelectionError] = useState('')
@@ -465,13 +591,17 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
-  const [pairMobileOpen, setPairMobileOpen] = useState(false)
   const [addComputerOpen, setAddComputerOpen] = useState(false)
   const [residentWorkspaceSelection, setResidentWorkspaceSelection] = useState<ResidentWorkspaceSelection | null>(null)
   const [residentProvisionOrigin, setResidentProvisionOrigin] = useState<'empty' | 'workbench' | null>(null)
   const [residentWorkspacePicking, setResidentWorkspacePicking] = useState(false)
   const [residentStatusChecking, setResidentStatusChecking] = useState(false)
   const [residentWorkspaceError, setResidentWorkspaceError] = useState('')
+  const [localSetupRetrying, setLocalSetupRetrying] = useState(false)
+  const [localSetupRetryError, setLocalSetupRetryError] = useState('')
+  const [localSetupDiagnosticCopyState, setLocalSetupDiagnosticCopyState] = useState<LocalSetupDiagnosticCopyState>('idle')
+  const [localSetupDiagnosticFeedback, setLocalSetupDiagnosticFeedback] = useState('')
+  const [localSetupDiagnosticFallback, setLocalSetupDiagnosticFallback] = useState('')
   const [residentLifecycleFeedback, setResidentLifecycleFeedback] = useState('')
   const [residentRecoveryReference, setResidentRecoveryReference] = useState<ResidentLifecycleRecoveryReference | null>(null)
   const [residentThreadFocusTarget, setResidentThreadFocusTarget] = useState<ResidentThreadFocusTarget | null>(null)
@@ -490,16 +620,18 @@ export default function App({ api: suppliedApi }: AppProps) {
   const addComputerTriggerRef = useRef<HTMLButtonElement>(null)
   const addComputerReturnTargetRef = useRef<HTMLElement | null>(null)
   const residentProvisionReturnTargetRef = useRef<HTMLElement | null>(null)
+  const localSetupWorkspaceButtonRef = useRef<HTMLButtonElement>(null)
+  const localSetupIssueRef = useRef<HTMLDivElement>(null)
+  const localSetupDiagnosticFallbackRef = useRef<HTMLTextAreaElement>(null)
+  const localSetupDiagnosticRequestRef = useRef(0)
+  const previousLocalSetupStageRef = useRef<LocalSetupStage | undefined>(undefined)
   const residentEndReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
-  const pairMobileTriggerRef = useRef<HTMLButtonElement>(null)
-  const pairMobileDialogTriggerRef = useRef<HTMLElement | null>(null)
   const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
-  const companionReturnTargetRef = useRef<'companion-button' | 'sidebar-toggle' | 'command' | null>(null)
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
@@ -515,37 +647,9 @@ export default function App({ api: suppliedApi }: AppProps) {
     setCommandPaletteOpen(true)
   }, [inspectorIsOverlay, sidebarIsOverlay])
 
-  const setWorkbenchSurface = useCallback((nextSurface: WorkbenchSurface) => {
-    const url = new URL(window.location.href)
-    if (nextSurface === 'companion') url.searchParams.set('surface', 'companion')
-    else url.searchParams.delete('surface')
-    window.history.replaceState({}, '', url)
-    setSurface(nextSurface)
-  }, [])
-
-  const openCompanion = useCallback((returnTarget: 'companion-button' | 'sidebar-toggle' | 'command') => {
-    companionReturnTargetRef.current = returnTarget
-    setWorkbenchSurface('companion')
-  }, [setWorkbenchSurface])
-
-  const exitCompanion = useCallback(() => {
-    setWorkbenchSurface('desktop')
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        const target = companionReturnTargetRef.current === 'command'
-          ? commandPaletteTriggerRef.current
-          : companionReturnTargetRef.current === 'sidebar-toggle'
-            ? sidebarToggleRef.current
-            : pairMobileTriggerRef.current
-        target?.focus()
-        companionReturnTargetRef.current = null
-      })
-    })
-  }, [setWorkbenchSurface])
-
   useEffect(() => {
     const openPalette = (event: globalThis.KeyboardEvent) => {
-      if (surface !== 'desktop' || event.defaultPrevented || event.repeat) return
+      if (event.defaultPrevented || event.repeat) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return
         event.preventDefault()
@@ -554,7 +658,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
     window.addEventListener('keydown', openPalette)
     return () => window.removeEventListener('keydown', openPalette)
-  }, [openCommandPalette, surface])
+  }, [openCommandPalette])
 
   useResponsiveDrawerFocus({
     open: sidebarOpen,
@@ -629,6 +733,46 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
   }, [api])
 
+  useEffect(() => {
+    const stage = snapshot?.localSetup?.stage
+    const previousStage = previousLocalSetupStageRef.current
+    previousLocalSetupStageRef.current = stage
+    if (stage !== 'needs_attention') {
+      setLocalSetupRetrying(false)
+      setLocalSetupRetryError('')
+    }
+    if (stage === 'choose_workspace' && previousStage && previousStage !== stage) {
+      window.requestAnimationFrame(() => {
+        const activeElement = document.activeElement
+        if (!activeElement || activeElement === document.body || !activeElement.isConnected) {
+          localSetupWorkspaceButtonRef.current?.focus()
+        }
+      })
+    }
+    if (stage === 'needs_attention' && previousStage !== stage) {
+      window.requestAnimationFrame(() => {
+        const activeElement = document.activeElement
+        if (!activeElement || activeElement === document.body || !activeElement.isConnected) {
+          localSetupIssueRef.current?.focus()
+        }
+      })
+    }
+  }, [snapshot?.localSetup?.stage])
+
+  const localSetupDiagnosticIdentity = [
+    snapshot?.localSetup?.stage ?? '',
+    snapshot?.localSetup?.issue?.area ?? '',
+    snapshot?.localSetup?.issue?.action ?? '',
+    snapshot?.localSetup?.issue?.code ?? '',
+  ].join('|')
+
+  useEffect(() => {
+    localSetupDiagnosticRequestRef.current += 1
+    setLocalSetupDiagnosticCopyState('idle')
+    setLocalSetupDiagnosticFeedback('')
+    setLocalSetupDiagnosticFallback('')
+  }, [localSetupDiagnosticIdentity])
+
   const selectedThread = snapshot?.threads.find((thread) => thread.id === selectedThreadId) ?? snapshot?.threads[0]
   const selectedProject =
     snapshot?.projects.find((project) => project.id === selectedThread?.projectId) ??
@@ -642,7 +786,8 @@ export default function App({ api: suppliedApi }: AppProps) {
   const canStartResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.startResidentTurn ?? false)
   const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
-  const canLoadModelCatalog = snapshot?.operations.modelCatalog ?? false
+  const canLoadModelCatalog = api.environment === 'native' && (snapshot?.operations.modelCatalog ?? false)
+  const canManageComputers = api.environment === 'native'
   const canProvisionResident = snapshot?.operations.provisionResident ?? false
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
@@ -954,6 +1099,53 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
   }
 
+  const retryLocalSetup = async () => {
+    const retryingRuntime = snapshot?.localSetup?.issue?.action === 'retry_runtime'
+    setLocalSetupRetryError('')
+    setLocalSetupRetrying(true)
+    try {
+      await api.retryLocalSetup()
+    } catch {
+      setLocalSetupRetryError(retryingRuntime
+        ? 'Runtime verification could not be retried. Review the current setup status and try again if the action remains available.'
+        : 'Prime Continuim could not retry the local connection. Review the current setup status and try again if it remains available.')
+    } finally {
+      setLocalSetupRetrying(false)
+    }
+  }
+
+  const copyLocalSetupDiagnostic = async () => {
+    const setup = snapshot?.localSetup
+    if (
+      setup?.stage !== 'needs_attention' ||
+      !setup.issue ||
+      setup.issue.retryable ||
+      (setup.issue.action !== 'review_diagnostics' && setup.issue.action !== 'manual_recovery')
+    ) return
+
+    const diagnostic = localSetupDiagnosticText(setup)
+    const requestId = ++localSetupDiagnosticRequestRef.current
+    setLocalSetupDiagnosticCopyState('copying')
+    setLocalSetupDiagnosticFeedback('Copying the path-free setup diagnostic…')
+    setLocalSetupDiagnosticFallback('')
+    try {
+      await writeClipboardText(diagnostic)
+      if (requestId !== localSetupDiagnosticRequestRef.current) return
+      setLocalSetupDiagnosticCopyState('copied')
+      setLocalSetupDiagnosticFeedback('Setup diagnostic copied. Share it with Prime Continuim support.')
+    } catch {
+      if (requestId !== localSetupDiagnosticRequestRef.current) return
+      setLocalSetupDiagnosticCopyState('failed')
+      setLocalSetupDiagnosticFallback(diagnostic)
+      setLocalSetupDiagnosticFeedback('Unable to copy the setup diagnostic. Select the diagnostic below, copy it manually, and share it with Prime Continuim support.')
+      window.requestAnimationFrame(() => {
+        const field = localSetupDiagnosticFallbackRef.current
+        field?.focus()
+        field?.select()
+      })
+    }
+  }
+
   const reviewResidentEnd = async (
     trigger: HTMLElement,
     recovery?: ResidentLifecycleOperationSummary,
@@ -1105,7 +1297,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     return (
       <div className="load-state" role="status" aria-live="polite">
         <Icon icon={Loader2} size={22} />
-        <p>Opening your cached workbench…</p>
+        <p>Opening Prime Continuim…</p>
       </div>
     )
   }
@@ -1124,6 +1316,22 @@ export default function App({ api: suppliedApi }: AppProps) {
         ? [snapshot.residentLifecycleOperations[0]]
         : []
     const canProvisionResident = snapshot.operations.provisionResident === true
+    const localSetup = snapshot.projects.length === 0 && snapshot.threads.length === 0
+      ? snapshot.localSetup
+      : undefined
+    const setupPresentation = localSetup ? localSetupPresentation(localSetup) : undefined
+    const recoveryFirst = Boolean(residentRecoveryReference || lifecycleOperations.length > 0)
+    const setupIssueLabel = localSetup?.issue?.action === 'manual_recovery'
+      ? 'Manual runtime recovery required'
+      : localSetup?.issue?.action === 'retry_runtime'
+        ? 'Runtime verification stopped'
+      : localSetup?.issue?.area === 'runtime'
+        ? 'Runtime verification paused'
+        : 'Local service unavailable'
+    const canCopyLocalSetupDiagnostic = localSetup?.stage === 'needs_attention' &&
+      Boolean(localSetup.issue) &&
+      localSetup.issue?.retryable === false &&
+      (localSetup.issue?.action === 'review_diagnostics' || localSetup.issue?.action === 'manual_recovery')
     return (
       <div className="empty-workbench">
         <header className="empty-workbench__topbar">
@@ -1131,18 +1339,35 @@ export default function App({ api: suppliedApi }: AppProps) {
           <strong>Prime Continuim</strong>
         </header>
         <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-          {residentLifecycleFeedback}
+          {localSetupDiagnosticFeedback || residentLifecycleFeedback}
         </p>
-        <main className="empty-workbench__main" id="main">
-          <span className="empty-workbench__icon"><Icon icon={canProvisionResident ? FolderGit2 : Inbox} size={22} /></span>
-          <h1>{canProvisionResident ? 'Start a resident thread' : snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet'}</h1>
+        <main
+          className={cx('empty-workbench__main', localSetup && 'empty-workbench__main--setup')}
+          data-local-setup-stage={localSetup?.stage}
+          id="main"
+        >
+          <span className={cx('empty-workbench__icon', localSetup?.stage === 'needs_attention' && 'empty-workbench__icon--danger')}>
+            <Icon icon={recoveryFirst ? AlertCircle : setupPresentation?.icon ?? (canProvisionResident ? FolderGit2 : Inbox)} size={22} />
+          </span>
+          <h1>
+            {recoveryFirst && localSetup
+              ? 'Finish resident setup'
+              : setupPresentation?.heading ?? (canProvisionResident ? 'Start a resident thread' : snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet')}
+          </h1>
           <p>
-            {canProvisionResident
+            {recoveryFirst && localSetup
+              ? 'Review the durable setup state first. Prime Continuim will not replay a resident create automatically.'
+              : setupPresentation?.description ?? (canProvisionResident
               ? 'Choose a workspace folder, confirm its names, and Prime Agent will keep the thread available after this window closes.'
               : snapshot.projects.length > 0
                 ? 'Reconnect the verified local host to start a resident thread, or open a durable thread that is already available.'
-                : 'Connect a verified local host to start a resident thread from one of your workspace folders.'}
+                : 'Connect a verified local host to start a resident thread from one of your workspace folders.')}
           </p>
+          {setupPresentation && (
+            <p className="local-setup__status" role="status" aria-live="polite" aria-atomic="true">
+              {setupPresentation.status}
+            </p>
+          )}
           {residentRecoveryReference && (
             <ResidentLifecycleFallbackCard
               reference={residentRecoveryReference}
@@ -1169,9 +1394,24 @@ export default function App({ api: suppliedApi }: AppProps) {
               onCheck={(operation) => void checkResidentLifecycle(operation)}
             />
           )}
+          {localSetup && <LocalSetupProgress setup={localSetup} />}
+          {localSetup?.stage === 'needs_attention' && localSetup.issue && (
+            <div className="local-setup__issue" role="alert" tabIndex={-1} ref={localSetupIssueRef}>
+              <span><Icon icon={AlertCircle} size={16} /></span>
+              <div>
+                <strong>{setupIssueLabel}</strong>
+                <p>{localSetup.issue.message}</p>
+                {localSetup.issue.code && <code>{localSetup.issue.code}</code>}
+                {canCopyLocalSetupDiagnostic && (
+                  <p>Copy the path-free setup diagnostic and share it with Prime Continuim support.</p>
+                )}
+              </div>
+            </div>
+          )}
           <div className="empty-workbench__actions">
-            {canProvisionResident && (
+            {(!localSetup || (localSetup.stage === 'choose_workspace' && !recoveryFirst)) && canProvisionResident && (
               <button
+                ref={localSetup ? localSetupWorkspaceButtonRef : undefined}
                 className="button button--primary"
                 type="button"
                 disabled={residentWorkspacePicking}
@@ -1182,20 +1422,80 @@ export default function App({ api: suppliedApi }: AppProps) {
                 {residentWorkspacePicking ? 'Opening folder picker…' : 'Choose workspace folder'}
               </button>
             )}
-            <button
-              ref={addComputerTriggerRef}
-              className={cx('button', canProvisionResident ? 'button--secondary' : 'button--primary')}
-              type="button"
-              onClick={(event) => {
-                addComputerReturnTargetRef.current = event.currentTarget
-                setAddComputerOpen(true)
-              }}
-            >
-              <Icon icon={Computer} /> Add computer
-            </button>
+            {localSetup?.stage === 'needs_attention' &&
+              (localSetup.issue?.action === 'retry_connection' || localSetup.issue?.action === 'retry_runtime') &&
+              localSetup.issue.retryable && (
+              <button
+                className="button button--primary"
+                type="button"
+                disabled={localSetupRetrying}
+                aria-busy={localSetupRetrying}
+                onClick={() => void retryLocalSetup()}
+              >
+                <Icon icon={localSetupRetrying ? Loader2 : RefreshCw} />
+                {localSetup.issue.action === 'retry_runtime'
+                  ? localSetupRetrying ? 'Retrying verification…' : 'Retry runtime verification'
+                  : localSetupRetrying ? 'Retrying local service…' : 'Retry local service'}
+              </button>
+            )}
+            {canCopyLocalSetupDiagnostic && (
+              <button
+                className="button button--primary"
+                type="button"
+                disabled={localSetupDiagnosticCopyState === 'copying'}
+                aria-busy={localSetupDiagnosticCopyState === 'copying'}
+                onClick={() => void copyLocalSetupDiagnostic()}
+              >
+                <Icon icon={localSetupDiagnosticCopyState === 'copying' ? Loader2 : localSetupDiagnosticCopyState === 'copied' ? Check : Copy} />
+                {localSetupDiagnosticCopyState === 'copying'
+                  ? 'Copying diagnostic…'
+                  : localSetupDiagnosticCopyState === 'copied'
+                    ? 'Setup diagnostic copied'
+                    : 'Copy setup diagnostic'}
+              </button>
+            )}
+            {canManageComputers && (
+              <button
+                ref={addComputerTriggerRef}
+                className={cx('button', localSetup || canProvisionResident ? 'button--secondary' : 'button--primary')}
+                type="button"
+                onClick={(event) => {
+                  addComputerReturnTargetRef.current = event.currentTarget
+                  setAddComputerOpen(true)
+                }}
+              >
+                <Icon icon={Computer} /> {localSetup ? 'Use another computer' : 'Add computer'}
+              </button>
+            )}
           </div>
-          <p className="form-error empty-workbench__error" role="alert">{residentWorkspaceError}</p>
-          <small>Your verified local host uses this folder for the workspace. Prime Continuim does not display its location or send it to another computer.</small>
+          {localSetupDiagnosticFallback && (
+            <div className="local-setup__diagnostic-fallback">
+              <strong>Clipboard unavailable</strong>
+              <p id="local-setup-diagnostic-instructions">
+                The diagnostic is selected below. Copy it manually and share it with Prime Continuim support.
+              </p>
+              <label htmlFor="local-setup-diagnostic">Setup diagnostic</label>
+              <textarea
+                ref={localSetupDiagnosticFallbackRef}
+                id="local-setup-diagnostic"
+                readOnly
+                rows={5}
+                value={localSetupDiagnosticFallback}
+                aria-describedby="local-setup-diagnostic-instructions"
+                onFocus={(event) => event.currentTarget.select()}
+              />
+            </div>
+          )}
+          {(residentWorkspaceError || localSetupRetryError) && (
+            <p className="form-error empty-workbench__error" role="alert">{residentWorkspaceError || localSetupRetryError}</p>
+          )}
+          <small>
+            {localSetup
+              ? localSetup.stage === 'choose_workspace'
+                ? 'The folder path stays with the verified local host. Prime Continuim does not display it or send it to another computer.'
+                : 'Workspace access remains disabled until the bundled runtime and local authority are verified.'
+              : 'Your verified local host uses this folder for the workspace. Prime Continuim does not display its location or send it to another computer.'}
+          </small>
         </main>
         <ResidentProvisionDialog
           api={api}
@@ -1224,21 +1524,6 @@ export default function App({ api: suppliedApi }: AppProps) {
   const visibleTaskState = taskStateIsStale
     ? `Last seen ${taskLabel(selectedThread.status).toLowerCase()}`
     : taskLabel(selectedThread.status)
-
-  if (surface === 'companion') {
-    return (
-      <CompanionPreview
-        environment={api.environment}
-        snapshot={snapshot}
-        selectedThread={selectedThread}
-        selectedProject={selectedProject}
-        selectedHost={selectedHost}
-        selectionError={threadSelectionError}
-        onSelectThread={selectThread}
-        onExit={exitCompanion}
-      />
-    )
-  }
 
   return (
     <div className="app-shell" data-sidebar-open={sidebarOpen} data-inspector-open={inspectorOpen}>
@@ -1384,11 +1669,6 @@ export default function App({ api: suppliedApi }: AppProps) {
           if (returnTarget) void chooseResidentWorkspace(returnTarget, reference.operationId)
         }}
         onCheckResidentReference={(reference) => void checkResidentRecoveryReference(reference)}
-        onOpenCompanion={(trigger) => {
-          pairMobileDialogTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
-          if (sidebarIsOverlay) closeSidebar()
-          setPairMobileOpen(true)
-        }}
         onOpenModels={(trigger) => {
           modelsDialogTriggerRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
           if (sidebarIsOverlay) closeSidebar()
@@ -1397,13 +1677,12 @@ export default function App({ api: suppliedApi }: AppProps) {
         onMoveThread={openMoveThread}
         canMoveThread={canMoveThreads}
         canLoadModelCatalog={canLoadModelCatalog}
+        canManageComputers={canManageComputers}
         canProvisionResident={canProvisionResident}
         residentLifecycleOperations={residentLifecycleOperations}
         residentRecoveryReference={residentRecoveryReference}
         residentLifecycleBusy={residentWorkspacePicking || residentStatusChecking}
         addComputerTriggerRef={addComputerTriggerRef}
-        companionTriggerRef={pairMobileTriggerRef}
-        environment={api.environment}
         containerRef={sidebarPanelRef}
         modal={sidebarIsModal}
         inert={inspectorIsModal}
@@ -1537,6 +1816,7 @@ export default function App({ api: suppliedApi }: AppProps) {
         snapshot={snapshot}
         selectedThreadId={selectedThread.id}
         canEndResident={canEndResident}
+        canManageComputers={canManageComputers}
         triggerRef={commandPaletteTriggerRef}
         onClose={() => setCommandPaletteOpen(false)}
         onSelectThread={selectThread}
@@ -1556,10 +1836,6 @@ export default function App({ api: suppliedApi }: AppProps) {
           setCommandPaletteOpen(false)
           setModelsOpen(true)
         }}
-        onOpenCompanion={() => {
-          setCommandPaletteOpen(false)
-          openCompanion('command')
-        }}
         onFocusComposer={() => {
           setCommandPaletteOpen(false)
           window.requestAnimationFrame(() => {
@@ -1572,20 +1848,6 @@ export default function App({ api: suppliedApi }: AppProps) {
           const trigger = commandPaletteTriggerRef.current
           setCommandPaletteOpen(false)
           if (trigger) void reviewResidentEnd(trigger)
-        }}
-      />
-
-      <PairMobileDialog
-        environment={api.environment}
-        open={pairMobileOpen}
-        snapshot={snapshot}
-        selectedThread={selectedThread}
-        selectedHost={selectedHost}
-        triggerRef={pairMobileDialogTriggerRef}
-        onClose={() => setPairMobileOpen(false)}
-        onOpenPreview={() => {
-          setPairMobileOpen(false)
-          openCompanion(sidebarIsOverlay ? 'sidebar-toggle' : 'companion-button')
         }}
       />
 
@@ -1626,18 +1888,16 @@ interface SidebarProps {
   onCheckResident: (operation: ResidentLifecycleOperationSummary) => void
   onRecoverResidentReference: (reference: ResidentLifecycleRecoveryReference, trigger: HTMLElement) => void
   onCheckResidentReference: (reference: ResidentLifecycleRecoveryReference) => void
-  onOpenCompanion: (trigger: HTMLElement) => void
   onOpenModels: (trigger: HTMLElement) => void
   onMoveThread: (hostId: string, trigger: HTMLElement | null) => void
   canMoveThread: boolean
   canLoadModelCatalog: boolean
+  canManageComputers: boolean
   canProvisionResident: boolean
   residentLifecycleOperations: ResidentLifecycleOperationSummary[]
   residentRecoveryReference: ResidentLifecycleRecoveryReference | null
   residentLifecycleBusy: boolean
   addComputerTriggerRef: RefObject<HTMLButtonElement | null>
-  companionTriggerRef: RefObject<HTMLButtonElement | null>
-  environment: RendererApi['environment']
   containerRef: RefObject<HTMLElement | null>
   modal: boolean
   inert: boolean
@@ -1657,18 +1917,16 @@ function Sidebar({
   onCheckResident,
   onRecoverResidentReference,
   onCheckResidentReference,
-  onOpenCompanion,
   onOpenModels,
   onMoveThread,
   canMoveThread,
   canLoadModelCatalog,
+  canManageComputers,
   canProvisionResident,
   residentLifecycleOperations,
   residentRecoveryReference,
   residentLifecycleBusy,
   addComputerTriggerRef,
-  companionTriggerRef,
-  environment,
   containerRef,
   modal,
   inert,
@@ -1882,24 +2140,16 @@ function Sidebar({
             <Icon icon={Bot} /> Models &amp; accounts
           </button>
         )}
-        <button
-          ref={addComputerTriggerRef}
-          className="button button--quiet button--full"
-          type="button"
-          onClick={(event) => onAddComputer(event.currentTarget)}
-        >
-          <Icon icon={Computer} /> Add computer
-        </button>
-        <button
-          ref={companionTriggerRef}
-          className="button button--quiet button--full"
-          type="button"
-          aria-haspopup="dialog"
-          onClick={(event) => onOpenCompanion(event.currentTarget)}
-        >
-          <Icon icon={Smartphone} /> Companion preview
-        </button>
-        {environment === 'preview' && <span className="preview-label">Browser preview · sample data</span>}
+        {canManageComputers && (
+          <button
+            ref={addComputerTriggerRef}
+            className="button button--quiet button--full"
+            type="button"
+            onClick={(event) => onAddComputer(event.currentTarget)}
+          >
+            <Icon icon={Computer} /> Add computer
+          </button>
+        )}
       </div>
     </aside>
   )
@@ -2676,10 +2926,12 @@ function runtimeReadinessCopy(readiness: HostRuntimeReadiness | undefined): {
         : 'Runtime files verified'
     return { summary: `${prefix}${assurance}`, cached, ...observation, ...(cached ? { tone: 'muted' as const } : {}) }
   }
-  const detail = readiness.recovery === 'restart'
-    ? 'Restart the host service, then try again.'
+  const detail = readiness.recovery === 'retry'
+    ? 'Retry runtime verification to run the same checks again.'
+    : readiness.recovery === 'restart'
+    ? 'Record diagnostics and contact support; this app cannot restart the detached host service.'
     : readiness.recovery === 'repair'
-      ? 'Repair or reinstall Prime Continuim on this computer.'
+      ? 'Record diagnostics and contact support before changing local runtime data.'
       : 'Review diagnostics for this host before retrying.'
   return {
     summary: `${prefix}${readiness.status === 'failed' ? 'Runtime verification failed' : 'Runtime verification unavailable'}`,
@@ -3071,6 +3323,7 @@ interface CommandPaletteDialogProps {
   snapshot: WorkbenchSnapshot
   selectedThreadId: string
   canEndResident: boolean
+  canManageComputers: boolean
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
   onSelectThread: (thread: ThreadSummary) => void
@@ -3078,7 +3331,6 @@ interface CommandPaletteDialogProps {
   onAddComputer: () => void
   onOpenInspector: () => void
   onOpenModels: () => void
-  onOpenCompanion: () => void
   onFocusComposer: () => void
   onEndResident: () => void
 }
@@ -3098,6 +3350,7 @@ function CommandPaletteDialog({
   snapshot,
   selectedThreadId,
   canEndResident,
+  canManageComputers,
   triggerRef,
   onClose,
   onSelectThread,
@@ -3105,7 +3358,6 @@ function CommandPaletteDialog({
   onAddComputer,
   onOpenInspector,
   onOpenModels,
-  onOpenCompanion,
   onFocusComposer,
   onEndResident,
 }: CommandPaletteDialogProps) {
@@ -3175,16 +3427,7 @@ function CommandPaletteDialog({
       keywords: 'end resident session permanent stop runtime preserve thread workspace',
       run: onEndResident,
     }] : []),
-    {
-      id: 'command:companion',
-      label: 'Open companion preview',
-      detail: 'Inspect the compact, read-only mobile supervision surface',
-      group: 'Commands' as const,
-      icon: Smartphone,
-      keywords: 'mobile phone companion preview attention hosts',
-      run: onOpenCompanion,
-    },
-    {
+    ...(canManageComputers ? [{
       id: 'command:add-computer',
       label: 'Add computer',
       detail: 'Discover and verify a configured SSH host',
@@ -3192,8 +3435,8 @@ function CommandPaletteDialog({
       icon: Computer,
       keywords: 'add computer ssh host remote machine',
       run: onAddComputer,
-    },
-  ], [canEndResident, onAddComputer, onEndResident, onFocusComposer, onOpenCompanion, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
+    }] : []),
+  ], [canEndResident, canManageComputers, onAddComputer, onEndResident, onFocusComposer, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
 
   const filteredItems = useMemo(() => {
     const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
@@ -3335,416 +3578,6 @@ function CommandPaletteDialog({
         </footer>
       </div>
     </NativeDialog>
-  )
-}
-
-interface PairMobileDialogProps {
-  environment: RendererApi['environment']
-  open: boolean
-  snapshot: WorkbenchSnapshot
-  selectedThread: ThreadSummary
-  selectedHost: HostSummary
-  triggerRef: RefObject<HTMLElement | null>
-  onClose: () => void
-  onOpenPreview: () => void
-}
-
-function PairMobileDialog({
-  environment,
-  open,
-  snapshot,
-  selectedThread,
-  selectedHost,
-  triggerRef,
-  onClose,
-  onOpenPreview,
-}: PairMobileDialogProps) {
-  return (
-    <NativeDialog
-      open={open}
-      labelledBy="pair-mobile-title"
-      describedBy="pair-mobile-description"
-      triggerRef={triggerRef}
-      className="pair-mobile-sheet"
-      onClose={onClose}
-    >
-      <div className="sheet__frame">
-        <header className="sheet__header">
-          <div className="sheet__title-group">
-            <span className="sheet__title-icon"><Icon icon={Smartphone} size={18} /></span>
-            <div>
-              <h2 id="pair-mobile-title">Mobile companion</h2>
-              <p id="pair-mobile-description">Preview this thread in a phone-sized layout.</p>
-            </div>
-          </div>
-          <button className="icon-button" type="button" aria-label="Close mobile companion" onClick={onClose}>
-            <Icon icon={X} size={18} />
-          </button>
-        </header>
-
-        <div className="sheet__scroll pair-mobile-content">
-          <section className="relay-gate" aria-labelledby="relay-gate-title">
-            <span className="relay-gate__icon"><Icon icon={LockKeyhole} size={20} /></span>
-            <div>
-              <span className="eyebrow">Preview only</span>
-              <h3 id="relay-gate-title">Phone control isn’t available in this build</h3>
-              <p>
-                This shows the companion layout on this computer. It does not connect a phone or enable remote control.
-              </p>
-            </div>
-          </section>
-
-          <section className="sheet-section" aria-labelledby="companion-preview-heading">
-            <div className="section-heading-row">
-              <div>
-                <h3 id="companion-preview-heading">Preview on this device</h3>
-                <p>Uses the thread data already loaded here. No relay, credential, or encrypted device connection is created.</p>
-              </div>
-              <span className="verification-mark">
-                <Icon icon={Eye} size={14} />
-                {environment === 'preview' ? 'Browser preview · sample data' : 'Native projection data'}
-              </span>
-            </div>
-            <div className="preview-summary">
-              <div><span>Thread</span><strong>{selectedThread.title}</strong></div>
-              <div><span>Host</span><strong>{selectedHost.name}</strong></div>
-              <div><span>Action queue</span><strong>{snapshot.attention.length}</strong></div>
-              <div><span>Evidence</span><strong>{snapshot.evidence.length}</strong></div>
-            </div>
-          </section>
-        </div>
-
-        <footer className="sheet__footer">
-          <p>The preview stays on this device and cannot pair a phone or send commands.</p>
-          <div className="sheet__footer-actions">
-            <button className="button button--quiet" type="button" onClick={onClose}>Close</button>
-            <button className="button button--primary" type="button" onClick={onOpenPreview}>
-              <Icon icon={Smartphone} size={15} /> Open companion preview
-            </button>
-          </div>
-        </footer>
-      </div>
-    </NativeDialog>
-  )
-}
-
-interface CompanionPreviewProps {
-  environment: RendererApi['environment']
-  snapshot: WorkbenchSnapshot
-  selectedThread: ThreadSummary
-  selectedProject: WorkbenchSnapshot['projects'][number]
-  selectedHost: HostSummary
-  selectionError: string
-  onSelectThread: (thread: ThreadSummary) => void
-  onExit: () => void
-}
-
-type CompanionView = 'attention' | 'threads' | 'thread' | 'hosts'
-
-function CompanionPreview({
-  environment,
-  snapshot,
-  selectedThread,
-  selectedProject,
-  selectedHost,
-  selectionError,
-  onSelectThread,
-  onExit,
-}: CompanionPreviewProps) {
-  const actionableAttention = useMemo(() => {
-    const items = [...snapshot.attention]
-    if (snapshot.composerReceipt.state === 'uncertain') {
-      items.push({
-        id: `uncertain-${selectedThread.id}`,
-        threadId: selectedThread.id,
-        kind: 'failed',
-        title: snapshot.composerReceipt.message || 'A command receipt is uncertain',
-        hostName: selectedHost.name,
-      })
-    }
-    return [...new Map(items.map((item) => [item.id, item])).values()]
-  }, [selectedHost.name, selectedThread.id, snapshot.attention, snapshot.composerReceipt])
-  const [view, setView] = useState<CompanionView>(() => actionableAttention.length > 0 ? 'attention' : 'threads')
-  const mainRef = useRef<HTMLElement>(null)
-  const attentionHeadingRef = useRef<HTMLHeadingElement>(null)
-  const threadsHeadingRef = useRef<HTMLHeadingElement>(null)
-  const threadHeadingRef = useRef<HTMLHeadingElement>(null)
-  const hostsHeadingRef = useRef<HTMLHeadingElement>(null)
-  const threadButtonRefs = useRef(new Map<string, HTMLButtonElement>())
-  const lastOpenedThreadIdRef = useRef(selectedThread.id)
-  const focusThreadHeadingRef = useRef(false)
-  const restoreThreadRowRef = useRef(false)
-  const navigationTargetRef = useRef<Exclude<CompanionView, 'thread'> | null>(null)
-  const connectionLabel = selectedHost.connection === 'online'
-    ? `Connected through ${selectedHost.connectionPath}`
-    : connectionCopy(selectedHost.connection, selectedHost)
-
-  useEffect(() => {
-    const heading = view === 'attention'
-      ? attentionHeadingRef.current
-      : view === 'threads'
-        ? threadsHeadingRef.current
-        : view === 'thread'
-          ? threadHeadingRef.current
-          : hostsHeadingRef.current
-    window.requestAnimationFrame(() => heading?.focus({ preventScroll: true }))
-  }, [])
-
-  useEffect(() => {
-    const navigationTarget = navigationTargetRef.current
-    if (navigationTarget && navigationTarget === view) {
-      navigationTargetRef.current = null
-      window.requestAnimationFrame(() => {
-        if (mainRef.current) mainRef.current.scrollTop = 0
-        const heading = navigationTarget === 'attention'
-          ? attentionHeadingRef.current
-          : navigationTarget === 'threads'
-            ? threadsHeadingRef.current
-            : hostsHeadingRef.current
-        heading?.focus({ preventScroll: true })
-      })
-      return
-    }
-
-    if (view === 'thread' && focusThreadHeadingRef.current) {
-      focusThreadHeadingRef.current = false
-      window.requestAnimationFrame(() => {
-        if (mainRef.current) mainRef.current.scrollTop = 0
-        threadHeadingRef.current?.focus({ preventScroll: true })
-      })
-    }
-    if (view === 'threads' && restoreThreadRowRef.current) {
-      restoreThreadRowRef.current = false
-      window.requestAnimationFrame(() => threadButtonRefs.current.get(lastOpenedThreadIdRef.current)?.focus())
-    }
-  }, [selectedThread.id, view])
-
-  const openThread = (thread: ThreadSummary) => {
-    lastOpenedThreadIdRef.current = thread.id
-    focusThreadHeadingRef.current = true
-    onSelectThread(thread)
-    setView('thread')
-  }
-
-  const returnToThreads = () => {
-    restoreThreadRowRef.current = true
-    setView('threads')
-  }
-
-  const navigateCompanion = (destination: Exclude<CompanionView, 'thread'>) => {
-    navigationTargetRef.current = destination
-    if (view !== destination) {
-      setView(destination)
-      return
-    }
-
-    navigationTargetRef.current = null
-    window.requestAnimationFrame(() => {
-      if (mainRef.current) mainRef.current.scrollTop = 0
-      const heading = destination === 'attention'
-        ? attentionHeadingRef.current
-        : destination === 'threads'
-          ? threadsHeadingRef.current
-          : hostsHeadingRef.current
-      heading?.focus({ preventScroll: true })
-    })
-  }
-
-  return (
-    <div className="companion-shell">
-      <a className="skip-link" href="#companion-main">Skip to companion content</a>
-      <header className="companion-topbar">
-        <div className="companion-brand">
-          <BrandMark />
-          <span>
-            <strong>Prime Continuim</strong>
-            <small>{environment === 'preview' ? 'Browser preview · sample data' : 'Read-only companion preview'}</small>
-          </span>
-        </div>
-        <button className="button button--quiet button--small" type="button" onClick={onExit}>
-          <Icon icon={Monitor} size={15} /> Desktop
-        </button>
-      </header>
-
-      <div className="companion-preview-notice" role="note">
-        <Icon icon={LockKeyhole} size={15} />
-        <span><strong>Read-only preview.</strong> Secure relay unavailable.</span>
-      </div>
-
-      <main ref={mainRef} className="companion-main" id="companion-main" tabIndex={-1}>
-        {selectionError && (
-          <div className="companion-error" role="alert">
-            <Icon icon={AlertCircle} size={15} />
-            <span>{selectionError}</span>
-          </div>
-        )}
-        {view === 'attention' && (
-          <section className="companion-screen" aria-labelledby="companion-attention-title">
-            <header className="companion-screen__header">
-              <span className="eyebrow">Action queue</span>
-              <h1 ref={attentionHeadingRef} id="companion-attention-title" tabIndex={-1}>Needs you</h1>
-              <p>Questions, approvals, uncertain commands, and failures only.</p>
-            </header>
-            {actionableAttention.length > 0 ? (
-              <ul className="companion-card-list">
-                {actionableAttention.map((item) => {
-                  const thread = snapshot.threads.find((candidate) => candidate.id === item.threadId)
-                  return (
-                    <li key={item.id} className={cx(item.diagnostic && 'companion-card-list__item--diagnostic')}>
-                      <button type="button" onClick={() => thread && openThread(thread)}>
-                        <span className={cx('companion-card-list__icon', `companion-card-list__icon--${item.kind}`)}>
-                          <Icon icon={item.kind === 'approval' ? ShieldCheck : item.kind === 'question' ? MessageSquare : AlertCircle} size={17} />
-                        </span>
-                        <span>
-                          <strong>{item.title}</strong>
-                          <small>{thread?.title ?? 'Unknown thread'} · {item.hostName}</small>
-                          <AttentionDiagnostic item={item} />
-                        </span>
-                        <Icon icon={ChevronRight} size={16} />
-                      </button>
-                      <AttentionDiagnosticCopy item={item} />
-                    </li>
-                  )
-                })}
-              </ul>
-            ) : (
-              <div className="companion-empty"><Icon icon={CheckCircle2} size={22} /><h2>Nothing needs you</h2><p>Active and recent work remains under Threads.</p></div>
-            )}
-          </section>
-        )}
-
-        {view === 'threads' && (
-          <section className="companion-screen" aria-labelledby="companion-threads-title">
-            <header className="companion-screen__header">
-              <span className="eyebrow">All locations</span>
-              <h1 ref={threadsHeadingRef} id="companion-threads-title" tabIndex={-1}>Threads</h1>
-              <p>Follow active and recent work across your computers.</p>
-            </header>
-            <ul className="companion-thread-list">
-              {snapshot.threads.map((thread) => {
-                const host = snapshot.hosts.find((candidate) => candidate.id === thread.hostId)
-                return (
-                  <li key={thread.id}>
-                    <button
-                      ref={(element) => {
-                        if (element) threadButtonRefs.current.set(thread.id, element)
-                        else threadButtonRefs.current.delete(thread.id)
-                      }}
-                      type="button"
-                      aria-current={thread.id === selectedThread.id ? 'page' : undefined}
-                      onClick={() => openThread(thread)}
-                    >
-                      <span className={cx('thread-row__state', `thread-row__state--${thread.status}`)} aria-hidden="true" />
-                      <span><strong>{thread.title}</strong><small>{thread.recap}</small><em>{host?.name ?? 'Unknown host'} · {taskLabel(thread.status)} · {thread.updatedAt}</em></span>
-                      <Icon icon={ChevronRight} size={16} />
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          </section>
-        )}
-
-        {view === 'thread' && (
-          <article className="companion-thread" aria-labelledby="companion-thread-title">
-            <header className="companion-thread__header">
-              <button className="button button--quiet button--small" type="button" onClick={returnToThreads}>
-                <Icon icon={ChevronRight} size={15} /> Threads
-              </button>
-              <span className={cx('task-state', `task-state--${selectedThread.status}`)}>{taskLabel(selectedThread.status)}</span>
-            </header>
-            <section className="companion-recap">
-              <span className="eyebrow">Thread recap</span>
-              <h1 ref={threadHeadingRef} id="companion-thread-title" tabIndex={-1}>{selectedThread.title}</h1>
-              <p>{selectedThread.recap}</p>
-              <div className="companion-meta"><span>{selectedProject.name}</span><span>{selectedHost.name}</span><span>{connectionLabel}</span></div>
-            </section>
-
-            {actionableAttention.filter((item) => item.threadId === selectedThread.id).map((item) => (
-              <section className="companion-decision" key={item.id} aria-label="Current decision">
-                <span><Icon icon={item.kind === 'approval' ? ShieldCheck : item.kind === 'question' ? MessageSquare : AlertCircle} size={17} /></span>
-                <div><strong>{item.title}</strong><p>Open the authorized desktop client to resolve this item.</p></div>
-              </section>
-            ))}
-
-            <section className="companion-results" aria-labelledby="companion-results-title">
-              <div className="section-heading-row">
-                <div><h2 id="companion-results-title">Results</h2><p>Concise review before the full transcript.</p></div>
-              </div>
-              <div className="companion-result-grid">
-                <div><span>Changed files</span><strong>{snapshot.changes.length}</strong></div>
-                <div><span>Checks</span><strong>{snapshot.evidence.length}</strong></div>
-                <div><span>Passed</span><strong>{snapshot.evidence.filter((item) => item.status === 'passed').length}</strong></div>
-              </div>
-              {snapshot.evidence.slice(0, 3).map((item) => (
-                <div className="companion-evidence-row" key={item.id}>
-                  <Icon icon={item.status === 'passed' ? CheckCircle2 : item.status === 'running' ? Loader2 : AlertCircle} size={15} />
-                  <span>
-                    <span className="sr-only">{runtimeStateLabel(item.status)}. </span>
-                    <strong>{item.label}</strong><small>{item.detail}</small>
-                  </span>
-                </div>
-              ))}
-            </section>
-
-            <section className="companion-transcript" aria-labelledby="companion-transcript-title">
-              <div className="section-heading-row"><div><h2 id="companion-transcript-title">Recent activity</h2><p>Most recent updates from the active computer.</p></div></div>
-              {selectedThread.transcript.slice(-6).map((block) => (
-                <article key={block.id} className={cx('companion-message', `companion-message--${block.kind}`)}>
-                  <header><strong>{block.author ?? (block.kind === 'checkpoint' ? 'Checkpoint' : 'Prime Agent')}</strong><time>{block.time}</time></header>
-                  <TranscriptBody body={block.body} kind={block.kind} />
-                  {block.detail && <small>{block.detail}</small>}
-                </article>
-              ))}
-            </section>
-
-            <section className="companion-lock-callout" aria-labelledby="companion-control-title">
-              <Icon icon={LockKeyhole} size={17} />
-              <div>
-                <strong id="companion-control-title">Replies are read-only in this preview</strong>
-                <p>Phone controls will appear here after secure pairing is available. This preview never sends a command.</p>
-              </div>
-            </section>
-          </article>
-        )}
-
-        {view === 'hosts' && (
-          <section className="companion-screen" aria-labelledby="companion-hosts-title">
-            <header className="companion-screen__header">
-              <span className="eyebrow">Execution locations</span>
-              <h1 ref={hostsHeadingRef} id="companion-hosts-title" tabIndex={-1}>Hosts</h1>
-              <p>See which computers Prime can reach right now.</p>
-            </header>
-            <ul className="companion-host-list">
-              {snapshot.hosts.map((host) => (
-                <li key={host.id}>
-                  <span className="companion-host-list__icon"><Icon icon={host.kind === 'local' ? Laptop : Server} size={17} /></span>
-                  <span><strong>{host.name}</strong><small>{host.connection === 'online' ? `Connected through ${host.connectionPath}` : connectionCopy(host.connection, host)}</small></span>
-                  <em>{host.compatibility.replaceAll('_', ' ')}</em>
-                </li>
-              ))}
-            </ul>
-            <div className="companion-lock-callout" role="note">
-              <Icon icon={LockKeyhole} size={18} />
-              <div><strong>Phone pairing isn't available yet</strong><p>This build does not create a pairing code or phone credential.</p></div>
-            </div>
-          </section>
-        )}
-      </main>
-
-      <nav className="companion-nav" aria-label="Companion navigation">
-        <button type="button" aria-current={view === 'attention' ? 'page' : undefined} onClick={() => navigateCompanion('attention')}>
-          <span><Icon icon={Bell} size={19} />{actionableAttention.length > 0 && <b>{actionableAttention.length}</b>}</span>
-          Attention
-        </button>
-        <button type="button" aria-current={view === 'threads' || view === 'thread' ? 'page' : undefined} onClick={() => navigateCompanion('threads')}>
-          <Icon icon={MessageSquare} size={19} /> Threads
-        </button>
-        <button type="button" aria-current={view === 'hosts' ? 'page' : undefined} onClick={() => navigateCompanion('hosts')}>
-          <Icon icon={Server} size={19} /> Hosts
-        </button>
-      </nav>
-    </div>
   )
 }
 
@@ -4328,7 +4161,6 @@ function ResidentProvisionDialog({
               type="text"
               value={projectDisplayName}
               maxLength={255}
-              autoFocus
               data-dialog-autofocus
               autoComplete="off"
               aria-invalid={invalidField === 'project'}
@@ -4643,7 +4475,6 @@ type ModelsCatalogError = {
 }
 
 function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: ModelsDialogProps) {
-  const isPreview = api.environment === 'preview'
   const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ModelsCatalogError | null>(null)
@@ -4767,9 +4598,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <div>
               <h2 id="models-title">Models &amp; accounts</h2>
               <p id="models-description">
-                {isPreview
-                  ? 'Illustrative sample catalog for the browser preview. No Prime Agent host was queried.'
-                  : <>Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.</>}
+                Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.
               </p>
             </div>
           </div>
@@ -4801,15 +4630,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
           </div>
         ) : catalog ? (
           <div className="models-workspace">
-            <aside className="provider-rail" aria-label={isPreview ? 'Sample accounts' : `Accounts on ${host.name}`}>
+            <aside className="provider-rail" aria-label={`Accounts on ${host.name}`}>
               <div className="provider-rail__summary">
-                <span className="eyebrow">{isPreview ? 'Sample accounts' : <>Accounts on <bdi>{host.name}</bdi></>}</span>
+                <span className="eyebrow">Accounts on <bdi>{host.name}</bdi></span>
                 <strong>{configuredProviders.length} configured</strong>
-                <small>
-                  {isPreview
-                    ? `Browser preview · illustrative Prime Agent ${catalog.releaseVersion} fixture`
-                    : `${oauthProviders.length} OAuth-capable providers · Prime Agent ${catalog.releaseVersion}`}
-                </small>
+                <small>{oauthProviders.length} OAuth-capable providers · Prime Agent {catalog.releaseVersion}</small>
               </div>
               <p className="sr-only" id="provider-filter-instructions">
                 {providerRailHorizontal
@@ -4859,15 +4684,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
             <section className="model-catalog" aria-label="Prime Agent models">
               <div className="model-catalog__topline">
                 <div>
-                  <span className="eyebrow">{isPreview ? 'Sample catalog' : 'Runtime catalog'}</span>
-                  <h3>{selectedProvider?.displayName ?? (isPreview ? 'Illustrative sample models' : 'Models reported by this host')}</h3>
-                  <p>
-                    {isPreview
-                      ? `${scopedAvailableCount} shown as available · ${scopedModelCount} listed in this sample`
-                      : `${scopedAvailableCount} available with current setup · ${scopedModelCount} listed by the runtime`}
-                  </p>
+                  <span className="eyebrow">Runtime catalog</span>
+                  <h3>{selectedProvider?.displayName ?? 'Models reported by this host'}</h3>
+                  <p>{scopedAvailableCount} available with current setup · {scopedModelCount} listed by the runtime</p>
                 </div>
-                <span className="catalog-freshness"><span aria-hidden="true" /> {isPreview ? 'Sample data' : `Read ${formatCatalogTime(catalog.observedAt)}`}</span>
+                <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
               </div>
 
               {selectedProvider && !selectedProvider.configured && (
@@ -4876,9 +4697,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                   <div>
                     <strong>{selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
                     <p>
-                      {isPreview
-                        ? <>In the native app, run <code>/login</code> on the connected Prime Agent host. This sample never reads or stores credentials.</>
-                        : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim's host protocol and renderer.</>}
+                      Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim's host protocol and renderer.
                     </p>
                   </div>
                 </div>
@@ -4967,11 +4786,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
               )}
               <footer className="model-catalog__footer">
                 <Icon icon={Info} size={14} />
-                <span>
-                  {isPreview
-                    ? 'Illustrative sample only; model names and availability are not host evidence. No sign-in, inference test, or model change runs in this browser preview.'
-                    : 'This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.'}
-                </span>
+                <span>This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.</span>
               </footer>
             </section>
           </div>
@@ -5012,9 +4827,6 @@ interface AddComputerDialogProps {
 function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialogProps) {
   const [computers, setComputers] = useState<DiscoveredComputer[]>([])
   const [selectedAlias, setSelectedAlias] = useState('')
-  const [manualMode, setManualMode] = useState(false)
-  const [manualHost, setManualHost] = useState('')
-  const [manualUser, setManualUser] = useState('')
   const [selectedComputer, setSelectedComputer] = useState<DiscoveredComputer | null>(null)
   const [loading, setLoading] = useState(false)
   const [probing, setProbing] = useState(false)
@@ -5028,8 +4840,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     message: string
     failed: boolean
   } | null>(null)
-  const [invalidField, setInvalidField] = useState<'manual-host' | 'install-consent' | null>(null)
-  const manualHostRef = useRef<HTMLInputElement>(null)
+  const [invalidField, setInvalidField] = useState<'install-consent' | null>(null)
   const installConsentRef = useRef<HTMLInputElement>(null)
   const copyFeedbackSequenceRef = useRef(0)
 
@@ -5055,7 +4866,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
         setStatus(items.length === 1 ? 'Found 1 SSH alias' : `Found ${items.length} SSH aliases`)
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Unable to read SSH aliases. Enter a host manually.')
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Unable to read SSH aliases. Check your OpenSSH configuration and try again.')
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -5067,7 +4878,6 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
     const selected = computers.find((computer) => computer.alias === alias) ?? null
     setSelectedAlias(alias)
     setSelectedComputer(selected)
-    setManualMode(false)
     setInstallConsent(selected?.probeComplete ? !selected.requiresInstall : false)
     setError('')
     setInvalidField(null)
@@ -5098,20 +4908,14 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
   const probe = async () => {
     setError('')
     setInvalidField(null)
-    if (manualMode && !manualHost.trim()) {
-      setError('Enter a hostname or SSH alias to run the connection check.')
-      setInvalidField('manual-host')
-      window.requestAnimationFrame(() => manualHostRef.current?.focus())
+    if (!selectedAlias) {
+      setError('Choose a discovered SSH alias before checking the connection.')
       return
     }
     setProbing(true)
-    setStatus(`Checking ${manualMode ? manualHost.trim() : selectedAlias}…`)
+    setStatus(`Checking ${selectedAlias}…`)
     try {
-      const result = await api.probeComputer(
-        manualMode
-          ? { hostname: manualHost.trim(), user: manualUser.trim() || undefined }
-          : { alias: selectedAlias },
-      )
+      const result = await api.probeComputer({ alias: selectedAlias })
       setSelectedComputer(result)
       setSelectedAlias(result.alias)
       setInstallConsent(!result.requiresInstall)
@@ -5126,11 +4930,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!selectedComputer?.probeComplete) {
-      setError('Select a discovered alias or check a manually entered host first.')
-      if (manualMode) {
-        setInvalidField('manual-host')
-        window.requestAnimationFrame(() => manualHostRef.current?.focus())
-      }
+      setError('Choose a discovered SSH alias and check its connection first.')
       return
     }
     if (selectedComputer.requiresInstall && !installConsent) {
@@ -5162,8 +4962,6 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
   const hasReportedFingerprint = Boolean(
     resolved && /^SHA256:[A-Za-z0-9+/]{32,}={0,2}$/.test(resolved.fingerprint) && resolved.fingerprint !== 'SHA256:pending-host-verification',
   )
-  const isPreview = api.environment === 'preview'
-
   return (
     <NativeDialog open={open} labelledBy="add-computer-title" describedBy="add-computer-description" triggerRef={triggerRef} onClose={onClose} className="sheet--computer" dismissible={!submitting}>
       <form className="sheet__frame" onSubmit={submit} aria-busy={submitting}>
@@ -5174,7 +4972,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
               <h2 id="add-computer-title">Add computer</h2>
               <p id="add-computer-description">
                 Use an existing SSH alias. OpenSSH keeps control of keys, proxy jumps, and host verification.
-                {api.environment === 'native' && ' This build cannot show interactive password, passphrase, or new host-key prompts; complete those in your terminal, then check again.'}
+                {' '}This build cannot show interactive password, passphrase, or new host-key prompts; complete those in your terminal, then check again.
               </p>
             </div>
           </div>
@@ -5201,12 +4999,12 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
               <fieldset className="alias-list">
                 <legend className="sr-only">Choose an SSH alias</legend>
                 {computers.map((computer) => (
-                  <label key={computer.alias} className={cx('alias-row', selectedAlias === computer.alias && !manualMode && 'alias-row--selected')}>
+                  <label key={computer.alias} className={cx('alias-row', selectedAlias === computer.alias && 'alias-row--selected')}>
                     <input
                       type="radio"
                       name="ssh-alias"
                       value={computer.alias}
-                      checked={selectedAlias === computer.alias && !manualMode}
+                      checked={selectedAlias === computer.alias}
                       onChange={() => selectAlias(computer.alias)}
                     />
                     <span className="alias-row__computer"><Icon icon={Server} size={16} /></span>
@@ -5220,57 +5018,13 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
               </fieldset>
             )}
 
-            {api.environment === 'preview' ? (
-              <details className="disclosure" open={manualMode} onToggle={(event) => setManualMode(event.currentTarget.open)}>
-                <summary><span>Preview a manual host</span><span>Sample browser demo</span></summary>
-                <div className="manual-fields">
-                  <label>
-                    <span>Hostname or SSH alias</span>
-                    <input
-                      ref={manualHostRef}
-                      id="manual-host"
-                      type="text"
-                      name="manual-host"
-                      value={manualHost}
-                      placeholder="build.example.com"
-                      spellCheck={false}
-                      aria-invalid={invalidField === 'manual-host'}
-                      aria-describedby={invalidField === 'manual-host' ? 'add-computer-error' : undefined}
-                      onChange={(event) => {
-                        setManualHost(event.target.value)
-                        if (invalidField === 'manual-host') {
-                          setInvalidField(null)
-                          setError('')
-                        }
-                      }}
-                    />
-                  </label>
-                  <label>
-                    <span>User <em>optional</em></span>
-                    <input
-                      type="text"
-                      name="manual-user"
-                      value={manualUser}
-                      placeholder="developer"
-                      autoComplete="username"
-                      spellCheck={false}
-                      onChange={(event) => setManualUser(event.target.value)}
-                    />
-                  </label>
-                  <button className="button button--secondary" type="button" onClick={() => void probe()} disabled={probing}>
-                    <Icon icon={Network} size={15} /> Check preview host
-                  </button>
-                </div>
-              </details>
-            ) : (
-              <details className="disclosure">
-                <summary><span>Alias not listed?</span><span>SSH configuration</span></summary>
-                <div className="manual-guidance">
-                  <p>Add a concrete <code>Host</code> alias to your SSH configuration, then close and reopen this sheet. Wildcard-only entries are not shown.</p>
-                  <code>Host buildbox{`\n`}  HostName build.example.com{`\n`}  User developer</code>
-                </div>
-              </details>
-            )}
+            <details className="disclosure">
+              <summary><span>Alias not listed?</span><span>SSH configuration</span></summary>
+              <div className="manual-guidance">
+                <p>Add a concrete <code>Host</code> alias to your SSH configuration, then close and reopen this sheet. Wildcard-only entries are not shown.</p>
+                <code>Host buildbox{`\n`}  HostName build.example.com{`\n`}  User developer</code>
+              </div>
+            </details>
           </section>
 
           {resolved && (
@@ -5281,7 +5035,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
                   <p>Confirm the effective target and host identity before continuing.</p>
                 </div>
                 <span className="verification-mark">
-                  <Icon icon={ShieldCheck} size={15} /> {isPreview ? 'Preview sample' : 'Verified by OpenSSH'}
+                  <Icon icon={ShieldCheck} size={15} /> Verified by OpenSSH
                 </span>
               </div>
               <dl className="resolved-grid">
@@ -5409,9 +5163,7 @@ function AddComputerDialog({ api, open, onClose, triggerRef }: AddComputerDialog
         <footer className="sheet__footer">
           <p>
             {resolved
-              ? isPreview
-                ? 'Sample browser preview only; no live host key was checked.'
-                : hasReportedFingerprint
+              ? hasReportedFingerprint
                 ? `Review the reported host-key fingerprint for ${resolved.effectiveTarget}.`
                 : `OpenSSH verified ${resolved.effectiveTarget}; this probe did not return a literal fingerprint.`
               : 'Choose a computer to continue.'}

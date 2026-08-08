@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,12 +51,12 @@ describe("HostService handoff availability", () => {
     expect(response.ok).toBe(true);
     if (!response.ok || response.method !== "handoff.plan") throw new Error("handoff plan request failed");
     expect(response.result).toMatchObject({
-      threadId: "demo-thread",
+      threadId: "test-thread",
       repositoryMatch: "exact",
       executable: false,
       source: {
-        projectId: "demo-project",
-        executionGenerationId: "demo-execution-1",
+        projectId: "test-project",
+        executionGenerationId: "test-execution-1",
       },
       destination: {
         hostId: "destination-host",
@@ -77,7 +78,7 @@ describe("HostService handoff availability", () => {
     const planResponse = await requestReviewablePlan(service, store);
     if (!planResponse.ok || planResponse.method !== "handoff.plan") throw new Error("handoff plan request failed");
     const host = await store.getHost();
-    const before = await store.getThreadSnapshot("demo-thread");
+    const before = await store.getThreadSnapshot("test-thread");
     const identity = { deviceId: "device-test", commandId: "service-handoff-command" };
 
     const response = await service.handle({
@@ -96,7 +97,7 @@ describe("HostService handoff availability", () => {
         retryable: false,
       },
     });
-    const after = await store.getThreadSnapshot("demo-thread");
+    const after = await store.getThreadSnapshot("test-thread");
     expect(after.thread.currentLocation).toEqual(before.thread.currentLocation);
   });
 
@@ -108,9 +109,9 @@ describe("HostService handoff availability", () => {
       deviceId: "device-test",
       commandId: "gateway-unavailable-command",
       expectedHostId: host.hostId,
-      threadId: "demo-thread",
+      threadId: "test-thread",
       issuedAt: new Date().toISOString(),
-      expectedExecutionGenerationId: "demo-execution-1",
+      expectedExecutionGenerationId: "test-execution-1",
       command: { kind: "prompt", text: "Do not queue this without an execution gateway." },
     };
 
@@ -150,9 +151,9 @@ describe("HostService handoff availability", () => {
       deviceId: "device-test",
       commandId: "wrong-host-command",
       expectedHostId: "different-host",
-      threadId: "demo-thread",
+      threadId: "test-thread",
       issuedAt: new Date().toISOString(),
-      expectedExecutionGenerationId: "demo-execution-1",
+      expectedExecutionGenerationId: "test-execution-1",
       command: { kind: "prompt", text: "This must never reach the wrong host journal." },
     };
 
@@ -205,7 +206,7 @@ describe("HostService handoff availability", () => {
       protocolVersion: PROTOCOL_VERSION,
       deviceId: "device-test",
       commandId: "missing-host-command",
-      threadId: "demo-thread",
+      threadId: "test-thread",
       issuedAt: new Date().toISOString(),
       command: { kind: "prompt", text: "This request must fail schema validation." },
     };
@@ -269,9 +270,9 @@ describe("HostService handoff availability", () => {
       deviceId: relayDevice.deviceId,
       commandId: "relay-follow-up",
       expectedHostId: host.hostId,
-      threadId: "demo-thread",
+      threadId: "test-thread",
       issuedAt: new Date().toISOString(),
-      expectedExecutionGenerationId: "demo-execution-1",
+      expectedExecutionGenerationId: "test-execution-1",
       command: { kind: "follow_up", text: "Continue from the phone." },
     };
     const denied = await service.handle(
@@ -389,7 +390,8 @@ async function temporaryService(): Promise<{
   const directory = await mkdtemp(join(tmpdir(), "prime-hostd-service-test-"));
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store);
   const host = await store.getHost();
   const relaySessions = createTestAuthenticatedRelaySessions();
   const pairingCeremonies = createTestVerifiedPairingCeremonies();
@@ -428,7 +430,7 @@ async function temporaryService(): Promise<{
       close() {},
     },
   });
-  await serviceWithVerifiedIdentity.initialize({ seed: true });
+  await serviceWithVerifiedIdentity.initialize();
   const relayDevice = await pairTestDevice(pairingAuthority, host.hostId);
   return { service: serviceWithVerifiedIdentity, store, pairingAuthority, relayDevice };
 }
@@ -483,10 +485,10 @@ async function requestReviewablePlan(service: HostService, store: HostStore) {
   const catalog = await store.getCatalogSnapshot();
   const host = await store.getHost();
   const source = catalog.projects[0];
-  if (!source) throw new Error("seed project missing");
+  if (!source) throw new Error("test project missing");
   const repositoryIdentity = {
     version: 1 as const,
-    canonicalRemotes: ["ssh://git.example/prime/demo.git"],
+    canonicalRemotes: ["ssh://git.example/prime/test.git"],
     defaultBranch: "main",
   };
   await store.upsertProject({ ...source, repositoryIdentity });
@@ -494,7 +496,7 @@ async function requestReviewablePlan(service: HostService, store: HostStore) {
     projectId: "destination-project",
     hostId: "destination-host",
     workspaceId: "destination-workspace",
-    displayName: "Destination demo",
+    displayName: "Destination project",
     repositoryIdentity,
     lastOpenedAt: new Date().toISOString(),
   };
@@ -507,8 +509,8 @@ async function requestReviewablePlan(service: HostService, store: HostStore) {
     payload: {
       expectedHostId: host.hostId,
       request: {
-        threadId: "demo-thread",
-        sourceGenerationId: "demo-execution-1",
+        threadId: "test-thread",
+        sourceGenerationId: "test-execution-1",
         destinationHostId: destination.hostId,
         destinationProjectId: destination.projectId,
         behaviorIfRunning: "interrupt",

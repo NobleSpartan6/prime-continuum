@@ -138,6 +138,8 @@ async function main() {
   const fuses = readRequiredFuses(executable)
   const windowsVersionInfo = await readWindowsVersionInfo(executablePath)
   verifyWindowsVersionInfo(windowsVersionInfo, projectPackage)
+  const windowsAuthenticode = await readWindowsAuthenticodeStatus(executablePath)
+  invariant(windowsAuthenticode.Status === 'NotSigned', `The development application package must be unsigned, but Authenticode reported ${windowsAuthenticode.Status}.`)
   const builtHostdHash = sha256(builtHostd)
   const packagedHostdHash = sha256(packagedHostd)
   invariant(packagedHostdHash === builtHostdHash, 'The packaged host daemon does not match the host daemon built in this run.')
@@ -253,6 +255,7 @@ async function main() {
       onlyLoadAppFromAsar: true,
     },
     windowsVersionInfo,
+    windowsAuthenticode,
     applicationSmoke,
     asarBytes: asarMetadata.size,
     asarVerifiedFiles: asarArtifacts.fileCount,
@@ -375,7 +378,19 @@ function parseJsonObject(bytes, label) {
 }
 
 function selectPackagedMetadata(projectPackage) {
-  const fields = ['name', 'version', 'private', 'author', 'description', 'main', 'type', 'packageManager', 'engines', 'dependencies']
+  const fields = [
+    'name',
+    'version',
+    'private',
+    'author',
+    'description',
+    'main',
+    'type',
+    'packageManager',
+    'engines',
+    'devEngines',
+    'dependencies',
+  ]
   const selected = {}
   for (const field of fields) {
     invariant(Object.hasOwn(projectPackage, field), `The project package manifest is missing ${field}.`)
@@ -405,6 +420,29 @@ async function readWindowsVersionInfo(executablePath) {
   return value
 }
 
+async function readWindowsAuthenticodeStatus(executablePath) {
+  const systemRoot = process.env.SystemRoot
+  invariant(typeof systemRoot === 'string' && isAbsolute(systemRoot), 'SystemRoot is required to inspect Windows Authenticode status.')
+  const powershell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const securityModule = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules', 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Security.psd1')
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    'Import-Module -Name $env:PRIME_CONTINUIM_SECURITY_MODULE -Force',
+    '$value = Get-AuthenticodeSignature -LiteralPath $env:PRIME_CONTINUIM_VERIFY_EXECUTABLE -ErrorAction Stop',
+    '[ordered]@{ Status = [string]$value.Status; SignerSubject = if ($null -eq $value.SignerCertificate) { "" } else { [string]$value.SignerCertificate.Subject } } | ConvertTo-Json -Compress',
+  ].join('; ')
+  const { stdout } = await execFileAsync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+    env: { ...process.env, PRIME_CONTINUIM_SECURITY_MODULE: securityModule, PRIME_CONTINUIM_VERIFY_EXECUTABLE: executablePath },
+    timeout: 15_000,
+    windowsHide: true,
+    maxBuffer: 64 * 1024,
+  })
+  const value = parseJsonObject(Buffer.from(stdout, 'utf8'), 'The Windows Authenticode result')
+  invariant(typeof value.Status === 'string' && value.Status.length > 0 && value.Status.length <= 128, 'The Windows Authenticode status is invalid.')
+  invariant(typeof value.SignerSubject === 'string' && value.SignerSubject.length <= 4096, 'The Windows Authenticode signer subject is invalid.')
+  return value
+}
+
 function verifyWindowsVersionInfo(value, projectPackage) {
   const productName = projectPackage.build?.productName
   const version = projectPackage.version
@@ -418,10 +456,7 @@ function verifyWindowsVersionInfo(value, projectPackage) {
   invariant(value.FileVersion === version, 'Windows FileVersion does not match this release.')
   invariant(value.ProductVersion === productVersion, 'Windows ProductVersion does not match this release.')
   invariant(value.CompanyName === author, 'Windows CompanyName does not match this release.')
-  invariant(
-    value.OriginalFilename === '' || value.OriginalFilename === `${productName}.exe`,
-    'Windows OriginalFilename still identifies a different executable.',
-  )
+  invariant(value.OriginalFilename === `${productName}.exe`, 'Windows OriginalFilename does not match this release.')
 }
 
 async function smokePackagedApplication(executablePath, packageDirectory) {

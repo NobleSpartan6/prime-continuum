@@ -30,5 +30,5 @@
 
 - Installing a signed production `hostd` package on arbitrary remote distributions.
 - Production authorization; packaged desktop/coordinator escrow creation and provider-backed Prompt/Stop/end E2E; automatic recovery or verified retirement for quarantined and genuinely uncertain resident operations; and durable lifecycle compaction beyond the current bounded development ledgers.
-- End-to-end relay, device pairing/revocation, native mobile control, and managed compute; Companion remains a read-only preview.
+- End-to-end relay, device pairing/revocation, native mobile control, a mobile client, and managed compute. No mobile product surface is exposed in this milestone.
 - Git object negotiation for production-scale handoff; the milestone preserves the transactional state machine and receipt contract.

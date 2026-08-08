@@ -9,6 +9,8 @@ import {
   ResidentLifecycleStatusSchema,
   SavedProjectSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RuntimeIntegritySnapshotSchema,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ThreadProjectionSnapshotSchema,
@@ -70,6 +72,7 @@ const HANDOFF_COORDINATOR_WARNING = {
 
 const KNOWN_METHODS = new Set([
   "health.get",
+  "runtime.integrity.retry",
   "runtime.model_catalog",
   "oauth.session.start",
   "oauth.session.status",
@@ -115,6 +118,8 @@ export interface HostServiceOptions {
 export interface RuntimeIntegrityReadinessProvider {
   /** Returns the latest bounded snapshot synchronously without performing integrity work. */
   snapshot(): RuntimeIntegritySnapshot;
+  /** Begins one bounded retry only when the current ownership generation permits it. */
+  retry?(): boolean;
   /** Settles any background integrity work before endpoint ownership is released. */
   close?(): Promise<void>;
 }
@@ -200,8 +205,8 @@ export class HostService {
     }
   }
 
-  async initialize(options: { seed?: boolean } = {}): Promise<void> {
-    await this.store.initialize(options);
+  async initialize(): Promise<void> {
+    await this.store.initialize();
     const host = await this.store.getHost();
     if (this.runtimeOAuthComposition && !this.oauthSessionBroker) {
       this.oauthSessionBroker = new HostOAuthSessionBroker({
@@ -302,6 +307,12 @@ export class HostService {
   }
 
   private async authorizeAndDispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
+    if (request.method === "runtime.integrity.retry" && context.transport !== "trusted_user") {
+      throw new PairingAuthorityError(
+        "REMOTE_RUNTIME_INTEGRITY_RETRY_FORBIDDEN",
+        "Runtime verification can be retried only by the trusted local desktop",
+      );
+    }
     if (isResidentLifecycleRequest(request) && context.transport !== "trusted_user") {
       throw new PairingAuthorityError(
         "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN",
@@ -402,6 +413,12 @@ export class HostService {
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [RUNTIME_OAUTH_CAPABILITY]
           : [];
+        const runtimeIntegrityRetryCapabilities = context.transport === "trusted_user" &&
+          runtimeIntegrity?.status === "failed" &&
+          runtimeIntegrity.retryable &&
+          typeof this.runtimeIntegrityProvider?.retry === "function"
+          ? [RUNTIME_INTEGRITY_RETRY_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -416,6 +433,7 @@ export class HostService {
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
+                ...runtimeIntegrityRetryCapabilities,
               ]
             : [
                 ...HOST_CAPABILITIES,
@@ -424,10 +442,48 @@ export class HostService {
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
                 RUNTIME_INTEGRITY_CAPABILITY,
+                ...runtimeIntegrityRetryCapabilities,
               ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
         };
+      }
+      case "runtime.integrity.retry": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "Runtime verification was requested from a different host authority.",
+          );
+        }
+        const provider = this.runtimeIntegrityProvider;
+        const current = provider?.snapshot();
+        if (
+          !provider ||
+          typeof provider.retry !== "function" ||
+          current?.status !== "failed" ||
+          !current.retryable
+        ) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_RETRY_UNAVAILABLE",
+            "Runtime verification is not currently eligible for retry.",
+          );
+        }
+        if (!provider.retry()) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_RETRY_REJECTED",
+            "Runtime verification could not start another attempt in this host generation.",
+            true,
+          );
+        }
+        const next = RuntimeIntegritySnapshotSchema.parse(provider.snapshot());
+        if (next.status !== "initializing" || !sameRuntimeIntegrityLineage(current, next)) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_RETRY_INVALID_STATE",
+            "Runtime verification did not enter a valid retry attempt.",
+          );
+        }
+        return next;
       }
       case "runtime.model_catalog": {
         const host = await this.store.getHost();
@@ -975,6 +1031,10 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       // Relay requests are rejected before scope evaluation. This branch keeps
       // the protocol switch exhaustive without granting remote OAuth access.
       return "host.admin";
+    case "runtime.integrity.retry":
+      // SSH and relay requests are rejected before scope evaluation. Keep the
+      // protocol switch exhaustive without granting remote repair authority.
+      return "host.admin";
     case "resident.provision":
     case "resident.end":
     case "resident.lifecycle.status":
@@ -1121,6 +1181,24 @@ function serviceStateForRuntimeIntegrity(
     case "unavailable":
       return "degraded";
   }
+}
+
+function sameRuntimeIntegrityLineage(
+  current: RuntimeIntegritySnapshot,
+  next: RuntimeIntegritySnapshot,
+): boolean {
+  return (
+    current.contractVersion === next.contractVersion &&
+    current.trustAnchorId === next.trustAnchorId &&
+    current.target.runtime === next.target.runtime &&
+    current.target.releaseVersion === next.target.releaseVersion &&
+    current.target.runtimeBuildId === next.target.runtimeBuildId &&
+    current.target.platform === next.target.platform &&
+    current.target.arch === next.target.arch &&
+    current.target.manifestSha256 === next.target.manifestSha256 &&
+    current.target.treeSha256 === next.target.treeSha256 &&
+    current.target.filesSha256 === next.target.filesSha256
+  );
 }
 
 function runtimeIntegrityAdmissionRejection(

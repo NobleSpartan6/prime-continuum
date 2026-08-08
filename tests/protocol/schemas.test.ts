@@ -12,6 +12,8 @@ import {
   PairingTicketDescriptorSchema,
   PROTOCOL_VERSION,
   RemoteDeviceScopesSchema,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
@@ -20,6 +22,92 @@ import {
 } from "../../src/shared/protocol";
 
 describe("host protocol schemas", () => {
+  it("binds runtime retry to one host and one retryable failed integrity snapshot", () => {
+    const runtimeIntegrity = {
+      contractVersion: 1 as const,
+      changedAt: "2026-08-08T12:00:00.000Z",
+      trustAnchorId: "a".repeat(64),
+      target: {
+        runtime: "prime-agent" as const,
+        releaseVersion: "0.7.0",
+        runtimeBuildId: "fixture-build-1",
+        platform: "win32",
+        arch: "x64",
+        manifestSha256: "a".repeat(64),
+        treeSha256: "b".repeat(64),
+        filesSha256: "c".repeat(64),
+      },
+      status: "failed" as const,
+      code: "RUNTIME_INTEGRITY_FAILED",
+      retryable: true,
+      recoveryAction: "retry_runtime_verification",
+    };
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "runtime-retry-1",
+      method: "runtime.integrity.retry",
+      payload: { expectedHostId: "host-1" },
+    } as const;
+    expect(HostIpcRequestSchema.parse(request)).toEqual(request);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, runtimePath: "C:\\private\\runtime" },
+      }).success,
+    ).toBe(false);
+    expect(
+      HostIpcResponseSchema.parse({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: request.requestId,
+        method: request.method,
+        ok: true,
+        result: {
+          contractVersion: runtimeIntegrity.contractVersion,
+          changedAt: runtimeIntegrity.changedAt,
+          trustAnchorId: runtimeIntegrity.trustAnchorId,
+          target: runtimeIntegrity.target,
+          status: "initializing",
+          phase: "preparing",
+          attempt: 2,
+        },
+      }).method,
+    ).toBe("runtime.integrity.retry");
+
+    const health = {
+      protocolVersion: PROTOCOL_VERSION,
+      hostdVersion: "0.1.0",
+      startedAt: "2026-08-08T11:59:00.000Z",
+      checkedAt: "2026-08-08T12:00:00.000Z",
+      serviceState: "degraded",
+      host: {
+        hostId: "host-1",
+        displayName: "Local computer",
+        kind: "local",
+        connectionPaths: [],
+        reachability: "online",
+        compatibility: "compatible",
+        platform: { os: "windows", architecture: "x64" },
+        attentionCounts: { total: 0, unread: 0, questions: 0, approvals: 0 },
+      },
+      capabilities: [RUNTIME_INTEGRITY_CAPABILITY, RUNTIME_INTEGRITY_RETRY_CAPABILITY],
+      runtimeIntegrity,
+    };
+    expect(HealthSnapshotSchema.safeParse(health).success).toBe(true);
+    expect(
+      HealthSnapshotSchema.safeParse({
+        ...health,
+        serviceState: "ready",
+        runtimeIntegrity: { ...runtimeIntegrity, status: "ready", assurance: "development-integrity" },
+      }).success,
+    ).toBe(false);
+    expect(
+      HealthSnapshotSchema.safeParse({
+        ...health,
+        runtimeIntegrity: { ...runtimeIntegrity, retryable: false },
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps pairing identity readiness backward compatible and secret-free", () => {
     const base = {
       protocolVersion: PROTOCOL_VERSION,

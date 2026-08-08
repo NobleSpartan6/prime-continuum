@@ -1,3 +1,4 @@
+import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +24,7 @@ afterEach(async () => {
 
 describe("command admission crash recovery", () => {
   it.each(faultPoints)("recovers exact materialization after a crash at %s", async (faultPoint) => {
-    const directory = await createSeededDirectory();
+    const directory = await createWorkspaceDirectory();
     const before = await baselineSnapshot(directory);
     const command = promptCommand(`recovery-${faultPoint}`);
     let injected = false;
@@ -92,10 +93,10 @@ describe("command admission crash recovery", () => {
   });
 
   it("recovers a default-gateway rejection without changing the thread projection", async () => {
-    const directory = await createSeededDirectory();
+    const directory = await createWorkspaceDirectory();
     const baselineStore = new HostStore(directory);
     await baselineStore.initialize();
-    const before = await baselineStore.getThreadSnapshot("demo-thread");
+    const before = await baselineStore.getThreadSnapshot("test-thread");
     const command = promptCommand("default-gateway-rejection");
     let injected = false;
     const crashingStore = new HostStore(directory, {
@@ -149,7 +150,7 @@ describe("command admission crash recovery", () => {
   });
 
   it("rejects a prepared v2 transaction copied from another host authority", async () => {
-    const directory = await createSeededDirectory();
+    const directory = await createWorkspaceDirectory();
     const command: CommandEnvelope = {
       ...promptCommand("foreign-host-v2"),
       command: { kind: "abort", reason: "exercise host-bound recovery" },
@@ -193,14 +194,15 @@ describe("command admission crash recovery", () => {
 async function baselineSnapshot(directory: string) {
   const baseline = new HostStore(directory);
   await baseline.initialize();
-  return baseline.getThreadSnapshot("demo-thread");
+  return baseline.getThreadSnapshot("test-thread");
 }
 
-async function createSeededDirectory(): Promise<string> {
+async function createWorkspaceDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "prime-hostd-admission-recovery-"));
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
-  await store.initialize({ seed: true });
+  await store.initialize();
+  await bootstrapTestWorkspace(store);
   return directory;
 }
 
@@ -210,9 +212,9 @@ function promptCommand(commandId: string): CommandEnvelope & { command: { kind: 
     deviceId: "fault-device",
     commandId,
     expectedHostId: "host-test",
-    threadId: "demo-thread",
+    threadId: "test-thread",
     issuedAt: "2026-08-06T01:00:00.000Z",
-    expectedExecutionGenerationId: "demo-execution-1",
+    expectedExecutionGenerationId: "test-execution-1",
     command: { kind: "prompt", text: `Materialize exactly once for ${commandId}.` },
   };
 }
@@ -226,7 +228,13 @@ async function readOnlyPendingTransaction(store: HostStore): Promise<Record<stri
 }
 
 async function jsonLines(path: string): Promise<Array<Record<string, any>>> {
-  const body = await readFile(path, "utf8");
+  let body: string;
+  try {
+    body = await readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
   return body
     .split("\n")
     .filter(Boolean)

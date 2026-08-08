@@ -1,16 +1,64 @@
 # Prime Continuim
 
-Development-stage native control-plane foundation for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
+A native desktop workbench for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
 
-> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release; production resident commands that invoke a provider are not authorized. On a release-attested local host, the native desktop can choose a workspace and create a durable resident thread through a crash-safe, client-owned escrow transaction; **Run prompt** and **Stop** remain disabled until that exact binding publishes a stable authoritative projection. Focused adapter/store/service/main/renderer tests cover provisioning, explicit End, restart recovery, exact reselection, command ownership, and fail-closed uncertainty. A credential-free release lifecycle smoke drives production `resident.provision` through HostService, the gateway, the coordinator, and the isolated Worker; verifies restart reattachment; rejects stale reviewed End consent before effects; and recovers a confirmed End after deterministic response loss. It confirms that the smoke fixture stays idle with its existing history fields unchanged, emits the exact terminal disposition, retires the binding, and neither recreates nor replays the session across restart. The smoke reads no user credential and sends no Prompt, Stop, provider request, or model-selection mutation. Remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
+The current Windows development build follows one local-first path: start the
+verified service and bundled runtime, choose a workspace, then open its durable
+thread. Provisioning, explicit End, restart recovery, exact reselection, and
+fail-closed command ownership are implemented and tested.
 
-The intended product is a cross-platform workbench that preserves one project-and-conversation experience across local and SSH-backed hosts. The current build provides the security, protocol, persistence, and interface seams needed to continue that work without presenting the deferred execution paths as available.
+Production resident commands that invoke a provider, remote SSH installation
+and upgrades, cross-host handoff, relay connectivity, mobile control, signed
+distribution, and automatic updates remain unavailable. Those controls are
+omitted or disabled instead of being represented by demo data. Packaging is
+verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging require platform CI and release verification.
 
-## Requirements
+## Windows development installer
 
-- Node.js 22.12 or newer (`24.14.0` is pinned in `.node-version` for reproducible local development)
-- pnpm 11 (`pnpm install` also provides the reviewed, build-only npm 10.9.8 runtime assembler)
-- System OpenSSH client
+The configured Windows development path is a one-click, per-user x64 installer.
+A separate Node.js, pnpm, or Prime Agent installation is not needed to launch the
+desktop and bootstrap its verified local host/runtime: the exact verified Prime
+Agent runtime seed and Continuim host service are bundled and initialized on
+first launch. The installer is configured to create **Prime Continuim**
+shortcuts on the desktop and Start menu, then launch the app when setup
+finishes.
+
+That bootstrap boundary is narrower than a complete coding environment. Real
+coding turns and tool use still require a supported Windows Bash environment
+(currently Git Bash), provider sign-in or credentials, and network access when
+Python workflows need `uv`, Python 3.11, or additional packages. Installer and
+package smoke tests do not prove those provider-backed workflows. The optional
+**Use another computer** path also relies on Windows OpenSSH plus an existing
+key or agent configuration; the desktop does not provide a password prompt.
+
+The current artifact is intentionally unsigned and is suitable only for
+controlled development testing. Windows may show an unknown-publisher warning;
+there is no automatic updater, signed download channel, or release-supported
+upgrade/repair flow yet. Obtain the installer and its checksum from the same
+trusted build output, then verify them before opening the installer:
+
+```powershell
+$installer = '.\Prime-Continuim-0.1.0-windows-x64-setup.exe'
+$expected = (Get-Content "$installer.sha256" -Raw).Split()[0]
+$actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw 'Prime Continuim installer checksum mismatch.' }
+Start-Process $installer
+```
+
+The installer is configured to appear as **Prime Continuim 0.1.0** in Windows
+Installed apps. Closing the desktop does not stop its detached local host
+service. App and host state are retained by design, and uninstall/upgrade
+behavior with that service or a resident session active has not yet passed a
+release lifecycle test; use this installer only in controlled development.
+
+## Development requirements
+
+- pnpm 11.9 or newer. `pnpm install` downloads the checksummed Node.js 24.14.0 runtime pinned by this repository and uses it for every repo workflow.
+- If pnpm cannot start on the machine yet, install Node.js 24.14.0 first, reopen the terminal, and then run `pnpm install`.
+
+Windows OpenSSH is optional and is needed only for **Use another computer**.
+
+## Standalone Prime Agent
 
 For a standalone Prime Agent installation on macOS or Linux, the official stable installer is:
 
@@ -27,25 +75,31 @@ pnpm install
 pnpm dev
 ```
 
-Run the renderer by itself for browser-based visual checks:
+After `pnpm install`, you do not need to switch the terminal's global Node.js
+version. If an older checkout reports a Node version mismatch, run
+`pnpm install` once so pnpm can install the pinned runtime, then retry
+`pnpm dev`.
 
-```powershell
-pnpm dev:web
-```
+`pnpm dev` now holds one exclusive workspace workflow lock, verifies or repairs the
+Electron payload, and accepts `out/runtime` only after its pinned pointer,
+manifest, file list, and complete payload tree verify. A missing or invalid
+runtime is rebuilt from the reviewed digest-pinned inputs, with progress shown
+in the terminal. Development then writes a `development-integrity` attestation
+under the dependency cache, where electron-vite cannot delete it, embeds those
+exact bytes in hostd, and only then starts Electron. This is an unsigned local
+integrity chain, not publisher authentication or a production signing claim.
+The first runtime build can take several minutes and may require network access
+to the pinned release assets. Concurrent `dev`, build, package, and installer
+workflows fail with the command that currently owns the workspace instead of
+mutating shared output underneath one another.
 
-The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search the active host projection and open controls that its negotiated capabilities allow. On a release-attested local host, **New resident thread** uses the native folder picker, keeps the path out of renderer state, and records a recoverable lifecycle operation before Prime Agent creation or promotion. Resident command capability appears only after at least one current durable binding publishes an exact projection. Each thread remains independently gated: a missing, changed, or failed binding stays read-only without disabling a healthy sibling. `pnpm dev` intentionally builds an unattested hostd and therefore does not enable this resident gateway. Browser preview data is illustrative and never executes a prompt. Cross-host handoff remains unavailable. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
+The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search the active host projection and open controls that its negotiated capabilities allow. On an integrity-attested local host, **New resident thread** uses the native folder picker, keeps the path out of renderer state, and records a recoverable lifecycle operation before Prime Agent creation or promotion. The development host can advertise `resident_lifecycle_v1` only after the exact runtime reaches ready; resident command capability appears only after at least one current durable binding publishes an exact projection. Each thread remains independently gated: a missing, changed, or failed binding stays read-only without disabling a healthy sibling. Cross-host handoff remains unavailable. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
 
 Open **Models & accounts** to inspect the secret-free compatibility catalog reported by the verified Prime Agent runtime on the selected host. The exact Prime Agent v0.7.0 artifact currently projects 1,169 model routes across 32 providers, including current GPT-5.6, Claude 5, Gemini 3.6, DeepSeek V4, Kimi K3, GLM-5.2, Qwen3.6, MiniMax M3, Mistral, and gpt-oss families. This list is generated from the installed runtime rather than maintained as a renderer allow-list. The runtime reports OAuth compatibility metadata for ChatGPT Plus/Pro (Codex), Claude Pro/Max, and GitHub Copilot.
 
 Host-only development foundations now exist for generation-bound resident model selection and local ChatGPT sign-in through Prime Agent's pinned `openai-codex` provider. They are not yet exposed as renderer controls, and normal host startup does not enable the OAuth path. Prime Agent v0.7.0 persists those OAuth credentials to plaintext `auth.json`, so Continuim requires an exact development opt-in and does not describe that path as secure credential storage. A production release remains blocked on OS-backed credential custody, durable OAuth restart reconciliation, and the user-facing account flow. Until the renderer integration lands, authenticate by running `/login` in Prime Agent on that host. [OpenAI's authentication documentation](https://developers.openai.com/codex/auth) distinguishes ChatGPT subscription access from separately billed API-key usage.
 
-Open **Companion preview** from the sidebar to inspect the pairing requirements and launch the read-only phone projection. For a direct browser preview, visit:
-
-```text
-http://127.0.0.1:5173/?surface=companion
-```
-
-The Companion Preview consumes the same host-scoped renderer projection as the desktop. It does not create pairing material, credentials, commands, a LAN listener, or a relay connection. Actual phone control remains disabled until the security gates in `docs/implementation-status.md` are implemented.
+Mobile pairing and phone control are not exposed in the desktop UI. They remain unavailable until the relay, device identity, key custody, pairing, and mobile-client release gates in `docs/implementation-status.md` are implemented and verified.
 
 ## Architecture
 
@@ -70,7 +124,7 @@ pnpm verify:renderer-visual
 
 `verify:hostd-resident-lifecycle:smoke` requires the current release build and runtime seed. With an isolated empty Prime Agent home, it waits for zero-binding `resident_lifecycle_v1`, submits production `resident.provision` through HostService, the gateway, the coordinator, and the isolated Worker, then verifies the exact committed projection, command capability, restart reattachment, and provision replay suppression. A distinct stale-cursor End is rejected before lifecycle WAL, binding revocation, adapter use, or daemon kill. The smoke then discards the confirmed End response after its first byte, recovers the exact completed result through lifecycle status, and proves the terminal projection, ended disposition, binding retirement, zero daemon sessions, and no replay across restart. It also requires exact parent-process signal/function identity across Worker passes. No user credential is read, and no Prompt, Stop, provider request, or model-selection mutation is sent.
 
-`verify:renderer-visual` rebuilds the complete attested release tree before capturing the browser-preview fixture through real Electron across 15 desktop, resident-setup, End-review, recovery, and Companion states, including 1600×1000, exact 390/320-pixel widths, and 320×256 short-height stress cases. It fails on page or surface-level horizontal overflow, unreachable compact actions, or a non-scrollable short recovery/setup surface, and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
+`verify:renderer-visual` rebuilds the complete attested release tree before explicitly injecting the internal visual-QA fixture through real Electron across 13 desktop, resident-setup, End-review, and recovery states, including 1600×1000, exact 390/320-pixel widths, and 320×256 short-height stress cases. Activation requires the harness's exact user agent, an explicit state, and its ephemeral `127.0.0.1` HTTP origin; an ordinary browser without the native bridge cannot activate the fixture. The gate fails on page or surface-level horizontal overflow, unreachable compact actions, or a non-scrollable short recovery/setup surface, and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
 
 On the verified Windows x64 development path, `pnpm package` keeps Windows
 executable resource editing and ASAR integrity enabled, then rejects a
@@ -86,24 +140,37 @@ pinned protocol identity, and requires a clean shutdown. The current unsigned
 artifact labels this assurance `development-integrity`; it does not claim
 adversarial authentication. No equivalent macOS or Linux package has been
 verified yet.
+
+`pnpm dist` applies those same build and runtime gates before creating
+`release/Prime-Continuim-<version>-windows-x64-setup.exe`. The NSIS behavior is
+pinned to a one-click, per-user install with the reviewed product icon, desktop
+and Start menu shortcuts, and launch-after-finish. A final non-executing
+verifier requires the exact configured artifact, validates its regular-file PE
+envelope and nonempty overlay while the file is held open, streams
+SHA-256, rejects an artifact that changes during verification, and writes the
+standard sibling `.exe.sha256` file. Run
+`node scripts/verify-windows-installer.mjs --config-only` to check the reviewed
+installer policy without building or opening an installer. The NSIS identity
+comes from the reviewed Electron Builder target; the PE shape check alone does
+not identify or execute NSIS. This checksum gate
+detects corruption only after trusted acquisition; it does not sign the file,
+authenticate its publisher, execute setup, or prove install, repair, upgrade,
+or uninstall behavior.
+
 Leave enough local disk space for Electron's executable rewrite; synced folders
 can otherwise defer the out-of-space failure until after Electron Builder exits.
-If Electron Builder 26.8.1 cannot create two unused macOS symlinks in its helper
-cache, provision the pinned artifact in a separate, digest-qualified user cache
-and rerun packaging:
+Windows artifacts are deliberately unsigned development artifacts. The
+reviewed `afterPack` resource editor preserves the product icon, version
+metadata, and Electron's ASAR-integrity resources without invoking Electron
+Builder's legacy `winCodeSign` resource pass. Production signing is not
+implemented: a production channel must sign after resource editing and replace
+the verifier's required `NotSigned` result with an exact publisher and
+timestamp policy.
 
-```powershell
-$env:ELECTRON_BUILDER_CACHE = & .\scripts\prepare-windows-build-cache.ps1
-pnpm package
-```
-
-The preparation script verifies the upstream SHA-512, excludes only the two
-macOS links, validates the required Windows tools, and refuses to overwrite an
-unexpected cache target. Do not work around the cache defect by disabling
-`win.signAndEditExecutable`, and do not share this writable cache across trust
-boundaries.
-
-Signed distribution still requires the product icon, platform signing identities, release metadata, and platform-native packaging verification.
+Signed distribution still requires platform signing identities, release
+metadata and publication, and platform-native install, upgrade, repair, and
+uninstall verification. Automatic updates remain deliberately unconfigured
+until that signed lifecycle exists.
 
 The current repository is a Phase 0/Phase 1 protocol/UI foundation with verified
 development components, an inert Phase 3A pairing-authority seam, and an

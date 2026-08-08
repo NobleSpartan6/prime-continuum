@@ -1,16 +1,18 @@
 import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
   ResidentLifecycleDispositionSchema,
+  RuntimeIntegritySnapshotSchema,
   RuntimeModelCatalogSnapshotSchema,
   THREAD_HANDOFF_CAPABILITY,
   type ResidentLifecycleStatus,
+  type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
-import { isNativeBridgeUnavailable } from './runtime'
 
 export type ConnectionState = 'online' | 'reconnecting' | 'offline'
 export type RuntimeModelCatalog = RuntimeModelCatalogSnapshot
@@ -37,8 +39,30 @@ export type HostRuntimeReadiness =
       status: 'initializing' | 'ready' | 'failed' | 'unavailable'
       phase?: 'preparing' | 'validating_seed' | 'copying' | 'verifying' | 'publishing'
       assurance?: 'development-integrity' | 'production-authenticated'
-      recovery?: 'restart' | 'repair' | 'diagnostics'
+      retryable?: boolean
+      recovery?: 'retry' | 'restart' | 'repair' | 'diagnostics'
     }
+
+export type LocalSetupStage =
+  | 'starting_local_service'
+  | 'preparing_runtime'
+  | 'choose_workspace'
+  | 'needs_attention'
+
+export interface LocalSetupIssue {
+  area: 'local_service' | 'runtime'
+  action: 'retry_connection' | 'retry_runtime' | 'manual_recovery' | 'review_diagnostics'
+  message: string
+  retryable: boolean
+  code?: string
+}
+
+/** Path-free first-run state derived only from the current native local authority. */
+export interface LocalSetupSummary {
+  stage: LocalSetupStage
+  runtimeReadiness?: HostRuntimeReadiness
+  issue?: LocalSetupIssue
+}
 
 export interface HostSummary {
   id: string
@@ -210,6 +234,8 @@ export interface WorkbenchSnapshot {
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
   runtime: RuntimeSummary
+  /** Current local setup only; never contains a folder, socket, executable, or data-root path. */
+  localSetup?: LocalSetupSummary
   /** Bounded, path-free desktop ledger for fresh resident lifecycle recovery. */
   residentLifecycleOperations: ResidentLifecycleOperationSummary[]
   operations: {
@@ -341,6 +367,7 @@ export interface RendererApi {
   environment: 'native' | 'preview'
   loadWorkbench(): Promise<WorkbenchSnapshot>
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
+  retryLocalSetup(): Promise<void>
   selectThread(threadId: string): Promise<void>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
@@ -409,8 +436,8 @@ const seedTranscript: TranscriptBlock[] = [
     id: 'block-1',
     kind: 'checkpoint',
     time: '9:42 AM',
-    body: previewSimulation('resumed from a sample checkpoint; no host snapshot was read.'),
-    detail: previewSimulation('sample transcript replaced in memory; no commands were replayed'),
+    body: previewSimulation('resumed from a visual-QA checkpoint; no host snapshot was read.'),
+    detail: previewSimulation('fixture transcript replaced in memory; no commands were replayed'),
   },
   {
     id: 'block-2',
@@ -433,7 +460,7 @@ const seedTranscript: TranscriptBlock[] = [
     author: 'Renderer checks',
     time: '9:48 AM',
     body: 'pnpm test -- renderer',
-    detail: previewSimulation('sample passing receipt; no host check ran'),
+    detail: previewSimulation('fixture passing receipt; no host check ran'),
     receipt: 'preview_simulation_receipt',
   },
   {
@@ -616,9 +643,9 @@ export const previewSnapshot: WorkbenchSnapshot = {
     { id: 'agent-3', parentId: 'agent-1', name: 'Protocol', role: 'Snapshots and command journal', status: 'waiting', hostName: 'devbox', toolUseCount: 7, tokenCount: 11_804 },
   ],
   evidence: [
-    { id: 'evidence-1', label: 'Sample renderer checks', detail: 'Preview fixture · passing', status: 'passed' },
-    { id: 'evidence-2', label: 'Sample type check', detail: 'Preview fixture · passing', status: 'passed' },
-    { id: 'evidence-3', label: 'Sample reconnect trace', detail: 'Preview fixture · awaiting path recovery', status: 'running' },
+    { id: 'evidence-1', label: 'Visual-QA renderer checks', detail: 'Internal fixture · passing', status: 'passed' },
+    { id: 'evidence-2', label: 'Visual-QA type check', detail: 'Internal fixture · passing', status: 'passed' },
+    { id: 'evidence-3', label: 'Visual-QA reconnect trace', detail: 'Internal fixture · awaiting path recovery', status: 'running' },
   ],
   runtime: {
     agentsReported: true,
@@ -657,7 +684,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
       },
     ],
   },
-  composerReceipt: { state: 'waiting_for_connection', message: previewSimulation('waiting for a sample connection') },
+  composerReceipt: { state: 'waiting_for_connection', message: previewSimulation('waiting for a fixture connection') },
 }
 
 export type PreviewVisualState =
@@ -717,6 +744,17 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       stopResidentTurn: false,
       crossHostHandoff: false,
       provisionResident: true,
+    }
+    if (visualState === 'resident-start') {
+      const runtimeReadiness: HostRuntimeReadiness = {
+        kind: 'reported',
+        freshness: 'live',
+        observedAt: '2026-08-07T12:00:00.000Z',
+        status: 'ready',
+        assurance: 'development-integrity',
+      }
+      snapshot.localSetup = { stage: 'choose_workspace', runtimeReadiness }
+      if (host) host.runtimeReadiness = runtimeReadiness
     }
     snapshot.composerReceipt = { state: 'idle', message: 'Ready to start a resident thread' }
     snapshot.residentLifecycleOperations = visualState === 'resident-recovery'
@@ -843,7 +881,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     snapshot.operations.startResidentTurn = true
     snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     setPreviewUpdate(
-      'sample resident session is attached and ready for another prompt',
+      'fixture resident session is attached and ready for another prompt',
       'no prompt was sent to a host',
     )
     return snapshot
@@ -860,8 +898,8 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       message: 'Host received the prompt · awaiting durable admission',
     }
     setPreviewUpdate(
-      'sample prompt crossed the connection and is awaiting durable host admission',
-      'Prime Agent does not own this sample prompt yet',
+      'fixture prompt crossed the connection and is awaiting durable host admission',
+      'Prime Agent does not own this fixture prompt yet',
     )
     return snapshot
   }
@@ -878,7 +916,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       message: 'Prime Agent owns this prompt · waiting for authoritative idle proof',
     }
     setPreviewUpdate(
-      'sample prompt was acknowledged by Prime Agent',
+      'fixture prompt was acknowledged by Prime Agent',
       'the preview retains ownership until an exact idle proof',
     )
     return snapshot
@@ -894,7 +932,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       message: 'Stop accepted · waiting for authoritative idle proof',
     }
     setPreviewUpdate(
-      'sample Stop request was acknowledged at a safe boundary',
+      'fixture Stop request was acknowledged at a safe boundary',
       'the Stop remains nonterminal until exact idle proof',
     )
     return snapshot
@@ -908,7 +946,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     message: 'Outcome unknown · recovery required; this Stop will not be replayed',
   }
   setPreviewUpdate(
-    'sample Stop outcome cannot be proven after the command boundary',
+    'fixture Stop outcome cannot be proven after the command boundary',
     'Prime Agent will not replay this Stop without exact recovery evidence',
   )
   return snapshot
@@ -918,7 +956,7 @@ const discoveredComputers: DiscoveredComputer[] = [
   {
     alias: 'devbox',
     effectiveTarget: 'ebene@devbox.internal:22',
-    fingerprint: 'Sample browser preview only; no live host key was checked.',
+    fingerprint: 'Visual QA fixture; no live host key was checked.',
     protocol: 'SSH · Ed25519 host key',
     platform: 'Ubuntu 24.04',
     architecture: 'arm64',
@@ -937,7 +975,7 @@ const discoveredComputers: DiscoveredComputer[] = [
   {
     alias: 'build-linux',
     effectiveTarget: 'builder@10.24.8.17:2222',
-    fingerprint: 'Sample browser preview only; no live host key was checked.',
+    fingerprint: 'Visual QA fixture; no live host key was checked.',
     protocol: 'SSH via corp-bastion · Ed25519 host key',
     platform: 'Debian 13',
     architecture: 'x86_64',
@@ -1040,6 +1078,10 @@ class BrowserPreviewApi implements RendererApi {
     return previewSnapshotForVisualState(this.visualState)
   }
 
+  async retryLocalSetup(): Promise<void> {
+    throw new Error('Local setup retry is available only in the native desktop app.')
+  }
+
   async selectThread(_threadId: string): Promise<void> {
     // Browser preview data is already materialized in memory. The native
     // adapter overrides this boundary with an authoritative host request.
@@ -1120,7 +1162,7 @@ class BrowserPreviewApi implements RendererApi {
       ...structuredClone(discoveredComputers[0]!),
       alias: hostname,
       effectiveTarget: `${user}@${hostname}:22`,
-      fingerprint: 'Sample browser preview only; no live host key was checked.',
+      fingerprint: 'Visual QA fixture; no live host key was checked.',
       recentProjects: [],
       probeComplete: true,
       installAvailable: true,
@@ -1182,7 +1224,7 @@ class BrowserPreviewApi implements RendererApi {
       runtimeLosses: ['Python variables', 'Running subprocesses', 'Active child processes'],
       warnings: [
         previewSimulation('no host checkpoint or transfer will run'),
-        'Secrets and ignored files are excluded from the sample transfer.',
+        'Secrets and ignored files are excluded from the fixture transfer.',
       ],
     }
   }
@@ -1198,7 +1240,7 @@ class BrowserPreviewApi implements RendererApi {
       ['materializing', previewSimulation('simulating a destination worktree; no files are created')],
       ['verifying', previewSimulation('simulating hash and Git-status checks')],
       ['switching_authority', previewSimulation('simulating an authority switch; host authority is unchanged')],
-      ['complete', previewSimulation('sample handoff complete; no host state changed')],
+      ['complete', previewSimulation('fixture handoff complete; no host state changed')],
     ]
     for (const [phase, message] of phases) {
       await delay(260)
@@ -1243,6 +1285,17 @@ function canonicalRendererJson(value: unknown): string {
     )
   }
   return JSON.stringify(normalize(value))
+}
+
+function sameRuntimeIntegrityLineage(
+  current: RuntimeIntegritySnapshot,
+  next: RuntimeIntegritySnapshot,
+): boolean {
+  return (
+    current.contractVersion === next.contractVersion &&
+    current.trustAnchorId === next.trustAnchorId &&
+    canonicalRendererJson(current.target) === canonicalRendererJson(next.target)
+  )
 }
 
 function displayTime(value: unknown): string {
@@ -1318,8 +1371,11 @@ function runtimeReadinessFromNative(value: unknown, activePhase: string | undefi
     assurance === 'development-integrity' || assurance === 'production-authenticated'
       ? assurance
       : undefined
+  const retryable = snapshot?.retryable === true
   const recoveryAction = asString(snapshot?.recoveryAction)
-  const recovery = recoveryAction === 'retry_runtime_initialization' || recoveryAction === 'restart_host_service'
+  const recovery = recoveryAction === 'retry_runtime_verification'
+    ? 'retry'
+    : recoveryAction === 'retry_runtime_initialization' || recoveryAction === 'restart_host_service'
     ? 'restart'
     : recoveryAction === 'reinstall_application' || recoveryAction === 'repair_application'
       ? 'repair'
@@ -1333,7 +1389,207 @@ function runtimeReadinessFromNative(value: unknown, activePhase: string | undefi
     status,
     ...(validPhase ? { phase: validPhase } : {}),
     ...(validAssurance ? { assurance: validAssurance } : {}),
+    ...((status === 'failed' || status === 'unavailable') ? { retryable } : {}),
     ...(recovery ? { recovery } : {}),
+  }
+}
+
+function localSetupDiagnosticCode(value: unknown): string | undefined {
+  const code = asString(value)
+  return code && /^[A-Za-z0-9._-]{1,96}$/.test(code) ? code : undefined
+}
+
+function localConnectionIssueFromNative(value: unknown): LocalSetupIssue | undefined {
+  const error = asRecord(value)
+  if (!error) return undefined
+  const code = localSetupDiagnosticCode(error.code)
+  const retryable = error.retryable === true
+  const message = code === 'hostd.start_timeout'
+    ? 'The local service did not become ready in time.'
+    : code === 'hostd.bundle_missing'
+      ? 'The bundled local service is missing from this installation.'
+      : code === 'hostd.spawn_failed'
+        ? 'Prime Continuim could not start the bundled local service.'
+        : code === 'hostd.endpoint_mismatch'
+          ? 'The local service could not verify its private endpoint.'
+          : 'Prime Continuim could not connect to the local service.'
+  return {
+    area: 'local_service',
+    action: retryable ? 'retry_connection' : 'review_diagnostics',
+    message,
+    retryable,
+    ...(code ? { code } : {}),
+  }
+}
+
+function runtimeSetupIssue(
+  readiness: Extract<HostRuntimeReadiness, { kind: 'reported' }>,
+  runtimeRetryAdvertised: boolean,
+  code?: string,
+): LocalSetupIssue {
+  if (
+    readiness.freshness === 'live' &&
+    readiness.status === 'failed' &&
+    readiness.retryable === true &&
+    runtimeRetryAdvertised
+  ) {
+    return {
+      area: 'runtime',
+      action: 'retry_runtime',
+      message: 'Runtime verification did not finish. Retry verification to run the same checks again.',
+      retryable: true,
+      ...(code ? { code } : {}),
+    }
+  }
+  if (readiness.recovery === 'restart') {
+    return {
+      area: 'runtime',
+      action: 'review_diagnostics',
+      message: 'Runtime verification could not finish. Record the diagnostic code and contact support; Prime Continuim cannot restart the detached host service from this screen.',
+      retryable: false,
+      ...(code ? { code } : {}),
+    }
+  }
+  if (readiness.recovery === 'repair') {
+    return {
+      area: 'runtime',
+      action: 'manual_recovery',
+      message: 'The installed runtime did not pass verification. Record the diagnostic code and contact support before changing local runtime data; this screen will not replace it.',
+      retryable: false,
+      ...(code ? { code } : {}),
+    }
+  }
+  return {
+    area: 'runtime',
+    action: 'review_diagnostics',
+    message: 'Prime Continuim could not verify the bundled runtime. Review the diagnostic code before continuing.',
+    retryable: false,
+    ...(code ? { code } : {}),
+  }
+}
+
+function localSetupFromNative(input: {
+  rawConnection: UnknownRecord | undefined
+  runtimeReadiness: HostRuntimeReadiness | undefined
+  runtimeCode?: string
+  runtimeRetryAdvertised: boolean
+  residentProvisioningReady: boolean
+  residentLifecycleAdvertised: boolean
+}): LocalSetupSummary | undefined {
+  const phase = asString(input.rawConnection?.phase)
+  const targetKind = asString(asRecord(input.rawConnection?.target)?.kind)
+  const verifiedHostId = asString(input.rawConnection?.hostId)
+  const localIntent = targetKind === 'local' || (!targetKind && !verifiedHostId && (!phase || phase === 'offline'))
+  if (!localIntent) return undefined
+
+  const runtimeIsExactlyReady = input.runtimeReadiness?.kind === 'reported' &&
+    input.runtimeReadiness.freshness === 'live' &&
+    input.runtimeReadiness.status === 'ready'
+  if (
+    input.residentProvisioningReady &&
+    input.residentLifecycleAdvertised &&
+    phase === 'online' &&
+    asString(input.rawConnection?.path) === 'local_socket' &&
+    runtimeIsExactlyReady
+  ) {
+    return {
+      stage: 'choose_workspace',
+      ...(input.runtimeReadiness ? { runtimeReadiness: input.runtimeReadiness } : {}),
+    }
+  }
+
+  const connectionIssue = localConnectionIssueFromNative(input.rawConnection?.error)
+  if (!phase || phase === 'connecting' || phase === 'reconnecting') {
+    return { stage: 'starting_local_service' }
+  }
+  if (phase === 'offline') {
+    return connectionIssue
+      ? { stage: 'needs_attention', issue: connectionIssue }
+      : { stage: 'starting_local_service' }
+  }
+
+  const liveReadiness = input.runtimeReadiness?.freshness === 'live' ? input.runtimeReadiness : undefined
+  if (phase === 'degraded') {
+    if (
+      liveReadiness?.kind === 'reported' &&
+      (liveReadiness.status === 'failed' || liveReadiness.status === 'unavailable')
+    ) {
+      return {
+        stage: 'needs_attention',
+        runtimeReadiness: liveReadiness,
+        issue: runtimeSetupIssue(liveReadiness, input.runtimeRetryAdvertised, input.runtimeCode),
+      }
+    }
+    const issue = connectionIssue ?? {
+      area: 'local_service' as const,
+      action: 'review_diagnostics' as const,
+      message: 'The local service connected, but setup could not finish safely.',
+      retryable: false,
+    }
+    return {
+      stage: 'needs_attention',
+      ...(liveReadiness ? { runtimeReadiness: liveReadiness } : {}),
+      issue,
+    }
+  }
+  if (liveReadiness?.kind === 'reported') {
+    if (liveReadiness.status === 'failed' || liveReadiness.status === 'unavailable') {
+      return {
+        stage: 'needs_attention',
+        runtimeReadiness: liveReadiness,
+        issue: runtimeSetupIssue(liveReadiness, input.runtimeRetryAdvertised, input.runtimeCode),
+      }
+    }
+    if (liveReadiness.status === 'ready' && !input.residentLifecycleAdvertised) {
+      return {
+        stage: 'needs_attention',
+        runtimeReadiness: liveReadiness,
+        issue: {
+          area: 'local_service',
+          action: 'review_diagnostics',
+          message: 'This local host service is incompatible with resident workspace setup. Review the diagnostic code and use a compatible host service before continuing.',
+          retryable: false,
+          code: 'resident_lifecycle_unavailable',
+        },
+      }
+    }
+    if (liveReadiness.status === 'ready' && asString(input.rawConnection?.path) !== 'local_socket') {
+      return {
+        stage: 'needs_attention',
+        runtimeReadiness: liveReadiness,
+        issue: {
+          area: 'local_service',
+          action: 'review_diagnostics',
+          message: 'The verified local host is not connected through its private local socket. Review diagnostics before continuing.',
+          retryable: false,
+          code: 'local_socket_required',
+        },
+      }
+    }
+    return { stage: 'preparing_runtime', runtimeReadiness: liveReadiness }
+  }
+  if (liveReadiness?.kind === 'not_reported') {
+    return {
+      stage: 'needs_attention',
+      runtimeReadiness: liveReadiness,
+      issue: {
+        area: 'runtime',
+        action: 'review_diagnostics',
+        message: 'This local host service does not report verified runtime readiness. Review diagnostics and use a compatible host service before continuing.',
+        retryable: false,
+        code: 'runtime_readiness_not_reported',
+      },
+    }
+  }
+  return {
+    stage: 'needs_attention',
+    issue: {
+      area: 'runtime',
+      action: 'review_diagnostics',
+      message: 'The local service did not report runtime readiness for its verified host identity. Review diagnostics before continuing.',
+      retryable: false,
+      code: 'runtime_readiness_unavailable',
+    },
   }
 }
 
@@ -1835,6 +2091,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const activeHostId = asString(rawConnection?.hostId)
   const activeTarget = asRecord(rawConnection?.target)
   const rawRuntimeReadiness = asRecord(rawConnection?.runtimeReadiness)
+  const exactActiveRuntimeReadiness = activeHostId && asString(rawRuntimeReadiness?.hostId) === activeHostId
+    ? runtimeReadinessFromNative(rawRuntimeReadiness, activePhase)
+    : undefined
+  const exactActiveRuntimeCode = exactActiveRuntimeReadiness
+    ? localSetupDiagnosticCode(asRecord(rawRuntimeReadiness?.snapshot)?.code)
+    : undefined
   const advertisedCapabilities = Array.isArray(rawConnection?.capabilities)
     ? rawConnection.capabilities.filter((capability): capability is string => typeof capability === 'string')
     : []
@@ -1877,10 +2139,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     const state = connectionFromNative(isActive && activePhase ? activePhase : 'offline')
     const rawKind = asString(host.kind)
     const synchronizedAt = asString(host.cacheUpdatedAt) ?? asString(host.lastSeenAt) ?? (isActive ? updatedAt : undefined)
-    const runtimeReadiness =
-      isActive && asString(rawRuntimeReadiness?.hostId) === hostId
-        ? runtimeReadinessFromNative(rawRuntimeReadiness, activePhase)
-        : undefined
+    const runtimeReadiness = isActive ? exactActiveRuntimeReadiness : undefined
     return {
       id: hostId,
       name: hostName,
@@ -2383,8 +2642,24 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     activePhase === 'online' &&
     asString(activeTarget?.kind) === 'local' &&
     asString(rawConnection?.path) === 'local_socket' &&
+    exactActiveRuntimeReadiness?.kind === 'reported' &&
+    exactActiveRuntimeReadiness.freshness === 'live' &&
+    exactActiveRuntimeReadiness.status === 'ready' &&
     advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
   )
+  const localSetup = localSetupFromNative({
+    rawConnection,
+    runtimeReadiness: exactActiveRuntimeReadiness,
+    runtimeCode: exactActiveRuntimeCode,
+    runtimeRetryAdvertised: Boolean(
+      (activePhase === 'online' || activePhase === 'degraded') &&
+      asString(activeTarget?.kind) === 'local' &&
+      asString(rawConnection?.path) === 'local_socket' &&
+      advertisedCapabilities.includes(RUNTIME_INTEGRITY_RETRY_CAPABILITY)
+    ),
+    residentProvisioningReady,
+    residentLifecycleAdvertised: advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
+  })
   const residentTurnActive = Boolean(
     selectedThread?.status === 'running' ||
     runtime.session?.isStreaming ||
@@ -2403,6 +2678,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     agents,
     evidence,
     runtime,
+    ...(localSetup ? { localSetup } : {}),
     residentLifecycleOperations,
     operations: {
       submitCommands: residentSessionReady,
@@ -2567,6 +2843,7 @@ export class NativeRendererApi implements RendererApi {
   private selectedThreadId?: string
   private threadSelectionGeneration = 0
   private connectionGeneration = 0
+  private connectionObservationRevision = 0
   private projectionRevision = 0
   private composerActionSequence = 0
   private authoritativeRefreshGeneration?: number
@@ -2675,11 +2952,60 @@ export class NativeRendererApi implements RendererApi {
     ].join('|')
   }
 
+  private connectionObservationKey(state: unknown): string {
+    const connection = asRecord(state)
+    const readiness = asRecord(connection?.runtimeReadiness)
+    const runtime = asRecord(readiness?.snapshot)
+    const error = asRecord(connection?.error)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string').sort()
+      : []
+    return [
+      capabilities.join(','),
+      asString(readiness?.kind) ?? '',
+      asString(readiness?.hostId) ?? '',
+      asString(runtime?.status) ?? '',
+      asString(runtime?.phase) ?? '',
+      asString(runtime?.assurance) ?? '',
+      asString(runtime?.recoveryAction) ?? '',
+      runtime?.retryable === true ? 'runtime-retryable' : '',
+      localSetupDiagnosticCode(runtime?.code) ?? '',
+      localSetupDiagnosticCode(error?.code) ?? '',
+      error?.retryable === true ? 'retryable' : '',
+    ].join('|')
+  }
+
   private connectionTargetKey(state: unknown): string {
     const target = asRecord(asRecord(state)?.target)
     const kind = asString(target?.kind)
     if (!kind) return ''
     return [kind, asString(target?.alias) ?? ''].join('|')
+  }
+
+  private beginConnectionReplyFence(target: UnknownRecord): {
+    revision: number
+    observedTargetKey: string
+    requestedTargetKey: string
+  } {
+    return {
+      // Beginning another connect supersedes every older reply, just as a
+      // native connection event does. The bridge reply is only an observation;
+      // it never outranks an event or request that the renderer saw later.
+      revision: ++this.connectionObservationRevision,
+      observedTargetKey: this.connectionTargetKey(this.connection),
+      requestedTargetKey: this.connectionTargetKey({ target }),
+    }
+  }
+
+  private connectionReplyIsCurrent(
+    fence: { revision: number; observedTargetKey: string; requestedTargetKey: string },
+    state: unknown,
+  ): boolean {
+    return (
+      fence.revision === this.connectionObservationRevision &&
+      fence.observedTargetKey === this.connectionTargetKey(this.connection) &&
+      fence.requestedTargetKey === this.connectionTargetKey(state)
+    )
   }
 
   private rebuildCatalog(): void {
@@ -2852,6 +3178,7 @@ export class NativeRendererApi implements RendererApi {
   }
 
   private applyConnectionState(state: unknown): void {
+    this.connectionObservationRevision += 1
     const previousPhase = asString(asRecord(this.connection)?.phase)
     const nextPhase = asString(asRecord(state)?.phase)
     const previousTarget = this.connectionTargetKey(this.connection)
@@ -2862,9 +3189,15 @@ export class NativeRendererApi implements RendererApi {
     const authorityChanged = Boolean(verifiedHostId && previousHostId && verifiedHostId !== previousHostId)
     if (targetChanged || authorityChanged) this.clearAuthorityMutationState()
     const connectionChanged = this.connectionKey(this.connection) !== this.connectionKey(state)
+    const observationChanged = this.connectionObservationKey(this.connection) !== this.connectionObservationKey(state)
     this.connection = state
     if (connectionChanged) {
       this.connectionGeneration += 1
+      this.projectionRevision += 1
+    } else if (observationChanged) {
+      // Readiness and structured setup errors are projection state, but they do
+      // not replace host authority. Fence an in-flight bootstrap without
+      // invalidating exact host-bound mutations.
       this.projectionRevision += 1
     }
     if (authorityChanged && verifiedHostId) {
@@ -3599,7 +3932,10 @@ export class NativeRendererApi implements RendererApi {
           existingTarget?.kind === 'ssh' && asString(existingTarget.alias)
             ? { kind: 'ssh', alias: asString(existingTarget.alias) }
             : { kind: 'local' }
-        this.applyConnectionState(await this.call<unknown>('connect', target))
+        const fence = this.beginConnectionReplyFence(target)
+        const state = await this.call<unknown>('connect', target)
+        if (!this.connectionReplyIsCurrent(fence, state)) return
+        this.applyConnectionState(state)
       }
 
       await this.refreshFromAuthoritativeHost()
@@ -3666,6 +4002,7 @@ export class NativeRendererApi implements RendererApi {
       }
     }
     const connectionChanged = this.connectionKey(this.connection) !== this.connectionKey(bootstrap?.connection)
+    this.connectionObservationRevision += 1
     this.connection = bootstrap?.connection
     if (connectionChanged) {
       this.connectionGeneration += 1
@@ -3948,6 +4285,91 @@ export class NativeRendererApi implements RendererApi {
     }
   }
 
+  async retryLocalSetup(): Promise<void> {
+    const current = this.projection ?? this.updateProjection()
+    const issue = current.localSetup?.issue
+    if (
+      current.localSetup?.stage !== 'needs_attention' ||
+      !issue?.retryable
+    ) {
+      throw new Error('The current local setup state does not allow a retry.')
+    }
+    if (issue.action === 'retry_runtime') {
+      const connection = asRecord(this.connection)
+      const expectedHostId = asString(connection?.hostId)
+      const targetKind = asString(asRecord(connection?.target)?.kind)
+      const path = asString(connection?.path)
+      const phase = asString(connection?.phase)
+      const capabilities = Array.isArray(connection?.capabilities)
+        ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+        : []
+      const readiness = asRecord(connection?.runtimeReadiness)
+      const previousSnapshot = RuntimeIntegritySnapshotSchema.safeParse(readiness?.snapshot)
+      if (
+        !expectedHostId ||
+        (phase !== 'online' && phase !== 'degraded') ||
+        targetKind !== 'local' ||
+        path !== 'local_socket' ||
+        !capabilities.includes(RUNTIME_INTEGRITY_RETRY_CAPABILITY) ||
+        asString(readiness?.hostId) !== expectedHostId ||
+        !previousSnapshot.success ||
+        previousSnapshot.data.status !== 'failed' ||
+        !previousSnapshot.data.retryable
+      ) {
+        throw new StaleHostAuthorityError()
+      }
+      const generation = this.connectionGeneration
+      const observationRevision = this.connectionObservationRevision
+      const result = RuntimeIntegritySnapshotSchema.parse(
+        await this.call<unknown>('retryRuntimeIntegrity', { expectedHostId }),
+      )
+      const latestConnection = asRecord(this.connection)
+      if (
+        generation !== this.connectionGeneration ||
+        asString(latestConnection?.hostId) !== expectedHostId ||
+        asString(asRecord(latestConnection?.target)?.kind) !== 'local' ||
+        asString(latestConnection?.path) !== 'local_socket'
+      ) {
+        throw new StaleHostAuthorityError()
+      }
+      if (
+        result.status !== 'initializing' ||
+        !sameRuntimeIntegrityLineage(previousSnapshot.data, result)
+      ) {
+        throw new Error('The native runtime retry returned an invalid verification state.')
+      }
+      // A native connection event outranks the bridge reply. Applying the
+      // response only when no newer observation arrived keeps a fast ready
+      // transition from being overwritten by this earlier initializing state.
+      if (observationRevision !== this.connectionObservationRevision) return
+      const latestCapabilities = Array.isArray(latestConnection?.capabilities)
+        ? latestConnection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+        : []
+      this.applyConnectionState({
+        ...latestConnection,
+        capabilities: latestCapabilities.filter(
+          (capability) => capability !== RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+        ),
+        runtimeReadiness: {
+          ...readiness,
+          observedAt: result.changedAt,
+          snapshot: result,
+        },
+      })
+      return
+    }
+    if (issue.action !== 'retry_connection') {
+      throw new Error('The current local setup state does not allow a connection retry.')
+    }
+    const targetKind = asString(asRecord(asRecord(this.connection)?.target)?.kind)
+    if (targetKind && targetKind !== 'local') throw new StaleHostAuthorityError()
+    const target = { kind: 'local' }
+    const fence = this.beginConnectionReplyFence(target)
+    const state = await this.call<unknown>('connect', target)
+    if (!this.connectionReplyIsCurrent(fence, state)) return
+    this.applyConnectionState(state)
+  }
+
   async selectThread(threadId: string): Promise<void> {
     if (!threadId) throw new Error('Choose a thread before requesting its snapshot.')
     const previousThreadId = this.selectedThreadId
@@ -4164,19 +4586,45 @@ export class NativeRendererApi implements RendererApi {
       if (!planId) throw new Error('The host installation plan is missing its identifier. Run the connection check again.')
       await this.call<never>('installHost', { planId, consent: true })
     }
-    const connection = asRecord(await this.call<unknown>('connect', { kind: 'ssh', alias: input.alias }))
-    this.applyConnectionState(connection)
-    await this.refreshFromAuthoritativeHost()
-    return {
-      host: {
-        id: `ssh:${input.alias}`,
-        name: input.alias,
-        kind: 'ssh',
-        connection: connectionFromNative(connection?.phase),
-        connectionPath: 'SSH',
-        compatibility: 'compatible',
-      },
+    const target = { kind: 'ssh', alias: input.alias }
+    const fence = this.beginConnectionReplyFence(target)
+    const connection = asRecord(await this.call<unknown>('connect', target))
+    const replyHostId = asString(connection?.hostId)
+    if (this.connectionReplyIsCurrent(fence, connection)) {
+      this.applyConnectionState(connection)
+    } else {
+      const current = asRecord(this.connection)
+      const currentTarget = asRecord(current?.target)
+      const replyTarget = asRecord(connection?.target)
+      const corroboratesCurrentSshAuthority = Boolean(
+        replyHostId &&
+        asString(current?.phase) === 'online' &&
+        asString(current?.path) === 'ssh' &&
+        asString(currentTarget?.kind) === 'ssh' &&
+        asString(currentTarget?.alias) === input.alias &&
+        asString(current?.hostId) === replyHostId &&
+        asString(replyTarget?.kind) === 'ssh' &&
+        asString(replyTarget?.alias) === input.alias
+      )
+      if (!corroboratesCurrentSshAuthority) throw new StaleHostAuthorityError()
     }
+    if (!replyHostId) throw new StaleHostAuthorityError()
+    await this.refreshFromAuthoritativeHost()
+    const current = asRecord(this.connection)
+    const currentTarget = asRecord(current?.target)
+    const host = this.projection?.hosts.find((candidate) => candidate.id === replyHostId)
+    if (
+      asString(current?.phase) !== 'online' ||
+      asString(current?.path) !== 'ssh' ||
+      asString(currentTarget?.kind) !== 'ssh' ||
+      asString(currentTarget?.alias) !== input.alias ||
+      asString(current?.hostId) !== replyHostId ||
+      !host ||
+      host.connection !== 'online' ||
+      host.connectionPath !== 'SSH' ||
+      host.kind !== 'ssh'
+    ) throw new StaleHostAuthorityError()
+    return { host }
   }
 
   async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }> {
@@ -4623,10 +5071,14 @@ let singletonApi: RendererApi | undefined
 export function createRendererApi(): RendererApi {
   if (!singletonApi) {
     const nativeBridge = Reflect.get(window, 'prime') as NativePrimeBridge | undefined
+    const search = new URLSearchParams(window.location.search)
+    const internalVisualQa = window.location.protocol === 'http:' &&
+      window.location.hostname === '127.0.0.1' &&
+      window.navigator.userAgent.includes('PrimeContinuimVisualQA/1') &&
+      search.has('visualState')
     if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge)
-    else if (isNativeBridgeUnavailable(window.navigator.userAgent, false)) {
-      throw new Error('The native control bridge did not load. Prime Continuim will not substitute sample data in the desktop app.')
-    } else singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
+    else if (internalVisualQa) singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
+    else throw new Error('Prime Continuim requires its desktop control bridge. Close this window and reopen the installed desktop app.')
   }
   return singletonApi
 }
