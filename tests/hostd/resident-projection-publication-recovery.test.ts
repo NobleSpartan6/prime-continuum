@@ -267,6 +267,23 @@ describe("resident projection publication recovery", () => {
     expect(queuedActive.thread.status).toBe("running");
     expect((await fixture.bootstrap.admitCommand(promptCommand(host.hostId, "queue-active-prompt"), true)).receipt)
       .toMatchObject({ status: "rejected", error: { code: "RESIDENT_SESSION_BUSY" } });
+
+    const queuedOnlyBase = projection(
+      fixture.binding,
+      23,
+      "Authoritative queued action.",
+      "resident-status",
+      false,
+    );
+    const queuedOnly: ResidentProjectionSnapshot = {
+      ...queuedOnlyBase,
+      runtime: { ...queuedOnlyBase.runtime, queuedActionCount: 1 },
+      queue: { ...queuedOnlyBase.queue, queuedCount: 1 },
+    };
+    const queuedWaiting = await fixture.bootstrap.publishResidentProjectionSnapshot(fixture.binding, queuedOnly);
+    expect(queuedWaiting.thread.status).toBe("running");
+    expect((await fixture.bootstrap.admitCommand(promptCommand(host.hostId, "queued-action-prompt"), true)).receipt)
+      .toMatchObject({ status: "rejected", error: { code: "RESIDENT_SESSION_BUSY" } });
   });
 });
 

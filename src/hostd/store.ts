@@ -1832,11 +1832,7 @@ export class HostStore {
         generation: projection.cursor.generation,
         sequence: projection.cursor.sequence,
       };
-      const runtimeActive =
-        projection.runtime.isStreaming ||
-        projection.runtime.isCompacting ||
-        projection.runtime.isBashRunning ||
-        projection.queue.active !== undefined;
+      const runtimeActive = residentPrivateProjectionReportsActivity(projection);
       const projectedStatus = runtimeActive
         ? "running"
         : source.thread.status === "complete" || source.thread.status === "failed"
@@ -6043,11 +6039,7 @@ function residentProjectionDigest(projection: ResidentProjectionSnapshot): strin
     stream: projection.stream,
     childAgents: projection.childAgents,
     goal: projection.goal,
-    activity:
-      projection.runtime.isStreaming ||
-      projection.runtime.isCompacting ||
-      projection.runtime.isBashRunning ||
-      projection.queue.active !== undefined,
+    activity: residentPrivateProjectionReportsActivity(projection),
   };
   return digestNormalizedJson(semantic);
 }
