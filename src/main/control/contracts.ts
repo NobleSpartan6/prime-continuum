@@ -7,6 +7,8 @@
  */
 
 import type {
+  ResidentLifecycleLookupResult,
+  ResidentLifecycleStatus,
   RuntimeIntegritySnapshot,
   RuntimeModelCatalogSnapshot,
   RuntimeOAuthSessionSnapshot
@@ -28,6 +30,9 @@ export const IPC = {
   startRuntimeOAuth: 'prime:runtime:oauth:start',
   runtimeOAuthStatus: 'prime:runtime:oauth:status',
   cancelRuntimeOAuth: 'prime:runtime:oauth:cancel',
+  selectResidentWorkspace: 'prime:resident:workspace:select',
+  provisionResident: 'prime:resident:provision',
+  residentLifecycleStatus: 'prime:resident:lifecycle:status',
   requestSnapshot: 'prime:thread:snapshot',
   submitCommand: 'prime:command:submit',
   approve: 'prime:approval:resolve',
@@ -170,6 +175,56 @@ export interface RuntimeOAuthSessionView {
   error?: RuntimeOAuthSessionSnapshot['error']
 }
 
+/**
+ * A short-lived renderer authorization for one directory selected by Electron.
+ * The selected path is retained only inside the main process.
+ */
+export interface ResidentWorkspaceSelection {
+  selectionToken: string
+  operationId: string
+  expectedHostId: string
+  suggestedName: string
+  expiresAt: string
+}
+
+export interface ResidentWorkspaceSelectionInput {
+  /**
+   * Re-authorize the private path for a path-free durable operation. A null
+   * status resumes the exact operation; a definitive pre-effect completion
+   * reuses its workspace identity under a newly minted lifecycle operation.
+   */
+  resumeOperationId?: string
+}
+
+export interface ResidentProvisionInput {
+  selectionToken: string
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+}
+
+/** Path-free durable operation state exposed during bootstrap and recovery. */
+export interface ResidentLifecycleOperationView {
+  operationId: string
+  expectedHostId: string
+  projectId: string
+  workspaceId: string
+  threadId: string
+  executionGenerationId: string
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+  createdAt: string
+  updatedAt: string
+  state:
+    | 'submitted'
+    | 'outcome_unknown'
+    | 'requires_reselection'
+    | 'terminal_refresh_pending'
+    | 'terminal'
+  lastStatus?: ResidentLifecycleStatus
+}
+
 export type CommandJournalStatus =
   | 'received'
   | 'admitted'
@@ -244,6 +299,8 @@ export interface BootstrapPayload {
   quarantinedOutboxCount: number
   /** Bounded local history of host-durable outcomes that must never replay. */
   durableUncertainReceipts: CommandReceipt[]
+  /** Path-free lifecycle entries; these may be queried after reconnect but are never replayed. */
+  residentLifecycleOperations: ResidentLifecycleOperationView[]
   connection: ConnectionState
   appVersion: string
 }
@@ -311,6 +368,12 @@ export interface PrimeBridge {
   startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
   runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
   cancelRuntimeOAuth(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
+  selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<Result<ResidentWorkspaceSelection>>
+  provisionResident(input: ResidentProvisionInput): Promise<Result<ResidentLifecycleStatus>>
+  residentLifecycleStatus(input: {
+    expectedHostId: string
+    operationId: string
+  }): Promise<Result<ResidentLifecycleLookupResult>>
   requestSnapshot(input: { threadId?: string; cursor?: SessionCursor }): Promise<Result<unknown>>
   submitCommand(input: ClientCommand): Promise<Result<CommandReceipt>>
   approve(input: ApprovalResolution): Promise<Result<CommandReceipt>>

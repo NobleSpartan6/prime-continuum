@@ -42,6 +42,18 @@ const handoffPlan = z
     behaviorIfRunning: z.enum(['interrupt', 'wait_for_idle'])
   })
   .strict()
+const residentProvision = z
+  .object({
+    selectionToken: id,
+    projectDisplayName: z.string().trim().min(1).max(255).regex(/^[^\0\r\n]+$/),
+    threadTitle: z.string().trim().min(1).max(255).regex(/^[^\0\r\n]+$/),
+    sessionName: z.string().trim().min(1).max(255).regex(/^[^\0\r\n]+$/).optional()
+  })
+  .strict()
+const residentWorkspaceSelection = z
+  .object({ resumeOperationId: id.optional() })
+  .strict()
+  .optional()
 
 export interface ControlIpcOptions {
   ipcMain: IpcMain
@@ -122,6 +134,21 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     z.object({ expectedHostId: id, sessionId: id }).strict(),
     (input: { expectedHostId: string; sessionId: string }) =>
       service.cancelRuntimeOAuth(input.expectedHostId, input.sessionId)
+  )
+  handle(
+    IPC.selectResidentWorkspace,
+    residentWorkspaceSelection,
+    (input: z.infer<typeof residentWorkspaceSelection>) => service.selectResidentWorkspace(input)
+  )
+  handle(
+    IPC.provisionResident,
+    residentProvision,
+    (input: z.infer<typeof residentProvision>) => service.provisionResident(input)
+  )
+  handle(
+    IPC.residentLifecycleStatus,
+    z.object({ expectedHostId: id, operationId: id }).strict(),
+    (input: { expectedHostId: string; operationId: string }) => service.residentLifecycleStatus(input)
   )
   handle(
     IPC.requestSnapshot,

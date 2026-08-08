@@ -4,6 +4,7 @@ import {
   CommandReconciliationSchema,
   HealthSnapshotSchema,
   HostIpcRequestSchema,
+  HostIpcResponseSchema,
   HostIpcSnapshotTransferEnvelopeSchema,
   MAX_SNAPSHOT_TRANSFER_BYTES,
   MobilePairingPolicySchema,
@@ -11,6 +12,7 @@ import {
   PairingTicketDescriptorSchema,
   PROTOCOL_VERSION,
   RemoteDeviceScopesSchema,
+  ResidentLifecycleStatusSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
   ThreadProjectionSnapshotSchema,
@@ -240,6 +242,88 @@ describe("host protocol schemas", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it("bounds trusted-local resident provisioning and returns path-free lifecycle state", () => {
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-provision-1",
+      method: "resident.provision",
+      payload: {
+        expectedHostId: "host-1",
+        operationId: "resident-op-1",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        threadId: "thread-1",
+        executionGenerationId: "execution-1",
+        workspaceDirectory: "C:\\work\\project",
+        projectDisplayName: "Project",
+        threadTitle: "First resident thread",
+        createdAt: "2026-08-08T12:00:00.000Z",
+      },
+    } as const;
+    expect(HostIpcRequestSchema.safeParse(request).success).toBe(true);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, workspaceDirectory: "bad\0path" },
+      }).success,
+    ).toBe(false);
+    for (const workspaceDirectory of ["relative/project", "C:\\work\\project\r\nforged"]) {
+      expect(
+        HostIpcRequestSchema.safeParse({
+          ...request,
+          payload: { ...request.payload, workspaceDirectory },
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, workspaceDirectory: "/srv/work/project" },
+      }).success,
+    ).toBe(true);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, workspaceDirectory: "\\\\server\\share\\project" },
+      }).success,
+    ).toBe(true);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, sessionPath: "C:\\secret\\session.jsonl" },
+      }).success,
+    ).toBe(false);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, threadTitle: "   " },
+      }).success,
+    ).toBe(false);
+
+    const status = ResidentLifecycleStatusSchema.parse({
+      version: 1,
+      kind: "provision",
+      operationId: "resident-op-1",
+      phase: "committed",
+      expectedHostId: "host-1",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      threadId: "thread-1",
+      executionGenerationId: "execution-1",
+      preparedAt: "2026-08-08T12:00:00.000Z",
+      updatedAt: "2026-08-08T12:00:01.000Z",
+      terminalAt: "2026-08-08T12:00:01.000Z",
+    });
+    const response = HostIpcResponseSchema.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: request.requestId,
+      method: request.method,
+      ok: true,
+      result: status,
+    });
+    expect(JSON.stringify(response)).not.toMatch(/workspaceDirectory|sessionFile|activeSessionId/);
   });
 
   it("requires exactly one reconciliation outcome", () => {

@@ -3,12 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway } from "../../src/hostd/gateway";
-import type { PrimeAgentResidentAdapterOptions } from "../../src/hostd/prime-agent-resident-adapter";
+import type {
+  PrimeAgentPublicModuleLoader,
+  PrimeAgentResidentAdapterOptions,
+  ResidentOwnedRuntimeCandidate,
+} from "../../src/hostd/prime-agent-resident-adapter";
+import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
   ResidentRuntimeContractError,
   type ResidentAbortIdleAuthorityEvidence,
+  type ResidentOwnedSessionCreateInput,
   type ResidentRuntimeConnection,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentSessionBinding,
@@ -39,6 +45,44 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
 
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
     expect(fixture.runtimeHandles.acquireVerifiedRuntimeHandle).not.toHaveBeenCalled();
+    expect(fixture.adapterFactory).not.toHaveBeenCalled();
+
+    await fixture.gateway.close();
+  });
+
+  it("proves lifecycle composition with zero bindings without advertising command readiness", async () => {
+    const fixture = await gatewayFixture([]);
+
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(true);
+    expect(fixture.runtimeHandles.acquireVerifiedRuntimeHandle).toHaveBeenCalledOnce();
+    expect(fixture.adapterFactory).toHaveBeenCalledOnce();
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    expect(fixture.adapter.attachResident).not.toHaveBeenCalled();
+
+    await fixture.gateway.close();
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(false);
+  });
+
+  it("fails zero-binding lifecycle readiness when the cached Worker module preflight rejects", async () => {
+    const moduleLoad = deferred<unknown>();
+    const moduleLoader = Object.assign(
+      vi.fn(() => moduleLoad.promise),
+      { close: vi.fn(async () => undefined) },
+    );
+    const moduleLoaderFactory = vi.fn(() => moduleLoader);
+    const fixture = await gatewayFixture([], {}, { moduleLoaderFactory });
+
+    const firstReadiness = fixture.gateway.residentLifecycleCapabilityReady();
+    const concurrentReadiness = fixture.gateway.residentLifecycleCapabilityReady();
+    await vi.waitFor(() => expect(moduleLoader).toHaveBeenCalledOnce());
+    expect(fixture.adapterFactory).not.toHaveBeenCalled();
+
+    moduleLoad.reject(new Error("verified Worker import failed"));
+    await expect(Promise.all([firstReadiness, concurrentReadiness])).resolves.toEqual([false, false]);
+    expect(fixture.runtimeHandles.acquireVerifiedRuntimeHandle).toHaveBeenCalledOnce();
+    expect(moduleLoaderFactory).toHaveBeenCalledOnce();
+    expect(moduleLoader).toHaveBeenCalledOnce();
+    expect(moduleLoader.close).toHaveBeenCalledOnce();
     expect(fixture.adapterFactory).not.toHaveBeenCalled();
 
     await fixture.gateway.close();
@@ -385,6 +429,9 @@ async function gatewayFixture(
     readonly autoProjectBindings?: boolean;
     readonly projectedBindings?: readonly ResidentSessionBinding[];
     readonly publishOnAttach?: false | ((binding: ResidentSessionBinding) => boolean);
+    readonly moduleLoaderFactory?: (
+      handle: VerifiedInstalledRuntimeHandle,
+    ) => PrimeAgentPublicModuleLoader;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "prime-resident-gateway-bootstrap-test-"));
@@ -438,6 +485,12 @@ async function gatewayFixture(
     isLive: vi.fn(async () => true),
     submit: vi.fn(async () => ({ disposition: "accepted" as const })),
     close: vi.fn(async () => undefined),
+    createOwnedCandidate: vi.fn(async () => {
+      throw new Error("No owned candidate was configured for this fixture");
+    }),
+    readStableResidentProjection: vi.fn(async () => {
+      throw new Error("No resident recovery projection was configured for this fixture");
+    }),
     attachResident: vi.fn(async (candidate: ResidentSessionBinding) => {
       const connection = attachResidentOverride
         ? await attachResidentOverride(candidate)
@@ -466,7 +519,7 @@ async function gatewayFixture(
     platform: "win32",
     environment: {},
     adapterFactory,
-    moduleLoaderFactory: () => async () => ({}),
+    moduleLoaderFactory: fixtureOptions.moduleLoaderFactory ?? (() => async () => ({})),
   });
   return {
     gateway,
@@ -485,6 +538,8 @@ async function gatewayFixture(
 }
 
 type ResidentGatewayAdapter = PrimeAgentGateway & {
+  createOwnedCandidate(input: ResidentOwnedSessionCreateInput): Promise<ResidentOwnedRuntimeCandidate>;
+  readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,

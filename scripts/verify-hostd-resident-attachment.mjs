@@ -34,6 +34,7 @@ const THREAD_ID = "demo-thread";
 const EXECUTION_GENERATION_ID = "demo-execution-1";
 const RESIDENT_COMMAND_CAPABILITY = "prime_agent_commands_v2";
 const EXPECTED_BASE_CAPABILITIES = Object.freeze([
+  "resident_lifecycle_v1",
   "runtime_integrity_v1",
   "runtime_model_catalog_v1",
   "snapshot_chunks_v1",

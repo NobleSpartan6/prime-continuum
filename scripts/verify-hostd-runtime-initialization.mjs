@@ -26,6 +26,7 @@ const BASE_HEALTH_CAPABILITIES = Object.freeze([
   "snapshot_chunks_v1",
 ].sort());
 const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
+const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
 const EXPECTED_MODEL_CATALOG = Object.freeze({
   releaseVersion: "0.7.0",
   providers: 32,
@@ -225,7 +226,7 @@ function assertRuntimeHealth(health, expectedStatus) {
     throw new Error("Runtime health capabilities are invalid");
   }
   const expectedCapabilities = expectedStatus === "ready"
-    ? [...BASE_HEALTH_CAPABILITIES, MODEL_CATALOG_CAPABILITY].sort()
+    ? [...BASE_HEALTH_CAPABILITIES, MODEL_CATALOG_CAPABILITY, RESIDENT_LIFECYCLE_CAPABILITY].sort()
     : BASE_HEALTH_CAPABILITIES;
   const actualCapabilities = [...health.capabilities].sort();
   if (JSON.stringify(actualCapabilities) !== JSON.stringify(expectedCapabilities)) {

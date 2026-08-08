@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { App } from 'electron'
 import {
   CapabilitySchema,
@@ -9,8 +10,11 @@ import {
   CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
+  RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  ResidentLifecycleLookupResultSchema,
+  ResidentLifecycleStatusSchema,
   ResidentAbortIdleObservedSignalSchema,
   ResidentPromptIdleObservedSignalSchema,
   RuntimeIntegritySnapshotSchema,
@@ -24,6 +28,8 @@ import {
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
   type RuntimeOAuthSessionSnapshot,
+  type ResidentLifecycleLookupResult,
+  type ResidentLifecycleStatus,
   type ThreadProjectionSnapshot,
 } from '../../shared/protocol'
 import {
@@ -44,6 +50,10 @@ import type {
   HostRuntimeReadiness,
   HostInstallPlan,
   OutboxEntry,
+  ResidentLifecycleOperationView,
+  ResidentProvisionInput,
+  ResidentWorkspaceSelection,
+  ResidentWorkspaceSelectionInput,
   RuntimeOAuthSessionView,
   SessionCursor,
   SshHostAlias,
@@ -175,10 +185,44 @@ interface ThreadChangeRefresh {
   cancelled: boolean
 }
 
+interface ResidentProvisionMetadata {
+  readonly projectDisplayName: string
+  readonly threadTitle: string
+  readonly sessionName?: string
+}
+
+interface ResidentWorkspaceSelectionRecord {
+  readonly selectionToken: string
+  readonly authority: CapturedProjectionAuthority
+  readonly workspaceDirectory: string
+  readonly selection: ResidentWorkspaceSelection
+  readonly projectId: string
+  readonly workspaceId: string
+  readonly threadId: string
+  readonly executionGenerationId: string
+  readonly createdAt: string
+  provisionMetadata?: ResidentProvisionMetadata
+  inFlight?: Promise<ResidentLifecycleStatus>
+}
+
+interface ResidentLifecycleLedger {
+  version: 1
+  entries: ResidentLifecycleOperationView[]
+}
+
+interface ResidentLifecycleStatusMerge {
+  readonly status: ResidentLifecycleStatus
+  readonly state?: ResidentLifecycleOperationView['state']
+}
+
+type RetiredResidentSelectionReason = 'expired' | 'superseded' | 'authority_changed' | 'terminal'
+
 interface ServiceOptions {
   app: App
   sshExecutable?: string
   openExternal?: (url: string) => Promise<void>
+  /** Electron's native directory picker, injected so paths never enter preload IPC. */
+  selectDirectory?: () => Promise<string | undefined>
 }
 
 const RECONNECT_DELAYS_MS = [500, 1_500, 3_500, 8_000, 15_000, 30_000] as const
@@ -198,6 +242,16 @@ const RETIRED_GENERATIONS_PER_THREAD_LIMIT = 16
 const RETIRED_CURSOR_GENERATIONS_PER_LINEAGE_LIMIT = 16
 const MAX_THREAD_CHANGE_REFRESHES = 1_024
 const TARGET_BINDING_LIMIT = 128
+const RESIDENT_SELECTION_TTL_MS = 5 * 60_000
+const RESIDENT_SELECTION_LIMIT = 32
+const RETIRED_RESIDENT_SELECTION_LIMIT = 64
+const RESIDENT_LIFECYCLE_LEDGER_LIMIT = 128
+const RESIDENT_PROVISION_TIMEOUT_MS = 120_000
+const RESIDENT_RECONNECT_RECONCILE_LIMIT = 8
+const RESIDENT_RECONNECT_STATUS_TIMEOUT_MS = 15_000
+const RESIDENT_BACKGROUND_REFRESH_LIMIT = 8
+const RESIDENT_BACKGROUND_REFRESH_BUDGET_MS = 120_000
+const RESIDENT_BACKGROUND_REFRESH_REQUEST_TIMEOUT_MS = 30_000
 const TERMINAL_COMMAND_RECEIPTS = new Set([
   'completed',
   'rejected',
@@ -209,6 +263,7 @@ export class DesktopControlService extends EventEmitter {
   private readonly app: App
   private readonly sshExecutable: string
   private readonly openExternal: ((url: string) => Promise<void>) | undefined
+  private readonly selectDirectory: (() => Promise<string | undefined>) | undefined
   private readonly oauthAuthorityId = `desktop-oauth-${randomUUID()}`
   private readonly openedOAuthSessions = new Set<string>()
   private readonly activeOAuthSessions = new Map<string, ActiveRuntimeOAuthSession>()
@@ -222,10 +277,15 @@ export class DesktopControlService extends EventEmitter {
   private readonly outbox: AtomicJsonStore<unknown[]>
   private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
   private readonly durableUncertainReceipts: AtomicJsonStore<DurableUncertainReceiptHistory>
+  private readonly residentLifecycleLedger: AtomicJsonStore<ResidentLifecycleLedger>
   private readonly latency = new LatencyRecorder()
   private readonly discoveredAliases = new Set<string>()
   private readonly installPlans = new Map<string, HostInstallPlan>()
   private readonly threadChangeRefreshes = new Map<string, ThreadChangeRefresh>()
+  private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelectionRecord>()
+  private readonly retiredResidentSelections = new Map<string, RetiredResidentSelectionReason>()
+  private residentProjectionRefreshPromise?: Promise<void>
+  private residentProjectionRefreshTail: Promise<void> = Promise.resolve()
   /**
    * Per-identity receipt/proof commits are serialized independently from the
    * transport request. This lets an idle proof delivered in the same read as a
@@ -260,6 +320,7 @@ export class DesktopControlService extends EventEmitter {
     this.app = options.app
     this.sshExecutable = options.sshExecutable ?? 'ssh'
     this.openExternal = options.openExternal
+    this.selectDirectory = options.selectDirectory
     const stateDirectory = path.join(this.app.getPath('userData'), 'control')
     const emptyCache = (): CacheEnvelope => ({ version: 3, entries: {}, targetHostBindings: [] })
     this.cache = new IndexedProjectionCacheStore(
@@ -285,6 +346,12 @@ export class DesktopControlService extends EventEmitter {
       () => ({ version: 1, entries: [] }),
       4 * 1024 * 1024,
       { malformedJson: 'error', validateRoot: isDurableUncertainReceiptHistory },
+    )
+    this.residentLifecycleLedger = new AtomicJsonStore<ResidentLifecycleLedger>(
+      path.join(stateDirectory, 'resident-lifecycle.json'),
+      () => ({ version: 1, entries: [] }),
+      2 * 1024 * 1024,
+      { malformedJson: 'error', validateRoot: isResidentLifecycleLedger },
     )
   }
 
@@ -313,6 +380,7 @@ export class DesktopControlService extends EventEmitter {
         const activeTarget = this.target
         const cache = retry === 0 ? initialCache : await this.readCache()
         const outbox = await this.readOutboxClassification(true)
+        const residentLifecycle = await this.residentLifecycleLedger.read()
         const connection = this.getConnectionState()
         if (
           generation === this.reconnectGeneration &&
@@ -331,6 +399,9 @@ export class DesktopControlService extends EventEmitter {
             durableUncertainReceipts: durableUncertainReceipts.entries
               .filter((receipt) => !activeHostId || receipt.hostId === activeHostId)
               .map(({ recordedAt: _recordedAt, ...receipt }) => receipt),
+            residentLifecycleOperations: residentLifecycle.entries
+              .filter((entry) => !activeHostId || entry.expectedHostId === activeHostId)
+              .map((entry) => structuredClone(entry)),
             connection,
             appVersion: this.app.getVersion()
           }
@@ -400,6 +471,7 @@ export class DesktopControlService extends EventEmitter {
 
   async connect(target: ConnectionTarget): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspaceSelections('authority_changed')
     try {
       if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
       const intentGeneration = ++this.controlIntentGeneration
@@ -451,6 +523,7 @@ export class DesktopControlService extends EventEmitter {
 
   async reconnect(): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspaceSelections('authority_changed')
     try {
       const target = this.target
       if (!target) {
@@ -476,6 +549,7 @@ export class DesktopControlService extends EventEmitter {
 
   async disconnect(): Promise<void> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspaceSelections('authority_changed')
     try {
       this.intentionallyOffline = true
       this.controlIntentGeneration += 1
@@ -687,6 +761,149 @@ export class DesktopControlService extends EventEmitter {
       }
       throw error
     }
+  }
+
+  async selectResidentWorkspace(
+    input: ResidentWorkspaceSelectionInput = {},
+  ): Promise<ResidentWorkspaceSelection> {
+    return await this.latency.measure('resident.workspace.select', async () => {
+      const authority = this.captureResidentLifecycleAuthority()
+      const initialRecovery = input.resumeOperationId === undefined
+        ? undefined
+        : await this.requireResidentWorkspaceRecoveryEntry(input.resumeOperationId, authority)
+      if (!this.selectDirectory) {
+        throw new ControlError(
+          'resident.workspace_picker_unavailable',
+          'The native workspace picker is unavailable.'
+        )
+      }
+
+      let selectedDirectory: string | undefined
+      try {
+        selectedDirectory = await this.selectDirectory()
+      } catch {
+        // Native dialog errors can contain the selected filesystem path. Keep
+        // the renderer-facing failure deliberately generic.
+        throw new ControlError(
+          'resident.workspace_picker_failed',
+          'The native workspace picker could not be opened.',
+          { retryable: true }
+        )
+      }
+      this.captureResidentLifecycleAuthority(authority.hostId)
+      this.assertProjectionAuthority(authority, 'resident workspace selection')
+      if (selectedDirectory === undefined) {
+        throw new ControlError(
+          'resident.workspace_selection_cancelled',
+          'No workspace folder was selected.'
+        )
+      }
+
+      const workspaceDirectory = normalizeSelectedWorkspaceDirectory(selectedDirectory)
+      const recovery = input.resumeOperationId === undefined
+        ? undefined
+        : await this.requireResidentWorkspaceRecoveryEntry(input.resumeOperationId, authority)
+      this.captureResidentLifecycleAuthority(authority.hostId)
+      this.assertProjectionAuthority(authority, 'resident workspace selection')
+      if (
+        initialRecovery &&
+        recovery &&
+        !sameResidentWorkspaceRecoverySource(initialRecovery, recovery)
+      ) {
+        throw new ControlError(
+          'resident.workspace_resume_changed',
+          'The durable resident operation changed while its workspace was being selected.',
+          { retryable: true }
+        )
+      }
+      this.expireResidentWorkspaceSelections()
+      this.revokeResidentWorkspaceSelections('superseded')
+
+      const selectionToken = randomUUID()
+      const operationId = recovery && shouldReuseResidentLifecycleOperation(recovery)
+        ? recovery.operationId
+        : `resident-${randomUUID()}`
+      const createdAt = recovery?.createdAt ?? now()
+      const selection = Object.freeze({
+        selectionToken,
+        operationId,
+        expectedHostId: authority.hostId,
+        suggestedName: suggestedWorkspaceName(workspaceDirectory),
+        expiresAt: new Date(Date.now() + RESIDENT_SELECTION_TTL_MS).toISOString(),
+      })
+      const record: ResidentWorkspaceSelectionRecord = {
+        selectionToken,
+        authority,
+        workspaceDirectory,
+        selection,
+        projectId: recovery?.projectId ?? `project-${randomUUID()}`,
+        workspaceId: recovery?.workspaceId ?? `workspace-${randomUUID()}`,
+        threadId: recovery?.threadId ?? `thread-${randomUUID()}`,
+        executionGenerationId: recovery?.executionGenerationId ?? `execution-${randomUUID()}`,
+        createdAt,
+        ...(recovery
+          ? {
+              provisionMetadata: Object.freeze({
+                projectDisplayName: recovery.projectDisplayName,
+                threadTitle: recovery.threadTitle,
+                ...(recovery.sessionName === undefined ? {} : { sessionName: recovery.sessionName }),
+              }),
+            }
+          : {}),
+      }
+      this.residentWorkspaceSelections.set(selectionToken, record)
+      this.enforceResidentSelectionLimit()
+      return { ...selection }
+    })
+  }
+
+  async provisionResident(input: ResidentProvisionInput): Promise<ResidentLifecycleStatus> {
+    const record = this.requireResidentWorkspaceSelection(input.selectionToken)
+    const metadata = normalizeResidentProvisionMetadata(input)
+    if (record.provisionMetadata && !sameResidentProvisionMetadata(record.provisionMetadata, metadata)) {
+      throw new ControlError(
+        'resident.provision_identity_conflict',
+        'This workspace selection was already bound to different provisioning details.'
+      )
+    }
+    record.provisionMetadata ??= metadata
+    this.assertResidentSelectionAuthority(record, 'resident provisioning')
+    if (record.inFlight) return await record.inFlight
+
+    let operation!: Promise<ResidentLifecycleStatus>
+    operation = this.runResidentProvision(record).finally(() => {
+      if (record.inFlight === operation) record.inFlight = undefined
+    })
+    record.inFlight = operation
+    return await operation
+  }
+
+  async residentLifecycleStatus(
+    input: { expectedHostId: string; operationId: string }
+  ): Promise<ResidentLifecycleLookupResult> {
+    // Durable lookup remains available when the runtime/Worker is temporarily
+    // unavailable and health therefore withdraws the provisioning capability.
+    const authority = this.captureResidentLifecycleAuthority(input.expectedHostId, false)
+    const raw = await authority.connection.request(
+      'resident.lifecycle.status',
+      input,
+      { timeoutMs: 30_000 }
+    )
+    this.assertProjectionAuthority(authority, 'resident lifecycle status')
+    const lookup = ResidentLifecycleLookupResultSchema.parse(raw)
+    if (lookup.status) {
+      const status = await this.acceptResidentLifecycleStatus(
+        lookup.status,
+        authority,
+        input.operationId,
+      )
+      this.assertProjectionAuthority(authority, 'resident lifecycle status')
+      return { status }
+    } else {
+      await this.markResidentLifecycleStatusMissing(authority, input.operationId)
+    }
+    this.assertProjectionAuthority(authority, 'resident lifecycle status')
+    return { status: null }
   }
 
   private captureLocalOAuthAuthority(expectedHostId: string): CapturedProjectionAuthority {
@@ -1376,6 +1593,7 @@ export class DesktopControlService extends EventEmitter {
     phase: 'connecting' | 'reconnecting',
     generation: number
   ): Promise<ConnectionState> {
+    this.revokeResidentWorkspaceSelections('authority_changed')
     this.stopHealthPolling()
     const previous = this.connection
     if (previous) this.cancelThreadChangeRefreshesForConnection(previous)
@@ -1455,6 +1673,14 @@ export class DesktopControlService extends EventEmitter {
         return this.getConnectionState()
       }
       this.assertActiveConnection(candidate, target, hostId, generation)
+      const residentAuthority: CapturedProjectionAuthority = {
+        hostId,
+        connection: candidate,
+        target,
+        generation,
+      }
+      await this.reconcileResidentLifecycleLedgerAfterConnect(residentAuthority)
+      this.assertActiveConnection(candidate, target, hostId, generation)
       // Publish online only after pending command identities have reconciled.
       // Renderer refreshes triggered by this transition therefore cannot race
       // ahead of a safely delivered send-when-reconnected follow-up.
@@ -1467,6 +1693,7 @@ export class DesktopControlService extends EventEmitter {
         since: now(),
         attempt: this.attempt
       })
+      this.scheduleResidentProjectionRefreshAfterConnect(residentAuthority)
       this.scheduleHealthPoll(candidate, target, hostId, generation)
       return this.getConnectionState()
     } catch (error) {
@@ -2077,6 +2304,878 @@ export class DesktopControlService extends EventEmitter {
       })
     }
     return { hostId, connection, target, generation: this.reconnectGeneration }
+  }
+
+  private captureResidentLifecycleAuthority(
+    expectedHostId?: string,
+    requireProvisionCapability = true,
+  ): CapturedProjectionAuthority {
+    const authority = this.captureProjectionAuthority()
+    if (this.state.phase !== 'online') {
+      throw new ControlError(
+        'resident.lifecycle_live_connection_required',
+        'Resident provisioning requires a live, fully reconciled host connection.',
+        { retryable: true }
+      )
+    }
+    if (expectedHostId !== undefined && authority.hostId !== expectedHostId) {
+      throw new ControlError(
+        'resident.lifecycle_authority_changed',
+        'The resident lifecycle operation belongs to a different host authority.',
+        {
+          retryable: true,
+          details: { expectedHostId, connectedHostId: authority.hostId },
+        }
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'resident.lifecycle_local_required',
+        'Resident workspace provisioning is available only on this computer.'
+      )
+    }
+    if (
+      requireProvisionCapability &&
+      !this.authorityCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY)
+    ) {
+      throw new ControlError(
+        'resident.lifecycle_unavailable',
+        'The connected host does not expose resident lifecycle provisioning.',
+        { retryable: true }
+      )
+    }
+    return authority
+  }
+
+  private requireResidentWorkspaceSelection(selectionToken: string): ResidentWorkspaceSelectionRecord {
+    this.expireResidentWorkspaceSelections()
+    const record = this.residentWorkspaceSelections.get(selectionToken)
+    if (record) return record
+    const reason = this.retiredResidentSelections.get(selectionToken)
+    if (reason === 'expired') {
+      throw new ControlError(
+        'resident.workspace_selection_expired',
+        'The workspace selection expired. Choose the folder again.'
+      )
+    }
+    if (reason === 'superseded') {
+      throw new ControlError(
+        'resident.workspace_selection_superseded',
+        'A newer workspace selection replaced this one.'
+      )
+    }
+    if (reason === 'authority_changed') {
+      throw new ControlError(
+        'resident.workspace_selection_authority_changed',
+        'The host connection changed after this workspace was selected.',
+        { retryable: true }
+      )
+    }
+    if (reason === 'terminal') {
+      throw new ControlError(
+        'resident.workspace_selection_completed',
+        'This workspace selection already reached a terminal lifecycle state.'
+      )
+    }
+    throw new ControlError(
+      'resident.workspace_selection_unknown',
+      'The workspace selection is not available. Choose the folder again.'
+    )
+  }
+
+  private async requireResidentWorkspaceRecoveryEntry(
+    operationId: string,
+    authority: CapturedProjectionAuthority,
+  ): Promise<ResidentLifecycleOperationView> {
+    if (!isHostId(operationId)) {
+      throw new ControlError(
+        'resident.workspace_resume_invalid',
+        'The resident operation selected for recovery is invalid.'
+      )
+    }
+    const ledger = await this.residentLifecycleLedger.read()
+    const entry = ledger.entries.find((candidate) => candidate.operationId === operationId)
+    if (!entry) {
+      throw new ControlError(
+        'resident.workspace_resume_unknown',
+        'The resident operation selected for recovery is not available.'
+      )
+    }
+    if (entry.expectedHostId !== authority.hostId) {
+      throw new ControlError(
+        'resident.workspace_resume_authority_changed',
+        'The resident operation selected for recovery belongs to a different host.'
+      )
+    }
+    if (!isRecoverableResidentWorkspaceEntry(entry)) {
+      throw new ControlError(
+        'resident.workspace_resume_not_allowed',
+        'This resident operation cannot be resumed by selecting a workspace.'
+      )
+    }
+    this.assertProjectionAuthority(authority, 'resident workspace recovery')
+    return structuredClone(entry)
+  }
+
+  private assertResidentSelectionAuthority(record: ResidentWorkspaceSelectionRecord, operation: string): void {
+    const authority = this.captureResidentLifecycleAuthority(record.selection.expectedHostId)
+    if (
+      authority.connection !== record.authority.connection ||
+      authority.generation !== record.authority.generation ||
+      !sameTarget(authority.target, record.authority.target)
+    ) {
+      this.retireResidentWorkspaceSelection(record.selectionToken, 'authority_changed')
+      throw new ControlError(
+        'resident.workspace_selection_authority_changed',
+        `The host connection changed during the ${operation}. Choose the workspace again.`,
+        { retryable: true }
+      )
+    }
+    this.assertProjectionAuthority(record.authority, operation)
+  }
+
+  private expireResidentWorkspaceSelections(): void {
+    const timestamp = Date.now()
+    for (const record of [...this.residentWorkspaceSelections.values()]) {
+      if (Date.parse(record.selection.expiresAt) <= timestamp) {
+        this.retireResidentWorkspaceSelection(record.selectionToken, 'expired')
+      }
+    }
+  }
+
+  private revokeResidentWorkspaceSelections(reason: RetiredResidentSelectionReason): void {
+    for (const selectionToken of [...this.residentWorkspaceSelections.keys()]) {
+      this.retireResidentWorkspaceSelection(selectionToken, reason)
+    }
+  }
+
+  private retireResidentWorkspaceSelection(
+    selectionToken: string,
+    reason: RetiredResidentSelectionReason,
+  ): void {
+    this.residentWorkspaceSelections.delete(selectionToken)
+    this.retiredResidentSelections.delete(selectionToken)
+    this.retiredResidentSelections.set(selectionToken, reason)
+    while (this.retiredResidentSelections.size > RETIRED_RESIDENT_SELECTION_LIMIT) {
+      const oldest = this.retiredResidentSelections.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retiredResidentSelections.delete(oldest)
+    }
+  }
+
+  private enforceResidentSelectionLimit(): void {
+    while (this.residentWorkspaceSelections.size > RESIDENT_SELECTION_LIMIT) {
+      const oldest = this.residentWorkspaceSelections.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retireResidentWorkspaceSelection(oldest, 'superseded')
+    }
+  }
+
+  private async runResidentProvision(record: ResidentWorkspaceSelectionRecord): Promise<ResidentLifecycleStatus> {
+    const metadata = record.provisionMetadata
+    if (!metadata) {
+      throw new ControlError('resident.provision_metadata_missing', 'Resident provisioning details are missing.')
+    }
+    this.assertResidentSelectionAuthority(record, 'resident provisioning')
+    await this.recordResidentLifecycleSubmission(record, metadata)
+    this.assertResidentSelectionAuthority(record, 'resident provisioning')
+
+    let raw: unknown
+    try {
+      raw = await record.authority.connection.request(
+        'resident.provision',
+        {
+          expectedHostId: record.selection.expectedHostId,
+          operationId: record.selection.operationId,
+          projectId: record.projectId,
+          workspaceId: record.workspaceId,
+          threadId: record.threadId,
+          executionGenerationId: record.executionGenerationId,
+          workspaceDirectory: record.workspaceDirectory,
+          projectDisplayName: metadata.projectDisplayName,
+          threadTitle: metadata.threadTitle,
+          createdAt: record.createdAt,
+          ...(metadata.sessionName === undefined ? {} : { sessionName: metadata.sessionName }),
+        },
+        { timeoutMs: RESIDENT_PROVISION_TIMEOUT_MS }
+      )
+    } catch {
+      await this.updateResidentLifecycleLedgerState(
+        record.authority,
+        record.selection.operationId,
+        'outcome_unknown'
+      )
+      const reconciled = await this.tryReconcileResidentProvision(record)
+      if (reconciled) return reconciled
+      throw new ControlError(
+        'resident.provision_outcome_unknown',
+        'The host did not confirm resident provisioning. Check its durable status before retrying the exact operation.',
+        {
+          retryable: true,
+          details: {
+            expectedHostId: record.selection.expectedHostId,
+            operationId: record.selection.operationId,
+          },
+        }
+      )
+    }
+
+    this.assertProjectionAuthority(record.authority, 'resident provisioning')
+    let status: ResidentLifecycleStatus
+    try {
+      status = ResidentLifecycleStatusSchema.parse(raw)
+    } catch {
+      await this.updateResidentLifecycleLedgerState(
+        record.authority,
+        record.selection.operationId,
+        'outcome_unknown'
+      )
+      throw new ControlError(
+        'protocol.resident_lifecycle_invalid',
+        'The host returned an invalid resident lifecycle response.',
+        {
+          retryable: true,
+          details: {
+            expectedHostId: record.selection.expectedHostId,
+            operationId: record.selection.operationId,
+          },
+        }
+      )
+    }
+    return await this.acceptResidentLifecycleStatus(
+      status,
+      record.authority,
+      record.selection.operationId,
+      record,
+    )
+  }
+
+  private async tryReconcileResidentProvision(
+    record: ResidentWorkspaceSelectionRecord,
+  ): Promise<ResidentLifecycleStatus | undefined> {
+    if (!this.isActiveConnection(
+      record.authority.connection,
+      record.authority.target,
+      record.authority.hostId,
+      record.authority.generation,
+    )) return undefined
+    try {
+      const raw = await record.authority.connection.request(
+        'resident.lifecycle.status',
+        {
+          expectedHostId: record.selection.expectedHostId,
+          operationId: record.selection.operationId,
+        },
+        { timeoutMs: 30_000 }
+      )
+      this.assertProjectionAuthority(record.authority, 'resident provisioning reconciliation')
+      const lookup = ResidentLifecycleLookupResultSchema.parse(raw)
+      if (!lookup.status) {
+        await this.markResidentLifecycleStatusMissing(record.authority, record.selection.operationId)
+        return undefined
+      }
+      return await this.acceptResidentLifecycleStatus(
+        lookup.status,
+        record.authority,
+        record.selection.operationId,
+        record,
+      )
+    } catch (error) {
+      if (error instanceof ControlError && error.code === 'resident.projection_refresh_failed') throw error
+      return undefined
+    }
+  }
+
+  private async recordResidentLifecycleSubmission(
+    record: ResidentWorkspaceSelectionRecord,
+    metadata: ResidentProvisionMetadata,
+  ): Promise<void> {
+    const entry: ResidentLifecycleOperationView = {
+      operationId: record.selection.operationId,
+      expectedHostId: record.selection.expectedHostId,
+      projectId: record.projectId,
+      workspaceId: record.workspaceId,
+      threadId: record.threadId,
+      executionGenerationId: record.executionGenerationId,
+      projectDisplayName: metadata.projectDisplayName,
+      threadTitle: metadata.threadTitle,
+      ...(metadata.sessionName === undefined ? {} : { sessionName: metadata.sessionName }),
+      createdAt: record.createdAt,
+      updatedAt: now(),
+      state: 'submitted',
+    }
+    this.assertProjectionAuthority(record.authority, 'resident lifecycle submission')
+    await this.residentLifecycleLedger.update((current) => {
+      this.assertProjectionAuthority(record.authority, 'resident lifecycle submission')
+      const existingIndex = current.entries.findIndex(
+        (candidate) => candidate.operationId === entry.operationId
+      )
+      if (existingIndex >= 0) {
+        const existing = current.entries[existingIndex]
+        if (!existing || !sameResidentLifecycleIdentity(existing, entry)) {
+          throw new ControlError(
+            'resident.provision_ledger_conflict',
+            'The resident lifecycle operation is already bound to different immutable details.'
+          )
+        }
+        // A delayed retry admission can finish after a status lookup has
+        // already established a newer durable fact. Local intent is never
+        // allowed to move any host-confirmed status backwards.
+        if (
+          existing.state === 'terminal' ||
+          existing.state === 'terminal_refresh_pending' ||
+          existing.lastStatus !== undefined
+        ) return current
+        const entries = [...current.entries]
+        entries[existingIndex] = {
+          ...existing,
+          updatedAt: entry.updatedAt,
+          state: 'submitted',
+        }
+        return { version: 1, entries }
+      }
+
+      const entries = [...current.entries]
+      while (entries.length >= RESIDENT_LIFECYCLE_LEDGER_LIMIT) {
+        const terminalIndex = entries.findIndex((candidate) => candidate.state === 'terminal')
+        if (terminalIndex < 0) {
+          throw new ControlError(
+            'resident.lifecycle_ledger_full',
+            'Too many resident lifecycle operations still require reconciliation.'
+          )
+        }
+        entries.splice(terminalIndex, 1)
+      }
+      entries.push(entry)
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(record.authority, 'resident lifecycle submission')
+  }
+
+  private async updateResidentLifecycleLedgerState(
+    authority: CapturedProjectionAuthority,
+    operationId: string,
+    state: ResidentLifecycleOperationView['state'],
+  ): Promise<void> {
+    this.assertProjectionAuthority(authority, 'resident lifecycle state update')
+    await this.residentLifecycleLedger.update((current) => {
+      // This fence deliberately runs inside the store's serialized callback.
+      // An old connection waiting behind another ledger write cannot mutate
+      // durable state after its generation has been replaced.
+      this.assertProjectionAuthority(authority, 'resident lifecycle state update')
+      const index = current.entries.findIndex(
+        (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
+      )
+      if (index < 0) return current
+      const existing = current.entries[index]
+      if (!existing) return current
+      if (
+        existing.state === 'terminal' ||
+        existing.state === 'terminal_refresh_pending' ||
+        existing.lastStatus !== undefined
+      ) {
+        return current
+      }
+      const entries = [...current.entries]
+      entries[index] = {
+        ...existing,
+        updatedAt: now(),
+        state,
+      }
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(authority, 'resident lifecycle state update')
+  }
+
+  private async markResidentLifecycleStatusMissing(
+    authority: CapturedProjectionAuthority,
+    operationId: string,
+  ): Promise<void> {
+    this.expireResidentWorkspaceSelections()
+    this.assertProjectionAuthority(authority, 'resident lifecycle missing status')
+    await this.residentLifecycleLedger.update((current) => {
+      this.assertProjectionAuthority(authority, 'resident lifecycle missing status')
+      const index = current.entries.findIndex(
+        (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
+      )
+      if (index < 0) return current
+      const existing = current.entries[index]
+      if (!existing) return current
+      // HostStore lifecycle records are immutable once observed. A later null
+      // can only be a stale or contradictory response; never erase the fact
+      // already persisted by a newer response.
+      if (existing.lastStatus !== undefined) {
+        throw new ControlError(
+          'protocol.resident_lifecycle_status_missing',
+          'The host omitted a resident lifecycle record that was observed previously.'
+        )
+      }
+      const hasLiveSelection = [...this.residentWorkspaceSelections.values()].some(
+        (record) =>
+          record.selection.expectedHostId === authority.hostId &&
+          record.selection.operationId === operationId
+      )
+      const entries = [...current.entries]
+      entries[index] = {
+        ...existing,
+        updatedAt: now(),
+        state: hasLiveSelection ? 'outcome_unknown' : 'requires_reselection',
+      }
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(authority, 'resident lifecycle missing status')
+  }
+
+  private async reconcileResidentLifecycleLedgerAfterConnect(
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    if (authority.target.kind !== 'local') return
+    let ledger: ResidentLifecycleLedger
+    try {
+      ledger = await this.residentLifecycleLedger.read()
+    } catch {
+      // A malformed durable ledger is surfaced by bootstrap. It must not make
+      // an otherwise verified host connection unavailable or trigger replay.
+      return
+    }
+    const entries = ledger.entries
+      .filter(
+        (entry) =>
+          entry.expectedHostId === authority.hostId &&
+          entry.state !== 'terminal'
+      )
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+      .slice(0, RESIDENT_RECONNECT_RECONCILE_LIMIT)
+    if (entries.length === 0) return
+
+    const observations = await Promise.all(entries.map(async (entry) => {
+      try {
+        const raw = await authority.connection.request(
+          'resident.lifecycle.status',
+          { expectedHostId: authority.hostId, operationId: entry.operationId },
+          { timeoutMs: RESIDENT_RECONNECT_STATUS_TIMEOUT_MS }
+        )
+        return {
+          entry,
+          lookup: ResidentLifecycleLookupResultSchema.parse(raw),
+        }
+      } catch {
+        return { entry, lookup: undefined }
+      }
+    }))
+
+    for (const observation of observations) {
+      if (!this.isActiveConnection(
+        authority.connection,
+        authority.target,
+        authority.hostId,
+        authority.generation,
+      )) return
+      if (!observation.lookup) continue
+      try {
+        if (observation.lookup.status) {
+          await this.acceptResidentLifecycleStatus(
+            observation.lookup.status,
+            authority,
+            observation.entry.operationId,
+            undefined,
+            { refreshCommittedProjection: false },
+          )
+        } else {
+          await this.markResidentLifecycleStatusMissing(authority, observation.entry.operationId)
+        }
+      } catch {
+        // Each durable identity is isolated. One stale/malformed result cannot
+        // prevent the remaining exact status-only reconciliations.
+      }
+    }
+  }
+
+  private scheduleResidentProjectionRefreshAfterConnect(
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (authority.target.kind !== 'local') return
+    let operation!: Promise<void>
+    operation = this.enqueueResidentProjectionRefresh(
+      () => this.refreshPendingResidentProjections(authority)
+    )
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.residentProjectionRefreshPromise === operation) {
+          this.residentProjectionRefreshPromise = undefined
+        }
+      })
+    this.residentProjectionRefreshPromise = operation
+  }
+
+  private async enqueueResidentProjectionRefresh<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.residentProjectionRefreshTail.then(operation)
+    this.residentProjectionRefreshTail = result.then(() => undefined, () => undefined)
+    return await result
+  }
+
+  private async refreshPendingResidentProjections(
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    const ledger = await this.residentLifecycleLedger.read()
+    const pending = ledger.entries
+      .flatMap((entry) =>
+        entry.expectedHostId === authority.hostId &&
+        entry.state === 'terminal_refresh_pending' &&
+        entry.lastStatus?.phase === 'committed'
+          ? [{ entry, status: entry.lastStatus }]
+          : []
+      )
+      .sort((left, right) => Date.parse(right.entry.updatedAt) - Date.parse(left.entry.updatedAt))
+      .slice(0, RESIDENT_BACKGROUND_REFRESH_LIMIT)
+    if (pending.length === 0) return
+    if (!this.isActiveConnection(
+      authority.connection,
+      authority.target,
+      authority.hostId,
+      authority.generation,
+    )) return
+
+    const deadline = Date.now() + RESIDENT_BACKGROUND_REFRESH_BUDGET_MS
+    let catalog: CatalogProjectionSnapshot
+    try {
+      const rawCatalog = await authority.connection.request(
+        'catalog.snapshot',
+        {},
+        {
+          timeoutMs: Math.min(
+            RESIDENT_BACKGROUND_REFRESH_REQUEST_TIMEOUT_MS,
+            Math.max(1, deadline - Date.now()),
+          ),
+        }
+      )
+      this.assertProjectionAuthority(authority, 'resident background catalog refresh')
+      catalog = CatalogProjectionSnapshotSchema.parse(rawCatalog)
+      const accepted = await this.persistCatalog(catalog, authority)
+      if (accepted && this.isActiveConnection(
+        authority.connection,
+        authority.target,
+        authority.hostId,
+        authority.generation,
+      )) this.emit('snapshot', catalog)
+    } catch {
+      return
+    }
+
+    const groups = new Map<string, typeof pending>()
+    for (const item of pending) {
+      const key = residentProjectionIdentityKey(item.status)
+      const group = groups.get(key) ?? []
+      group.push(item)
+      groups.set(key, group)
+    }
+    for (const group of groups.values()) {
+      if (Date.now() >= deadline) return
+      if (!this.isActiveConnection(
+        authority.connection,
+        authority.target,
+        authority.hostId,
+        authority.generation,
+      )) return
+      const representative = group[0]
+      if (!representative) continue
+      try {
+        this.assertCommittedResidentCatalogIdentity(representative.status, catalog)
+        await this.refreshCommittedResidentThread(
+          representative.status,
+          authority,
+          Math.min(
+            RESIDENT_BACKGROUND_REFRESH_REQUEST_TIMEOUT_MS,
+            Math.max(1, deadline - Date.now()),
+          ),
+        )
+        for (const item of group) {
+          await this.markResidentProjectionRefreshed(
+            authority,
+            item.entry.operationId,
+            item.status,
+          )
+        }
+      } catch {
+        // Leave this exact status refresh-pending. A later reconnect or an
+        // explicit status lookup retries it without replaying provisioning.
+      }
+    }
+  }
+
+  private async acceptResidentLifecycleStatus(
+    status: ResidentLifecycleStatus,
+    authority: CapturedProjectionAuthority,
+    operationId: string,
+    record?: ResidentWorkspaceSelectionRecord,
+    options: { refreshCommittedProjection?: boolean } = {},
+  ): Promise<ResidentLifecycleStatus> {
+    this.assertProjectionAuthority(authority, 'resident lifecycle confirmation')
+    if (
+      status.operationId !== operationId ||
+      status.expectedHostId !== authority.hostId ||
+      (record && !residentStatusMatchesSelection(status, record))
+    ) {
+      throw new ControlError(
+        'protocol.resident_lifecycle_identity_mismatch',
+        'The host returned resident lifecycle state for a different immutable operation.'
+      )
+    }
+
+    const merged = await this.mergeResidentLifecycleStatus(status, authority, operationId)
+    let acceptedStatus = merged.status
+    const terminal = isTerminalResidentLifecycleStatus(acceptedStatus)
+    if (terminal) {
+      for (const candidate of [...this.residentWorkspaceSelections.values()]) {
+        if (
+          candidate.selection.expectedHostId === authority.hostId &&
+          candidate.selection.operationId === operationId
+        ) {
+          this.retireResidentWorkspaceSelection(candidate.selectionToken, 'terminal')
+        }
+      }
+    }
+    if (
+      acceptedStatus.phase === 'committed' &&
+      merged.state !== 'terminal' &&
+      options.refreshCommittedProjection !== false
+    ) {
+      await this.refreshCommittedResidentProjection(acceptedStatus, authority)
+      acceptedStatus = await this.markResidentProjectionRefreshed(
+        authority,
+        operationId,
+        acceptedStatus,
+      )
+    }
+    this.assertProjectionAuthority(authority, 'resident lifecycle confirmation')
+    return acceptedStatus
+  }
+
+  private async mergeResidentLifecycleStatus(
+    status: ResidentLifecycleStatus,
+    authority: CapturedProjectionAuthority,
+    operationId: string,
+  ): Promise<ResidentLifecycleStatusMerge> {
+    let merged: ResidentLifecycleStatusMerge = { status }
+    this.assertProjectionAuthority(authority, 'resident lifecycle status merge')
+    await this.residentLifecycleLedger.update((current) => {
+      // Reads followed by a separate update admit a classic stale-response
+      // race. Compare and replace under the store's one serialized callback so
+      // the status with the newest host timestamp is the only possible winner.
+      this.assertProjectionAuthority(authority, 'resident lifecycle status merge')
+      const index = current.entries.findIndex(
+        (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
+      )
+      if (index < 0) return current
+      const existing = current.entries[index]
+      if (!existing) return current
+      if (!residentStatusMatchesLedger(status, existing)) {
+        throw new ControlError(
+          'protocol.resident_lifecycle_identity_mismatch',
+          'The host returned resident lifecycle state for different generated identifiers.'
+        )
+      }
+
+      const persistedStatus = existing.lastStatus
+      if (persistedStatus) {
+        if (!sameResidentLifecycleStatusIdentity(persistedStatus, status)) {
+          throw new ControlError(
+            'protocol.resident_lifecycle_identity_mismatch',
+            'The host changed immutable resident lifecycle status identity.'
+          )
+        }
+        const persistedUpdatedAt = Date.parse(persistedStatus.updatedAt)
+        const incomingUpdatedAt = Date.parse(status.updatedAt)
+        if (incomingUpdatedAt < persistedUpdatedAt) {
+          merged = { status: persistedStatus, state: existing.state }
+          return current
+        }
+        if (incomingUpdatedAt === persistedUpdatedAt) {
+          if (!isDeepStrictEqual(persistedStatus, status)) {
+            throw new ControlError(
+              'protocol.resident_lifecycle_status_conflict',
+              'The host returned conflicting resident lifecycle states at the same timestamp.'
+            )
+          }
+          const state = convergedResidentLifecycleState(existing.state, persistedStatus)
+          merged = { status: persistedStatus, state }
+          if (state === existing.state) return current
+          const entries = [...current.entries]
+          entries[index] = { ...existing, updatedAt: now(), state }
+          return { version: 1, entries }
+        }
+        if (isTerminalResidentLifecycleStatus(persistedStatus)) {
+          throw new ControlError(
+            'protocol.resident_lifecycle_terminal_changed',
+            'The host changed a terminal resident lifecycle state after it was persisted.'
+          )
+        }
+      }
+
+      const state = residentLifecycleStateForStatus(status)
+      const entries = [...current.entries]
+      entries[index] = {
+        ...existing,
+        updatedAt: now(),
+        state,
+        lastStatus: status,
+      }
+      merged = { status, state }
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(authority, 'resident lifecycle status merge')
+    return merged
+  }
+
+  private async markResidentProjectionRefreshed(
+    authority: CapturedProjectionAuthority,
+    operationId: string,
+    refreshedStatus: ResidentLifecycleStatus,
+  ): Promise<ResidentLifecycleStatus> {
+    let currentStatus = refreshedStatus
+    this.assertProjectionAuthority(authority, 'resident projection refresh commit')
+    await this.residentLifecycleLedger.update((current) => {
+      this.assertProjectionAuthority(authority, 'resident projection refresh commit')
+      const index = current.entries.findIndex(
+        (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
+      )
+      if (index < 0) return current
+      const existing = current.entries[index]
+      if (!existing?.lastStatus) return current
+      const persistedStatus = existing.lastStatus
+      if (
+        !residentStatusMatchesLedger(refreshedStatus, existing) ||
+        !sameResidentLifecycleStatusIdentity(persistedStatus, refreshedStatus)
+      ) {
+        throw new ControlError(
+          'protocol.resident_lifecycle_identity_mismatch',
+          'The resident lifecycle identity changed during its projection refresh.'
+        )
+      }
+      const persistedUpdatedAt = Date.parse(persistedStatus.updatedAt)
+      const refreshedUpdatedAt = Date.parse(refreshedStatus.updatedAt)
+      if (persistedUpdatedAt > refreshedUpdatedAt) {
+        currentStatus = persistedStatus
+        return current
+      }
+      if (
+        persistedUpdatedAt !== refreshedUpdatedAt ||
+        !isDeepStrictEqual(persistedStatus, refreshedStatus)
+      ) {
+        throw new ControlError(
+          'protocol.resident_lifecycle_status_conflict',
+          'The resident lifecycle state changed inconsistently during its projection refresh.'
+        )
+      }
+      currentStatus = persistedStatus
+      if (existing.state === 'terminal') return current
+      if (existing.state !== 'terminal_refresh_pending' || persistedStatus.phase !== 'committed') {
+        return current
+      }
+      const entries = [...current.entries]
+      entries[index] = { ...existing, updatedAt: now(), state: 'terminal' }
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(authority, 'resident projection refresh commit')
+    return currentStatus
+  }
+
+  private async refreshCommittedResidentProjection(
+    status: ResidentLifecycleStatus,
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    await this.enqueueResidentProjectionRefresh(
+      () => this.refreshCommittedResidentProjectionUnlocked(status, authority)
+    )
+  }
+
+  private async refreshCommittedResidentProjectionUnlocked(
+    status: ResidentLifecycleStatus,
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    try {
+      const rawCatalog = await authority.connection.request(
+        'catalog.snapshot',
+        {},
+        { timeoutMs: 45_000 }
+      )
+      this.assertProjectionAuthority(authority, 'resident catalog refresh')
+      const catalog = CatalogProjectionSnapshotSchema.parse(rawCatalog)
+      this.assertCommittedResidentCatalogIdentity(status, catalog)
+      const accepted = await this.persistCatalog(catalog, authority)
+      if (accepted && this.isActiveConnection(
+        authority.connection,
+        authority.target,
+        authority.hostId,
+        authority.generation,
+      )) this.emit('snapshot', catalog)
+      await this.refreshCommittedResidentThread(status, authority, 45_000)
+    } catch (error) {
+      if (error instanceof ControlError && error.code.startsWith('protocol.resident_')) throw error
+      throw new ControlError(
+        'resident.projection_refresh_failed',
+        'Resident provisioning committed, but the new catalog projection could not be refreshed.',
+        {
+          retryable: true,
+          details: { expectedHostId: status.expectedHostId, operationId: status.operationId },
+        }
+      )
+    }
+  }
+
+  private assertCommittedResidentCatalogIdentity(
+    status: ResidentLifecycleStatus,
+    catalog: CatalogProjectionSnapshot,
+  ): void {
+    const project = catalog.projects.find((candidate) => candidate.projectId === status.projectId)
+    const thread = catalog.threads.find((candidate) => candidate.threadId === status.threadId)
+    if (
+      !project ||
+      project.workspaceId !== status.workspaceId ||
+      project.hostId !== status.expectedHostId ||
+      !thread ||
+      thread.currentLocation.projectId !== status.projectId ||
+      thread.currentLocation.workspaceId !== status.workspaceId ||
+      thread.currentLocation.executionGenerationId !== status.executionGenerationId
+    ) {
+      throw new ControlError(
+        'protocol.resident_catalog_identity_mismatch',
+        'The refreshed catalog did not contain the committed resident operation.'
+      )
+    }
+  }
+
+  private async refreshCommittedResidentThread(
+    status: ResidentLifecycleStatus,
+    authority: CapturedProjectionAuthority,
+    timeoutMs: number,
+  ): Promise<void> {
+    const rawSnapshot = await authority.connection.request(
+      'thread.snapshot',
+      { threadId: status.threadId },
+      { timeoutMs }
+    )
+    this.assertProjectionAuthority(authority, 'resident thread refresh')
+    const snapshot = ThreadProjectionSnapshotSchema.parse(rawSnapshot)
+    if (
+      snapshot.thread.threadId !== status.threadId ||
+      snapshot.thread.currentLocation.hostId !== status.expectedHostId ||
+      snapshot.thread.currentLocation.projectId !== status.projectId ||
+      snapshot.thread.currentLocation.workspaceId !== status.workspaceId ||
+      snapshot.thread.currentLocation.executionGenerationId !== status.executionGenerationId
+    ) {
+      throw new ControlError(
+        'protocol.resident_snapshot_identity_mismatch',
+        'The refreshed thread did not match the committed resident operation.'
+      )
+    }
+    const accepted = await this.persistThreadSnapshot(snapshot, authority)
+    if (accepted && this.isActiveConnection(
+      authority.connection,
+      authority.target,
+      authority.hostId,
+      authority.generation,
+    )) this.emit('snapshot', snapshot)
   }
 
   private assertProjectionAuthority(authority: CapturedProjectionAuthority, operation: string): void {
@@ -3742,6 +4841,306 @@ function recoverRuntimeOAuthIdentity(
 function isConnectionTarget(value: unknown): value is ConnectionTarget {
   if (!isRecord(value)) return false
   return value.kind === 'local' || (value.kind === 'ssh' && typeof value.alias === 'string' && value.alias.length > 0)
+}
+
+function normalizeSelectedWorkspaceDirectory(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    value.length < 1 ||
+    value.length > 4_096 ||
+    /[\0\r\n]/.test(value) ||
+    !path.isAbsolute(value)
+  ) {
+    throw new ControlError(
+      'resident.workspace_selection_invalid',
+      'The native workspace picker returned an invalid folder.'
+    )
+  }
+  const normalized = path.resolve(value)
+  if (normalized.length < 1 || normalized.length > 4_096 || /[\0\r\n]/.test(normalized)) {
+    throw new ControlError(
+      'resident.workspace_selection_invalid',
+      'The native workspace picker returned an invalid folder.'
+    )
+  }
+  return normalized
+}
+
+function suggestedWorkspaceName(workspaceDirectory: string): string {
+  const basename = path.basename(workspaceDirectory)
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .slice(0, 255)
+  return basename.length > 0 ? basename : 'Workspace'
+}
+
+function sameResidentProvisionMetadata(
+  left: ResidentProvisionMetadata,
+  right: ResidentProvisionMetadata,
+): boolean {
+  return (
+    left.projectDisplayName === right.projectDisplayName &&
+    left.threadTitle === right.threadTitle &&
+    left.sessionName === right.sessionName
+  )
+}
+
+function normalizeResidentProvisionMetadata(input: ResidentProvisionInput): ResidentProvisionMetadata {
+  const projectDisplayName = normalizeResidentLabel(input.projectDisplayName, 'project display name')
+  const threadTitle = normalizeResidentLabel(input.threadTitle, 'thread title')
+  const sessionName = input.sessionName === undefined
+    ? undefined
+    : normalizeResidentLabel(input.sessionName, 'session name')
+  return Object.freeze({
+    projectDisplayName,
+    threadTitle,
+    ...(sessionName === undefined ? {} : { sessionName }),
+  })
+}
+
+function normalizeResidentLabel(value: unknown, label: string): string {
+  if (typeof value !== 'string') {
+    throw new ControlError('resident.provision_label_invalid', `The ${label} is invalid.`)
+  }
+  const normalized = value.trim()
+  if (normalized.length < 1 || normalized.length > 255 || /[\0\r\n]/.test(normalized)) {
+    throw new ControlError('resident.provision_label_invalid', `The ${label} is invalid.`)
+  }
+  return normalized
+}
+
+function isRecoverableResidentWorkspaceEntry(entry: ResidentLifecycleOperationView): boolean {
+  if (entry.state === 'requires_reselection') return true
+  const status = entry.lastStatus
+  if (
+    status === undefined &&
+    (entry.state === 'submitted' || entry.state === 'outcome_unknown')
+  ) return true
+  if (
+    entry.state === 'submitted' &&
+    status?.kind === 'provision' &&
+    (
+      status.phase === 'prepared' ||
+      status.phase === 'promoted_observed' ||
+      status.phase === 'projection_committed'
+    )
+  ) return true
+  return (
+    entry.state === 'terminal' &&
+    status?.kind === 'provision' &&
+    status.phase === 'completed' &&
+    (
+      status.completionReason === 'owned_create_failed_before_effect' ||
+      status.completionReason === 'owned_create_cleaned'
+    )
+  )
+}
+
+function shouldReuseResidentLifecycleOperation(entry: ResidentLifecycleOperationView): boolean {
+  return !(
+    entry.state === 'terminal' &&
+    entry.lastStatus?.kind === 'provision' &&
+    entry.lastStatus.phase === 'completed'
+  )
+}
+
+function sameResidentWorkspaceRecoverySource(
+  left: ResidentLifecycleOperationView,
+  right: ResidentLifecycleOperationView,
+): boolean {
+  return (
+    sameResidentLifecycleIdentity(left, right) &&
+    left.state === right.state &&
+    left.lastStatus?.phase === right.lastStatus?.phase &&
+    left.lastStatus?.completionReason === right.lastStatus?.completionReason
+  )
+}
+
+function sameResidentLifecycleIdentity(
+  left: ResidentLifecycleOperationView,
+  right: ResidentLifecycleOperationView,
+): boolean {
+  return (
+    left.operationId === right.operationId &&
+    left.expectedHostId === right.expectedHostId &&
+    left.projectId === right.projectId &&
+    left.workspaceId === right.workspaceId &&
+    left.threadId === right.threadId &&
+    left.executionGenerationId === right.executionGenerationId &&
+    left.projectDisplayName === right.projectDisplayName &&
+    left.threadTitle === right.threadTitle &&
+    left.sessionName === right.sessionName &&
+    left.createdAt === right.createdAt
+  )
+}
+
+function residentStatusMatchesSelection(
+  status: ResidentLifecycleStatus,
+  record: ResidentWorkspaceSelectionRecord,
+): boolean {
+  return (
+    status.kind === 'provision' &&
+    status.operationId === record.selection.operationId &&
+    status.expectedHostId === record.selection.expectedHostId &&
+    status.projectId === record.projectId &&
+    status.workspaceId === record.workspaceId &&
+    status.threadId === record.threadId &&
+    status.executionGenerationId === record.executionGenerationId
+  )
+}
+
+function residentStatusMatchesLedger(
+  status: ResidentLifecycleStatus,
+  entry: ResidentLifecycleOperationView,
+): boolean {
+  return (
+    status.kind === 'provision' &&
+    status.operationId === entry.operationId &&
+    status.expectedHostId === entry.expectedHostId &&
+    status.projectId === entry.projectId &&
+    status.workspaceId === entry.workspaceId &&
+    status.threadId === entry.threadId &&
+    status.executionGenerationId === entry.executionGenerationId
+  )
+}
+
+function sameResidentLifecycleStatusIdentity(
+  left: ResidentLifecycleStatus,
+  right: ResidentLifecycleStatus,
+): boolean {
+  return (
+    left.version === right.version &&
+    left.kind === right.kind &&
+    left.operationId === right.operationId &&
+    left.expectedHostId === right.expectedHostId &&
+    left.projectId === right.projectId &&
+    left.workspaceId === right.workspaceId &&
+    left.threadId === right.threadId &&
+    left.executionGenerationId === right.executionGenerationId &&
+    left.preparedAt === right.preparedAt
+  )
+}
+
+function residentLifecycleStateForStatus(
+  status: ResidentLifecycleStatus,
+): ResidentLifecycleOperationView['state'] {
+  if (status.phase === 'committed') return 'terminal_refresh_pending'
+  return isTerminalResidentLifecycleStatus(status) ? 'terminal' : 'submitted'
+}
+
+function convergedResidentLifecycleState(
+  existingState: ResidentLifecycleOperationView['state'],
+  status: ResidentLifecycleStatus,
+): ResidentLifecycleOperationView['state'] {
+  const statusState = residentLifecycleStateForStatus(status)
+  if (existingState === 'terminal' && isTerminalResidentLifecycleStatus(status)) return 'terminal'
+  if (existingState === 'terminal_refresh_pending' && status.phase === 'committed') {
+    return 'terminal_refresh_pending'
+  }
+  return statusState
+}
+
+function residentProjectionIdentityKey(status: ResidentLifecycleStatus): string {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      status.expectedHostId,
+      status.projectId,
+      status.workspaceId,
+      status.threadId,
+      status.executionGenerationId,
+    ]))
+    .digest('hex')
+}
+
+function isTerminalResidentLifecycleStatus(status: ResidentLifecycleStatus): boolean {
+  return (
+    status.phase === 'committed' ||
+    status.phase === 'completed' ||
+    status.phase === 'detached' ||
+    status.phase === 'quarantined'
+  )
+}
+
+const RESIDENT_LEDGER_ENTRY_KEYS = new Set([
+  'operationId',
+  'expectedHostId',
+  'projectId',
+  'workspaceId',
+  'threadId',
+  'executionGenerationId',
+  'projectDisplayName',
+  'threadTitle',
+  'sessionName',
+  'createdAt',
+  'updatedAt',
+  'state',
+  'lastStatus',
+])
+
+function isResidentLifecycleLedger(value: unknown): value is ResidentLifecycleLedger {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.entries)) return false
+  if (Object.keys(value).some((key) => key !== 'version' && key !== 'entries')) return false
+  if (value.entries.length > RESIDENT_LIFECYCLE_LEDGER_LIMIT) return false
+  return value.entries.every(isResidentLifecycleLedgerEntry)
+}
+
+function isResidentLifecycleLedgerEntry(value: unknown): value is ResidentLifecycleOperationView {
+  if (!isRecord(value) || Object.keys(value).some((key) => !RESIDENT_LEDGER_ENTRY_KEYS.has(key))) return false
+  if (
+    !isHostId(value.operationId) ||
+    !isHostId(value.expectedHostId) ||
+    !isHostId(value.projectId) ||
+    !isHostId(value.workspaceId) ||
+    !isHostId(value.threadId) ||
+    !isHostId(value.executionGenerationId) ||
+    !isBoundedResidentLabel(value.projectDisplayName) ||
+    !isBoundedResidentLabel(value.threadTitle) ||
+    (value.sessionName !== undefined && !isBoundedResidentLabel(value.sessionName)) ||
+    !isBoundedIsoDate(value.createdAt) ||
+    !isBoundedIsoDate(value.updatedAt) ||
+    ![
+      'submitted',
+      'outcome_unknown',
+      'requires_reselection',
+      'terminal_refresh_pending',
+      'terminal',
+    ].includes(String(value.state))
+  ) return false
+
+  const parsedStatus = value.lastStatus === undefined
+    ? undefined
+    : ResidentLifecycleStatusSchema.safeParse(value.lastStatus)
+  if (parsedStatus && !parsedStatus.success) return false
+  const status = parsedStatus?.success ? parsedStatus.data : undefined
+  const entry = value as unknown as ResidentLifecycleOperationView
+  if (status && !residentStatusMatchesLedger(status, entry)) return false
+  if (value.state === 'terminal' && !(status && isTerminalResidentLifecycleStatus(status))) return false
+  if (value.state === 'terminal_refresh_pending' && status?.phase !== 'committed') return false
+  if (
+    status &&
+    isTerminalResidentLifecycleStatus(status) &&
+    value.state !== 'terminal' &&
+    value.state !== 'terminal_refresh_pending'
+  ) return false
+  if (value.state === 'requires_reselection' && status !== undefined) return false
+  return true
+}
+
+function isBoundedResidentLabel(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length >= 1 &&
+    value.length <= 255 &&
+    !/[\0\r\n]/.test(value)
+  )
+}
+
+function isBoundedIsoDate(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length >= 20 &&
+    value.length <= 40 &&
+    Number.isFinite(Date.parse(value))
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

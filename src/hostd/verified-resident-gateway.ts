@@ -11,6 +11,7 @@ import {
 } from "./gateway";
 import {
   PrimeAgentResidentAdapter,
+  type ResidentOwnedRuntimeCandidate,
   type PrimeAgentPublicModuleLoader,
   type PrimeAgentResidentAdapterOptions,
 } from "./prime-agent-resident-adapter";
@@ -18,15 +19,22 @@ import {
   createPrimeAgentResidentWorkerModuleLoader,
   type PrimeAgentResidentWorkerModuleLoader,
 } from "./prime-agent-resident-worker-proxy";
+import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
   ResidentRuntimeContractError,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentPromptIdleAuthorityEvidence,
+  type ResidentOwnedSessionCreateInput,
   type ResidentRuntimeConnection,
   type ResidentSessionBinding,
 } from "./resident-runtime";
 import type { VerifiedInstalledRuntimeHandle } from "./runtime-integrity-manager";
 import type { VerifiedRuntimeHandleProvider } from "./runtime-model-catalog";
+import {
+  ResidentLifecycleCoordinator,
+  type ResidentProvisionRequest,
+  type ResidentProvisioningAdapter,
+} from "./resident-lifecycle-coordinator";
 import {
   residentDispatchAuthorityFingerprint,
   validateResidentAbortReconciliationLease,
@@ -34,6 +42,7 @@ import {
   type HostStore,
   type ResidentAbortIdleObservedEvent,
   type ResidentAbortReconciliationLease,
+  type ResidentLifecycleStatus,
   type ResidentPromptIdleObservedEvent,
   type ResidentPromptReconciliationLease,
 } from "./store";
@@ -42,6 +51,8 @@ import type { CommandEnvelope } from "../shared/protocol";
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
 
 type ResidentGatewayAdapter = PrimeAgentGateway & {
+  createOwnedCandidate?(input: Parameters<ResidentProvisioningAdapter["createOwnedCandidate"]>[0]): Promise<ResidentOwnedRuntimeCandidate>;
+  readStableResidentProjection?(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,
@@ -95,6 +106,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   private readonly platform: NodeJS.Platform;
   private readonly adapterFactory: NonNullable<VerifiedResidentGatewayOptions["adapterFactory"]>;
   private readonly moduleLoaderFactory: NonNullable<VerifiedResidentGatewayOptions["moduleLoaderFactory"]>;
+  private readonly lifecycleCoordinator: ResidentLifecycleCoordinator;
   private readonly projectionListeners = new Set<(change: PrimeAgentProjectionChange) => void>();
   private readonly promptIdleListeners = new Set<(event: ResidentPromptIdleObservedEvent) => void>();
   private readonly abortIdleListeners = new Set<(event: ResidentAbortIdleObservedEvent) => void>();
@@ -122,6 +134,11 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     this.platform = options.platform ?? process.platform;
     this.adapterFactory = options.adapterFactory ?? ((adapterOptions) => new PrimeAgentResidentAdapter(adapterOptions));
     this.moduleLoaderFactory = options.moduleLoaderFactory ?? createVerifiedResidentModuleLoader;
+    this.lifecycleCoordinator = new ResidentLifecycleCoordinator({
+      store: this.store,
+      adapter: () => this.ensureProvisioningAdapter(),
+      onCommitted: (binding) => this.acceptCommittedBinding(binding),
+    });
   }
 
   async isLive(threadId: string, executionGenerationId: string): Promise<boolean> {
@@ -173,6 +190,28 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       this.scheduleAbortReconciliationDiscovery();
     }
     return ready;
+  }
+
+  /**
+   * Proves the verified runtime/adapter composition independently of active
+   * bindings. HostService separately gates advertisement on runtime integrity.
+   */
+  async residentLifecycleCapabilityReady(): Promise<boolean> {
+    if (this.closed) return false;
+    try {
+      await this.ensureProvisioningAdapter();
+      return !this.closed;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Durable client-owned escrow provisioning for one Store-authorized thread. */
+  provisionResident(request: ResidentProvisionRequest): Promise<ResidentLifecycleStatus> {
+    if (this.closed) {
+      return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
+    }
+    return this.lifecycleCoordinator.provision(request);
   }
 
   subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
@@ -266,6 +305,10 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   close(): Promise<void> {
     this.closed = true;
     this.closePromise ??= (async () => {
+      // Let every durable mutation boundary settle before the adapter starts
+      // retiring escrow transports. This preserves unknown-outcome semantics
+      // and fences post-close Store transitions and readiness handoffs.
+      await this.lifecycleCoordinator.close();
       const pending = this.adapterPromise;
       const pendingAdapter = pending ? await pending.catch(() => undefined) : this.adapter;
       // Closing the owned adapter first rejects any blocked pinned idle barrier;
@@ -310,6 +353,35 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       },
     );
     return attempt;
+  }
+
+  private async ensureProvisioningAdapter(): Promise<ResidentProvisioningAdapter> {
+    const adapter = await this.ensureAdapter();
+    if (
+      typeof adapter.createOwnedCandidate !== "function" ||
+      typeof adapter.readStableResidentProjection !== "function"
+    ) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_MODULE_INVALID",
+        "The verified resident adapter does not expose client-owned provisioning and recovery.",
+      );
+    }
+    return Object.freeze({
+      createOwnedCandidate: (input: ResidentOwnedSessionCreateInput) => adapter.createOwnedCandidate!(input),
+      readStableResidentProjection: (binding: ResidentSessionBinding) =>
+        adapter.readStableResidentProjection!(binding),
+    });
+  }
+
+  private acceptCommittedBinding(binding: ResidentSessionBinding): void {
+    if (this.closed) return;
+    const slot = residentBindingSlotKeyFor(binding);
+    const desired = Object.freeze({
+      binding,
+      fingerprint: residentDispatchAuthorityFingerprint(binding),
+    });
+    this.desiredBindings.set(slot, desired);
+    this.scheduleBindingPreparation(desired);
   }
 
   private synchronizeDesiredBindings(bindings: readonly ResidentSessionBinding[]): void {
@@ -630,6 +702,18 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     const closeableModuleLoader = isCloseableResidentModuleLoader(moduleLoader) ? moduleLoader : undefined;
     let adapter: ResidentGatewayAdapter;
     try {
+      // A structurally valid adapter is not proof that its isolated Worker can
+      // import the freshly verified runtime modules. Cross this asynchronous
+      // boundary before lifecycle readiness can be advertised; the adapter
+      // retains this exact loader, whose Worker promise is cached, so later
+      // operations cannot observe a different module load outcome.
+      await moduleLoader();
+      if (this.closed) {
+        throw new GatewayError(
+          "GATEWAY_CLOSED",
+          "The resident gateway closed during its runtime module preflight",
+        );
+      }
       adapter = this.adapterFactory({
         executable: handle.executable,
         cliEntrypoint: handle.cliEntrypoint,

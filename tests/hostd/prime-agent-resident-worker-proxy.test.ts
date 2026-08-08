@@ -305,7 +305,10 @@ class LinkedWorkerPort extends EventEmitter implements ResidentWorkerPort {
   }
 }
 
-function linkedWorkerHarness(runtime: ResidentWorkerRuntimeModule): {
+function linkedWorkerHarness(
+  runtime: ResidentWorkerRuntimeModule,
+  loadRuntimeModule: (moduleUrl: string) => Promise<ResidentWorkerRuntimeModule> = async () => runtime,
+): {
   readonly workerFactory: ResidentWorkerFactory;
   readonly worker: () => LinkedWorker;
 } {
@@ -318,7 +321,7 @@ function linkedWorkerHarness(runtime: ResidentWorkerRuntimeModule): {
     const server = new ResidentRuntimeWorkerServer({
       bootstrap,
       port,
-      loadRuntimeModule: async () => runtime,
+      loadRuntimeModule,
     });
     queueMicrotask(() => void server.start());
     return worker;
@@ -373,6 +376,38 @@ async function attach(
 }
 
 describe("Prime Agent resident Worker proxy", () => {
+  it("caches an asynchronous Worker import failure for every loader observer", async () => {
+    const fixture = runtimeFixture();
+    const moduleImport = deferred<ResidentWorkerRuntimeModule>();
+    const loadRuntimeModule = vi.fn(() => moduleImport.promise);
+    const harness = linkedWorkerHarness(fixture.runtime, loadRuntimeModule);
+    const loader = createPrimeAgentResidentWorkerModuleLoader(verifiedHandle(), {
+      workerFactory: harness.workerFactory,
+      readyTimeoutMs: 1_000,
+    });
+
+    const firstLoad = loader();
+    const concurrentLoad = loader();
+    expect(concurrentLoad).toBe(firstLoad);
+    await vi.waitFor(() => expect(loadRuntimeModule).toHaveBeenCalledOnce());
+
+    moduleImport.reject(new Error("verified runtime module import failed"));
+    const outcomes = await Promise.allSettled([firstLoad, concurrentLoad]);
+    expect(outcomes).toHaveLength(2);
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.reason).toMatchObject({
+          name: "ResidentWorkerTransportError",
+          code: "RESIDENT_WORKER_FATAL",
+        });
+      }
+    }
+    expect(loadRuntimeModule).toHaveBeenCalledOnce();
+
+    await loader.close();
+  });
+
   it("forwards exact attach options and awaits the host recoverDaemon callback", async () => {
     const fixture = runtimeFixture({ recoverDuringAttach: true });
     const { loader, module, harness } = await loadProxy(fixture.runtime);

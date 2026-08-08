@@ -20,6 +20,7 @@ export interface HostDataPaths {
   residentProjectionLineages: string;
   residentDispatchAttempts: string;
   residentLifecycleOperations: string;
+  workspaceThreadBootstrapOperations: string;
   receipts: string;
   handoffs: string;
   security: string;
@@ -84,6 +85,7 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     residentProjectionLineages: join(root, "resident-projection-lineages"),
     residentDispatchAttempts: join(root, "resident-dispatch-attempts"),
     residentLifecycleOperations: join(root, "resident-lifecycle-operations"),
+    workspaceThreadBootstrapOperations: join(root, "workspace-thread-bootstrap-operations"),
     receipts: join(root, "receipts"),
     handoffs: join(root, "handoffs"),
     security,

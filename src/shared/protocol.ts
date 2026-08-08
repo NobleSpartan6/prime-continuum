@@ -51,6 +51,7 @@ export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
+export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
 /** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
@@ -1265,6 +1266,162 @@ export const HostProbeSchema = z.object({
 });
 export type HostProbe = z.infer<typeof HostProbeSchema>;
 
+/**
+ * Path-free public state for one durable resident lifecycle operation. The
+ * host Store owns the detailed mutation journal; clients receive only bounded
+ * authority, phase, and recovery metadata.
+ */
+export const ResidentLifecyclePhaseSchema = z.enum([
+  "prepared",
+  "owned_create_dispatching",
+  "owned_observed",
+  "promotion_dispatching",
+  "promoted_observed",
+  "projection_committed",
+  "committed",
+  "ending",
+  "kill_dispatching",
+  "kill_acknowledged",
+  "detached",
+  "quarantined",
+  "completed",
+]);
+export type ResidentLifecyclePhase = z.infer<typeof ResidentLifecyclePhaseSchema>;
+
+export const ResidentLifecycleStatusSchema = z
+  .object({
+    version: z.literal(1),
+    kind: z.enum(["provision", "end", "detach"]),
+    operationId: IdSchema,
+    phase: ResidentLifecyclePhaseSchema,
+    expectedHostId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    quarantinedFrom: ResidentLifecyclePhaseSchema.exclude([
+      "committed",
+      "completed",
+      "detached",
+      "quarantined",
+    ]).optional(),
+    quarantineReason: z.enum([
+      "external_outcome_unknown",
+      "authority_changed",
+      "explicit_reconciliation_required",
+      "owned_client_lost",
+    ]).optional(),
+    completionReason: z.enum([
+      "owned_create_failed_before_effect",
+      "owned_create_cleaned",
+    ]).optional(),
+    terminalAt: IsoDateTimeSchema.optional(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    const provisionPhases = new Set<ResidentLifecyclePhase>([
+      "prepared",
+      "owned_create_dispatching",
+      "owned_observed",
+      "promotion_dispatching",
+      "promoted_observed",
+      "projection_committed",
+      "committed",
+      "quarantined",
+      "completed",
+    ]);
+    const endPhases = new Set<ResidentLifecyclePhase>([
+      "ending",
+      "kill_dispatching",
+      "kill_acknowledged",
+      "quarantined",
+      "completed",
+    ]);
+    if (
+      (status.kind === "provision" && !provisionPhases.has(status.phase)) ||
+      (status.kind === "end" && !endPhases.has(status.phase)) ||
+      (status.kind === "detach" && status.phase !== "detached")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["phase"],
+        message: "Resident lifecycle phase does not belong to its operation",
+      });
+    }
+    const quarantined = status.phase === "quarantined";
+    if (quarantined !== Boolean(status.quarantinedFrom && status.quarantineReason)) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident lifecycle quarantine metadata must be present exactly for quarantined state",
+      });
+    }
+    if (
+      (status.quarantineReason === "owned_client_lost" && status.quarantinedFrom !== "owned_observed") ||
+      (status.quarantineReason === "external_outcome_unknown" &&
+        status.quarantinedFrom !== "owned_create_dispatching" &&
+        status.quarantinedFrom !== "promotion_dispatching" &&
+        status.quarantinedFrom !== "kill_dispatching")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quarantineReason"],
+        message: "Resident lifecycle quarantine reason does not match its durable boundary",
+      });
+    }
+    const terminal = status.phase === "committed" || status.phase === "completed" || status.phase === "detached";
+    if (terminal !== (status.terminalAt !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminalAt"],
+        message: "Resident lifecycle terminal time must match terminal state",
+      });
+    }
+    if ((status.completionReason !== undefined) !== (status.kind === "provision" && status.phase === "completed")) {
+      context.addIssue({
+        code: "custom",
+        path: ["completionReason"],
+        message: "Resident lifecycle completion reason does not match a completed provision",
+      });
+    }
+  });
+export type ResidentLifecycleStatus = z.infer<typeof ResidentLifecycleStatusSchema>;
+
+/**
+ * Host-local provisioning envelope. `workspaceDirectory` is accepted only on
+ * the trusted-user transport and is never returned in a response or event.
+ */
+export const ResidentProvisionRequestSchema = z
+  .object({
+    expectedHostId: IdSchema,
+    operationId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    workspaceDirectory: z
+      .string()
+      .min(1)
+      .max(4_096)
+      .refine((value) => !/[\0\r\n]/.test(value), "Workspace paths cannot contain control characters")
+      .refine(
+        (value) => /^(?:\/|[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(value),
+        "Workspace paths must be absolute",
+      ),
+    projectDisplayName: z.string().trim().min(1).max(255).refine((value) => !/[\0\r\n]/.test(value)),
+    threadTitle: z.string().trim().min(1).max(255).refine((value) => !/[\0\r\n]/.test(value)),
+    createdAt: IsoDateTimeSchema,
+    sessionName: z.string().trim().min(1).max(255).refine((value) => !/[\0\r\n]/.test(value)).optional(),
+  })
+  .strict();
+export type ResidentProvisionRequest = z.infer<typeof ResidentProvisionRequestSchema>;
+
+export const ResidentLifecycleLookupResultSchema = z
+  .object({ status: ResidentLifecycleStatusSchema.nullable() })
+  .strict();
+export type ResidentLifecycleLookupResult = z.infer<typeof ResidentLifecycleLookupResultSchema>;
+
 const RequestBase = {
   protocolVersion: z.literal(PROTOCOL_VERSION),
   requestId: IdSchema,
@@ -1338,6 +1495,16 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     ...RequestBase,
+    method: z.literal("resident.provision"),
+    payload: ResidentProvisionRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("resident.lifecycle.status"),
+    payload: z.object({ expectedHostId: IdSchema, operationId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("handoff.plan"),
     payload: z.object({ expectedHostId: IdSchema, request: HandoffPlanRequestSchema }),
   }),
@@ -1387,6 +1554,12 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("thread.snapshot"), result: ThreadProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.reconcile"), result: CommandReconciliationSchema }),
+  z.object({ ...SuccessBase, method: z.literal("resident.provision"), result: ResidentLifecycleStatusSchema }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("resident.lifecycle.status"),
+    result: ResidentLifecycleLookupResultSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("handoff.plan"), result: HandoffPlanSchema }),
   z.object({ ...SuccessBase, method: z.literal("handoff.commit"), result: HandoffCommitResultSchema }),
 ]);
@@ -1405,6 +1578,8 @@ export const HostIpcErrorResponseSchema = z.object({
     "thread.snapshot",
     "command.submit",
     "command.reconcile",
+    "resident.provision",
+    "resident.lifecycle.status",
     "handoff.plan",
     "handoff.commit",
   ]),

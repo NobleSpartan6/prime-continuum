@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
@@ -19,6 +19,7 @@ import { PROTOCOL_VERSION, type CommandEnvelope, type ThreadProjectionSnapshot }
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
@@ -67,7 +68,9 @@ describe("HostStore resident provisioning lifecycle", () => {
     expect(await restarted.hasExactResidentProjection(committed)).toBe(true);
   });
 
-  it("binds operation IDs to one exact envelope and rejects candidate authority or time substitution", async () => {
+  it("binds operation IDs exactly and accepts opaque candidate time across wall-clock rollback", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2030-01-02T12:00:00.000Z");
     const fixture = await createFixture();
     const input = operationInput(fixture, "provision-identity");
     await fixture.store.prepareResidentProvision(input);
@@ -79,12 +82,15 @@ describe("HostStore resident provisioning lifecycle", () => {
     ).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED" });
 
     const lease = await fixture.store.beginResidentOwnedCreate(input);
-    await expect(
-      fixture.store.observeResidentOwnedCandidate(lease, {
-        ...ownedCandidate(fixture, "too-early"),
-        boundAt: "2020-01-01T00:00:00.000Z",
-      }),
-    ).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_CANDIDATE_TIME_INVALID" });
+    vi.setSystemTime("2020-01-01T00:00:00.000Z");
+    await expect(fixture.store.observeResidentOwnedCandidate(lease, {
+      ...ownedCandidate(fixture, "rolled-back-clock"),
+      boundAt: "2020-01-01T00:00:00.000Z",
+    })).resolves.toMatchObject({
+      phase: "owned_observed",
+      preparedAt: "2030-01-02T12:00:00.000Z",
+      updatedAt: "2030-01-02T12:00:00.000Z",
+    });
   });
 
   it("fails closed on host, generation, project, and canonical workspace authority drift", async () => {
@@ -188,6 +194,27 @@ describe("HostStore resident provisioning lifecycle", () => {
       executionGenerationId: "demo-execution-2",
     };
     expect((await restarted.prepareResidentProvision(secondInput)).phase).toBe("prepared");
+  });
+
+  it("quarantines a dispatching lifecycle on restart after wall-clock rollback", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2030-09-10T12:00:00.000Z");
+    const fixture = await createFixture();
+    const input = operationInput(fixture, "rollback-dispatch-quarantine");
+    await fixture.store.prepareResidentProvision(input);
+    await fixture.store.beginResidentOwnedCreate(input);
+
+    vi.setSystemTime("2020-09-10T12:00:00.000Z");
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    expect(await restarted.getResidentLifecycleStatus(input.operationId)).toMatchObject({
+      phase: "quarantined",
+      quarantinedFrom: "owned_create_dispatching",
+      quarantineReason: "external_outcome_unknown",
+      preparedAt: "2030-09-10T12:00:00.000Z",
+      updatedAt: "2030-09-10T12:00:00.000Z",
+    });
+    await expect(restarted.getCatalogSnapshot()).resolves.toBeDefined();
   });
 
   it("recovers only local post-promotion work and never recreates a promotion mutation lease", async () => {
@@ -332,6 +359,92 @@ describe("HostStore resident provisioning lifecycle", () => {
       });
     },
   );
+
+  it("keeps a rolled-back detach causally linked to its committed provision across restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2031-04-05T12:00:00.000Z");
+    const fixture = await createFixture();
+    const provision = await provisionActiveBinding(fixture, "rollback-detach-provision", "rollback-detach", 51);
+    const provisionStatus = await fixture.store.getResidentLifecycleStatus(provision.input.operationId);
+    if (!provisionStatus?.terminalAt) throw new Error("committed provision status missing");
+
+    vi.setSystemTime("2021-04-05T12:00:00.000Z");
+    const detachInput = operationInput(fixture, "rollback-detach-successor", "2");
+    const detached = await fixture.store.detachResidentLifecycle(detachInput, provision.binding);
+    expect(detached.phase).toBe("detached");
+    expect(Date.parse(detached.preparedAt)).toBeGreaterThanOrEqual(Date.parse(provisionStatus.terminalAt));
+    expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
+
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    expect(await restarted.getResidentLifecycleStatus(provision.input.operationId)).toMatchObject({
+      phase: "committed",
+    });
+    expect(await restarted.getResidentLifecycleStatus(detachInput.operationId)).toMatchObject({
+      phase: "detached",
+    });
+    expect(await restarted.listResidentSessionBindings()).toEqual([]);
+  });
+
+  it("replays only local end revocation after rollback and restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2032-05-06T12:00:00.000Z");
+    const fixture = await createFixture();
+    const provision = await provisionActiveBinding(fixture, "rollback-end-provision", "rollback-end", 52);
+
+    vi.setSystemTime("2022-05-06T12:00:00.000Z");
+    const endInput = operationInput(fixture, "rollback-end-successor", "3");
+    const ending = await fixture.store.prepareResidentEnd(endInput, provision.binding);
+    expect(ending.phase).toBe("ending");
+    expect(Date.parse(ending.preparedAt)).toBeGreaterThanOrEqual(Date.parse(provision.binding.boundAt));
+    expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
+
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    expect(await restarted.getResidentLifecycleStatus(endInput.operationId)).toMatchObject({ phase: "ending" });
+    expect(await restarted.listResidentSessionBindings()).toEqual([]);
+    await expect(restarted.acquireResidentProvisionRecoveryLease(provision.input)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_RECOVERY_UNAVAILABLE",
+    });
+  });
+
+  it("clamps promoted projection and commit audit time through rollback without reopening mutation", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2033-06-07T12:00:00.000Z");
+    const fixture = await createFixture();
+    const input = operationInput(fixture, "rollback-projection-commit", "4");
+    await fixture.store.prepareResidentProvision(input);
+    const createLease = await fixture.store.beginResidentOwnedCreate(input);
+    await fixture.store.observeResidentOwnedCandidate(createLease, ownedCandidate(fixture, "rollback-projection"));
+    const promotionLease = await fixture.store.beginResidentPromotion(input);
+    const projectionLease = await fixture.store.observeResidentPromotion(promotionLease);
+    const promoted = await fixture.store.getResidentLifecycleStatus(input.operationId);
+    if (!promoted) throw new Error("promoted lifecycle status missing");
+
+    vi.setSystemTime("2023-06-07T12:00:00.000Z");
+    const published = await fixture.store.publishResidentLifecycleProjection(
+      projectionLease,
+      projection(projectionLease.binding, 53),
+    );
+    const projectionCommitted = await fixture.store.getResidentLifecycleStatus(input.operationId);
+    if (!projectionCommitted) throw new Error("projection lifecycle status missing");
+    expect(Date.parse(published.generatedAt)).toBeGreaterThanOrEqual(Date.parse(promoted.updatedAt));
+    expect(Date.parse(projectionCommitted.updatedAt)).toBeGreaterThanOrEqual(Date.parse(promoted.updatedAt));
+
+    const active = await fixture.store.commitResidentProvision(projectionLease);
+    const committed = await fixture.store.getResidentLifecycleStatus(input.operationId);
+    expect(committed).toMatchObject({ phase: "committed", terminalAt: expect.any(String) });
+    if (!committed?.terminalAt) throw new Error("committed lifecycle status missing terminal time");
+    expect(Date.parse(committed.terminalAt)).toBeGreaterThanOrEqual(Date.parse(projectionCommitted.updatedAt));
+    await expect(fixture.store.getCatalogSnapshot()).resolves.toBeDefined();
+
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toEqual({ seeded: false });
+    expect(await restarted.listResidentSessionBindings()).toEqual([active]);
+    await expect(restarted.acquireResidentProvisionRecoveryLease(input)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_RECOVERY_UNAVAILABLE",
+    });
+  });
 
   it.each(["end", "detach"] as const)(
     "preserves lifecycle linkage through supervisor metadata refresh and later %s",
@@ -865,6 +978,26 @@ function runtimeCompatibility(): ResidentOwnedSessionCandidate["runtime"] {
     capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES],
     runtimeBuildId: PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId,
   };
+}
+
+async function provisionActiveBinding(
+  fixture: Fixture,
+  operationId: string,
+  candidateSuffix: string,
+  sequence: number,
+): Promise<{ input: ResidentLifecycleOperationInput; binding: ResidentSessionBinding }> {
+  const input = operationInput(fixture, operationId);
+  await fixture.store.prepareResidentProvision(input);
+  const createLease = await fixture.store.beginResidentOwnedCreate(input);
+  await fixture.store.observeResidentOwnedCandidate(createLease, ownedCandidate(fixture, candidateSuffix));
+  const promotionLease = await fixture.store.beginResidentPromotion(input);
+  const projectionLease = await fixture.store.observeResidentPromotion(promotionLease);
+  await fixture.store.publishResidentLifecycleProjection(
+    projectionLease,
+    projection(projectionLease.binding, sequence),
+  );
+  const binding = await fixture.store.commitResidentProvision(projectionLease);
+  return { input, binding };
 }
 
 function projection(binding: ResidentSessionBinding, sequence: number): ResidentProjectionSnapshot {

@@ -1,13 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  ResidentLifecycleStatusSchema,
+  SavedProjectSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  ThreadProjectionSnapshotSchema,
+  ThreadSummarySchema,
   type HostIpcRequest,
   type HostIpcResponse,
   type HostIdentityReadiness,
@@ -45,6 +50,10 @@ import {
   type ResidentPromptIdleObservedEvent,
 } from "./store";
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
+import {
+  ResidentProvisionCoordinatorError,
+  type ResidentProvisionRequest as CoordinatorResidentProvisionRequest,
+} from "./resident-lifecycle-coordinator";
 
 // The durable store contains a single-process handoff harness for protocol and
 // rollback testing. Production hostd must not advertise executable handoff
@@ -68,6 +77,8 @@ const KNOWN_METHODS = new Set([
   "thread.snapshot",
   "command.submit",
   "command.reconcile",
+  "resident.provision",
+  "resident.lifecycle.status",
   "handoff.plan",
   "handoff.commit",
 ]);
@@ -105,6 +116,16 @@ export interface RuntimeIntegrityReadinessProvider {
   /** Settles any background integrity work before endpoint ownership is released. */
   close?(): Promise<void>;
 }
+
+type ResidentLifecycleGateway = PrimeAgentGateway & {
+  residentLifecycleCapabilityReady(): Promise<boolean>;
+  provisionResident(request: CoordinatorResidentProvisionRequest): Promise<unknown>;
+};
+
+type ResidentProvisionProtocolPayload = Extract<
+  HostIpcRequest,
+  { method: "resident.provision" }
+>["payload"];
 
 export class HostService {
   readonly store: HostStore;
@@ -278,6 +299,12 @@ export class HostService {
   }
 
   private async authorizeAndDispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
+    if (isResidentLifecycleRequest(request) && context.transport !== "trusted_user") {
+      throw new PairingAuthorityError(
+        "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN",
+        "Resident session lifecycle operations are available only to the trusted local desktop",
+      );
+    }
     if (context.transport === "trusted_user") return this.dispatch(request, context);
     if (isOAuthRequest(request)) {
       throw new PairingAuthorityError(
@@ -348,6 +375,22 @@ export class HostService {
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [PRIME_AGENT_COMMAND_CAPABILITY]
           : [];
+        let residentLifecycleReady = false;
+        if (
+          context.transport === "trusted_user" &&
+          this.gateway.continuity === "resident" &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready") &&
+          isResidentLifecycleGateway(this.gateway)
+        ) {
+          try {
+            residentLifecycleReady = await this.gateway.residentLifecycleCapabilityReady();
+          } catch {
+            residentLifecycleReady = false;
+          }
+        }
+        const residentLifecycleCapabilities = residentLifecycleReady
+          ? [RESIDENT_LIFECYCLE_CAPABILITY]
+          : [];
         const modelCatalogCapabilities = this.runtimeModelCatalogProvider &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
@@ -364,10 +407,17 @@ export class HostService {
           serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
           host,
           capabilities: runtimeIntegrity === undefined
-            ? [...HOST_CAPABILITIES, ...executionCapabilities, ...modelCatalogCapabilities, ...oauthCapabilities]
+            ? [
+                ...HOST_CAPABILITIES,
+                ...executionCapabilities,
+                ...residentLifecycleCapabilities,
+                ...modelCatalogCapabilities,
+                ...oauthCapabilities,
+              ]
             : [
                 ...HOST_CAPABILITIES,
                 ...executionCapabilities,
+                ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
                 RUNTIME_INTEGRITY_CAPABILITY,
@@ -656,6 +706,69 @@ export class HostService {
         }
         return this.store.reconcileCommands(request.payload.commands);
       }
+      case "resident.provision": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "The resident provisioning operation targets a different host authority.",
+          );
+        }
+        const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+        if (runtimeIntegrity && runtimeIntegrity.status !== "ready") {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_RUNTIME_UNAVAILABLE",
+            "The verified Prime Agent runtime is not ready for resident provisioning.",
+            runtimeIntegrity.status !== "unavailable",
+          );
+        }
+        if (!isResidentLifecycleGateway(this.gateway) || !(await this.gateway.residentLifecycleCapabilityReady())) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_UNAVAILABLE",
+            "Resident session provisioning is not available on this host.",
+            true,
+          );
+        }
+
+        const artifacts = initialResidentWorkspaceArtifacts(request.payload);
+        await this.store.bootstrapWorkspaceThread({
+          operationId: residentWorkspaceBootstrapOperationId(request.payload.operationId),
+          requestDigest: residentWorkspaceBootstrapDigest(request.payload),
+          expectedHostId: request.payload.expectedHostId,
+          project: artifacts.project,
+          thread: artifacts.thread,
+          initialProjection: artifacts.projection,
+          workspaceDirectory: request.payload.workspaceDirectory,
+        });
+        const status = await this.gateway.provisionResident({
+          operationId: request.payload.operationId,
+          expectedHostId: request.payload.expectedHostId,
+          projectId: request.payload.projectId,
+          workspaceId: request.payload.workspaceId,
+          threadId: request.payload.threadId,
+          executionGenerationId: request.payload.executionGenerationId,
+          selection: {
+            kind: "new",
+            ...(request.payload.sessionName === undefined
+              ? {}
+              : { sessionName: request.payload.sessionName }),
+          },
+        });
+        return ResidentLifecycleStatusSchema.parse(status);
+      }
+      case "resident.lifecycle.status": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "The resident lifecycle status belongs to a different host authority.",
+          );
+        }
+        const status = await this.store.getResidentLifecycleStatus(request.payload.operationId);
+        return {
+          status: status === undefined ? null : ResidentLifecycleStatusSchema.parse(status),
+        };
+      }
       case "handoff.plan": {
         const host = await this.store.getHost();
         if (request.payload.expectedHostId !== host.hostId) {
@@ -838,6 +951,12 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       // Relay requests are rejected before scope evaluation. This branch keeps
       // the protocol switch exhaustive without granting remote OAuth access.
       return "host.admin";
+    case "resident.provision":
+    case "resident.lifecycle.status":
+      // Remote and SSH lifecycle requests are rejected before this scope is
+      // evaluated. Keep the protocol switch exhaustive without granting a
+      // remote session-management capability.
+      return "host.admin";
     case "handoff.plan":
     case "handoff.commit":
       return "run_location.change";
@@ -857,6 +976,109 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
           return "approval.resolve";
       }
   }
+}
+
+function isResidentLifecycleRequest(request: HostIpcRequest): boolean {
+  return request.method === "resident.provision" || request.method === "resident.lifecycle.status";
+}
+
+function isResidentLifecycleGateway(gateway: PrimeAgentGateway): gateway is ResidentLifecycleGateway {
+  const candidate = gateway as Partial<ResidentLifecycleGateway>;
+  return typeof candidate.residentLifecycleCapabilityReady === "function" &&
+    typeof candidate.provisionResident === "function";
+}
+
+function residentWorkspaceBootstrapOperationId(operationId: string): string {
+  return `workspace-bootstrap-${createHash("sha256").update(operationId, "utf8").digest("hex").slice(0, 48)}`;
+}
+
+function residentWorkspaceBootstrapDigest(request: ResidentProvisionProtocolPayload): string {
+  // The canonical workspace path is bound separately by the private Store
+  // envelope. Keeping it out of this semantic digest lets physical aliases
+  // converge after Store canonicalization without weakening exact equality.
+  return createHash("sha256")
+    .update(JSON.stringify({
+      version: 1,
+      operation: "resident.workspace.bootstrap",
+      expectedHostId: request.expectedHostId,
+      operationId: request.operationId,
+      projectId: request.projectId,
+      workspaceId: request.workspaceId,
+      threadId: request.threadId,
+      executionGenerationId: request.executionGenerationId,
+      projectDisplayName: request.projectDisplayName,
+      threadTitle: request.threadTitle,
+      createdAt: request.createdAt,
+      sessionName: request.sessionName ?? null,
+    }))
+    .digest("hex");
+}
+
+function initialResidentWorkspaceArtifacts(request: ResidentProvisionProtocolPayload): Readonly<{
+  project: ReturnType<typeof SavedProjectSchema.parse>;
+  thread: ReturnType<typeof ThreadSummarySchema.parse>;
+  projection: ReturnType<typeof ThreadProjectionSnapshotSchema.parse>;
+}> {
+  // The bootstrap lineage belongs to the immutable thread execution, not to
+  // one lifecycle attempt. A definitively clean create failure may start a new
+  // lifecycle operation over these exact artifacts; deriving the cursor from
+  // operationId would make that safe retry diverge from its durable snapshot.
+  const bootstrapLineage = createHash("sha256")
+    .update(JSON.stringify({
+      version: 1,
+      hostId: request.expectedHostId,
+      projectId: request.projectId,
+      workspaceId: request.workspaceId,
+      threadId: request.threadId,
+      executionGenerationId: request.executionGenerationId,
+    }))
+    .digest("hex")
+    .slice(0, 40);
+  const cursor = Object.freeze({
+    threadId: request.threadId,
+    executionGenerationId: request.executionGenerationId,
+    generation: `resident-bootstrap-${bootstrapLineage}`,
+    sequence: 0,
+  });
+  const project = SavedProjectSchema.parse({
+    projectId: request.projectId,
+    hostId: request.expectedHostId,
+    workspaceId: request.workspaceId,
+    displayName: request.projectDisplayName,
+    lastOpenedAt: request.createdAt,
+  });
+  const thread = ThreadSummarySchema.parse({
+    threadId: request.threadId,
+    title: request.threadTitle,
+    projectIdentity: request.projectId,
+    currentLocation: {
+      hostId: request.expectedHostId,
+      projectId: request.projectId,
+      workspaceId: request.workspaceId,
+      executionGenerationId: request.executionGenerationId,
+    },
+    status: "idle",
+    unread: false,
+    updatedAt: request.createdAt,
+    lastKnownCursor: cursor,
+  });
+  const projection = ThreadProjectionSnapshotSchema.parse({
+    snapshotVersion: 1,
+    generatedAt: request.createdAt,
+    thread,
+    transcriptBlockIndex: [],
+    materializedRecentBlocks: [],
+    queueState: { pendingCommandIds: [], paused: false },
+    approvals: [],
+    childAgents: [],
+    goals: [],
+    schedules: [],
+    git: { stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
+    evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
+    pendingAttention: [],
+    latestCursor: cursor,
+  });
+  return Object.freeze({ project, thread, projection });
 }
 
 function serviceStateForRuntimeIntegrity(
@@ -931,6 +1153,9 @@ function toStructuredError(error: unknown): StructuredError {
   }
   if (error instanceof OAuthBrokerError) {
     return { code: error.code, message: error.message, retryable: error.code === "OAUTH_PROVIDER_BUSY" };
+  }
+  if (error instanceof ResidentProvisionCoordinatorError) {
+    return { code: error.code, message: error.message, retryable: error.retryable };
   }
   if (error instanceof ZodError) {
     return { code: "INVALID_STATE", message: "Durable host state failed schema validation", retryable: false };

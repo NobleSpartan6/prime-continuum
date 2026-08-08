@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { hostname, platform as nodePlatform, arch, release, totalmem, freemem } from "node:os";
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve as resolvePath, win32 } from "node:path";
 import { open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
@@ -127,8 +127,222 @@ const WorkspaceAuthorityFileSchema = z
 
 export const MAX_RESIDENT_LIFECYCLE_OPERATIONS = 10_000;
 export const MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES = 2 * 1024 * 1024;
+export const MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS = 10_000;
+export const MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES = 32 * 1024 * 1024;
 
 const Sha256DigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
+
+export const WorkspaceThreadBootstrapInputSchema = z
+  .object({
+    operationId: IdSchema,
+    requestDigest: Sha256DigestSchema,
+    expectedHostId: IdSchema,
+    project: SavedProjectSchema,
+    thread: ThreadSummarySchema,
+    initialProjection: ThreadProjectionSnapshotSchema,
+    workspaceDirectory: WorkspaceDirectorySchema,
+  })
+  .strict()
+  .superRefine((input, context) => {
+    if (input.project.hostId !== input.expectedHostId) {
+      context.addIssue({
+        code: "custom",
+        path: ["project", "hostId"],
+        message: "The bootstrap project must belong to the expected host",
+      });
+    }
+    if (
+      input.thread.projectIdentity !== input.project.projectId ||
+      input.thread.currentLocation.hostId !== input.expectedHostId ||
+      input.thread.currentLocation.projectId !== input.project.projectId ||
+      input.thread.currentLocation.workspaceId !== input.project.workspaceId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["thread", "currentLocation"],
+        message: "The bootstrap thread must belong to the exact project workspace authority",
+      });
+    }
+    if (!isDeepStrictEqual(input.initialProjection.thread, input.thread)) {
+      context.addIssue({
+        code: "custom",
+        path: ["initialProjection", "thread"],
+        message: "The bootstrap projection must contain the exact requested thread",
+      });
+    }
+  });
+export type WorkspaceThreadBootstrapInput = z.infer<typeof WorkspaceThreadBootstrapInputSchema>;
+
+const WorkspaceThreadBootstrapPhaseSchema = z.enum([
+  "prepared",
+  "project_committed",
+  "snapshot_committed",
+  "thread_committed",
+  "authority_committed",
+  "committed",
+]);
+type WorkspaceThreadBootstrapPhase = z.infer<typeof WorkspaceThreadBootstrapPhaseSchema>;
+
+const WorkspaceThreadBootstrapArtifactProvenanceSchema = z
+  .object({
+    project: z.enum(["absent", "adopted"]),
+    snapshot: z.enum(["absent", "adopted"]),
+    thread: z.enum(["absent", "adopted"]),
+    authority: z.enum(["absent", "adopted"]),
+  })
+  .strict();
+type WorkspaceThreadBootstrapArtifactProvenance = z.infer<
+  typeof WorkspaceThreadBootstrapArtifactProvenanceSchema
+>;
+
+const WorkspaceThreadBootstrapArtifactSchema = z.enum(["project", "snapshot", "thread", "authority"]);
+type WorkspaceThreadBootstrapArtifact = z.infer<typeof WorkspaceThreadBootstrapArtifactSchema>;
+
+const WorkspaceThreadBootstrapRollbackArtifactActionSchema = z.enum(["remove", "retain", "absent"]);
+type WorkspaceThreadBootstrapRollbackArtifactAction = z.infer<
+  typeof WorkspaceThreadBootstrapRollbackArtifactActionSchema
+>;
+
+const WorkspaceThreadBootstrapRollbackPhaseSchema = z.enum([
+  "planned",
+  "authority_processed",
+  "thread_processed",
+  "snapshot_processed",
+  "project_processed",
+  "retired",
+]);
+type WorkspaceThreadBootstrapRollbackPhase = z.infer<typeof WorkspaceThreadBootstrapRollbackPhaseSchema>;
+
+const WorkspaceThreadBootstrapRollbackSchema = z
+  .object({
+    reason: z.literal("workspace_unavailable"),
+    phase: WorkspaceThreadBootstrapRollbackPhaseSchema,
+    plan: z
+      .object({
+        project: WorkspaceThreadBootstrapRollbackArtifactActionSchema,
+        snapshot: WorkspaceThreadBootstrapRollbackArtifactActionSchema,
+        thread: WorkspaceThreadBootstrapRollbackArtifactActionSchema,
+        authority: WorkspaceThreadBootstrapRollbackArtifactActionSchema,
+      })
+      .strict(),
+    detectedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+  })
+  .strict();
+type WorkspaceThreadBootstrapRollback = z.infer<typeof WorkspaceThreadBootstrapRollbackSchema>;
+
+interface WorkspaceThreadBootstrapArtifactPresence {
+  readonly project: boolean;
+  readonly snapshot: boolean;
+  readonly thread: boolean;
+  readonly authority: boolean;
+}
+
+const WorkspaceThreadBootstrapOperationRecordSchema = z
+  .object({
+    version: z.literal(1),
+    operationId: IdSchema,
+    input: WorkspaceThreadBootstrapInputSchema,
+    operationFingerprint: Sha256DigestSchema,
+    canonicalWorkspaceDigest: Sha256DigestSchema,
+    authority: WorkspaceAuthoritySchema,
+    // Optional only so an interrupted v1 bootstrap written by an earlier build
+    // can be retired without guessing which exact artifacts it adopted. New
+    // records always persist this provenance before materializing anything.
+    artifactProvenance: WorkspaceThreadBootstrapArtifactProvenanceSchema.optional(),
+    // Each claim is durably appended before its corresponding artifact can be
+    // written. Combined with absent-at-preparation provenance, this closes the
+    // artifact-before-phase crash window without adding ownership data to the
+    // public catalog files.
+    materializationClaims: z.array(WorkspaceThreadBootstrapArtifactSchema).max(4).optional(),
+    phase: WorkspaceThreadBootstrapPhaseSchema,
+    preparedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    committedAt: IsoDateTimeSchema.optional(),
+    rollback: WorkspaceThreadBootstrapRollbackSchema.optional(),
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (
+      record.operationId !== record.input.operationId ||
+      record.operationFingerprint !== workspaceThreadBootstrapOperationFingerprint(record.input) ||
+      record.canonicalWorkspaceDigest !== workspaceThreadBootstrapCanonicalWorkspaceDigest(record.input.workspaceDirectory)
+    ) {
+      context.addIssue({ code: "custom", message: "Workspace bootstrap operation identity changed" });
+    }
+    const expectedAuthority = {
+      authorityVersion: 1 as const,
+      hostId: record.input.expectedHostId,
+      projectId: record.input.project.projectId,
+      workspaceId: record.input.project.workspaceId,
+      threadId: record.input.thread.threadId,
+      executionGenerationId: record.input.thread.currentLocation.executionGenerationId,
+      workspaceDirectory: record.input.workspaceDirectory,
+      registeredAt: record.authority.registeredAt,
+    };
+    if (
+      !isDeepStrictEqual(record.authority, expectedAuthority) ||
+      Date.parse(record.authority.registeredAt) > Date.parse(record.preparedAt)
+    ) {
+      context.addIssue({ code: "custom", path: ["authority"], message: "Workspace bootstrap authority changed" });
+    }
+    if (Date.parse(record.updatedAt) < Date.parse(record.preparedAt)) {
+      context.addIssue({ code: "custom", path: ["updatedAt"], message: "Workspace bootstrap time regressed" });
+    }
+    if ((record.phase === "committed") !== (record.committedAt !== undefined)) {
+      context.addIssue({ code: "custom", path: ["committedAt"], message: "Workspace bootstrap completion is invalid" });
+    }
+    if (record.committedAt !== undefined && record.committedAt !== record.updatedAt) {
+      context.addIssue({ code: "custom", path: ["committedAt"], message: "Workspace bootstrap completion time changed" });
+    }
+    if (record.rollback) {
+      if (record.phase === "committed") {
+        context.addIssue({ code: "custom", path: ["rollback"], message: "A committed bootstrap cannot roll back" });
+      }
+      if (Date.parse(record.rollback.detectedAt) < Date.parse(record.preparedAt)) {
+        context.addIssue({ code: "custom", path: ["rollback", "detectedAt"], message: "Rollback predates preparation" });
+      }
+      if (record.rollback.updatedAt !== record.updatedAt) {
+        context.addIssue({ code: "custom", path: ["rollback", "updatedAt"], message: "Rollback time changed" });
+      }
+    }
+    if (record.materializationClaims) {
+      const orderedArtifacts = ["project", "snapshot", "thread", "authority"] as const;
+      const phaseRank = workspaceThreadBootstrapPhaseRank(record.phase);
+      const minimumClaims = Math.min(phaseRank, orderedArtifacts.length);
+      const maximumClaims = Math.min(phaseRank + (record.phase === "committed" ? 0 : 1), orderedArtifacts.length);
+      if (
+        record.materializationClaims.some(
+          (artifact, index) => artifact !== orderedArtifacts[index],
+        ) ||
+        record.materializationClaims.length < minimumClaims ||
+        record.materializationClaims.length > maximumClaims
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["materializationClaims"],
+          message: "Workspace bootstrap materialization claims are not an ordered prefix",
+        });
+      }
+    }
+  });
+type WorkspaceThreadBootstrapOperationRecord = z.infer<typeof WorkspaceThreadBootstrapOperationRecordSchema>;
+
+export const WorkspaceThreadBootstrapStatusSchema = z
+  .object({
+    version: z.literal(1),
+    operationId: IdSchema,
+    phase: z.literal("committed"),
+    expectedHostId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    committedAt: IsoDateTimeSchema,
+  })
+  .strict();
+export type WorkspaceThreadBootstrapStatus = z.infer<typeof WorkspaceThreadBootstrapStatusSchema>;
 
 export const ResidentLifecycleOperationInputSchema = z
   .object({
@@ -451,11 +665,7 @@ const ResidentSessionBindingRecordSchema = z.discriminatedUnion("state", [
       operationId: IdSchema.optional(),
       completedAt: IsoDateTimeSchema,
     })
-    .strict()
-    .refine((record) => Date.parse(record.completedAt) >= Date.parse(record.binding.boundAt), {
-      path: ["completedAt"],
-      message: "Completion cannot precede the resident binding",
-    }),
+    .strict(),
   z
     .object({
       state: z.literal("detached"),
@@ -464,11 +674,7 @@ const ResidentSessionBindingRecordSchema = z.discriminatedUnion("state", [
       detachedAt: IsoDateTimeSchema,
       reason: z.enum(["explicit", "ending"]),
     })
-    .strict()
-    .refine((record) => Date.parse(record.detachedAt) >= Date.parse(record.binding.boundAt), {
-      path: ["detachedAt"],
-      message: "Detachment cannot precede the resident binding",
-    }),
+    .strict(),
 ]);
 type ResidentSessionBindingRecord = z.infer<typeof ResidentSessionBindingRecordSchema>;
 
@@ -1535,9 +1741,31 @@ export type ResidentLifecycleFaultPoint =
   | "after_detached"
   | "after_detached_binding";
 
+export type WorkspaceThreadBootstrapFaultPoint =
+  | "after_prepared"
+  | "after_project"
+  | "after_project_committed"
+  | "after_snapshot"
+  | "after_snapshot_committed"
+  | "after_thread"
+  | "after_thread_committed"
+  | "after_authority"
+  | "after_authority_committed"
+  | "after_committed"
+  | "after_rollback_planned"
+  | "after_rollback_authority"
+  | "after_rollback_thread"
+  | "after_rollback_snapshot"
+  | "after_rollback_project"
+  | "after_rollback_retired";
+
 export type HandoffCheckpointWriter = (path: string, checkpoint: HandoffCheckpoint) => Promise<boolean>;
 
 export interface HostStoreOptions {
+  workspaceThreadBootstrapFaultInjector?: (
+    point: WorkspaceThreadBootstrapFaultPoint,
+    operationId: string,
+  ) => void | Promise<void>;
   admissionFaultInjector?: (point: AdmissionFaultPoint, transactionId: string) => void | Promise<void>;
   residentProjectionFaultInjector?: (
     point: ResidentProjectionFaultPoint,
@@ -1626,6 +1854,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.residentProjectionLineages),
         ensurePrivateDirectory(this.paths.residentDispatchAttempts),
         ensurePrivateDirectory(this.paths.residentLifecycleOperations),
+        ensurePrivateDirectory(this.paths.workspaceThreadBootstrapOperations),
         ensurePrivateDirectory(this.commandIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionAttemptsDirectory()),
@@ -1644,7 +1873,13 @@ export class HostStore {
       await this.recoverAdmissionTransactionsUnlocked();
 
       this.residentSubsystemFault = undefined;
+      let workspaceBootstrapRecoveryPending = false;
       try {
+        await this.validateWorkspaceThreadBootstrapOperationDirectoryUnlocked();
+        workspaceBootstrapRecoveryPending = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).some(
+          (operation) =>
+            operation.phase !== "committed" && operation.rollback?.phase !== "retired",
+        );
         const workspaceAuthorityFile = await readJsonFile(
           this.paths.workspaceAuthorities,
           WorkspaceAuthorityFileSchema,
@@ -1657,6 +1892,8 @@ export class HostStore {
             MAX_WORKSPACE_AUTHORITY_FILE_BYTES,
           );
         }
+        await this.recoverWorkspaceThreadBootstrapOperationsUnlocked();
+        workspaceBootstrapRecoveryPending = false;
         const residentBindingFile = await readJsonFile(
           this.paths.residentSessionBindings,
           ResidentSessionBindingFileSchema,
@@ -1673,6 +1910,15 @@ export class HostStore {
         await this.recoverResidentLifecycleOperationsUnlocked("before_projection_recovery");
         await this.validateResidentProjectionLineageDirectoryUnlocked();
       } catch (error) {
+        if (error instanceof HostStoreError && error.code.startsWith("WORKSPACE_BOOTSTRAP_")) throw error;
+        if (workspaceBootstrapRecoveryPending) {
+          throw new HostStoreError(
+            "WORKSPACE_BOOTSTRAP_RECOVERY_FAILED",
+            "Workspace bootstrap recovery could not validate its private authority state",
+            false,
+            { cause: error },
+          );
+        }
         this.residentSubsystemFault = residentSubsystemUnavailable(error);
       }
       if (this.residentSubsystemFault) {
@@ -1758,6 +2004,123 @@ export class HostStore {
       });
       if (!snapshot) throw new HostStoreError("SNAPSHOT_NOT_FOUND", `Thread ${threadId} has no durable snapshot`);
       return snapshot;
+    });
+  }
+
+  /**
+   * Convergently creates the exact public catalog/projection and private
+   * workspace authority required before a fresh resident lifecycle begins.
+   * The durable status intentionally excludes the host-local workspace path
+   * and request digest.
+   */
+  async bootstrapWorkspaceThread(
+    inputValue: WorkspaceThreadBootstrapInput,
+  ): Promise<WorkspaceThreadBootstrapStatus> {
+    const parsedInput = WorkspaceThreadBootstrapInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const canonicalDirectory = await canonicalWorkspaceDirectory(parsedInput.workspaceDirectory);
+      const input = WorkspaceThreadBootstrapInputSchema.parse({
+        ...parsedInput,
+        workspaceDirectory: canonicalDirectory,
+      });
+      const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(input.operationId);
+      if (existing) {
+        if (!isDeepStrictEqual(existing.input, input)) {
+          throw new HostStoreError(
+            "WORKSPACE_BOOTSTRAP_OPERATION_ID_REUSED",
+            "This workspace bootstrap operation ID is already bound to a different exact envelope",
+          );
+        }
+        if (existing.phase === "committed") {
+          await this.assertWorkspaceThreadBootstrapCommittedAuthorityCurrentUnlocked(existing);
+          return workspaceThreadBootstrapStatus(existing);
+        }
+        try {
+          const recoverable =
+            existing.rollback?.phase === "retired"
+              ? await this.reactivateRetiredWorkspaceThreadBootstrapOperationUnlocked(existing, input)
+              : existing;
+          const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(recoverable, true);
+          return workspaceThreadBootstrapStatus(completed);
+        } catch (error) {
+          this.initialized = false;
+          throw error;
+        }
+      }
+
+      const host = await this.readHostUnlocked();
+      if (host.hostId !== input.expectedHostId) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_HOST_MISMATCH",
+          "The workspace bootstrap operation targets a different host authority",
+        );
+      }
+      await this.assertNoResidentLifecycleOperationUnlocked(input.thread.threadId);
+      await this.assertNoResidentDispatchTransitionUnlocked(
+        input.thread.threadId,
+        "Workspace bootstrap cannot begin while a resident dispatch is unresolved",
+      );
+      const bindingRecord = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+        (record) =>
+          record.binding.threadId === input.thread.threadId &&
+          (record.state === "active" || record.state === "activating"),
+      );
+      if (bindingRecord) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_RESIDENT_ACTIVE",
+          "Workspace bootstrap requires a thread without active resident authority",
+        );
+      }
+      const competing = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).find(
+        (operation) =>
+          operation.phase !== "committed" &&
+          operation.rollback?.phase !== "retired" &&
+          operation.input.thread.threadId === input.thread.threadId,
+      );
+      if (competing) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_IN_PROGRESS",
+          "This thread already has a nonterminal workspace bootstrap operation",
+        );
+      }
+
+      const observedAt = now();
+      const authority = await this.resolveWorkspaceThreadBootstrapAuthorityUnlocked(input, observedAt);
+      const artifactProvenance = await this.resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
+        input,
+        authority,
+      );
+      const preparedAt = causalNow(authority.registeredAt);
+      const prepared = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        version: 1,
+        operationId: input.operationId,
+        input,
+        operationFingerprint: workspaceThreadBootstrapOperationFingerprint(input),
+        canonicalWorkspaceDigest: workspaceThreadBootstrapCanonicalWorkspaceDigest(canonicalDirectory),
+        authority,
+        artifactProvenance,
+        materializationClaims: [],
+        phase: "prepared",
+        preparedAt,
+        updatedAt: preparedAt,
+      });
+      await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(prepared, "prepared");
+      if (Buffer.byteLength(`${JSON.stringify(prepared)}\n`, "utf8") > MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_RECORD_TOO_LARGE",
+          "The bounded workspace bootstrap operation record is too large",
+        );
+      }
+      try {
+        await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(prepared, "after_prepared", true);
+        const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(prepared, true);
+        return workspaceThreadBootstrapStatus(completed);
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
     });
   }
 
@@ -1993,7 +2356,7 @@ export class HostStore {
           "A new resident session cannot be provisioned while this thread already has an active binding",
         );
       }
-      const timestamp = now();
+      const timestamp = causalNow(authority.registeredAt);
       const record = ResidentLifecycleOperationRecordSchema.parse({
         version: 1,
         kind: "provision",
@@ -2020,7 +2383,7 @@ export class HostStore {
       if (record.phase !== "prepared") {
         throw residentLifecycleMutationAlreadyCrossed(record, "owned create");
       }
-      const dispatchStartedAt = now();
+      const dispatchStartedAt = causalNow(record.updatedAt);
       const dispatching = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "owned_create_dispatching",
@@ -2064,7 +2427,7 @@ export class HostStore {
       await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
       const binding = await this.residentBindingFromOwnedCandidateUnlocked(record, candidate);
       await this.assertResidentLifecycleCandidateUnusedUnlocked(record, binding);
-      const observedAt = now();
+      const observedAt = causalNow(record.updatedAt);
       const observed = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "owned_observed",
@@ -2095,7 +2458,7 @@ export class HostStore {
         "provision",
         "owned_create_dispatching",
       );
-      const completedAt = now();
+      const completedAt = causalNow(record.updatedAt);
       const completed = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "completed",
@@ -2128,7 +2491,7 @@ export class HostStore {
         "provision",
         "owned_create_dispatching",
       );
-      const completedAt = now();
+      const completedAt = causalNow(record.updatedAt);
       const completed = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "completed",
@@ -2152,7 +2515,7 @@ export class HostStore {
       if (record.phase !== "owned_observed" || !record.binding) {
         throw residentLifecycleMutationAlreadyCrossed(record, "owned-session promotion");
       }
-      const dispatchStartedAt = now();
+      const dispatchStartedAt = causalNow(record.updatedAt);
       const dispatching = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "promotion_dispatching",
@@ -2187,7 +2550,7 @@ export class HostStore {
       const retryable = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "owned_observed",
-        updatedAt: now(),
+        updatedAt: causalNow(record.updatedAt),
       });
       await this.writeResidentLifecycleBoundaryUnlocked(retryable, "after_mutation_failed_before_effect");
       this.residentPromotionLeases.delete(lease as object);
@@ -2216,7 +2579,7 @@ export class HostStore {
         );
       }
       await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
-      const promotionObservedAt = now();
+      const promotionObservedAt = causalNow(record.updatedAt);
       const observed = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "promoted_observed",
@@ -2280,7 +2643,7 @@ export class HostStore {
         await this.materializeActiveResidentBindingUnlocked(record);
         await this.injectResidentLifecycleFault("after_active_binding", record.operationId);
       });
-      const committedAt = now();
+      const committedAt = causalNow(record.updatedAt);
       const committed = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "committed",
@@ -2323,7 +2686,7 @@ export class HostStore {
       );
       this.assertBindingMatchesLifecycleAuthority(binding, authority);
       await this.assertExactActiveResidentBindingUnlocked(binding);
-      const timestamp = now();
+      const timestamp = await this.residentLifecycleSuccessorPreparedAtUnlocked(binding, authority);
       const record = ResidentLifecycleOperationRecordSchema.parse({
         version: 1,
         kind: "end",
@@ -2356,7 +2719,7 @@ export class HostStore {
         throw residentLifecycleMutationAlreadyCrossed(record, "resident kill");
       }
       await this.assertResidentBindingRevokedForOperationUnlocked(record);
-      const dispatchStartedAt = now();
+      const dispatchStartedAt = causalNow(record.updatedAt);
       const dispatching = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "kill_dispatching",
@@ -2385,7 +2748,7 @@ export class HostStore {
       const retryable = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "ending",
-        updatedAt: now(),
+        updatedAt: causalNow(record.updatedAt),
       });
       await this.writeResidentLifecycleBoundaryUnlocked(retryable, "after_mutation_failed_before_effect");
       this.residentKillLeases.delete(lease as object);
@@ -2427,7 +2790,7 @@ export class HostStore {
         phase: "quarantined",
         quarantinedFrom: record.phase,
         quarantineReason: "external_outcome_unknown",
-        updatedAt: now(),
+        updatedAt: causalNow(record.updatedAt),
       });
       await this.writeResidentLifecycleBoundaryUnlocked(quarantined, "after_quarantined");
       return residentLifecycleStatus(quarantined);
@@ -2454,7 +2817,7 @@ export class HostStore {
           "The kill lease no longer matches its exact durable lifecycle operation",
         );
       }
-      const acknowledgedAt = now();
+      const acknowledgedAt = causalNow(record.updatedAt);
       const acknowledged = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
         phase: "kill_acknowledged",
@@ -2465,7 +2828,7 @@ export class HostStore {
         await this.materializeCompletedResidentBindingUnlocked(acknowledged);
         await this.injectResidentLifecycleFault("after_completed_binding", record.operationId);
       });
-      const completedAt = now();
+      const completedAt = causalNow(acknowledged.updatedAt);
       const completed = ResidentLifecycleOperationRecordSchema.parse({
         ...acknowledged,
         phase: "completed",
@@ -2508,7 +2871,7 @@ export class HostStore {
       );
       this.assertBindingMatchesLifecycleAuthority(binding, authority);
       await this.assertExactActiveResidentBindingUnlocked(binding);
-      const timestamp = now();
+      const timestamp = await this.residentLifecycleSuccessorPreparedAtUnlocked(binding, authority);
       const record = ResidentLifecycleOperationRecordSchema.parse({
         version: 1,
         kind: "detach",
@@ -2904,7 +3267,11 @@ export class HostStore {
           ],
         });
       }
-      const generatedAt = now();
+      const generatedAt = causalNow(
+        source.generatedAt,
+        source.thread.updatedAt,
+        lifecycleRecord?.updatedAt,
+      );
       const latestCursor = {
         threadId: binding.threadId,
         executionGenerationId: binding.executionGenerationId,
@@ -6278,6 +6645,18 @@ export class HostStore {
     await this.options.residentDispatchFaultInjector?.(point, attemptId);
   }
 
+  private async injectWorkspaceThreadBootstrapFault(
+    point: WorkspaceThreadBootstrapFaultPoint,
+    operationId: string,
+  ): Promise<void> {
+    try {
+      await this.options.workspaceThreadBootstrapFaultInjector?.(point, operationId);
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
   private async injectResidentLifecycleFault(
     point: ResidentLifecycleFaultPoint,
     operationId: string,
@@ -6559,6 +6938,1129 @@ export class HostStore {
     }
   }
 
+  private workspaceThreadBootstrapOperationPath(operationId: string): string {
+    return join(this.paths.workspaceThreadBootstrapOperations, `${storageKey(operationId)}.json`);
+  }
+
+  private async validateWorkspaceThreadBootstrapOperationDirectoryUnlocked(): Promise<void> {
+    try {
+      const records = await this.readWorkspaceThreadBootstrapOperationsUnlocked(true);
+      const nonterminalThreads = new Set<string>();
+      for (const record of records) {
+        if (record.phase === "committed" || record.rollback?.phase === "retired") continue;
+        const threadId = record.input.thread.threadId;
+        if (nonterminalThreads.has(threadId)) {
+          throw new HostStoreError(
+            "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+            "A thread has more than one nonterminal workspace bootstrap operation",
+          );
+        }
+        nonterminalThreads.add(threadId);
+      }
+    } catch (error) {
+      if (error instanceof HostStoreError && error.code.startsWith("WORKSPACE_BOOTSTRAP_")) throw error;
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+        "The workspace bootstrap registry is invalid",
+        false,
+        { cause: error },
+      );
+    }
+  }
+
+  private async readWorkspaceThreadBootstrapOperationsUnlocked(
+    cleanTemporaryFiles = false,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord[]> {
+    const entries = await readdir(this.paths.workspaceThreadBootstrapOperations, { withFileTypes: true });
+    const records: WorkspaceThreadBootstrapOperationRecord[] = [];
+    const operationIds = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "The workspace bootstrap registry contains a non-file entry",
+        );
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        if (cleanTemporaryFiles) {
+          await rm(join(this.paths.workspaceThreadBootstrapOperations, entry.name), { force: true });
+          continue;
+        }
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "The workspace bootstrap registry contains an incomplete temporary entry",
+        );
+      }
+      if (!entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "The workspace bootstrap registry contains an unexpected entry",
+        );
+      }
+      if (records.length >= MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_LIMIT_REACHED",
+          "The workspace bootstrap registry exceeds its bounded entry limit",
+        );
+      }
+      let record: WorkspaceThreadBootstrapOperationRecord | undefined;
+      try {
+        record = await readJsonFile(
+          join(this.paths.workspaceThreadBootstrapOperations, entry.name),
+          WorkspaceThreadBootstrapOperationRecordSchema,
+          { maxBytes: MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES },
+        );
+      } catch (error) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "A workspace bootstrap operation record is invalid",
+          false,
+          { cause: error },
+        );
+      }
+      if (
+        !record ||
+        entry.name !== `${storageKey(record.operationId)}.json` ||
+        operationIds.has(record.operationId)
+      ) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "A workspace bootstrap filename does not match one unique operation identity",
+        );
+      }
+      operationIds.add(record.operationId);
+      records.push(record);
+    }
+    return records.sort((left, right) => left.operationId.localeCompare(right.operationId));
+  }
+
+  private async readWorkspaceThreadBootstrapOperationUnlocked(
+    operationId: string,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord | undefined> {
+    let record: WorkspaceThreadBootstrapOperationRecord | undefined;
+    try {
+      record = await readJsonFile(
+        this.workspaceThreadBootstrapOperationPath(operationId),
+        WorkspaceThreadBootstrapOperationRecordSchema,
+        { optional: true, maxBytes: MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES },
+      );
+    } catch (error) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+        "The workspace bootstrap operation record is invalid",
+        false,
+        { cause: error },
+      );
+    }
+    if (record && record.operationId !== operationId) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+        "The workspace bootstrap record changed its operation identity",
+      );
+    }
+    return record;
+  }
+
+  private async writeWorkspaceThreadBootstrapOperationUnlocked(
+    recordValue: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const record = WorkspaceThreadBootstrapOperationRecordSchema.parse(recordValue);
+    const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(record.operationId);
+    if (existing) {
+      const rollbackTransitionInvalid = existing.rollback
+        ? !record.rollback ||
+          !isDeepStrictEqual(existing.rollback.plan, record.rollback.plan) ||
+          existing.rollback.reason !== record.rollback.reason ||
+          existing.rollback.detectedAt !== record.rollback.detectedAt ||
+          workspaceThreadBootstrapRollbackPhaseRank(record.rollback.phase) <
+            workspaceThreadBootstrapRollbackPhaseRank(existing.rollback.phase) ||
+          workspaceThreadBootstrapRollbackPhaseRank(record.rollback.phase) >
+            workspaceThreadBootstrapRollbackPhaseRank(existing.rollback.phase) + 1
+        : record.rollback !== undefined && record.rollback.phase !== "planned";
+      if (
+        !isDeepStrictEqual(existing.input, record.input) ||
+        existing.operationFingerprint !== record.operationFingerprint ||
+        existing.canonicalWorkspaceDigest !== record.canonicalWorkspaceDigest ||
+        !isDeepStrictEqual(existing.authority, record.authority) ||
+        !isDeepStrictEqual(existing.artifactProvenance, record.artifactProvenance) ||
+        Date.parse(record.updatedAt) < Date.parse(existing.updatedAt) ||
+        !workspaceThreadBootstrapClaimsTransitionIsValid(
+          existing.materializationClaims,
+          record.materializationClaims,
+        ) ||
+        workspaceThreadBootstrapPhaseRank(record.phase) < workspaceThreadBootstrapPhaseRank(existing.phase) ||
+        workspaceThreadBootstrapPhaseRank(record.phase) > workspaceThreadBootstrapPhaseRank(existing.phase) + 1 ||
+        (existing.rollback !== undefined && record.phase !== existing.phase) ||
+        (record.rollback !== undefined && existing.rollback === undefined && record.phase !== existing.phase) ||
+        (existing.rollback !== undefined &&
+          !isDeepStrictEqual(existing.materializationClaims, record.materializationClaims)) ||
+        rollbackTransitionInvalid
+      ) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+          "The workspace bootstrap operation attempted an invalid durable transition",
+        );
+      }
+    } else {
+      const records = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
+      if (records.length >= MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_LIMIT_REACHED",
+          "The workspace bootstrap operation registry is full",
+        );
+      }
+    }
+    await atomicWriteJson(
+      this.workspaceThreadBootstrapOperationPath(record.operationId),
+      record,
+      MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES,
+    );
+  }
+
+  private async writeWorkspaceThreadBootstrapBoundaryUnlocked(
+    record: WorkspaceThreadBootstrapOperationRecord,
+    faultPoint: WorkspaceThreadBootstrapFaultPoint,
+    injectFaults: boolean,
+  ): Promise<void> {
+    await this.writeWorkspaceThreadBootstrapOperationUnlocked(record);
+    if (injectFaults) await this.injectWorkspaceThreadBootstrapFault(faultPoint, record.operationId);
+  }
+
+  private async resolveWorkspaceThreadBootstrapAuthorityUnlocked(
+    input: WorkspaceThreadBootstrapInput,
+    preparedAt: string,
+  ): Promise<WorkspaceAuthority> {
+    const authorities = await this.readWorkspaceAuthoritiesUnlocked();
+    const existing = authorities.find((authority) => authority.threadId === input.thread.threadId);
+    const expectedIdentity = {
+      authorityVersion: 1 as const,
+      hostId: input.expectedHostId,
+      projectId: input.project.projectId,
+      workspaceId: input.project.workspaceId,
+      threadId: input.thread.threadId,
+      executionGenerationId: input.thread.currentLocation.executionGenerationId,
+      workspaceDirectory: input.workspaceDirectory,
+    };
+    if (
+      existing &&
+      (!workspaceAuthorityMatchesScope(existing, {
+        hostId: expectedIdentity.hostId,
+        projectId: expectedIdentity.projectId,
+        workspaceId: expectedIdentity.workspaceId,
+        threadId: expectedIdentity.threadId,
+        executionGenerationId: expectedIdentity.executionGenerationId,
+      }) ||
+        !sameCanonicalPath(existing.workspaceDirectory, input.workspaceDirectory))
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The existing workspace authority differs from the requested bootstrap",
+      );
+    }
+    const pathOwner = authorities.find(
+      (authority) =>
+        authority.threadId !== input.thread.threadId &&
+        sameCanonicalPath(authority.workspaceDirectory, input.workspaceDirectory) &&
+        (authority.hostId !== input.expectedHostId ||
+          authority.projectId !== input.project.projectId ||
+          authority.workspaceId !== input.project.workspaceId),
+    );
+    if (pathOwner) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The canonical workspace is already owned by a different saved workspace",
+      );
+    }
+    if (!existing && authorities.length >= MAX_WORKSPACE_AUTHORITIES) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_LIMIT_REACHED",
+        "The workspace authority registry is full",
+      );
+    }
+    return WorkspaceAuthoritySchema.parse({
+      ...expectedIdentity,
+      registeredAt: existing?.registeredAt ?? preparedAt,
+    });
+  }
+
+  private async resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
+    input: WorkspaceThreadBootstrapInput,
+    authority: WorkspaceAuthority,
+  ): Promise<WorkspaceThreadBootstrapArtifactProvenance> {
+    const projects = await this.readProjectsUnlocked();
+    const matchingProjects = projects.filter((project) => project.projectId === input.project.projectId);
+    if (matchingProjects.length > 1 || (matchingProjects[0] && !isDeepStrictEqual(matchingProjects[0], input.project))) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The saved project differs from the exact workspace bootstrap artifact",
+      );
+    }
+
+    let snapshot: ThreadProjectionSnapshot | undefined;
+    try {
+      snapshot = await readJsonFile(this.snapshotPath(input.thread.threadId), ThreadProjectionSnapshotSchema, {
+        optional: true,
+      });
+    } catch (error) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The existing thread projection is invalid",
+        false,
+        { cause: error },
+      );
+    }
+    if (snapshot && !isDeepStrictEqual(snapshot, input.initialProjection)) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The thread projection differs from the exact workspace bootstrap artifact",
+      );
+    }
+
+    const threads = await this.readThreadsUnlocked();
+    const matchingThreads = threads.filter((thread) => thread.threadId === input.thread.threadId);
+    if (matchingThreads.length > 1 || (matchingThreads[0] && !isDeepStrictEqual(matchingThreads[0], input.thread))) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The saved thread differs from the exact workspace bootstrap artifact",
+      );
+    }
+
+    const authorities = await this.readWorkspaceAuthoritiesUnlocked();
+    const matchingAuthorities = authorities.filter((candidate) => candidate.threadId === input.thread.threadId);
+    if (matchingAuthorities.length > 1 || (matchingAuthorities[0] && !isDeepStrictEqual(matchingAuthorities[0], authority))) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The workspace authority differs from the exact workspace bootstrap artifact",
+      );
+    }
+    const pathOwner = authorities.find(
+      (candidate) =>
+        candidate.threadId !== input.thread.threadId &&
+        sameCanonicalPath(candidate.workspaceDirectory, input.workspaceDirectory) &&
+        (candidate.hostId !== input.expectedHostId ||
+          candidate.projectId !== input.project.projectId ||
+          candidate.workspaceId !== input.project.workspaceId),
+    );
+    if (pathOwner) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The canonical workspace authority was claimed by a different saved workspace",
+      );
+    }
+
+    return WorkspaceThreadBootstrapArtifactProvenanceSchema.parse({
+      project: matchingProjects[0] ? "adopted" : "absent",
+      snapshot: snapshot ? "adopted" : "absent",
+      thread: matchingThreads[0] ? "adopted" : "absent",
+      authority: matchingAuthorities[0] ? "adopted" : "absent",
+    });
+  }
+
+  private async reactivateRetiredWorkspaceThreadBootstrapOperationUnlocked(
+    retired: WorkspaceThreadBootstrapOperationRecord,
+    input: WorkspaceThreadBootstrapInput,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord> {
+    if (retired.rollback?.phase !== "retired" || !isDeepStrictEqual(retired.input, input)) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_OPERATION_ID_REUSED",
+        "Only the retired workspace bootstrap's exact canonical envelope may be retried",
+      );
+    }
+    const host = await this.readHostUnlocked();
+    if (host.hostId !== input.expectedHostId) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_HOST_MISMATCH",
+        "The workspace bootstrap operation targets a different host authority",
+      );
+    }
+    if (
+      (await this.readResidentLifecycleOperationsUnlocked()).some(
+        (operation) => operation.input.threadId === input.thread.threadId,
+      ) ||
+      (await this.readWorkspaceThreadBootstrapRollbackBindingsUnlocked()).some(
+        (record) => record.binding.threadId === input.thread.threadId,
+      )
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ROLLBACK_REFERENCED",
+        "A retired workspace bootstrap cannot reactivate after resident lifecycle state exists",
+      );
+    }
+    await this.assertNoResidentDispatchTransitionUnlocked(
+      input.thread.threadId,
+      "A retired workspace bootstrap cannot reactivate while resident dispatch state exists",
+    );
+    const competing = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).find(
+      (operation) =>
+        operation.operationId !== input.operationId &&
+        operation.phase !== "committed" &&
+        operation.rollback?.phase !== "retired" &&
+        operation.input.thread.threadId === input.thread.threadId,
+    );
+    if (competing) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_IN_PROGRESS",
+        "This thread already has a nonterminal workspace bootstrap operation",
+      );
+    }
+
+    const observedAt = causalNow(retired.updatedAt);
+    const authority = await this.resolveWorkspaceThreadBootstrapAuthorityUnlocked(input, observedAt);
+    const artifactProvenance = await this.resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
+      input,
+      authority,
+    );
+    const preparedAt = causalNow(observedAt, authority.registeredAt);
+    const prepared = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+      version: 1,
+      operationId: input.operationId,
+      input,
+      operationFingerprint: workspaceThreadBootstrapOperationFingerprint(input),
+      canonicalWorkspaceDigest: workspaceThreadBootstrapCanonicalWorkspaceDigest(input.workspaceDirectory),
+      authority,
+      artifactProvenance,
+      materializationClaims: [],
+      phase: "prepared",
+      preparedAt,
+      updatedAt: preparedAt,
+    });
+    await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(prepared, "prepared");
+    await atomicWriteJson(
+      this.workspaceThreadBootstrapOperationPath(prepared.operationId),
+      prepared,
+      MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES,
+    );
+    await this.injectWorkspaceThreadBootstrapFault("after_prepared", prepared.operationId);
+    return prepared;
+  }
+
+  private async assertWorkspaceThreadBootstrapCommittedAuthorityCurrentUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const host = await this.readHostUnlocked();
+    const authority = (await this.readWorkspaceAuthoritiesUnlocked()).find(
+      (candidate) => candidate.threadId === operation.input.thread.threadId,
+    );
+    if (host.hostId !== operation.input.expectedHostId || !authority || !isDeepStrictEqual(authority, operation.authority)) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_CHANGED",
+        "The durable workspace authority changed after bootstrap completion",
+      );
+    }
+  }
+
+  private async assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+    phase: WorkspaceThreadBootstrapPhase,
+  ): Promise<void> {
+    const host = await this.readHostUnlocked();
+    if (host.hostId !== operation.input.expectedHostId) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_CHANGED",
+        "The host authority changed after workspace bootstrap preparation",
+      );
+    }
+    const currentCanonicalDirectory = await canonicalWorkspaceDirectory(operation.input.workspaceDirectory);
+    if (
+      !sameCanonicalPath(currentCanonicalDirectory, operation.input.workspaceDirectory) ||
+      workspaceThreadBootstrapCanonicalWorkspaceDigest(currentCanonicalDirectory) !==
+        operation.canonicalWorkspaceDigest
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_CHANGED",
+        "The canonical workspace authority changed after bootstrap preparation",
+      );
+    }
+    const requiredRank = workspaceThreadBootstrapPhaseRank(phase);
+    const projects = await this.readProjectsUnlocked();
+    const matchingProjects = projects.filter((project) => project.projectId === operation.input.project.projectId);
+    if (matchingProjects.length > 1 || (matchingProjects[0] && !isDeepStrictEqual(matchingProjects[0], operation.input.project))) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The saved project differs from the exact workspace bootstrap artifact",
+      );
+    }
+    if (requiredRank >= workspaceThreadBootstrapPhaseRank("project_committed") && !matchingProjects[0]) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_MISSING",
+        "A committed workspace bootstrap project artifact is missing",
+      );
+    }
+    if (!matchingProjects[0] && projects.length >= 10_000) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_PROJECT_LIMIT_REACHED", "The saved project catalog is full");
+    }
+
+    let snapshot: ThreadProjectionSnapshot | undefined;
+    try {
+      snapshot = await readJsonFile(
+        this.snapshotPath(operation.input.thread.threadId),
+        ThreadProjectionSnapshotSchema,
+        { optional: true },
+      );
+    } catch (error) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The existing thread projection is invalid",
+        false,
+        { cause: error },
+      );
+    }
+    if (snapshot && !isDeepStrictEqual(snapshot, operation.input.initialProjection)) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The thread projection differs from the exact workspace bootstrap artifact",
+      );
+    }
+    if (requiredRank >= workspaceThreadBootstrapPhaseRank("snapshot_committed") && !snapshot) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_MISSING",
+        "A committed workspace bootstrap projection artifact is missing",
+      );
+    }
+
+    const threads = await this.readThreadsUnlocked();
+    const matchingThreads = threads.filter((thread) => thread.threadId === operation.input.thread.threadId);
+    if (matchingThreads.length > 1 || (matchingThreads[0] && !isDeepStrictEqual(matchingThreads[0], operation.input.thread))) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The saved thread differs from the exact workspace bootstrap artifact",
+      );
+    }
+    if (requiredRank >= workspaceThreadBootstrapPhaseRank("thread_committed") && !matchingThreads[0]) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_MISSING",
+        "A committed workspace bootstrap thread artifact is missing",
+      );
+    }
+    if (!matchingThreads[0] && threads.length >= 10_000) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_THREAD_LIMIT_REACHED", "The saved thread catalog is full");
+    }
+
+    const authorities = await this.readWorkspaceAuthoritiesUnlocked();
+    const matchingAuthorities = authorities.filter(
+      (authority) => authority.threadId === operation.input.thread.threadId,
+    );
+    if (
+      matchingAuthorities.length > 1 ||
+      (matchingAuthorities[0] && !isDeepStrictEqual(matchingAuthorities[0], operation.authority))
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The workspace authority differs from the exact workspace bootstrap artifact",
+      );
+    }
+    const pathOwner = authorities.find(
+      (authority) =>
+        authority.threadId !== operation.input.thread.threadId &&
+        sameCanonicalPath(authority.workspaceDirectory, operation.input.workspaceDirectory) &&
+        (authority.hostId !== operation.input.expectedHostId ||
+          authority.projectId !== operation.input.project.projectId ||
+          authority.workspaceId !== operation.input.project.workspaceId),
+    );
+    if (pathOwner) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The canonical workspace authority was claimed by a different saved workspace",
+      );
+    }
+    if (requiredRank >= workspaceThreadBootstrapPhaseRank("authority_committed") && !matchingAuthorities[0]) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_MISSING",
+        "A committed workspace bootstrap authority artifact is missing",
+      );
+    }
+    if (!matchingAuthorities[0] && authorities.length >= MAX_WORKSPACE_AUTHORITIES) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_LIMIT_REACHED",
+        "The workspace authority registry is full",
+      );
+    }
+  }
+
+  private async materializeWorkspaceThreadBootstrapProjectUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const projects = await this.readProjectsUnlocked();
+    const existing = projects.find((project) => project.projectId === operation.input.project.projectId);
+    if (existing) {
+      if (!isDeepStrictEqual(existing, operation.input.project)) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          "The saved project changed before workspace bootstrap materialization",
+        );
+      }
+      return;
+    }
+    if (projects.length >= 10_000) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_PROJECT_LIMIT_REACHED", "The saved project catalog is full");
+    }
+    projects.push(operation.input.project);
+    await atomicWriteJson(this.paths.projects, ProjectFileSchema.parse({ version: 1, projects }));
+  }
+
+  private async materializeWorkspaceThreadBootstrapSnapshotUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const path = this.snapshotPath(operation.input.thread.threadId);
+    const existing = await readJsonFile(path, ThreadProjectionSnapshotSchema, { optional: true });
+    if (existing) {
+      if (!isDeepStrictEqual(existing, operation.input.initialProjection)) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          "The thread projection changed before workspace bootstrap materialization",
+        );
+      }
+      return;
+    }
+    await atomicWriteJson(path, operation.input.initialProjection);
+  }
+
+  private async materializeWorkspaceThreadBootstrapThreadUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const threads = await this.readThreadsUnlocked();
+    const existing = threads.find((thread) => thread.threadId === operation.input.thread.threadId);
+    if (existing) {
+      if (!isDeepStrictEqual(existing, operation.input.thread)) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          "The saved thread changed before workspace bootstrap materialization",
+        );
+      }
+      return;
+    }
+    if (threads.length >= 10_000) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_THREAD_LIMIT_REACHED", "The saved thread catalog is full");
+    }
+    threads.push(operation.input.thread);
+    await atomicWriteJson(this.paths.threads, ThreadFileSchema.parse({ version: 1, threads }));
+  }
+
+  private async materializeWorkspaceThreadBootstrapAuthorityUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const authorities = await this.readWorkspaceAuthoritiesUnlocked();
+    const existing = authorities.find((authority) => authority.threadId === operation.input.thread.threadId);
+    if (existing) {
+      if (!isDeepStrictEqual(existing, operation.authority)) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          "The workspace authority changed before bootstrap materialization",
+        );
+      }
+      return;
+    }
+    const pathOwner = authorities.find(
+      (authority) =>
+        sameCanonicalPath(authority.workspaceDirectory, operation.input.workspaceDirectory) &&
+        (authority.hostId !== operation.input.expectedHostId ||
+          authority.projectId !== operation.input.project.projectId ||
+          authority.workspaceId !== operation.input.project.workspaceId),
+    );
+    if (pathOwner) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The canonical workspace authority changed before bootstrap materialization",
+      );
+    }
+    if (authorities.length >= MAX_WORKSPACE_AUTHORITIES) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_AUTHORITY_LIMIT_REACHED",
+        "The workspace authority registry is full",
+      );
+    }
+    authorities.push(operation.authority);
+    await this.writeWorkspaceAuthoritiesUnlocked(authorities);
+  }
+
+  private async claimWorkspaceThreadBootstrapArtifactUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+    artifact: WorkspaceThreadBootstrapArtifact,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord> {
+    // Older records did not persist creation/adoption provenance. They remain
+    // recoverable when the workspace is present, but are never treated as
+    // proof that an artifact may be removed.
+    if (!operation.materializationClaims) return operation;
+    if (operation.materializationClaims.includes(artifact)) return operation;
+    const claimed = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+      ...operation,
+      materializationClaims: [...operation.materializationClaims, artifact],
+      updatedAt: causalNow(operation.updatedAt),
+    });
+    await this.writeWorkspaceThreadBootstrapOperationUnlocked(claimed);
+    return claimed;
+  }
+
+  private async materializeWorkspaceThreadBootstrapOperationUnlocked(
+    operationValue: WorkspaceThreadBootstrapOperationRecord,
+    injectFaults: boolean,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord> {
+    let operation = WorkspaceThreadBootstrapOperationRecordSchema.parse(operationValue);
+    if (operation.phase === "committed") return operation;
+    await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(operation, operation.phase);
+
+    if (workspaceThreadBootstrapPhaseRank(operation.phase) < workspaceThreadBootstrapPhaseRank("project_committed")) {
+      operation = await this.claimWorkspaceThreadBootstrapArtifactUnlocked(operation, "project");
+      await this.materializeWorkspaceThreadBootstrapProjectUnlocked(operation);
+      if (injectFaults) await this.injectWorkspaceThreadBootstrapFault("after_project", operation.operationId);
+      operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        ...operation,
+        phase: "project_committed",
+        updatedAt: causalNow(operation.updatedAt),
+      });
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_project_committed", injectFaults);
+    }
+    if (workspaceThreadBootstrapPhaseRank(operation.phase) < workspaceThreadBootstrapPhaseRank("snapshot_committed")) {
+      operation = await this.claimWorkspaceThreadBootstrapArtifactUnlocked(operation, "snapshot");
+      await this.materializeWorkspaceThreadBootstrapSnapshotUnlocked(operation);
+      if (injectFaults) await this.injectWorkspaceThreadBootstrapFault("after_snapshot", operation.operationId);
+      operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        ...operation,
+        phase: "snapshot_committed",
+        updatedAt: causalNow(operation.updatedAt),
+      });
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_snapshot_committed", injectFaults);
+    }
+    if (workspaceThreadBootstrapPhaseRank(operation.phase) < workspaceThreadBootstrapPhaseRank("thread_committed")) {
+      operation = await this.claimWorkspaceThreadBootstrapArtifactUnlocked(operation, "thread");
+      await this.materializeWorkspaceThreadBootstrapThreadUnlocked(operation);
+      if (injectFaults) await this.injectWorkspaceThreadBootstrapFault("after_thread", operation.operationId);
+      operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        ...operation,
+        phase: "thread_committed",
+        updatedAt: causalNow(operation.updatedAt),
+      });
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_thread_committed", injectFaults);
+    }
+    if (workspaceThreadBootstrapPhaseRank(operation.phase) < workspaceThreadBootstrapPhaseRank("authority_committed")) {
+      operation = await this.claimWorkspaceThreadBootstrapArtifactUnlocked(operation, "authority");
+      await this.materializeWorkspaceThreadBootstrapAuthorityUnlocked(operation);
+      if (injectFaults) await this.injectWorkspaceThreadBootstrapFault("after_authority", operation.operationId);
+      operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        ...operation,
+        phase: "authority_committed",
+        updatedAt: causalNow(operation.updatedAt),
+      });
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_authority_committed", injectFaults);
+    }
+    await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(operation, "authority_committed");
+    const committedAt = causalNow(operation.updatedAt);
+    operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+      ...operation,
+      phase: "committed",
+      updatedAt: committedAt,
+      committedAt,
+    });
+    await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_committed", injectFaults);
+    return operation;
+  }
+
+  private async observeWorkspaceThreadBootstrapArtifactsUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<WorkspaceThreadBootstrapArtifactPresence> {
+    const current = await this.resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
+      operation.input,
+      operation.authority,
+    );
+    return {
+      project: current.project === "adopted",
+      snapshot: current.snapshot === "adopted",
+      thread: current.thread === "adopted",
+      authority: current.authority === "adopted",
+    };
+  }
+
+  private async readWorkspaceThreadBootstrapRollbackBindingsUnlocked(): Promise<ResidentSessionBindingRecord[]> {
+    const file = await readJsonFile(this.paths.residentSessionBindings, ResidentSessionBindingFileSchema, {
+      optional: true,
+      maxBytes: MAX_RESIDENT_SESSION_BINDING_FILE_BYTES,
+    });
+    return (file?.records ?? []).map((record) => ({
+      ...record,
+      binding: validateResidentSessionBinding(record.binding),
+    })) as ResidentSessionBindingRecord[];
+  }
+
+  private async assertWorkspaceThreadBootstrapRollbackHasNoResidentMutationUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<{
+    lifecycleOperations: ResidentLifecycleOperationRecord[];
+    bindingRecords: ResidentSessionBindingRecord[];
+  }> {
+    const [lifecycleOperations, bindingRecords] = await Promise.all([
+      this.readResidentLifecycleOperationsUnlocked(),
+      this.readWorkspaceThreadBootstrapRollbackBindingsUnlocked(),
+    ]);
+    if (
+      lifecycleOperations.some((candidate) => candidate.input.threadId === operation.input.thread.threadId) ||
+      bindingRecords.some((candidate) => candidate.binding.threadId === operation.input.thread.threadId)
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ROLLBACK_REFERENCED",
+        "A workspace bootstrap with resident lifecycle state cannot be retired",
+      );
+    }
+    try {
+      await this.assertNoResidentDispatchTransitionUnlocked(
+        operation.input.thread.threadId,
+        "A workspace bootstrap with resident dispatch state cannot be retired",
+      );
+    } catch (error) {
+      if (error instanceof HostStoreError && error.code === "RESIDENT_DISPATCH_ACTIVE") {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ROLLBACK_REFERENCED",
+          "A workspace bootstrap with resident dispatch state cannot be retired",
+          false,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    return { lifecycleOperations, bindingRecords };
+  }
+
+  private async planWorkspaceThreadBootstrapRollbackUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<WorkspaceThreadBootstrapRollback["plan"]> {
+    const presence = await this.observeWorkspaceThreadBootstrapArtifactsUnlocked(operation);
+    const { lifecycleOperations, bindingRecords } =
+      await this.assertWorkspaceThreadBootstrapRollbackHasNoResidentMutationUnlocked(operation);
+    const [operations, threads, authorities] = await Promise.all([
+      this.readWorkspaceThreadBootstrapOperationsUnlocked(),
+      this.readThreadsUnlocked(),
+      this.readWorkspaceAuthoritiesUnlocked(),
+    ]);
+    const otherOperations = operations.filter((candidate) => candidate.operationId !== operation.operationId);
+    const claimed = new Set(operation.materializationClaims ?? []);
+    const provenance = operation.artifactProvenance;
+    const initialAction = (
+      artifact: WorkspaceThreadBootstrapArtifact,
+    ): WorkspaceThreadBootstrapRollbackArtifactAction => {
+      if (provenance?.[artifact] === "adopted" && !presence[artifact]) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          `The adopted workspace bootstrap ${artifact} artifact is missing`,
+        );
+      }
+      if (!presence[artifact]) return "absent";
+      return provenance?.[artifact] === "absent" && claimed.has(artifact) ? "remove" : "retain";
+    };
+
+    let authority = initialAction("authority");
+    let thread = initialAction("thread");
+    let snapshot = initialAction("snapshot");
+    let project = initialAction("project");
+    const sameThreadReferenced = otherOperations.some(
+      (candidate) => candidate.input.thread.threadId === operation.input.thread.threadId,
+    );
+    const sameProjectReferenced = otherOperations.some(
+      (candidate) => candidate.input.project.projectId === operation.input.project.projectId,
+    );
+    if (sameThreadReferenced && presence.authority) authority = "retain";
+    const authorityRemains = presence.authority && authority !== "remove";
+    if ((authorityRemains || sameThreadReferenced) && presence.thread) thread = "retain";
+    const threadRemains = presence.thread && thread !== "remove";
+    if ((threadRemains || sameThreadReferenced) && presence.snapshot) snapshot = "retain";
+    const snapshotRemains = presence.snapshot && snapshot !== "remove";
+
+    const otherPublicThreadReferencesProject = threads.some(
+      (candidate) =>
+        candidate.threadId !== operation.input.thread.threadId &&
+        candidate.projectIdentity === operation.input.project.projectId,
+    );
+    const otherAuthorityReferencesProject = authorities.some(
+      (candidate) =>
+        candidate.threadId !== operation.input.thread.threadId &&
+        candidate.projectId === operation.input.project.projectId,
+    );
+    const lifecycleReferencesProject = lifecycleOperations.some(
+      (candidate) => candidate.input.projectId === operation.input.project.projectId,
+    );
+    const bindingReferencesProject = bindingRecords.some((record) => {
+      const boundThread = threads.find((candidate) => candidate.threadId === record.binding.threadId);
+      return boundThread?.projectIdentity === operation.input.project.projectId;
+    });
+    if (
+      presence.project &&
+      (threadRemains ||
+        snapshotRemains ||
+        authorityRemains ||
+        sameProjectReferenced ||
+        otherPublicThreadReferencesProject ||
+        otherAuthorityReferencesProject ||
+        lifecycleReferencesProject ||
+        bindingReferencesProject)
+    ) {
+      project = "retain";
+    }
+
+    if (
+      (presence.authority && (!presence.thread || !presence.project)) ||
+      (presence.thread && (!presence.snapshot || !presence.project)) ||
+      (presence.snapshot && !presence.project)
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+        "The partial workspace bootstrap artifacts no longer form a valid materialization prefix",
+      );
+    }
+
+    return WorkspaceThreadBootstrapRollbackSchema.shape.plan.parse({
+      project,
+      snapshot,
+      thread,
+      authority,
+    });
+  }
+
+  private async assertWorkspaceThreadBootstrapRollbackPlanCurrentUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    const rollback = operation.rollback;
+    if (!rollback) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_STATE_INVALID", "Workspace bootstrap rollback state is missing");
+    }
+    await this.assertWorkspaceThreadBootstrapRollbackHasNoResidentMutationUnlocked(operation);
+    const presence = await this.observeWorkspaceThreadBootstrapArtifactsUnlocked(operation);
+    const processedRank = workspaceThreadBootstrapRollbackPhaseRank(rollback.phase);
+    const processedAt: Record<WorkspaceThreadBootstrapArtifact, number> = {
+      authority: workspaceThreadBootstrapRollbackPhaseRank("authority_processed"),
+      thread: workspaceThreadBootstrapRollbackPhaseRank("thread_processed"),
+      snapshot: workspaceThreadBootstrapRollbackPhaseRank("snapshot_processed"),
+      project: workspaceThreadBootstrapRollbackPhaseRank("project_processed"),
+    };
+    for (const artifact of ["authority", "thread", "snapshot", "project"] as const) {
+      const action = rollback.plan[artifact];
+      const exists = presence[artifact];
+      if (
+        (action === "retain" && !exists) ||
+        (action === "absent" && exists) ||
+        (action === "remove" && processedRank >= processedAt[artifact] && exists)
+      ) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED",
+          `The workspace bootstrap rollback ${artifact} artifact changed after its durable plan`,
+        );
+      }
+    }
+
+    const [operations, threads, authorities, lifecycleOperations, bindingRecords] = await Promise.all([
+      this.readWorkspaceThreadBootstrapOperationsUnlocked(),
+      this.readThreadsUnlocked(),
+      this.readWorkspaceAuthoritiesUnlocked(),
+      this.readResidentLifecycleOperationsUnlocked(),
+      this.readWorkspaceThreadBootstrapRollbackBindingsUnlocked(),
+    ]);
+    const otherOperations = operations.filter((candidate) => candidate.operationId !== operation.operationId);
+    if (
+      ((rollback.plan.authority === "remove" ||
+        rollback.plan.thread === "remove" ||
+        rollback.plan.snapshot === "remove") &&
+        otherOperations.some((candidate) => candidate.input.thread.threadId === operation.input.thread.threadId)) ||
+      (rollback.plan.project === "remove" &&
+        (otherOperations.some(
+          (candidate) => candidate.input.project.projectId === operation.input.project.projectId,
+        ) ||
+          threads.some(
+            (candidate) =>
+              candidate.threadId !== operation.input.thread.threadId &&
+              candidate.projectIdentity === operation.input.project.projectId,
+          ) ||
+          authorities.some(
+            (candidate) =>
+              candidate.threadId !== operation.input.thread.threadId &&
+              candidate.projectId === operation.input.project.projectId,
+          ) ||
+          lifecycleOperations.some(
+            (candidate) => candidate.input.projectId === operation.input.project.projectId,
+          ) ||
+          bindingRecords.some((record) => {
+            const boundThread = threads.find((candidate) => candidate.threadId === record.binding.threadId);
+            return boundThread?.projectIdentity === operation.input.project.projectId;
+          })))
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_ROLLBACK_REFERENCED",
+        "A workspace bootstrap artifact gained a durable reference after rollback planning",
+      );
+    }
+  }
+
+  private async processWorkspaceThreadBootstrapRollbackArtifactUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+    artifact: WorkspaceThreadBootstrapArtifact,
+  ): Promise<void> {
+    const action = operation.rollback?.plan[artifact];
+    if (action !== "remove") return;
+    await this.assertWorkspaceThreadBootstrapRollbackPlanCurrentUnlocked(operation);
+    if (artifact === "authority") {
+      const authorities = await this.readWorkspaceAuthoritiesUnlocked();
+      const index = authorities.findIndex((candidate) => candidate.threadId === operation.input.thread.threadId);
+      if (index < 0) return;
+      if (!isDeepStrictEqual(authorities[index], operation.authority)) {
+        throw new HostStoreError("WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED", "Rollback authority changed");
+      }
+      authorities.splice(index, 1);
+      await this.writeWorkspaceAuthoritiesUnlocked(authorities);
+      return;
+    }
+    if (artifact === "thread") {
+      const threads = await this.readThreadsUnlocked();
+      const index = threads.findIndex((candidate) => candidate.threadId === operation.input.thread.threadId);
+      if (index < 0) return;
+      if (!isDeepStrictEqual(threads[index], operation.input.thread)) {
+        throw new HostStoreError("WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED", "Rollback thread changed");
+      }
+      threads.splice(index, 1);
+      await atomicWriteJson(this.paths.threads, ThreadFileSchema.parse({ version: 1, threads }));
+      return;
+    }
+    if (artifact === "snapshot") {
+      const path = this.snapshotPath(operation.input.thread.threadId);
+      const snapshot = await readJsonFile(path, ThreadProjectionSnapshotSchema, { optional: true });
+      if (!snapshot) return;
+      if (!isDeepStrictEqual(snapshot, operation.input.initialProjection)) {
+        throw new HostStoreError("WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED", "Rollback projection changed");
+      }
+      await durableRemoveFile(path);
+      return;
+    }
+    const projects = await this.readProjectsUnlocked();
+    const index = projects.findIndex((candidate) => candidate.projectId === operation.input.project.projectId);
+    if (index < 0) return;
+    if (!isDeepStrictEqual(projects[index], operation.input.project)) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_ARTIFACT_DIVERGED", "Rollback project changed");
+    }
+    projects.splice(index, 1);
+    await atomicWriteJson(this.paths.projects, ProjectFileSchema.parse({ version: 1, projects }));
+  }
+
+  private async advanceWorkspaceThreadBootstrapRollbackUnlocked(
+    operation: WorkspaceThreadBootstrapOperationRecord,
+    phase: WorkspaceThreadBootstrapRollbackPhase,
+    faultPoint: WorkspaceThreadBootstrapFaultPoint,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord> {
+    const rollback = operation.rollback;
+    if (!rollback) {
+      throw new HostStoreError("WORKSPACE_BOOTSTRAP_STATE_INVALID", "Workspace bootstrap rollback state is missing");
+    }
+    const updatedAt = causalNow(operation.updatedAt);
+    const advanced = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+      ...operation,
+      updatedAt,
+      rollback: { ...rollback, phase, updatedAt },
+    });
+    await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(advanced, faultPoint, true);
+    return advanced;
+  }
+
+  private async rollbackUnavailableWorkspaceThreadBootstrapOperationUnlocked(
+    operationValue: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<void> {
+    let operation = WorkspaceThreadBootstrapOperationRecordSchema.parse(operationValue);
+    if (!operation.rollback) {
+      const plan = await this.planWorkspaceThreadBootstrapRollbackUnlocked(operation);
+      const detectedAt = causalNow(operation.updatedAt);
+      operation = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+        ...operation,
+        updatedAt: detectedAt,
+        rollback: {
+          reason: "workspace_unavailable",
+          phase: "planned",
+          plan,
+          detectedAt,
+          updatedAt: detectedAt,
+        },
+      });
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_rollback_planned", true);
+    }
+    const currentRollbackPhaseRank = (): number => {
+      const rollback = operation.rollback;
+      if (!rollback) {
+        throw new HostStoreError("WORKSPACE_BOOTSTRAP_STATE_INVALID", "Workspace bootstrap rollback state is missing");
+      }
+      return workspaceThreadBootstrapRollbackPhaseRank(rollback.phase);
+    };
+
+    if (currentRollbackPhaseRank() < workspaceThreadBootstrapRollbackPhaseRank("authority_processed")) {
+      await this.processWorkspaceThreadBootstrapRollbackArtifactUnlocked(operation, "authority");
+      operation = await this.advanceWorkspaceThreadBootstrapRollbackUnlocked(
+        operation,
+        "authority_processed",
+        "after_rollback_authority",
+      );
+    }
+    if (currentRollbackPhaseRank() < workspaceThreadBootstrapRollbackPhaseRank("thread_processed")) {
+      await this.processWorkspaceThreadBootstrapRollbackArtifactUnlocked(operation, "thread");
+      operation = await this.advanceWorkspaceThreadBootstrapRollbackUnlocked(
+        operation,
+        "thread_processed",
+        "after_rollback_thread",
+      );
+    }
+    if (currentRollbackPhaseRank() < workspaceThreadBootstrapRollbackPhaseRank("snapshot_processed")) {
+      await this.processWorkspaceThreadBootstrapRollbackArtifactUnlocked(operation, "snapshot");
+      operation = await this.advanceWorkspaceThreadBootstrapRollbackUnlocked(
+        operation,
+        "snapshot_processed",
+        "after_rollback_snapshot",
+      );
+    }
+    if (currentRollbackPhaseRank() < workspaceThreadBootstrapRollbackPhaseRank("project_processed")) {
+      await this.processWorkspaceThreadBootstrapRollbackArtifactUnlocked(operation, "project");
+      operation = await this.advanceWorkspaceThreadBootstrapRollbackUnlocked(
+        operation,
+        "project_processed",
+        "after_rollback_project",
+      );
+    }
+    if (currentRollbackPhaseRank() < workspaceThreadBootstrapRollbackPhaseRank("retired")) {
+      await this.assertWorkspaceThreadBootstrapRollbackPlanCurrentUnlocked(operation);
+      await this.advanceWorkspaceThreadBootstrapRollbackUnlocked(
+        operation,
+        "retired",
+        "after_rollback_retired",
+      );
+    }
+  }
+
+  private async recoverWorkspaceThreadBootstrapOperationsUnlocked(): Promise<void> {
+    let operations: WorkspaceThreadBootstrapOperationRecord[];
+    try {
+      operations = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
+    } catch (error) {
+      if (error instanceof HostStoreError && error.code.startsWith("WORKSPACE_BOOTSTRAP_")) throw error;
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_RECOVERY_FAILED",
+        "Workspace bootstrap recovery could not read its durable intent",
+        false,
+        { cause: error },
+      );
+    }
+    for (const operation of operations) {
+      if (operation.phase === "committed" || operation.rollback?.phase === "retired") continue;
+      try {
+        if (operation.rollback) {
+          await this.rollbackUnavailableWorkspaceThreadBootstrapOperationUnlocked(operation);
+          continue;
+        }
+        await this.materializeWorkspaceThreadBootstrapOperationUnlocked(operation, false);
+      } catch (error) {
+        if (error instanceof HostStoreError && error.code === "WORKSPACE_PATH_UNAVAILABLE") {
+          await this.rollbackUnavailableWorkspaceThreadBootstrapOperationUnlocked(operation);
+          continue;
+        }
+        if (error instanceof HostStoreError && error.code.startsWith("WORKSPACE_BOOTSTRAP_")) throw error;
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_RECOVERY_FAILED",
+          "Workspace bootstrap recovery could not converge its exact local artifacts",
+          false,
+          { cause: error },
+        );
+      }
+    }
+  }
+
   private residentLifecycleOperationPath(operationId: string): string {
     return join(this.paths.residentLifecycleOperations, `${storageKey(operationId)}.json`);
   }
@@ -6794,6 +8296,26 @@ export class HostStore {
     }
   }
 
+  private async residentLifecycleSuccessorPreparedAtUnlocked(
+    binding: ResidentSessionBinding,
+    authority: ResidentLifecycleAuthority,
+  ): Promise<string> {
+    const bindingFingerprint = residentDispatchAuthorityFingerprint(binding);
+    const predecessor = (await this.readResidentLifecycleOperationsUnlocked()).find(
+      (operation) =>
+        operation.kind === "provision" &&
+        operation.phase === "committed" &&
+        operation.binding !== undefined &&
+        residentDispatchAuthorityFingerprint(operation.binding) === bindingFingerprint,
+    );
+    return causalNow(
+      authority.registeredAt,
+      binding.boundAt,
+      predecessor?.updatedAt,
+      predecessor?.terminalAt,
+    );
+  }
+
   private async residentBindingFromOwnedCandidateUnlocked(
     record: ResidentLifecycleOperationRecord,
     candidate: ResidentOwnedSessionCandidate,
@@ -6806,15 +8328,6 @@ export class HostStore {
       throw new HostStoreError(
         "RESIDENT_LIFECYCLE_CANDIDATE_AUTHORITY_MISMATCH",
         "The owned resident candidate does not use the exact canonical lifecycle workspace",
-      );
-    }
-    if (
-      Date.parse(candidate.boundAt) < Date.parse(record.preparedAt) ||
-      Date.parse(candidate.boundAt) < Date.parse(record.authority.registeredAt)
-    ) {
-      throw new HostStoreError(
-        "RESIDENT_LIFECYCLE_CANDIDATE_TIME_INVALID",
-        "The owned resident candidate identity predates its durable lifecycle authority",
       );
     }
     return validateResidentSessionBinding({
@@ -7292,7 +8805,7 @@ export class HostStore {
   ): Promise<ResidentLifecycleOperationRecord> {
     if (record.phase === "quarantined") return record;
     if (!residentLifecycleOperationIsNonterminal(record)) return record;
-    const timestamp = now();
+    const timestamp = causalNow(record.updatedAt);
     const quarantined = ResidentLifecycleOperationRecordSchema.parse({
       ...record,
       phase: "quarantined",
@@ -7335,7 +8848,7 @@ export class HostStore {
           } else if (operation.phase === "kill_acknowledged" || operation.phase === "completed") {
             await this.materializeCompletedResidentBindingUnlocked(operation);
             if (operation.phase === "kill_acknowledged") {
-              const completedAt = now();
+              const completedAt = causalNow(operation.updatedAt);
               operation = ResidentLifecycleOperationRecordSchema.parse({
                 ...operation,
                 phase: "completed",
@@ -7375,7 +8888,7 @@ export class HostStore {
           );
           if (active) {
             await this.assertResidentLifecycleProjectionProofUnlocked(operation);
-            const committedAt = now();
+            const committedAt = causalNow(operation.updatedAt);
             const committed = ResidentLifecycleOperationRecordSchema.parse({
               ...operation,
               phase: "committed",
@@ -7644,7 +9157,6 @@ export class HostStore {
               (candidate.kind === "end" || candidate.kind === "detach") &&
               candidate.binding !== undefined &&
               operationBinding !== undefined &&
-              Date.parse(candidate.preparedAt) >= Date.parse(operation.terminalAt ?? operation.updatedAt) &&
               residentDispatchAuthorityFingerprint(candidate.binding) ===
                 residentDispatchAuthorityFingerprint(operationBinding),
           );
@@ -8111,6 +9623,85 @@ function residentSubsystemUnavailable(cause: unknown): HostStoreError {
     "Resident continuity state is unavailable. Repair the retained private state and restart the host service.",
     false,
     { cause },
+  );
+}
+
+function workspaceThreadBootstrapOperationFingerprint(inputValue: WorkspaceThreadBootstrapInput): string {
+  const input = WorkspaceThreadBootstrapInputSchema.parse(inputValue);
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function workspaceThreadBootstrapCanonicalWorkspaceDigest(workspaceDirectory: string): string {
+  const directory = WorkspaceDirectorySchema.parse(workspaceDirectory);
+  return createHash("sha256").update(canonicalPathKey(directory)).digest("hex");
+}
+
+function workspaceThreadBootstrapPhaseRank(phase: WorkspaceThreadBootstrapPhase): number {
+  switch (phase) {
+    case "prepared":
+      return 0;
+    case "project_committed":
+      return 1;
+    case "snapshot_committed":
+      return 2;
+    case "thread_committed":
+      return 3;
+    case "authority_committed":
+      return 4;
+    case "committed":
+      return 5;
+  }
+}
+
+function workspaceThreadBootstrapRollbackPhaseRank(phase: WorkspaceThreadBootstrapRollbackPhase): number {
+  switch (phase) {
+    case "planned":
+      return 0;
+    case "authority_processed":
+      return 1;
+    case "thread_processed":
+      return 2;
+    case "snapshot_processed":
+      return 3;
+    case "project_processed":
+      return 4;
+    case "retired":
+      return 5;
+  }
+}
+
+function workspaceThreadBootstrapClaimsTransitionIsValid(
+  existing: WorkspaceThreadBootstrapArtifact[] | undefined,
+  candidate: WorkspaceThreadBootstrapArtifact[] | undefined,
+): boolean {
+  if (!existing || !candidate) return existing === candidate;
+  if (candidate.length < existing.length || candidate.length > existing.length + 1) return false;
+  return existing.every((artifact, index) => candidate[index] === artifact);
+}
+
+function workspaceThreadBootstrapStatus(
+  recordValue: WorkspaceThreadBootstrapOperationRecord,
+): WorkspaceThreadBootstrapStatus {
+  const record = WorkspaceThreadBootstrapOperationRecordSchema.parse(recordValue);
+  if (record.phase !== "committed" || !record.committedAt) {
+    throw new HostStoreError(
+      "WORKSPACE_BOOTSTRAP_NOT_COMMITTED",
+      "The workspace bootstrap operation has not committed its exact local artifacts",
+    );
+  }
+  return Object.freeze(
+    WorkspaceThreadBootstrapStatusSchema.parse({
+      version: 1,
+      operationId: record.operationId,
+      phase: "committed",
+      expectedHostId: record.input.expectedHostId,
+      projectId: record.input.project.projectId,
+      workspaceId: record.input.project.workspaceId,
+      threadId: record.input.thread.threadId,
+      executionGenerationId: record.input.thread.currentLocation.executionGenerationId,
+      preparedAt: record.preparedAt,
+      committedAt: record.committedAt,
+    }),
   );
 }
 
@@ -8740,9 +10331,22 @@ function parseWorkspaceRegistration(value: WorkspaceAuthorityRegistration): Work
   return parsed.data;
 }
 
+async function durableRemoveFile(path: string): Promise<void> {
+  await rm(path, { force: true });
+  // POSIX requires the directory entry removal to be flushed before the WAL
+  // may advance. Node does not expose a portable directory fsync on Windows.
+  if (process.platform === "win32") return;
+  const directory = await open(dirname(path), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 async function canonicalWorkspaceDirectory(value: string): Promise<string> {
   const parsed = WorkspaceDirectorySchema.safeParse(value);
-  if (!parsed.success) {
+  if (!parsed.success || !workspaceDirectoryIsPlatformQualified(value)) {
     throw new HostStoreError(
       "WORKSPACE_PATH_INVALID",
       "The workspace directory must be a bounded absolute path without control characters",
@@ -8769,6 +10373,19 @@ async function canonicalWorkspaceDirectory(value: string): Promise<string> {
     throw new HostStoreError("WORKSPACE_PATH_INVALID", "The canonical workspace directory is not a safe path");
   }
   return validated.data;
+}
+
+export function workspaceDirectoryIsPlatformQualified(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "win32") return posix.isAbsolute(value);
+  if (!win32.isAbsolute(value)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  const normalized = value.replaceAll("/", "\\");
+  if (/^\\\\\?\\[A-Za-z]:\\/.test(normalized)) return true;
+  if (/^\\\\\?\\UNC\\[^\\]+\\[^\\]+(?:\\|$)/i.test(normalized)) return true;
+  return /^\\\\(?![?.](?:\\|$))[^\\]+\\[^\\]+(?:\\|$)/.test(normalized);
 }
 
 function canonicalPathKey(value: string): string {
@@ -8995,4 +10612,19 @@ function randomId(prefix: string): string {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Produces an audit timestamp that cannot regress behind already-durable
+ * causal state. The clock remains informational: phase and exact identity
+ * checks authorize transitions, while these internal floors only keep the
+ * persisted history and ISO schemas monotonic through wall-clock rollback.
+ */
+function causalNow(...causalPredecessors: Array<string | undefined>): string {
+  let timestamp = Date.now();
+  for (const predecessor of causalPredecessors) {
+    if (predecessor === undefined) continue;
+    timestamp = Math.max(timestamp, Date.parse(predecessor));
+  }
+  return new Date(timestamp).toISOString();
 }

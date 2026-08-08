@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, type Session } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions, type Session } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerControlIpc } from './control/ipc'
@@ -193,6 +193,19 @@ void app.whenReady().then(async () => {
     app,
     openExternal: async (url) => {
       await shell.openExternal(url)
+    },
+    selectDirectory: async () => {
+      const options: OpenDialogOptions = {
+        title: 'Choose a workspace folder',
+        buttonLabel: 'Use workspace',
+        properties: ['openDirectory', 'createDirectory']
+      }
+      const window = mainWindow
+      const result = window && !window.isDestroyed()
+        ? await dialog.showOpenDialog(window, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled || result.filePaths.length !== 1) return undefined
+      return result.filePaths[0]
     }
   })
   unregisterOrderlyQuit = installOrderlyQuitDrain(app, {
