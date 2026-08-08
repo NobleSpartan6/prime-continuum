@@ -125,23 +125,349 @@ const WorkspaceAuthorityFileSchema = z
     }
   });
 
+export const MAX_RESIDENT_LIFECYCLE_OPERATIONS = 10_000;
+export const MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES = 2 * 1024 * 1024;
+
+const Sha256DigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
+
+export const ResidentLifecycleOperationInputSchema = z
+  .object({
+    operationId: IdSchema,
+    expectedHostId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    requestDigest: Sha256DigestSchema,
+  })
+  .strict();
+export type ResidentLifecycleOperationInput = z.infer<typeof ResidentLifecycleOperationInputSchema>;
+
+export const ResidentOwnedSessionCandidateSchema = ResidentSessionBindingSchema.pick({
+  workspaceDirectory: true,
+  activeSessionId: true,
+  sessionId: true,
+  sessionFile: true,
+  runtime: true,
+})
+  .extend({
+    candidateVersion: z.literal(1),
+    boundAt: IsoDateTimeSchema,
+  })
+  .strict();
+export type ResidentOwnedSessionCandidate = z.infer<typeof ResidentOwnedSessionCandidateSchema>;
+
+export const ResidentLifecyclePhaseSchema = z.enum([
+  "prepared",
+  "owned_create_dispatching",
+  "owned_observed",
+  "promotion_dispatching",
+  "promoted_observed",
+  "projection_committed",
+  "committed",
+  "ending",
+  "kill_dispatching",
+  "kill_acknowledged",
+  "detached",
+  "quarantined",
+  "completed",
+]);
+export type ResidentLifecyclePhase = z.infer<typeof ResidentLifecyclePhaseSchema>;
+
+const ResidentLifecycleKindSchema = z.enum(["provision", "end", "detach"]);
+export type ResidentLifecycleKind = z.infer<typeof ResidentLifecycleKindSchema>;
+
+const ResidentLifecycleQuarantineReasonSchema = z.enum([
+  "external_outcome_unknown",
+  "authority_changed",
+  "explicit_reconciliation_required",
+  "owned_client_lost",
+]);
+const ResidentLifecycleCompletionReasonSchema = z.enum([
+  "owned_create_failed_before_effect",
+  "owned_create_cleaned",
+]);
+
+const ResidentLifecycleAuthoritySchema = WorkspaceAuthoritySchema.extend({
+  authorityDigest: Sha256DigestSchema,
+}).strict();
+type ResidentLifecycleAuthority = z.infer<typeof ResidentLifecycleAuthoritySchema>;
+
+const ResidentLifecycleProjectionProofSchema = z
+  .object({
+    bindingFingerprint: Sha256DigestSchema,
+    projectionDigest: Sha256DigestSchema,
+    cursorGeneration: IdSchema,
+    cursorSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    publishedAt: IsoDateTimeSchema,
+  })
+  .strict();
+type ResidentLifecycleProjectionProof = z.infer<typeof ResidentLifecycleProjectionProofSchema>;
+
+const ResidentLifecycleOperationRecordSchema = z
+  .object({
+    version: z.literal(1),
+    kind: ResidentLifecycleKindSchema,
+    operationId: IdSchema,
+    input: ResidentLifecycleOperationInputSchema,
+    operationFingerprint: Sha256DigestSchema,
+    authority: ResidentLifecycleAuthoritySchema,
+    phase: ResidentLifecyclePhaseSchema,
+    preparedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    binding: ResidentSessionBindingSchema.optional(),
+    projectionProof: ResidentLifecycleProjectionProofSchema.optional(),
+    quarantinedFrom: z.enum([
+      "prepared",
+      "owned_create_dispatching",
+      "owned_observed",
+      "promotion_dispatching",
+      "promoted_observed",
+      "projection_committed",
+      "ending",
+      "kill_dispatching",
+      "kill_acknowledged",
+    ]).optional(),
+    quarantineReason: ResidentLifecycleQuarantineReasonSchema.optional(),
+    completionReason: ResidentLifecycleCompletionReasonSchema.optional(),
+    terminalAt: IsoDateTimeSchema.optional(),
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (
+      record.operationId !== record.input.operationId ||
+      record.operationFingerprint !==
+        residentLifecycleOperationFingerprint(record.kind, record.input, record.authority.authorityDigest) ||
+      record.authority.authorityDigest !== residentLifecycleAuthorityDigest(record.authority) ||
+      record.input.expectedHostId !== record.authority.hostId ||
+      record.input.projectId !== record.authority.projectId ||
+      record.input.workspaceId !== record.authority.workspaceId ||
+      record.input.threadId !== record.authority.threadId ||
+      record.input.executionGenerationId !== record.authority.executionGenerationId
+    ) {
+      context.addIssue({ code: "custom", message: "Resident lifecycle operation authority changed" });
+    }
+    if (Date.parse(record.updatedAt) < Date.parse(record.preparedAt)) {
+      context.addIssue({ code: "custom", path: ["updatedAt"], message: "Lifecycle update cannot precede preparation" });
+    }
+    const provisionPhases = new Set<ResidentLifecyclePhase>([
+      "prepared",
+      "owned_create_dispatching",
+      "owned_observed",
+      "promotion_dispatching",
+      "promoted_observed",
+      "projection_committed",
+      "committed",
+      "completed",
+      "quarantined",
+    ]);
+    const endPhases = new Set<ResidentLifecyclePhase>([
+      "ending",
+      "kill_dispatching",
+      "kill_acknowledged",
+      "completed",
+      "quarantined",
+    ]);
+    if (
+      (record.kind === "provision" && !provisionPhases.has(record.phase)) ||
+      (record.kind === "end" && !endPhases.has(record.phase)) ||
+      (record.kind === "detach" && record.phase !== "detached")
+    ) {
+      context.addIssue({ code: "custom", path: ["phase"], message: "Lifecycle phase does not belong to its operation" });
+    }
+    if (
+      record.phase === "quarantined" &&
+      ((record.kind === "provision" &&
+        ![
+          "prepared",
+          "owned_create_dispatching",
+          "owned_observed",
+          "promotion_dispatching",
+          "promoted_observed",
+          "projection_committed",
+        ].includes(record.quarantinedFrom ?? "")) ||
+        (record.kind === "end" &&
+          !["ending", "kill_dispatching", "kill_acknowledged"].includes(record.quarantinedFrom ?? "")) ||
+        record.kind === "detach")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quarantinedFrom"],
+        message: "Lifecycle quarantine origin does not belong to its operation",
+      });
+    }
+    const provisionPhaseHasNoBinding =
+      record.kind === "provision" &&
+      (record.phase === "prepared" ||
+        record.phase === "owned_create_dispatching" ||
+        record.phase === "completed" ||
+        (record.phase === "quarantined" &&
+          (record.quarantinedFrom === "prepared" || record.quarantinedFrom === "owned_create_dispatching")));
+    const bindingRequired = record.kind !== "provision" || !provisionPhaseHasNoBinding;
+    if (bindingRequired !== (record.binding !== undefined)) {
+      context.addIssue({ code: "custom", path: ["binding"], message: "Lifecycle binding does not match its phase" });
+    }
+    if (
+      record.binding &&
+      (record.binding.threadId !== record.input.threadId ||
+        record.binding.executionGenerationId !== record.input.executionGenerationId ||
+        !sameCanonicalPath(record.binding.workspaceDirectory, record.authority.workspaceDirectory))
+    ) {
+      context.addIssue({ code: "custom", path: ["binding"], message: "Lifecycle binding changed its exact authority" });
+    }
+    const proofRequired =
+      record.phase === "projection_committed" ||
+      record.phase === "committed" ||
+      (record.phase === "quarantined" && record.quarantinedFrom === "projection_committed");
+    if (proofRequired !== (record.projectionProof !== undefined)) {
+      context.addIssue({ code: "custom", path: ["projectionProof"], message: "Projection proof does not match lifecycle phase" });
+    }
+    if (
+      record.projectionProof &&
+      record.binding &&
+      record.projectionProof.bindingFingerprint !== residentDispatchAuthorityFingerprint(record.binding)
+    ) {
+      context.addIssue({ code: "custom", path: ["projectionProof"], message: "Projection proof changed its binding" });
+    }
+    const quarantined = record.phase === "quarantined";
+    if (quarantined !== (record.quarantinedFrom !== undefined && record.quarantineReason !== undefined)) {
+      context.addIssue({ code: "custom", message: "Lifecycle quarantine metadata is incomplete" });
+    }
+    if (
+      (record.quarantineReason === "owned_client_lost" && record.quarantinedFrom !== "owned_observed") ||
+      (record.quarantineReason === "external_outcome_unknown" &&
+        record.quarantinedFrom !== "owned_create_dispatching" &&
+        record.quarantinedFrom !== "promotion_dispatching" &&
+        record.quarantinedFrom !== "kill_dispatching")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quarantineReason"],
+        message: "Lifecycle quarantine reason does not match its exact origin",
+      });
+    }
+    const terminal = record.phase === "committed" || record.phase === "completed" || record.phase === "detached";
+    if (terminal !== (record.terminalAt !== undefined)) {
+      context.addIssue({ code: "custom", path: ["terminalAt"], message: "Lifecycle terminal time does not match its phase" });
+    }
+    const completedOwnedCreate =
+      record.kind === "provision" &&
+      record.phase === "completed" &&
+      (record.completionReason === "owned_create_failed_before_effect" ||
+        record.completionReason === "owned_create_cleaned");
+    if (completedOwnedCreate !== (record.completionReason !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["completionReason"],
+        message: "Lifecycle completion reason does not match its terminal operation",
+      });
+    }
+  });
+type ResidentLifecycleOperationRecord = z.infer<typeof ResidentLifecycleOperationRecordSchema>;
+
+export interface ResidentLifecycleStatus {
+  readonly version: 1;
+  readonly kind: ResidentLifecycleKind;
+  readonly operationId: string;
+  readonly phase: ResidentLifecyclePhase;
+  readonly expectedHostId: string;
+  readonly projectId: string;
+  readonly workspaceId: string;
+  readonly threadId: string;
+  readonly executionGenerationId: string;
+  readonly preparedAt: string;
+  readonly updatedAt: string;
+  readonly quarantinedFrom?: Exclude<ResidentLifecyclePhase, "committed" | "completed" | "detached" | "quarantined">;
+  readonly quarantineReason?: z.infer<typeof ResidentLifecycleQuarantineReasonSchema>;
+  readonly completionReason?: z.infer<typeof ResidentLifecycleCompletionReasonSchema>;
+  readonly terminalAt?: string;
+}
+
+const residentOwnedCreateLeaseBrand: unique symbol = Symbol("resident-owned-create-lease");
+const residentPromotionLeaseBrand: unique symbol = Symbol("resident-promotion-lease");
+const residentLifecycleProjectionLeaseBrand: unique symbol = Symbol("resident-lifecycle-projection-lease");
+const residentKillLeaseBrand: unique symbol = Symbol("resident-kill-lease");
+
+export interface ResidentOwnedCreateLease {
+  readonly [residentOwnedCreateLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly operationId: string;
+  readonly operationFingerprint: string;
+  readonly dispatchStartedAt: string;
+}
+
+export interface ResidentPromotionLease {
+  readonly [residentPromotionLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly operationId: string;
+  readonly operationFingerprint: string;
+  readonly binding: ResidentSessionBinding;
+  readonly dispatchStartedAt: string;
+}
+
+/**
+ * The only authority that can publish a projection for an activating binding.
+ * It can be recovered after restart only from durable post-promotion state;
+ * no external mutation is authorized by this lease.
+ */
+export interface ResidentLifecycleProjectionLease {
+  readonly [residentLifecycleProjectionLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly operationId: string;
+  readonly operationFingerprint: string;
+  readonly binding: ResidentSessionBinding;
+  readonly promotionObservedAt: string;
+}
+
+export interface ResidentKillLease {
+  readonly [residentKillLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly operationId: string;
+  readonly operationFingerprint: string;
+  readonly binding: ResidentSessionBinding;
+  readonly dispatchStartedAt: string;
+}
+
 const ResidentSessionBindingRecordSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("activating"),
+      binding: ResidentSessionBindingSchema,
+      operationId: IdSchema,
+      observedAt: IsoDateTimeSchema,
+    })
+    .strict(),
   z
     .object({
       state: z.literal("active"),
       binding: ResidentSessionBindingSchema,
+      operationId: IdSchema.optional(),
     })
     .strict(),
   z
     .object({
       state: z.literal("completed"),
       binding: ResidentSessionBindingSchema,
+      operationId: IdSchema.optional(),
       completedAt: IsoDateTimeSchema,
     })
     .strict()
     .refine((record) => Date.parse(record.completedAt) >= Date.parse(record.binding.boundAt), {
       path: ["completedAt"],
       message: "Completion cannot precede the resident binding",
+    }),
+  z
+    .object({
+      state: z.literal("detached"),
+      binding: ResidentSessionBindingSchema,
+      operationId: IdSchema,
+      detachedAt: IsoDateTimeSchema,
+      reason: z.enum(["explicit", "ending"]),
+    })
+    .strict()
+    .refine((record) => Date.parse(record.detachedAt) >= Date.parse(record.binding.boundAt), {
+      path: ["detachedAt"],
+      message: "Detachment cannot precede the resident binding",
     }),
 ]);
 type ResidentSessionBindingRecord = z.infer<typeof ResidentSessionBindingRecordSchema>;
@@ -175,7 +501,7 @@ const ResidentSessionBindingFileSchema = z
         }
         seen.add(value);
       }
-      if (record.state === "active") {
+      if (record.state === "active" || record.state === "activating") {
         if (activeThreadIds.has(binding.threadId)) {
           context.addIssue({
             code: "custom",
@@ -1030,6 +1356,7 @@ const ResidentProjectionTransactionSchema = z
     transactionId: IdSchema,
     preparedAt: IsoDateTimeSchema,
     binding: ResidentSessionBindingSchema,
+    lifecycleOperationId: IdSchema.optional(),
     projectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
     previousLineage: ResidentProjectionCursorLineageSchema.optional(),
     nextLineage: ResidentProjectionCursorLineageSchema,
@@ -1074,6 +1401,12 @@ const ResidentProjectionTransactionSchema = z
       });
     }
     const abortProof = transaction.abortIdleProofAttempt;
+    if (transaction.lifecycleOperationId !== undefined && abortProof !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "An activating projection cannot consume a Stop reconciliation proof",
+      });
+    }
     if (
       abortProof &&
       (!residentAcknowledgedAbortAttemptRetainsLock(abortProof) ||
@@ -1179,6 +1512,29 @@ export type ResidentDispatchFaultPoint =
   | "after_abort_idle_journal"
   | "after_abort_idle_event";
 
+export type ResidentLifecycleFaultPoint =
+  | "after_prepared"
+  | "after_owned_create_dispatching"
+  | "after_mutation_failed_before_effect"
+  | "after_owned_create_cleanup"
+  | "after_quarantined"
+  | "after_owned_observed"
+  | "after_promotion_dispatching"
+  | "after_promoted_observed"
+  | "after_activating_binding"
+  | "after_projection_publication"
+  | "after_projection_committed"
+  | "after_active_binding"
+  | "after_committed"
+  | "after_ending"
+  | "after_binding_revoked"
+  | "after_kill_dispatching"
+  | "after_kill_acknowledged"
+  | "after_completed_binding"
+  | "after_completed"
+  | "after_detached"
+  | "after_detached_binding";
+
 export type HandoffCheckpointWriter = (path: string, checkpoint: HandoffCheckpoint) => Promise<boolean>;
 
 export interface HostStoreOptions {
@@ -1190,6 +1546,10 @@ export interface HostStoreOptions {
   residentDispatchFaultInjector?: (
     point: ResidentDispatchFaultPoint,
     attemptId: string,
+  ) => void | Promise<void>;
+  residentLifecycleFaultInjector?: (
+    point: ResidentLifecycleFaultPoint,
+    operationId: string,
   ) => void | Promise<void>;
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
@@ -1243,6 +1603,10 @@ export class HostStore {
   private readonly residentPromptReconciliationLeaseCache = new Map<string, ResidentPromptReconciliationLease>();
   private readonly residentAbortReconciliationLeases = new WeakSet<object>();
   private readonly residentAbortReconciliationLeaseCache = new Map<string, ResidentAbortReconciliationLease>();
+  private readonly residentOwnedCreateLeases = new WeakSet<object>();
+  private readonly residentPromotionLeases = new WeakSet<object>();
+  private readonly residentLifecycleProjectionLeases = new WeakSet<object>();
+  private readonly residentKillLeases = new WeakSet<object>();
 
   constructor(dataDir: string, options: HostStoreOptions = {}) {
     this.paths = getHostDataPaths(dataDir);
@@ -1261,6 +1625,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.residentProjectionTransactions),
         ensurePrivateDirectory(this.paths.residentProjectionLineages),
         ensurePrivateDirectory(this.paths.residentDispatchAttempts),
+        ensurePrivateDirectory(this.paths.residentLifecycleOperations),
         ensurePrivateDirectory(this.commandIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionAttemptsDirectory()),
@@ -1304,6 +1669,8 @@ export class HostStore {
             MAX_RESIDENT_SESSION_BINDING_FILE_BYTES,
           );
         }
+        await this.validateResidentLifecycleOperationDirectoryUnlocked();
+        await this.recoverResidentLifecycleOperationsUnlocked("before_projection_recovery");
         await this.validateResidentProjectionLineageDirectoryUnlocked();
       } catch (error) {
         this.residentSubsystemFault = residentSubsystemUnavailable(error);
@@ -1327,6 +1694,7 @@ export class HostStore {
         // unlike an unrelated resident-state degradation, replay failure is a
         // global public-consistency failure and therefore aborts initialize().
         await this.recoverResidentProjectionTransactionsUnlocked();
+        await this.recoverResidentLifecycleOperationsUnlocked("after_projection_recovery");
         try {
           await this.validateResidentStateUnlocked();
         } catch (error) {
@@ -1403,6 +1771,16 @@ export class HostStore {
         const current = projects[existing];
         if (!current) throw new HostStoreError("PROJECT_STATE_INVALID", "The project catalog index is invalid");
         if (current.hostId !== project.hostId || current.workspaceId !== project.workspaceId) {
+          const lifecycle = (await this.readResidentLifecycleOperationsUnlocked()).find(
+            (operation) =>
+              operation.input.projectId === project.projectId && residentLifecycleOperationIsNonterminal(operation),
+          );
+          if (lifecycle) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_IN_PROGRESS",
+              "Project execution authority cannot change during a resident lifecycle operation",
+            );
+          }
           const authorities = await this.readWorkspaceAuthoritiesUnlocked();
           if (authorities.some((authority) => authority.projectId === project.projectId)) {
             throw new HostStoreError(
@@ -1435,6 +1813,7 @@ export class HostStore {
         const current = threads[existing];
         if (!current) throw new HostStoreError("THREAD_STATE_INVALID", "The thread catalog index is invalid");
         if (!isDeepStrictEqual(current.currentLocation, thread.currentLocation)) {
+          await this.assertNoResidentLifecycleOperationUnlocked(thread.threadId);
           await this.assertNoResidentDispatchTransitionUnlocked(
             thread.threadId,
             "Execution authority cannot change while a resident dispatch is unresolved",
@@ -1515,6 +1894,7 @@ export class HostStore {
       });
       if (existing && isDeepStrictEqual(existing, authority)) return canonicalDirectory;
       if (existing) {
+        await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
         await this.assertNoResidentDispatchTransitionUnlocked(
           input.threadId,
           "Workspace authority cannot change while a resident dispatch is unresolved",
@@ -1585,6 +1965,572 @@ export class HostStore {
     });
   }
 
+  async getResidentLifecycleStatus(operationIdValue: string): Promise<ResidentLifecycleStatus | undefined> {
+    const operationId = IdSchema.parse(operationIdValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const record = await this.readResidentLifecycleOperationUnlocked(operationId);
+      return record ? residentLifecycleStatus(record) : undefined;
+    });
+  }
+
+  async prepareResidentProvision(inputValue: ResidentLifecycleOperationInput): Promise<ResidentLifecycleStatus> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const existing = await this.resolveExactResidentLifecycleOperationUnlocked("provision", input, {
+        optional: true,
+      });
+      if (existing) return residentLifecycleStatus(existing);
+
+      const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
+      await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
+      if ((await this.readResidentSessionBindingsUnlocked()).some((binding) => binding.threadId === input.threadId)) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_ALREADY_ACTIVE",
+          "A new resident session cannot be provisioned while this thread already has an active binding",
+        );
+      }
+      const timestamp = now();
+      const record = ResidentLifecycleOperationRecordSchema.parse({
+        version: 1,
+        kind: "provision",
+        operationId: input.operationId,
+        input,
+        operationFingerprint: residentLifecycleOperationFingerprint("provision", input, authority.authorityDigest),
+        authority,
+        phase: "prepared",
+        preparedAt: timestamp,
+        updatedAt: timestamp,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(record, "after_prepared");
+      return residentLifecycleStatus(record);
+    });
+  }
+
+  async beginResidentOwnedCreate(inputValue: ResidentLifecycleOperationInput): Promise<ResidentOwnedCreateLease> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const record = await this.requireExactResidentLifecycleOperationUnlocked("provision", input);
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      if (record.phase !== "prepared") {
+        throw residentLifecycleMutationAlreadyCrossed(record, "owned create");
+      }
+      const dispatchStartedAt = now();
+      const dispatching = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "owned_create_dispatching",
+        updatedAt: dispatchStartedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(dispatching, "after_owned_create_dispatching");
+      const lease = Object.freeze({
+        [residentOwnedCreateLeaseBrand]: true as const,
+        leaseVersion: 1 as const,
+        operationId: record.operationId,
+        operationFingerprint: record.operationFingerprint,
+        dispatchStartedAt,
+      });
+      this.residentOwnedCreateLeases.add(lease);
+      return lease;
+    });
+  }
+
+  async observeResidentOwnedCandidate(
+    leaseValue: ResidentOwnedCreateLease,
+    candidateValue: ResidentOwnedSessionCandidate,
+  ): Promise<ResidentLifecycleStatus> {
+    const candidate = ResidentOwnedSessionCandidateSchema.parse(candidateValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentOwnedCreateLease(leaseValue);
+      const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        !record ||
+        record.kind !== "provision" ||
+        record.phase !== "owned_create_dispatching" ||
+        record.operationFingerprint !== lease.operationFingerprint ||
+        record.updatedAt !== lease.dispatchStartedAt
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_STALE",
+          "The owned-create lease no longer matches its exact durable lifecycle operation",
+        );
+      }
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      const binding = await this.residentBindingFromOwnedCandidateUnlocked(record, candidate);
+      await this.assertResidentLifecycleCandidateUnusedUnlocked(record, binding);
+      const observedAt = now();
+      const observed = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "owned_observed",
+        binding,
+        updatedAt: observedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(observed, "after_owned_observed");
+      this.residentOwnedCreateLeases.delete(lease as object);
+      return residentLifecycleStatus(observed);
+    });
+  }
+
+  /**
+   * Terminal only when the coordinator has proof that create was never
+   * invoked. A post-create validation or attach failure must instead confirm
+   * complete_owned_session and use completeResidentOwnedCreateCleanup; an
+   * unknown cleanup outcome must be quarantined.
+   */
+  async failResidentOwnedCreateBeforeEffect(
+    leaseValue: ResidentOwnedCreateLease,
+  ): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentOwnedCreateLease(leaseValue);
+      const record = await this.requireLifecycleLeaseRecordUnlocked(
+        lease,
+        "provision",
+        "owned_create_dispatching",
+      );
+      const completedAt = now();
+      const completed = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "completed",
+        completionReason: "owned_create_failed_before_effect",
+        updatedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(completed, "after_mutation_failed_before_effect");
+      this.residentOwnedCreateLeases.delete(lease as object);
+      return residentLifecycleStatus(completed);
+    });
+  }
+
+  /**
+   * Records definitive cleanup of a session that may have been created but
+   * could not produce a valid owned candidate. The exact create lease remains
+   * the authority; this transition is legal only after an independently parsed
+   * successful complete_owned_session response. A resolved upstream dispose()
+   * is not proof because Prime v0.7 swallows completion failures there.
+   */
+  async completeResidentOwnedCreateCleanup(
+    leaseValue: ResidentOwnedCreateLease,
+  ): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentOwnedCreateLease(leaseValue);
+      const record = await this.requireLifecycleLeaseRecordUnlocked(
+        lease,
+        "provision",
+        "owned_create_dispatching",
+      );
+      const completedAt = now();
+      const completed = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "completed",
+        completionReason: "owned_create_cleaned",
+        updatedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(completed, "after_owned_create_cleanup");
+      this.residentOwnedCreateLeases.delete(lease as object);
+      return residentLifecycleStatus(completed);
+    });
+  }
+
+  async beginResidentPromotion(inputValue: ResidentLifecycleOperationInput): Promise<ResidentPromotionLease> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const record = await this.requireExactResidentLifecycleOperationUnlocked("provision", input);
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      if (record.phase !== "owned_observed" || !record.binding) {
+        throw residentLifecycleMutationAlreadyCrossed(record, "owned-session promotion");
+      }
+      const dispatchStartedAt = now();
+      const dispatching = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "promotion_dispatching",
+        updatedAt: dispatchStartedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(dispatching, "after_promotion_dispatching");
+      const lease = Object.freeze({
+        [residentPromotionLeaseBrand]: true as const,
+        leaseVersion: 1 as const,
+        operationId: record.operationId,
+        operationFingerprint: record.operationFingerprint,
+        binding: validateResidentSessionBinding(record.binding),
+        dispatchStartedAt,
+      });
+      this.residentPromotionLeases.add(lease);
+      return lease;
+    });
+  }
+
+  async failResidentPromotionBeforeEffect(
+    leaseValue: ResidentPromotionLease,
+  ): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentPromotionLease(leaseValue);
+      const record = await this.requireLifecycleLeaseRecordUnlocked(
+        lease,
+        "provision",
+        "promotion_dispatching",
+      );
+      const retryable = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "owned_observed",
+        updatedAt: now(),
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(retryable, "after_mutation_failed_before_effect");
+      this.residentPromotionLeases.delete(lease as object);
+      return residentLifecycleStatus(retryable);
+    });
+  }
+
+  async observeResidentPromotion(leaseValue: ResidentPromotionLease): Promise<ResidentLifecycleProjectionLease> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentPromotionLease(leaseValue);
+      const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        !record ||
+        record.kind !== "provision" ||
+        record.phase !== "promotion_dispatching" ||
+        !record.binding ||
+        record.operationFingerprint !== lease.operationFingerprint ||
+        record.updatedAt !== lease.dispatchStartedAt ||
+        !isDeepStrictEqual(record.binding, lease.binding)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_STALE",
+          "The promotion lease no longer matches its exact durable lifecycle operation",
+        );
+      }
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      const promotionObservedAt = now();
+      const observed = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "promoted_observed",
+        updatedAt: promotionObservedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(observed, "after_promoted_observed");
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeActivatingResidentBindingUnlocked(observed);
+        await this.injectResidentLifecycleFault("after_activating_binding", observed.operationId);
+      });
+      this.residentPromotionLeases.delete(lease as object);
+      return this.createResidentLifecycleProjectionLease(observed, promotionObservedAt);
+    });
+  }
+
+  async acquireResidentProvisionRecoveryLease(
+    inputValue: ResidentLifecycleOperationInput,
+  ): Promise<ResidentLifecycleProjectionLease> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const record = await this.requireExactResidentLifecycleOperationUnlocked("provision", input);
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      if ((record.phase !== "promoted_observed" && record.phase !== "projection_committed") || !record.binding) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_RECOVERY_UNAVAILABLE",
+          "Only durable post-promotion state can mint a local provisioning recovery lease",
+        );
+      }
+      await this.guardResidentLifecycleMaterializationUnlocked(() =>
+        this.materializeActivatingResidentBindingUnlocked(record),
+      );
+      return this.createResidentLifecycleProjectionLease(record, record.updatedAt);
+    });
+  }
+
+  async commitResidentProvision(leaseValue: ResidentLifecycleProjectionLease): Promise<ResidentSessionBinding> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentLifecycleProjectionLease(leaseValue);
+      const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        !record ||
+        record.kind !== "provision" ||
+        record.phase !== "projection_committed" ||
+        !record.binding ||
+        !record.projectionProof ||
+        record.operationFingerprint !== lease.operationFingerprint ||
+        !isDeepStrictEqual(record.binding, lease.binding)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_PROJECTION_PROOF_REQUIRED",
+          "Provisioning can commit only from its exact durable projection proof",
+        );
+      }
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      await this.assertResidentLifecycleProjectionProofUnlocked(record);
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeActiveResidentBindingUnlocked(record);
+        await this.injectResidentLifecycleFault("after_active_binding", record.operationId);
+      });
+      const committedAt = now();
+      const committed = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "committed",
+        updatedAt: committedAt,
+        terminalAt: committedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(committed, "after_committed");
+      this.residentLifecycleProjectionLeases.delete(lease as object);
+      return validateResidentSessionBinding(record.binding);
+    });
+  }
+
+  async prepareResidentEnd(
+    inputValue: ResidentLifecycleOperationInput,
+    bindingValue: ResidentSessionBinding,
+  ): Promise<ResidentLifecycleStatus> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    const binding = validateResidentSessionBinding(bindingValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const existing = await this.resolveExactResidentLifecycleOperationUnlocked("end", input, { optional: true });
+      if (existing) {
+        if (!existing.binding || !isDeepStrictEqual(existing.binding, binding)) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+            "This resident end operation is already bound to a different exact resident binding",
+          );
+        }
+        await this.guardResidentLifecycleMaterializationUnlocked(() =>
+          this.materializeEndingResidentBindingRevocationUnlocked(existing),
+        );
+        return residentLifecycleStatus(existing);
+      }
+      const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
+      await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
+      await this.assertNoResidentDispatchTransitionUnlocked(
+        input.threadId,
+        "Resident end cannot begin while a dispatch is unresolved",
+      );
+      this.assertBindingMatchesLifecycleAuthority(binding, authority);
+      await this.assertExactActiveResidentBindingUnlocked(binding);
+      const timestamp = now();
+      const record = ResidentLifecycleOperationRecordSchema.parse({
+        version: 1,
+        kind: "end",
+        operationId: input.operationId,
+        input,
+        operationFingerprint: residentLifecycleOperationFingerprint("end", input, authority.authorityDigest),
+        authority,
+        phase: "ending",
+        preparedAt: timestamp,
+        updatedAt: timestamp,
+        binding,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(record, "after_ending");
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeEndingResidentBindingRevocationUnlocked(record);
+        await this.injectResidentLifecycleFault("after_binding_revoked", record.operationId);
+      });
+      return residentLifecycleStatus(record);
+    });
+  }
+
+  async beginResidentKill(inputValue: ResidentLifecycleOperationInput): Promise<ResidentKillLease> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const record = await this.requireExactResidentLifecycleOperationUnlocked("end", input);
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      if (record.phase !== "ending" || !record.binding) {
+        throw residentLifecycleMutationAlreadyCrossed(record, "resident kill");
+      }
+      await this.assertResidentBindingRevokedForOperationUnlocked(record);
+      const dispatchStartedAt = now();
+      const dispatching = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "kill_dispatching",
+        updatedAt: dispatchStartedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(dispatching, "after_kill_dispatching");
+      const lease = Object.freeze({
+        [residentKillLeaseBrand]: true as const,
+        leaseVersion: 1 as const,
+        operationId: record.operationId,
+        operationFingerprint: record.operationFingerprint,
+        binding: validateResidentSessionBinding(record.binding),
+        dispatchStartedAt,
+      });
+      this.residentKillLeases.add(lease);
+      return lease;
+    });
+  }
+
+  async failResidentKillBeforeEffect(leaseValue: ResidentKillLease): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentKillLease(leaseValue);
+      const record = await this.requireLifecycleLeaseRecordUnlocked(lease, "end", "kill_dispatching");
+      const retryable = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "ending",
+        updatedAt: now(),
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(retryable, "after_mutation_failed_before_effect");
+      this.residentKillLeases.delete(lease as object);
+      return residentLifecycleStatus(retryable);
+    });
+  }
+
+  async quarantineResidentLifecycleOutcomeUnknown(
+    leaseValue: ResidentOwnedCreateLease | ResidentPromotionLease | ResidentKillLease,
+  ): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      let record: ResidentLifecycleOperationRecord;
+      let lease: ResidentOwnedCreateLease | ResidentPromotionLease | ResidentKillLease;
+      if (this.residentOwnedCreateLeases.has(leaseValue as object)) {
+        lease = this.validateResidentOwnedCreateLease(leaseValue as ResidentOwnedCreateLease);
+        record = await this.requireLifecycleLeaseRecordUnlocked(
+          lease,
+          "provision",
+          "owned_create_dispatching",
+        );
+        this.residentOwnedCreateLeases.delete(lease as object);
+      } else if (this.residentPromotionLeases.has(leaseValue as object)) {
+        lease = this.validateResidentPromotionLease(leaseValue as ResidentPromotionLease);
+        record = await this.requireLifecycleLeaseRecordUnlocked(
+          lease,
+          "provision",
+          "promotion_dispatching",
+        );
+        this.residentPromotionLeases.delete(lease as object);
+      } else {
+        lease = this.validateResidentKillLease(leaseValue as ResidentKillLease);
+        record = await this.requireLifecycleLeaseRecordUnlocked(lease, "end", "kill_dispatching");
+        this.residentKillLeases.delete(lease as object);
+      }
+      const quarantined = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "quarantined",
+        quarantinedFrom: record.phase,
+        quarantineReason: "external_outcome_unknown",
+        updatedAt: now(),
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(quarantined, "after_quarantined");
+      return residentLifecycleStatus(quarantined);
+    });
+  }
+
+  async acknowledgeResidentKill(leaseValue: ResidentKillLease): Promise<ResidentLifecycleStatus> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentKillLease(leaseValue);
+      const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        !record ||
+        record.kind !== "end" ||
+        record.phase !== "kill_dispatching" ||
+        !record.binding ||
+        record.operationFingerprint !== lease.operationFingerprint ||
+        record.updatedAt !== lease.dispatchStartedAt ||
+        !isDeepStrictEqual(record.binding, lease.binding)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_STALE",
+          "The kill lease no longer matches its exact durable lifecycle operation",
+        );
+      }
+      const acknowledgedAt = now();
+      const acknowledged = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "kill_acknowledged",
+        updatedAt: acknowledgedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(acknowledged, "after_kill_acknowledged");
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeCompletedResidentBindingUnlocked(acknowledged);
+        await this.injectResidentLifecycleFault("after_completed_binding", record.operationId);
+      });
+      const completedAt = now();
+      const completed = ResidentLifecycleOperationRecordSchema.parse({
+        ...acknowledged,
+        phase: "completed",
+        updatedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(completed, "after_completed");
+      this.residentKillLeases.delete(lease as object);
+      return residentLifecycleStatus(completed);
+    });
+  }
+
+  async detachResidentLifecycle(
+    inputValue: ResidentLifecycleOperationInput,
+    bindingValue: ResidentSessionBinding,
+  ): Promise<ResidentLifecycleStatus> {
+    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+    const binding = validateResidentSessionBinding(bindingValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const existing = await this.resolveExactResidentLifecycleOperationUnlocked("detach", input, { optional: true });
+      if (existing) {
+        if (!existing.binding || !isDeepStrictEqual(existing.binding, binding)) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+            "This resident detach operation is already bound to a different exact resident binding",
+          );
+        }
+        await this.guardResidentLifecycleMaterializationUnlocked(() =>
+          this.materializeDetachedResidentBindingUnlocked(existing),
+        );
+        return residentLifecycleStatus(existing);
+      }
+      const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
+      await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
+      await this.assertNoResidentDispatchTransitionUnlocked(
+        input.threadId,
+        "Resident detach cannot begin while a dispatch is unresolved",
+      );
+      this.assertBindingMatchesLifecycleAuthority(binding, authority);
+      await this.assertExactActiveResidentBindingUnlocked(binding);
+      const timestamp = now();
+      const record = ResidentLifecycleOperationRecordSchema.parse({
+        version: 1,
+        kind: "detach",
+        operationId: input.operationId,
+        input,
+        operationFingerprint: residentLifecycleOperationFingerprint("detach", input, authority.authorityDigest),
+        authority,
+        phase: "detached",
+        preparedAt: timestamp,
+        updatedAt: timestamp,
+        terminalAt: timestamp,
+        binding,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(record, "after_detached");
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeDetachedResidentBindingUnlocked(record);
+        await this.injectResidentLifecycleFault("after_detached_binding", record.operationId);
+      });
+      return residentLifecycleStatus(record);
+    });
+  }
+
   /**
    * Reports whether the public thread snapshot is backed by the private cursor
    * lineage for this exact active resident authority. The gateway additionally
@@ -1631,6 +2577,7 @@ export class HostStore {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const binding = validateResidentSessionBinding(bindingValue);
+      await this.assertNoResidentLifecycleOperationUnlocked(binding.threadId);
       const scope = await this.currentWorkspaceScopeUnlocked(
         binding.threadId,
         binding.executionGenerationId,
@@ -1685,7 +2632,13 @@ export class HostStore {
         );
       }
       if (existing && isDeepStrictEqual(existing, binding)) return;
-      const activeRecord = ResidentSessionBindingRecordSchema.parse({ state: "active", binding });
+      const activeRecord = ResidentSessionBindingRecordSchema.parse({
+        state: "active",
+        binding,
+        ...(existingRecord?.state === "active" && existingRecord.operationId
+          ? { operationId: existingRecord.operationId }
+          : {}),
+      });
       if (existingIndex >= 0) records[existingIndex] = activeRecord;
       else {
         if (records.length >= MAX_RESIDENT_SESSION_BINDINGS) {
@@ -1707,10 +2660,82 @@ export class HostStore {
     projection: ResidentProjectionSnapshot,
     abortIdleLeaseValue?: ResidentAbortReconciliationLease,
   ): Promise<ThreadProjectionSnapshot> {
+    return this.exclusive(() =>
+      this.publishResidentProjectionSnapshotUnlocked(bindingValue, projection, abortIdleLeaseValue),
+    );
+  }
+
+  async publishResidentLifecycleProjection(
+    leaseValue: ResidentLifecycleProjectionLease,
+    projection: ResidentProjectionSnapshot,
+  ): Promise<ThreadProjectionSnapshot> {
     return this.exclusive(async () => {
+      const lease = this.validateResidentLifecycleProjectionLease(leaseValue);
+      const published = await this.publishResidentProjectionSnapshotUnlocked(
+        lease.binding,
+        projection,
+        undefined,
+        lease,
+      );
+      try {
+        await this.injectResidentLifecycleFault("after_projection_publication", lease.operationId);
+        const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+        if (
+          !record ||
+          record.kind !== "provision" ||
+          (record.phase !== "promoted_observed" && record.phase !== "projection_committed") ||
+          !record.binding ||
+          record.operationFingerprint !== lease.operationFingerprint ||
+          !isDeepStrictEqual(record.binding, lease.binding)
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_LEASE_STALE",
+            "The lifecycle projection lease no longer matches its exact durable operation",
+          );
+        }
+        const proof = ResidentLifecycleProjectionProofSchema.parse({
+          bindingFingerprint: residentDispatchAuthorityFingerprint(record.binding),
+          projectionDigest: residentProjectionDigest(projection),
+          cursorGeneration: projection.cursor.generation,
+          cursorSequence: projection.cursor.sequence,
+          publishedAt: published.generatedAt,
+        });
+        const projectionCommitted = ResidentLifecycleOperationRecordSchema.parse({
+          ...record,
+          phase: "projection_committed",
+          projectionProof: proof,
+          updatedAt: published.generatedAt,
+        });
+        await this.writeResidentLifecycleBoundaryUnlocked(
+          projectionCommitted,
+          "after_projection_committed",
+        );
+        return published;
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+    });
+  }
+
+  private async publishResidentProjectionSnapshotUnlocked(
+    bindingValue: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+    abortIdleLeaseValue?: ResidentAbortReconciliationLease,
+    lifecycleLeaseValue?: ResidentLifecycleProjectionLease,
+  ): Promise<ThreadProjectionSnapshot> {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const binding = validateResidentSessionBinding(bindingValue);
+      const lifecycleRecord = lifecycleLeaseValue
+        ? await this.assertResidentLifecycleProjectionLeaseAuthorityUnlocked(lifecycleLeaseValue, binding)
+        : undefined;
+      if (lifecycleRecord && abortIdleLeaseValue) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_AUTHORITY_CONFLICT",
+          "An activating projection cannot use an active-session reconciliation lease",
+        );
+      }
       const scope = await this.currentWorkspaceScopeUnlocked(
         binding.threadId,
         binding.executionGenerationId,
@@ -1722,16 +2747,29 @@ export class HostStore {
       const active = records.find(
         (record) => record.state === "active" && record.binding.threadId === binding.threadId,
       );
-      if (!active) {
+      const activating = lifecycleRecord
+        ? records.find(
+            (record) =>
+              record.state === "activating" &&
+              record.operationId === lifecycleRecord.operationId &&
+              record.binding.threadId === binding.threadId,
+          )
+        : undefined;
+      const projectionBinding = active ?? activating;
+      if (!projectionBinding) {
         throw new HostStoreError(
           "RESIDENT_PROJECTION_BINDING_NOT_FOUND",
-          "No active resident binding exists for this projection",
+          lifecycleRecord
+            ? "No exact activating resident binding exists for this lifecycle projection"
+            : "No active resident binding exists for this projection",
         );
       }
-      if (!isDeepStrictEqual(active.binding, binding)) {
+      if (!isDeepStrictEqual(projectionBinding.binding, binding)) {
         throw new HostStoreError(
           "RESIDENT_PROJECTION_BINDING_MISMATCH",
-          "Only the exact active resident binding may publish a projection",
+          lifecycleRecord
+            ? "Only the exact lifecycle candidate may publish its activating projection"
+            : "Only the exact active resident binding may publish a projection",
         );
       }
       if (
@@ -1949,6 +2987,7 @@ export class HostStore {
             ),
         preparedAt: generatedAt,
         binding,
+        ...(lifecycleRecord ? { lifecycleOperationId: lifecycleRecord.operationId } : {}),
         projectionDigest,
         previousLineage,
         nextLineage,
@@ -1976,7 +3015,6 @@ export class HostStore {
         throw error;
       }
       return published;
-    });
   }
 
   async completeResidentSessionBinding(bindingValue: ResidentSessionBinding): Promise<void> {
@@ -1984,6 +3022,7 @@ export class HostStore {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const binding = validateResidentSessionBinding(bindingValue);
+      await this.assertNoResidentLifecycleOperationUnlocked(binding.threadId);
       const scope = await this.currentWorkspaceScopeUnlocked(
         binding.threadId,
         binding.executionGenerationId,
@@ -2009,6 +3048,12 @@ export class HostStore {
         throw new HostStoreError(
           "RESIDENT_BINDING_CONFLICT",
           "Only the exact current resident session binding may be completed",
+        );
+      }
+      if (existing.operationId) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_REQUIRED",
+          "A lifecycle-managed resident binding can be completed only through its exact durable end operation",
         );
       }
       await this.assertNoResidentDispatchTransitionUnlocked(
@@ -3092,6 +4137,7 @@ export class HostStore {
           "The handoff source generation is no longer authoritative",
         );
       }
+      await this.assertNoResidentLifecycleOperationUnlocked(thread.threadId);
       if (thread.currentLocation.hostId === request.destinationHostId) {
         throw new HostStoreError("SAME_HOST_HANDOFF", "The destination must be a different host");
       }
@@ -3182,6 +4228,7 @@ export class HostStore {
         await this.ensureHandoffCommandReceiptUnlocked(record.receipt, command);
         return { receipt: record.receipt, progress: record.progress, duplicate: true };
       }
+      await this.assertNoResidentLifecycleOperationUnlocked(record.plan.threadId);
 
       const existingCommand = await this.readReceiptUnlocked(command);
       if (existingCommand) {
@@ -3368,16 +4415,41 @@ export class HostStore {
     const active = records.find(
       (record) => record.state === "active" && record.binding.threadId === binding.threadId,
     );
-    if (!active) {
+    let projectionBinding: ResidentSessionBindingRecord | undefined = active;
+    if (transaction.lifecycleOperationId) {
+      const operation = await this.readResidentLifecycleOperationUnlocked(transaction.lifecycleOperationId);
+      const activating = records.find(
+        (record) =>
+          record.state === "activating" &&
+          record.operationId === transaction.lifecycleOperationId &&
+          record.binding.threadId === binding.threadId,
+      );
+      if (
+        !operation ||
+        operation.kind !== "provision" ||
+        (operation.phase !== "promoted_observed" && operation.phase !== "projection_committed") ||
+        !operation.binding ||
+        !isDeepStrictEqual(operation.binding, binding)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_PROJECTION_AUTHORITY_MISMATCH",
+          "A pending activating projection no longer belongs to its exact lifecycle operation",
+        );
+      }
+      projectionBinding = activating ?? active;
+    }
+    if (!projectionBinding) {
       throw new HostStoreError(
         "RESIDENT_PROJECTION_BINDING_NOT_FOUND",
-        "A pending resident projection has no active resident binding",
+        transaction.lifecycleOperationId
+          ? "A pending lifecycle projection has no exact activating binding"
+          : "A pending resident projection has no active resident binding",
       );
     }
-    if (!isDeepStrictEqual(active.binding, binding)) {
+    if (!isDeepStrictEqual(projectionBinding.binding, binding)) {
       throw new HostStoreError(
         "RESIDENT_PROJECTION_BINDING_MISMATCH",
-        "A pending resident projection no longer belongs to the exact active binding",
+        "A pending resident projection no longer belongs to its exact binding",
       );
     }
 
@@ -5206,6 +6278,18 @@ export class HostStore {
     await this.options.residentDispatchFaultInjector?.(point, attemptId);
   }
 
+  private async injectResidentLifecycleFault(
+    point: ResidentLifecycleFaultPoint,
+    operationId: string,
+  ): Promise<void> {
+    try {
+      await this.options.residentLifecycleFaultInjector?.(point, operationId);
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
   private async seedIfEmptyUnlocked(): Promise<SeedResult> {
     const [host, projects, threads] = await Promise.all([
       this.readHostUnlocked(),
@@ -5337,6 +6421,7 @@ export class HostStore {
       );
     }
     this.assertResidentSubsystemAvailable();
+    await this.assertNoResidentLifecycleOperationUnlocked(command.threadId);
     const host = await this.readHostUnlocked();
     if (command.expectedHostId !== host.hostId) {
       throw new HostStoreError(
@@ -5384,6 +6469,7 @@ export class HostStore {
       );
     }
     this.assertResidentSubsystemAvailable();
+    await this.assertNoResidentLifecycleOperationUnlocked(command.threadId);
     const host = await this.readHostUnlocked();
     if (command.expectedHostId !== host.hostId) {
       throw new HostStoreError(
@@ -5473,6 +6559,836 @@ export class HostStore {
     }
   }
 
+  private residentLifecycleOperationPath(operationId: string): string {
+    return join(this.paths.residentLifecycleOperations, `${storageKey(operationId)}.json`);
+  }
+
+  private async validateResidentLifecycleOperationDirectoryUnlocked(): Promise<void> {
+    const records = await this.readResidentLifecycleOperationsUnlocked(true);
+    const nonterminalThreads = new Set<string>();
+    for (const record of records) {
+      if (!residentLifecycleOperationIsNonterminal(record)) continue;
+      if (nonterminalThreads.has(record.input.threadId)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A thread has more than one nonterminal resident lifecycle operation",
+        );
+      }
+      nonterminalThreads.add(record.input.threadId);
+    }
+  }
+
+  private async readResidentLifecycleOperationsUnlocked(cleanTemporaryFiles = false): Promise<ResidentLifecycleOperationRecord[]> {
+    const entries = await readdir(this.paths.residentLifecycleOperations, { withFileTypes: true });
+    const records: ResidentLifecycleOperationRecord[] = [];
+    const operationIds = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "The resident lifecycle registry contains a non-file entry",
+        );
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        if (cleanTemporaryFiles) {
+          await rm(join(this.paths.residentLifecycleOperations, entry.name), { force: true });
+          continue;
+        }
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "The resident lifecycle registry contains an incomplete temporary entry",
+        );
+      }
+      if (!entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "The resident lifecycle registry contains an unexpected entry",
+        );
+      }
+      if (records.length >= MAX_RESIDENT_LIFECYCLE_OPERATIONS) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LIMIT_REACHED",
+          "The resident lifecycle operation registry exceeds its bounded entry limit",
+        );
+      }
+      const path = join(this.paths.residentLifecycleOperations, entry.name);
+      const record = await readJsonFile(path, ResidentLifecycleOperationRecordSchema, {
+        maxBytes: MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES,
+      });
+      if (!record || entry.name !== `${storageKey(record.operationId)}.json` || operationIds.has(record.operationId)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A resident lifecycle filename does not match one unique operation identity",
+        );
+      }
+      operationIds.add(record.operationId);
+      records.push(record);
+    }
+    return records.sort((left, right) => left.operationId.localeCompare(right.operationId));
+  }
+
+  private async readResidentLifecycleOperationUnlocked(
+    operationId: string,
+  ): Promise<ResidentLifecycleOperationRecord | undefined> {
+    const record = await readJsonFile(
+      this.residentLifecycleOperationPath(operationId),
+      ResidentLifecycleOperationRecordSchema,
+      { optional: true, maxBytes: MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES },
+    );
+    if (record && record.operationId !== operationId) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "The resident lifecycle record changed its operation identity",
+      );
+    }
+    return record;
+  }
+
+  private async writeResidentLifecycleOperationUnlocked(recordValue: ResidentLifecycleOperationRecord): Promise<void> {
+    const record = ResidentLifecycleOperationRecordSchema.parse(recordValue);
+    const existing = await this.readResidentLifecycleOperationUnlocked(record.operationId);
+    if (!existing) {
+      const entries = await readdir(this.paths.residentLifecycleOperations, { withFileTypes: true });
+      if (entries.length >= MAX_RESIDENT_LIFECYCLE_OPERATIONS) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LIMIT_REACHED",
+          "The resident lifecycle operation registry is full",
+        );
+      }
+    }
+    await atomicWriteJson(
+      this.residentLifecycleOperationPath(record.operationId),
+      record,
+      MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES,
+    );
+  }
+
+  private async writeResidentLifecycleBoundaryUnlocked(
+    record: ResidentLifecycleOperationRecord,
+    faultPoint: ResidentLifecycleFaultPoint,
+  ): Promise<void> {
+    try {
+      await this.writeResidentLifecycleOperationUnlocked(record);
+      await this.injectResidentLifecycleFault(faultPoint, record.operationId);
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
+  private async guardResidentLifecycleMaterializationUnlocked(
+    materialize: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await materialize();
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
+  private async resolveExactResidentLifecycleOperationUnlocked(
+    kind: ResidentLifecycleKind,
+    input: ResidentLifecycleOperationInput,
+    options: { optional: boolean },
+  ): Promise<ResidentLifecycleOperationRecord | undefined> {
+    const record = await this.readResidentLifecycleOperationUnlocked(input.operationId);
+    if (!record) {
+      if (options.optional) return undefined;
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_OPERATION_NOT_FOUND",
+        "No durable resident lifecycle operation exists for this identity",
+      );
+    }
+    if (record.kind !== kind || !isDeepStrictEqual(record.input, input)) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+        "This resident lifecycle operation ID is already bound to a different exact envelope",
+      );
+    }
+    return record;
+  }
+
+  private async requireExactResidentLifecycleOperationUnlocked(
+    kind: ResidentLifecycleKind,
+    input: ResidentLifecycleOperationInput,
+  ): Promise<ResidentLifecycleOperationRecord> {
+    const record = await this.resolveExactResidentLifecycleOperationUnlocked(kind, input, { optional: false });
+    if (!record) throw new HostStoreError("RESIDENT_LIFECYCLE_OPERATION_NOT_FOUND", "Lifecycle operation is missing");
+    return record;
+  }
+
+  private async resolveResidentLifecycleAuthorityUnlocked(
+    input: ResidentLifecycleOperationInput,
+  ): Promise<ResidentLifecycleAuthority> {
+    const host = await this.readHostUnlocked();
+    if (host.hostId !== input.expectedHostId) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_HOST_MISMATCH",
+        "The resident lifecycle operation targets a different host authority",
+      );
+    }
+    const scope = await this.currentWorkspaceScopeUnlocked(input.threadId, input.executionGenerationId);
+    if (scope.projectId !== input.projectId || scope.workspaceId !== input.workspaceId) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_AUTHORITY_MISMATCH",
+        "The resident lifecycle envelope does not match the current project and workspace authority",
+      );
+    }
+    await this.resolveWorkspaceDirectoryUnlocked(scope);
+    const authority = (await this.readWorkspaceAuthoritiesUnlocked()).find(
+      (candidate) => candidate.threadId === input.threadId,
+    );
+    if (!authority || !workspaceAuthorityMatchesScope(authority, scope)) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_AUTHORITY_MISMATCH",
+        "The resident lifecycle operation has no exact canonical workspace authority",
+      );
+    }
+    const canonicalDirectory = await canonicalWorkspaceDirectory(authority.workspaceDirectory);
+    if (!sameCanonicalPath(canonicalDirectory, authority.workspaceDirectory)) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_AUTHORITY_MISMATCH",
+        "The resident lifecycle workspace authority is no longer canonical",
+      );
+    }
+    return ResidentLifecycleAuthoritySchema.parse({
+      ...authority,
+      authorityDigest: residentLifecycleAuthorityDigest(authority),
+    });
+  }
+
+  private async assertResidentLifecycleAuthorityCurrentUnlocked(
+    record: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    let current: ResidentLifecycleAuthority;
+    try {
+      current = await this.resolveResidentLifecycleAuthorityUnlocked(record.input);
+    } catch (error) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_AUTHORITY_CHANGED",
+        "The durable resident lifecycle operation no longer matches current execution authority",
+        false,
+        { cause: error },
+      );
+    }
+    if (!isDeepStrictEqual(current, record.authority)) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_AUTHORITY_CHANGED",
+        "The canonical workspace authority changed after lifecycle preparation",
+      );
+    }
+  }
+
+  private async assertNoResidentLifecycleOperationUnlocked(threadId: string): Promise<void> {
+    this.assertResidentSubsystemAvailable();
+    const operation = (await this.readResidentLifecycleOperationsUnlocked()).find(
+      (candidate) => candidate.input.threadId === threadId && residentLifecycleOperationIsNonterminal(candidate),
+    );
+    if (operation) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_IN_PROGRESS",
+        "This thread has a nonterminal resident lifecycle operation and is read-only until it is resolved",
+        operation.phase !== "quarantined",
+      );
+    }
+  }
+
+  private async residentBindingFromOwnedCandidateUnlocked(
+    record: ResidentLifecycleOperationRecord,
+    candidate: ResidentOwnedSessionCandidate,
+  ): Promise<ResidentSessionBinding> {
+    const candidateCanonicalDirectory = await canonicalWorkspaceDirectory(candidate.workspaceDirectory);
+    if (
+      !sameCanonicalPath(candidate.workspaceDirectory, candidateCanonicalDirectory) ||
+      !sameCanonicalPath(candidateCanonicalDirectory, record.authority.workspaceDirectory)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_CANDIDATE_AUTHORITY_MISMATCH",
+        "The owned resident candidate does not use the exact canonical lifecycle workspace",
+      );
+    }
+    if (
+      Date.parse(candidate.boundAt) < Date.parse(record.preparedAt) ||
+      Date.parse(candidate.boundAt) < Date.parse(record.authority.registeredAt)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_CANDIDATE_TIME_INVALID",
+        "The owned resident candidate identity predates its durable lifecycle authority",
+      );
+    }
+    return validateResidentSessionBinding({
+      bindingVersion: 1,
+      lifecycle: "resident",
+      threadId: record.input.threadId,
+      executionGenerationId: record.input.executionGenerationId,
+      workspaceDirectory: record.authority.workspaceDirectory,
+      activeSessionId: candidate.activeSessionId,
+      sessionId: candidate.sessionId,
+      ...(candidate.sessionFile ? { sessionFile: candidate.sessionFile } : {}),
+      boundAt: candidate.boundAt,
+      runtime: candidate.runtime,
+    });
+  }
+
+  private async assertResidentLifecycleCandidateUnusedUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+    binding: ResidentSessionBinding,
+  ): Promise<void> {
+    const bindingRecords = await this.readResidentSessionBindingRecordsUnlocked();
+    const lifecycleRecords = await this.readResidentLifecycleOperationsUnlocked();
+    const reusedBinding = bindingRecords.find((record) => residentSessionIdentitiesOverlap(record.binding, binding));
+    const reusedOperation = lifecycleRecords.find(
+      (record) =>
+        record.operationId !== operation.operationId &&
+        record.binding !== undefined &&
+        residentSessionIdentitiesOverlap(record.binding, binding),
+    );
+    if (reusedBinding || reusedOperation) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_CANDIDATE_REUSED",
+        "The owned resident candidate identity is already reserved by durable state",
+      );
+    }
+    if (
+      bindingRecords.some(
+        (record) =>
+          (record.state === "active" || record.state === "activating") &&
+          record.binding.threadId === binding.threadId,
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_ALREADY_ACTIVE",
+        "The lifecycle thread already has an active or activating resident binding",
+      );
+    }
+  }
+
+  private assertBindingMatchesLifecycleAuthority(
+    binding: ResidentSessionBinding,
+    authority: ResidentLifecycleAuthority,
+  ): void {
+    if (
+      binding.threadId !== authority.threadId ||
+      binding.executionGenerationId !== authority.executionGenerationId ||
+      !sameCanonicalPath(binding.workspaceDirectory, authority.workspaceDirectory)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_MISMATCH",
+        "The resident binding does not match the exact lifecycle authority",
+      );
+    }
+  }
+
+  private async assertExactActiveResidentBindingUnlocked(binding: ResidentSessionBinding): Promise<void> {
+    const active = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+      (record) => record.state === "active" && record.binding.threadId === binding.threadId,
+    );
+    if (!active || !isDeepStrictEqual(active.binding, binding)) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_CONFLICT",
+        "Only the exact active resident binding may cross this lifecycle boundary",
+      );
+    }
+  }
+
+  private async materializeActivatingResidentBindingUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    const activatingPhase =
+      operation.phase === "promoted_observed" ||
+      operation.phase === "projection_committed" ||
+      (operation.phase === "quarantined" &&
+        (operation.quarantinedFrom === "promoted_observed" ||
+          operation.quarantinedFrom === "projection_committed"));
+    if (
+      operation.kind !== "provision" ||
+      !activatingPhase ||
+      !operation.binding
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_ACTIVATION_INVALID",
+        "Only an exact post-promotion operation can materialize an activating binding",
+      );
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const sameIdentity = records.find((record) => isDeepStrictEqual(record.binding, operation.binding));
+    if (
+      sameIdentity?.state === "activating" &&
+      sameIdentity.operationId === operation.operationId
+    ) {
+      return;
+    }
+    if (
+      sameIdentity?.state === "active" &&
+      (operation.phase === "projection_committed" ||
+        (operation.phase === "quarantined" && operation.quarantinedFrom === "projection_committed"))
+    ) return;
+    if (sameIdentity) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The lifecycle candidate identity is already reserved by another binding state",
+      );
+    }
+    if (
+      records.some(
+        (record) =>
+          (record.state === "active" || record.state === "activating") &&
+          record.binding.threadId === operation.input.threadId,
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The lifecycle thread already has an active or activating binding",
+      );
+    }
+    if (records.length >= MAX_RESIDENT_SESSION_BINDINGS) {
+      throw new HostStoreError("RESIDENT_BINDING_LIMIT_REACHED", "The resident binding registry is full");
+    }
+    records.push(
+      ResidentSessionBindingRecordSchema.parse({
+        state: "activating",
+        binding: operation.binding,
+        operationId: operation.operationId,
+        observedAt: operation.updatedAt,
+      }),
+    );
+    await this.writeResidentSessionBindingRecordsUnlocked(records);
+  }
+
+  private async materializeActiveResidentBindingUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (operation.kind !== "provision" || operation.phase !== "projection_committed" || !operation.binding) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_COMMIT_INVALID",
+        "Only a projection-proven provisioning operation can activate a resident binding",
+      );
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const index = records.findIndex((record) => isDeepStrictEqual(record.binding, operation.binding));
+    const current = index >= 0 ? records[index] : undefined;
+    if (current?.state === "active") return;
+    if (current?.state !== "activating" || current.operationId !== operation.operationId) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The exact activating binding is missing from projection-proven lifecycle state",
+      );
+    }
+    records[index] = ResidentSessionBindingRecordSchema.parse({
+      state: "active",
+      binding: operation.binding,
+      operationId: operation.operationId,
+    });
+    await this.writeResidentSessionBindingRecordsUnlocked(records);
+  }
+
+  private async assertResidentLifecycleProjectionProofUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (!operation.binding || !operation.projectionProof) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_PROJECTION_PROOF_REQUIRED",
+        "The lifecycle operation has no exact durable projection proof",
+      );
+    }
+    const lineage = await this.readResidentProjectionLineageUnlocked(
+      residentProjectionAuthorityFromBinding(operation.binding),
+    );
+    const snapshot = await this.readSnapshotUnlocked(operation.binding.threadId);
+    const catalogThread = (await this.readThreadsUnlocked()).find(
+      (thread) => thread.threadId === operation.binding?.threadId,
+    );
+    if (
+      !lineage ||
+      lineage.current.generation !== operation.projectionProof.cursorGeneration ||
+      lineage.current.sequence !== operation.projectionProof.cursorSequence ||
+      lineage.current.digest !== operation.projectionProof.projectionDigest ||
+      residentPublishedProjectionDigest(snapshot) !== operation.projectionProof.projectionDigest ||
+      snapshot.generatedAt !== operation.projectionProof.publishedAt ||
+      snapshot.latestCursor.threadId !== operation.binding.threadId ||
+      snapshot.latestCursor.executionGenerationId !== operation.binding.executionGenerationId ||
+      snapshot.latestCursor.generation !== operation.projectionProof.cursorGeneration ||
+      snapshot.latestCursor.sequence !== operation.projectionProof.cursorSequence ||
+      snapshot.runtime?.residency !== "resident" ||
+      snapshot.runtime.activeSessionId !== operation.binding.activeSessionId ||
+      snapshot.runtime.sessionId !== operation.binding.sessionId ||
+      !catalogThread ||
+      !isDeepStrictEqual(catalogThread, snapshot.thread)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_PROJECTION_PROOF_MISMATCH",
+        "The activating binding no longer has its exact durable projection lineage",
+      );
+    }
+  }
+
+  private async assertResidentLifecycleProjectionLeaseAuthorityUnlocked(
+    leaseValue: ResidentLifecycleProjectionLease,
+    binding: ResidentSessionBinding,
+  ): Promise<ResidentLifecycleOperationRecord> {
+    const lease = this.validateResidentLifecycleProjectionLease(leaseValue);
+    const operation = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+    if (
+      !operation ||
+      operation.kind !== "provision" ||
+      (operation.phase !== "promoted_observed" && operation.phase !== "projection_committed") ||
+      !operation.binding ||
+      operation.operationFingerprint !== lease.operationFingerprint ||
+      !isDeepStrictEqual(operation.binding, lease.binding) ||
+      !isDeepStrictEqual(binding, lease.binding)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_STALE",
+        "The lifecycle projection lease no longer owns the exact activating candidate",
+      );
+    }
+    await this.assertResidentLifecycleAuthorityCurrentUnlocked(operation);
+    return operation;
+  }
+
+  private async materializeEndingResidentBindingRevocationUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (
+      operation.kind !== "end" ||
+      !operation.binding ||
+      !["ending", "kill_dispatching", "kill_acknowledged", "completed", "quarantined"].includes(operation.phase)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_END_INVALID",
+        "Only an exact resident end operation can revoke its binding",
+      );
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const index = records.findIndex((record) => isDeepStrictEqual(record.binding, operation.binding));
+    const current = index >= 0 ? records[index] : undefined;
+    if (
+      current?.state === "detached" &&
+      current.operationId === operation.operationId &&
+      current.reason === "ending"
+    ) {
+      return;
+    }
+    if (current?.state === "completed" && (operation.phase === "kill_acknowledged" || operation.phase === "completed")) {
+      return;
+    }
+    if (current?.state !== "active") {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The end operation no longer owns its exact active or revoked binding",
+      );
+    }
+    records[index] = ResidentSessionBindingRecordSchema.parse({
+      state: "detached",
+      binding: operation.binding,
+      operationId: operation.operationId,
+      detachedAt: operation.preparedAt,
+      reason: "ending",
+    });
+    await this.writeResidentSessionBindingRecordsUnlocked(records);
+  }
+
+  private async materializeDetachedResidentBindingUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (operation.kind !== "detach" || operation.phase !== "detached" || !operation.binding) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_DETACH_INVALID",
+        "Only an exact detach operation can revoke its resident binding",
+      );
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const index = records.findIndex((record) => isDeepStrictEqual(record.binding, operation.binding));
+    const current = index >= 0 ? records[index] : undefined;
+    if (
+      current?.state === "detached" &&
+      current.operationId === operation.operationId &&
+      current.reason === "explicit"
+    ) {
+      return;
+    }
+    if (current?.state !== "active") {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The detach operation no longer owns its exact active binding",
+      );
+    }
+    records[index] = ResidentSessionBindingRecordSchema.parse({
+      state: "detached",
+      binding: operation.binding,
+      operationId: operation.operationId,
+      detachedAt: operation.terminalAt,
+      reason: "explicit",
+    });
+    await this.writeResidentSessionBindingRecordsUnlocked(records);
+  }
+
+  private async assertResidentBindingRevokedForOperationUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    const record = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+      (candidate) => operation.binding && isDeepStrictEqual(candidate.binding, operation.binding),
+    );
+    if (
+      record?.state !== "detached" ||
+      record.operationId !== operation.operationId ||
+      record.reason !== "ending"
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_NOT_REVOKED",
+        "Resident command authority must be durably revoked before kill dispatch",
+      );
+    }
+  }
+
+  private async materializeCompletedResidentBindingUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (
+      operation.kind !== "end" ||
+      (operation.phase !== "kill_acknowledged" && operation.phase !== "completed") ||
+      !operation.binding
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_END_INVALID",
+        "Only a kill-acknowledged end operation can complete its binding",
+      );
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const index = records.findIndex((record) => isDeepStrictEqual(record.binding, operation.binding));
+    const current = index >= 0 ? records[index] : undefined;
+    if (current?.state === "completed") return;
+    if (
+      current?.state !== "detached" ||
+      current.operationId !== operation.operationId ||
+      current.reason !== "ending"
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_BINDING_CONFLICT",
+        "The kill acknowledgment no longer owns its exact revoked binding",
+      );
+    }
+    records[index] = ResidentSessionBindingRecordSchema.parse({
+      state: "completed",
+      binding: operation.binding,
+      operationId: operation.operationId,
+      completedAt: operation.updatedAt,
+    });
+    await this.writeResidentSessionBindingRecordsUnlocked(records);
+  }
+
+  private createResidentLifecycleProjectionLease(
+    operation: ResidentLifecycleOperationRecord,
+    promotionObservedAt: string,
+  ): ResidentLifecycleProjectionLease {
+    if (!operation.binding) {
+      throw new HostStoreError("RESIDENT_LIFECYCLE_BINDING_MISSING", "Lifecycle candidate binding is missing");
+    }
+    const lease = Object.freeze({
+      [residentLifecycleProjectionLeaseBrand]: true as const,
+      leaseVersion: 1 as const,
+      operationId: operation.operationId,
+      operationFingerprint: operation.operationFingerprint,
+      binding: validateResidentSessionBinding(operation.binding),
+      promotionObservedAt,
+    });
+    this.residentLifecycleProjectionLeases.add(lease);
+    return lease;
+  }
+
+  private validateResidentOwnedCreateLease(value: ResidentOwnedCreateLease): ResidentOwnedCreateLease {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !this.residentOwnedCreateLeases.has(value as object) ||
+      value[residentOwnedCreateLeaseBrand] !== true ||
+      value.leaseVersion !== 1
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_INVALID",
+        "Owned create requires an opaque lease issued by this HostStore process",
+      );
+    }
+    return value;
+  }
+
+  private validateResidentPromotionLease(value: ResidentPromotionLease): ResidentPromotionLease {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !this.residentPromotionLeases.has(value as object) ||
+      value[residentPromotionLeaseBrand] !== true ||
+      value.leaseVersion !== 1
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_INVALID",
+        "Promotion requires an opaque lease issued by this HostStore process",
+      );
+    }
+    return value;
+  }
+
+  private validateResidentLifecycleProjectionLease(
+    value: ResidentLifecycleProjectionLease,
+  ): ResidentLifecycleProjectionLease {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !this.residentLifecycleProjectionLeases.has(value as object) ||
+      value[residentLifecycleProjectionLeaseBrand] !== true ||
+      value.leaseVersion !== 1
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_INVALID",
+        "Lifecycle projection requires an opaque lease issued by this HostStore process",
+      );
+    }
+    return value;
+  }
+
+  private validateResidentKillLease(value: ResidentKillLease): ResidentKillLease {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !this.residentKillLeases.has(value as object) ||
+      value[residentKillLeaseBrand] !== true ||
+      value.leaseVersion !== 1
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_INVALID",
+        "Resident kill requires an opaque lease issued by this HostStore process",
+      );
+    }
+    return value;
+  }
+
+  private async requireLifecycleLeaseRecordUnlocked(
+    lease: ResidentOwnedCreateLease | ResidentPromotionLease | ResidentKillLease,
+    kind: ResidentLifecycleKind,
+    phase: "owned_create_dispatching" | "promotion_dispatching" | "kill_dispatching",
+  ): Promise<ResidentLifecycleOperationRecord> {
+    const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+    const leaseBinding = "binding" in lease ? lease.binding : undefined;
+    if (
+      !record ||
+      record.kind !== kind ||
+      record.phase !== phase ||
+      record.operationFingerprint !== lease.operationFingerprint ||
+      record.updatedAt !== lease.dispatchStartedAt ||
+      (leaseBinding !== undefined && !isDeepStrictEqual(record.binding, leaseBinding))
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_LEASE_STALE",
+        "The lifecycle mutation lease no longer matches its exact durable dispatch boundary",
+      );
+    }
+    return record;
+  }
+
+  private async quarantineResidentLifecycleOperationUnlocked(
+    record: ResidentLifecycleOperationRecord,
+    reason: z.infer<typeof ResidentLifecycleQuarantineReasonSchema>,
+  ): Promise<ResidentLifecycleOperationRecord> {
+    if (record.phase === "quarantined") return record;
+    if (!residentLifecycleOperationIsNonterminal(record)) return record;
+    const timestamp = now();
+    const quarantined = ResidentLifecycleOperationRecordSchema.parse({
+      ...record,
+      phase: "quarantined",
+      quarantinedFrom: record.phase,
+      quarantineReason: reason,
+      updatedAt: timestamp,
+    });
+    await this.writeResidentLifecycleOperationUnlocked(quarantined);
+    return quarantined;
+  }
+
+  private async recoverResidentLifecycleOperationsUnlocked(
+    stage: "before_projection_recovery" | "after_projection_recovery",
+  ): Promise<void> {
+    const operations = await this.readResidentLifecycleOperationsUnlocked();
+    for (const original of operations) {
+      let operation = original;
+
+      if (stage === "before_projection_recovery") {
+        if (
+          operation.phase === "owned_create_dispatching" ||
+          operation.phase === "promotion_dispatching" ||
+          operation.phase === "kill_dispatching"
+        ) {
+          operation = await this.quarantineResidentLifecycleOperationUnlocked(
+            operation,
+            "external_outcome_unknown",
+          );
+        } else if (operation.phase === "owned_observed") {
+          operation = await this.quarantineResidentLifecycleOperationUnlocked(operation, "owned_client_lost");
+        }
+
+        if (operation.kind === "end" && operation.binding) {
+          if (
+            operation.phase === "ending" ||
+            (operation.phase === "quarantined" &&
+              (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching"))
+          ) {
+            await this.materializeEndingResidentBindingRevocationUnlocked(operation);
+          } else if (operation.phase === "kill_acknowledged" || operation.phase === "completed") {
+            await this.materializeCompletedResidentBindingUnlocked(operation);
+            if (operation.phase === "kill_acknowledged") {
+              const completedAt = now();
+              operation = ResidentLifecycleOperationRecordSchema.parse({
+                ...operation,
+                phase: "completed",
+                updatedAt: completedAt,
+                terminalAt: completedAt,
+              });
+              await this.writeResidentLifecycleOperationUnlocked(operation);
+            }
+          }
+        } else if (operation.kind === "detach") {
+          await this.materializeDetachedResidentBindingUnlocked(operation);
+        }
+
+        if (
+          operation.kind === "provision" &&
+          (operation.phase === "promoted_observed" || operation.phase === "projection_committed")
+        ) {
+          await this.materializeActivatingResidentBindingUnlocked(operation);
+        }
+
+        if (residentLifecycleOperationIsNonterminal(operation) && operation.phase !== "quarantined") {
+          try {
+            await this.assertResidentLifecycleAuthorityCurrentUnlocked(operation);
+          } catch {
+            operation = await this.quarantineResidentLifecycleOperationUnlocked(operation, "authority_changed");
+          }
+        }
+      }
+
+      if (stage === "after_projection_recovery" && operation.kind === "provision") {
+        if (operation.phase === "promoted_observed" || operation.phase === "projection_committed") {
+          await this.materializeActivatingResidentBindingUnlocked(operation);
+        }
+        if (operation.phase === "projection_committed" && operation.binding) {
+          const active = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+            (record) => record.state === "active" && isDeepStrictEqual(record.binding, operation.binding),
+          );
+          if (active) {
+            await this.assertResidentLifecycleProjectionProofUnlocked(operation);
+            const committedAt = now();
+            const committed = ResidentLifecycleOperationRecordSchema.parse({
+              ...operation,
+              phase: "committed",
+              updatedAt: committedAt,
+              terminalAt: committedAt,
+            });
+            await this.writeResidentLifecycleOperationUnlocked(committed);
+          }
+        }
+      }
+    }
+  }
+
   private async readWorkspaceAuthoritiesUnlocked(): Promise<WorkspaceAuthority[]> {
     const file = await readJsonFile(this.paths.workspaceAuthorities, WorkspaceAuthorityFileSchema, {
       maxBytes: MAX_WORKSPACE_AUTHORITY_FILE_BYTES,
@@ -5512,13 +7428,17 @@ export class HostStore {
   }
 
   private async validateResidentStateUnlocked(): Promise<void> {
-    const [host, projects, threads, authorities, bindings] = await Promise.all([
+    const [host, projects, threads, authorities, bindingRecords, lifecycleOperations] = await Promise.all([
       this.readHostUnlocked(),
       this.readProjectsUnlocked(),
       this.readThreadsUnlocked(),
       this.readWorkspaceAuthoritiesUnlocked(),
-      this.readResidentSessionBindingsUnlocked(),
+      this.readResidentSessionBindingRecordsUnlocked(),
+      this.readResidentLifecycleOperationsUnlocked(),
     ]);
+    const bindings = bindingRecords
+      .filter((record): record is Extract<ResidentSessionBindingRecord, { state: "active" }> => record.state === "active")
+      .map((record) => record.binding);
     const projectsById = new Map(projects.map((project) => [project.projectId, project]));
     const threadsById = new Map(threads.map((thread) => [thread.threadId, thread]));
     const authoritiesByThread = new Map(authorities.map((authority) => [authority.threadId, authority]));
@@ -5595,6 +7515,198 @@ export class HostStore {
           "RESIDENT_BINDING_PATH_MISMATCH",
           "An active resident binding does not match its canonical workspace path",
         );
+      }
+    }
+
+    const lifecycleById = new Map(lifecycleOperations.map((operation) => [operation.operationId, operation]));
+    for (const record of bindingRecords) {
+      const binding = validateResidentSessionBinding(record.binding);
+      if (record.state === "activating") {
+        const operation = lifecycleById.get(record.operationId);
+        const validPhase =
+          operation?.phase === "promoted_observed" ||
+          operation?.phase === "projection_committed" ||
+          (operation?.phase === "quarantined" &&
+            (operation.quarantinedFrom === "promoted_observed" ||
+              operation.quarantinedFrom === "projection_committed"));
+        if (
+          !operation ||
+          operation.kind !== "provision" ||
+          !validPhase ||
+          !operation.binding ||
+          !isDeepStrictEqual(operation.binding, binding)
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_STATE_INVALID",
+            "An activating binding has no exact durable provisioning operation",
+          );
+        }
+      } else if (record.state === "detached") {
+        const operation = lifecycleById.get(record.operationId);
+        const validEndingPhase =
+          operation?.kind === "end" &&
+          (operation.phase === "ending" ||
+            operation.phase === "kill_dispatching" ||
+            operation.phase === "kill_acknowledged" ||
+            operation.phase === "completed" ||
+            (operation.phase === "quarantined" &&
+              (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching")));
+        const validDetachPhase = operation?.kind === "detach" && operation.phase === "detached";
+        if (
+          !operation ||
+          !operation.binding ||
+          !isDeepStrictEqual(operation.binding, binding) ||
+          (record.reason === "ending" ? !validEndingPhase : !validDetachPhase)
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_STATE_INVALID",
+            "A detached binding has no exact durable revocation operation",
+          );
+        }
+      } else if (record.operationId) {
+        const operation = lifecycleById.get(record.operationId);
+        const matchesProvision =
+          record.state === "active" &&
+          operation?.kind === "provision" &&
+          (operation.phase === "committed" || operation.phase === "projection_committed") &&
+          operation.binding !== undefined &&
+          residentDispatchAuthorityFingerprint(operation.binding) === residentDispatchAuthorityFingerprint(binding);
+        const matchesEnd =
+          record.state === "completed" &&
+          operation?.kind === "end" &&
+          operation.phase === "completed" &&
+          operation.binding !== undefined &&
+          isDeepStrictEqual(operation.binding, binding);
+        if (!matchesProvision && !matchesEnd) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_STATE_INVALID",
+            "A lifecycle-linked binding record does not match its exact durable operation",
+          );
+        }
+      }
+    }
+
+    for (const operation of lifecycleOperations) {
+      const operationBinding = operation.binding;
+      if (operation.kind === "provision") {
+        const requiresActivating =
+          operation.phase === "promoted_observed" ||
+          operation.phase === "projection_committed" ||
+          (operation.phase === "quarantined" &&
+            (operation.quarantinedFrom === "promoted_observed" ||
+              operation.quarantinedFrom === "projection_committed"));
+        if (requiresActivating) {
+          const activating = bindingRecords.find(
+            (record) =>
+              record.state === "activating" &&
+              record.operationId === operation.operationId &&
+              operationBinding !== undefined &&
+              isDeepStrictEqual(record.binding, operationBinding),
+          );
+          const crashSafeActive =
+            operation.phase === "quarantined" && operation.quarantinedFrom === "projection_committed"
+              ? bindingRecords.find(
+                  (record) =>
+                    record.state === "active" &&
+                    record.operationId === operation.operationId &&
+                    operationBinding !== undefined &&
+                    residentDispatchAuthorityFingerprint(record.binding) ===
+                      residentDispatchAuthorityFingerprint(operationBinding),
+                )
+              : undefined;
+          if (!activating && !crashSafeActive) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_STATE_INVALID",
+              "A post-promotion lifecycle operation has no exact activating binding record",
+            );
+          }
+        }
+        if (operation.phase === "committed") {
+          const active = bindingRecords.find(
+            (record) =>
+              record.state === "active" &&
+              record.operationId === operation.operationId &&
+              operationBinding !== undefined &&
+              residentDispatchAuthorityFingerprint(record.binding) ===
+                residentDispatchAuthorityFingerprint(operationBinding),
+          );
+          const legacyCompleted = bindingRecords.find(
+            (record) =>
+              record.state === "completed" &&
+              record.operationId === undefined &&
+              operationBinding !== undefined &&
+              residentDispatchAuthorityFingerprint(record.binding) ===
+                residentDispatchAuthorityFingerprint(operationBinding),
+          );
+          const successor = lifecycleOperations.find(
+            (candidate) =>
+              candidate.operationId !== operation.operationId &&
+              (candidate.kind === "end" || candidate.kind === "detach") &&
+              candidate.binding !== undefined &&
+              operationBinding !== undefined &&
+              Date.parse(candidate.preparedAt) >= Date.parse(operation.terminalAt ?? operation.updatedAt) &&
+              residentDispatchAuthorityFingerprint(candidate.binding) ===
+                residentDispatchAuthorityFingerprint(operationBinding),
+          );
+          if (!active && !legacyCompleted && !successor) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_STATE_INVALID",
+              "A committed provisioning operation has no exact active binding or durable revocation successor",
+            );
+          }
+        }
+      } else if (operation.kind === "end") {
+        const requiresRevoked =
+          operation.phase === "ending" ||
+          operation.phase === "kill_dispatching" ||
+          (operation.phase === "quarantined" &&
+            (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching"));
+        if (requiresRevoked) {
+          const detached = bindingRecords.find(
+            (record) =>
+              record.state === "detached" &&
+              record.reason === "ending" &&
+              record.operationId === operation.operationId &&
+              operationBinding !== undefined &&
+              isDeepStrictEqual(record.binding, operationBinding),
+          );
+          if (!detached) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_STATE_INVALID",
+              "A resident end operation has no exact revoked binding record",
+            );
+          }
+        }
+        if (operation.phase === "completed") {
+          const completed = bindingRecords.find(
+            (record) =>
+              record.state === "completed" &&
+              record.operationId === operation.operationId &&
+              operationBinding !== undefined &&
+              isDeepStrictEqual(record.binding, operationBinding),
+          );
+          if (!completed) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_STATE_INVALID",
+              "A completed resident end operation has no exact completed binding record",
+            );
+          }
+        }
+      } else {
+        const detached = bindingRecords.find(
+          (record) =>
+            record.state === "detached" &&
+            record.reason === "explicit" &&
+            record.operationId === operation.operationId &&
+            operationBinding !== undefined &&
+            isDeepStrictEqual(record.binding, operationBinding),
+        );
+        if (!detached) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_STATE_INVALID",
+            "An explicit detach operation has no exact detached binding record",
+          );
+        }
       }
     }
   }
@@ -6000,6 +8112,86 @@ function residentSubsystemUnavailable(cause: unknown): HostStoreError {
     false,
     { cause },
   );
+}
+
+function residentLifecycleOperationFingerprint(
+  kind: ResidentLifecycleKind,
+  inputValue: ResidentLifecycleOperationInput,
+  authorityDigest: string,
+): string {
+  const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+  const canonicalAuthorityDigest = Sha256DigestSchema.parse(authorityDigest);
+  return createHash("sha256")
+    .update(JSON.stringify({ kind, input, authorityDigest: canonicalAuthorityDigest }))
+    .digest("hex");
+}
+
+function residentLifecycleAuthorityDigest(
+  authorityValue: Omit<ResidentLifecycleAuthority, "authorityDigest"> | ResidentLifecycleAuthority,
+): string {
+  const authority = {
+    authorityVersion: authorityValue.authorityVersion,
+    hostId: authorityValue.hostId,
+    projectId: authorityValue.projectId,
+    workspaceId: authorityValue.workspaceId,
+    threadId: authorityValue.threadId,
+    executionGenerationId: authorityValue.executionGenerationId,
+    workspaceDirectory: canonicalPathKey(authorityValue.workspaceDirectory),
+    registeredAt: authorityValue.registeredAt,
+  };
+  return createHash("sha256").update(JSON.stringify(authority)).digest("hex");
+}
+
+function residentLifecycleStatus(recordValue: ResidentLifecycleOperationRecord): ResidentLifecycleStatus {
+  const record = ResidentLifecycleOperationRecordSchema.parse(recordValue);
+  return Object.freeze({
+    version: 1 as const,
+    kind: record.kind,
+    operationId: record.operationId,
+    phase: record.phase,
+    expectedHostId: record.input.expectedHostId,
+    projectId: record.input.projectId,
+    workspaceId: record.input.workspaceId,
+    threadId: record.input.threadId,
+    executionGenerationId: record.input.executionGenerationId,
+    preparedAt: record.preparedAt,
+    updatedAt: record.updatedAt,
+    ...(record.quarantinedFrom ? { quarantinedFrom: record.quarantinedFrom } : {}),
+    ...(record.quarantineReason ? { quarantineReason: record.quarantineReason } : {}),
+    ...(record.completionReason ? { completionReason: record.completionReason } : {}),
+    ...(record.terminalAt ? { terminalAt: record.terminalAt } : {}),
+  });
+}
+
+function residentLifecycleOperationIsNonterminal(record: ResidentLifecycleOperationRecord): boolean {
+  return record.phase !== "committed" && record.phase !== "completed" && record.phase !== "detached";
+}
+
+function residentLifecycleMutationAlreadyCrossed(
+  record: ResidentLifecycleOperationRecord,
+  boundary: string,
+): HostStoreError {
+  const reconciliationRequired =
+    record.phase === "owned_create_dispatching" ||
+    record.phase === "promotion_dispatching" ||
+    record.phase === "kill_dispatching" ||
+    record.phase === "quarantined";
+  return new HostStoreError(
+    reconciliationRequired
+      ? "RESIDENT_LIFECYCLE_RECONCILIATION_REQUIRED"
+      : "RESIDENT_LIFECYCLE_PHASE_CONFLICT",
+    `The durable resident lifecycle operation cannot cross the ${boundary} boundary from its current phase`,
+    !reconciliationRequired,
+  );
+}
+
+function residentSessionIdentitiesOverlap(
+  left: ResidentSessionBinding,
+  right: ResidentSessionBinding,
+): boolean {
+  return left.activeSessionId === right.activeSessionId ||
+    left.sessionId === right.sessionId ||
+    (left.sessionFile !== undefined && right.sessionFile !== undefined && left.sessionFile === right.sessionFile);
 }
 
 function parseWorkspaceLookup(threadId: string, executionGenerationId: string): {
