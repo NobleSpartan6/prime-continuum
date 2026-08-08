@@ -150,6 +150,7 @@ class SharedFakePrimeDaemon {
             return session.snapshot;
           },
           subscribe: () => () => undefined,
+          promoteToResident: async () => undefined,
           dispose: async () => {
             if (disposed) return;
             disposed = true;

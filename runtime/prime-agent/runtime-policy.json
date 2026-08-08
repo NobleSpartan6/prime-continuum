@@ -31,7 +31,8 @@
       "attach_snapshot",
       "event_sequence",
       "slim_attach",
-      "chunked_snapshot"
+      "chunked_snapshot",
+      "client_owned_sessions"
     ]
   },
   "criticalPackages": {

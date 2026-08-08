@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { resolve as resolvePath } from "node:path";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
@@ -19,12 +19,14 @@ import {
 } from "./resident-projection";
 import {
   ResidentRuntimeContractError,
+  buildResidentOwnedDaemonCreateRequest,
   buildResidentDaemonCreateRequest,
   buildResidentDaemonStartInvocation,
   validateResidentAbortIdleReconciliationRequest,
   validateResidentDaemonHello,
   validateResidentGenerationDispatchLease,
   validateResidentPromptIdleReconciliationRequest,
+  validateResidentOwnedSessionCreateInput,
   validateResidentSessionBinding,
   type ResidentDaemonStartInvocation,
   type ResidentAbortIdleAuthorityEvidence,
@@ -41,6 +43,7 @@ import {
   type ResidentRuntimeLifecycleSnapshot,
   type ResidentRuntimeLifecycleState,
   type ResidentRuntimeStructuredError,
+  type ResidentOwnedSessionCreateInput,
   type ResidentSessionBinding,
   type ResidentSessionCreateInput,
 } from "./resident-runtime";
@@ -70,6 +73,60 @@ const MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS = 4;
 const MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS = 4;
 const RESIDENT_PROJECTION_COALESCE_MS = 100;
 const PROMPT_ADMISSION_CANCEL_GRACE_MS = 2_000;
+const ResidentOwnedRuntimeCandidateBrand: unique symbol = Symbol("ResidentOwnedRuntimeCandidate");
+const UNVERIFIED_OWNED_CLEANUP_ATTEMPT = Object.freeze({
+  disposition: "attempted_unverified" as const,
+  durableCompletionAuthorized: false as const,
+  reason: "prime_v0_7_dispose_suppresses_complete_response" as const,
+});
+
+export interface ResidentOwnedCleanupAttemptResult {
+  readonly disposition: "attempted_unverified";
+  readonly durableCompletionAuthorized: false;
+  readonly reason: "prime_v0_7_dispose_suppresses_complete_response";
+}
+
+/**
+ * Process-local escrow capability for one exact client-owned Prime session.
+ * Its runtime brand and private-field-backed methods are lost across structured
+ * clone, so durable state cannot recreate mutation authority after restart.
+ */
+export interface ResidentOwnedRuntimeCandidate {
+  readonly [ResidentOwnedRuntimeCandidateBrand]: true;
+  readonly candidateVersion: 1;
+  readonly threadId: string;
+  readonly executionGenerationId: string;
+  readonly workspaceDirectory: string;
+  readonly activeSessionId: string;
+  readonly sessionId: string;
+  readonly sessionFile?: string;
+  /** Immutable proposed resident binding time, minted before promotion. */
+  readonly boundAt: string;
+  readonly runtime: ResidentRuntimeCompatibility;
+  /** One upstream promotion invocation; repeated calls share its exact result. */
+  promoteToResident(): Promise<void>;
+  /** Read two equal authoritative snapshots after promotion; never mutates Prime. */
+  readStableProjection(): Promise<ResidentProjectionSnapshot>;
+  /** Read and durably publish one stable projection through caller-held Store authority. */
+  publishStableProjection(
+    publisher: (
+      binding: ResidentSessionBinding,
+      projection: ResidentProjectionSnapshot,
+    ) => Promise<void>,
+  ): Promise<ResidentProjectionSnapshot>;
+  /**
+   * Best-effort owned cleanup only. Prime v0.7 suppresses the
+   * complete_owned_session response, so this result can never authorize a
+   * durable Store completion transition.
+   */
+  attemptUnverifiedOwnedCleanup(): Promise<ResidentOwnedCleanupAttemptResult>;
+  /**
+   * Release local authority. Before promotion this attempts unverified owned
+   * cleanup; after promotion it detaches; after unknown promotion it closes
+   * only the owner transport. Resolution is never cleanup proof.
+   */
+  dispose(): Promise<void>;
+}
 
 const WireStringSchema = z.string().min(1).max(4_096);
 const SessionActionsSchema = z
@@ -265,6 +322,8 @@ export interface PrimeDaemonAgentConnectionPublic {
   ): Promise<void>;
   /** v0.7.0 resolves abort when requestAbort() is accepted, not when stopping completes. */
   abort?(): Promise<void>;
+  /** v0.7.0 promotes one client-owned worker to ordinary resident lifetime. */
+  promoteToResident(): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
 }
@@ -279,7 +338,7 @@ export interface PrimeAgentPublicModule {
         closeClientOnDispose: true;
         sendClientEnv: false;
         supportsExtensionUi: false;
-        ownedSession: false;
+        ownedSession: boolean;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<PrimeDaemonAgentConnectionPublic>;
@@ -420,6 +479,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
   private readonly options: ResolvedOptions;
   private readonly lifecycle: LifecycleController;
   private readonly connections = new Map<string, ManagedResidentRuntimeConnection>();
+  private readonly ownedCandidates = new Set<ManagedResidentOwnedCandidate>();
   private readonly modelSelectionAttempts = new Map<
     string,
     Readonly<{
@@ -480,6 +540,120 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     });
   }
 
+  createOwnedCandidate(inputValue: ResidentOwnedSessionCreateInput): Promise<ResidentOwnedRuntimeCandidate> {
+    let input: ResidentOwnedSessionCreateInput;
+    let request: ReturnType<typeof buildResidentOwnedDaemonCreateRequest>;
+    try {
+      // Complete every caller-controlled validation before the daemon create
+      // mutation can be invoked. The frozen normalized input also closes a
+      // getter/mutation TOCTOU gap between request construction and identity.
+      input = validateResidentOwnedSessionCreateInput(inputValue);
+      request = buildResidentOwnedDaemonCreateRequest(input);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    return this.enqueue(async () => {
+      this.assertOpen();
+      let client: PrimeDaemonClientPublic | undefined;
+      let attached: PrimeDaemonAgentConnectionPublic | undefined;
+      let createDispatched = false;
+      let createdActiveSessionId: string | undefined;
+      let postCreatePhase = "awaiting_create_response";
+      try {
+        await this.ensureDaemonSingleFlight();
+        this.lifecycle.transition("creating_resident");
+        const runtimeModule = await this.loadModule();
+        const opened = await this.openValidatedClient(runtimeModule);
+        client = opened.client;
+        postCreatePhase = "create_response_unverified";
+        createDispatched = true;
+        const response = await requestDaemon(
+          client,
+          request,
+          this.options.requestTimeoutMs,
+          "create",
+          true,
+        );
+        postCreatePhase = "validating_create_summary";
+        const summary = parseLiveSessionSummary(response.data, "create");
+        createdActiveSessionId = summary.activeSessionId;
+        postCreatePhase = "validating_create_identity";
+        assertWorkspaceMatches(summary.cwd, input.workspaceDirectory, "owned create summary");
+        const sessionFile = validateOwnedCandidateSessionFile(summary.sessionFile, input);
+
+        postCreatePhase = "checking_adapter_authority";
+        this.assertOpen();
+        this.lifecycle.transition("attaching");
+        postCreatePhase = "attaching_owned_connection";
+        attached = await this.attachPublicConnection(
+          runtimeModule,
+          client,
+          summary.activeSessionId,
+          true,
+        );
+        postCreatePhase = "validating_owned_connection";
+        if (typeof attached.promoteToResident !== "function") {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_MODULE_INVALID",
+            "The pinned Prime Agent owned connection is missing resident promotion support.",
+          );
+        }
+
+        postCreatePhase = "constructing_owned_candidate";
+        const candidate = new ManagedResidentOwnedCandidate({
+          threadId: input.threadId,
+          executionGenerationId: input.executionGenerationId,
+          workspaceDirectory: input.workspaceDirectory,
+          activeSessionId: summary.activeSessionId,
+          sessionId: summary.sessionId,
+          ...(sessionFile ? { sessionFile } : {}),
+          boundAt: this.options.now().toISOString(),
+          runtime: opened.compatibility,
+          client,
+          attached,
+          requestTimeoutMs: this.options.requestTimeoutMs,
+          onClosed: () => this.ownedCandidates.delete(candidate),
+        });
+        this.ownedCandidates.add(candidate);
+        client = undefined;
+        attached = undefined;
+        this.lifecycle.transition("ready");
+        return candidate;
+      } catch (error) {
+        // Public owned dispose may send complete_owned_session when attach
+        // succeeded, but v0.7 suppresses its acknowledgement; it is cleanup,
+        // never proof. Closing an unattached owner client activates Prime's
+        // bounded owner-disconnect cleanup. Neither path can issue root kill.
+        let cleanup = "not_required";
+        if (attached) {
+          cleanup = "public_owned_dispose_unverified";
+          try {
+            await attached.dispose();
+          } catch {
+            cleanup = "public_owned_dispose_failed";
+            client?.close();
+          }
+        } else if (client) {
+          client.close();
+          cleanup = "owner_transport_closed";
+        }
+        if (createDispatched) {
+          throw this.fail(
+            unknownOwnedCreateOutcome(
+              postCreatePhase,
+              createdActiveSessionId,
+              cleanup,
+              error,
+            ),
+          );
+        }
+        throw this.fail(error);
+      }
+    });
+  }
+
+  /** @deprecated Legacy harness-only path; production provisioning uses client-owned escrow. */
   createResident(input: ResidentSessionCreateInput): Promise<ResidentRuntimeConnection> {
     return this.enqueue(async () => {
       this.assertOpen();
@@ -889,14 +1063,21 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       if (this.closed) return;
       await this.daemonEnsurePromise?.catch(() => undefined);
       const connections = [...this.connections.values()];
-      const outcomes = await Promise.allSettled(connections.map((connection) => connection.detach()));
-      outcomes.forEach((outcome, index) => {
+      const candidates = [...this.ownedCandidates];
+      const [connectionOutcomes, candidateOutcomes] = await Promise.all([
+        Promise.allSettled(connections.map((connection) => connection.detach())),
+        Promise.allSettled(candidates.map((candidate) => candidate.dispose())),
+      ]);
+      connectionOutcomes.forEach((outcome, index) => {
         if (outcome.status === "rejected") connections[index]?.forceClose();
       });
       this.connections.clear();
+      this.ownedCandidates.clear();
       this.modelSelectionAttempts.clear();
       this.closed = true;
-      const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+      const failure = [...connectionOutcomes, ...candidateOutcomes].find(
+        (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+      );
       if (failure) {
         const error = normalizeRuntimeError(failure.reason, "Prime Agent connection detach failed during adapter close.");
         this.lifecycle.transition("failed", { error: error.toJSON() });
@@ -1030,12 +1211,13 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     runtimeModule: PrimeAgentPublicModule,
     client: PrimeDaemonClientPublic,
     activeSessionId: string,
+    ownedSession = false,
   ): Promise<PrimeDaemonAgentConnectionPublic> {
     return runtimeModule.DaemonAgentConnection.attach(client, activeSessionId, {
       closeClientOnDispose: true,
       sendClientEnv: false,
       supportsExtensionUi: false,
-      ownedSession: false,
+      ownedSession,
       // Do not re-enter the adapter operation queue: recovery may be invoked
       // by static attach while create/attach itself owns that queue.
       recoverDaemon: async () => void (await this.ensureDaemonSingleFlight()),
@@ -1084,6 +1266,248 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     const normalized = normalizeRuntimeError(error, "Prime Agent resident runtime operation failed.");
     this.lifecycle.transition("failed", { binding, error: normalized.toJSON() });
     return normalized;
+  }
+}
+
+type ResidentOwnedCandidateState =
+  | "owned"
+  | "promoting"
+  | "promoted"
+  | "promotion_unknown"
+  | "disposed";
+
+class ManagedResidentOwnedCandidate implements ResidentOwnedRuntimeCandidate {
+  readonly [ResidentOwnedRuntimeCandidateBrand] = true as const;
+  readonly candidateVersion = 1 as const;
+  readonly #identity: Readonly<{
+    threadId: string;
+    executionGenerationId: string;
+    workspaceDirectory: string;
+    activeSessionId: string;
+    sessionId: string;
+    sessionFile?: string;
+    boundAt: string;
+    runtime: ResidentRuntimeCompatibility;
+  }>;
+  readonly #client: PrimeDaemonClientPublic;
+  readonly #attached: PrimeDaemonAgentConnectionPublic;
+  readonly #requestTimeoutMs: number;
+  readonly #onClosed: () => void;
+  #state: ResidentOwnedCandidateState = "owned";
+  #residentBinding: ResidentSessionBinding | undefined;
+  #promotionPromise: Promise<void> | undefined;
+  #disposePromise: Promise<void> | undefined;
+  #ownedCleanupAttemptPromise: Promise<ResidentOwnedCleanupAttemptResult> | undefined;
+
+  constructor(options: Readonly<{
+    threadId: string;
+    executionGenerationId: string;
+    workspaceDirectory: string;
+    activeSessionId: string;
+    sessionId: string;
+    sessionFile?: string;
+    boundAt: string;
+    runtime: ResidentRuntimeCompatibility;
+    client: PrimeDaemonClientPublic;
+    attached: PrimeDaemonAgentConnectionPublic;
+    requestTimeoutMs: number;
+    onClosed: () => void;
+  }>) {
+    this.#identity = Object.freeze({
+      threadId: options.threadId,
+      executionGenerationId: options.executionGenerationId,
+      workspaceDirectory: options.workspaceDirectory,
+      activeSessionId: options.activeSessionId,
+      sessionId: options.sessionId,
+      ...(options.sessionFile ? { sessionFile: options.sessionFile } : {}),
+      boundAt: options.boundAt,
+      runtime: Object.freeze({
+        ...options.runtime,
+        capabilities: Object.freeze([...options.runtime.capabilities]),
+      }),
+    });
+    this.#client = options.client;
+    this.#attached = options.attached;
+    this.#requestTimeoutMs = options.requestTimeoutMs;
+    this.#onClosed = options.onClosed;
+    Object.freeze(this);
+  }
+
+  get threadId(): string {
+    return this.#identity.threadId;
+  }
+
+  get executionGenerationId(): string {
+    return this.#identity.executionGenerationId;
+  }
+
+  get workspaceDirectory(): string {
+    return this.#identity.workspaceDirectory;
+  }
+
+  get activeSessionId(): string {
+    return this.#identity.activeSessionId;
+  }
+
+  get sessionId(): string {
+    return this.#identity.sessionId;
+  }
+
+  get sessionFile(): string | undefined {
+    return this.#identity.sessionFile;
+  }
+
+  get boundAt(): string {
+    return this.#identity.boundAt;
+  }
+
+  get runtime(): ResidentRuntimeCompatibility {
+    return this.#identity.runtime;
+  }
+
+  promoteToResident(): Promise<void> {
+    if (this.#promotionPromise) return this.#promotionPromise;
+    if (this.#disposePromise || this.#state !== "owned") {
+      return Promise.reject(
+        new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+          "This client-owned Prime Agent candidate is no longer available for promotion.",
+          { details: { activeSessionId: this.activeSessionId, state: this.#state } },
+        ),
+      );
+    }
+    if (typeof this.#attached.promoteToResident !== "function") {
+      return Promise.reject(
+        new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_MODULE_INVALID",
+          "The pinned Prime Agent owned connection is missing resident promotion support.",
+        ),
+      );
+    }
+
+    this.#state = "promoting";
+    this.#promotionPromise = Promise.resolve().then(async () => {
+      try {
+        await awaitResidentMutationInvocation(
+          this.#attached.promoteToResident(),
+          this.#requestTimeoutMs,
+          "owned-session promotion",
+        );
+      } catch (error) {
+        this.#state = "promotion_unknown";
+        throw unknownOwnedPromotionOutcome(this.activeSessionId, error);
+      }
+      this.#residentBinding = freezeBinding({
+        bindingVersion: 1,
+        lifecycle: "resident",
+        threadId: this.threadId,
+        executionGenerationId: this.executionGenerationId,
+        workspaceDirectory: this.workspaceDirectory,
+        activeSessionId: this.activeSessionId,
+        sessionId: this.sessionId,
+        ...(this.sessionFile ? { sessionFile: this.sessionFile } : {}),
+        boundAt: this.boundAt,
+        runtime: this.runtime,
+      });
+      this.#state = "promoted";
+    });
+    return this.#promotionPromise;
+  }
+
+  async readStableProjection(): Promise<ResidentProjectionSnapshot> {
+    const binding = this.#requirePromotedBinding();
+    const projection = await readStableResidentProjection(this.#attached, binding).catch((error) => {
+      if (error instanceof ResidentRuntimeContractError) throw error;
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_REQUEST_FAILED",
+        "Prime Agent promotion did not produce a stable authoritative snapshot.",
+        { retryable: true, details: { cause: errorMessage(error) }, cause: error },
+      );
+    });
+    if (!projection) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_RESPONSE_INVALID",
+        "Prime Agent state changed throughout owned-session promotion reconciliation.",
+        { details: { activeSessionId: this.activeSessionId } },
+      );
+    }
+    return projection;
+  }
+
+  async publishStableProjection(
+    publisher: (
+      binding: ResidentSessionBinding,
+      projection: ResidentProjectionSnapshot,
+    ) => Promise<void>,
+  ): Promise<ResidentProjectionSnapshot> {
+    if (typeof publisher !== "function") {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_ARGUMENT_INVALID",
+        "Owned-session projection publication requires a durable publisher.",
+        { details: { field: "publisher" } },
+      );
+    }
+    const binding = this.#requirePromotedBinding();
+    const projection = await this.readStableProjection();
+    await publishProjection(publisher, binding, projection);
+    return projection;
+  }
+
+  attemptUnverifiedOwnedCleanup(): Promise<ResidentOwnedCleanupAttemptResult> {
+    if (this.#ownedCleanupAttemptPromise) return this.#ownedCleanupAttemptPromise;
+    if (this.#state !== "owned") {
+      return Promise.reject(
+        new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+          "Unverified owned cleanup is available only before resident promotion begins.",
+          { details: { activeSessionId: this.activeSessionId, state: this.#state } },
+        ),
+      );
+    }
+    this.#ownedCleanupAttemptPromise = this.#disposeConnection().then(
+      () => UNVERIFIED_OWNED_CLEANUP_ATTEMPT,
+    );
+    return this.#ownedCleanupAttemptPromise;
+  }
+
+  dispose(): Promise<void> {
+    return this.#disposeConnection();
+  }
+
+  #requirePromotedBinding(): ResidentSessionBinding {
+    if (this.#state === "promoted" && this.#residentBinding && !this.#disposePromise) {
+      return this.#residentBinding;
+    }
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+      "A stable resident projection is available only after confirmed promotion.",
+      { details: { activeSessionId: this.activeSessionId, state: this.#state } },
+    );
+  }
+
+  #disposeConnection(): Promise<void> {
+    if (this.#disposePromise) return this.#disposePromise;
+    const promotionSettlement = this.#promotionPromise?.catch(() => undefined) ?? Promise.resolve();
+    this.#disposePromise = promotionSettlement
+      .then(async () => {
+        if (this.#state === "promotion_unknown") {
+          // The upstream promotion may still settle after our wrapper timed
+          // out. Disposing the owned connection could race that settlement and
+          // emit complete_owned_session. Abandon only this client transport.
+          this.#client.close();
+          return;
+        }
+        await this.#attached.dispose();
+      })
+      .catch((error) => {
+        if (this.#state !== "promotion_unknown") this.#client.close();
+        throw error;
+      })
+      .finally(() => {
+        if (this.#state !== "promotion_unknown") this.#state = "disposed";
+        this.#onClosed();
+      });
+    return this.#disposePromise;
   }
 }
 
@@ -2416,6 +2840,51 @@ function unknownResidentMutationOutcome(
   );
 }
 
+function unknownOwnedPromotionOutcome(
+  activeSessionId: string,
+  cause: unknown,
+): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    "Prime Agent may have promoted the client-owned session, but no definitive response was received.",
+    {
+      retryable: false,
+      details: {
+        command: "promote_owned_session",
+        activeSessionId,
+        outcome: "unknown",
+        cause: errorMessage(cause),
+      },
+      cause,
+    },
+  );
+}
+
+function unknownOwnedCreateOutcome(
+  phase: string,
+  activeSessionId: string | undefined,
+  cleanup: string | undefined,
+  cause: unknown,
+): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    "Prime Agent may own a client-owned session, but its final state is not proven.",
+    {
+      retryable: false,
+      details: {
+        command: "create",
+        phase,
+        outcome: "unknown",
+        ...(activeSessionId ? { activeSessionId } : {}),
+        ...(cleanup ? { cleanup } : {}),
+        failureCode: cause instanceof ResidentRuntimeContractError ? cause.code : "unclassified",
+        cause: errorMessage(cause),
+      },
+      cause,
+    },
+  );
+}
+
 function classifyPromptAdmissionFailure(
   dispatchAttemptId: string,
   error: unknown,
@@ -2807,6 +3276,38 @@ function assertWorkspaceMatches(actual: string, expected: string, source: string
     `Prime Agent ${source} belongs to a different workspace.`,
     { details: { field: "cwd" } },
   );
+}
+
+function validateOwnedCandidateSessionFile(
+  sessionFile: string | undefined,
+  input: ResidentOwnedSessionCreateInput,
+): string | undefined {
+  if (sessionFile === undefined) {
+    if (input.session.kind === "new") return undefined;
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SESSION_MISMATCH",
+      "Prime Agent did not return the exact imported session identity.",
+      { details: { field: "sessionFile" } },
+    );
+  }
+  if (!isAbsolute(sessionFile) || resolvePath(sessionFile) !== sessionFile) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_RESPONSE_INVALID",
+      "Prime Agent returned a non-canonical owned-session path.",
+      { details: { field: "sessionFile" } },
+    );
+  }
+  if (
+    input.session.kind === "resume" &&
+    !sameWorkspacePath(sessionFile, input.session.sessionPath)
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SESSION_MISMATCH",
+      "Prime Agent created a different session than the exact imported target.",
+      { details: { field: "sessionFile" } },
+    );
+  }
+  return sessionFile;
 }
 
 function sameWorkspacePath(left: string, right: string): boolean {

@@ -35,6 +35,7 @@ export const REQUIRED_RESIDENT_DAEMON_CAPABILITIES = Object.freeze([
   "event_sequence",
   "slim_attach",
   "chunked_snapshot",
+  "client_owned_sessions",
 ] as const);
 
 /**
@@ -398,6 +399,32 @@ export interface ResidentSessionCreateInput {
   readonly sessionName?: string;
 }
 
+/**
+ * Deliberately narrower than the legacy resident-create input. A durable
+ * provisioning coordinator must select one immutable target before the daemon
+ * mutation starts; `continue_recent` is therefore not representable here.
+ */
+export type ResidentOwnedSessionSelection =
+  | Readonly<{ kind: "new" }>
+  | Readonly<{ kind: "resume"; sessionPath: string }>;
+
+export type ResidentOwnedSessionCreateInput =
+  | Readonly<{
+      threadId: string;
+      executionGenerationId: string;
+      workspaceDirectory: string;
+      session: Readonly<{ kind: "new" }>;
+      sessionName?: string;
+    }>
+  | Readonly<{
+      threadId: string;
+      executionGenerationId: string;
+      workspaceDirectory: string;
+      session: Readonly<{ kind: "resume"; sessionPath: string }>;
+      /** Import renaming is not admitted before durable resident activation. */
+      sessionName?: never;
+    }>;
+
 /** Narrow adapter-private command passed to the pinned package's DaemonClient. */
 export interface ResidentDaemonCreateRequest {
   readonly type: "create";
@@ -407,6 +434,111 @@ export interface ResidentDaemonCreateRequest {
   readonly sessionPath?: string;
   readonly continueRecent?: true;
   readonly name?: string;
+}
+
+/** Exact client-owned escrow mutation sent only after durable intent exists. */
+export interface ResidentOwnedDaemonCreateRequest {
+  readonly type: "create";
+  readonly config: Readonly<{ cwd: string }>;
+  readonly lifecycle: "client_owned";
+  readonly noSession: false;
+  readonly sessionPath?: string;
+  readonly name?: string;
+}
+
+const ResidentOwnedSessionCreateInputSchema = z.union([
+  z
+    .object({
+      threadId: z.string(),
+      executionGenerationId: z.string(),
+      workspaceDirectory: z.string(),
+      session: z.object({ kind: z.literal("new") }).strict(),
+      sessionName: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      threadId: z.string(),
+      executionGenerationId: z.string(),
+      workspaceDirectory: z.string(),
+      session: z
+        .object({
+          kind: z.literal("resume"),
+          sessionPath: z.string(),
+        })
+        .strict(),
+    })
+    .strict(),
+]);
+
+/**
+ * Build the strict v0.7 client-owned create command. All validation completes
+ * before the caller obtains a wire request, so failures are definitive and no
+ * ambiguous raw path or moving `continue_recent` selector can reach Prime.
+ */
+export function buildResidentOwnedDaemonCreateRequest(
+  input: ResidentOwnedSessionCreateInput,
+): ResidentOwnedDaemonCreateRequest {
+  const validated = validateResidentOwnedSessionCreateInput(input);
+  const sessionName = validated.sessionName;
+  const sessionPath = validated.session.kind === "resume" ? validated.session.sessionPath : undefined;
+
+  return Object.freeze({
+    type: "create",
+    config: Object.freeze({ cwd: validated.workspaceDirectory }),
+    lifecycle: "client_owned",
+    noSession: false,
+    ...(sessionPath ? { sessionPath } : {}),
+    ...(sessionName ? { name: sessionName } : {}),
+  });
+}
+
+/** Validate, canonicalize, and deeply freeze one owned-create selection. */
+export function validateResidentOwnedSessionCreateInput(
+  input: unknown,
+): ResidentOwnedSessionCreateInput {
+  const parsed = ResidentOwnedSessionCreateInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+      "Resident owned-session creation input is invalid.",
+      {
+        details: {
+          field: parsed.error.issues[0]?.path.join(".") || "input",
+        },
+      },
+    );
+  }
+
+  boundedOpaqueId(parsed.data.threadId, "threadId");
+  boundedOpaqueId(parsed.data.executionGenerationId, "executionGenerationId");
+  const workspaceDirectory = boundedCanonicalAbsolutePath(
+    parsed.data.workspaceDirectory,
+    "workspaceDirectory",
+  );
+  if (parsed.data.session.kind === "resume") {
+    return Object.freeze({
+      threadId: parsed.data.threadId,
+      executionGenerationId: parsed.data.executionGenerationId,
+      workspaceDirectory,
+      session: Object.freeze({
+        kind: "resume" as const,
+        sessionPath: boundedCanonicalAbsolutePath(parsed.data.session.sessionPath, "sessionPath"),
+      }),
+    });
+  }
+
+  const rawSessionName = "sessionName" in parsed.data ? parsed.data.sessionName : undefined;
+  const sessionName = rawSessionName === undefined
+    ? undefined
+    : boundedSessionName(rawSessionName);
+  return Object.freeze({
+    threadId: parsed.data.threadId,
+    executionGenerationId: parsed.data.executionGenerationId,
+    workspaceDirectory,
+    session: Object.freeze({ kind: "new" as const }),
+    ...(sessionName ? { sessionName } : {}),
+  });
 }
 
 /**
@@ -739,6 +871,7 @@ export interface ResidentRuntimeAdapter {
   getLifecycle(): ResidentRuntimeLifecycleSnapshot;
   subscribeLifecycle(listener: ResidentRuntimeLifecycleListener): () => void;
   ensureDaemon(invocation: ResidentDaemonStartInvocation): Promise<ResidentRuntimeCompatibility>;
+  /** Legacy harness-only direct resident create; production must use owned escrow. */
   createResident(input: ResidentSessionCreateInput): Promise<ResidentRuntimeConnection>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   close(): Promise<void>;
@@ -761,6 +894,18 @@ function boundedAbsolutePath(value: string, field: string): string {
     throw new ResidentRuntimeContractError(
       "PRIME_RUNTIME_ARGUMENT_INVALID",
       `Resident runtime ${field} must be absolute.`,
+      { details: { field } },
+    );
+  }
+  return path;
+}
+
+function boundedCanonicalAbsolutePath(value: string, field: string): string {
+  const path = boundedAbsolutePath(value, field);
+  if (resolvePath(path) !== path) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+      `Resident runtime ${field} must be canonical.`,
       { details: { field } },
     );
   }

@@ -148,6 +148,8 @@ interface HarnessState {
   requests: Array<Readonly<object>>;
   closes: number;
   disposeCalls: number;
+  ownedCleanupDisposeCalls: number;
+  residentDetachDisposeCalls: number;
   eventListeners: Set<(event: unknown) => void | Promise<void>>;
   attachCalls: Array<{ activeSessionId: string; options: Readonly<Record<string, unknown>> }>;
   spawnCalls: Array<{ executable: string; argv: readonly string[]; options: unknown }>;
@@ -177,6 +179,7 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined;
   }>;
   abortCalls: number;
+  promoteCalls: number;
   availableModelsHandler?: () => Promise<unknown> | unknown;
   setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
   promptHandler?: (
@@ -184,6 +187,9 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
   ) => Promise<void> | void;
   abortHandler?: () => Promise<void> | void;
+  promoteHandler?: () => Promise<void> | void;
+  promoteAvailable: boolean;
+  attachHandler?: () => Promise<void> | void;
   waitHandler?: (milliseconds: number) => Promise<void> | void;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
@@ -197,6 +203,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     requests: [],
     closes: 0,
     disposeCalls: 0,
+    ownedCleanupDisposeCalls: 0,
+    residentDetachDisposeCalls: 0,
     eventListeners: new Set(),
     attachCalls: [],
     spawnCalls: [],
@@ -210,6 +218,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     setModelCalls: [],
     promptCalls: [],
     abortCalls: 0,
+    promoteCalls: 0,
+    promoteAvailable: true,
     ...overrides,
   };
 
@@ -261,6 +271,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       if (state.recoverDuringAttach) {
         await (options.recoverDaemon as () => Promise<void>)();
       }
+      await state.attachHandler?.();
+      let ownedSession = options.ownedSession === true;
       return {
         getInitialSnapshot: async () => {
           state.chronology.push("snapshot");
@@ -280,14 +292,17 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             ? state.availableModelsHandler()
             : [{ provider: "openai", id: "gpt-5", secretMetadata: "discarded" }];
         },
-        setModel: async (providerId, modelId) => {
+        setModel: async (providerId: string, modelId: string) => {
           state.setModelCalls.push({ providerId, modelId });
           state.chronology.push(`model:set:${providerId}/${modelId}`);
           return state.setModelHandler
             ? state.setModelHandler(providerId, modelId)
             : { provider: providerId, id: modelId, rawCredential: "discarded" };
         },
-        prompt: async (message, options) => {
+        prompt: async (
+          message: string,
+          options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
+        ) => {
           state.promptCalls.push({ message, options });
           state.chronology.push("prompt");
           await state.promptHandler?.(message, options);
@@ -297,16 +312,26 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           state.chronology.push("abort");
           await state.abortHandler?.();
         },
-        subscribe: (listener) => {
+        promoteToResident: state.promoteAvailable
+          ? async () => {
+              state.promoteCalls += 1;
+              state.chronology.push("promote");
+              await state.promoteHandler?.();
+              ownedSession = false;
+            }
+          : undefined,
+        subscribe: (listener: (event: unknown) => void | Promise<void>) => {
           state.eventListeners.add(listener);
           return () => state.eventListeners.delete(listener);
         },
         dispose: async () => {
           state.disposeCalls += 1;
+          if (ownedSession) state.ownedCleanupDisposeCalls += 1;
+          else state.residentDetachDisposeCalls += 1;
           state.chronology.push("dispose");
           await state.disposeHandler?.();
         },
-      };
+      } as unknown as PrimeDaemonAgentConnectionPublic;
     }
   }
 
@@ -378,6 +403,25 @@ function createInput() {
     executionGenerationId: "generation-1",
     workspaceDirectory: "C:\\work\\project",
     sessionName: "Prime Continuim",
+  } as const;
+}
+
+function ownedInput() {
+  return {
+    threadId: "thread-owned-1",
+    executionGenerationId: "generation-owned-1",
+    workspaceDirectory: "C:\\work\\project",
+    session: { kind: "new" },
+    sessionName: "Prime Continuim",
+  } as const;
+}
+
+function ownedResumeInput() {
+  return {
+    threadId: "thread-owned-1",
+    executionGenerationId: "generation-owned-1",
+    workspaceDirectory: "C:\\work\\project",
+    session: { kind: "resume", sessionPath: "C:\\sessions\\session-1.jsonl" },
   } as const;
 }
 
@@ -561,6 +605,423 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     expect(state.chronology.filter((entry) => entry === "connect")).toHaveLength(3);
     await connection.detach();
     await adapter.close();
+  });
+});
+
+describe("PrimeAgentResidentAdapter client-owned escrow", () => {
+  it("creates and attaches one exact client-owned candidate without durable resident side effects", async () => {
+    const { adapter, state } = createHarness();
+
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+
+    expect(state.requests).toEqual([{
+      type: "create",
+      config: { cwd: "C:\\work\\project" },
+      lifecycle: "client_owned",
+      noSession: false,
+      name: "Prime Continuim",
+    }]);
+    expect(state.attachCalls).toHaveLength(1);
+    expect(state.attachCalls[0]).toMatchObject({
+      activeSessionId: "active-1",
+      options: {
+        closeClientOnDispose: true,
+        sendClientEnv: false,
+        supportsExtensionUi: false,
+        ownedSession: true,
+      },
+    });
+    expect(candidate).toMatchObject({
+      candidateVersion: 1,
+      threadId: "thread-owned-1",
+      executionGenerationId: "generation-owned-1",
+      workspaceDirectory: "C:\\work\\project",
+      activeSessionId: "active-1",
+      sessionId: "session-1",
+      sessionFile: "C:\\sessions\\session-1.jsonl",
+      boundAt: "2026-08-06T17:00:00.000Z",
+      runtime: { runtimeBuildId: "be9e2fa-dirty" },
+    });
+    expect(Object.isFrozen(candidate)).toBe(true);
+    expect(Object.isFrozen(candidate.runtime)).toBe(true);
+    expect(Object.isFrozen(candidate.runtime.capabilities)).toBe(true);
+    expect(Reflect.ownKeys(candidate).some((key) => typeof key === "symbol")).toBe(true);
+    expect(structuredClone(candidate)).toEqual({ candidateVersion: 1 });
+    expect(structuredClone(candidate)).not.toHaveProperty("promoteToResident");
+    expect(state.persistCalls).toHaveLength(0);
+    expect(state.projectionCalls).toHaveLength(0);
+
+    const cleanupAttempt = candidate.attemptUnverifiedOwnedCleanup();
+    expect(candidate.attemptUnverifiedOwnedCleanup()).toBe(cleanupAttempt);
+    const disposal = candidate.dispose();
+    const cleanupResult = await cleanupAttempt;
+    expect(cleanupResult).toEqual({
+      disposition: "attempted_unverified",
+      durableCompletionAuthorized: false,
+      reason: "prime_v0_7_dispose_suppresses_complete_response",
+    });
+    expect(Object.isFrozen(cleanupResult)).toBe(true);
+    expect(cleanupResult).not.toHaveProperty("proof");
+    await disposal;
+    expect(candidate.attemptUnverifiedOwnedCleanup()).toBe(cleanupAttempt);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.ownedCleanupDisposeCalls).toBe(1);
+    expect(state.residentDetachDisposeCalls).toBe(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+    expect(state.disposeCalls).toBe(1);
+  });
+
+  it("quarantines success:false create because Prime may have already registered a worker", async () => {
+    const { adapter, state } = createHarness({
+      requestHandler: (command) => ({
+        type: "response",
+        command: (command as { type?: string }).type ?? "unknown",
+        success: false,
+        error: "Session is already active under another daemon client",
+      }),
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedResumeInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "create",
+      phase: "create_response_unverified",
+      outcome: "unknown",
+      cleanup: "owner_transport_closed",
+      failureCode: "PRIME_RUNTIME_REQUEST_FAILED",
+    });
+    expect(state.requests).toHaveLength(1);
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("quarantines post-create local validation even after best-effort owned disposal", async () => {
+    const { adapter, state } = createHarness({ promoteAvailable: false });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "create",
+      phase: "validating_owned_connection",
+      outcome: "unknown",
+      activeSessionId: "active-1",
+      cleanup: "public_owned_dispose_unverified",
+      failureCode: "PRIME_RUNTIME_MODULE_INVALID",
+    });
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["create"]);
+    expect(state.attachCalls).toHaveLength(1);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.ownedCleanupDisposeCalls).toBe(1);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("quarantines an owned attach failure after the daemon accepted create", async () => {
+    const { adapter, state } = createHarness({
+      attachHandler: () => {
+        throw new Error("attach transport failed");
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "create",
+      phase: "attaching_owned_connection",
+      outcome: "unknown",
+      activeSessionId: "active-1",
+      cleanup: "owner_transport_closed",
+    });
+    expect(state.attachCalls).toHaveLength(1);
+    expect(state.disposeCalls).toBe(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("rejects a daemon summary that drifts from the exact imported session path", async () => {
+    const { adapter, state } = createHarness({
+      requestHandler: (command) => ({
+        type: "response",
+        command: (command as { type?: string }).type ?? "unknown",
+        success: true,
+        data: liveSummary({ sessionFile: "C:\\sessions\\other.jsonl" }),
+      }),
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedResumeInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "create",
+      phase: "validating_create_identity",
+      outcome: "unknown",
+      activeSessionId: "active-1",
+      cleanup: "owner_transport_closed",
+      failureCode: "PRIME_RUNTIME_SESSION_MISMATCH",
+    });
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.requests).toHaveLength(1);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("rejects ambiguous owned input definitively before connecting or mutating", async () => {
+    const { adapter, state } = createHarness();
+
+    await expectRuntimeError(
+      adapter.createOwnedCandidate({
+        ...ownedInput(),
+        session: { kind: "continue_recent" },
+      } as never),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+    await expectRuntimeError(
+      adapter.createOwnedCandidate({
+        ...ownedResumeInput(),
+        sessionName: "Renamed before promotion",
+      } as never),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+
+    expect(state.chronology).toEqual([]);
+    expect(state.requests).toHaveLength(0);
+    expect(state.attachCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("classifies a lost owned create response as unknown and never replays or root-kills it", async () => {
+    const { adapter, state } = createHarness({
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type === "create") throw new Error("create response lost");
+        return { type: "response", command: "unknown", success: true };
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({ command: "create", outcome: "unknown" });
+    expect(state.requests).toHaveLength(1);
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("treats a malformed create response as unknown rather than a definitive rejection", async () => {
+    const { adapter, state } = createHarness({
+      requestHandler: () => ({
+        type: "response",
+        command: "list",
+        success: true,
+        data: { sessions: [] },
+      }),
+    });
+
+    const error = await expectRuntimeError(
+      adapter.createOwnedCandidate(ownedInput()),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "create",
+      phase: "create_response_unverified",
+      outcome: "unknown",
+      cleanup: "owner_transport_closed",
+    });
+    expect(state.requests).toHaveLength(1);
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("promotes exactly once, preserves boundAt, publishes stable state, then detaches as resident", async () => {
+    const { adapter, state } = createHarness();
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+    const proposedBoundAt = candidate.boundAt;
+
+    const first = candidate.promoteToResident();
+    const duplicate = candidate.promoteToResident();
+    expect(duplicate).toBe(first);
+    await first;
+
+    let publishedBinding: ResidentSessionBinding | undefined;
+    let publishedProjection: ResidentProjectionSnapshot | undefined;
+    const projection = await candidate.publishStableProjection(async (durableBinding, stableProjection) => {
+      publishedBinding = durableBinding;
+      publishedProjection = stableProjection;
+    });
+
+    expect(state.promoteCalls).toBe(1);
+    expect(publishedBinding).toMatchObject({
+      lifecycle: "resident",
+      threadId: "thread-owned-1",
+      executionGenerationId: "generation-owned-1",
+      activeSessionId: "active-1",
+      sessionId: "session-1",
+      boundAt: proposedBoundAt,
+    });
+    expect(publishedProjection).toBe(projection);
+    expect(projection).toMatchObject({
+      identity: {
+        activeSessionId: "active-1",
+        sessionId: "session-1",
+        workspaceDirectory: "C:\\work\\project",
+      },
+      cursor: { generation: "events-1", sequence: 4 },
+    });
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
+    await expectRuntimeError(
+      candidate.attemptUnverifiedOwnedCleanup(),
+      "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+    );
+
+    await candidate.dispose();
+    expect(state.disposeCalls).toBe(1);
+    expect(state.ownedCleanupDisposeCalls).toBe(0);
+    expect(state.residentDetachDisposeCalls).toBe(1);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("does not publish or claim readiness after four changing post-promotion reads", async () => {
+    let sequence = 0;
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ cursorSequence: ++sequence }),
+    });
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+    await candidate.promoteToResident();
+    const publisher = vi.fn(async () => undefined);
+
+    await expectRuntimeError(
+      candidate.publishStableProjection(publisher),
+      "PRIME_RUNTIME_RESPONSE_INVALID",
+    );
+
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(4);
+    expect(publisher).not.toHaveBeenCalled();
+    expect(state.projectionCalls).toHaveLength(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await candidate.dispose();
+    await adapter.close();
+  });
+
+  it("keeps a promoted resident alive when durable projection publication fails locally", async () => {
+    const { adapter, state } = createHarness();
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+    await candidate.promoteToResident();
+
+    const error = await expectRuntimeError(
+      candidate.publishStableProjection(async () => {
+        throw new Error("lifecycle WAL unavailable");
+      }),
+      "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
+    );
+
+    expect(error.retryable).toBe(true);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await candidate.dispose();
+    expect(state.residentDetachDisposeCalls).toBe(1);
+    expect(state.ownedCleanupDisposeCalls).toBe(0);
+    await adapter.close();
+  });
+
+  it("retains unknown promotion truth across late settlement and best-effort dispose", async () => {
+    const promotionGate = deferred();
+    const { adapter, state } = createHarness({
+      promoteHandler: () => promotionGate.promise,
+    });
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+    const proposedBoundAt = candidate.boundAt;
+
+    const first = candidate.promoteToResident();
+    const duplicate = candidate.promoteToResident();
+    expect(duplicate).toBe(first);
+    const error = await expectRuntimeError(first, "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
+    expect(error).toMatchObject({ retryable: false });
+    expect(error.details).toMatchObject({
+      command: "promote_owned_session",
+      activeSessionId: "active-1",
+      outcome: "unknown",
+    });
+    expect(state.promoteCalls).toBe(1);
+    expect(candidate.boundAt).toBe(proposedBoundAt);
+    const cleanupError = await expectRuntimeError(
+      candidate.attemptUnverifiedOwnedCleanup(),
+      "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+    );
+    expect(cleanupError.details).toMatchObject({ state: "promotion_unknown" });
+
+    const closesBeforeAbandon = state.closes;
+    await candidate.dispose();
+    expect(state.disposeCalls).toBe(0);
+    expect(state.ownedCleanupDisposeCalls).toBe(0);
+    expect(state.residentDetachDisposeCalls).toBe(0);
+    expect(state.closes).toBe(closesBeforeAbandon + 1);
+    promotionGate.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await expectRuntimeError(candidate.promoteToResident(), "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
+    const postDisposeCleanup = await expectRuntimeError(
+      candidate.attemptUnverifiedOwnedCleanup(),
+      "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+    );
+    expect(postDisposeCleanup.details).toMatchObject({ state: "promotion_unknown" });
+    expect(state.promoteCalls).toBe(1);
+    expect(state.disposeCalls).toBe(0);
+    expect(state.ownedCleanupDisposeCalls).toBe(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+    expect(state.disposeCalls).toBe(0);
+  });
+
+  it("adapter close abandons promotion-unknown transport without owned cleanup", async () => {
+    const promotionGate = deferred();
+    const { adapter, state } = createHarness({
+      promoteHandler: () => promotionGate.promise,
+    });
+    const candidate = await adapter.createOwnedCandidate(ownedInput());
+    await expectRuntimeError(
+      candidate.promoteToResident(),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+
+    const closesBeforeAbandon = state.closes;
+    await adapter.close();
+    expect(state.disposeCalls).toBe(0);
+    expect(state.ownedCleanupDisposeCalls).toBe(0);
+    expect(state.residentDetachDisposeCalls).toBe(0);
+    expect(state.closes).toBe(closesBeforeAbandon + 1);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+
+    promotionGate.resolve();
+    await Promise.resolve();
+    const cleanupError = await expectRuntimeError(
+      candidate.attemptUnverifiedOwnedCleanup(),
+      "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT",
+    );
+    expect(cleanupError.details).toMatchObject({ state: "promotion_unknown" });
+    expect(state.disposeCalls).toBe(0);
   });
 });
 

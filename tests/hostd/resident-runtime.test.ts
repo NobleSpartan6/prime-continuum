@@ -6,6 +6,7 @@ import {
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
   RESIDENT_RUNTIME_LAUNCH_STRATEGY,
   ResidentRuntimeContractError,
+  buildResidentOwnedDaemonCreateRequest,
   buildResidentDaemonCreateRequest,
   buildResidentDaemonStartInvocation,
   sanitizeResidentDaemonEnvironment,
@@ -69,6 +70,7 @@ describe("resident Prime Agent runtime pin", () => {
       "event_sequence",
       "slim_attach",
       "chunked_snapshot",
+      "client_owned_sessions",
     ]);
     expect(Object.isFrozen(PINNED_PRIME_AGENT_RUNTIME)).toBe(true);
     expect(Object.isFrozen(PINNED_PRIME_AGENT_RUNTIME.daemon)).toBe(true);
@@ -118,8 +120,21 @@ describe("resident daemon compatibility", () => {
     expect(error.toJSON()).toMatchObject({
       code: "PRIME_RUNTIME_CAPABILITY_MISSING",
       retryable: false,
-      details: { missingCapabilities: "slim_attach,chunked_snapshot" },
+      details: { missingCapabilities: "slim_attach,chunked_snapshot,client_owned_sessions" },
     });
+  });
+
+  it("rejects the pinned runtime when client-owned escrow is unavailable", () => {
+    const hello = validHello();
+    hello.serverCapabilities = REQUIRED_RESIDENT_DAEMON_CAPABILITIES.filter(
+      (capability) => capability !== "client_owned_sessions",
+    );
+
+    const error = expectContractError(
+      () => validateResidentDaemonHello(hello),
+      "PRIME_RUNTIME_CAPABILITY_MISSING",
+    );
+    expect(error.details).toEqual({ missingCapabilities: "client_owned_sessions" });
   });
 
   it("binds an accepted hello to the exact requested socket path", () => {
@@ -329,6 +344,67 @@ describe("resident launch and create plans", () => {
       noSession: false,
       continueRecent: true,
     });
+  });
+
+  it("builds an exact client-owned escrow request from one canonical target", () => {
+    const request = buildResidentOwnedDaemonCreateRequest({
+      threadId: "thread-owned-1",
+      executionGenerationId: "execution-owned-1",
+      workspaceDirectory: "C:\\work\\project",
+      session: { kind: "resume", sessionPath: "C:\\sessions\\thread.jsonl" },
+    });
+
+    expect(request).toEqual({
+      type: "create",
+      config: { cwd: "C:\\work\\project" },
+      lifecycle: "client_owned",
+      noSession: false,
+      sessionPath: "C:\\sessions\\thread.jsonl",
+    });
+    expect(request).not.toHaveProperty("continueRecent");
+    expect(Object.isFrozen(request)).toBe(true);
+    expect(Object.isFrozen(request.config)).toBe(true);
+  });
+
+  it("rejects moving selectors, ambiguous raw fields, and non-canonical owned paths", () => {
+    expectContractError(
+      () => buildResidentOwnedDaemonCreateRequest({
+        threadId: "thread-owned-import-name",
+        executionGenerationId: "execution-owned-import-name",
+        workspaceDirectory: "C:\\work\\project",
+        session: { kind: "resume", sessionPath: "C:\\sessions\\thread.jsonl" },
+        sessionName: "Must not rename import",
+      } as never),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+    expectContractError(
+      () => buildResidentOwnedDaemonCreateRequest({
+        threadId: "thread-owned-2",
+        executionGenerationId: "execution-owned-2",
+        workspaceDirectory: "C:\\work\\project",
+        session: { kind: "continue_recent" },
+      } as never),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+    expectContractError(
+      () => buildResidentOwnedDaemonCreateRequest({
+        threadId: "thread-owned-3",
+        executionGenerationId: "execution-owned-3",
+        workspaceDirectory: "C:\\work\\project",
+        sessionPath: "C:\\sessions\\thread.jsonl",
+        session: { kind: "new" },
+      } as never),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
+    expectContractError(
+      () => buildResidentOwnedDaemonCreateRequest({
+        threadId: "thread-owned-4",
+        executionGenerationId: "execution-owned-4",
+        workspaceDirectory: "C:\\work\\project\\..\\other",
+        session: { kind: "new" },
+      }),
+      "PRIME_RUNTIME_ARGUMENT_INVALID",
+    );
   });
 
   it("rejects control characters rather than placing them in process arguments", () => {
