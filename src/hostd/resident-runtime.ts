@@ -88,6 +88,8 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_DISPATCH_RETIRED"
   | "COMMAND_ID_REUSED"
   | "PRIME_RUNTIME_DISPATCH_IDENTITY_LIMIT"
+  | "PRIME_RUNTIME_LIFECYCLE_IDENTITY_LIMIT"
+  | "PRIME_RUNTIME_LIFECYCLE_RETIRED"
   | "PRIME_RUNTIME_ADAPTER_CLOSED"
   | "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT";
 
@@ -837,6 +839,14 @@ export interface ResidentRuntimeLifecycleSnapshot {
 
 export type ResidentRuntimeLifecycleListener = (snapshot: ResidentRuntimeLifecycleSnapshot) => void;
 
+/** Definitive Prime acknowledgement for one exact Store-authorized resident end. */
+export interface ResidentEndAcknowledgement {
+  readonly acknowledgementVersion: 1;
+  readonly operation: "end";
+  readonly activeSessionId: string;
+  readonly sessionId: string;
+}
+
 /** Host-owned connection handle. It intentionally exposes no upstream state or event DTO. */
 export interface ResidentRuntimeConnection {
   readonly binding: ResidentSessionBinding;
@@ -874,6 +884,12 @@ export interface ResidentRuntimeAdapter {
   /** Legacy harness-only direct resident create; production must use owned escrow. */
   createResident(input: ResidentSessionCreateInput): Promise<ResidentRuntimeConnection>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
+  /** Read exact, stable Prime state without publishing it or mutating durable authority. */
+  readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
+  /** Invoke one exact root kill only behind the caller's durable Store kill lease. */
+  endResidentSession(binding: ResidentSessionBinding): Promise<ResidentEndAcknowledgement>;
+  /** Release only a matching process-local transport; never stops or completes Prime state. */
+  detachResidentSession(binding: ResidentSessionBinding): Promise<void>;
   close(): Promise<void>;
 }
 

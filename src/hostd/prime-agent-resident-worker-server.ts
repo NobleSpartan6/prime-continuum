@@ -269,7 +269,10 @@ export class ResidentRuntimeWorkerServer {
           requestId,
           operation,
           ok: false,
-          error: serializeResidentWorkerError(error, residentWorkerFailureOutcome(error, mutationInvoked)),
+          error: serializeResidentWorkerError(
+            error,
+            residentWorkerFailureOutcome(error, mutationInvoked, operation),
+          ),
         });
       } catch (serializationError) {
         await this.failFatal(serializationError);
@@ -823,13 +826,18 @@ function operationMayMutate(
 function residentWorkerFailureOutcome(
   error: unknown,
   mutationInvoked: boolean,
+  operation: ResidentWorkerOperation,
 ): "definitive" | "unknown" {
   if (!mutationInvoked) return "definitive";
   const status = isRecord(error) ? error.status : undefined;
-  // These are the only public admission statuses that prove the runtime did
-  // not take ownership. Every other post-invocation failure is uncertain and
-  // must be reconciled, never replayed.
-  return status === "cancelled" || status === "unsupported" ? "definitive" : "unknown";
+  // These are prompt/Stop admission statuses, not generic daemon-command
+  // outcomes. In particular, root kill is a `client.request`: every failure
+  // after that call is unknown even if an upstream error happens to carry one
+  // of the same status strings.
+  return (operation === "connection.prompt" || operation === "connection.abort") &&
+    (status === "cancelled" || status === "unsupported")
+    ? "definitive"
+    : "unknown";
 }
 
 function uncertainPromotionDisposalError(

@@ -33,6 +33,7 @@ import {
   type ResidentAbortIdleReconciliationRequest,
   type ResidentDispatchOperation,
   type ResidentDispatchResult,
+  type ResidentEndAcknowledgement,
   type ResidentGenerationDispatchLease,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentPromptIdleReconciliationRequest,
@@ -66,6 +67,7 @@ const MAX_LIVE_SESSIONS = 10_000;
 const MAX_AVAILABLE_MODELS = 5_000;
 const MAX_MODEL_SELECTION_IDENTITIES = 10_000;
 const MAX_RESIDENT_DISPATCH_IDENTITIES = 10_000;
+const MAX_RESIDENT_LIFECYCLE_END_IDENTITIES = 10_000;
 const RETIRED_RESIDENT_DISPATCH_FENCE_BYTES = 2 * 1024 * 1024;
 const RETIRED_RESIDENT_DISPATCH_FENCE_HASHES = 8;
 const MAX_RESIDENT_PROMPT_CHARACTERS = 65_536;
@@ -276,6 +278,11 @@ interface AbortIdleReconciliationRecord {
   readonly result: Promise<ResidentAbortIdleAuthorityEvidence>;
 }
 
+interface ResidentLifecycleEndAttempt {
+  readonly bindingFingerprint: string;
+  readonly result: Promise<ResidentEndAcknowledgement>;
+}
+
 interface ResidentIdleReconciliationCancellation {
   readonly promise: Promise<never>;
   readonly reject: (error: ResidentRuntimeContractError) => void;
@@ -480,6 +487,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
   private readonly lifecycle: LifecycleController;
   private readonly connections = new Map<string, ManagedResidentRuntimeConnection>();
   private readonly ownedCandidates = new Set<ManagedResidentOwnedCandidate>();
+  private readonly lifecycleEndAttempts = new Map<string, ResidentLifecycleEndAttempt>();
+  private readonly settledLifecycleEndIds = new Set<string>();
+  private readonly retiredLifecycleEndFence = new RetiredResidentDispatchFence();
   private readonly modelSelectionAttempts = new Map<
     string,
     Readonly<{
@@ -787,6 +797,229 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     });
   }
 
+  readStableResidentProjection(bindingValue: ResidentSessionBinding): Promise<ResidentProjectionSnapshot> {
+    let binding: ResidentSessionBinding;
+    try {
+      binding = validateResidentSessionBinding(bindingValue);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    return this.enqueue(async () => {
+      this.assertOpen();
+      let client: PrimeDaemonClientPublic | undefined;
+      let attached: PrimeDaemonAgentConnectionPublic | undefined;
+      try {
+        await this.ensureDaemonSingleFlight();
+        const runtimeModule = await this.loadModule();
+        const opened = await this.openValidatedClient(runtimeModule);
+        client = opened.client;
+        assertRuntimeCompatibilityMatchesBinding(opened.compatibility, binding);
+        const response = await requestDaemon(
+          client,
+          { type: "list" },
+          this.options.requestTimeoutMs,
+          "list",
+        );
+        const summary = findExactLiveSession(response.data, binding);
+        assertSummaryMatchesBinding(summary, binding);
+        this.assertOpen();
+        attached = await this.attachPublicConnection(
+          runtimeModule,
+          client,
+          binding.activeSessionId,
+          false,
+        );
+        const projection = await readStableResidentProjection(attached, binding);
+        if (!projection) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_RESPONSE_INVALID",
+            "Prime Agent state changed throughout the bounded resident recovery read.",
+          );
+        }
+        const currentCompatibility = validateResidentDaemonHello(
+          client.hello ?? (await client.waitForHello(this.options.connectTimeoutMs)),
+          {
+            expectedSocketPath: this.options.socketPath,
+            expectedExecutablePath: this.options.invocation.executable,
+            expectedEntrypointPath: this.options.invocation.argv[0],
+          },
+        );
+        assertRuntimeCompatibilityMatchesBinding(currentCompatibility, binding);
+        this.assertOpen();
+        return projection;
+      } catch (error) {
+        throw normalizeRuntimeError(
+          error,
+          "Prime Agent resident recovery projection could not be read.",
+        );
+      } finally {
+        if (attached) await attached.dispose().catch(() => undefined);
+        closeDaemonClientQuietly(client);
+      }
+    });
+  }
+
+  endResidentSession(bindingValue: ResidentSessionBinding): Promise<ResidentEndAcknowledgement> {
+    let binding: ResidentSessionBinding;
+    let bindingFingerprint: string;
+    try {
+      binding = validateResidentSessionBinding(bindingValue);
+      bindingFingerprint = residentDispatchAuthorityFingerprint(binding);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    const existing = this.lifecycleEndAttempts.get(binding.activeSessionId);
+    if (existing) {
+      if (existing.bindingFingerprint !== bindingFingerprint) {
+        return Promise.reject(
+          new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_SESSION_MISMATCH",
+            "This resident runtime end identity is already bound to different exact authority.",
+            { details: { activeSessionId: binding.activeSessionId } },
+          ),
+        );
+      }
+      return existing.result;
+    }
+    if (this.retiredLifecycleEndFence.has(bindingFingerprint)) {
+      return Promise.reject(
+        new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_LIFECYCLE_RETIRED",
+          "This resident runtime end authority is retired and cannot regain a root-kill invocation.",
+          { details: { activeSessionId: binding.activeSessionId } },
+        ),
+      );
+    }
+    this.retireSettledLifecycleEndAttempts();
+    if (this.lifecycleEndAttempts.size >= MAX_RESIDENT_LIFECYCLE_END_IDENTITIES) {
+      return Promise.reject(
+        new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_LIFECYCLE_IDENTITY_LIMIT",
+          "Resident runtime lifecycle end identity capacity has been reached.",
+          { details: { limit: MAX_RESIDENT_LIFECYCLE_END_IDENTITIES } },
+        ),
+      );
+    }
+
+    const result = this.enqueue(() => this.endResidentSessionOnce(binding));
+    const record = Object.freeze({ bindingFingerprint, result });
+    this.lifecycleEndAttempts.set(binding.activeSessionId, record);
+    void result.then(() => {
+      if (this.lifecycleEndAttempts.get(binding.activeSessionId) === record) {
+        this.settledLifecycleEndIds.add(binding.activeSessionId);
+      }
+    }, () => undefined);
+    void result.catch((error: unknown) => {
+      if (
+        !isUnknownMutationOutcome(error) &&
+        this.lifecycleEndAttempts.get(binding.activeSessionId) === record
+      ) {
+        this.lifecycleEndAttempts.delete(binding.activeSessionId);
+        this.settledLifecycleEndIds.delete(binding.activeSessionId);
+      }
+    });
+    return result;
+  }
+
+  private retireSettledLifecycleEndAttempts(): void {
+    while (
+      this.lifecycleEndAttempts.size >= MAX_RESIDENT_LIFECYCLE_END_IDENTITIES &&
+      this.settledLifecycleEndIds.size > 0
+    ) {
+      const activeSessionId = this.settledLifecycleEndIds.values().next().value as
+        | string
+        | undefined;
+      if (!activeSessionId) return;
+      this.settledLifecycleEndIds.delete(activeSessionId);
+      const retired = this.lifecycleEndAttempts.get(activeSessionId);
+      if (!retired || !this.lifecycleEndAttempts.delete(activeSessionId)) continue;
+      this.retiredLifecycleEndFence.add(retired.bindingFingerprint);
+    }
+  }
+
+  detachResidentSession(bindingValue: ResidentSessionBinding): Promise<void> {
+    let binding: ResidentSessionBinding;
+    try {
+      binding = validateResidentSessionBinding(bindingValue);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    return this.enqueue(async () => {
+      this.assertOpen();
+      const connection = this.connections.get(binding.activeSessionId);
+      if (!connection) return;
+      assertExactBindingAuthority(connection.binding, binding);
+      connection.forceClose();
+    });
+  }
+
+  private async endResidentSessionOnce(
+    binding: ResidentSessionBinding,
+  ): Promise<ResidentEndAcknowledgement> {
+    this.assertOpen();
+    const localConnection = this.connections.get(binding.activeSessionId);
+    if (localConnection) assertExactBindingAuthority(localConnection.binding, binding);
+
+    let client: PrimeDaemonClientPublic | undefined;
+    try {
+      await this.ensureDaemonSingleFlight();
+      const runtimeModule = await this.loadModule();
+      const opened = await this.openValidatedClient(runtimeModule);
+      client = opened.client;
+      assertRuntimeCompatibilityMatchesBinding(opened.compatibility, binding);
+      const response = await requestDaemon(
+        client,
+        { type: "list" },
+        this.options.requestTimeoutMs,
+        "list",
+      );
+      const summary = findExactLiveSession(response.data, binding);
+      assertSummaryMatchesBinding(summary, binding);
+
+      // close() can revoke adapter authority while the read-only fence awaits
+      // Prime. Re-check synchronously at the final pre-invocation boundary.
+      this.assertOpen();
+      try {
+        await requestResidentLifecycleKill(
+          client,
+          binding.activeSessionId,
+          this.options.requestTimeoutMs,
+        );
+      } catch (error) {
+        if (isUnknownMutationOutcome(error)) {
+          this.forceCloseResidentTransport(binding.activeSessionId);
+        }
+        throw error;
+      }
+
+      this.forceCloseResidentTransport(binding.activeSessionId);
+      return Object.freeze({
+        acknowledgementVersion: 1,
+        operation: "end",
+        activeSessionId: binding.activeSessionId,
+        sessionId: binding.sessionId,
+      });
+    } catch (error) {
+      throw normalizeRuntimeError(error, "Prime Agent resident session end failed.");
+    } finally {
+      // Local cleanup must never replace a confirmed acknowledgement or an
+      // outcome-unknown fence with a replayable-looking failure.
+      closeDaemonClientQuietly(client);
+    }
+  }
+
+  private forceCloseResidentTransport(activeSessionId: string): void {
+    try {
+      this.connections.get(activeSessionId)?.forceClose();
+    } catch {
+      // Confirmed or outcome-unknown root kill authority is never weakened by
+      // best-effort local transport cleanup.
+    }
+  }
+
   async isLive(threadId: string, executionGenerationId: string): Promise<boolean> {
     if (this.closeRequested || this.closed) return false;
     const connection = [...this.connections.values()].find(
@@ -1074,6 +1307,8 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       this.connections.clear();
       this.ownedCandidates.clear();
       this.modelSelectionAttempts.clear();
+      this.lifecycleEndAttempts.clear();
+      this.settledLifecycleEndIds.clear();
       this.closed = true;
       const failure = [...connectionOutcomes, ...candidateOutcomes].find(
         (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
@@ -1762,7 +1997,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.locallyClosed = true;
     this.projectionRefreshRequested = false;
     this.unsubscribeUpstream();
-    this.options.client.close();
+    closeDaemonClientQuietly(this.options.client);
     this.cancelResidentIdleReconciliation();
     this.lifecycle.transition("closed", { binding: this.binding });
     this.options.onClosed();
@@ -3033,6 +3268,73 @@ async function requestDaemon(
   return responseValue as unknown as PrimeDaemonResponseSuccess;
 }
 
+/**
+ * The caller has already crossed its durable Store kill lease and completed
+ * the exact read-only fence. Only a worker-proven pre-invocation failure may
+ * escape as definite; every observation after upstream invocation is unknown.
+ */
+async function requestResidentLifecycleKill(
+  client: PrimeDaemonClientPublic,
+  activeSessionId: string,
+  timeoutMs: number,
+): Promise<void> {
+  let responseValue: unknown;
+  try {
+    responseValue = await client.request({ type: "kill", activeSessionId }, timeoutMs);
+  } catch (error) {
+    if (isDefinitiveMutationNonInvocation(error)) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_REQUEST_FAILED",
+        "Prime Agent rejected the resident end request before invoking root kill.",
+        {
+          retryable: true,
+          details: { command: "kill", outcome: "definitive", cause: safeErrorMessage(error) },
+          cause: error,
+        },
+      );
+    }
+    throw unknownResidentLifecycleEndOutcome(error);
+  }
+
+  try {
+    assertBoundedJson(responseValue, 8 * 1024 * 1024, "kill response");
+    if (
+      !isRecord(responseValue) ||
+      responseValue.type !== "response" ||
+      responseValue.command !== "kill" ||
+      responseValue.success !== true
+    ) {
+      throw invalidResponse("kill");
+    }
+  } catch (error) {
+    throw unknownResidentLifecycleEndOutcome(error);
+  }
+}
+
+function unknownResidentLifecycleEndOutcome(cause: unknown): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    "Prime Agent root kill may have been invoked, but no definitive acknowledgement was received.",
+    {
+      details: { command: "kill", outcome: "unknown", cause: safeErrorMessage(cause) },
+      cause,
+    },
+  );
+}
+
+function isUnknownMutationOutcome(error: unknown): boolean {
+  return error instanceof ResidentRuntimeContractError &&
+    error.code === "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN";
+}
+
+function isDefinitiveMutationNonInvocation(error: unknown): boolean {
+  try {
+    return isRecord(error) && error.outcome === "definitive";
+  } catch {
+    return false;
+  }
+}
+
 function parseLiveSessionSummary(value: unknown, source: string): LiveSessionSummary {
   assertBoundedJson(value, 2 * 1024 * 1024, `${source} session summary`);
   const parsed = LiveSessionSummarySchema.safeParse(value);
@@ -3046,6 +3348,34 @@ function parseLiveSessionList(value: unknown): LiveSessionSummary[] {
     throw invalidResponse("list");
   }
   return value.sessions.map((summary) => parseLiveSessionSummary(summary, "list"));
+}
+
+function findExactLiveSession(
+  listResponseData: unknown,
+  binding: ResidentSessionBinding,
+): LiveSessionSummary {
+  const matches = parseLiveSessionList(listResponseData).filter(
+    (candidate) => candidate.activeSessionId === binding.activeSessionId,
+  );
+  if (matches.length > 1) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_RESPONSE_INVALID",
+      "Prime Agent returned an ambiguous resident active-session identity.",
+      { details: { activeSessionId: binding.activeSessionId } },
+    );
+  }
+  const summary = matches[0];
+  // `isSessionActive` is Prime's busy/working signal, not worker liveness. An
+  // idle resident is the normal end/recovery target and remains in this
+  // non-`all` live-worker list with lifecycle `live`.
+  if (!summary || summary.lifecycle !== "live") {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SESSION_NOT_FOUND",
+      "The exact resident Prime Agent session is not currently active.",
+      { retryable: true, details: { activeSessionId: binding.activeSessionId } },
+    );
+  }
+  return summary;
 }
 
 async function publishInitialProjection(
@@ -3249,6 +3579,39 @@ function assertSummaryMatchesBinding(summary: LiveSessionSummary, binding: Resid
     "PRIME_RUNTIME_SESSION_MISMATCH",
     "The live Prime Agent session does not match the durable host binding.",
     { details: { fields: mismatches.join(","), activeSessionId: binding.activeSessionId } },
+  );
+}
+
+function assertRuntimeCompatibilityMatchesBinding(
+  current: ResidentRuntimeCompatibility,
+  binding: ResidentSessionBinding,
+): void {
+  const currentAuthority = residentDispatchAuthorityFingerprint({
+    ...binding,
+    runtime: current,
+  });
+  if (currentAuthority === residentDispatchAuthorityFingerprint(binding)) return;
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_IDENTITY_MISMATCH",
+    "The connected Prime Agent runtime no longer matches the exact resident binding.",
+    { details: { activeSessionId: binding.activeSessionId } },
+  );
+}
+
+function assertExactBindingAuthority(
+  current: ResidentSessionBinding,
+  candidate: ResidentSessionBinding,
+): void {
+  if (
+    residentDispatchAuthorityFingerprint(current) ===
+    residentDispatchAuthorityFingerprint(candidate)
+  ) {
+    return;
+  }
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_SESSION_MISMATCH",
+    "The requested resident binding conflicts with the exact attached authority.",
+    { details: { activeSessionId: candidate.activeSessionId } },
   );
 }
 
@@ -3492,6 +3855,23 @@ function boundedInteger(
 
 function errorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 2_048);
+}
+
+function safeErrorMessage(error: unknown): string {
+  try {
+    return errorMessage(error);
+  } catch {
+    return "Error details unavailable";
+  }
+}
+
+function closeDaemonClientQuietly(client: PrimeDaemonClientPublic | undefined): void {
+  try {
+    client?.close();
+  } catch {
+    // Closing a process-local transport is best effort and carries no durable
+    // Prime or Store lifecycle authority.
+  }
 }
 
 function isDefinitiveEndpointAbsence(error: unknown): boolean {

@@ -467,6 +467,27 @@ describe("Prime Agent resident Worker proxy", () => {
     await loader.close();
   });
 
+  it("never treats admission-like status text as definitive after generic root-kill invocation", async () => {
+    const fixture = runtimeFixture();
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const client = new module.DaemonClient("resident-test-socket");
+    await client.connect(1_000);
+    fixture.state.clients[0]!.request = async () => {
+      throw Object.assign(new Error("kill reported unsupported after invocation"), {
+        status: "unsupported",
+      });
+    };
+
+    await expect(client.request({ type: "kill", activeSessionId: "active-session" }, 1_000))
+      .rejects.toMatchObject({
+        status: "unsupported",
+        outcome: "unknown",
+      } satisfies Partial<ResidentWorkerRemoteError>);
+
+    client.close();
+    await loader.close();
+  });
+
   it("fences a crashed mutation as unknown and ignores a late response without replay", async () => {
     const invoked = vi.fn();
     const fixture = runtimeFixture({

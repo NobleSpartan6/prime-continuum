@@ -73,7 +73,7 @@ function liveSummary(overrides: Record<string, unknown> = {}): Record<string, un
     id: "active-1",
     lifecycle: "live",
     activity: "idle",
-    isSessionActive: true,
+    isSessionActive: false,
     activeSessionId: "active-1",
     sessionId: "session-1",
     sessionFile: "C:\\sessions\\session-1.jsonl",
@@ -164,6 +164,7 @@ interface HarnessState {
   }>;
   waitForIdleCalls: number;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
+  closeHandler?: () => void;
   persistHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   completeHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   publishProjectionHandler?: (
@@ -257,6 +258,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     close(): void {
       state.closes += 1;
       state.chronology.push("client:close");
+      state.closeHandler?.();
     }
   }
 
@@ -1026,6 +1028,262 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
 });
 
 describe("PrimeAgentResidentAdapter session lifecycle", () => {
+  it("ends an exact resident independently of local attachment and memoizes one root kill", async () => {
+    const { adapter, state } = createHarness();
+    const durableBinding = binding();
+
+    const first = adapter.endResidentSession(durableBinding);
+    const duplicate = adapter.endResidentSession({
+      ...durableBinding,
+      runtime: {
+        ...durableBinding.runtime,
+        capabilities: [...durableBinding.runtime.capabilities].reverse(),
+        supervisorGeneration: "supervisor-refreshed",
+      },
+    });
+
+    expect(duplicate).toBe(first);
+    await expect(first).resolves.toEqual({
+      acknowledgementVersion: 1,
+      operation: "end",
+      activeSessionId: "active-1",
+      sessionId: "session-1",
+    });
+    await expect(adapter.endResidentSession(durableBinding)).resolves.toEqual({
+      acknowledgementVersion: 1,
+      operation: "end",
+      activeSessionId: "active-1",
+      sessionId: "session-1",
+    });
+
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
+      "list",
+      "kill",
+    ]);
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.persistCalls).toHaveLength(0);
+    expect(state.completeCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("does not let local client-close failure turn a confirmed end into a replayable result", async () => {
+    let closeCalls = 0;
+    const { adapter, state } = createHarness({
+      closeHandler: () => {
+        closeCalls += 1;
+        if (closeCalls === 2) throw new Error("local close failed after kill acknowledgement");
+      },
+    });
+
+    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
+    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
+      "list",
+      "kill",
+    ]);
+    await adapter.close();
+  });
+
+  it("retires settled end results fail-closed while admitting healthy work past the exact-result bound", async () => {
+    let expectedOrdinal = 0;
+    const { adapter, state } = createHarness({
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: {
+              sessions: [liveSummary({
+                id: `active-${expectedOrdinal}`,
+                activeSessionId: `active-${expectedOrdinal}`,
+                sessionId: `session-${expectedOrdinal}`,
+                sessionFile: `C:\\sessions\\session-${expectedOrdinal}.jsonl`,
+              })],
+            },
+          };
+        }
+        if (type === "kill") {
+          expect(command).toMatchObject({ activeSessionId: `active-${expectedOrdinal}` });
+          expectedOrdinal += 1;
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    for (let ordinal = 0; ordinal <= 10_000; ordinal += 1) {
+      await adapter.endResidentSession(binding({
+        activeSessionId: `active-${ordinal}`,
+        sessionId: `session-${ordinal}`,
+        sessionFile: `C:\\sessions\\session-${ordinal}.jsonl`,
+      }));
+    }
+    expect(expectedOrdinal).toBe(10_001);
+    const requestsBeforeRetiredReplay = state.requests.length;
+    await expectRuntimeError(
+      adapter.endResidentSession(binding({
+        activeSessionId: "active-0",
+        sessionId: "session-0",
+        sessionFile: "C:\\sessions\\session-0.jsonl",
+      })),
+      "PRIME_RUNTIME_LIFECYCLE_RETIRED",
+    );
+    expect(state.requests).toHaveLength(requestsBeforeRetiredReplay);
+    await adapter.close();
+  }, 30_000);
+
+  it("keeps exact-list fence failures definite and permits a later leased retry", async () => {
+    let liveSessionId = "different-session";
+    const { adapter, state } = createHarness({
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ sessionId: liveSessionId })] },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expectRuntimeError(adapter.endResidentSession(binding()), "PRIME_RUNTIME_SESSION_MISMATCH");
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
+
+    liveSessionId = "session-1";
+    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
+      "list",
+      "list",
+      "kill",
+    ]);
+    await adapter.close();
+  });
+
+  it.each([
+    ["request rejection", async () => { throw new Error("kill response transport closed"); }],
+    ["negative response", async () => ({ type: "response", command: "kill", success: false, error: "not found" })],
+    ["malformed response", async () => ({ type: "response", command: "kill", success: "maybe" })],
+  ] as const)("treats a post-invocation %s as unknown and never replays root kill", async (_label, killResult) => {
+    const { adapter, state } = createHarness({
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return { type: "response", command: "list", success: true, data: { sessions: [liveSummary()] } };
+        }
+        if (type === "kill") return killResult();
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    const first = adapter.endResidentSession(binding());
+    const error = await expectRuntimeError(first, "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
+    expect(error.retryable).toBe(false);
+    const duplicate = adapter.endResidentSession(binding());
+    expect(duplicate).toBe(first);
+    await expectRuntimeError(duplicate, "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
+      "list",
+      "kill",
+    ]);
+    await adapter.close();
+  });
+
+  it("retries only when the worker proves root kill was not invoked", async () => {
+    let killCalls = 0;
+    const { adapter, state } = createHarness({
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return { type: "response", command: "list", success: true, data: { sessions: [liveSummary()] } };
+        }
+        if (type === "kill" && ++killCalls === 1) {
+          throw Object.assign(new Error("worker rejected before invocation"), { outcome: "definitive" });
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.endResidentSession(binding()),
+      "PRIME_RUNTIME_REQUEST_FAILED",
+    );
+    expect(error.details).toMatchObject({ command: "kill", outcome: "definitive" });
+    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
+      "list",
+      "kill",
+      "list",
+      "kill",
+    ]);
+    await adapter.close();
+  });
+
+  it("detaches only the exact local transport and is idempotent without Store completion", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.attachResident(binding());
+
+    await expectRuntimeError(
+      adapter.detachResidentSession({ ...connection.binding, sessionId: "different-session" }),
+      "PRIME_RUNTIME_SESSION_MISMATCH",
+    );
+    expect(connection.getLifecycle().state).toBe("ready");
+
+    await Promise.all([
+      adapter.detachResidentSession(connection.binding),
+      adapter.detachResidentSession(connection.binding),
+    ]);
+    expect(connection.getLifecycle().state).toBe("closed");
+    expect(state.eventListeners.size).toBe(0);
+    expect(state.disposeCalls).toBe(0);
+    expect(state.completeCalls).toHaveLength(0);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("reads a stable exact projection through an ephemeral non-owned attachment without publishing", async () => {
+    const { adapter, state } = createHarness();
+
+    const projection = await adapter.readStableResidentProjection(binding());
+
+    expect(projection).toMatchObject({
+      cursor: { generation: "events-1", sequence: 4 },
+      identity: { activeSessionId: "active-1", sessionId: "session-1" },
+    });
+    expect(state.requests).toEqual([{ type: "list" }]);
+    expect(state.attachCalls).toEqual([{
+      activeSessionId: "active-1",
+      options: expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
+    }]);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.persistCalls).toHaveLength(0);
+    expect(state.completeCalls).toHaveLength(0);
+    expect(state.projectionCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("rejects recovery reads when the connected capability set drifts from the binding", async () => {
+    const durableBinding = binding();
+    const { adapter, state } = createHarness({
+      hello: validHello({
+        serverCapabilities: [...durableBinding.runtime.capabilities, "unexpected-new-capability"],
+      }),
+    });
+
+    await expectRuntimeError(
+      adapter.readStableResidentProjection(durableBinding),
+      "PRIME_RUNTIME_IDENTITY_MISMATCH",
+    );
+    expect(state.requests).toHaveLength(0);
+    expect(state.attachCalls).toHaveLength(0);
+    expect(state.projectionCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
   it("persists a resident binding before attach and detach never kills or completes the worker", async () => {
     const { adapter, state } = createHarness();
 
