@@ -1,6 +1,7 @@
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent } from 'electron'
 import { z } from 'zod'
-import { IPC, type Result } from './contracts'
+import { RuntimeIntegrityTargetSchema } from '../../shared/protocol'
+import { IPC, type Result, type RuntimeIntegrityRepairInput } from './contracts'
 import { ControlError, toStructuredError } from './errors'
 import type { DesktopControlService } from './service'
 
@@ -74,12 +75,26 @@ const residentEnd = z
 export interface ControlIpcOptions {
   ipcMain: IpcMain
   service: DesktopControlService
-  getWindow: () => BrowserWindow | undefined
+  getWindows: () => readonly BrowserWindow[]
   isTrustedSender: (event: IpcMainInvokeEvent) => boolean
 }
 
+export function isTrustedRendererSender(
+  event: IpcMainInvokeEvent,
+  windows: readonly BrowserWindow[],
+  rendererUrlIsTrusted: (candidate: string) => boolean,
+): boolean {
+  return windows.some((window) =>
+    !window.isDestroyed() &&
+    !window.webContents.isDestroyed() &&
+    event.sender === window.webContents &&
+    event.senderFrame === window.webContents.mainFrame &&
+    rendererUrlIsTrusted(event.senderFrame.url)
+  )
+}
+
 export function registerControlIpc(options: ControlIpcOptions): () => void {
-  const { ipcMain, service, getWindow, isTrustedSender } = options
+  const { ipcMain, service, getWindows, isTrustedSender } = options
   const channels: string[] = []
 
   const handle = <T>(
@@ -132,6 +147,16 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     IPC.retryRuntimeIntegrity,
     z.object({ expectedHostId: id }).strict(),
     (input: { expectedHostId: string }) => service.retryRuntimeIntegrity(input.expectedHostId)
+  )
+  handle(
+    IPC.repairRuntimeIntegrity,
+    z.object({
+      expectedHostId: id,
+      expectedTrustAnchorId: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+      expectedTarget: RuntimeIntegrityTargetSchema,
+      expectedChangedAt: z.string().datetime({ offset: true }),
+    }).strict(),
+    (input: RuntimeIntegrityRepairInput) => service.repairRuntimeIntegrity(input)
   )
   handle(
     IPC.runtimeModelCatalog,
@@ -234,9 +259,14 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
   handle(IPC.diagnostics, z.undefined(), () => service.diagnostics())
 
   const forward = (channel: string) => (payload: unknown): void => {
-    const window = getWindow()
-    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return
-    window.webContents.send(channel, payload)
+    const delivered = new Set<number>()
+    for (const window of getWindows()) {
+      if (window.isDestroyed() || window.webContents.isDestroyed()) continue
+      const webContentsId = window.webContents.id
+      if (delivered.has(webContentsId)) continue
+      delivered.add(webContentsId)
+      window.webContents.send(channel, payload)
+    }
   }
   const onConnectionState = forward(IPC.connectionState)
   const onHostEvent = forward(IPC.hostEvent)

@@ -168,6 +168,7 @@ An unauthenticated candidate, paired device, or malicious relay may open many ch
 13. **Opaque relay payloads.** Relay-visible records contain only the routing and delivery fields required for bounded forwarding; all application content and authorization claims are encrypted and authenticated.
 14. **Outbound-only reachability.** Direct relay operation requires no public inbound hostd listener and no interim LAN HTTP/WebSocket server.
 15. **Capability honesty.** Pairing, approval, handoff, artifact, notification, and mobile controls are individually gated by negotiated capabilities as well as device scopes.
+16. **Control projection is observation, not authority.** `resident_control_projection_v1` polling requires a current authenticated channel with `projection.read` and an exact expected host, thread, and execution generation. Its Store-owned sequence advances only with durable semantic state, exposes no workspace or daemon path, and cannot admit, reconcile, complete, or replay a command. A forged, stale, revoked, or under-scoped lease is rejected before projection disclosure.
 
 ## Pairing design requirements
 

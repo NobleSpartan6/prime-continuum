@@ -615,6 +615,121 @@ describe("runtime integrity manager", () => {
     expect(await readdir(corruptPointer.paths.runtimeInstalls)).toEqual([]);
   });
 
+  it("quarantines only the exact installed runtime target and re-promotes verified seed bytes", async () => {
+    const fixture = await createFixture();
+    const manager = createManager(fixture);
+    await manager.ensureInstalled(fixture.seedRoot);
+    const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    const tamperedPayload = join(finalPath, ...fixture.payloads[0]!.path.split("/"));
+    await writeFile(tamperedPayload, "preserve corrupt runtime evidence");
+    const unrelatedInstall = join(fixture.paths.runtimeInstalls, "unrelated-install-evidence");
+    await mkdir(unrelatedInstall);
+    await writeFile(join(unrelatedInstall, "keep.txt"), "keep unrelated runtime evidence");
+    await writeFile(fixture.paths.projects, "project data remains untouched");
+
+    await expect(manager.verifyInstalled()).rejects.toBeInstanceOf(RuntimeIntegrityInstalledCorruptionError);
+    await expect(manager.repairInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+
+    const quarantineRoot = join(fixture.paths.runtime, "quarantine");
+    const quarantines = await readdir(quarantineRoot);
+    expect(quarantines).toHaveLength(1);
+    const quarantine = join(quarantineRoot, quarantines[0]!);
+    expect(await readFile(join(quarantine, "installed-image", ...fixture.payloads[0]!.path.split("/")), "utf8"))
+      .toBe("preserve corrupt runtime evidence");
+    expect(await readFile(join(quarantine, "current.json"), "utf8"))
+      .toContain(fixture.attestation.tree.sha256);
+    expect(await readFile(tamperedPayload)).toEqual(fixture.payloads[0]!.bytes);
+    expect(await readFile(join(unrelatedInstall, "keep.txt"), "utf8"))
+      .toBe("keep unrelated runtime evidence");
+    expect(await readFile(fixture.paths.projects, "utf8")).toBe("project data remains untouched");
+  });
+
+  it("repairs a malformed pointer without deleting its evidence", async () => {
+    const fixture = await createFixture();
+    await mkdir(fixture.paths.runtime, { recursive: true });
+    await writeFile(fixture.paths.runtimeCurrent, "{malformed-pointer\n");
+    const manager = createManager(fixture);
+
+    await expect(manager.ensureInstalled(fixture.seedRoot)).rejects.toMatchObject({
+      code: "RUNTIME_REPAIR_REQUIRED",
+      reason: "installed_pointer_invalid",
+    });
+    await expect(manager.repairInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+
+    const quarantines = await readdir(join(fixture.paths.runtime, "quarantine"));
+    expect(quarantines).toHaveLength(1);
+    expect(await readFile(join(fixture.paths.runtime, "quarantine", quarantines[0]!, "current.json"), "utf8"))
+      .toBe("{malformed-pointer\n");
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8"))
+      .toContain(fixture.attestation.tree.sha256);
+  });
+
+  it("fully validates the repair seed before quarantining installed bytes", async () => {
+    const fixture = await createFixture();
+    await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    const installedPayload = join(finalPath, ...fixture.payloads[0]!.path.split("/"));
+    await writeFile(installedPayload, "installed evidence remains in place");
+    await writeFile(join(fixture.seedImage, ...fixture.payloads[0]!.path.split("/")), "invalid repair seed");
+
+    await expect(createManager(fixture).repairInstalled(fixture.seedRoot)).rejects.toMatchObject({
+      code: "RUNTIME_REPAIR_REQUIRED",
+      reason: "packaged_seed_invalid",
+    });
+    expect(await readFile(installedPayload, "utf8")).toBe("installed evidence remains in place");
+    expect(await readFile(fixture.paths.runtimeCurrent, "utf8")).toContain(fixture.attestation.tree.sha256);
+    await expect(readdir(join(fixture.paths.runtime, "quarantine"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retains at most two exact repair quarantines and resumes pruning after restart", async () => {
+    const fixture = await createFixture();
+    await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    let interruptPrune = true;
+    const manager = createManager(fixture, {
+      faultInjector(point) {
+        if (point === "before_repair_quarantine_prune" && interruptPrune) {
+          interruptPrune = false;
+          throw new Error("simulated process loss before quarantine pruning");
+        }
+      },
+    });
+
+    await manager.repairInstalled(fixture.seedRoot);
+    await manager.repairInstalled(fixture.seedRoot);
+    await expect(manager.repairInstalled(fixture.seedRoot)).rejects.toThrow(
+      "simulated process loss before quarantine pruning",
+    );
+    const quarantineRoot = join(fixture.paths.runtime, "quarantine");
+    expect(await readdir(quarantineRoot)).toHaveLength(3);
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(await readdir(quarantineRoot)).toHaveLength(2);
+
+    await createManager(fixture).repairInstalled(fixture.seedRoot);
+    expect(await readdir(quarantineRoot)).toHaveLength(2);
+  });
+
+  it("removes empty repair tokens but fails closed on unknown quarantine entries", async () => {
+    const fixture = await createFixture();
+    await createManager(fixture).ensureInstalled(fixture.seedRoot);
+    const quarantineRoot = join(fixture.paths.runtime, "quarantine");
+    await mkdir(join(quarantineRoot, "repair-abcdef"), { recursive: true });
+
+    await expect(createManager(fixture).ensureInstalled()).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(await readdir(quarantineRoot)).toEqual([]);
+
+    await writeFile(join(quarantineRoot, "unknown-evidence.txt"), "do not delete");
+    await expect(createManager(fixture).ensureInstalled()).rejects.toThrow("unexpected entry");
+    expect(await readFile(join(quarantineRoot, "unknown-evidence.txt"), "utf8")).toBe("do not delete");
+  });
+
   it("types a final that disappears during pre-use verification as transient and fully recovers it", async () => {
     const fixture = await createFixture();
     const finalPath = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);

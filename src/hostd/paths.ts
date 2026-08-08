@@ -18,6 +18,7 @@ export interface HostDataPaths {
   transactions: string;
   residentProjectionTransactions: string;
   residentProjectionLineages: string;
+  residentControlProjections: string;
   residentDispatchAttempts: string;
   residentLifecycleOperations: string;
   residentLifecycleRetiredFence: string;
@@ -85,6 +86,7 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     transactions: join(root, "transactions"),
     residentProjectionTransactions: join(root, "resident-projection-transactions"),
     residentProjectionLineages: join(root, "resident-projection-lineages"),
+    residentControlProjections: join(root, "resident-control-projections"),
     residentDispatchAttempts: join(root, "resident-dispatch-attempts"),
     residentLifecycleOperations: join(root, "resident-lifecycle-operations"),
     residentLifecycleRetiredFence: join(root, "resident-lifecycle-retired-fence.json"),

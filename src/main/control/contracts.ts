@@ -10,6 +10,7 @@ import type {
   ResidentLifecycleLookupResult,
   ResidentLifecycleStatus,
   RuntimeIntegritySnapshot,
+  RuntimeIntegrityTarget,
   RuntimeModelCatalogSnapshot,
   RuntimeOAuthSessionSnapshot
 } from '../../shared/protocol'
@@ -27,6 +28,7 @@ export const IPC = {
   projectCatalog: 'prime:catalog:projects',
   threadProjection: 'prime:thread:projection',
   retryRuntimeIntegrity: 'prime:runtime:integrity:retry',
+  repairRuntimeIntegrity: 'prime:runtime:integrity:repair',
   runtimeModelCatalog: 'prime:runtime:model-catalog',
   startRuntimeOAuth: 'prime:runtime:oauth:start',
   runtimeOAuthStatus: 'prime:runtime:oauth:status',
@@ -122,6 +124,13 @@ export type HostRuntimeReadiness =
       kind: 'reported'
       snapshot: RuntimeIntegritySnapshot
     })
+
+export interface RuntimeIntegrityRepairInput {
+  expectedHostId: string
+  expectedTrustAnchorId: string
+  expectedTarget: RuntimeIntegrityTarget
+  expectedChangedAt: string
+}
 
 export interface ConnectionState {
   phase: 'offline' | 'connecting' | 'online' | 'reconnecting' | 'degraded'
@@ -408,6 +417,7 @@ export interface PrimeBridge {
   projectCatalog(input: { hostId: string }): Promise<Result<unknown>>
   threadProjection(input: { threadId: string; cursor?: SessionCursor }): Promise<Result<unknown>>
   retryRuntimeIntegrity(input: { expectedHostId: string }): Promise<Result<RuntimeIntegritySnapshot>>
+  repairRuntimeIntegrity(input: RuntimeIntegrityRepairInput): Promise<Result<RuntimeIntegritySnapshot>>
   runtimeModelCatalog(input: { expectedHostId: string }): Promise<Result<RuntimeModelCatalogSnapshot>>
   startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
   runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>

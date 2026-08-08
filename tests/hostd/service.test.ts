@@ -12,6 +12,11 @@ import {
 import { HostService, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
 import {
+  PINNED_PRIME_AGENT_RUNTIME,
+  REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
+  type ResidentSessionBinding,
+} from "../../src/hostd/resident-runtime";
+import {
   createTestAuthenticatedRelaySessions,
   type TestAuthenticatedRelaySessions,
 } from "../helpers/validated-relay-session";
@@ -379,6 +384,63 @@ describe("HostService handoff availability", () => {
       error: { code: "REMOTE_DEVICE_IDENTITY_MISMATCH" },
     });
   });
+
+  it("reveals resident control state only through a current authenticated projection-read channel", async () => {
+    const { service, store, pairingAuthority, relayDevice, workspaceDirectory } = await temporaryService();
+    const host = await store.getHost();
+    await store.persistResidentSessionBinding(serviceResidentBinding(workspaceDirectory));
+    const projectionChannel = await registerTestChannel(pairingAuthority, host.hostId, relayDevice, 20);
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "relay-resident-control",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: host.hostId,
+        threadId: "test-thread",
+        expectedExecutionGenerationId: "test-execution-1",
+      },
+    } as const;
+
+    const allowed = await service.handle(request, { transport: "relay", channel: projectionChannel.lease });
+    expect(allowed).toMatchObject({
+      ok: true,
+      method: "thread.control.snapshot",
+      result: {
+        quiescence: { state: "uncertain", reason: "lifecycle_transition" },
+        controlSequence: 0,
+      },
+    });
+
+    const forged = await service.handle(
+      { ...request, requestId: "relay-resident-control-forged" },
+      {
+        transport: "relay",
+        channel: { ...projectionChannel.lease, channelId: "f".repeat(32) },
+      },
+    );
+    expect(forged).toMatchObject({ ok: false, error: { code: "CHANNEL_LEASE_INVALID" } });
+
+    const reducedGrant = await pairingAuthority.changeDeviceScopes({
+      expectedHostId: host.hostId,
+      expectedHostIdentityEpoch: relayDevice.hostIdentityEpoch,
+      fingerprint: relayDevice.fingerprint,
+      expectedGrantVersion: relayDevice.grantVersion,
+      scopes: ["thread.follow_up"],
+    });
+    const stale = await service.handle(
+      { ...request, requestId: "relay-resident-control-stale" },
+      { transport: "relay", channel: projectionChannel.lease },
+    );
+    expect(stale).toMatchObject({ ok: false, error: { code: "CHANNEL_LEASE_INVALID" } });
+
+    const reducedChannel = await registerTestChannel(pairingAuthority, host.hostId, reducedGrant, 21);
+    const denied = await service.handle(
+      { ...request, requestId: "relay-resident-control-scope-denied" },
+      { transport: "relay", channel: reducedChannel.lease },
+    );
+    expect(denied).toMatchObject({ ok: false, error: { code: "REMOTE_SCOPE_DENIED" } });
+    await service.close();
+  });
 });
 
 async function temporaryService(): Promise<{
@@ -386,12 +448,13 @@ async function temporaryService(): Promise<{
   store: HostStore;
   pairingAuthority: PairingAuthority;
   relayDevice: DeviceGrantRecord;
+  workspaceDirectory: string;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "prime-hostd-service-test-"));
   temporaryDirectories.push(directory);
   const store = new HostStore(directory);
   await store.initialize();
-  await bootstrapTestWorkspace(store);
+  const workspace = await bootstrapTestWorkspace(store);
   const host = await store.getHost();
   const relaySessions = createTestAuthenticatedRelaySessions();
   const pairingCeremonies = createTestVerifiedPairingCeremonies();
@@ -432,7 +495,37 @@ async function temporaryService(): Promise<{
   });
   await serviceWithVerifiedIdentity.initialize();
   const relayDevice = await pairTestDevice(pairingAuthority, host.hostId);
-  return { service: serviceWithVerifiedIdentity, store, pairingAuthority, relayDevice };
+  return {
+    service: serviceWithVerifiedIdentity,
+    store,
+    pairingAuthority,
+    relayDevice,
+    workspaceDirectory: workspace.workspaceDirectory,
+  };
+}
+
+function serviceResidentBinding(workspaceDirectory: string): ResidentSessionBinding {
+  return {
+    bindingVersion: 1,
+    lifecycle: "resident",
+    threadId: "test-thread",
+    executionGenerationId: "test-execution-1",
+    workspaceDirectory,
+    activeSessionId: "service-resident-control-active",
+    sessionId: "service-resident-control-session",
+    sessionFile: join(workspaceDirectory, ".prime-agent", "service-resident-control.jsonl"),
+    boundAt: "2026-08-08T12:05:00.000Z",
+    runtime: {
+      releaseVersion: PINNED_PRIME_AGENT_RUNTIME.releaseVersion,
+      appVersion: PINNED_PRIME_AGENT_RUNTIME.expectedAppVersion,
+      protocolName: PINNED_PRIME_AGENT_RUNTIME.daemon.protocolName,
+      protocolVersion: PINNED_PRIME_AGENT_RUNTIME.daemon.protocolVersion,
+      schemaRevision: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaRevision,
+      schemaId: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaId,
+      capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES],
+      runtimeBuildId: PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId,
+    },
+  };
 }
 
 async function pairTestDevice(authority: PairingAuthority, hostId: string): Promise<DeviceGrantRecord> {

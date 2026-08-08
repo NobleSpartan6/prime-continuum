@@ -49,10 +49,12 @@ export const CapabilitySchema = z
 
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
 export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" as const;
+export const RUNTIME_INTEGRITY_REPAIR_CAPABILITY = "runtime_integrity_repair_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
 export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
+export const RESIDENT_CONTROL_PROJECTION_CAPABILITY = "resident_control_projection_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
 /** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
@@ -195,6 +197,120 @@ export const SessionCursorSchema = z.object({
   sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 export type SessionCursor = z.infer<typeof SessionCursorSchema>;
+
+/**
+ * Path-free host-owned view of the one resident control operation that
+ * currently fences a thread generation. It is deliberately a projection, not
+ * mutation authority: clients still submit a complete generation-fenced
+ * command envelope through `command.submit`.
+ */
+export const ResidentControlOperationSchema = z
+  .object({
+    kind: z.enum(["prompt", "abort"]),
+    deviceId: IdSchema,
+    commandId: IdSchema,
+    phase: z.enum(["admitted", "dispatching", "acknowledged", "uncertain"]),
+    admittedAt: IsoDateTimeSchema,
+    changedAt: IsoDateTimeSchema,
+  })
+  .strict()
+  .superRefine((operation, context) => {
+    if (Date.parse(operation.changedAt) < Date.parse(operation.admittedAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["changedAt"],
+        message: "Resident control operation time cannot precede admission",
+      });
+    }
+  });
+export type ResidentControlOperation = z.infer<typeof ResidentControlOperationSchema>;
+
+export const ResidentControlQuiescenceSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("idle_proven") }).strict(),
+  z.object({ state: z.literal("prompt_owned") }).strict(),
+  z.object({ state: z.literal("stop_owned") }).strict(),
+  z
+    .object({
+      state: z.literal("uncertain"),
+      reason: z.enum(["active_without_operation", "mutation_outcome_unknown", "lifecycle_transition"]),
+    })
+    .strict(),
+  z.object({ state: z.literal("ended"), endedAt: IsoDateTimeSchema }).strict(),
+]);
+export type ResidentControlQuiescence = z.infer<typeof ResidentControlQuiescenceSchema>;
+
+/**
+ * Bounded generation-scoped read model for cross-device control discovery.
+ * `controlSequence` is Store-owned and monotonic for this exact thread
+ * generation; duplicate reads of unchanged semantic state return the same
+ * sequence and timestamp.
+ */
+export const ResidentControlProjectionSnapshotSchema = z
+  .object({
+    projectionVersion: z.literal(1),
+    hostId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    bindingFingerprint: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+    controlSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    changedAt: IsoDateTimeSchema,
+    authorityCursor: SessionCursorSchema,
+    operation: ResidentControlOperationSchema.optional(),
+    quiescence: ResidentControlQuiescenceSchema,
+  })
+  .strict()
+  .superRefine((projection, context) => {
+    if (
+      projection.authorityCursor.threadId !== projection.threadId ||
+      projection.authorityCursor.executionGenerationId !== projection.executionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["authorityCursor"],
+        message: "Resident control cursor must belong to the exact projected generation",
+      });
+    }
+    if (
+      projection.operation &&
+      Date.parse(projection.changedAt) < Date.parse(projection.operation.changedAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["changedAt"],
+        message: "Resident control projection time cannot precede its current operation",
+      });
+    }
+
+    const operation = projection.operation;
+    switch (projection.quiescence.state) {
+      case "prompt_owned":
+        if (operation?.kind !== "prompt" || operation.phase === "uncertain") {
+          context.addIssue({ code: "custom", message: "Prompt ownership requires one certain prompt operation" });
+        }
+        break;
+      case "stop_owned":
+        if (operation?.kind !== "abort" || operation.phase === "uncertain") {
+          context.addIssue({ code: "custom", message: "Stop ownership requires one certain abort operation" });
+        }
+        break;
+      case "uncertain":
+        if (
+          projection.quiescence.reason === "mutation_outcome_unknown"
+            ? operation?.phase !== "uncertain"
+            : operation !== undefined
+        ) {
+          context.addIssue({ code: "custom", message: "Uncertain control state has inconsistent operation evidence" });
+        }
+        break;
+      case "idle_proven":
+      case "ended":
+        if (operation !== undefined) {
+          context.addIssue({ code: "custom", message: "Quiescent resident control state cannot retain an operation" });
+        }
+        break;
+    }
+  });
+export type ResidentControlProjectionSnapshot = z.infer<typeof ResidentControlProjectionSnapshotSchema>;
 
 export const TaskStateSchema = z.enum([
   "idle",
@@ -1284,6 +1400,32 @@ export const HealthSnapshotSchema = z
         message: `${RUNTIME_INTEGRITY_RETRY_CAPABILITY} requires a retryable failed runtime integrity snapshot`,
       });
     }
+    const advertisesRuntimeIntegrityRepair = health.capabilities.includes(
+      RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+    );
+    if (
+      advertisesRuntimeIntegrityRepair &&
+      (
+        health.runtimeIntegrity?.status !== "failed" ||
+        health.runtimeIntegrity.retryable ||
+        health.runtimeIntegrity.recoveryAction !== "repair_application" ||
+        (health.runtimeIntegrity.code !== "RUNTIME_REPAIR_REQUIRED" &&
+          health.runtimeIntegrity.code !== "RUNTIME_INSTALLED_CORRUPTION")
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["capabilities"],
+        message: `${RUNTIME_INTEGRITY_REPAIR_CAPABILITY} requires an eligible nonretryable installed-runtime failure`,
+      });
+    }
+    if (advertisesRuntimeIntegrityRetry && advertisesRuntimeIntegrityRepair) {
+      context.addIssue({
+        code: "custom",
+        path: ["capabilities"],
+        message: "Runtime integrity retry and repair capabilities are mutually exclusive",
+      });
+    }
     if (!health.runtimeIntegrity) return;
     const expectedServiceState = health.runtimeIntegrity.status === "initializing"
       ? "starting"
@@ -1551,6 +1693,16 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     ...RequestBase,
+    method: z.literal("runtime.integrity.repair"),
+    payload: z.object({
+      expectedHostId: IdSchema,
+      expectedTrustAnchorId: RuntimeIntegrityTrustAnchorIdSchema,
+      expectedTarget: RuntimeIntegrityTargetSchema,
+      expectedChangedAt: IsoDateTimeSchema,
+    }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("runtime.model_catalog"),
     payload: z.object({ expectedHostId: IdSchema }).strict(),
   }),
@@ -1594,6 +1746,17 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
           });
         }
       }),
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("thread.control.snapshot"),
+    payload: z
+      .object({
+        expectedHostId: IdSchema,
+        threadId: IdSchema,
+        expectedExecutionGenerationId: IdSchema,
+      })
+      .strict(),
   }),
   z.object({
     ...RequestBase,
@@ -1676,12 +1839,22 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
     method: z.literal("runtime.integrity.retry"),
     result: RuntimeIntegritySnapshotSchema,
   }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("runtime.integrity.repair"),
+    result: RuntimeIntegritySnapshotSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("runtime.model_catalog"), result: RuntimeModelCatalogSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.start"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.status"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.cancel"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("catalog.snapshot"), result: CatalogProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("thread.snapshot"), result: ThreadProjectionSnapshotSchema }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("thread.control.snapshot"),
+    result: ResidentControlProjectionSnapshotSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.reconcile"), result: CommandReconciliationSchema }),
   z.object({ ...SuccessBase, method: z.literal("resident.provision"), result: ResidentLifecycleStatusSchema }),
@@ -1702,12 +1875,14 @@ export const HostIpcErrorResponseSchema = z.object({
   method: z.enum([
     "health.get",
     "runtime.integrity.retry",
+    "runtime.integrity.repair",
     "runtime.model_catalog",
     "oauth.session.start",
     "oauth.session.status",
     "oauth.session.cancel",
     "catalog.snapshot",
     "thread.snapshot",
+    "thread.control.snapshot",
     "command.submit",
     "command.reconcile",
     "resident.provision",

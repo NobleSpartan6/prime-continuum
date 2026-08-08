@@ -9,6 +9,7 @@ import {
   type Result,
   type SshProbe
 } from '../main/control/contracts'
+import { HUD_IPC, type HudBridge } from '../shared/window-control'
 
 function invoke<T>(channel: string, input?: unknown): Promise<Result<T>> {
   return ipcRenderer.invoke(channel, input) as Promise<Result<T>>
@@ -33,6 +34,7 @@ const bridge: PrimeBridge = {
   projectCatalog: (input) => invoke(IPC.projectCatalog, input),
   threadProjection: (input) => invoke(IPC.threadProjection, input),
   retryRuntimeIntegrity: (input) => invoke(IPC.retryRuntimeIntegrity, input),
+  repairRuntimeIntegrity: (input) => invoke(IPC.repairRuntimeIntegrity, input),
   runtimeModelCatalog: (input) => invoke(IPC.runtimeModelCatalog, input),
   startRuntimeOAuth: (input) => invoke(IPC.startRuntimeOAuth, input),
   runtimeOAuthStatus: (input) => invoke(IPC.runtimeOAuthStatus, input),
@@ -54,6 +56,16 @@ const bridge: PrimeBridge = {
   onHostEvent: (listener) => subscribe(IPC.hostEvent, listener),
   onSnapshot: (listener) => subscribe(IPC.snapshot, listener),
   onHandoffProgress: (listener) => subscribe(IPC.handoffProgress, listener)
+}
+
+const hudBridge: HudBridge = {
+  hudOpen: (target) => ipcRenderer.invoke(HUD_IPC.open, target),
+  hudState: () => ipcRenderer.invoke(HUD_IPC.state),
+  hudSetMode: (mode) => ipcRenderer.invoke(HUD_IPC.setMode, mode),
+  hudClose: () => ipcRenderer.invoke(HUD_IPC.close),
+  hudReturnToWorkbench: () => ipcRenderer.invoke(HUD_IPC.returnToWorkbench),
+  hudSetIgnoreMouseEvents: (ignore) => ipcRenderer.invoke(HUD_IPC.setIgnoreMouseEvents, ignore),
+  onHudState: (listener) => subscribe(HUD_IPC.stateChanged, listener)
 }
 
 type CompatibilityBridge = {
@@ -88,7 +100,7 @@ const compatibility: CompatibilityBridge = {
   subscribeWorkbench: (listener) => bridge.onSnapshot(listener)
 }
 
-contextBridge.exposeInMainWorld('prime', Object.freeze({ ...bridge, ...compatibility }))
+contextBridge.exposeInMainWorld('prime', Object.freeze({ ...bridge, ...hudBridge, ...compatibility }))
 
-export type RendererPrimeBridge = PrimeBridge & CompatibilityBridge
+export type RendererPrimeBridge = PrimeBridge & HudBridge & CompatibilityBridge
 export type { ClientCommand, ConnectionTarget, HandoffCommitRequest, HandoffPlanRequest }

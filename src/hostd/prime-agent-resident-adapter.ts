@@ -73,7 +73,9 @@ const MAX_RESIDENT_DISPATCH_IDENTITIES = 10_000;
 const RETIRED_RESIDENT_DISPATCH_FENCE_BYTES = 2 * 1024 * 1024;
 const RETIRED_RESIDENT_DISPATCH_FENCE_HASHES = 8;
 const MAX_RESIDENT_PROMPT_CHARACTERS = 65_536;
-const MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS = 4;
+const MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS = 40;
+const MODEL_SELECTION_RECONCILIATION_POLL_MS = 50;
+const MODEL_SELECTION_EPHEMERAL_DISPOSE_GRACE_MS = 100;
 const MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS = 4;
 const RESIDENT_PROJECTION_COALESCE_MS = 100;
 const PROMPT_ADMISSION_CANCEL_GRACE_MS = 2_000;
@@ -197,6 +199,8 @@ const ModelSelectionSnapshotSchema = z
         sessionFile: WireStringSchema.optional(),
         cwd: WireStringSchema,
         model: ModelSelectionIdentitySchema,
+        leafId: WireStringSchema.nullable(),
+        messageCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
       })
       .passthrough(),
     lastEventSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -384,6 +388,12 @@ export interface PrimeAgentResidentAdapterOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  /** Attempt-scoped publication for one authoritatively proven model.select. */
+  readonly publishModelSelectionProjection: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   readonly spawnFactory?: ResidentDaemonSpawn;
   readonly connectTimeoutMs?: number;
   readonly startupTimeoutMs?: number;
@@ -399,6 +409,11 @@ interface ResolvedOptions {
   readonly persistBinding: (binding: ResidentSessionBinding) => Promise<void>;
   readonly authorizeResidentKillInvocation: ResidentKillInvocationAuthorizer;
   readonly publishProjection: (
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
+  readonly publishModelSelectionProjection: (
+    command: CommandEnvelope,
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
@@ -519,6 +534,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
         );
       }),
       publishProjection: options.publishProjection,
+      publishModelSelectionProjection: options.publishModelSelectionProjection,
       spawnFactory: options.spawnFactory ?? defaultResidentDaemonSpawn,
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
       startupTimeoutMs: boundedTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, "startupTimeoutMs"),
@@ -804,31 +820,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       return Promise.reject(error);
     }
 
-    return this.enqueue(async () => {
-      this.assertOpen();
-      let client: PrimeDaemonClientPublic | undefined;
-      let attached: PrimeDaemonAgentConnectionPublic | undefined;
-      try {
-        await this.ensureDaemonSingleFlight();
-        const runtimeModule = await this.loadModule();
-        const opened = await this.openValidatedClient(runtimeModule);
-        client = opened.client;
-        assertRuntimeCompatibilityMatchesBinding(opened.compatibility, binding);
-        const response = await requestDaemon(
-          client,
-          { type: "list" },
-          this.options.requestTimeoutMs,
-          "list",
-        );
-        const summary = findExactAvailableResidentSession(response.data, binding);
-        assertSummaryMatchesBinding(summary, binding);
-        this.assertOpen();
-        attached = await this.attachPublicConnection(
-          runtimeModule,
-          client,
-          binding.activeSessionId,
-          false,
-        );
+    return this.readThroughEphemeralResidentAttachment(
+      binding,
+      async (attached) => {
         const projection = await readStableResidentProjection(attached, binding);
         if (!projection) {
           throw new ResidentRuntimeContractError(
@@ -836,8 +830,162 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
             "Prime Agent state changed throughout the bounded resident recovery read.",
           );
         }
+        return projection;
+      },
+      "Prime Agent resident recovery projection could not be read.",
+    );
+  }
+
+  private readStableSelectedModelProjection(
+    binding: ResidentSessionBinding,
+    providerId: string,
+    modelId: string,
+  ): Promise<ResidentProjectionSnapshot> {
+    const deadline = performance.now() + this.options.requestTimeoutMs;
+    return this.readThroughEphemeralResidentAttachment(
+      binding,
+      (attached, client) => readStableModelSelectionProjection(
+        attached,
+        client,
+        binding,
+        providerId,
+        modelId,
+        deadline,
+        this.options.wait,
+      ),
+      "Prime Agent model-selection projection could not be read.",
+      "bounded_model_reconciliation",
+      deadline,
+    );
+  }
+
+  private readThroughEphemeralResidentAttachment<T>(
+    binding: ResidentSessionBinding,
+    read: (
+      attached: PrimeDaemonAgentConnectionPublic,
+      client: PrimeDaemonClientPublic,
+    ) => Promise<T>,
+    failureMessage: string,
+    cleanupMode: "graceful" | "bounded_model_reconciliation" = "graceful",
+    deadline?: number,
+  ): Promise<T> {
+    return this.enqueue(async () => {
+      this.assertOpen();
+      let client: PrimeDaemonClientPublic | undefined;
+      let attached: PrimeDaemonAgentConnectionPublic | undefined;
+      let unsubscribeAttached: (() => void) | undefined;
+      try {
+        if (deadline === undefined) {
+          await this.ensureDaemonSingleFlight();
+        } else {
+          await beforeModelSelectionDeadline(
+            deadline,
+            () => this.ensureDaemonSingleFlight(),
+            "model selection daemon validation",
+          );
+        }
+        const runtimeModule = deadline === undefined
+          ? await this.loadModule()
+          : await beforeModelSelectionDeadline(
+              deadline,
+              () => this.loadModule(),
+              "model selection runtime module load",
+            );
+        let openingClient: PrimeDaemonClientPublic | undefined;
+        let openPromise: Promise<OpenClient> | undefined;
+        let opened: OpenClient;
+        if (deadline === undefined) {
+          opened = await this.openValidatedClient(runtimeModule);
+        } else {
+          try {
+            opened = await beforeModelSelectionDeadline(
+              deadline,
+              (remainingMs) => {
+                openPromise = this.openValidatedClient(
+                  runtimeModule,
+                  Math.max(1, Math.min(this.options.connectTimeoutMs, remainingMs)),
+                  (createdClient) => {
+                    openingClient = createdClient;
+                  },
+                );
+                return openPromise;
+              },
+              "model selection validated client open",
+            );
+          } catch (error) {
+            closeDaemonClientQuietly(openingClient);
+            if (openPromise) observeLateOpenClient(openPromise);
+            throw error;
+          }
+        }
+        client = opened.client;
+        assertRuntimeCompatibilityMatchesBinding(opened.compatibility, binding);
+        const response = deadline === undefined
+          ? await requestDaemon(
+              client,
+              { type: "list" },
+              this.options.requestTimeoutMs,
+              "list",
+            )
+          : await beforeModelSelectionDeadline(
+              deadline,
+              (remainingMs) => requestDaemon(
+                client!,
+                { type: "list" },
+                remainingMs,
+                "list",
+              ),
+              "model selection exact session list",
+            );
+        const summary = findExactAvailableResidentSession(response.data, binding);
+        assertSummaryMatchesBinding(summary, binding);
+        this.assertOpen();
+        if (deadline === undefined) {
+          attached = await this.attachPublicConnection(
+            runtimeModule,
+            client,
+            binding.activeSessionId,
+            false,
+          );
+        } else {
+          let attachPromise: Promise<PrimeDaemonAgentConnectionPublic> | undefined;
+          try {
+            attached = await beforeModelSelectionDeadline(
+              deadline,
+              () => {
+                attachPromise = this.attachPublicConnection(
+                  runtimeModule,
+                  client!,
+                  binding.activeSessionId,
+                  false,
+                );
+                return attachPromise;
+              },
+              "model selection exact session attachment",
+            );
+          } catch (error) {
+            if (attachPromise) observeLateAttachedConnection(attachPromise);
+            throw error;
+          }
+        }
+        // Worker-backed public connections retain events until a subscriber is
+        // present. Drain this read-only attachment while reconciliation runs so
+        // a busy session cannot exhaust the proxy's bounded event queue.
+        unsubscribeAttached = attached.subscribe(() => undefined);
+        const result = await read(attached, client);
+        const currentHello = client.hello ?? (
+          deadline === undefined
+            ? await client.waitForHello(this.options.connectTimeoutMs)
+            : await beforeModelSelectionDeadline(
+                deadline,
+                (remainingMs) => client!.waitForHello(
+                  Math.max(1, Math.min(this.options.connectTimeoutMs, remainingMs)),
+                ),
+                "model selection daemon handshake revalidation",
+              )
+        );
         const currentCompatibility = validateResidentDaemonHello(
-          client.hello ?? (await client.waitForHello(this.options.connectTimeoutMs)),
+          currentHello,
           {
             expectedSocketPath: this.options.socketPath,
             expectedExecutablePath: this.options.invocation.executable,
@@ -846,15 +994,34 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
         );
         assertRuntimeCompatibilityMatchesBinding(currentCompatibility, binding);
         this.assertOpen();
-        return projection;
+        return result;
       } catch (error) {
-        throw normalizeRuntimeError(
-          error,
-          "Prime Agent resident recovery projection could not be read.",
-        );
+        throw normalizeRuntimeError(error, failureMessage);
       } finally {
-        if (attached) await attached.dispose().catch(() => undefined);
-        closeDaemonClientQuietly(client);
+        try {
+          unsubscribeAttached?.();
+        } catch {
+          // Continue releasing the attachment and client below.
+        }
+        if (cleanupMode === "bounded_model_reconciliation") {
+          let disposal: Promise<unknown> = Promise.resolve();
+          if (attached) {
+            try {
+              disposal = Promise.resolve(attached.dispose()).catch(() => undefined);
+            } catch {
+              disposal = Promise.resolve();
+            }
+          }
+          // Closing the owned ephemeral transport immediately prevents the
+          // pinned connection's default detach timeout from retaining the
+          // adapter queue after reconciliation's outward deadline. The caught
+          // disposal promise remains observed even if the grace race wins.
+          closeDaemonClientQuietly(client);
+          await settleWithinGrace(disposal, MODEL_SELECTION_EPHEMERAL_DISPOSE_GRACE_MS);
+        } else {
+          if (attached) await attached.dispose().catch(() => undefined);
+          closeDaemonClientQuietly(client);
+        }
       }
     });
   }
@@ -1113,7 +1280,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     }
 
     const result = connection
-      .selectModel(command.command.providerId, command.command.modelId, durableBinding)
+      .selectModel(command, durableBinding)
       .then(() => ({
         disposition: "handled" as const,
         message: "Prime Agent selected and verified the requested model",
@@ -1351,16 +1518,21 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     }
   }
 
-  private async openValidatedClient(runtimeModule: PrimeAgentPublicModule): Promise<OpenClient> {
+  private async openValidatedClient(
+    runtimeModule: PrimeAgentPublicModule,
+    timeoutMs = this.options.connectTimeoutMs,
+    onClientCreated?: (client: PrimeDaemonClientPublic) => void,
+  ): Promise<OpenClient> {
     const client = new runtimeModule.DaemonClient(this.options.socketPath);
+    onClientCreated?.(client);
     try {
-      await client.connect(this.options.connectTimeoutMs);
+      await client.connect(timeoutMs);
     } catch (error) {
       client.close();
       throw new DaemonUnavailableError(error);
     }
     try {
-      const hello = client.hello ?? (await client.waitForHello(this.options.connectTimeoutMs));
+      const hello = client.hello ?? (await client.waitForHello(timeoutMs));
       return {
         client,
         compatibility: validateResidentDaemonHello(hello, {
@@ -1422,6 +1594,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       expectedEntrypointPath: this.options.invocation.argv[0],
       persistBinding: this.options.persistBinding,
       publishProjection: this.options.publishProjection,
+      publishModelSelectionProjection: this.options.publishModelSelectionProjection,
+      readStableSelectedModelProjection: (selectionBinding, providerId, modelId) =>
+        this.readStableSelectedModelProjection(selectionBinding, providerId, modelId),
       initialProjection,
       refreshProjectionOnStart: initialProjection === undefined,
       onClosed: () => {
@@ -1728,6 +1903,16 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         binding: ResidentSessionBinding,
         projection: ResidentProjectionSnapshot,
       ) => Promise<void>;
+      publishModelSelectionProjection: (
+        command: CommandEnvelope,
+        binding: ResidentSessionBinding,
+        projection: ResidentProjectionSnapshot,
+      ) => Promise<void>;
+      readStableSelectedModelProjection: (
+        binding: ResidentSessionBinding,
+        providerId: string,
+        modelId: string,
+      ) => Promise<ResidentProjectionSnapshot>;
       initialProjection: ResidentProjectionSnapshot | undefined;
       refreshProjectionOnStart: boolean;
       onClosed: () => void;
@@ -1766,13 +1951,34 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   }
 
   selectModel(
-    providerId: string,
-    modelId: string,
+    commandValue: CommandEnvelope,
     expectedBinding: ResidentSessionBinding,
   ): Promise<SanitizedResidentModelIdentity> {
-    const selection = ModelSelectionIdentitySchema.parse({ provider: providerId, id: modelId });
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "model.select") {
+      return Promise.reject(
+        new GatewayError("MODEL_SELECTION_COMMAND_REQUIRED", "Resident model selection requires an exact model.select command"),
+      );
+    }
+    const selection = ModelSelectionIdentitySchema.parse({
+      provider: command.command.providerId,
+      id: command.command.modelId,
+    });
     const durableBinding = validateResidentSessionBinding(expectedBinding);
-    return this.enqueueModelMutation(() => this.selectModelOnce(selection.provider, selection.id, durableBinding));
+    if (
+      command.threadId !== durableBinding.threadId ||
+      command.expectedExecutionGenerationId !== durableBinding.executionGenerationId
+    ) {
+      return Promise.reject(
+        new GatewayError("MODEL_SELECTION_AUTHORITY_MISMATCH", "Model selection does not match its durable resident authority"),
+      );
+    }
+    return this.enqueueModelMutation(() => this.selectModelOnce(
+      command,
+      selection.provider,
+      selection.id,
+      durableBinding,
+    ));
   }
 
   prompt(
@@ -2663,6 +2869,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   }
 
   private async selectModelOnce(
+    command: CommandEnvelope,
     providerId: string,
     modelId: string,
     expectedBinding: ResidentSessionBinding,
@@ -2715,16 +2922,29 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     }
 
     try {
-      // A resolved setModel invalidates the pinned connection's snapshot cache;
-      // consecutive equal cursor/projection reads additionally prove that the
-      // pinned multi-RPC snapshot did not race a concurrent daemon event.
-      const projection = await readStableModelSelectionProjection(
-        this.options.attached,
-        expectedBinding,
-        providerId,
-        modelId,
+      // Prime v0.7's supervisor does not invalidate its attach cache for a
+      // successful set_model response. Reconcile through fixed read-only state,
+      // messages, and context requests on a new verified daemon client; the
+      // attachment supplies only the before/after event-cursor fence. Completion
+      // is never inferred from the mutation DTO or the cached attach model.
+      const projection = await awaitResidentMutationInvocation(
+        this.options.readStableSelectedModelProjection(
+          expectedBinding,
+          providerId,
+          modelId,
+        ),
+        this.options.requestTimeoutMs,
+        "model selection reconciliation",
       );
-      await publishProjection(this.options.publishProjection, expectedBinding, projection);
+      this.assertModelSelectionLive(expectedBinding);
+      await publishModelSelectionProjection(
+        this.options.publishModelSelectionProjection,
+        command,
+        expectedBinding,
+        projection,
+      );
+      this.assertModelSelectionLive(expectedBinding);
+      this.acceptAuthoritativeProjection(projection);
     } catch {
       throw new GatewayError(
         "MODEL_SELECTION_RECONCILIATION_FAILED",
@@ -3077,6 +3297,46 @@ function awaitResidentMutationInvocation<T>(
   });
 }
 
+async function settleWithinGrace(settlement: Promise<unknown>, graceMs: number): Promise<void> {
+  const observed = Promise.resolve(settlement).then(
+    () => undefined,
+    () => undefined,
+  );
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      observed,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, graceMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function observeLateOpenClient(opening: Promise<OpenClient>): void {
+  void opening.then(
+    (opened) => closeDaemonClientQuietly(opened.client),
+    () => undefined,
+  );
+}
+
+function observeLateAttachedConnection(
+  attachment: Promise<PrimeDaemonAgentConnectionPublic>,
+): void {
+  void attachment.then(
+    (attached) => {
+      try {
+        void Promise.resolve(attached.dispose()).catch(() => undefined);
+      } catch {
+        // The ephemeral transport was already closed at the deadline.
+      }
+    },
+    () => undefined,
+  );
+}
+
 function defaultResidentDaemonSpawn(
   executable: string,
   argv: readonly string[],
@@ -3345,28 +3605,81 @@ function sanitizeAvailableModels(value: unknown): readonly SanitizedResidentMode
 
 async function readStableModelSelectionProjection(
   connection: PrimeDaemonAgentConnectionPublic,
+  client: PrimeDaemonClientPublic,
   binding: ResidentSessionBinding,
   providerId: string,
   modelId: string,
+  deadline: number,
+  wait: (milliseconds: number) => Promise<void>,
 ): Promise<ResidentProjectionSnapshot> {
   let previous:
     | Readonly<{
-        cursor: Readonly<{ generation: string; sequence: number }>;
+        proof: Readonly<{
+          cursor: Readonly<{ generation: string; sequence: number }>;
+          state: Readonly<Record<string, unknown>>;
+          messages: readonly unknown[];
+          sessionContext: Readonly<Record<string, unknown>>;
+        }>;
         projection: ResidentProjectionSnapshot;
       }>
     | undefined;
   for (let read = 0; read < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS; read += 1) {
-    const snapshot = await connection.getInitialSnapshot();
-    const cursor = assertSelectedModelSnapshot(snapshot, binding, providerId, modelId);
-    const projection = normalizeProjection(snapshot, binding);
+    // Prime v0.7's supervisor can retain an attach snapshot across set_model:
+    // the worker applies the mutation, but the command response does not
+    // invalidate the supervisor's attach cache. Use the attachment only to
+    // fence the worker event cursor. The state, messages, and context that
+    // prove completion are fixed read-only requests routed to the exact live
+    // worker and are never inferred from the set_model response DTO.
+    const beforeSnapshot = await beforeModelSelectionDeadline(
+      deadline,
+      () => connection.getInitialSnapshot(),
+      "model selection attachment snapshot",
+    );
+    const beforeCursor = inspectBoundSnapshotCursor(beforeSnapshot, binding);
+    const round = await readFixedResidentProjectionRound(
+      client,
+      beforeSnapshot,
+      binding,
+      providerId,
+      modelId,
+      deadline,
+    );
+    const afterSnapshot = await beforeModelSelectionDeadline(
+      deadline,
+      () => connection.getInitialSnapshot(),
+      "model selection attachment snapshot",
+    );
+    const afterCursor = inspectBoundSnapshotCursor(afterSnapshot, binding);
+    if (!isDeepStrictEqual(beforeCursor, afterCursor) || !round) {
+      previous = undefined;
+      if (read + 1 < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS) {
+        await beforeModelSelectionDeadline(
+          deadline,
+          (remainingMs) => wait(Math.min(MODEL_SELECTION_RECONCILIATION_POLL_MS, remainingMs)),
+          "model selection reconciliation wait",
+        );
+      }
+      continue;
+    }
+    const projection = normalizeProjection(round.snapshot, binding);
     if (
+      round.selected &&
       previous &&
-      isDeepStrictEqual(previous.cursor, cursor) &&
+      isDeepStrictEqual(previous.proof, round.proof) &&
       isDeepStrictEqual(previous.projection, projection)
     ) {
       return projection;
     }
-    previous = Object.freeze({ cursor, projection });
+    previous = round.selected
+      ? Object.freeze({ proof: round.proof, projection })
+      : undefined;
+    if (read + 1 < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS) {
+      await beforeModelSelectionDeadline(
+        deadline,
+        (remainingMs) => wait(Math.min(MODEL_SELECTION_RECONCILIATION_POLL_MS, remainingMs)),
+        "model selection reconciliation wait",
+      );
+    }
   }
   throw new ResidentRuntimeContractError(
     "PRIME_RUNTIME_RESPONSE_INVALID",
@@ -3374,12 +3687,152 @@ async function readStableModelSelectionProjection(
   );
 }
 
-function assertSelectedModelSnapshot(
+async function readFixedResidentProjectionRound(
+  client: PrimeDaemonClientPublic,
+  attachmentSnapshot: unknown,
+  binding: ResidentSessionBinding,
+  providerId: string,
+  modelId: string,
+  deadline: number,
+): Promise<Readonly<{
+  snapshot: unknown;
+  selected: boolean;
+  proof: Readonly<{
+    cursor: Readonly<{ generation: string; sequence: number }>;
+    state: Readonly<Record<string, unknown>>;
+    messages: readonly unknown[];
+    sessionContext: Readonly<Record<string, unknown>>;
+  }>;
+}> | undefined> {
+  if (!isRecord(attachmentSnapshot)) throw invalidResponse("model-selection attachment snapshot");
+  const stateBeforeResponse = await beforeModelSelectionDeadline(
+    deadline,
+    (remainingMs) => requestDaemon(
+      client,
+      { type: "get_connection_state", activeSessionId: binding.activeSessionId },
+      remainingMs,
+      "get_connection_state",
+    ),
+    "model selection get_connection_state",
+  );
+  const messagesResponse = await beforeModelSelectionDeadline(
+    deadline,
+    (remainingMs) => requestDaemon(
+      client,
+      { type: "get_messages", activeSessionId: binding.activeSessionId },
+      remainingMs,
+      "get_messages",
+    ),
+    "model selection get_messages",
+  );
+  const contextResponse = await beforeModelSelectionDeadline(
+    deadline,
+    (remainingMs) => requestDaemon(
+      client,
+      { type: "get_session_context", activeSessionId: binding.activeSessionId },
+      remainingMs,
+      "get_session_context",
+    ),
+    "model selection get_session_context",
+  );
+  const stateAfterResponse = await beforeModelSelectionDeadline(
+    deadline,
+    (remainingMs) => requestDaemon(
+      client,
+      { type: "get_connection_state", activeSessionId: binding.activeSessionId },
+      remainingMs,
+      "get_connection_state",
+    ),
+    "model selection get_connection_state",
+  );
+  if (!isRecord(stateBeforeResponse.data) || !isRecord(stateAfterResponse.data)) {
+    throw invalidResponse("get_connection_state");
+  }
+  if (!isRecord(messagesResponse.data) || !Array.isArray(messagesResponse.data.messages)) {
+    throw invalidResponse("get_messages");
+  }
+  if (!isRecord(contextResponse.data) || !isRecord(contextResponse.data.context)) {
+    throw invalidResponse("get_session_context");
+  }
+  if (
+    typeof stateBeforeResponse.data.messageCount !== "number" ||
+    !Number.isSafeInteger(stateBeforeResponse.data.messageCount) ||
+    stateBeforeResponse.data.messageCount < 0
+  ) {
+    throw invalidResponse("model-selection message fence");
+  }
+  if (
+    !isDeepStrictEqual(stateBeforeResponse.data, stateAfterResponse.data) ||
+    stateBeforeResponse.data.messageCount !== messagesResponse.data.messages.length
+  ) {
+    return undefined;
+  }
+  const cursor = inspectBoundSnapshotCursor(attachmentSnapshot, binding);
+  const snapshot = {
+    ...attachmentSnapshot,
+    state: stateBeforeResponse.data,
+    messages: messagesResponse.data.messages,
+    sessionContext: contextResponse.data.context,
+  };
+  // Validate exact durable identity, model, leaf, message count, and cursor
+  // consistency before retaining any raw proof material for cross-round equality.
+  const observation = inspectModelSelectionSnapshot(snapshot, binding, providerId, modelId);
+  const contextModel = contextResponse.data.context.model;
+  const selected =
+    observation.selected &&
+    stateBeforeResponse.data.leafId !== null &&
+    isRecord(contextModel) &&
+    contextModel.provider === providerId &&
+    contextModel.modelId === modelId;
+  return Object.freeze({
+    snapshot,
+    selected,
+    proof: Object.freeze({
+      cursor,
+      state: stateBeforeResponse.data,
+      messages: messagesResponse.data.messages,
+      sessionContext: contextResponse.data.context,
+    }),
+  });
+}
+
+function beforeModelSelectionDeadline<T>(
+  deadline: number,
+  operation: (remainingMs: number) => Promise<T>,
+  label: string,
+): Promise<T> {
+  const remainingMs = Math.floor(deadline - performance.now());
+  if (remainingMs <= 0) {
+    return Promise.reject(new ResidentMutationAdmissionTimeoutError(label));
+  }
+  return awaitResidentMutationInvocation(
+    Promise.resolve().then(() => operation(remainingMs)),
+    remainingMs,
+    label,
+  );
+}
+
+function inspectBoundSnapshotCursor(
+  snapshot: unknown,
+  binding: ResidentSessionBinding,
+): Readonly<{ generation: string; sequence: number }> {
+  validateInitialSnapshotValue(snapshot, binding);
+  const parsed = InitialSnapshotSchema.safeParse(snapshot);
+  if (!parsed.success || !parsed.data.lastEventCursor || parsed.data.lastEventSequence === undefined) {
+    throw invalidResponse("model-selection attachment cursor");
+  }
+  return Object.freeze({ ...parsed.data.lastEventCursor });
+}
+
+function inspectModelSelectionSnapshot(
   snapshot: unknown,
   binding: ResidentSessionBinding,
   providerId: string,
   modelId: string,
-): Readonly<{ generation: string; sequence: number }> {
+): Readonly<{
+  cursor: Readonly<{ generation: string; sequence: number }>;
+  selected: boolean;
+}> {
   assertBoundedJson(snapshot, MAX_RUNTIME_SNAPSHOT_BYTES, "model-selection snapshot");
   const parsed = ModelSelectionSnapshotSchema.safeParse(snapshot);
   if (!parsed.success) throw invalidResponse("model-selection snapshot");
@@ -3388,9 +3841,7 @@ function assertSelectedModelSnapshot(
     state.activeSessionId !== binding.activeSessionId ||
     state.sessionId !== binding.sessionId ||
     (binding.sessionFile !== undefined && state.sessionFile !== binding.sessionFile) ||
-    !sameWorkspacePath(state.cwd, binding.workspaceDirectory) ||
-    state.model.provider !== providerId ||
-    state.model.id !== modelId
+    !sameWorkspacePath(state.cwd, binding.workspaceDirectory)
   ) {
     throw new ResidentRuntimeContractError(
       "PRIME_RUNTIME_SESSION_MISMATCH",
@@ -3398,8 +3849,11 @@ function assertSelectedModelSnapshot(
     );
   }
   return Object.freeze({
-    generation: parsed.data.lastEventCursor.generation,
-    sequence: parsed.data.lastEventCursor.sequence,
+    cursor: Object.freeze({
+      generation: parsed.data.lastEventCursor.generation,
+      sequence: parsed.data.lastEventCursor.sequence,
+    }),
+    selected: state.model.provider === providerId && state.model.id === modelId,
   });
 }
 
@@ -3418,6 +3872,27 @@ async function publishProjection(
       "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
       "The authoritative Prime Agent projection could not be saved before the session became ready.",
       { retryable: true, cause: error },
+    );
+  }
+}
+
+async function publishModelSelectionProjection(
+  publisher: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>,
+  command: CommandEnvelope,
+  binding: ResidentSessionBinding,
+  projection: ResidentProjectionSnapshot,
+): Promise<void> {
+  try {
+    await publisher(command, binding, projection);
+  } catch (error) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
+      "The proven Prime Agent model selection could not be saved under its exact durable attempt.",
+      { retryable: false, cause: error },
     );
   }
 }

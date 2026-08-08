@@ -12,6 +12,7 @@ import {
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
@@ -62,6 +63,7 @@ import type {
   ResidentWorkspaceSelection,
   ResidentWorkspaceSelectionInput,
   RuntimeOAuthSessionView,
+  RuntimeIntegrityRepairInput,
   SessionCursor,
   SshHostAlias,
   SshProbe,
@@ -712,6 +714,83 @@ export class DesktopControlService extends EventEmitter {
     const snapshot = parsed.data
     this.authorityCapabilities = this.authorityCapabilities.filter(
       (capability) => capability !== RUNTIME_INTEGRITY_RETRY_CAPABILITY
+    )
+    this.authorityRuntimeReadiness = {
+      ...currentReadiness,
+      observedAt: now(),
+      snapshot,
+    }
+    const { capabilities: _capabilities, runtimeReadiness: _runtimeReadiness, ...base } = this.state
+    this.setState({ ...base, ...this.authorityObservationState() })
+    this.scheduleHealthPoll(
+      authority.connection,
+      authority.target,
+      authority.hostId,
+      authority.generation,
+    )
+    return snapshot
+  }
+
+  async repairRuntimeIntegrity(input: RuntimeIntegrityRepairInput): Promise<RuntimeIntegritySnapshot> {
+    const authority = this.captureProjectionAuthority()
+    if (input.expectedHostId !== authority.hostId) {
+      throw new ControlError(
+        'runtime.integrity_repair_authority_changed',
+        'The selected host changed before runtime repair could start.',
+        { retryable: true }
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'runtime.integrity_repair_local_required',
+        'Runtime repair can be started only on this computer.'
+      )
+    }
+    if (!this.authorityCapabilities.includes(RUNTIME_INTEGRITY_REPAIR_CAPABILITY)) {
+      throw new ControlError(
+        'runtime.integrity_repair_unavailable',
+        'The current host state does not allow runtime repair.'
+      )
+    }
+    const currentReadiness = this.authorityRuntimeReadiness
+    if (
+      currentReadiness?.kind !== 'reported' ||
+      currentReadiness.hostId !== input.expectedHostId ||
+      currentReadiness.snapshot.status !== 'failed' ||
+      currentReadiness.snapshot.retryable ||
+      currentReadiness.snapshot.trustAnchorId !== input.expectedTrustAnchorId ||
+      currentReadiness.snapshot.changedAt !== input.expectedChangedAt ||
+      !isDeepStrictEqual(currentReadiness.snapshot.target, input.expectedTarget)
+    ) {
+      throw new ControlError(
+        'runtime.integrity_repair_state_changed',
+        'Runtime repair authority changed before the operation could start.',
+        { retryable: true }
+      )
+    }
+    const previousSnapshot = currentReadiness.snapshot
+    const raw = await authority.connection.request(
+      'runtime.integrity.repair',
+      input,
+      { timeoutMs: 10_000, priority: 'urgent' }
+    )
+    this.assertProjectionAuthority(authority, 'runtime integrity repair')
+    const parsed = RuntimeIntegritySnapshotSchema.safeParse(raw)
+    if (
+      !parsed.success ||
+      parsed.data.status !== 'initializing' ||
+      !sameRuntimeIntegrityLineage(previousSnapshot, parsed.data)
+    ) {
+      const error = new ControlError(
+        'protocol.runtime_integrity_repair_invalid',
+        'The host returned an invalid runtime repair state.'
+      )
+      authority.connection.terminate(error)
+      throw error
+    }
+    const snapshot = parsed.data
+    this.authorityCapabilities = this.authorityCapabilities.filter(
+      (capability) => capability !== RUNTIME_INTEGRITY_REPAIR_CAPABILITY
     )
     this.authorityRuntimeReadiness = {
       ...currentReadiness,
@@ -5135,6 +5214,28 @@ function observationFromHealth(value: unknown): HealthObservation {
     throw new ControlError(
       'protocol.runtime_integrity_retry_contract_mismatch',
       'The host runtime retry capability did not match its failed integrity state.',
+    )
+  }
+  const advertisesRuntimeIntegrityRepair = capabilities.includes(RUNTIME_INTEGRITY_REPAIR_CAPABILITY)
+  if (
+    advertisesRuntimeIntegrityRepair &&
+    (
+      runtimeIntegrity?.status !== 'failed' ||
+      runtimeIntegrity.retryable ||
+      runtimeIntegrity.recoveryAction !== 'repair_application' ||
+      (runtimeIntegrity.code !== 'RUNTIME_REPAIR_REQUIRED' &&
+        runtimeIntegrity.code !== 'RUNTIME_INSTALLED_CORRUPTION')
+    )
+  ) {
+    throw new ControlError(
+      'protocol.runtime_integrity_repair_contract_mismatch',
+      'The host runtime repair capability did not match an eligible installed-runtime failure.',
+    )
+  }
+  if (advertisesRuntimeIntegrityRetry && advertisesRuntimeIntegrityRepair) {
+    throw new ControlError(
+      'protocol.runtime_integrity_recovery_contract_mismatch',
+      'The host advertised conflicting runtime recovery capabilities.',
     )
   }
   if (

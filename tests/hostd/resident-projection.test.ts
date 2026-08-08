@@ -188,6 +188,36 @@ function expectProjectionError(
 }
 
 describe("resident authoritative snapshot normalization", () => {
+  it("canonicalizes an empty rehydrated recap to the same absent value", () => {
+    const absentSnapshot = validSnapshot();
+    const emptySnapshot = validSnapshot();
+    delete absentSnapshot.state.recap;
+    emptySnapshot.state.recap = "";
+
+    const absentProjection = normalizeResidentProjectionSnapshot(absentSnapshot, validBinding());
+    const emptyProjection = normalizeResidentProjectionSnapshot(emptySnapshot, validBinding());
+
+    expect(absentProjection.runtime.recap).toBeUndefined();
+    expect(emptyProjection.runtime.recap).toBeUndefined();
+    expect(emptyProjection).toEqual(absentProjection);
+  });
+
+  it("accepts context usage above the nominal window while preserving exact token counts", () => {
+    const snapshot = validSnapshot();
+    snapshot.state.contextUsage = {
+      tokens: 10_031,
+      contextWindow: 8_192,
+      percent: 122.44873046875,
+    };
+
+    const projection = normalizeResidentProjectionSnapshot(snapshot, validBinding());
+
+    expect(projection.runtime.context).toEqual({
+      usedTokens: 10_031,
+      maxTokens: 8_192,
+    });
+  });
+
   it("produces a frozen, bounded host-owned projection from a representative v0.7.0 snapshot", () => {
     const projection = normalizeResidentProjectionSnapshot(validSnapshot(), validBinding());
 
@@ -200,6 +230,7 @@ describe("resident authoritative snapshot normalization", () => {
         workspaceDirectory,
       },
       cursor: { generation: "daemon-generation-1", sequence: 17 },
+      selectedModel: { providerId: "openai", modelId: "gpt-5.2" },
       runtime: {
         runtime: "prime_agent",
         residency: "resident",
@@ -278,10 +309,26 @@ describe("resident authoritative snapshot normalization", () => {
     expect(serialized).not.toContain("child-session");
     expect(serialized).not.toContain("sessionDir");
     expect(Object.isFrozen(projection)).toBe(true);
+    expect(Object.isFrozen(projection.selectedModel)).toBe(true);
     expect(Object.isFrozen(projection.runtime)).toBe(true);
     expect(Object.isFrozen(projection.transcript)).toBe(true);
     expect(Object.isFrozen(projection.transcript[0])).toBe(true);
     expect(Object.isFrozen(projection.childAgents[0]?.activity)).toBe(true);
+  });
+
+  it("preserves the exact private model pair when public display strings collide", () => {
+    const firstSnapshot = validSnapshot();
+    const secondSnapshot = validSnapshot();
+    firstSnapshot.state.model = { provider: "openrouter", id: "anthropic/claude" };
+    secondSnapshot.state.model = { provider: "openrouter/anthropic", id: "claude" };
+
+    const first = normalizeResidentProjectionSnapshot(firstSnapshot, validBinding());
+    const second = normalizeResidentProjectionSnapshot(secondSnapshot, validBinding());
+
+    expect(first.runtime.model).toBe("openrouter/anthropic/claude");
+    expect(second.runtime.model).toBe(first.runtime.model);
+    expect(first.selectedModel).toEqual({ providerId: "openrouter", modelId: "anthropic/claude" });
+    expect(second.selectedModel).toEqual({ providerId: "openrouter/anthropic", modelId: "claude" });
   });
 
   it("preserves tool and visible status semantics while isolating the in-progress stream", () => {

@@ -318,6 +318,10 @@ function createAdapter(
       await store.publishResidentProjectionSnapshot(binding, projection);
       daemon.chronology.push(`store:projection:${binding.activeSessionId}`);
     },
+    publishModelSelectionProjection: async (command, binding, projection) => {
+      await store.publishResidentModelSelectionProjection(command, binding, projection);
+      daemon.chronology.push(`store:model-projection:${binding.activeSessionId}`);
+    },
     spawnFactory: () => daemon.spawnLauncher(),
     connectTimeoutMs: 100,
     startupTimeoutMs: 100,

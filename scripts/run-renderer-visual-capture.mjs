@@ -24,6 +24,8 @@ const expectedTargets = [
   ['resident-end-dialog-short-320', 320, 256, 'resident-end-review', undefined],
   ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
+  ['hud-expanded', 620, 380, 'hud-expanded', 'hud'],
+  ['hud-buddy', 184, 64, 'hud-buddy', 'hud'],
 ]
 const obsoleteCaptures = [
   'desktop.png',
@@ -90,6 +92,12 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     ((name === 'resident-end-dialog-390' || name === 'resident-end-dialog-short-320') && result.stateEvidence?.residentEndDialogOpen !== true) ||
     (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
     (name === 'resident-recovery-short-320' && result.stateEvidence?.emptyMainScrollable !== true)
+    || (name.startsWith('hud-') && (
+      result.stateEvidence?.hudSurfaceVisible !== true ||
+      result.stateEvidence?.hudStatusVisible !== true ||
+      result.stateEvidence?.hudHostTransparent !== true ||
+      result.stateEvidence?.hudMode !== name.slice('hud-'.length)
+    ))
   ) {
     throw new Error(`Renderer visual capture returned invalid evidence for ${name}`)
   }

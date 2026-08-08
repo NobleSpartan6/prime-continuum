@@ -13,6 +13,19 @@ never becomes a second authority. There is no TCP listener.
 Both paths carry protocol v1 frames: a 4-byte unsigned big-endian payload length
 followed by one UTF-8 JSON document. The default maximum frame payload is 1 MiB.
 
+`runtime.integrity.repair` is a trusted-local, path-free recovery boundary, not
+an installer repair. Hostd advertises it only for an eligible nonretryable
+installed-runtime failure in a generation that has issued no verified handle
+and has no active, prepared, or quarantined resident lifecycle state. The
+request repeats the exact host, trust anchor, runtime target, and failed-state
+timestamp. Repair fully validates the app-bundled attested seed before moving
+anything, quarantines only that target's content-addressed installed image and
+current pointer, then re-promotes and re-verifies the bundle. Projects, threads,
+workspaces, credentials, and resident state are outside its addressable paths.
+Two validated quarantine generations are retained; older evidence is pruned
+only after a replacement is pointer-current and fully verified, with restart
+recovery for an interrupted prune. Unknown quarantine entries fail closed.
+
 ## Protocol versus Prime Agent runtime transports
 
 The DTOs in `../shared/protocol.ts` are Prime Continuim's public host protocol.
@@ -101,6 +114,20 @@ acknowledged-Stop idle proof and returns nonretryable recovery-required admissio
 errors. Safe retirement requires a future daemon-level atomic
 `abort_and_quiesce` epoch or verified session rotation; an ordinary
 `abort` followed by `waitForIdle` is not an ordering fence in Prime Agent 0.7.0.
+
+`resident_control_projection_v1` is the polling-only multi-device prerequisite,
+not a mobile-control claim. `thread.control.snapshot` requires the exact expected
+host, thread, and execution generation and returns only a path-free binding
+fingerprint, authoritative cursor, one current Prompt/Stop slot, and a
+Store-owned monotonic sequence. Stop is projected while it coexists with the
+prompt it is quiescing. Detach, lifecycle transition, active state without a
+current command identity, and uncertain mutation outcomes never become inferred
+idle. Duplicate polls are byte-stable and terminal End survives restart. The
+bounded generation registry validates all compaction candidates before it
+retires only generations no longer current in the catalog; it fails closed when
+all retained generations remain current and never pressure-prunes terminal End.
+Relay callers additionally need a current authenticated channel with
+`projection.read`; this endpoint neither submits nor reconciles a mutation.
 
 ## Admission durability
 

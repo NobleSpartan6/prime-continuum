@@ -1,6 +1,7 @@
 import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
@@ -13,6 +14,7 @@ import {
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
+import type { HudMode, HudState, HudTarget } from '../../shared/window-control'
 
 export type ConnectionState = 'online' | 'reconnecting' | 'offline'
 export type RuntimeModelCatalog = RuntimeModelCatalogSnapshot
@@ -51,7 +53,7 @@ export type LocalSetupStage =
 
 export interface LocalSetupIssue {
   area: 'local_service' | 'runtime'
-  action: 'retry_connection' | 'retry_runtime' | 'manual_recovery' | 'review_diagnostics'
+  action: 'retry_connection' | 'retry_runtime' | 'repair_runtime' | 'manual_recovery' | 'review_diagnostics'
   message: string
   retryable: boolean
   code?: string
@@ -367,7 +369,15 @@ export interface RendererApi {
   environment: 'native' | 'preview'
   loadWorkbench(): Promise<WorkbenchSnapshot>
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
+  hudOpen(target: HudTarget): Promise<HudState>
+  hudState(): Promise<HudState>
+  hudSetMode(mode: HudMode): Promise<HudState>
+  hudClose(): Promise<HudState>
+  hudReturnToWorkbench(): Promise<void>
+  hudSetIgnoreMouseEvents(ignore: boolean): Promise<HudState>
+  onHudState(listener: (state: HudState) => void): () => void
   retryLocalSetup(): Promise<void>
+  repairLocalRuntime(): Promise<void>
   selectThread(threadId: string): Promise<void>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
@@ -698,6 +708,8 @@ export type PreviewVisualState =
   | 'resident-recovery'
   | 'resident-end-review'
   | 'resident-end-pending'
+  | 'hud-expanded'
+  | 'hud-buddy'
 
 const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
@@ -710,6 +722,8 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'resident-recovery',
   'resident-end-review',
   'resident-end-pending',
+  'hud-expanded',
+  'hud-buddy',
 ])
 
 function previewVisualStateFromSearch(search: string): PreviewVisualState {
@@ -876,7 +890,11 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     previewUpdate.detail = previewSimulation(detail)
   }
 
-  if (visualState === 'idle') {
+  if (visualState === 'idle' || visualState === 'hud-expanded' || visualState === 'hud-buddy') {
+    if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
+      selectedThread.workspaceId = 'workspace-preview-hud'
+      selectedThread.executionGenerationId = 'execution-preview-hud'
+    }
     selectedThread.status = 'idle'
     snapshot.operations.startResidentTurn = true
     snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
@@ -1070,16 +1088,75 @@ const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCata
 
 class BrowserPreviewApi implements RendererApi {
   readonly environment = 'preview' as const
+  private previewHudState: HudState = { state: 'closed' }
+  private readonly hudListeners = new Set<(state: HudState) => void>()
 
-  constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {}
+  constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
+    if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
+      this.previewHudState = {
+        state: visualState === 'hud-buddy' ? 'buddy' : 'expanded',
+        target: {
+          expectedHostId: 'host-devbox',
+          threadId: 'thread-seamless',
+          expectedExecutionGenerationId: 'execution-preview-hud',
+        },
+        ignoresMouseEvents: false,
+      }
+    }
+  }
 
   async loadWorkbench(): Promise<WorkbenchSnapshot> {
     await delay(120)
     return previewSnapshotForVisualState(this.visualState)
   }
 
+  private publishHudState(state: HudState): HudState {
+    this.previewHudState = state
+    for (const listener of this.hudListeners) listener(state)
+    return state
+  }
+
+  async hudOpen(target: HudTarget): Promise<HudState> {
+    return this.publishHudState({ state: 'expanded', target, ignoresMouseEvents: false })
+  }
+
+  async hudState(): Promise<HudState> {
+    return this.previewHudState
+  }
+
+  async hudSetMode(mode: HudMode): Promise<HudState> {
+    if (this.previewHudState.state === 'closed') return this.previewHudState
+    return this.publishHudState({
+      state: mode,
+      target: this.previewHudState.target,
+      ignoresMouseEvents: false,
+    })
+  }
+
+  async hudClose(): Promise<HudState> {
+    return this.publishHudState({ state: 'closed' })
+  }
+
+  async hudReturnToWorkbench(): Promise<void> {
+    // Browser preview has no native workbench window to focus.
+  }
+
+  async hudSetIgnoreMouseEvents(ignore: boolean): Promise<HudState> {
+    if (this.previewHudState.state === 'closed') return this.previewHudState
+    return this.publishHudState({ ...this.previewHudState, ignoresMouseEvents: ignore })
+  }
+
+  onHudState(listener: (state: HudState) => void): () => void {
+    this.hudListeners.add(listener)
+    return () => this.hudListeners.delete(listener)
+  }
+
   async retryLocalSetup(): Promise<void> {
     throw new Error('Local setup retry is available only in the native desktop app.')
+  }
+
+  async repairLocalRuntime(): Promise<void> {
+    throw new Error('Local runtime repair is available only in the native desktop app.')
   }
 
   async selectThread(_threadId: string): Promise<void> {
@@ -1425,6 +1502,7 @@ function localConnectionIssueFromNative(value: unknown): LocalSetupIssue | undef
 function runtimeSetupIssue(
   readiness: Extract<HostRuntimeReadiness, { kind: 'reported' }>,
   runtimeRetryAdvertised: boolean,
+  runtimeRepairAdvertised: boolean,
   code?: string,
 ): LocalSetupIssue {
   if (
@@ -1451,6 +1529,20 @@ function runtimeSetupIssue(
     }
   }
   if (readiness.recovery === 'repair') {
+    if (
+      readiness.freshness === 'live' &&
+      readiness.status === 'failed' &&
+      readiness.retryable === false &&
+      runtimeRepairAdvertised
+    ) {
+      return {
+        area: 'runtime',
+        action: 'repair_runtime',
+        message: 'Prime Continuim can quarantine the failed local runtime copy and restore it from this app’s verified bundle. Saved projects, threads, and workspace files will remain unchanged.',
+        retryable: false,
+        ...(code ? { code } : {}),
+      }
+    }
     return {
       area: 'runtime',
       action: 'manual_recovery',
@@ -1473,6 +1565,7 @@ function localSetupFromNative(input: {
   runtimeReadiness: HostRuntimeReadiness | undefined
   runtimeCode?: string
   runtimeRetryAdvertised: boolean
+  runtimeRepairAdvertised: boolean
   residentProvisioningReady: boolean
   residentLifecycleAdvertised: boolean
 }): LocalSetupSummary | undefined {
@@ -1510,6 +1603,9 @@ function localSetupFromNative(input: {
 
   const liveReadiness = input.runtimeReadiness?.freshness === 'live' ? input.runtimeReadiness : undefined
   if (phase === 'degraded') {
+    if (liveReadiness?.kind === 'reported' && liveReadiness.status === 'initializing') {
+      return { stage: 'preparing_runtime', runtimeReadiness: liveReadiness }
+    }
     if (
       liveReadiness?.kind === 'reported' &&
       (liveReadiness.status === 'failed' || liveReadiness.status === 'unavailable')
@@ -1517,7 +1613,12 @@ function localSetupFromNative(input: {
       return {
         stage: 'needs_attention',
         runtimeReadiness: liveReadiness,
-        issue: runtimeSetupIssue(liveReadiness, input.runtimeRetryAdvertised, input.runtimeCode),
+        issue: runtimeSetupIssue(
+          liveReadiness,
+          input.runtimeRetryAdvertised,
+          input.runtimeRepairAdvertised,
+          input.runtimeCode,
+        ),
       }
     }
     const issue = connectionIssue ?? {
@@ -1537,7 +1638,12 @@ function localSetupFromNative(input: {
       return {
         stage: 'needs_attention',
         runtimeReadiness: liveReadiness,
-        issue: runtimeSetupIssue(liveReadiness, input.runtimeRetryAdvertised, input.runtimeCode),
+        issue: runtimeSetupIssue(
+          liveReadiness,
+          input.runtimeRetryAdvertised,
+          input.runtimeRepairAdvertised,
+          input.runtimeCode,
+        ),
       }
     }
     if (liveReadiness.status === 'ready' && !input.residentLifecycleAdvertised) {
@@ -2657,6 +2763,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       asString(rawConnection?.path) === 'local_socket' &&
       advertisedCapabilities.includes(RUNTIME_INTEGRITY_RETRY_CAPABILITY)
     ),
+    runtimeRepairAdvertised: Boolean(
+      (activePhase === 'online' || activePhase === 'degraded') &&
+      asString(activeTarget?.kind) === 'local' &&
+      asString(rawConnection?.path) === 'local_socket' &&
+      advertisedCapabilities.includes(RUNTIME_INTEGRITY_REPAIR_CAPABILITY)
+    ),
     residentProvisioningReady,
     residentLifecycleAdvertised: advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
   })
@@ -2862,7 +2974,10 @@ export class NativeRendererApi implements RendererApi {
     retryable?: boolean
   }
 
-  constructor(private readonly bridge: NativePrimeBridge) {}
+  constructor(
+    private readonly bridge: NativePrimeBridge,
+    private readonly options: { allowConnectionInitiation?: boolean } = {},
+  ) {}
 
   private async call<T>(method: string, payload?: unknown): Promise<T> {
     const candidate = (this.bridge as Record<string, unknown>)[method]
@@ -2871,6 +2986,37 @@ export class NativeRendererApi implements RendererApi {
     }
     const raw = await (candidate as (input?: unknown) => Promise<unknown>)(payload)
     return unwrapResult<T>(raw)
+  }
+
+  async hudOpen(target: HudTarget): Promise<HudState> {
+    return this.call<HudState>('hudOpen', target)
+  }
+
+  async hudState(): Promise<HudState> {
+    return this.call<HudState>('hudState')
+  }
+
+  async hudSetMode(mode: HudMode): Promise<HudState> {
+    return this.call<HudState>('hudSetMode', mode)
+  }
+
+  async hudClose(): Promise<HudState> {
+    return this.call<HudState>('hudClose')
+  }
+
+  async hudReturnToWorkbench(): Promise<void> {
+    await this.call<void>('hudReturnToWorkbench')
+  }
+
+  async hudSetIgnoreMouseEvents(ignore: boolean): Promise<HudState> {
+    return this.call<HudState>('hudSetIgnoreMouseEvents', ignore)
+  }
+
+  onHudState(listener: (state: HudState) => void): () => void {
+    const candidate = (this.bridge as Record<string, unknown>).onHudState
+    if (typeof candidate !== 'function') return () => undefined
+    const unsubscribe = (candidate as (listener: (state: HudState) => void) => unknown).call(this.bridge, listener)
+    return typeof unsubscribe === 'function' ? unsubscribe as () => void : () => undefined
   }
 
   private updateProjection(): WorkbenchSnapshot {
@@ -3928,6 +4074,7 @@ export class NativeRendererApi implements RendererApi {
       const phase = asString(connection?.phase)
       const existingTarget = asRecord(connection?.target)
       if (phase !== 'online') {
+        if (this.options.allowConnectionInitiation === false) return
         const target =
           existingTarget?.kind === 'ssh' && asString(existingTarget.alias)
             ? { kind: 'ssh', alias: asString(existingTarget.alias) }
@@ -4368,6 +4515,83 @@ export class NativeRendererApi implements RendererApi {
     const state = await this.call<unknown>('connect', target)
     if (!this.connectionReplyIsCurrent(fence, state)) return
     this.applyConnectionState(state)
+  }
+
+  async repairLocalRuntime(): Promise<void> {
+    const current = this.projection ?? this.updateProjection()
+    const issue = current.localSetup?.issue
+    if (
+      current.localSetup?.stage !== 'needs_attention' ||
+      issue?.action !== 'repair_runtime' ||
+      issue.retryable
+    ) {
+      throw new Error('The current local setup state does not allow runtime repair.')
+    }
+    const connection = asRecord(this.connection)
+    const expectedHostId = asString(connection?.hostId)
+    const targetKind = asString(asRecord(connection?.target)?.kind)
+    const path = asString(connection?.path)
+    const phase = asString(connection?.phase)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    const readiness = asRecord(connection?.runtimeReadiness)
+    const previousSnapshot = RuntimeIntegritySnapshotSchema.safeParse(readiness?.snapshot)
+    if (
+      !expectedHostId ||
+      (phase !== 'online' && phase !== 'degraded') ||
+      targetKind !== 'local' ||
+      path !== 'local_socket' ||
+      !capabilities.includes(RUNTIME_INTEGRITY_REPAIR_CAPABILITY) ||
+      asString(readiness?.hostId) !== expectedHostId ||
+      !previousSnapshot.success ||
+      previousSnapshot.data.status !== 'failed' ||
+      previousSnapshot.data.retryable ||
+      previousSnapshot.data.recoveryAction !== 'repair_application'
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+
+    const failedSnapshot = previousSnapshot.data
+    const generation = this.connectionGeneration
+    const observationRevision = this.connectionObservationRevision
+    const result = RuntimeIntegritySnapshotSchema.parse(
+      await this.call<unknown>('repairRuntimeIntegrity', {
+        expectedHostId,
+        expectedTrustAnchorId: failedSnapshot.trustAnchorId,
+        expectedTarget: failedSnapshot.target,
+        expectedChangedAt: failedSnapshot.changedAt,
+      }),
+    )
+    const latestConnection = asRecord(this.connection)
+    if (
+      generation !== this.connectionGeneration ||
+      asString(latestConnection?.hostId) !== expectedHostId ||
+      asString(asRecord(latestConnection?.target)?.kind) !== 'local' ||
+      asString(latestConnection?.path) !== 'local_socket'
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    if (result.status !== 'initializing' || !sameRuntimeIntegrityLineage(failedSnapshot, result)) {
+      throw new Error('The native runtime repair returned an invalid verification state.')
+    }
+    // A newer native connection event is authoritative over this earlier
+    // initializing reply, including a repair that already reached ready.
+    if (observationRevision !== this.connectionObservationRevision) return
+    const latestCapabilities = Array.isArray(latestConnection?.capabilities)
+      ? latestConnection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    this.applyConnectionState({
+      ...latestConnection,
+      capabilities: latestCapabilities.filter(
+        (capability) => capability !== RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+      ),
+      runtimeReadiness: {
+        ...readiness,
+        observedAt: result.changedAt,
+        snapshot: result,
+      },
+    })
   }
 
   async selectThread(threadId: string): Promise<void> {
@@ -5068,7 +5292,7 @@ export class NativeRendererApi implements RendererApi {
 
 let singletonApi: RendererApi | undefined
 
-export function createRendererApi(): RendererApi {
+export function createRendererApi(options: { allowConnectionInitiation?: boolean } = {}): RendererApi {
   if (!singletonApi) {
     const nativeBridge = Reflect.get(window, 'prime') as NativePrimeBridge | undefined
     const search = new URLSearchParams(window.location.search)
@@ -5076,7 +5300,7 @@ export function createRendererApi(): RendererApi {
       window.location.hostname === '127.0.0.1' &&
       window.navigator.userAgent.includes('PrimeContinuimVisualQA/1') &&
       search.has('visualState')
-    if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge)
+    if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge, options)
     else if (internalVisualQa) singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
     else throw new Error('Prime Continuim requires its desktop control bridge. Close this window and reopen the installed desktop app.')
   }

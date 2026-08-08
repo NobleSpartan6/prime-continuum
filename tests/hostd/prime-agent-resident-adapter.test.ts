@@ -153,6 +153,29 @@ function validSnapshot(options: {
   };
 }
 
+function validAuthoritativeSnapshot(options: {
+  state?: Record<string, unknown>;
+  messages?: unknown[];
+  sessionContext?: Record<string, unknown>;
+} = {}): Record<string, unknown> {
+  const messages = options.messages ?? [];
+  return {
+    ...validSnapshot({
+      messages,
+      state: {
+        leafId: "model-change-1",
+        ...options.state,
+      },
+    }),
+    sessionContext: options.sessionContext ?? {
+      messages: [],
+      thinkingLevel: "medium",
+      serviceTier: "standard",
+      model: { provider: "openai", modelId: "gpt-5" },
+    },
+  };
+}
+
 interface HarnessState {
   connectOutcomes: Array<"ok" | "fail" | "timeout">;
   hello: unknown;
@@ -160,6 +183,8 @@ interface HarnessState {
   requests: Array<Readonly<object>>;
   closes: number;
   disposeCalls: number;
+  subscribeCalls: number;
+  unsubscribeCalls: number;
   ownedCleanupDisposeCalls: number;
   residentDetachDisposeCalls: number;
   eventListeners: Set<(event: unknown) => void | Promise<void>>;
@@ -173,6 +198,11 @@ interface HarnessState {
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
   }>;
+  modelProjectionCalls: Array<{
+    command: CommandEnvelope;
+    binding: ResidentSessionBinding;
+    projection: ResidentProjectionSnapshot;
+  }>;
   waitForIdleCalls: number;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
   closeHandler?: () => void;
@@ -181,7 +211,18 @@ interface HarnessState {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
-  snapshotHandler?: () => Promise<unknown> | unknown;
+  publishModelSelectionProjectionHandler?: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
+  snapshotHandler?: (attachmentOrdinal: number) => Promise<unknown> | unknown;
+  authoritativeRoundCalls: number;
+  authoritativeSnapshotHandler?: (roundOrdinal: number) => Promise<unknown> | unknown;
+  authoritativeStateAfterHandler?: (
+    roundOrdinal: number,
+    snapshot: Readonly<Record<string, unknown>>,
+  ) => Promise<unknown> | unknown;
   waitForIdleHandler?: () => Promise<void> | void;
   availableModelsCalls: number;
   setModelCalls: Array<{ providerId: string; modelId: string }>;
@@ -200,7 +241,7 @@ interface HarnessState {
   abortHandler?: () => Promise<void> | void;
   promoteHandler?: () => Promise<void> | void;
   promoteAvailable: boolean;
-  attachHandler?: () => Promise<void> | void;
+  attachHandler?: (attachmentOrdinal: number) => Promise<void> | void;
   waitHandler?: (milliseconds: number) => Promise<void> | void;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
@@ -215,6 +256,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     requests: [],
     closes: 0,
     disposeCalls: 0,
+    subscribeCalls: 0,
+    unsubscribeCalls: 0,
     ownedCleanupDisposeCalls: 0,
     residentDetachDisposeCalls: 0,
     eventListeners: new Set(),
@@ -224,7 +267,9 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     launcherUnrefs: 0,
     persistCalls: [],
     projectionCalls: [],
+    modelProjectionCalls: [],
     waitForIdleCalls: 0,
+    authoritativeRoundCalls: 0,
     availableModelsCalls: 0,
     setModelCalls: [],
     promptCalls: [],
@@ -235,6 +280,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
   };
 
   class FakeDaemonClient implements PrimeDaemonClientPublic {
+    private authoritativeSnapshot: Readonly<Record<string, unknown>> | undefined;
+
     constructor(readonly socketPath: string) {}
 
     get hello(): unknown {
@@ -262,6 +309,41 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       if (type === "list") {
         return { type: "response", command: "list", success: true, data: { sessions: [liveSummary()] } };
       }
+      if (type === "get_connection_state") {
+        if (!this.authoritativeSnapshot) {
+          state.authoritativeRoundCalls += 1;
+          const snapshot = state.authoritativeSnapshotHandler
+            ? await state.authoritativeSnapshotHandler(state.authoritativeRoundCalls)
+            : validAuthoritativeSnapshot();
+          if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+            return { type: "response", command: type, success: true, data: snapshot };
+          }
+          this.authoritativeSnapshot = snapshot as Readonly<Record<string, unknown>>;
+          return { type: "response", command: type, success: true, data: this.authoritativeSnapshot.state };
+        }
+        const snapshot = this.authoritativeSnapshot;
+        const data = state.authoritativeStateAfterHandler
+          ? await state.authoritativeStateAfterHandler(state.authoritativeRoundCalls, snapshot)
+          : snapshot.state;
+        this.authoritativeSnapshot = undefined;
+        return { type: "response", command: type, success: true, data };
+      }
+      if (type === "get_messages") {
+        return {
+          type: "response",
+          command: type,
+          success: true,
+          data: { messages: this.authoritativeSnapshot?.messages },
+        };
+      }
+      if (type === "get_session_context") {
+        return {
+          type: "response",
+          command: type,
+          success: true,
+          data: { context: this.authoritativeSnapshot?.sessionContext },
+        };
+      }
       return { type: "response", command: type, success: true };
     }
 
@@ -280,16 +362,17 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     ): Promise<PrimeDaemonAgentConnectionPublic> {
       state.attachCalls.push({ activeSessionId, options });
       state.chronology.push("attach");
+      const attachmentOrdinal = state.attachCalls.length;
       if (state.recoverDuringAttach) {
         await (options.recoverDaemon as () => Promise<void>)();
       }
-      await state.attachHandler?.();
+      await state.attachHandler?.(attachmentOrdinal);
       let ownedSession = options.ownedSession === true;
       return {
         getInitialSnapshot: async () => {
           state.chronology.push("snapshot");
           return state.snapshotHandler
-            ? state.snapshotHandler()
+            ? state.snapshotHandler(attachmentOrdinal)
             : validSnapshot();
         },
         waitForIdle: async () => {
@@ -333,8 +416,12 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             }
           : undefined,
         subscribe: (listener: (event: unknown) => void | Promise<void>) => {
+          state.subscribeCalls += 1;
           state.eventListeners.add(listener);
-          return () => state.eventListeners.delete(listener);
+          return () => {
+            state.unsubscribeCalls += 1;
+            state.eventListeners.delete(listener);
+          };
         },
         dispose: async () => {
           state.disposeCalls += 1;
@@ -384,6 +471,14 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       state.projectionCalls.push({ binding: projectionBinding, projection });
       state.chronology.push("projection:publish");
       await state.publishProjectionHandler?.(projectionBinding, projection);
+    },
+    publishModelSelectionProjection: async (command, projectionBinding, projection) => {
+      state.projectionCalls.push({ binding: projectionBinding, projection });
+      state.modelProjectionCalls.push({ command, binding: projectionBinding, projection });
+      state.chronology.push("projection:model-selection:publish");
+      if (state.publishModelSelectionProjectionHandler) {
+        await state.publishModelSelectionProjectionHandler(command, projectionBinding, projection);
+      }
     },
     authorizeResidentKillInvocation: state.authorizeResidentKillInvocation,
     spawnFactory: (executable, argv, options) => {
@@ -2697,8 +2792,167 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
 
     expect(state.availableModelsCalls).toBe(1);
     expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
-    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(4);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
     expect(state.projectionCalls).toHaveLength(2);
+    expect(state.modelProjectionCalls).toHaveLength(1);
+    expect(state.modelProjectionCalls[0]).toMatchObject({
+      command,
+      binding: connection.binding,
+      projection: {
+        selectedModel: { providerId: "openai", modelId: "gpt-5" },
+        runtime: { model: "openai/gpt-5" },
+      },
+    });
+    expect(state.chronology.filter((entry) => entry === "projection:model-selection:publish")).toHaveLength(1);
+    expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("uses only the exact model-attempt publisher and fails uncertain when it rejects", async () => {
+    const command = modelSelectionCommand("select-through-dedicated-publication");
+    const { adapter, state } = createHarness({
+      publishModelSelectionProjectionHandler: async () => {
+        throw new Error("same-cursor Store authority rejected");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+      retryable: false,
+    });
+
+    expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
+    expect(state.modelProjectionCalls).toHaveLength(1);
+    expect(state.modelProjectionCalls[0]).toMatchObject({ command, binding: connection.binding });
+    expect(state.chronology.filter((entry) => entry === "projection:publish")).toHaveLength(1);
+    expect(state.chronology.filter((entry) => entry === "projection:model-selection:publish")).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("reconciles independently when the primary connection's projection remains stale", async () => {
+    let mutationCommitted = false;
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({
+        state: {
+          model: { provider: "openai", id: "gpt-4" },
+        },
+      }),
+      authoritativeSnapshotHandler: () => validAuthoritativeSnapshot({
+        state: {
+          model: mutationCommitted
+            ? { provider: "openai", id: "gpt-5" }
+            : { provider: "openai", id: "gpt-4" },
+          leafId: mutationCommitted ? "model-change-target" : "model-change-baseline",
+        },
+        sessionContext: {
+          messages: [],
+          thinkingLevel: "medium",
+          serviceTier: "standard",
+          model: mutationCommitted
+            ? { provider: "openai", modelId: "gpt-5" }
+            : { provider: "openai", modelId: "gpt-4" },
+        },
+      }),
+      setModelHandler: () => {
+        mutationCommitted = true;
+        return { provider: "untrusted-response", id: "must-not-prove-completion" };
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const closesBeforeSelection = state.closes;
+    expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-4");
+
+    await expect(adapter.submit(modelSelectionCommand("select-after-stale-cache"), {
+      residentBinding: connection.binding,
+    })).resolves.toEqual({
+      disposition: "handled",
+      message: "Prime Agent selected and verified the requested model",
+    });
+
+    expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
+    expect(state.attachCalls).toHaveLength(2);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
+    expect(
+      state.requests
+        .map((request) => (request as { type?: string }).type)
+        .filter((type) => type?.startsWith("get_")),
+    ).toEqual([
+      "get_connection_state",
+      "get_messages",
+      "get_session_context",
+      "get_connection_state",
+      "get_connection_state",
+      "get_messages",
+      "get_session_context",
+      "get_connection_state",
+    ]);
+    expect(
+      state.requests
+        .filter((request) => (request as { type?: string }).type?.startsWith("get_"))
+        .every((request) => (request as { activeSessionId?: string }).activeSessionId === "active-1"),
+    ).toBe(true);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.closes - closesBeforeSelection).toBe(2);
+    expect(state.subscribeCalls).toBe(2);
+    expect(state.unsubscribeCalls).toBe(1);
+    expect(state.eventListeners.size).toBe(1);
+    expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("waits for the accepted model mutation to become authoritative without dispatching twice", async () => {
+    let mutationStarted = false;
+    let readsAfterMutation = 0;
+    const waits: number[] = [];
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({
+        state: { model: { provider: "openai", id: "gpt-4" } },
+      }),
+      authoritativeSnapshotHandler: () => {
+        if (mutationStarted) readsAfterMutation += 1;
+        const selected = mutationStarted && readsAfterMutation >= 3;
+        return validAuthoritativeSnapshot({
+          state: {
+            model: selected
+              ? { provider: "openai", id: "gpt-5" }
+              : { provider: "openai", id: "gpt-4" },
+            leafId: selected ? "model-change-target" : "model-change-baseline",
+          },
+          sessionContext: {
+            messages: [],
+            thinkingLevel: "medium",
+            serviceTier: "standard",
+            model: selected
+              ? { provider: "openai", modelId: "gpt-5" }
+              : { provider: "openai", modelId: "gpt-4" },
+          },
+        });
+      },
+      setModelHandler: (providerId, modelId) => {
+        mutationStarted = true;
+        return { provider: providerId, id: modelId };
+      },
+      waitHandler: (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand(), {
+      residentBinding: connection.binding,
+    })).resolves.toMatchObject({
+      disposition: "handled",
+      message: "Prime Agent selected and verified the requested model",
+    });
+
+    expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
+    expect(readsAfterMutation).toBe(4);
+    expect(waits).toEqual([50, 50, 50]);
     expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
     await connection.detach();
     await adapter.close();
@@ -2749,7 +3003,242 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
       retryable: false,
     });
     expect(state.setModelCalls).toHaveLength(1);
-    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(82);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rejects an attachment whose cursor sequence fields disagree", async () => {
+    const { adapter, state } = createHarness({
+      snapshotHandler: (attachmentOrdinal) => attachmentOrdinal === 1
+        ? validSnapshot()
+        : {
+            ...validSnapshot(),
+            lastEventSequence: 5,
+            lastEventCursor: { generation: "events-1", sequence: 4 },
+          },
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand("select-with-inconsistent-cursor"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.authoritativeRoundCalls).toBe(0);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("does not accept a target-other-target state race behind an unchanged attachment cursor", async () => {
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({
+        state: { model: { provider: "openai", id: "gpt-4" } },
+      }),
+      authoritativeSnapshotHandler: () => validAuthoritativeSnapshot({
+        state: {
+          model: { provider: "openai", id: "gpt-5" },
+          leafId: "model-change-target",
+        },
+      }),
+      authoritativeStateAfterHandler: (roundOrdinal, snapshot) => {
+        if (roundOrdinal % 2 === 0) return snapshot.state;
+        return {
+          ...(snapshot.state as Readonly<Record<string, unknown>>),
+          model: { provider: "openai", id: "gpt-4" },
+          leafId: `model-change-other-${roundOrdinal}`,
+        };
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand("select-through-state-race"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.authoritativeRoundCalls).toBe(40);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("requires raw state messageCount to match the exact raw message list", async () => {
+    const { adapter, state } = createHarness({
+      authoritativeSnapshotHandler: () => validAuthoritativeSnapshot({
+        messages: [],
+        state: { messageCount: 1 },
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand("select-through-message-race"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.authoritativeRoundCalls).toBe(40);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("requires two equal whole proof rounds when session context changes", async () => {
+    const { adapter, state } = createHarness({
+      authoritativeSnapshotHandler: (roundOrdinal) => validAuthoritativeSnapshot({
+        state: { leafId: "model-change-target" },
+        sessionContext: {
+          messages: [],
+          thinkingLevel: "medium",
+          serviceTier: "standard",
+          model: { provider: "openai", modelId: "gpt-5" },
+          proofMarker: roundOrdinal % 2,
+        },
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(modelSelectionCommand("select-through-context-race"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.authoritativeRoundCalls).toBe(40);
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("fails outward and releases the adapter queue when attachment read and disposal hang", async () => {
+    const neverSnapshot = new Promise<unknown>(() => undefined);
+    const neverDispose = new Promise<void>(() => undefined);
+    let disposeInvocations = 0;
+    const { adapter, state } = createHarness({
+      snapshotHandler: (attachmentOrdinal) => attachmentOrdinal === 2
+        ? neverSnapshot
+        : validSnapshot(),
+      disposeHandler: () => {
+        disposeInvocations += 1;
+        return disposeInvocations === 1 ? neverDispose : Promise.resolve();
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const startedAt = performance.now();
+
+    await expect(adapter.submit(modelSelectionCommand("select-before-hanging-read"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    await vi.waitFor(() => expect(state.disposeCalls).toBe(1), { timeout: 250 });
+
+    await expect(adapter.readStableResidentProjection(connection.binding)).resolves.toMatchObject({
+      runtime: { model: "openai/gpt-5" },
+    });
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.authoritativeRoundCalls).toBe(0);
+    expect(state.disposeCalls).toBe(2);
+    expect(
+      state.requests.some((request) =>
+        (request as { type?: string }).type?.startsWith("get_")),
+    ).toBe(false);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(5);
+    await connection.detach();
+    await adapter.close();
+  }, 2_000);
+
+  it("releases the adapter queue when the exact model-only attachment never settles", async () => {
+    const neverAttach = new Promise<void>(() => undefined);
+    const { adapter, state } = createHarness({
+      attachHandler: (attachmentOrdinal) => attachmentOrdinal === 2
+        ? neverAttach
+        : Promise.resolve(),
+    });
+    const connection = await adapter.createResident(createInput());
+    const startedAt = performance.now();
+
+    await expect(adapter.submit(modelSelectionCommand("select-before-hanging-attach"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+
+    await expect(adapter.readStableResidentProjection(connection.binding)).resolves.toMatchObject({
+      runtime: { model: "openai/gpt-5" },
+    });
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(state.attachCalls).toHaveLength(3);
+    expect(state.authoritativeRoundCalls).toBe(0);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(4);
+    await connection.detach();
+    await adapter.close();
+  }, 2_000);
+
+  it("fails uncertain after a bounded wait when the requested model never becomes authoritative", async () => {
+    const waits: number[] = [];
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({
+        state: { model: { provider: "openai", id: "gpt-4" } },
+      }),
+      authoritativeSnapshotHandler: () => validAuthoritativeSnapshot({
+        state: {
+          model: { provider: "openai", id: "gpt-4" },
+          leafId: "model-change-baseline",
+        },
+        sessionContext: {
+          messages: [],
+          thinkingLevel: "medium",
+          serviceTier: "standard",
+          model: { provider: "openai", modelId: "gpt-4" },
+        },
+      }),
+      waitHandler: (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const closesBeforeSelection = state.closes;
+
+    await expect(adapter.submit(modelSelectionCommand("select-model-never-visible"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      retryable: false,
+      uncertain: true,
+    });
+
+    expect(state.setModelCalls).toHaveLength(1);
+    expect(waits).toHaveLength(39);
+    expect(waits.every((milliseconds) => milliseconds === 50)).toBe(true);
+    expect(state.attachCalls).toHaveLength(2);
+    expect(state.disposeCalls).toBe(1);
+    expect(state.closes - closesBeforeSelection).toBe(2);
+    expect(state.subscribeCalls).toBe(2);
+    expect(state.unsubscribeCalls).toBe(1);
+    expect(state.eventListeners.size).toBe(1);
     expect(state.projectionCalls).toHaveLength(1);
     await connection.detach();
     await adapter.close();
@@ -2831,7 +3320,7 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
     await adapter.close();
   });
 
-  it("rechecks the exact binding when a queued selection reaches the mutation boundary", async () => {
+  it("refuses publication and rechecks queued work when the exact binding changes", async () => {
     let releaseFirst: (() => void) | undefined;
     const firstMutation = new Promise<void>((resolvePromise) => {
       releaseFirst = resolvePromise;
@@ -2843,13 +3332,17 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
       },
     });
     const connection = await adapter.createResident(createInput());
-    const first = adapter.submit(modelSelectionCommand("select-before-binding-refresh"), {
-      residentBinding: connection.binding,
-    });
+    const first = adapter
+      .submit(modelSelectionCommand("select-before-binding-refresh"), {
+        residentBinding: connection.binding,
+      })
+      .catch((error: unknown) => error);
     while (state.setModelCalls.length === 0) await Promise.resolve();
-    const second = adapter.submit(modelSelectionCommand("select-after-binding-refresh"), {
-      residentBinding: connection.binding,
-    });
+    const second = adapter
+      .submit(modelSelectionCommand("select-after-binding-refresh"), {
+        residentBinding: connection.binding,
+      })
+      .catch((error: unknown) => error);
 
     await emit({ type: "connection_status", status: "reconnecting" });
     state.hello = validHello({ supervisorGeneration: "supervisor-model-refresh" });
@@ -2857,8 +3350,11 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
     await emit({ type: "connection_status", status: "connected" });
     releaseFirst?.();
 
-    await expect(first).resolves.toMatchObject({ disposition: "handled" });
-    await expect(second).rejects.toMatchObject({
+    await expect(first).resolves.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
+    await expect(second).resolves.toMatchObject({
       code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
       uncertain: false,
     });
@@ -2867,7 +3363,7 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
     await adapter.close();
   });
 
-  it("lets a terminal action drain one in-flight mutation but cancels queued mutations before setModel", async () => {
+  it("refuses post-proof publication and cancels queued mutations after a terminal action", async () => {
     let releaseFirst: (() => void) | undefined;
     const firstMutation = new Promise<void>((resolvePromise) => {
       releaseFirst = resolvePromise;
@@ -2879,9 +3375,11 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
       },
     });
     const connection = await adapter.createResident(createInput());
-    const first = adapter.submit(modelSelectionCommand("select-before-detach"), {
-      residentBinding: connection.binding,
-    });
+    const first = adapter
+      .submit(modelSelectionCommand("select-before-detach"), {
+        residentBinding: connection.binding,
+      })
+      .catch((error: unknown) => error);
     while (state.setModelCalls.length === 0) await Promise.resolve();
     const second = adapter
       .submit(modelSelectionCommand("select-queued-before-detach"), { residentBinding: connection.binding })
@@ -2889,7 +3387,10 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
     const detached = connection.detach();
     releaseFirst?.();
 
-    await expect(first).resolves.toMatchObject({ disposition: "handled" });
+    await expect(first).resolves.toMatchObject({
+      code: "MODEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+    });
     await expect(second).resolves.toMatchObject({
       code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
       uncertain: false,

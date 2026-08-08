@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PrimeAgentGateway } from "../../src/hostd/gateway";
+import type { PrimeAgentGateway, PrimeAgentProjectionChange } from "../../src/hostd/gateway";
 import type {
   PrimeAgentPublicModuleLoader,
   PrimeAgentResidentAdapterOptions,
@@ -269,6 +269,51 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     await fixture.gateway.close();
   });
 
+  it("routes a proven model projection through the exact command-scoped Store boundary", async () => {
+    const durableBinding = binding("thread-a", "execution-a", "active-a");
+    const command = modelCommand("thread-a", "execution-a");
+    const fixture = await gatewayFixture([durableBinding]);
+    const changes: PrimeAgentProjectionChange[] = [];
+    const unsubscribe = fixture.gateway.subscribeProjectionChanges((change) => changes.push(change));
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    vi.mocked(fixture.store.publishResidentProjectionSnapshot).mockClear();
+
+    const projection = { runtime: { model: "openai/gpt-5" } } as unknown as ResidentProjectionSnapshot;
+    await fixture.adapterOptions.publishModelSelectionProjection(command, durableBinding, projection);
+
+    expect(fixture.store.publishResidentModelSelectionProjection).toHaveBeenCalledOnce();
+    expect(fixture.store.publishResidentModelSelectionProjection).toHaveBeenCalledWith(
+      command,
+      durableBinding,
+      projection,
+    );
+    expect(fixture.store.publishResidentProjectionSnapshot).not.toHaveBeenCalled();
+    expect(changes).toContainEqual({ threadId: "thread-a", executionGenerationId: "execution-a" });
+    unsubscribe();
+    await fixture.gateway.close();
+  });
+
+  it("proves only the exact prepared binding without retiring a healthy replacement", async () => {
+    const current = binding("thread-a", "execution-a", "active-current");
+    const stale = {
+      ...current,
+      activeSessionId: "active-stale",
+      sessionId: "session-stale",
+    };
+    const fixture = await gatewayFixture([current]);
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+
+    await expect(fixture.gateway.isResidentBindingLive(stale)).resolves.toBe(false);
+    await expect(fixture.gateway.isResidentBindingLive(current)).resolves.toBe(true);
+    expect(fixture.adapter.attachResident).toHaveBeenCalledOnce();
+    expect(fixture.adapter.isLive).toHaveBeenCalledOnce();
+
+    await fixture.gateway.close();
+  });
+
   it("detaches a returned connection when post-attach readiness setup throws", async () => {
     const durableBinding = binding("thread-a", "execution-a", "active-a");
     const detach = vi.fn(async () => undefined);
@@ -378,8 +423,14 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
     await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
     await fixture.adapterOptions.publishProjection(durableBinding, {} as never);
+    await expect(fixture.adapterOptions.publishModelSelectionProjection(
+      modelCommand("thread-a", "execution-a"),
+      durableBinding,
+      {} as never,
+    )).rejects.toMatchObject({ code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED" });
 
     expect(fixture.store.publishResidentProjectionSnapshot).not.toHaveBeenCalled();
+    expect(fixture.store.publishResidentModelSelectionProjection).not.toHaveBeenCalled();
     await expect(fixture.gateway.isLive("thread-a", "execution-a")).resolves.toBe(false);
 
     await fixture.gateway.close();
@@ -465,6 +516,7 @@ async function gatewayFixture(
       projectedBindings.push(candidate);
       return undefined;
     }),
+    publishResidentModelSelectionProjection: vi.fn(async () => undefined),
     listResidentPromptReconciliationLeases: vi.fn(async () => []),
     listResidentAbortReconciliationLeases: vi.fn(async () => []),
     completeResidentPromptReconciliation: vi.fn(async () => {

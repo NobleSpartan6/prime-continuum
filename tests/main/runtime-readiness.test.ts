@@ -120,6 +120,65 @@ describe('DesktopControlService runtime readiness', () => {
     await service.disconnect()
   })
 
+  it('sends one exact local runtime repair fence and immediately retires the capability', async () => {
+    const failed = repairRuntimeSnapshot()
+    const initializing = { ...runtimeSnapshot('initializing'), changedAt: '2026-08-07T12:00:01.000Z', attempt: 2 }
+    const expectedInput = {
+      expectedHostId: 'host-a',
+      expectedTrustAnchorId: failed.trustAnchorId,
+      expectedTarget: failed.target,
+      expectedChangedAt: failed.changedAt,
+    }
+    const connection = new TestConnection((method, _requestIndex, options, params) => {
+      if (method === 'health.get') {
+        return health({ runtime: failed, capabilities: ['runtime_integrity_repair_v1'] })
+      }
+      if (method === 'runtime.integrity.repair') {
+        expect(params).toEqual(expectedInput)
+        expect(options).toEqual({ timeoutMs: 10_000, priority: 'urgent' })
+        return initializing
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest()
+    await service.connect({ kind: 'local' })
+
+    await expect(service.repairRuntimeIntegrity(expectedInput)).resolves.toEqual(initializing)
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.repair')).toHaveLength(1)
+    expect(service.getConnectionState()).toMatchObject({
+      phase: 'online',
+      runtimeReadiness: { kind: 'reported', snapshot: { status: 'initializing', attempt: 2 } },
+    })
+    expect(service.getConnectionState().capabilities).not.toContain('runtime_integrity_repair_v1')
+    await expect(service.repairRuntimeIntegrity(expectedInput)).rejects.toMatchObject({
+      code: 'runtime.integrity_repair_unavailable',
+    })
+    await service.disconnect()
+  })
+
+  it('rejects a stale repair trust fence before sending the host mutation', async () => {
+    const failed = repairRuntimeSnapshot()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return health({ runtime: failed, capabilities: ['runtime_integrity_repair_v1'] })
+      }
+      throw new Error(`Runtime repair must not be sent: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest()
+    await service.connect({ kind: 'local' })
+
+    await expect(service.repairRuntimeIntegrity({
+      expectedHostId: 'host-a',
+      expectedTrustAnchorId: 'f'.repeat(64),
+      expectedTarget: failed.target,
+      expectedChangedAt: failed.changedAt,
+    })).rejects.toMatchObject({ code: 'runtime.integrity_repair_state_changed' })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.integrity.repair')).toHaveLength(0)
+    await service.disconnect()
+  })
+
   it('refuses a retry capability received over an SSH target without sending the mutation', async () => {
     const connection = new TestConnection((method) => {
       if (method === 'health.get') {
@@ -549,6 +608,16 @@ function runtimeSnapshot(
     return { ...base, status, code: 'RUNTIME_INTEGRITY_FAILED', retryable: true, recoveryAction: 'retry_runtime_initialization' }
   }
   return { ...base, status, code: 'RUNTIME_INTEGRITY_UNAVAILABLE', retryable: false, recoveryAction: 'reinstall_application' }
+}
+
+function repairRuntimeSnapshot(): Extract<RuntimeIntegritySnapshot, { status: 'failed' }> {
+  const failed = runtimeSnapshot('failed') as Extract<RuntimeIntegritySnapshot, { status: 'failed' }>
+  return {
+    ...failed,
+    code: 'RUNTIME_REPAIR_REQUIRED',
+    retryable: false,
+    recoveryAction: 'repair_application',
+  }
 }
 
 function followUp(

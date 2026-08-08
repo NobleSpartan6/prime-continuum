@@ -2,6 +2,7 @@ import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway } from "../../src/hostd/gateway";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
@@ -27,6 +28,65 @@ afterEach(async () => {
 });
 
 describe("HostService resident end causal recovery", () => {
+  it("retains a terminal ended control projection across restart", async () => {
+    const fixture = await serviceFixture();
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: fixture.store,
+      adapter: async () => ({
+        createOwnedCandidate: undefined as never,
+        readStableResidentProjection: undefined as never,
+        endResidentSession: async (lease: ResidentKillLease) => {
+          await fixture.store.authorizeResidentKillInvocation(lease);
+          return {
+            acknowledgementVersion: 1 as const,
+            operation: "end" as const,
+            activeSessionId: lease.binding.activeSessionId,
+            sessionId: lease.binding.sessionId,
+          };
+        },
+      }),
+    });
+    const service = new HostService(fixture.store, lifecycleGateway(coordinator, fixture.binding));
+    const before = await service.handle(controlProtocolRequest(fixture, "resident-control-before-end"), TRUSTED_USER_SESSION);
+    expect(before).toMatchObject({
+      ok: true,
+      result: { controlSequence: 0, quiescence: { state: "idle_proven" } },
+    });
+
+    await expect(service.handle(endProtocolRequest(fixture), TRUSTED_USER_SESSION)).resolves.toMatchObject({
+      ok: true,
+      method: "resident.end",
+      result: { kind: "end", phase: "completed" },
+    });
+    const ended = await service.handle(controlProtocolRequest(fixture, "resident-control-after-end"), TRUSTED_USER_SESSION);
+    expect(ended).toMatchObject({
+      ok: true,
+      method: "thread.control.snapshot",
+      result: {
+        controlSequence: 1,
+        quiescence: { state: "ended", endedAt: expect.any(String) },
+      },
+    });
+    if (!ended.ok || ended.method !== "thread.control.snapshot") {
+      throw new Error("terminal resident control projection was unavailable");
+    }
+    expect(ended.result.operation).toBeUndefined();
+    await service.close();
+
+    const restartedStore = new HostStore(fixture.dataDirectory);
+    const restartedService = new HostService(restartedStore);
+    await restartedService.initialize();
+    const afterRestart = await restartedService.handle(
+      controlProtocolRequest(fixture, "resident-control-ended-after-restart"),
+      TRUSTED_USER_SESSION,
+    );
+    expect(afterRestart).toEqual({
+      ...ended,
+      requestId: "resident-control-ended-after-restart",
+    });
+    await restartedService.close();
+  });
+
   it("rejects end consent after a second client advances Prompt or Stop state and requires a fresh cursor", async () => {
     const fixture = await serviceFixture();
     const reviewedRequest = fixture.endRequest;
@@ -48,7 +108,7 @@ describe("HostService resident end causal recovery", () => {
         endResidentSession,
       }),
     });
-    const service = new HostService(fixture.store, lifecycleGateway(coordinator));
+    const service = new HostService(fixture.store, lifecycleGateway(coordinator, fixture.binding));
 
     await expect(service.handle(endProtocolRequest(fixture), TRUSTED_USER_SESSION)).resolves.toMatchObject({
       ok: false,
@@ -104,7 +164,7 @@ describe("HostService resident end causal recovery", () => {
       adapter: async () => adapter,
     });
     const submit = vi.fn(async () => ({ disposition: "accepted" as const }));
-    const gateway = lifecycleGateway(coordinator, submit);
+    const gateway = lifecycleGateway(coordinator, fixture.binding, submit);
     const service = new HostService(fixture.store, gateway);
 
     // The first framed session's response is intentionally left unread while
@@ -177,7 +237,7 @@ describe("HostService resident end causal recovery", () => {
       store: fixture.store,
       adapter: async () => adapter,
     });
-    const service = new HostService(fixture.store, lifecycleGateway(coordinator));
+    const service = new HostService(fixture.store, lifecycleGateway(coordinator, fixture.binding));
     const lostResponse = service.handle(endProtocolRequest(fixture), TRUSTED_USER_SESSION);
     await dispatchMarked.promise;
     expect(await fixture.store.getResidentLifecycleStatus(fixture.endRequest.operationId)).toMatchObject({
@@ -210,7 +270,7 @@ describe("HostService resident end causal recovery", () => {
         endResidentSession: retryAdapter,
       }),
     });
-    const retryService = new HostService(restarted, lifecycleGateway(retryCoordinator));
+    const retryService = new HostService(restarted, lifecycleGateway(retryCoordinator, fixture.binding));
     await expect(retryService.handle({
       ...endProtocolRequest(fixture),
       requestId: "resident-end-retry-after-restart",
@@ -270,6 +330,11 @@ async function serviceFixture(): Promise<ServiceFixture> {
     },
   };
   await store.persistResidentSessionBinding(binding);
+  const initialSnapshot = await store.getThreadSnapshot(binding.threadId);
+  await store.publishResidentProjectionSnapshot(
+    binding,
+    advancedResidentProjection(binding, initialSnapshot.latestCursor),
+  );
   const sourceSnapshot = await store.getThreadSnapshot(binding.threadId);
   const endRequest: ResidentEndRequest = {
     operationId: "resident-end-service-operation",
@@ -325,6 +390,7 @@ function advancedResidentProjection(
 
 function lifecycleGateway(
   coordinator: ResidentLifecycleCoordinator,
+  expectedBinding: ResidentSessionBinding,
   submit = vi.fn(async () => ({ disposition: "accepted" as const })),
 ): PrimeAgentGateway {
   return {
@@ -333,6 +399,7 @@ function lifecycleGateway(
     provisionResident: async () => { throw new Error("provision is outside this fixture"); },
     endResident: (request: ResidentEndRequest) => coordinator.end(request),
     isLive: async () => true,
+    isResidentBindingLive: async (binding) => isDeepStrictEqual(binding, expectedBinding),
     submit,
     close: () => coordinator.close(),
   } as PrimeAgentGateway;
@@ -355,6 +422,19 @@ function statusProtocolRequest(fixture: ServiceFixture): HostIpcRequest {
     payload: {
       expectedHostId: fixture.endRequest.expectedHostId,
       operationId: fixture.endRequest.operationId,
+    },
+  };
+}
+
+function controlProtocolRequest(fixture: ServiceFixture, requestId: string): HostIpcRequest {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    requestId,
+    method: "thread.control.snapshot",
+    payload: {
+      expectedHostId: fixture.endRequest.expectedHostId,
+      threadId: fixture.endRequest.threadId,
+      expectedExecutionGenerationId: fixture.endRequest.executionGenerationId,
     },
   };
 }

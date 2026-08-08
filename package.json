@@ -30,6 +30,8 @@
     "verify:hostd-runtime:smoke": "node scripts/verify-hostd-runtime-initialization.mjs",
     "verify:hostd-resident-lifecycle:smoke": "node scripts/verify-hostd-resident-lifecycle.mjs",
     "verify:renderer-visual": "node scripts/run-workflow.mjs verify:renderer-visual",
+    "self-build": "node scripts/self-build.mjs",
+    "verify:self-build-receipt": "node scripts/self-build.mjs --verify-receipt",
     "preview": "node scripts/run-workflow.mjs preview",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "test": "vitest run",

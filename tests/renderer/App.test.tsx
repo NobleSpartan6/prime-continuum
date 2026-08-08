@@ -16,6 +16,7 @@ import {
   type RuntimeModelCatalog,
   type WorkbenchSnapshot,
 } from '../../src/renderer/src/api'
+import type { HudMode, HudState, HudTarget } from '../../src/shared/window-control'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -101,6 +102,91 @@ function createIdleResidentApi() {
     return snapshot
   }
   return api
+}
+
+function createHudHarness(options: {
+  taskState?: WorkbenchSnapshot['threads'][number]['status']
+  connection?: WorkbenchSnapshot['hosts'][number]['connection']
+  targetGenerationId?: string
+} = {}) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  const snapshot = structuredClone(previewSnapshot)
+  const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-seamless')
+  const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+  if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected the HUD resident fixture')
+  thread.executionGenerationId = 'generation-hud-one'
+  thread.workspaceId = 'workspace-hud-one'
+  thread.status = options.taskState ?? 'idle'
+  host.connection = options.connection ?? 'online'
+  snapshot.selectedThreadId = thread.id
+  snapshot.selectedProjectId = thread.projectId
+  snapshot.runtime.session = {
+    ...snapshot.runtime.session,
+    residency: 'resident',
+    activeSessionId: 'active-hud-one',
+    sessionId: 'session-hud-one',
+    isStreaming: thread.status === 'running',
+  }
+  snapshot.operations = {
+    ...snapshot.operations,
+    submitCommands: true,
+    startResidentTurn: thread.status === 'idle',
+    stopResidentTurn: thread.status === 'running',
+  }
+  snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+
+  const target: HudTarget = {
+    expectedHostId: host.id,
+    threadId: thread.id,
+    expectedExecutionGenerationId: options.targetGenerationId ?? thread.executionGenerationId,
+  }
+  let state: HudState = { state: 'expanded', target, ignoresMouseEvents: false }
+  const workbenchListeners = new Set<(next: WorkbenchSnapshot) => void>()
+  const hudListeners = new Set<(next: HudState) => void>()
+  api.loadWorkbench = vi.fn(async () => structuredClone(snapshot))
+  api.subscribe = vi.fn((listener) => {
+    workbenchListeners.add(listener)
+    return () => workbenchListeners.delete(listener)
+  })
+  api.hudState = vi.fn(async () => state)
+  api.hudOpen = vi.fn(async (nextTarget) => {
+    state = { state: 'expanded', target: nextTarget, ignoresMouseEvents: false }
+    return state
+  })
+  api.hudSetMode = vi.fn(async (mode: HudMode) => {
+    if (state.state === 'closed') return state
+    state = { state: mode, target: state.target, ignoresMouseEvents: false }
+    return state
+  })
+  api.hudClose = vi.fn(async () => {
+    state = { state: 'closed' }
+    return state
+  })
+  api.hudReturnToWorkbench = vi.fn(async () => undefined)
+  api.hudSetIgnoreMouseEvents = vi.fn(async (ignore) => state.state === 'closed'
+    ? state
+    : { ...state, ignoresMouseEvents: ignore })
+  api.onHudState = vi.fn((listener) => {
+    hudListeners.add(listener)
+    return () => hudListeners.delete(listener)
+  })
+  api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+  api.abortThread = vi.fn(async () => ({ state: 'sent', message: 'Stop accepted' }))
+  api.selectThread = vi.fn(async () => undefined)
+  api.retryLocalSetup = vi.fn(async () => undefined)
+  api.repairLocalRuntime = vi.fn(async () => undefined)
+  return {
+    api: api as RendererApi,
+    snapshot,
+    target,
+    publishSnapshot(next: WorkbenchSnapshot = structuredClone(snapshot)) {
+      workbenchListeners.forEach((listener) => listener(next))
+    },
+    publishHudState(next: HudState) {
+      state = next
+      hudListeners.forEach((listener) => listener(next))
+    },
+  }
 }
 
 function lifecycleOperation(
@@ -196,6 +282,7 @@ function createLocalSetupHarness(
     return () => listeners.delete(listener)
   }
   api.retryLocalSetup = vi.fn(async () => undefined)
+  api.repairLocalRuntime = vi.fn(async () => undefined)
   const publish = (setup: LocalSetupSummary) => {
     snapshot = {
       ...snapshot,
@@ -334,6 +421,201 @@ afterEach(() => {
 })
 
 describe('Prime Continuim renderer', () => {
+  it('renders the exact resident thread in the desktop HUD and uses the authoritative composer path', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness()
+    render(<App api={harness.api} surface="hud" />)
+
+    const heading = await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(heading).toBeVisible()
+    expect(document.title).toBe('Prime Continuim HUD — Seamless remote experience')
+    expect(screen.getByLabelText('Thread transcript')).toBeVisible()
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Repair runtime' })).not.toBeInTheDocument()
+
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    await waitFor(() => expect(composer).toHaveFocus())
+    await user.type(composer, 'Build the HUD from this resident thread')
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    expect(harness.api.sendComposer).toHaveBeenCalledWith({
+      threadId: harness.target.threadId,
+      text: 'Build the HUD from this resident thread',
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
+    const buddy = await screen.findByRole('button', { name: /Working: Seamless remote experience\. Open conversation/ })
+    await waitFor(() => expect(buddy).toHaveFocus())
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    await user.click(buddy)
+    expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
+    await user.keyboard('{Escape}')
+    expect(await screen.findByRole('button', { name: /Open conversation/ })).toBeVisible()
+  })
+
+  it('never falls back to another thread when the HUD generation fence does not match', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness({ targetGenerationId: 'generation-that-is-not-current' })
+    render(<App api={harness.api} surface="hud" />)
+
+    expect(await screen.findByRole('heading', { name: 'Desktop HUD unavailable' })).toBeVisible()
+    expect(screen.getByText(/host, thread, and execution generation are not present/i)).toBeVisible()
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(harness.api.selectThread).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Return to workbench' }))
+    expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
+    expect(harness.api.retryLocalSetup).not.toHaveBeenCalled()
+    expect(harness.api.repairLocalRuntime).not.toHaveBeenCalled()
+  })
+
+  it('clears a draft when the native HUD is retargeted and preserves it across modes for one target', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness()
+    render(<App api={harness.api} surface="hud" />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const firstComposer = screen.getByRole('textbox', { name: 'Message' })
+    await user.type(firstComposer, 'This draft belongs only to the first thread')
+
+    const nextSnapshot = structuredClone(harness.snapshot)
+    const sourceThread = nextSnapshot.threads.find((thread) => thread.id === harness.target.threadId)!
+    const nextThread = {
+      ...structuredClone(sourceThread),
+      id: 'thread-hud-two',
+      remoteId: 'thread-hud-two',
+      title: 'Second HUD resident thread',
+      executionGenerationId: 'generation-hud-two',
+      transcript: [],
+    }
+    nextSnapshot.threads.push(nextThread)
+    nextSnapshot.selectedThreadId = nextThread.id
+    nextSnapshot.selectedProjectId = nextThread.projectId
+    const nextTarget: HudTarget = {
+      expectedHostId: nextThread.hostId,
+      threadId: nextThread.remoteId,
+      expectedExecutionGenerationId: nextThread.executionGenerationId,
+    }
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: nextTarget, ignoresMouseEvents: false })
+      harness.publishSnapshot(nextSnapshot)
+    })
+
+    expect(await screen.findByRole('heading', { name: 'Second HUD resident thread' })).toBeVisible()
+    const secondComposer = screen.getByRole('textbox', { name: 'Message' })
+    await waitFor(() => expect(secondComposer).toHaveValue(''))
+    expect(secondComposer).not.toHaveValue('This draft belongs only to the first thread')
+
+    await user.type(secondComposer, 'Keep this draft while changing HUD modes')
+    await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
+    await user.click(await screen.findByRole('button', { name: /Open conversation/ }))
+    expect(await screen.findByRole('textbox', { name: 'Message' })).toHaveValue('Keep this draft while changing HUD modes')
+
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    expect(harness.api.sendComposer).toHaveBeenLastCalledWith({
+      threadId: nextThread.id,
+      text: 'Keep this draft while changing HUD modes',
+    })
+  })
+
+  it('uses the resident Stop authority and explicit close path from the expanded HUD', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness({ taskState: 'running' })
+    render(<App api={harness.api} surface="hud" />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Stop the active Prime Agent turn' }))
+    expect(harness.api.abortThread).toHaveBeenCalledOnce()
+    expect(harness.api.abortThread).toHaveBeenCalledWith(harness.target.threadId)
+
+    await user.click(screen.getByRole('button', { name: 'Close desktop HUD' }))
+    expect(harness.api.hudClose).toHaveBeenCalledOnce()
+  })
+
+  it('clears the draft before paint when the same HUD thread advances to a new execution generation', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness()
+    render(<App api={harness.api} surface="hud" />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Draft from the retired execution')
+
+    const nextSnapshot = structuredClone(harness.snapshot)
+    const thread = nextSnapshot.threads.find((candidate) => candidate.id === harness.target.threadId)!
+    thread.executionGenerationId = 'generation-hud-two'
+    const nextTarget: HudTarget = {
+      ...harness.target,
+      expectedExecutionGenerationId: thread.executionGenerationId,
+    }
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: nextTarget, ignoresMouseEvents: false })
+      harness.publishSnapshot(nextSnapshot)
+    })
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    expect(composer).toHaveValue('')
+    expect(composer).not.toHaveValue('Draft from the retired execution')
+  })
+
+  it('keeps passive HUD and transcript updates from stealing focus', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness()
+    render(<App api={harness.api} surface="hud" />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const returnButton = screen.getByRole('button', { name: 'Workbench' })
+    await user.click(returnButton)
+    expect(returnButton).toHaveFocus()
+
+    act(() => {
+      harness.publishHudState({
+        state: 'expanded',
+        target: harness.target,
+        ignoresMouseEvents: true,
+      })
+      const next = structuredClone(harness.snapshot)
+      next.threads[0]!.transcript = [
+        ...next.threads[0]!.transcript,
+        {
+          id: 'hud-passive-update',
+          kind: 'assistant',
+          author: 'Prime Agent',
+          time: 'Now',
+          body: 'Passive HUD update.',
+        },
+      ]
+      harness.publishSnapshot(next)
+    })
+
+    await screen.findByText('Passive HUD update.')
+    expect(returnButton).toHaveFocus()
+  })
+
+  it('opens the HUD from the workbench only with an exact materialized resident target', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness()
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Show desktop HUD' }))
+    expect(harness.api.hudOpen).toHaveBeenCalledWith(harness.target)
+
+    cleanup()
+    render(<App api={asNativeFixture(createPreviewRendererApi())} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(screen.queryByRole('button', { name: 'Show desktop HUD' })).not.toBeInTheDocument()
+  })
+
+  it('shows approval as Needs you and routes review to the workbench without a fake approval control', async () => {
+    const user = userEvent.setup()
+    const harness = createHudHarness({ taskState: 'needs_approval' })
+    render(<App api={harness.api} surface="hud" />)
+
+    expect(await screen.findByText('Needs you')).toBeVisible()
+    expect(screen.getByText(/approval needs review in the full workbench/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Review in workbench' }))
+    expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
+  })
+
   it('requires explicit confirmation for permanent resident ending and checks an ambiguous result without replay', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
@@ -711,6 +993,67 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => expect(alert).toHaveFocus())
     expect(screen.queryByRole('button', { name: /retry|repair|reinstall/i })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Use another computer' })).toBeVisible()
+  })
+
+  it('offers one primary scoped runtime repair and keeps diagnostic copy secondary', async () => {
+    const user = userEvent.setup()
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'failed',
+        retryable: false,
+        recovery: 'repair',
+      },
+      issue: {
+        area: 'runtime',
+        action: 'repair_runtime',
+        message: 'Prime Continuim can quarantine the failed local runtime copy and restore it from this app’s verified bundle. Saved projects, threads, and workspace files will remain unchanged.',
+        retryable: false,
+        code: 'RUNTIME_REPAIR_REQUIRED',
+      },
+    })
+    const admission = deferred<void>()
+    harness.api.repairLocalRuntime = vi.fn(() => admission.promise)
+    render(<App api={harness.api} />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Runtime repair required')
+    expect(alert).toHaveTextContent('Saved projects, threads, and workspace files will remain unchanged')
+    const repair = screen.getByRole('button', { name: 'Repair runtime' })
+    const copy = screen.getByRole('button', { name: 'Copy setup diagnostic' })
+    expect(repair).toHaveClass('button--primary')
+    expect(copy).toHaveClass('button--secondary')
+
+    await user.click(repair)
+    expect(harness.api.repairLocalRuntime).toHaveBeenCalledOnce()
+    expect(harness.api.retryLocalSetup).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Repairing runtime…' })).toBeDisabled()
+    admission.resolve()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Repair runtime' })).toBeEnabled())
+  })
+
+  it('says a scoped repair could not start when admission fails', async () => {
+    const user = userEvent.setup()
+    const harness = createLocalSetupHarness({
+      stage: 'needs_attention',
+      issue: {
+        area: 'runtime',
+        action: 'repair_runtime',
+        message: 'The local runtime copy can be repaired from the verified app bundle.',
+        retryable: false,
+        code: 'RUNTIME_REPAIR_REQUIRED',
+      },
+    })
+    harness.api.repairLocalRuntime = vi.fn(async () => {
+      throw new Error('admission rejected')
+    })
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime' }))
+    expect(await screen.findByText(/Runtime repair could not start/)).toBeVisible()
+    expect(screen.queryByText(/could not finish/)).not.toBeInTheDocument()
   })
 
   it('copies a bounded path-free diagnostic from an initial nonretryable setup state with the keyboard', async () => {

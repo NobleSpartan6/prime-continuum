@@ -18,13 +18,18 @@ import {
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
 const UNSIGNED_WINDOWS_ENV = createWindowsPackagingEnvironment(process.env)
 
-const releaseBuildSteps = [
-  pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
-  nodeStep('Generate the runtime attestation', 'scripts/generate-runtime-attestation.mjs', ['--output', 'out/main/runtime-attestation.json']),
-  nodeStep('Build the attested host service', 'scripts/build-hostd.mjs', ['--attestation', 'out/main/runtime-attestation.json']),
-]
+function createWorkflows(releaseOptions = {}) {
+  const releaseBuildSteps = [
+    pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
+    nodeStep('Generate the runtime attestation', 'scripts/generate-runtime-attestation.mjs', [
+      '--output', 'out/main/runtime-attestation.json',
+      ...(releaseOptions.runtimeRoot ? ['--runtime-root', releaseOptions.runtimeRoot] : []),
+      ...(releaseOptions.electron ? ['--electron', releaseOptions.electron] : []),
+    ]),
+    nodeStep('Build the attested host service', 'scripts/build-hostd.mjs', ['--attestation', 'out/main/runtime-attestation.json']),
+  ]
 
-const workflows = {
+  return {
   dev: createDevelopmentWorkflowPlan(PROJECT_ROOT).map(materializePlannedStep),
   preview: createPreviewWorkflowPlan().map(materializePlannedStep),
   build: [
@@ -61,14 +66,17 @@ const workflows = {
     nodeStep('Verify the Windows application package', 'scripts/verify-windows-package.mjs'),
     nodeStep('Verify and checksum the Windows installer', 'scripts/verify-windows-installer.mjs'),
   ],
+  }
 }
 
 async function main() {
   const args = process.argv.slice(2)
-  if (args.length !== 1 || !Object.hasOwn(workflows, args[0])) {
+  const workflow = args[0]
+  const releaseOptions = parseReleaseOptions(workflow, args.slice(1))
+  const workflows = createWorkflows(releaseOptions)
+  if (!workflow || !Object.hasOwn(workflows, workflow)) {
     throw new Error(`Usage: node scripts/run-workflow.mjs <${Object.keys(workflows).join('|')}>`)
   }
-  const workflow = args[0]
   assertPinnedDevelopmentNodeRuntime({ projectRoot: PROJECT_ROOT })
   const lock = await acquireWorkflowLock({ workflow, projectRoot: PROJECT_ROOT })
   try {
@@ -100,6 +108,26 @@ async function main() {
       await lock.release()
     }
   }
+}
+
+function parseReleaseOptions(workflow, args) {
+  if (args.length === 0) return {}
+  if (workflow !== 'build:release') {
+    throw new Error(`Workflow ${workflow ?? '(missing)'} does not accept additional arguments.`)
+  }
+  const result = {}
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index]
+    const value = args[index + 1]
+    if ((name !== '--runtime-root' && name !== '--electron') || !value || /[\0\r\n]/.test(value)) {
+      throw new Error('build:release accepts only --runtime-root <path> and --electron <path>.')
+    }
+    if (Object.hasOwn(result, name === '--runtime-root' ? 'runtimeRoot' : 'electron')) {
+      throw new Error(`Duplicate build:release option: ${name}.`)
+    }
+    result[name === '--runtime-root' ? 'runtimeRoot' : 'electron'] = resolve(PROJECT_ROOT, value)
+  }
+  return result
 }
 
 function nodeStep(label, script, args = []) {

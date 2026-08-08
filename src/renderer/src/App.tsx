@@ -24,8 +24,10 @@ import {
   ListChecks,
   Loader2,
   LockKeyhole,
+  Maximize2,
   Menu,
   MessageSquare,
+  Minimize2,
   Monitor,
   Network,
   PanelLeftClose,
@@ -63,6 +65,8 @@ import {
   type ThreadSummary,
   type WorkbenchSnapshot,
 } from './api'
+import type { HudMode, HudState, HudTarget } from '../../shared/window-control'
+import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
 import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
@@ -170,7 +174,9 @@ function localSetupDiagnosticText(setup: LocalSetupSummary): string {
     `Stage: ${stage}`,
     `Area: ${area}`,
     `Code: ${code}`,
-    'Next step: Share this diagnostic with Prime Continuim support.',
+    setup.issue?.action === 'repair_runtime'
+      ? 'Next step: Use Repair runtime. If repair remains unavailable, share this diagnostic with Prime Continuim support.'
+      : 'Next step: Share this diagnostic with Prime Continuim support.',
   ].join('\n')
 }
 
@@ -197,6 +203,12 @@ function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'
 
 function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): string {
   return `${hostId}\u0000${thread.id}\u0000${thread.executionGenerationId ?? ''}`
+}
+
+function threadMatchesHudTarget(thread: ThreadSummary, target: HudTarget): boolean {
+  return thread.hostId === target.expectedHostId &&
+    (thread.id === target.threadId || thread.remoteId === target.threadId) &&
+    thread.executionGenerationId === target.expectedExecutionGenerationId
 }
 
 function actionableResidentLifecycleOperations(
@@ -435,6 +447,91 @@ function taskIcon(status: TaskState): LucideIcon {
   return icons[status]
 }
 
+type HudStatusTone = 'ready' | 'working' | 'needs-you' | 'offline' | 'done' | 'failed'
+
+interface HudStatusPresentation {
+  label: 'Ready' | 'Working' | 'Needs you' | 'Offline' | 'Done' | 'Failed'
+  detail: string
+  icon: LucideIcon
+  tone: HudStatusTone
+  needsWorkbench: boolean
+}
+
+function hudStatusPresentation(
+  thread: ThreadSummary,
+  connection: ConnectionState,
+  receipt: ComposerReceiptView,
+): HudStatusPresentation {
+  if (connection !== 'online' || receipt.state === 'waiting_for_connection') {
+    return {
+      label: 'Offline',
+      detail: 'The cached transcript is available. Return to the workbench to restore local authority.',
+      icon: WifiOff,
+      tone: 'offline',
+      needsWorkbench: true,
+    }
+  }
+  if (receipt.state === 'uncertain') {
+    return {
+      label: 'Needs you',
+      detail: 'The last control outcome is uncertain. Review authoritative state in the workbench.',
+      icon: AlertCircle,
+      tone: 'needs-you',
+      needsWorkbench: true,
+    }
+  }
+  if (receipt.state === 'rejected' || thread.status === 'failed') {
+    return {
+      label: 'Failed',
+      detail: receipt.message || 'Prime Agent reported a failure. Review the thread in the workbench.',
+      icon: AlertCircle,
+      tone: 'failed',
+      needsWorkbench: true,
+    }
+  }
+  if (thread.status === 'needs_approval' || thread.status === 'waiting') {
+    return {
+      label: 'Needs you',
+      detail: thread.status === 'needs_approval'
+        ? 'An approval needs review in the full workbench.'
+        : 'Prime Agent is waiting for input. Open the workbench for the full review surface.',
+      icon: thread.status === 'needs_approval' ? ShieldCheck : Clock3,
+      tone: 'needs-you',
+      needsWorkbench: true,
+    }
+  }
+  if (
+    thread.status === 'running' ||
+    receipt.state === 'sending' ||
+    receipt.state === 'sent' ||
+    receipt.state === 'queued'
+  ) {
+    return {
+      label: 'Working',
+      detail: 'Prime Agent is working in this resident thread.',
+      icon: Activity,
+      tone: 'working',
+      needsWorkbench: false,
+    }
+  }
+  if (thread.status === 'complete') {
+    return {
+      label: 'Done',
+      detail: 'Prime Agent completed the latest task.',
+      icon: CheckCircle2,
+      tone: 'done',
+      needsWorkbench: false,
+    }
+  }
+  return {
+    label: 'Ready',
+    detail: 'Prime Agent is ready for another prompt.',
+    icon: Circle,
+    tone: 'ready',
+    needsWorkbench: false,
+  }
+}
+
 function connectionCopy(connection: ConnectionState, host: HostSummary): string {
   if (connection === 'reconnecting') {
     return `Reconnecting… Last synchronized ${host.lastSynchronized ?? 'recently'}`
@@ -576,17 +673,68 @@ function useResponsiveDrawerFocus({
   }, [mediaQuery, onClose, open, panelRef, triggerRef])
 }
 
-interface AppProps {
-  api?: RendererApi
+function HudBoundarySurface({
+  loading = false,
+  detail,
+  onReturnToWorkbench,
+  onClose,
+}: {
+  loading?: boolean
+  detail: string
+  onReturnToWorkbench: () => void
+  onClose: () => void
+}) {
+  return (
+    <main
+      className={cx('hud-shell', 'hud-shell--boundary', loading && 'hud-shell--loading')}
+      data-hud-click-through="transparent"
+      aria-labelledby="hud-boundary-heading"
+    >
+      <section className="hud-boundary" data-hud-interactive="true">
+        <span className="hud-boundary__mark"><BrandMark /></span>
+        <div className="hud-boundary__copy">
+          <h1 id="hud-boundary-heading">{loading ? 'Opening desktop HUD…' : 'Desktop HUD unavailable'}</h1>
+          <p>{detail}</p>
+        </div>
+        <div className="hud-boundary__actions">
+          <button
+            className="button button--secondary"
+            type="button"
+            aria-label="Return to workbench"
+            onClick={onReturnToWorkbench}
+          >
+            <Icon icon={ArrowRight} size={14} /> <span>Return to workbench</span>
+          </button>
+          <button className="icon-button" type="button" aria-label="Close desktop HUD" title="Close desktop HUD" onClick={onClose}>
+            <Icon icon={X} size={16} />
+          </button>
+        </div>
+      </section>
+    </main>
+  )
 }
 
-export default function App({ api: suppliedApi }: AppProps) {
-  const api = useMemo(() => suppliedApi ?? createRendererApi(), [suppliedApi])
+export type AppSurface = 'workbench' | 'hud'
+
+export interface AppProps {
+  api?: RendererApi
+  surface?: AppSurface
+  initialThreadId?: string
+}
+
+export default function App({ api: suppliedApi, surface = 'workbench', initialThreadId = '' }: AppProps) {
+  const api = useMemo(
+    () => suppliedApi ?? createRendererApi({ allowConnectionInitiation: surface !== 'hud' }),
+    [suppliedApi, surface],
+  )
   const [snapshot, setSnapshot] = useState<WorkbenchSnapshot | null>(null)
   const [loadError, setLoadError] = useState('')
+  const [hudState, setHudState] = useState<HudState | null>(surface === 'hud' ? null : { state: 'closed' })
+  const [hudBoundaryError, setHudBoundaryError] = useState('')
+  const [hudActionError, setHudActionError] = useState('')
   const [threadSelectionError, setThreadSelectionError] = useState('')
   const [selectedProjectId, setSelectedProjectId] = useState('')
-  const [selectedThreadId, setSelectedThreadId] = useState('')
+  const [selectedThreadId, setSelectedThreadId] = useState(initialThreadId)
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Changes')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
@@ -648,6 +796,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   }, [inspectorIsOverlay, sidebarIsOverlay])
 
   useEffect(() => {
+    if (surface === 'hud') return
     const openPalette = (event: globalThis.KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -658,7 +807,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
     window.addEventListener('keydown', openPalette)
     return () => window.removeEventListener('keydown', openPalette)
-  }, [openCommandPalette])
+  }, [openCommandPalette, surface])
 
   useResponsiveDrawerFocus({
     open: sidebarOpen,
@@ -680,6 +829,50 @@ export default function App({ api: suppliedApi }: AppProps) {
   const composerAuthorityGenerationRef = useRef(0)
   const composerActionSequenceRef = useRef(0)
   const latestComposerActionsRef = useRef(new Map<string, ComposerLocalAction>())
+  const hudSelectionRequestRef = useRef('')
+  const previousHudTargetKeyRef = useRef('')
+  const hudFocusKeyRef = useRef('')
+
+  useEffect(() => {
+    if (surface !== 'hud') return
+    let cancelled = false
+    setHudBoundaryError('')
+    const applyHudState = (nextState: HudState) => {
+      if (!cancelled) setHudState(nextState)
+    }
+    void api.hudState()
+      .then(applyHudState)
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setHudBoundaryError(error instanceof Error
+            ? error.message
+            : 'The desktop HUD could not verify its native window state.')
+        }
+      })
+    const unsubscribe = api.onHudState(applyHudState)
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }, [api, surface])
+
+  useEffect(() => {
+    if (surface !== 'hud') return
+    const previousTitle = document.title
+    document.title = 'Prime Continuim HUD'
+    return () => {
+      document.title = previousTitle
+    }
+  }, [surface])
+
+  useEffect(() => {
+    if (surface !== 'hud') return
+    return installHudClickThrough({
+      document,
+      window,
+      setIgnoreMouseEvents: (ignore) => api.hudSetIgnoreMouseEvents(ignore),
+    })
+  }, [api, surface])
 
   useEffect(() => {
     let cancelled = false
@@ -811,6 +1004,54 @@ export default function App({ api: suppliedApi }: AppProps) {
     !selectedResidentEnd &&
     selectedThread.residentLifecycle?.state !== 'ended',
   )
+  const activeHudTarget = hudState && hudState.state !== 'closed' ? hudState.target : undefined
+  const activeHudTargetKey = activeHudTarget
+    ? [
+        activeHudTarget.expectedHostId,
+        activeHudTarget.threadId,
+        activeHudTarget.expectedExecutionGenerationId,
+      ].join('\u0000')
+    : ''
+  const exactHudThread = activeHudTarget
+    ? snapshot?.threads.find((thread) => threadMatchesHudTarget(thread, activeHudTarget))
+    : undefined
+  const initialHudTargetMismatch = Boolean(
+    surface === 'hud' &&
+    initialThreadId &&
+    exactHudThread &&
+    exactHudThread.id !== initialThreadId &&
+    exactHudThread.remoteId !== initialThreadId,
+  )
+
+  useEffect(() => {
+    if (surface !== 'hud') return
+    document.title = exactHudThread?.title
+      ? `Prime Continuim HUD — ${exactHudThread.title}`
+      : 'Prime Continuim HUD'
+  }, [exactHudThread?.title, surface])
+  const canOpenHud = Boolean(
+    surface === 'workbench' &&
+    api.environment === 'native' &&
+    selectedThreadIsMaterialized &&
+    selectedHost &&
+    selectedThread?.executionGenerationId &&
+    selectedThread.residentLifecycle?.state !== 'ended' &&
+    selectedRuntime.session?.residency === 'resident' &&
+    selectedRuntime.session.activeSessionId &&
+    selectedRuntime.session.sessionId,
+  )
+
+  useLayoutEffect(() => {
+    if (surface !== 'hud' || !activeHudTargetKey) return
+    const previousTargetKey = previousHudTargetKeyRef.current
+    previousHudTargetKeyRef.current = activeHudTargetKey
+    if (!previousTargetKey || previousTargetKey === activeHudTargetKey) return
+    composerAuthorityGenerationRef.current += 1
+    latestComposerActionsRef.current.clear()
+    setComposerText('')
+    setComposerValidationError('')
+    setComposerReceipt({ state: 'idle', message: '' })
+  }, [activeHudTargetKey, surface])
 
   useEffect(() => {
     if (
@@ -874,6 +1115,106 @@ export default function App({ api: suppliedApi }: AppProps) {
       window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#thread-heading')?.focus())
     })
   }, [residentThreadFocusTarget, snapshot])
+
+  useEffect(() => {
+    if (
+      surface !== 'hud' ||
+      !snapshot ||
+      !activeHudTarget ||
+      !exactHudThread ||
+      initialHudTargetMismatch
+    ) return
+    const selectionKey = [
+      activeHudTarget.expectedHostId,
+      exactHudThread.id,
+      activeHudTarget.expectedExecutionGenerationId,
+    ].join('\u0000')
+    if (selectedThreadId !== exactHudThread.id) {
+      composerAuthorityGenerationRef.current += 1
+      setSelectedThreadId(exactHudThread.id)
+      setSelectedProjectId(exactHudThread.projectId)
+    }
+    if (snapshot.selectedThreadId === exactHudThread.id || hudSelectionRequestRef.current === selectionKey) return
+    hudSelectionRequestRef.current = selectionKey
+    setThreadSelectionError('')
+    void api.selectThread(exactHudThread.id).catch((error: unknown) => {
+      setThreadSelectionError(error instanceof Error
+        ? error.message
+        : 'The desktop HUD could not materialize its pinned resident thread.')
+    })
+  }, [
+    activeHudTarget,
+    api,
+    exactHudThread,
+    initialHudTargetMismatch,
+    selectedThreadId,
+    snapshot,
+    surface,
+  ])
+
+  useEffect(() => {
+    if (surface !== 'hud' || hudState?.state !== 'expanded') return
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.key !== 'Escape') return
+      if (document.querySelector('dialog[open], [role="dialog"], [role="menu"], [role="listbox"]')) return
+      event.preventDefault()
+      setHudActionError('')
+      void api.hudSetMode('buddy')
+        .then(setHudState)
+        .catch((error: unknown) => {
+          setHudActionError(error instanceof Error ? error.message : 'The desktop HUD could not collapse.')
+        })
+    }
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [api, hudState?.state, surface])
+
+  useEffect(() => {
+    if (
+      surface !== 'hud' ||
+      !hudState ||
+      hudState.state === 'closed' ||
+      !exactHudThread ||
+      snapshot?.selectedThreadId !== exactHudThread.id
+    ) return
+    const focusKey = [
+      hudState.state,
+      activeHudTarget?.expectedHostId ?? '',
+      activeHudTarget?.threadId ?? '',
+      activeHudTarget?.expectedExecutionGenerationId ?? '',
+      snapshot.selectedThreadId,
+    ].join('\u0000')
+    if (hudFocusKeyRef.current === focusKey) return
+    let innerFrame: number | undefined
+    const frame = window.requestAnimationFrame(() => {
+      innerFrame = window.requestAnimationFrame(() => {
+        hudFocusKeyRef.current = focusKey
+        if (hudState.state === 'buddy') {
+          document.querySelector<HTMLButtonElement>('#hud-buddy-open')?.focus()
+          return
+        }
+        const composer = document.querySelector<HTMLTextAreaElement>('#thread-composer')
+        if (composer && !composer.disabled) composer.focus()
+        else if (document.querySelector<HTMLButtonElement>('#resident-turn-primary:not(:disabled)')) {
+          document.querySelector<HTMLButtonElement>('#resident-turn-primary:not(:disabled)')?.focus()
+        } else {
+          document.querySelector<HTMLElement>('#hud-thread-heading')?.focus()
+        }
+      })
+    })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      if (innerFrame !== undefined) window.cancelAnimationFrame(innerFrame)
+    }
+  }, [
+    activeHudTarget?.expectedExecutionGenerationId,
+    activeHudTarget?.expectedHostId,
+    activeHudTarget?.threadId,
+    exactHudThread?.id,
+    hudState?.state,
+    snapshot?.selectedThreadId,
+    surface,
+  ])
   activeHostIdRef.current = selectedHost?.id
   activeThreadIdRef.current = selectedThread?.id
 
@@ -1073,6 +1414,50 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
   }
 
+  const setNativeHudMode = async (mode: HudMode) => {
+    setHudActionError('')
+    try {
+      setHudState(await api.hudSetMode(mode))
+    } catch (error) {
+      setHudActionError(error instanceof Error
+        ? error.message
+        : mode === 'expanded' ? 'The desktop HUD could not open.' : 'The desktop HUD could not collapse.')
+    }
+  }
+
+  const closeNativeHud = async () => {
+    setHudActionError('')
+    try {
+      setHudState(await api.hudClose())
+    } catch (error) {
+      setHudActionError(error instanceof Error ? error.message : 'The desktop HUD could not close.')
+    }
+  }
+
+  const returnToWorkbench = async () => {
+    setHudActionError('')
+    try {
+      await api.hudReturnToWorkbench()
+    } catch (error) {
+      setHudActionError(error instanceof Error ? error.message : 'Prime Continuim could not focus the workbench.')
+    }
+  }
+
+  const showDesktopHud = async () => {
+    if (!canOpenHud || !selectedHost || !selectedThread?.executionGenerationId) return
+    const target: HudTarget = {
+      expectedHostId: selectedHost.id,
+      threadId: selectedThread.id,
+      expectedExecutionGenerationId: selectedThread.executionGenerationId,
+    }
+    setHudActionError('')
+    try {
+      await api.hudOpen(target)
+    } catch (error) {
+      setHudActionError(error instanceof Error ? error.message : 'The desktop HUD could not open.')
+    }
+  }
+
   const chooseResidentWorkspace = async (
     trigger: HTMLElement,
     resumeOperationId?: string,
@@ -1101,14 +1486,18 @@ export default function App({ api: suppliedApi }: AppProps) {
 
   const retryLocalSetup = async () => {
     const retryingRuntime = snapshot?.localSetup?.issue?.action === 'retry_runtime'
+    const repairingRuntime = snapshot?.localSetup?.issue?.action === 'repair_runtime'
     setLocalSetupRetryError('')
     setLocalSetupRetrying(true)
     try {
-      await api.retryLocalSetup()
+      if (repairingRuntime) await api.repairLocalRuntime()
+      else await api.retryLocalSetup()
     } catch {
-      setLocalSetupRetryError(retryingRuntime
-        ? 'Runtime verification could not be retried. Review the current setup status and try again if the action remains available.'
-        : 'Prime Continuim could not retry the local connection. Review the current setup status and try again if it remains available.')
+      setLocalSetupRetryError(repairingRuntime
+        ? 'Runtime repair could not start. No saved project or workspace data was changed. Review the current setup status before trying again.'
+        : retryingRuntime
+          ? 'Runtime verification could not be retried. Review the current setup status and try again if the action remains available.'
+          : 'Prime Continuim could not retry the local connection. Review the current setup status and try again if it remains available.')
     } finally {
       setLocalSetupRetrying(false)
     }
@@ -1120,7 +1509,9 @@ export default function App({ api: suppliedApi }: AppProps) {
       setup?.stage !== 'needs_attention' ||
       !setup.issue ||
       setup.issue.retryable ||
-      (setup.issue.action !== 'review_diagnostics' && setup.issue.action !== 'manual_recovery')
+      (setup.issue.action !== 'review_diagnostics' &&
+        setup.issue.action !== 'manual_recovery' &&
+        setup.issue.action !== 'repair_runtime')
     ) return
 
     const diagnostic = localSetupDiagnosticText(setup)
@@ -1280,6 +1671,167 @@ export default function App({ api: suppliedApi }: AppProps) {
     })
   }
 
+  if (surface === 'hud') {
+    const showBoundary = (detail: string, loading = false) => (
+      <HudBoundarySurface
+        detail={detail}
+        loading={loading}
+        onReturnToWorkbench={() => void returnToWorkbench()}
+        onClose={() => void closeNativeHud()}
+      />
+    )
+    if (hudBoundaryError) return showBoundary(hudBoundaryError)
+    if (loadError) return showBoundary(loadError)
+    if (!hudState || !snapshot) {
+      return showBoundary('Verifying the pinned resident thread without changing local runtime data.', true)
+    }
+    if (hudState.state === 'closed') {
+      return showBoundary('This HUD session is closed. Return to the workbench to open it for a verified resident thread.')
+    }
+    if (initialHudTargetMismatch) {
+      return showBoundary('The native HUD target changed before this renderer could verify it. No other thread was opened.')
+    }
+    if (!exactHudThread) {
+      return showBoundary('The pinned host, thread, and execution generation are not present in the current authoritative snapshot.')
+    }
+    if (threadSelectionError) return showBoundary(threadSelectionError)
+    if (snapshot.selectedThreadId !== exactHudThread.id || selectedThread?.id !== exactHudThread.id) {
+      return showBoundary(`Opening ${exactHudThread.title} without falling back to another cached thread.`, true)
+    }
+    if (
+      !selectedProject ||
+      !selectedHost ||
+      !selectedThreadIsMaterialized ||
+      selectedRuntime.session?.residency !== 'resident' ||
+      !selectedRuntime.session.activeSessionId ||
+      !selectedRuntime.session.sessionId
+    ) {
+      return showBoundary('The pinned thread is not currently materialized as an attached resident Prime Agent session.')
+    }
+
+    const status = hudStatusPresentation(selectedThread, selectedHost.connection, composerReceipt)
+    if (hudState.state === 'buddy') {
+      return (
+        <main
+          className="hud-shell hud-shell--buddy"
+          data-hud-click-through="transparent"
+          aria-label="Prime Agent desktop buddy"
+        >
+          <section className="hud-buddy" data-hud-interactive="true">
+            <div className="hud-buddy__drag">
+              <BrandMark />
+              <span className={cx('hud-status', `hud-status--${status.tone}`)} role="status" aria-live="polite">
+                <Icon icon={status.icon} size={14} />
+                <span>
+                  <strong>{status.label}</strong>
+                  <small title={selectedThread.title}>{selectedThread.title}</small>
+                </span>
+              </span>
+            </div>
+            <button
+              id="hud-buddy-open"
+              className="hud-buddy__open"
+              type="button"
+              aria-label={`${status.label}: ${selectedThread.title}. Open conversation`}
+              title="Open conversation"
+              onClick={() => void setNativeHudMode('expanded')}
+            >
+              <Icon icon={Maximize2} size={15} />
+            </button>
+          </section>
+          {hudActionError && <p className="sr-only" role="alert">{hudActionError}</p>}
+        </main>
+      )
+    }
+
+    return (
+      <main
+        className="hud-shell hud-shell--expanded"
+        data-hud-click-through="transparent"
+        aria-labelledby="hud-thread-heading"
+      >
+        <section className="hud-expanded" data-hud-interactive="true">
+          <header className="hud-expanded__header">
+            <div className="hud-expanded__identity">
+              <BrandMark />
+              <div>
+                <h1 id="hud-thread-heading" tabIndex={-1}>{selectedThread.title}</h1>
+                <span className={cx('hud-status', `hud-status--${status.tone}`)} role="status" aria-live="polite">
+                  <Icon icon={status.icon} size={13} />
+                  <span>{status.label}</span>
+                </span>
+              </div>
+            </div>
+            <div className="hud-expanded__controls">
+              <button
+                className="button button--quiet hud-expanded__return"
+                type="button"
+                title="Return to workbench"
+                onClick={() => void returnToWorkbench()}
+              >
+                <Icon icon={ArrowRight} size={14} /> <span>Workbench</span>
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Keep as desktop buddy"
+                title="Keep as desktop buddy"
+                onClick={() => void setNativeHudMode('buddy')}
+              >
+                <Icon icon={Minimize2} size={15} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Close desktop HUD"
+                title="Close desktop HUD"
+                onClick={() => void closeNativeHud()}
+              >
+                <Icon icon={X} size={16} />
+              </button>
+            </div>
+          </header>
+          <div className="hud-expanded__thread">
+            {hudActionError && (
+              <div className="hud-notice hud-notice--error" role="alert">
+                <Icon icon={AlertCircle} size={14} /> <span>{hudActionError}</span>
+              </div>
+            )}
+            {status.needsWorkbench && !hudActionError && (
+              <div className={cx('hud-notice', `hud-notice--${status.tone}`)}>
+                <Icon icon={status.icon} size={14} />
+                <span>{status.detail}</span>
+                <button className="button button--quiet" type="button" onClick={() => void returnToWorkbench()}>
+                  Review in workbench
+                </button>
+              </div>
+            )}
+            <Transcript thread={selectedThread} />
+            <Composer
+              connection={selectedHost.connection}
+              hostName={selectedHost.name}
+              taskState={selectedThread.status}
+              runtime={selectedRuntime}
+              text={composerText}
+              onTextChange={(nextText) => {
+                setComposerText(nextText)
+                if (composerValidationError) setComposerValidationError('')
+              }}
+              validationError={composerValidationError}
+              receipt={composerReceipt}
+              canStartTurn={canStartResidentTurn}
+              canStopTurn={canStopResidentTurn}
+              modelCatalogAvailable={false}
+              onOpenModelCatalog={() => undefined}
+              onSubmit={submitComposer}
+              onStop={() => void stopResidentTurn()}
+            />
+          </div>
+        </section>
+      </main>
+    )
+  }
+
   if (loadError) {
     return (
       <div className="load-state" role="alert">
@@ -1323,6 +1875,8 @@ export default function App({ api: suppliedApi }: AppProps) {
     const recoveryFirst = Boolean(residentRecoveryReference || lifecycleOperations.length > 0)
     const setupIssueLabel = localSetup?.issue?.action === 'manual_recovery'
       ? 'Manual runtime recovery required'
+      : localSetup?.issue?.action === 'repair_runtime'
+        ? 'Runtime repair required'
       : localSetup?.issue?.action === 'retry_runtime'
         ? 'Runtime verification stopped'
       : localSetup?.issue?.area === 'runtime'
@@ -1331,7 +1885,9 @@ export default function App({ api: suppliedApi }: AppProps) {
     const canCopyLocalSetupDiagnostic = localSetup?.stage === 'needs_attention' &&
       Boolean(localSetup.issue) &&
       localSetup.issue?.retryable === false &&
-      (localSetup.issue?.action === 'review_diagnostics' || localSetup.issue?.action === 'manual_recovery')
+      (localSetup.issue?.action === 'review_diagnostics' ||
+        localSetup.issue?.action === 'manual_recovery' ||
+        localSetup.issue?.action === 'repair_runtime')
     return (
       <div className="empty-workbench">
         <header className="empty-workbench__topbar">
@@ -1438,9 +1994,25 @@ export default function App({ api: suppliedApi }: AppProps) {
                   : localSetupRetrying ? 'Retrying local service…' : 'Retry local service'}
               </button>
             )}
-            {canCopyLocalSetupDiagnostic && (
+            {localSetup?.stage === 'needs_attention' &&
+              localSetup.issue?.action === 'repair_runtime' && (
               <button
                 className="button button--primary"
+                type="button"
+                disabled={localSetupRetrying}
+                aria-busy={localSetupRetrying}
+                onClick={() => void retryLocalSetup()}
+              >
+                <Icon icon={localSetupRetrying ? Loader2 : RefreshCw} />
+                {localSetupRetrying ? 'Repairing runtime…' : 'Repair runtime'}
+              </button>
+            )}
+            {canCopyLocalSetupDiagnostic && (
+              <button
+                className={cx(
+                  'button',
+                  localSetup?.issue?.action === 'repair_runtime' ? 'button--secondary' : 'button--primary',
+                )}
                 type="button"
                 disabled={localSetupDiagnosticCopyState === 'copying'}
                 aria-busy={localSetupDiagnosticCopyState === 'copying'}
@@ -1577,6 +2149,18 @@ export default function App({ api: suppliedApi }: AppProps) {
             Task state: {visibleTaskState}
           </span>
 
+          {canOpenHud && (
+            <button
+              className="icon-button topbar__hud-control"
+              type="button"
+              aria-label="Show desktop HUD"
+              title="Show desktop HUD"
+              onClick={() => void showDesktopHud()}
+            >
+              <Icon icon={MessageSquare} size={17} />
+            </button>
+          )}
+
           <button
             ref={commandPaletteTriggerRef}
             className="command-trigger"
@@ -1707,6 +2291,14 @@ export default function App({ api: suppliedApi }: AppProps) {
               <span className="connection-notice__icon"><Icon icon={AlertCircle} size={14} /></span>
               <span>{threadSelectionError}</span>
               <span className="connection-notice__detail">The cached thread summary remains available.</span>
+            </div>
+          )}
+
+          {hudActionError && (
+            <div className="connection-notice connection-notice--offline" role="alert">
+              <span className="connection-notice__icon"><Icon icon={AlertCircle} size={14} /></span>
+              <span>Desktop HUD unavailable</span>
+              <span className="connection-notice__detail">{hudActionError}</span>
             </div>
           )}
 

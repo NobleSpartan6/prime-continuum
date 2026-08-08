@@ -11,6 +11,7 @@ export async function runSupervisedWorkflowStep({
   createLease = createWorkflowChildLease,
   awaitSupervisorExit = waitForSupervisorExit,
   teardownTimeoutMs = 10_000,
+  stepTimeoutMs,
 }) {
   const supervisor = fork(SUPERVISOR, [], {
     cwd: step.cwd,
@@ -37,6 +38,8 @@ export async function runSupervisedWorkflowStep({
   let startedChildPid
   let childPublished = false
   let releaseLease = false
+  let stepTimer
+  let timedOut = false
   const signalHandlers = new Map()
   for (const signal of ['SIGINT', 'SIGTERM']) {
     const handler = () => supervisor.send?.({ type: 'terminate', signal })
@@ -59,7 +62,17 @@ export async function runSupervisedWorkflowStep({
     startedChildPid = startedMessage.childPid
     await lease.setChildPid(startedMessage.childPid)
     childPublished = true
+    if (stepTimeoutMs !== undefined) {
+      if (!Number.isSafeInteger(stepTimeoutMs) || stepTimeoutMs <= 0) {
+        throw new TypeError('stepTimeoutMs must be a positive safe integer when provided.')
+      }
+      stepTimer = setTimeout(() => {
+        timedOut = true
+        try { supervisor.send?.({ type: 'terminate', signal: 'SIGTERM' }) } catch {}
+      }, stepTimeoutMs)
+    }
     const result = await completion
+    if (stepTimer) clearTimeout(stepTimer)
     if (result.supervisorExitedWithoutChildConfirmation) {
       throw new Error('Workflow supervisor exited without confirming child-tree completion.')
     }
@@ -70,8 +83,9 @@ export async function runSupervisedWorkflowStep({
     if (!releaseLease) {
       throw new Error('Workflow child process is still alive after supervisor exit; retaining its lease.')
     }
-    return result
+    return { ...result, timedOut }
   } catch (error) {
+    if (stepTimer) clearTimeout(stepTimer)
     if (startedChildPid && !childPublished) {
       try {
         await lease.setChildPid(startedChildPid)
@@ -85,8 +99,17 @@ export async function runSupervisedWorkflowStep({
     if (await awaitSupervisorExit(supervisor, teardownTimeoutMs)) {
       releaseLease = await lease.confirmChildTreeExited()
     }
-    throw error
+    const supervisionError = error instanceof Error ? error : new Error(String(error))
+    Object.defineProperty(supervisionError, 'collateralState', {
+      configurable: true,
+      enumerable: false,
+      value: releaseLease
+        ? 'supervisor_failed_after_teardown_attempt'
+        : 'unknown_supervised_tree_retained_lease',
+    })
+    throw supervisionError
   } finally {
+    if (stepTimer) clearTimeout(stepTimer)
     for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler)
     if (releaseLease) await lease.release()
   }

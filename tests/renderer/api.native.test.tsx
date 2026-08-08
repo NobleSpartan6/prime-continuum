@@ -370,6 +370,45 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('forwards the narrow HUD bridge without mixing window state into workbench projection', async () => {
+    const target = {
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      expectedExecutionGenerationId: 'generation-one',
+    }
+    const expanded = { state: 'expanded' as const, target, ignoresMouseEvents: false }
+    let hudListener: ((state: typeof expanded) => void) | undefined
+    const bridge = {
+      hudOpen: vi.fn(() => ok(expanded)),
+      hudState: vi.fn(() => ok(expanded)),
+      hudSetMode: vi.fn(() => ok({ ...expanded, state: 'buddy' as const })),
+      hudClose: vi.fn(() => ok({ state: 'closed' as const })),
+      hudReturnToWorkbench: vi.fn(() => ok(undefined)),
+      hudSetIgnoreMouseEvents: vi.fn(() => ok({ ...expanded, ignoresMouseEvents: true })),
+      onHudState: vi.fn((listener: (state: typeof expanded) => void) => {
+        hudListener = listener
+        return () => { hudListener = undefined }
+      }),
+    }
+    const api = new NativeRendererApi(bridge)
+    const observed = vi.fn()
+    const unsubscribe = api.onHudState(observed)
+
+    await expect(api.hudOpen(target)).resolves.toEqual(expanded)
+    await expect(api.hudState()).resolves.toEqual(expanded)
+    await expect(api.hudSetMode('buddy')).resolves.toMatchObject({ state: 'buddy', target })
+    await expect(api.hudSetIgnoreMouseEvents(true)).resolves.toMatchObject({ ignoresMouseEvents: true })
+    await expect(api.hudReturnToWorkbench()).resolves.toBeUndefined()
+    await expect(api.hudClose()).resolves.toEqual({ state: 'closed' })
+    hudListener?.(expanded)
+    expect(observed).toHaveBeenCalledWith(expanded)
+    unsubscribe()
+    expect(hudListener).toBeUndefined()
+    expect(bridge.hudOpen).toHaveBeenCalledWith(target)
+    expect(bridge.hudSetMode).toHaveBeenCalledWith('buddy')
+    expect(bridge.hudSetIgnoreMouseEvents).toHaveBeenCalledWith(true)
+  })
+
   it('consumes one exact resident end confirmation before the mutation and never retries it', async () => {
     const catalog = recoveryCatalog()
     const snapshot = recoverySnapshot(catalog.threads[0], 'Resident end admission.')
@@ -1900,6 +1939,33 @@ describe('NativeRendererApi', () => {
     expect(connect).toHaveBeenNthCalledWith(2, { kind: 'local' })
   })
 
+  it('hydrates a HUD projection without initiating a shared service connection', async () => {
+    const connect = vi.fn(() => new Promise<never>(() => undefined))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'offline',
+          target: { kind: 'local' },
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          error: { code: 'hostd.start_timeout', message: 'Timed out.', retryable: true },
+        },
+        appVersion: '0.1.0',
+      })),
+      connect,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+
+    const view = await new NativeRendererApi(bridge, { allowConnectionInitiation: false }).loadWorkbench()
+    expect(view.localSetup?.stage).toBe('needs_attention')
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(connect).not.toHaveBeenCalled()
+    expect(bridge.hostCatalog).not.toHaveBeenCalled()
+  })
+
   it('offers and sends one exact runtime retry only for the negotiated local failed authority', async () => {
     const failed = runtimeIntegritySnapshot('failed')
     const initializing = runtimeIntegritySnapshot('initializing')
@@ -1952,6 +2018,110 @@ describe('NativeRendererApi', () => {
     })
     expect(published.at(-1)?.localSetup?.issue).toBeUndefined()
     unsubscribe()
+  })
+
+  it('offers and sends one path-free runtime repair fence only for the negotiated local authority', async () => {
+    const failed = {
+      ...runtimeIntegritySnapshot('failed'),
+      code: 'RUNTIME_REPAIR_REQUIRED',
+      retryable: false,
+      recoveryAction: 'repair_application',
+    }
+    const initializing = runtimeIntegritySnapshot('initializing')
+    const repairRuntimeIntegrity = vi.fn(() => ok(initializing))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'degraded',
+          target: { kind: 'local' },
+          hostId: 'host-local',
+          path: 'local_socket',
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          capabilities: ['runtime_integrity_v1', 'runtime_integrity_repair_v1'],
+          runtimeReadiness: {
+            kind: 'reported',
+            hostId: 'host-local',
+            hostdVersion: '0.1.0',
+            startedAt: '2026-08-05T19:59:00.000Z',
+            observedAt: '2026-08-05T20:00:00.000Z',
+            snapshot: failed,
+          },
+        },
+        appVersion: '0.1.0',
+      })),
+      repairRuntimeIntegrity,
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const view = await api.loadWorkbench()
+    expect(view.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      runtimeReadiness: { status: 'failed', retryable: false, recovery: 'repair' },
+      issue: { area: 'runtime', action: 'repair_runtime', retryable: false },
+    })
+    expect(JSON.stringify(view.localSetup)).not.toMatch(/[A-Z]:\\|\/Users\//)
+
+    await expect(api.repairLocalRuntime()).resolves.toBeUndefined()
+    expect(repairRuntimeIntegrity).toHaveBeenCalledOnce()
+    expect(repairRuntimeIntegrity).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      expectedTrustAnchorId: failed.trustAnchorId,
+      expectedTarget: failed.target,
+      expectedChangedAt: failed.changedAt,
+    })
+    expect(published.at(-1)?.localSetup).toMatchObject({
+      stage: 'preparing_runtime',
+      runtimeReadiness: { status: 'initializing', phase: 'preparing' },
+    })
+    unsubscribe()
+  })
+
+  it('keeps repair manual when the host does not advertise the exact repair capability', async () => {
+    const failed = {
+      ...runtimeIntegritySnapshot('failed'),
+      code: 'RUNTIME_REPAIR_REQUIRED',
+      retryable: false,
+      recoveryAction: 'repair_application',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: {
+          phase: 'degraded',
+          target: { kind: 'local' },
+          hostId: 'host-local',
+          path: 'local_socket',
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+          capabilities: ['runtime_integrity_v1'],
+          runtimeReadiness: {
+            kind: 'reported',
+            hostId: 'host-local',
+            hostdVersion: '0.1.0',
+            startedAt: '2026-08-05T19:59:00.000Z',
+            observedAt: '2026-08-05T20:00:00.000Z',
+            snapshot: failed,
+          },
+        },
+        appVersion: '0.1.0',
+      })),
+      repairRuntimeIntegrity: vi.fn(),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+    expect(view.localSetup).toMatchObject({
+      stage: 'needs_attention',
+      issue: { action: 'manual_recovery', retryable: false },
+    })
+    await expect(api.repairLocalRuntime()).rejects.toThrow('does not allow runtime repair')
+    expect(bridge.repairRuntimeIntegrity).not.toHaveBeenCalled()
   })
 
   it('does not offer runtime retry without the exact negotiated capability', async () => {

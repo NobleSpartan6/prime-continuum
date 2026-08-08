@@ -17,6 +17,8 @@ import {
   IdSchema,
   IsoDateTimeSchema,
   PROTOCOL_VERSION,
+  ResidentControlProjectionSnapshotSchema,
+  RuntimeSessionSummarySchema,
   RunLocationSchema,
   SavedProjectSchema,
   SessionCursorSchema,
@@ -34,6 +36,9 @@ import {
   type HandoffProgress,
   type HandoffReceipt,
   type HostSummary,
+  type ResidentControlOperation,
+  type ResidentControlProjectionSnapshot,
+  type RuntimeSessionSummary,
   type SavedProject,
   type StructuredError,
   type ThreadProjectionSnapshot,
@@ -66,8 +71,10 @@ const ThreadFileSchema = z.object({ version: z.literal(1), threads: z.array(Thre
 
 export const MAX_WORKSPACE_AUTHORITIES = 10_000;
 export const MAX_RESIDENT_SESSION_BINDINGS = 10_000;
+export const MAX_RESIDENT_CONTROL_PROJECTIONS = 10_000;
 export const MAX_WORKSPACE_AUTHORITY_FILE_BYTES = 16 * 1024 * 1024;
 export const MAX_RESIDENT_SESSION_BINDING_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_RESIDENT_CONTROL_PROJECTION_BYTES = 64 * 1024;
 
 const WorkspaceDirectorySchema = z
   .string()
@@ -1231,15 +1238,38 @@ export interface ResidentAbortReconciliationLease {
   readonly settlementCursor: z.infer<typeof SessionCursorSchema>;
 }
 
+const ModelSelectionProofIdentitySchema = z
+  .object({
+    providerId: z.string().min(1).max(128),
+    modelId: z.string().min(1).max(512),
+  })
+  .strict();
+
+const MODEL_SELECTION_RUNNING_MESSAGE = "Selecting the model on the resident Prime Agent session";
+
+const ModelSelectionProjectionProofSchema = z
+  .object({
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    selectedModel: ModelSelectionProofIdentitySchema,
+    cursor: SessionCursorSchema,
+    projectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    invariantDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    runningReceiptDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    publishedAt: IsoDateTimeSchema,
+  })
+  .strict();
+type ModelSelectionProjectionProof = z.infer<typeof ModelSelectionProjectionProofSchema>;
+
 const ModelSelectionAttemptSchema = z
   .object({
     version: z.literal(1),
     command: CommandEnvelopeSchema,
     binding: ResidentSessionBindingSchema,
-    state: z.enum(["admitted", "dispatching"]),
+    state: z.enum(["admitted", "dispatching", "projection_committed"]),
     admittedAt: IsoDateTimeSchema,
     updatedAt: IsoDateTimeSchema,
     dispatchStartedAt: IsoDateTimeSchema.optional(),
+    projectionProof: ModelSelectionProjectionProofSchema.optional(),
   })
   .strict()
   .superRefine((attempt, context) => {
@@ -1252,8 +1282,22 @@ const ModelSelectionAttemptSchema = z
     ) {
       context.addIssue({ code: "custom", message: "Model selection attempt does not match its resident binding" });
     }
-    if ((attempt.state === "dispatching") !== (attempt.dispatchStartedAt !== undefined)) {
+    if ((attempt.state !== "admitted") !== (attempt.dispatchStartedAt !== undefined)) {
       context.addIssue({ code: "custom", path: ["dispatchStartedAt"], message: "Dispatch time must match attempt state" });
+    }
+    if ((attempt.state === "projection_committed") !== (attempt.projectionProof !== undefined)) {
+      context.addIssue({ code: "custom", path: ["projectionProof"], message: "Projection proof must match attempt state" });
+    }
+    if (
+      attempt.projectionProof &&
+      (attempt.projectionProof.cursor.threadId !== attempt.command.threadId ||
+        attempt.projectionProof.cursor.executionGenerationId !== attempt.command.expectedExecutionGenerationId ||
+        attempt.projectionProof.bindingFingerprint !== residentDispatchAuthorityFingerprint(attempt.binding) ||
+        attempt.command.command.kind !== "model.select" ||
+        attempt.projectionProof.selectedModel.providerId !== attempt.command.command.providerId ||
+        attempt.projectionProof.selectedModel.modelId !== attempt.command.command.modelId)
+    ) {
+      context.addIssue({ code: "custom", path: ["projectionProof", "cursor"], message: "Projection proof changed command authority" });
     }
   });
 type ModelSelectionAttempt = z.infer<typeof ModelSelectionAttemptSchema>;
@@ -1626,6 +1670,14 @@ const ResidentProjectionAuthoritySchema = z
   .strict();
 type ResidentProjectionAuthority = z.infer<typeof ResidentProjectionAuthoritySchema>;
 
+const ResidentModelSelectionProofAnchorSchema = z
+  .object({
+    deviceId: IdSchema,
+    commandId: IdSchema,
+    committedAttemptDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
 const ResidentProjectionCursorLineageSchema = z
   .object({
     authorityId: IdSchema,
@@ -1638,6 +1690,7 @@ const ResidentProjectionCursorLineageSchema = z
       })
       .strict(),
     retiredGenerations: z.array(IdSchema).max(MAX_RETIRED_RESIDENT_CURSOR_GENERATIONS),
+    modelSelectionProofAnchor: ResidentModelSelectionProofAnchorSchema.optional(),
   })
   .strict()
   .superRefine((lineage, context) => {
@@ -1743,6 +1796,14 @@ const ResidentProjectionTransactionSchema = z
     // content at one unchanged upstream cursor after waitForIdle proves the
     // previous same-cursor view stale.
     abortIdleProofAttempt: ResidentDispatchAttemptSchema.optional(),
+    // A model change can be durable upstream without advancing Prime v0.7's
+    // attachment event cursor. Only the exact non-replayable dispatch attempt
+    // may authorize that narrow semantic rewrite, and the prior runtime plus
+    // invariant digest bind recovery to the lineage it replaces.
+    modelSelectionProofAttempt: ModelSelectionAttemptSchema.optional(),
+    modelSelectionRunningReceipt: CommandReceiptSchema.optional(),
+    modelSelectionSourceSnapshot: ThreadProjectionSnapshotSchema.optional(),
+    modelSelectionInvariantDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     snapshot: ThreadProjectionSnapshotSchema,
     threadsFile: ThreadFileSchema,
   })
@@ -1769,7 +1830,7 @@ const ResidentProjectionTransactionSchema = z
     if (!residentProjectionLineageTransitionIsValid(
       transaction.previousLineage,
       nextLineage,
-      transaction.abortIdleProofAttempt !== undefined,
+      transaction.abortIdleProofAttempt !== undefined || transaction.modelSelectionProofAttempt !== undefined,
     )) {
       context.addIssue({
         code: "custom",
@@ -1777,11 +1838,76 @@ const ResidentProjectionTransactionSchema = z
       });
     }
     const abortProof = transaction.abortIdleProofAttempt;
-    if (transaction.lifecycleOperationId !== undefined && abortProof !== undefined) {
+    const modelProof = transaction.modelSelectionProofAttempt;
+    const hasModelRecoveryFence =
+      transaction.modelSelectionRunningReceipt !== undefined &&
+      transaction.modelSelectionSourceSnapshot !== undefined &&
+      transaction.modelSelectionInvariantDigest !== undefined;
+    if (
+      (modelProof !== undefined) !== hasModelRecoveryFence ||
+      (transaction.modelSelectionSourceSnapshot === undefined) !==
+        (transaction.modelSelectionInvariantDigest === undefined) ||
+      (transaction.modelSelectionRunningReceipt === undefined) !==
+        (transaction.modelSelectionInvariantDigest === undefined)
+    ) {
       context.addIssue({
         code: "custom",
-        message: "An activating projection cannot consume a Stop reconciliation proof",
+        message: "A model-selection projection must carry its complete recovery fence",
       });
+    }
+    if (
+      transaction.lifecycleOperationId !== undefined &&
+      (abortProof !== undefined || modelProof !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "An activating projection cannot consume an active-session mutation proof",
+      });
+    }
+    if (abortProof !== undefined && modelProof !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "A resident projection cannot consume Stop and model-selection proofs together",
+      });
+    }
+    if (!modelProof) {
+      if (
+        !isDeepStrictEqual(
+          nextLineage.modelSelectionProofAnchor,
+          transaction.previousLineage?.modelSelectionProofAnchor,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["nextLineage", "modelSelectionProofAnchor"],
+          message: "A non-model projection cannot change the durable model-selection proof anchor",
+        });
+      }
+    } else if (
+      transaction.modelSelectionRunningReceipt &&
+      transaction.modelSelectionInvariantDigest
+    ) {
+      const committed = createCommittedModelSelectionAttempt(
+        modelProof,
+        snapshot.latestCursor,
+        transaction.projectionDigest,
+        transaction.modelSelectionInvariantDigest,
+        transaction.modelSelectionRunningReceipt,
+        snapshot.generatedAt,
+        snapshot.generatedAt,
+      );
+      if (
+        !isDeepStrictEqual(
+          nextLineage.modelSelectionProofAnchor,
+          residentModelSelectionProofAnchorForAttempt(committed),
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["nextLineage", "modelSelectionProofAnchor"],
+          message: "A model projection did not durably anchor its exact committed attempt",
+        });
+      }
     }
     if (
       abortProof &&
@@ -1807,6 +1933,71 @@ const ResidentProjectionTransactionSchema = z
         code: "custom",
         message: "Resident abort idle projection does not match its exact acknowledged Stop proof",
       });
+    }
+    if (
+      modelProof &&
+      transaction.modelSelectionRunningReceipt &&
+      transaction.modelSelectionSourceSnapshot &&
+      transaction.modelSelectionInvariantDigest
+    ) {
+      const command = modelProof.command.command;
+      const runtime = snapshot.runtime;
+      const runningReceipt = transaction.modelSelectionRunningReceipt;
+      const sourceSnapshot = transaction.modelSelectionSourceSnapshot;
+      const sourceRuntime = sourceSnapshot.runtime;
+      const sameCursor =
+        transaction.previousLineage !== undefined &&
+        transaction.previousLineage.current.generation === nextLineage.current.generation &&
+        transaction.previousLineage.current.sequence === nextLineage.current.sequence;
+      if (
+        command.kind !== "model.select" ||
+        modelProof.state !== "dispatching" ||
+        !isDeepStrictEqual(modelProof.binding, binding) ||
+        runningReceipt.status !== "running" ||
+        runningReceipt.deviceId !== modelProof.command.deviceId ||
+        runningReceipt.commandId !== modelProof.command.commandId ||
+        runningReceipt.threadId !== modelProof.command.threadId ||
+        runningReceipt.executionGenerationId !== modelProof.command.expectedExecutionGenerationId ||
+        runningReceipt.updatedAt !== modelProof.dispatchStartedAt ||
+        runningReceipt.receivedAt !== modelProof.admittedAt ||
+        runningReceipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+        modelProof.updatedAt !== modelProof.dispatchStartedAt ||
+        runningReceipt.queuePosition !== undefined ||
+        runningReceipt.error !== undefined ||
+        !runtime ||
+        runtime.model !== residentSelectedModelIdentity(modelProof.command) ||
+        transaction.transactionId !== deterministicId(
+          "resident-model-selection-projection",
+          modelProof.command.deviceId,
+          modelProof.command.commandId,
+          nextLineage.current.generation,
+          String(nextLineage.current.sequence),
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "Resident model-selection projection does not match its exact dispatch proof",
+        });
+      }
+      const semanticFenceInvalid = !runtime || !sourceRuntime ||
+        !transaction.previousLineage ||
+        sourceSnapshot.latestCursor.generation !== transaction.previousLineage.current.generation ||
+        sourceSnapshot.latestCursor.sequence !== transaction.previousLineage.current.sequence ||
+        residentPublishedProjectionDigest(sourceSnapshot) !== transaction.previousLineage.current.digest ||
+        residentModelSelectionPublishedInvariantDigest(snapshot, runtime ?? sourceRuntime) !==
+          transaction.modelSelectionInvariantDigest ||
+        (sameCursor &&
+          (!residentModelSelectionRuntimeDeltaIsValid(sourceRuntime ?? runtime!, runtime ?? sourceRuntime!) ||
+            residentModelSelectionPublishedInvariantDigest(sourceSnapshot, sourceRuntime ?? runtime!) !==
+              transaction.modelSelectionInvariantDigest));
+      if (
+        semanticFenceInvalid
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "Model-selection projection changed or lost its exact source and semantic fence",
+        });
+      }
     }
     if (
       snapshot.thread.threadId !== binding.threadId ||
@@ -1953,6 +2144,7 @@ export type ResidentProjectionFaultPoint =
   | "after_lineage"
   | "after_snapshot"
   | "after_threads"
+  | "after_model_selection_attempt"
   | "after_prompt_locks";
 
 export type ResidentDispatchFaultPoint =
@@ -2044,6 +2236,8 @@ export interface HostStoreOptions {
   residentLifecycleOperationLimit?: number;
   /** Test-only pressure override for exact projection-lineage churn. */
   residentProjectionLineageLimit?: number;
+  /** Test-only pressure override; production retains this bounded maximum. */
+  residentControlProjectionLimit?: number;
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
 
@@ -2088,6 +2282,7 @@ export class HostStore {
   private readonly options: HostStoreOptions;
   private readonly residentLifecycleOperationLimit: number;
   private readonly residentProjectionLineageLimit: number;
+  private readonly residentControlProjectionLimit: number;
   private readonly residentPromptReconciliationLeases = new WeakSet<object>();
   private readonly residentPromptReconciliationLeaseCache = new Map<string, ResidentPromptReconciliationLease>();
   private readonly residentAbortReconciliationLeases = new WeakSet<object>();
@@ -2112,6 +2307,15 @@ export class HostStore {
       throw new TypeError("residentProjectionLineageLimit must be an integer from 1 through the production maximum");
     }
     this.residentProjectionLineageLimit = lineageLimit;
+    const controlProjectionLimit = options.residentControlProjectionLimit ?? MAX_RESIDENT_CONTROL_PROJECTIONS;
+    if (
+      !Number.isInteger(controlProjectionLimit) ||
+      controlProjectionLimit < 1 ||
+      controlProjectionLimit > MAX_RESIDENT_CONTROL_PROJECTIONS
+    ) {
+      throw new TypeError("residentControlProjectionLimit must be an integer from 1 through the production maximum");
+    }
+    this.residentControlProjectionLimit = controlProjectionLimit;
   }
 
   async initialize(): Promise<void> {
@@ -2125,6 +2329,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.transactions),
         ensurePrivateDirectory(this.paths.residentProjectionTransactions),
         ensurePrivateDirectory(this.paths.residentProjectionLineages),
+        ensurePrivateDirectory(this.paths.residentControlProjections),
         ensurePrivateDirectory(this.paths.residentDispatchAttempts),
         ensurePrivateDirectory(this.paths.residentLifecycleOperations),
         ensurePrivateDirectory(this.paths.workspaceThreadBootstrapOperations),
@@ -2188,6 +2393,7 @@ export class HostStore {
         await this.validateResidentLifecycleOperationDirectoryUnlocked();
         await this.recoverResidentLifecycleOperationsUnlocked("before_projection_recovery");
         await this.validateResidentProjectionLineageDirectoryUnlocked();
+        await this.validateResidentControlProjectionDirectoryUnlocked();
       } catch (error) {
         if (error instanceof HostStoreError && error.code.startsWith("WORKSPACE_BOOTSTRAP_")) throw error;
         if (workspaceBootstrapRecoveryPending) {
@@ -2285,6 +2491,202 @@ export class HostStore {
       });
       if (!snapshot) throw new HostStoreError("SNAPSHOT_NOT_FOUND", `Thread ${threadId} has no durable snapshot`);
       return snapshot;
+    });
+  }
+
+  /**
+   * Materialize the current host-owned resident control state for one exact
+   * thread generation. This read never acquires mutation authority and never
+   * replays an upstream command. The private sequence advances only when the
+   * Store's durable semantic facts have changed since the last successful
+   * poll.
+   */
+  async getResidentControlProjection(
+    expectedHostIdValue: string,
+    threadIdValue: string,
+    executionGenerationIdValue: string,
+    livePreparedBindingValue?: ResidentSessionBinding,
+  ): Promise<ResidentControlProjectionSnapshot> {
+    const expectedHostId = IdSchema.parse(expectedHostIdValue);
+    const threadId = IdSchema.parse(threadIdValue);
+    const executionGenerationId = IdSchema.parse(executionGenerationIdValue);
+    const livePreparedBinding = livePreparedBindingValue
+      ? validateResidentSessionBinding(livePreparedBindingValue)
+      : undefined;
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+
+      const host = await this.readHostUnlocked();
+      if (host.hostId !== expectedHostId) {
+        throw new HostStoreError(
+          "HOST_AUTHORITY_MISMATCH",
+          "The resident control projection was requested from a different host authority",
+        );
+      }
+      const thread = (await this.readThreadsUnlocked()).find((candidate) => candidate.threadId === threadId);
+      if (!thread) {
+        throw new HostStoreError("THREAD_NOT_FOUND", `Thread ${threadId} does not exist`);
+      }
+      if (thread.currentLocation.executionGenerationId !== executionGenerationId) {
+        throw new HostStoreError(
+          "STALE_EXECUTION_GENERATION",
+          "The resident control projection targets a previous execution generation",
+        );
+      }
+
+      const snapshot = await this.readSnapshotUnlocked(threadId);
+      if (
+        snapshot.thread.currentLocation.hostId !== expectedHostId ||
+        snapshot.thread.currentLocation.executionGenerationId !== executionGenerationId ||
+        snapshot.latestCursor.threadId !== threadId ||
+        snapshot.latestCursor.executionGenerationId !== executionGenerationId
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_AUTHORITY_MISMATCH",
+          "The durable thread snapshot does not match the requested resident control authority",
+        );
+      }
+
+      const [bindingRecords, promptAttempt, abortAttempt] = await Promise.all([
+        this.readResidentSessionBindingRecordsUnlocked(),
+        this.findResidentPromptLockUnlocked(threadId),
+        this.findResidentAbortLockUnlocked(threadId),
+      ]);
+      for (const attempt of [promptAttempt, abortAttempt]) {
+        if (attempt && attempt.command.expectedExecutionGenerationId !== executionGenerationId) {
+          throw new HostStoreError(
+            "RESIDENT_CONTROL_AUTHORITY_MISMATCH",
+            "A durable resident control barrier belongs to another execution generation",
+          );
+        }
+      }
+
+      const matchingRecords = bindingRecords.filter(
+        (record) =>
+          record.binding.threadId === threadId &&
+          record.binding.executionGenerationId === executionGenerationId,
+      );
+      const activeRecord = matchingRecords.find((record) => record.state === "active");
+      const transitionRecord = matchingRecords.find(
+        (record) => record.state === "activating" || record.state === "detached",
+      );
+      const ended = snapshot.residentLifecycle;
+      let bindingFingerprint: string;
+      let operation: ResidentControlOperation | undefined;
+      let quiescence: ResidentControlProjectionSnapshot["quiescence"];
+
+      if (ended) {
+        if (promptAttempt || abortAttempt || activeRecord || transitionRecord) {
+          throw new HostStoreError(
+            "RESIDENT_CONTROL_STATE_INVALID",
+            "An ended resident generation retains live control authority",
+          );
+        }
+        bindingFingerprint = ended.bindingFingerprint;
+        quiescence = { state: "ended", endedAt: ended.endedAt };
+      } else {
+        const authorityRecord = activeRecord ?? transitionRecord;
+        if (!authorityRecord) {
+          throw new HostStoreError(
+            "RESIDENT_CONTROL_PROJECTION_UNAVAILABLE",
+            "This thread generation has no durable resident control authority",
+          );
+        }
+        bindingFingerprint = residentDispatchAuthorityFingerprint(authorityRecord.binding);
+        for (const attempt of [promptAttempt, abortAttempt]) {
+          if (attempt && attempt.bindingFingerprint !== bindingFingerprint) {
+            throw new HostStoreError(
+              "RESIDENT_CONTROL_AUTHORITY_MISMATCH",
+              "A durable resident control barrier no longer matches the resident binding",
+            );
+          }
+        }
+
+        // A Stop is the current control operation while it coexists with the
+        // prompt it is attempting to quiesce. The prompt barrier remains
+        // private durable evidence; it is not erased or rebound here.
+        const currentAttempt = abortAttempt ?? promptAttempt;
+        operation = currentAttempt ? residentControlOperation(currentAttempt) : undefined;
+        const exactResidentAuthorityReady = activeRecord !== undefined &&
+          livePreparedBinding !== undefined &&
+          isDeepStrictEqual(activeRecord.binding, livePreparedBinding) &&
+          await this.hasExactResidentProjectionUnlocked(livePreparedBinding);
+        if (operation?.phase === "uncertain") {
+          quiescence = { state: "uncertain", reason: "mutation_outcome_unknown" };
+        } else if (operation?.kind === "abort") {
+          quiescence = { state: "stop_owned" };
+        } else if (operation?.kind === "prompt") {
+          quiescence = { state: "prompt_owned" };
+        } else if (!exactResidentAuthorityReady) {
+          quiescence = { state: "uncertain", reason: "lifecycle_transition" };
+        } else if (residentSnapshotReportsActivity(snapshot)) {
+          quiescence = { state: "uncertain", reason: "active_without_operation" };
+        } else {
+          quiescence = { state: "idle_proven" };
+        }
+      }
+
+      const semantic = {
+        projectionVersion: 1 as const,
+        hostId: expectedHostId,
+        threadId,
+        executionGenerationId,
+        bindingFingerprint,
+        authorityCursor: snapshot.latestCursor,
+        ...(operation ? { operation } : {}),
+        quiescence,
+      };
+      const fileName = this.residentControlProjectionName(threadId, executionGenerationId);
+      await this.assertResidentControlProjectionCapacityUnlocked(fileName);
+      const path = join(this.paths.residentControlProjections, fileName);
+      let current: ResidentControlProjectionSnapshot | undefined;
+      try {
+        current = await readJsonFile(path, ResidentControlProjectionSnapshotSchema, {
+          optional: true,
+          maxBytes: MAX_RESIDENT_CONTROL_PROJECTION_BYTES,
+        });
+      } catch (error) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "The durable resident control projection is corrupt or truncated",
+          false,
+          { cause: error },
+        );
+      }
+      if (current) {
+        if (
+          current.hostId !== expectedHostId ||
+          current.threadId !== threadId ||
+          current.executionGenerationId !== executionGenerationId
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_CONTROL_PROJECTION_INVALID",
+            "The durable resident control projection changed generation identity",
+          );
+        }
+        if (residentControlProjectionMatchesSemantic(current, semantic)) return current;
+        if (current.controlSequence === Number.MAX_SAFE_INTEGER) {
+          throw new HostStoreError(
+            "RESIDENT_CONTROL_SEQUENCE_EXHAUSTED",
+            "The resident control sequence cannot advance safely",
+          );
+        }
+      }
+
+      const changedAt = causalNow(
+        current?.changedAt,
+        operation?.changedAt,
+        snapshot.generatedAt,
+        ended?.endedAt,
+      );
+      const next = ResidentControlProjectionSnapshotSchema.parse({
+        ...semantic,
+        controlSequence: current ? current.controlSequence + 1 : 0,
+        changedAt,
+      });
+      await atomicWriteJson(path, next, MAX_RESIDENT_CONTROL_PROJECTION_BYTES);
+      return next;
     });
   }
 
@@ -2606,6 +3008,31 @@ export class HostStore {
         }
       }
       return Object.freeze(bindings.map((binding) => validateResidentSessionBinding(binding)));
+    });
+  }
+
+  /**
+   * Proves that runtime repair cannot strand or mutate resident authority.
+   * This read is serialized with every lifecycle write. A degraded resident
+   * subsystem is itself a blocker because absence cannot then be proven.
+   */
+  async assertRuntimeRepairQuiescent(): Promise<void> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const [bindings, operations] = await Promise.all([
+        this.readResidentSessionBindingsUnlocked(),
+        this.readResidentLifecycleOperationsUnlocked(),
+      ]);
+      if (
+        bindings.length > 0 ||
+        operations.some((operation) => residentLifecycleOperationIsNonterminal(operation))
+      ) {
+        throw new HostStoreError(
+          "RUNTIME_REPAIR_RESIDENT_STATE_ACTIVE",
+          "Runtime repair is blocked while a resident session or lifecycle operation remains active.",
+        );
+      }
     });
   }
 
@@ -3345,35 +3772,39 @@ export class HostStore {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const binding = validateResidentSessionBinding(bindingValue);
-      const active = (await this.readResidentSessionBindingsUnlocked()).find(
-        (candidate) => candidate.threadId === binding.threadId,
-      );
-      if (
-        !active ||
-        residentDispatchAuthorityFingerprint(active) !== residentDispatchAuthorityFingerprint(binding)
-      ) {
-        return false;
-      }
-
-      const lineage = await this.readResidentProjectionLineageUnlocked(
-        residentProjectionAuthorityFromBinding(binding),
-      );
-      if (!lineage) return false;
-      const snapshot = await this.readSnapshotUnlocked(binding.threadId);
-      // Host-owned admission may update status/queue fields after publication,
-      // so readiness follows the exact private lineage and its still-current
-      // cursor/identity rather than requiring the full public digest to remain
-      // byte-equivalent to the last upstream projection.
-      return snapshot.thread.threadId === binding.threadId &&
-        snapshot.thread.currentLocation.executionGenerationId === binding.executionGenerationId &&
-        snapshot.latestCursor.threadId === binding.threadId &&
-        snapshot.latestCursor.executionGenerationId === binding.executionGenerationId &&
-        snapshot.latestCursor.generation === lineage.current.generation &&
-        snapshot.latestCursor.sequence === lineage.current.sequence &&
-        snapshot.runtime?.residency === "resident" &&
-        snapshot.runtime.activeSessionId === binding.activeSessionId &&
-        snapshot.runtime.sessionId === binding.sessionId;
+      return this.hasExactResidentProjectionUnlocked(binding);
     });
+  }
+
+  private async hasExactResidentProjectionUnlocked(binding: ResidentSessionBinding): Promise<boolean> {
+    const active = (await this.readResidentSessionBindingsUnlocked()).find(
+      (candidate) => candidate.threadId === binding.threadId,
+    );
+    if (
+      !active ||
+      residentDispatchAuthorityFingerprint(active) !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      return false;
+    }
+
+    const lineage = await this.readResidentProjectionLineageUnlocked(
+      residentProjectionAuthorityFromBinding(binding),
+    );
+    if (!lineage) return false;
+    const snapshot = await this.readSnapshotUnlocked(binding.threadId);
+    // Host-owned admission may update status/queue fields after publication,
+    // so readiness follows the exact private lineage and its still-current
+    // cursor/identity rather than requiring the full public digest to remain
+    // byte-equivalent to the last upstream projection.
+    return snapshot.thread.threadId === binding.threadId &&
+      snapshot.thread.currentLocation.executionGenerationId === binding.executionGenerationId &&
+      snapshot.latestCursor.threadId === binding.threadId &&
+      snapshot.latestCursor.executionGenerationId === binding.executionGenerationId &&
+      snapshot.latestCursor.generation === lineage.current.generation &&
+      snapshot.latestCursor.sequence === lineage.current.sequence &&
+      snapshot.runtime?.residency === "resident" &&
+      snapshot.runtime.activeSessionId === binding.activeSessionId &&
+      snapshot.runtime.sessionId === binding.sessionId;
   }
 
   async persistResidentSessionBinding(bindingValue: ResidentSessionBinding): Promise<void> {
@@ -3406,6 +3837,12 @@ export class HostStore {
       );
       const existingRecord = existingIndex >= 0 ? records[existingIndex] : undefined;
       const existing = existingRecord?.state === "active" ? existingRecord.binding : undefined;
+      if (existing && !isDeepStrictEqual(existing, binding)) {
+        await this.assertNoModelSelectionTransitionUnlocked(
+          binding.threadId,
+          "Resident binding metadata cannot refresh while a model selection is unresolved",
+        );
+      }
       if (
         existing &&
         residentDispatchAuthorityFingerprint(existing) !== residentDispatchAuthorityFingerprint(binding)
@@ -3470,6 +3907,45 @@ export class HostStore {
     );
   }
 
+  /**
+   * Publishes the authoritative result of one exact, non-replayable model
+   * mutation. Prime v0.7 may leave its attachment cursor unchanged after
+   * set_model, so this dedicated path re-reads the durable dispatch attempt,
+   * receipt, and binding under the same Store lock before admitting only the
+   * model-coupled semantic delta.
+   */
+  async publishResidentModelSelectionProjection(
+    commandValue: CommandEnvelope,
+    bindingValue: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ): Promise<ThreadProjectionSnapshot> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "model.select") {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMAND_REQUIRED",
+        "This projection path accepts only an exact model-selection command",
+      );
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const binding = validateResidentSessionBinding(bindingValue);
+      const proof = await this.assertResidentModelSelectionProjectionAuthorityUnlocked(
+        command,
+        binding,
+        projection,
+      );
+      return this.publishResidentProjectionSnapshotUnlocked(
+        binding,
+        projection,
+        undefined,
+        undefined,
+        proof.attempt,
+        proof.runningReceipt,
+      );
+    });
+  }
+
   async publishResidentLifecycleProjection(
     leaseValue: ResidentLifecycleProjectionLease,
     projection: ResidentProjectionSnapshot,
@@ -3528,6 +4004,8 @@ export class HostStore {
     projection: ResidentProjectionSnapshot,
     abortIdleLeaseValue?: ResidentAbortReconciliationLease,
     lifecycleLeaseValue?: ResidentLifecycleProjectionLease,
+    modelSelectionProofAttemptValue?: ModelSelectionAttempt,
+    modelSelectionRunningReceiptValue?: CommandReceipt,
   ): Promise<ThreadProjectionSnapshot> {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
@@ -3539,6 +4017,24 @@ export class HostStore {
         throw new HostStoreError(
           "RESIDENT_PROJECTION_AUTHORITY_CONFLICT",
           "An activating projection cannot use an active-session reconciliation lease",
+        );
+      }
+      if (
+        (modelSelectionProofAttemptValue !== undefined) !==
+          (modelSelectionRunningReceiptValue !== undefined)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_AUTHORITY_CONFLICT",
+          "A model-selection projection requires its exact attempt and running receipt together",
+        );
+      }
+      if (
+        modelSelectionProofAttemptValue &&
+        (lifecycleRecord !== undefined || abortIdleLeaseValue !== undefined)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_AUTHORITY_CONFLICT",
+          "A model-selection projection cannot consume another resident publication authority",
         );
       }
       const scope = await this.currentWorkspaceScopeUnlocked(
@@ -3596,6 +4092,12 @@ export class HostStore {
             projection,
           )
         : undefined;
+      const modelSelectionProofAttempt = modelSelectionProofAttemptValue
+        ? ModelSelectionAttemptSchema.parse(modelSelectionProofAttemptValue)
+        : undefined;
+      const modelSelectionRunningReceipt = modelSelectionRunningReceiptValue
+        ? CommandReceiptSchema.parse(modelSelectionRunningReceiptValue)
+        : undefined;
 
       const source = await this.readSnapshotUnlocked(binding.threadId);
       if (
@@ -3620,6 +4122,15 @@ export class HostStore {
       const authority = residentProjectionAuthorityFromBinding(binding);
       const authorityId = residentProjectionAuthorityId(authority);
       const previousLineage = await this.readResidentProjectionLineageUnlocked(authority);
+      if (
+        abortIdleProofAttempt &&
+        previousLineage &&
+        projection.cursor.generation === previousLineage.current.generation &&
+        projection.cursor.sequence === previousLineage.current.sequence &&
+        projectionDigest !== previousLineage.current.digest
+      ) {
+        await this.assertNoCommittedModelSelectionRewriteUnlocked(binding);
+      }
       let nextLineage: ResidentProjectionCursorLineage;
       if (!previousLineage) {
         await this.assertResidentProjectionLineageCapacityUnlocked();
@@ -3642,10 +4153,24 @@ export class HostStore {
         }
         if (projection.cursor.sequence === previousLineage.current.sequence) {
           if (projectionDigest !== previousLineage.current.digest) {
-            if (!abortIdleProofAttempt) {
+            if (!abortIdleProofAttempt && !modelSelectionProofAttempt) {
               throw new HostStoreError(
                 "RESIDENT_PROJECTION_CURSOR_CONFLICT",
                 "The same resident projection cursor was reused for different authoritative content",
+              );
+            }
+            if (
+              modelSelectionProofAttempt &&
+              !residentModelSelectionSameCursorDeltaIsValid(
+                source,
+                projection,
+                previousLineage,
+                modelSelectionProofAttempt,
+              )
+            ) {
+              throw new HostStoreError(
+                "RESIDENT_MODEL_SELECTION_PROJECTION_CONFLICT",
+                "Same-cursor model selection changed content outside its exact semantic whitelist",
               );
             }
             nextLineage = ResidentProjectionCursorLineageSchema.parse({
@@ -3658,7 +4183,8 @@ export class HostStore {
           } else {
             if (
               source.latestCursor.generation !== projection.cursor.generation ||
-              source.latestCursor.sequence !== projection.cursor.sequence
+              source.latestCursor.sequence !== projection.cursor.sequence ||
+              residentPublishedProjectionDigest(source) !== previousLineage.current.digest
             ) {
               throw new HostStoreError(
                 "RESIDENT_PROJECTION_LINEAGE_DIVERGED",
@@ -3670,6 +4196,46 @@ export class HostStore {
                 "RESIDENT_ABORT_IDLE_PROJECTION_CONFLICT",
                 "The durable projection remained active despite matching the acknowledged Stop idle proof digest",
               );
+            }
+            if (modelSelectionProofAttempt && modelSelectionRunningReceipt) {
+              const runtime = source.runtime;
+              if (
+                !runtime ||
+                runtime.model !== residentSelectedModelIdentity(modelSelectionProofAttempt.command)
+              ) {
+                throw new HostStoreError(
+                  "MODEL_SELECTION_PROJECTION_TARGET_MISMATCH",
+                  "A digest-equal model projection does not report the exact requested model",
+                );
+              }
+              const committed = createCommittedModelSelectionAttempt(
+                modelSelectionProofAttempt,
+                source.latestCursor,
+                previousLineage.current.digest,
+                residentModelSelectionPublishedInvariantDigest(source, runtime),
+                modelSelectionRunningReceipt,
+                source.generatedAt,
+                causalNow(modelSelectionProofAttempt.updatedAt, source.generatedAt),
+              );
+              try {
+                const anchoredLineage = ResidentProjectionCursorLineageSchema.parse({
+                  ...previousLineage,
+                  modelSelectionProofAnchor: residentModelSelectionProofAnchorForAttempt(committed),
+                });
+                await atomicWriteJson(
+                  this.residentProjectionLineagePath(anchoredLineage.authorityId),
+                  anchoredLineage,
+                  MAX_RESIDENT_PROJECTION_LINEAGE_BYTES,
+                );
+                await atomicWriteJson(
+                  this.modelSelectionAttemptPath(committed.command),
+                  committed,
+                  MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+                );
+              } catch (error) {
+                this.initialized = false;
+                throw error;
+              }
             }
             return source;
           }
@@ -3713,6 +4279,7 @@ export class HostStore {
         source.generatedAt,
         source.thread.updatedAt,
         lifecycleRecord?.updatedAt,
+        modelSelectionProofAttempt?.updatedAt,
       );
       const latestCursor = {
         threadId: binding.threadId,
@@ -3775,12 +4342,44 @@ export class HostStore {
         );
       }
       const retiredPromptAttempts: readonly ResidentDispatchAttempt[] = [];
+      if (modelSelectionProofAttempt && !source.runtime) {
+        throw new HostStoreError(
+          "RESIDENT_MODEL_SELECTION_SOURCE_INVALID",
+          "Model-selection publication requires an exact prior resident runtime projection",
+        );
+      }
+      const modelSelectionInvariantDigest = modelSelectionProofAttempt
+        ? residentModelSelectionPublishedInvariantDigest(published, published.runtime!)
+        : undefined;
+      if (modelSelectionProofAttempt && modelSelectionRunningReceipt && modelSelectionInvariantDigest) {
+        const committed = createCommittedModelSelectionAttempt(
+          modelSelectionProofAttempt,
+          published.latestCursor,
+          projectionDigest,
+          modelSelectionInvariantDigest,
+          modelSelectionRunningReceipt,
+          published.generatedAt,
+          published.generatedAt,
+        );
+        nextLineage = ResidentProjectionCursorLineageSchema.parse({
+          ...nextLineage,
+          modelSelectionProofAnchor: residentModelSelectionProofAnchorForAttempt(committed),
+        });
+      }
       const transaction = ResidentProjectionTransactionSchema.parse({
         version: 1,
         kind: "resident_projection_publication",
-        transactionId: abortIdleProofAttempt && previousLineage &&
-          previousLineage.current.generation === projection.cursor.generation &&
-          previousLineage.current.sequence === projection.cursor.sequence
+        transactionId: modelSelectionProofAttempt
+          ? deterministicId(
+              "resident-model-selection-projection",
+              modelSelectionProofAttempt.command.deviceId,
+              modelSelectionProofAttempt.command.commandId,
+              projection.cursor.generation,
+              String(projection.cursor.sequence),
+            )
+          : abortIdleProofAttempt && previousLineage &&
+            previousLineage.current.generation === projection.cursor.generation &&
+            previousLineage.current.sequence === projection.cursor.sequence
           ? deterministicId(
               "resident-abort-idle-projection",
               abortIdleProofAttempt.attemptId,
@@ -3805,6 +4404,14 @@ export class HostStore {
         previousLineage.current.generation === projection.cursor.generation &&
         previousLineage.current.sequence === projection.cursor.sequence
           ? { abortIdleProofAttempt }
+          : {}),
+        ...(modelSelectionProofAttempt && modelSelectionRunningReceipt && source.runtime && modelSelectionInvariantDigest
+          ? {
+              modelSelectionProofAttempt,
+              modelSelectionRunningReceipt,
+              modelSelectionSourceSnapshot: source,
+              modelSelectionInvariantDigest,
+            }
           : {}),
         snapshot: published,
         threadsFile: ThreadFileSchema.parse({ version: 1, threads: updatedThreads }),
@@ -4797,6 +5404,7 @@ export class HostStore {
           "The resident session binding changed after model-selection admission",
         );
       }
+      await this.assertNoOtherModelSelectionTransitionUnlocked(command, binding);
 
       const dispatchStartedAt = now();
       const dispatching = ModelSelectionAttemptSchema.parse({
@@ -4809,7 +5417,7 @@ export class HostStore {
         ...receipt,
         status: "running",
         queuePosition: undefined,
-        message: "Selecting the model on the resident Prime Agent session",
+        message: MODEL_SELECTION_RUNNING_MESSAGE,
         error: undefined,
         updatedAt: dispatchStartedAt,
       });
@@ -4867,15 +5475,38 @@ export class HostStore {
           "The model-selection receipt is already terminal",
         );
       }
-      if (update.status !== "failed" && attempt.state !== "dispatching") {
+      if (attempt.state === "projection_committed") {
+        assertModelSelectionCommittedReceiptFence(attempt, current);
+        await this.assertCommittedModelSelectionProofUnlocked(attempt);
+      }
+      if (update.status === "completed" && attempt.state !== "projection_committed") {
         throw new HostStoreError(
-          "MODEL_SELECTION_NOT_DISPATCHED",
-          "Only a dispatched model selection can finish as completed or uncertain",
+          "MODEL_SELECTION_PROJECTION_PROOF_REQUIRED",
+          "Model selection cannot complete without its exact durable projection proof",
         );
       }
+      if (
+        attempt.state !== "projection_committed" &&
+        update.status === "uncertain" &&
+        attempt.state !== "dispatching"
+      ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_NOT_DISPATCHED",
+          "Only a dispatched model selection can finish as uncertain",
+        );
+      }
+      const terminalUpdate = attempt.state === "projection_committed"
+        ? {
+            status: "completed" as const,
+            message: update.status === "completed"
+              ? update.message
+              : "Prime Agent selected and durably published the verified model",
+            error: undefined,
+          }
+        : update;
       const receipt = CommandReceiptSchema.parse({
         ...current,
-        ...update,
+        ...terminalUpdate,
         queuePosition: undefined,
         updatedAt: now(),
       });
@@ -5275,6 +5906,8 @@ export class HostStore {
 
     await this.assertResidentProjectionPromptRetirementsUnlocked(transaction, currentSnapshot);
     await this.assertResidentProjectionAbortIdleProofUnlocked(transaction, currentSnapshot);
+    const committedModelSelectionAttempt =
+      await this.assertResidentProjectionModelSelectionProofUnlocked(transaction);
     await this.materializeResidentProjectionLineageUnlocked(transaction);
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_lineage", transaction.transactionId);
@@ -5286,6 +5919,19 @@ export class HostStore {
     await atomicWriteJson(this.paths.threads, transaction.threadsFile);
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_threads", transaction.transactionId);
+    }
+    if (committedModelSelectionAttempt) {
+      await atomicWriteJson(
+        this.modelSelectionAttemptPath(committedModelSelectionAttempt.command),
+        committedModelSelectionAttempt,
+        MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+      );
+      if (injectFaults) {
+        await this.injectResidentProjectionFault(
+          "after_model_selection_attempt",
+          transaction.transactionId,
+        );
+      }
     }
     for (const retired of transaction.retiredPromptAttempts) {
       const path = this.residentDispatchAttemptPath(retired.command);
@@ -5565,8 +6211,16 @@ export class HostStore {
         await this.materializeResidentEndProjectionTransactionUnlocked(transaction, false);
         continue;
       }
-      const expectedTransactionId = transaction.abortIdleProofAttempt
+      const expectedTransactionId = transaction.modelSelectionProofAttempt
         ? deterministicId(
+            "resident-model-selection-projection",
+            transaction.modelSelectionProofAttempt.command.deviceId,
+            transaction.modelSelectionProofAttempt.command.commandId,
+            transaction.snapshot.latestCursor.generation,
+            String(transaction.snapshot.latestCursor.sequence),
+          )
+        : transaction.abortIdleProofAttempt
+          ? deterministicId(
             "resident-abort-idle-projection",
             transaction.abortIdleProofAttempt.attemptId,
             transaction.snapshot.latestCursor.generation,
@@ -5657,6 +6311,124 @@ export class HostStore {
         "Resident projection lineage storage contains an unexpected entry",
       );
     }
+  }
+
+  private async validateResidentControlProjectionDirectoryUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentControlProjections, { withFileTypes: true });
+    const files: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "Resident control projection storage contains a non-file entry",
+        );
+      }
+      if (/^[a-f0-9]{64}\.json\.tmp-[0-9]+-[a-f0-9]{16}$/.test(entry.name)) {
+        // An interrupted atomic replacement never made this private sibling
+        // authoritative. Removing only the exact writer-owned temp shape is a
+        // safe startup recovery step; terminal projections are never pruned.
+        await rm(join(this.paths.residentControlProjections, entry.name), { force: true });
+        continue;
+      }
+      if (!/^[a-f0-9]{64}\.json$/.test(entry.name)) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          `Unexpected resident control projection file ${entry.name}`,
+        );
+      }
+      files.push(entry.name);
+    }
+    const retained = files.length > this.residentControlProjectionLimit
+      ? await this.compactStaleResidentControlProjectionsUnlocked(files)
+      : files;
+    if (retained.length > this.residentControlProjectionLimit) {
+      throw new HostStoreError(
+        "RESIDENT_CONTROL_PROJECTION_LIMIT",
+        `Resident control projection storage exceeds ${this.residentControlProjectionLimit} retained generations`,
+      );
+    }
+  }
+
+  private async assertResidentControlProjectionCapacityUnlocked(fileName: string): Promise<void> {
+    const entries = await readdir(this.paths.residentControlProjections, { withFileTypes: true });
+    const files: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "Resident control projection storage contains an unexpected entry",
+        );
+      }
+      files.push(entry.name);
+    }
+    const retained =
+      files.length > this.residentControlProjectionLimit ||
+      (files.length >= this.residentControlProjectionLimit && !files.includes(fileName))
+        ? await this.compactStaleResidentControlProjectionsUnlocked(files)
+        : files;
+    if (
+      retained.length > this.residentControlProjectionLimit ||
+      (retained.length >= this.residentControlProjectionLimit && !retained.includes(fileName))
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_CONTROL_PROJECTION_LIMIT",
+        "The bounded resident control projection registry is full",
+      );
+    }
+  }
+
+  /**
+   * Retire only fully parsed, host-bound generations that are no longer the
+   * catalog's current authority. Every candidate is validated before the first
+   * unlink, so one corrupt record blocks the whole compaction. Current terminal
+   * End remains in the catalog and is therefore retained.
+   */
+  private async compactStaleResidentControlProjectionsUnlocked(fileNames: readonly string[]): Promise<string[]> {
+    const [host, threads] = await Promise.all([this.readHostUnlocked(), this.readThreadsUnlocked()]);
+    const currentGenerations = new Set(
+      threads.map((thread) => storageKey(thread.threadId, thread.currentLocation.executionGenerationId)),
+    );
+    const validated: Array<{ fileName: string; authorityKey: string }> = [];
+    for (const fileName of fileNames) {
+      let projection: ResidentControlProjectionSnapshot | undefined;
+      try {
+        projection = await readJsonFile(
+          join(this.paths.residentControlProjections, fileName),
+          ResidentControlProjectionSnapshotSchema,
+          { maxBytes: MAX_RESIDENT_CONTROL_PROJECTION_BYTES },
+        );
+      } catch (error) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "Resident control projection compaction encountered corrupt or truncated state",
+          false,
+          { cause: error },
+        );
+      }
+      if (!projection || projection.hostId !== host.hostId) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "Resident control projection compaction encountered foreign host authority",
+        );
+      }
+      const authorityKey = storageKey(projection.threadId, projection.executionGenerationId);
+      if (fileName !== `${authorityKey}.json`) {
+        throw new HostStoreError(
+          "RESIDENT_CONTROL_PROJECTION_INVALID",
+          "Resident control projection filename does not match its generation authority",
+        );
+      }
+      validated.push({ fileName, authorityKey });
+    }
+
+    const stale = validated.filter((candidate) => !currentGenerations.has(candidate.authorityKey));
+    for (const candidate of stale) {
+      await rm(join(this.paths.residentControlProjections, candidate.fileName), { force: true });
+    }
+    const retired = new Set(stale.map((candidate) => candidate.fileName));
+    return validated
+      .map((candidate) => candidate.fileName)
+      .filter((fileName) => !retired.has(fileName));
   }
 
   private async readResidentProjectionLineageUnlocked(
@@ -5757,6 +6529,104 @@ export class HostStore {
         publicationAlreadyMaterialized
           ? "A materialized Stop idle projection lost its exact proof lock before transaction retirement"
           : "A prepared Stop idle projection no longer matches its exact acknowledged Stop lock",
+      );
+    }
+  }
+
+  private async assertResidentProjectionModelSelectionProofUnlocked(
+    transaction: ResidentProjectionTransaction,
+  ): Promise<ModelSelectionAttempt | undefined> {
+    const expected = transaction.modelSelectionProofAttempt;
+    if (!expected) return;
+    const expectedReceipt = transaction.modelSelectionRunningReceipt;
+    const sourceSnapshot = transaction.modelSelectionSourceSnapshot;
+    const invariantDigest = transaction.modelSelectionInvariantDigest;
+    if (!expectedReceipt || !sourceSnapshot || !invariantDigest) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_PROOF_CONFLICT",
+        "A prepared model-selection projection lost its complete durable recovery fence",
+      );
+    }
+    const committed = modelSelectionCommittedAttemptForTransaction(transaction);
+    const [identity, current, receipt] = await Promise.all([
+      this.resolveCommandIdentityUnlocked(expected.command),
+      this.readModelSelectionAttemptUnlocked(expected.command),
+      this.readReceiptUnlocked(expected.command),
+    ]);
+    if (
+      !identity ||
+      !current ||
+      !receipt ||
+      !isDeepStrictEqual(receipt, expectedReceipt) ||
+      !isDeepStrictEqual(identity.command, expected.command) ||
+      (!isDeepStrictEqual(current, expected) && !isDeepStrictEqual(current, committed))
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_PROOF_CONFLICT",
+        "A prepared model-selection projection lost its exact durable running attempt",
+      );
+    }
+    this.assertReceiptMatchesCommand(receipt, expected.command);
+    const currentBinding = await this.resolveModelSelectionBindingUnlocked(expected.command);
+    if (
+      !isDeepStrictEqual(currentBinding, expected.binding) ||
+      !isDeepStrictEqual(transaction.binding, expected.binding)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_BINDING_CONFLICT",
+        "A prepared model-selection projection no longer belongs to its exact resident binding",
+      );
+    }
+    await this.assertResidentModelSelectionProjectionPhaseUnlocked(
+      transaction,
+      isDeepStrictEqual(current, committed),
+    );
+    return committed;
+  }
+
+  private async assertResidentModelSelectionProjectionPhaseUnlocked(
+    transaction: ResidentProjectionTransaction,
+    attemptAlreadyCommitted: boolean,
+  ): Promise<void> {
+    const source = transaction.modelSelectionSourceSnapshot;
+    const proof = transaction.modelSelectionProofAttempt;
+    if (!source || !proof) return;
+    const [lineage, threads] = await Promise.all([
+      this.readResidentProjectionLineageUnlocked(
+        residentProjectionAuthorityFromBinding(transaction.binding),
+      ),
+      this.readThreadsUnlocked(),
+    ]);
+    const sourceThreads = [...transaction.threadsFile.threads];
+    const sourceThreadIndex = sourceThreads.findIndex(
+      (thread) => thread.threadId === transaction.binding.threadId,
+    );
+    if (sourceThreadIndex < 0) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_PHASE_INVALID",
+        "A prepared model-selection projection lost its exact source catalog slot",
+      );
+    }
+    sourceThreads[sourceThreadIndex] = source.thread;
+    const currentSnapshot = await this.readSnapshotUnlocked(transaction.binding.threadId);
+    const snapshotIsSource = isDeepStrictEqual(currentSnapshot, source);
+    const snapshotIsTarget = isDeepStrictEqual(currentSnapshot, transaction.snapshot);
+    const catalogFile = ThreadFileSchema.parse({ version: 1, threads });
+    const catalogIsSource = isDeepStrictEqual(
+      catalogFile,
+      ThreadFileSchema.parse({ version: 1, threads: sourceThreads }),
+    );
+    const catalogIsTarget = isDeepStrictEqual(catalogFile, transaction.threadsFile);
+    const lineageIsPrevious = isDeepStrictEqual(lineage, transaction.previousLineage);
+    const lineageIsNext = isDeepStrictEqual(lineage, transaction.nextLineage);
+    const validPhase = attemptAlreadyCommitted
+      ? snapshotIsTarget && catalogIsTarget && lineageIsNext
+      : (snapshotIsSource && catalogIsSource && (lineageIsPrevious || lineageIsNext)) ||
+        (snapshotIsTarget && lineageIsNext && (catalogIsSource || catalogIsTarget));
+    if (!validPhase) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_PHASE_INVALID",
+        "A prepared model-selection projection is not in an exact recoverable write phase",
       );
     }
   }
@@ -6545,11 +7415,14 @@ export class HostStore {
           "Model-selection attempt filename does not match its command identity",
         );
       }
-      const current = await this.readReceiptUnlocked(attempt.command);
-      if (!current) {
+      const [identity, current] = await Promise.all([
+        this.resolveCommandIdentityUnlocked(attempt.command),
+        this.readReceiptUnlocked(attempt.command),
+      ]);
+      if (!identity || !isDeepStrictEqual(identity.command, attempt.command) || !current) {
         throw new HostStoreError(
           "MODEL_SELECTION_ATTEMPT_INVALID",
-          "Model-selection attempt has no durable command receipt",
+          "Model-selection attempt has no exact durable command identity and receipt",
         );
       }
       if (
@@ -6563,29 +7436,71 @@ export class HostStore {
           "Model-selection attempt conflicts with its durable receipt",
         );
       }
+      this.assertReceiptMatchesCommand(current, attempt.command);
       if (
-        (current.status === "running" && attempt.state !== "dispatching") ||
-        ((current.status === "completed" || current.status === "uncertain") &&
-          attempt.state !== "dispatching") ||
-        current.status === "received" ||
-        current.status === "rejected" ||
-        current.status === "cancelled"
+        current.status === "running" &&
+        (current.receivedAt !== attempt.admittedAt ||
+          current.updatedAt !== attempt.dispatchStartedAt ||
+          current.queuePosition !== undefined ||
+          current.error !== undefined ||
+          current.message !== MODEL_SELECTION_RUNNING_MESSAGE)
       ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection attempt lost its exact durable running receipt fence",
+        );
+      }
+      const validTerminalState =
+        (current.status === "failed" && attempt.state !== "projection_committed") ||
+        (current.status === "uncertain" && attempt.state === "dispatching") ||
+        (current.status === "completed" && attempt.state === "projection_committed");
+      const validPendingState =
+        (current.status === "admitted" && attempt.state === "admitted") ||
+        (current.status === "running" &&
+          (attempt.state === "dispatching" || attempt.state === "projection_committed"));
+      if (!validTerminalState && !validPendingState) {
         throw new HostStoreError(
           "MODEL_SELECTION_ATTEMPT_INVALID",
           "Model-selection attempt state conflicts with its receipt lifecycle",
         );
+      }
+      if (attempt.state === "projection_committed") {
+        assertModelSelectionCommittedReceiptFence(attempt, current);
       }
       if (
         current.status === "completed" ||
         current.status === "failed" ||
         current.status === "uncertain"
       ) {
+        if (attempt.state === "projection_committed") {
+          await this.assertCommittedModelSelectionProofUnlocked(attempt);
+        }
         await this.appendModelSelectionJournalUnlocked(
           attempt.command,
           current.status,
           current.updatedAt,
           current.message,
+        );
+        await rm(path, { force: true });
+        continue;
+      }
+
+      if (attempt.state === "projection_committed") {
+        await this.assertCommittedModelSelectionProofUnlocked(attempt);
+        const completed = CommandReceiptSchema.parse({
+          ...current,
+          status: "completed",
+          queuePosition: undefined,
+          message: "Recovered the durably published model selection after host restart",
+          error: undefined,
+          updatedAt: causalNow(current.updatedAt, attempt.updatedAt),
+        });
+        await atomicWriteJson(this.receiptPath(attempt.command), completed);
+        await this.appendModelSelectionJournalUnlocked(
+          attempt.command,
+          "completed",
+          completed.updatedAt,
+          completed.message,
         );
         await rm(path, { force: true });
         continue;
@@ -6611,6 +7526,84 @@ export class HostStore {
         recovered.message,
       );
       await rm(path, { force: true });
+    }
+  }
+
+  private async assertCommittedModelSelectionProofUnlocked(
+    attempt: ModelSelectionAttempt,
+  ): Promise<void> {
+    const proof = attempt.projectionProof;
+    if (attempt.state !== "projection_committed" || !proof) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "A committed model selection has no exact immutable publication proof",
+      );
+    }
+    const binding = await this.resolveModelSelectionBindingUnlocked(attempt.command);
+    if (
+      !isDeepStrictEqual(binding, attempt.binding) ||
+      proof.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "Committed model-selection proof no longer matches its exact resident binding",
+      );
+    }
+    const [snapshot, lineage, threads] = await Promise.all([
+      this.readSnapshotUnlocked(binding.threadId),
+      this.readResidentProjectionLineageUnlocked(residentProjectionAuthorityFromBinding(binding)),
+      this.readThreadsUnlocked(),
+    ]);
+    const catalogThread = threads.find((thread) => thread.threadId === binding.threadId);
+    if (
+      !lineage ||
+      !catalogThread ||
+      !isDeepStrictEqual(catalogThread, snapshot.thread) ||
+      lineage.current.generation !== snapshot.latestCursor.generation ||
+      lineage.current.sequence !== snapshot.latestCursor.sequence ||
+      lineage.current.digest !== residentPublishedProjectionDigest(snapshot)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "Committed model-selection proof has no consistent current projection lineage",
+      );
+    }
+    if (
+      !isDeepStrictEqual(
+        lineage.modelSelectionProofAnchor,
+        residentModelSelectionProofAnchorForAttempt(attempt),
+      )
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "Committed model-selection proof lost its exact durable lineage anchor",
+      );
+    }
+    const proofIsCurrent =
+      proof.cursor.generation === lineage.current.generation &&
+      proof.cursor.sequence === lineage.current.sequence;
+    const proofIsHistorical =
+      (proof.cursor.generation === lineage.current.generation &&
+        proof.cursor.sequence < lineage.current.sequence) ||
+      lineage.retiredGenerations.includes(proof.cursor.generation);
+    if (!proofIsCurrent && !proofIsHistorical) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "Committed model-selection proof is not an ancestor of the current projection lineage",
+      );
+    }
+    if (
+      proofIsCurrent &&
+      (snapshot.generatedAt !== proof.publishedAt ||
+        lineage.current.digest !== proof.projectionDigest ||
+        !snapshot.runtime ||
+        snapshot.runtime.model !== residentSelectedModelIdentity(attempt.command) ||
+        residentModelSelectionPublishedInvariantDigest(snapshot, snapshot.runtime) !== proof.invariantDigest)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+        "Committed model-selection proof does not match its exact published target",
+      );
     }
   }
 
@@ -7130,6 +8123,64 @@ export class HostStore {
     return attempt;
   }
 
+  private async assertResidentModelSelectionProjectionAuthorityUnlocked(
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ): Promise<Readonly<{ attempt: ModelSelectionAttempt; runningReceipt: CommandReceipt }>> {
+    if (command.command.kind !== "model.select") {
+      throw new HostStoreError(
+        "MODEL_SELECTION_COMMAND_REQUIRED",
+        "Model-selection projection authority requires an exact model.select command",
+      );
+    }
+    const [identity, attempt, receipt] = await Promise.all([
+      this.resolveCommandIdentityUnlocked(command),
+      this.readModelSelectionAttemptUnlocked(command),
+      this.readReceiptUnlocked(command),
+    ]);
+    if (
+      !identity ||
+      !attempt ||
+      !receipt ||
+      attempt.state !== "dispatching" ||
+      !attempt.dispatchStartedAt ||
+      receipt.status !== "running" ||
+      receipt.receivedAt !== attempt.admittedAt ||
+      receipt.updatedAt !== attempt.dispatchStartedAt ||
+      receipt.queuePosition !== undefined ||
+      receipt.error !== undefined ||
+      receipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+      attempt.updatedAt !== attempt.dispatchStartedAt ||
+      !isDeepStrictEqual(identity.command, command) ||
+      !isDeepStrictEqual(attempt.command, command) ||
+      !isDeepStrictEqual(attempt.binding, binding)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_AUTHORITY_INVALID",
+        "Only the exact durable running model-selection attempt may publish its authoritative projection",
+      );
+    }
+    this.assertReceiptMatchesCommand(receipt, command);
+    const currentBinding = await this.resolveModelSelectionBindingUnlocked(command);
+    if (!isDeepStrictEqual(currentBinding, binding)) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_CONFLICT",
+        "The resident session binding changed before model-selection projection publication",
+      );
+    }
+    if (
+      !residentProjectionSelectedModelMatchesCommand(projection, command) ||
+      projection.runtime.model !== residentSelectedModelIdentity(command)
+    ) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_PROJECTION_TARGET_MISMATCH",
+        "The authoritative resident projection does not report the exact requested model",
+      );
+    }
+    return Object.freeze({ attempt, runningReceipt: receipt });
+  }
+
   private async assertNoResidentDispatchTransitionUnlocked(threadId: string, message: string): Promise<void> {
     const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
     if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
@@ -7160,6 +8211,14 @@ export class HostStore {
         throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
       }
     }
+    await this.assertNoModelSelectionTransitionUnlocked(threadId, message);
+  }
+
+  private async assertNoModelSelectionTransitionUnlocked(threadId: string, message: string): Promise<void> {
+    const attempts = await this.readModelSelectionTransitionsUnlocked();
+    if (attempts.some((attempt) => attempt.command.threadId === threadId)) {
+      throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+    }
   }
 
   private async assertModelSelectionAttemptCapacityUnlocked(): Promise<void> {
@@ -7184,6 +8243,88 @@ export class HostStore {
         "Model-selection attempt storage contains an unexpected entry",
       );
     }
+  }
+
+  private async assertNoOtherModelSelectionTransitionUnlocked(
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+  ): Promise<void> {
+    const attempts = await this.readModelSelectionTransitionsUnlocked();
+    const authority = residentProjectionAuthorityFromBinding(binding);
+    for (const other of attempts) {
+      if (
+        other.command.deviceId === command.deviceId &&
+        other.command.commandId === command.commandId
+      ) {
+        continue;
+      }
+      if (
+        (other.state === "dispatching" || other.state === "projection_committed") &&
+        isDeepStrictEqual(residentProjectionAuthorityFromBinding(other.binding), authority)
+      ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ALREADY_ACTIVE",
+          "Another model selection still owns this exact resident session transition",
+          true,
+        );
+      }
+    }
+  }
+
+  private async assertNoCommittedModelSelectionRewriteUnlocked(
+    binding: ResidentSessionBinding,
+  ): Promise<void> {
+    const authority = residentProjectionAuthorityFromBinding(binding);
+    const attempts = await this.readModelSelectionTransitionsUnlocked();
+    if (
+      attempts.some(
+        (attempt) =>
+          attempt.state === "projection_committed" &&
+          isDeepStrictEqual(residentProjectionAuthorityFromBinding(attempt.binding), authority),
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_MODEL_SELECTION_PROJECTION_ACTIVE",
+        "Same-cursor Stop reconciliation must wait for the committed model publication to finalize",
+        true,
+      );
+    }
+  }
+
+  private async readModelSelectionTransitionsUnlocked(): Promise<ModelSelectionAttempt[]> {
+    const directory = this.modelSelectionAttemptsDirectory();
+    const entries = await readdir(directory, { withFileTypes: true });
+    const attempts: ModelSelectionAttempt[] = [];
+    if (entries.length > MAX_PENDING_MODEL_SELECTION_ATTEMPTS) {
+      throw new HostStoreError(
+        "MODEL_SELECTION_ATTEMPT_LIMIT",
+        "Model-selection transition authority cannot be inspected because its bounded store is full",
+      );
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection transition authority contains an unexpected entry",
+        );
+      }
+      const other = await readJsonFile(
+        join(directory, entry.name),
+        ModelSelectionAttemptSchema,
+        { maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES },
+      );
+      if (
+        !other ||
+        entry.name !== `${storageKey(other.command.deviceId, other.command.commandId)}.json`
+      ) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_INVALID",
+          "Model-selection transition authority has an invalid command identity",
+        );
+      }
+      attempts.push(other);
+    }
+    return attempts;
   }
 
   private async readAdmissionTransactionUnlocked(
@@ -10498,6 +11639,10 @@ export class HostStore {
     return join(this.paths.residentProjectionLineages, this.residentProjectionLineageName(authorityId));
   }
 
+  private residentControlProjectionName(threadId: string, executionGenerationId: string): string {
+    return `${storageKey(threadId, executionGenerationId)}.json`;
+  }
+
   private handoffPath(handoffId: string): string {
     return join(this.paths.handoffs, `${storageKey(handoffId)}.json`);
   }
@@ -10846,9 +11991,16 @@ function residentProjectionAuthorityId(authorityValue: ResidentProjectionAuthori
 }
 
 function residentProjectionDigest(projection: ResidentProjectionSnapshot): string {
+  return residentProjectionDigestWithRuntime(projection, projection.runtime);
+}
+
+function residentProjectionDigestWithRuntime(
+  projection: ResidentProjectionSnapshot,
+  runtime: RuntimeSessionSummary,
+): string {
   const semantic = {
     cursor: projection.cursor,
-    runtime: projection.runtime,
+    runtime,
     transcript: projection.transcript,
     stream: projection.stream,
     childAgents: projection.childAgents,
@@ -10871,6 +12023,244 @@ function residentPublishedProjectionDigest(snapshot: ThreadProjectionSnapshot): 
     goal: snapshot.goals[0],
     activity: snapshot.thread.status === "running",
   });
+}
+
+function residentPublishedProjectionDigestWithRuntime(
+  snapshot: ThreadProjectionSnapshot,
+  runtime: RuntimeSessionSummary,
+): string {
+  return digestNormalizedJson({
+    cursor: {
+      generation: snapshot.latestCursor.generation,
+      sequence: snapshot.latestCursor.sequence,
+    },
+    runtime,
+    transcript: snapshot.materializedRecentBlocks,
+    stream: snapshot.inProgressStream,
+    childAgents: snapshot.childAgents,
+    goal: snapshot.goals[0],
+    activity: snapshot.thread.status === "running",
+  });
+}
+
+function residentSelectedModelIdentity(command: CommandEnvelope): string {
+  if (command.command.kind !== "model.select") {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMAND_REQUIRED",
+      "An exact model.select command is required to identify the selected model",
+    );
+  }
+  return `${command.command.providerId}/${command.command.modelId}`;
+}
+
+function residentProjectionSelectedModelMatchesCommand(
+  projection: ResidentProjectionSnapshot,
+  command: CommandEnvelope,
+): boolean {
+  return command.command.kind === "model.select" &&
+    projection.selectedModel?.providerId === command.command.providerId &&
+    projection.selectedModel.modelId === command.command.modelId;
+}
+
+function modelSelectionCommittedAttemptForTransaction(
+  transaction: ResidentProjectionTransaction,
+): ModelSelectionAttempt {
+  const attempt = transaction.modelSelectionProofAttempt;
+  const invariantDigest = transaction.modelSelectionInvariantDigest;
+  const runningReceipt = transaction.modelSelectionRunningReceipt;
+  if (!attempt || !invariantDigest || !runningReceipt) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_PROJECTION_PROOF_CONFLICT",
+      "A model-selection projection transaction has no exact committed-attempt proof",
+    );
+  }
+  return createCommittedModelSelectionAttempt(
+    attempt,
+    transaction.snapshot.latestCursor,
+    transaction.projectionDigest,
+    invariantDigest,
+    runningReceipt,
+    transaction.snapshot.generatedAt,
+    transaction.snapshot.generatedAt,
+  );
+}
+
+function createCommittedModelSelectionAttempt(
+  attempt: ModelSelectionAttempt,
+  cursor: z.infer<typeof SessionCursorSchema>,
+  projectionDigest: string,
+  invariantDigest: string,
+  runningReceipt: CommandReceipt,
+  publishedAt: string,
+  updatedAt: string,
+): ModelSelectionAttempt {
+  const selection = attempt.command.command;
+  if (selection.kind !== "model.select") {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMAND_REQUIRED",
+      "Committed model-selection proof requires an exact model.select command",
+    );
+  }
+  const projectionProof: ModelSelectionProjectionProof = ModelSelectionProjectionProofSchema.parse({
+    bindingFingerprint: residentDispatchAuthorityFingerprint(attempt.binding),
+    selectedModel: {
+      providerId: selection.providerId,
+      modelId: selection.modelId,
+    },
+    cursor,
+    projectionDigest,
+    invariantDigest,
+    runningReceiptDigest: digestNormalizedJson(runningReceipt),
+    publishedAt,
+  });
+  return ModelSelectionAttemptSchema.parse({
+    ...attempt,
+    state: "projection_committed",
+    updatedAt,
+    projectionProof,
+  });
+}
+
+function residentModelSelectionProofAnchorForAttempt(
+  attempt: ModelSelectionAttempt,
+): z.infer<typeof ResidentModelSelectionProofAnchorSchema> {
+  if (attempt.state !== "projection_committed" || !attempt.projectionProof) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
+      "Only an exact projection-committed attempt can anchor model publication ancestry",
+    );
+  }
+  return ResidentModelSelectionProofAnchorSchema.parse({
+    deviceId: attempt.command.deviceId,
+    commandId: attempt.command.commandId,
+    committedAttemptDigest: digestNormalizedJson(attempt),
+  });
+}
+
+function assertModelSelectionCommittedReceiptFence(
+  attempt: ModelSelectionAttempt,
+  receipt: CommandReceipt,
+): void {
+  const proof = attempt.projectionProof;
+  if (
+    attempt.state !== "projection_committed" ||
+    !proof ||
+    !attempt.dispatchStartedAt ||
+    (receipt.status !== "running" && receipt.status !== "completed") ||
+    receipt.deviceId !== attempt.command.deviceId ||
+    receipt.commandId !== attempt.command.commandId ||
+    receipt.threadId !== attempt.command.threadId ||
+    receipt.executionGenerationId !== attempt.command.expectedExecutionGenerationId ||
+    receipt.receivedAt !== attempt.admittedAt ||
+    receipt.queuePosition !== undefined ||
+    (receipt.status === "completed" && receipt.error !== undefined)
+  ) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMITTED_RECEIPT_INVALID",
+      "Committed model-selection proof does not match its durable receipt lifecycle",
+    );
+  }
+  const runningReceipt = receipt.status === "running"
+    ? receipt
+    : CommandReceiptSchema.parse({
+        ...receipt,
+        status: "running",
+        message: MODEL_SELECTION_RUNNING_MESSAGE,
+        error: undefined,
+        queuePosition: undefined,
+        updatedAt: attempt.dispatchStartedAt,
+      });
+  if (
+    runningReceipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+    runningReceipt.updatedAt !== attempt.dispatchStartedAt ||
+    runningReceipt.error !== undefined ||
+    proof.runningReceiptDigest !== digestNormalizedJson(runningReceipt)
+  ) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMITTED_RECEIPT_INVALID",
+      "Committed model-selection proof lost its exact pre-publication running receipt",
+    );
+  }
+}
+
+function residentModelSelectionRuntimeInvariant(runtime: RuntimeSessionSummary): unknown {
+  const {
+    model: _model,
+    thinkingLevel: _thinkingLevel,
+    serviceTier: _serviceTier,
+    context,
+    ...stable
+  } = runtime;
+  return {
+    ...stable,
+    // Context presence and used-token evidence remain authoritative. Only the
+    // model-derived context-window maximum may change at an unchanged cursor.
+    ...(context ? { context: { usedTokens: context.usedTokens } } : {}),
+  };
+}
+
+function residentModelSelectionRuntimeDeltaIsValid(
+  previous: RuntimeSessionSummary,
+  candidate: RuntimeSessionSummary,
+): boolean {
+  return isDeepStrictEqual(
+    residentModelSelectionRuntimeInvariant(previous),
+    residentModelSelectionRuntimeInvariant(candidate),
+  );
+}
+
+function residentModelSelectionPrivateInvariantDigest(projection: ResidentProjectionSnapshot): string {
+  return digestNormalizedJson({
+    cursor: projection.cursor,
+    runtime: residentModelSelectionRuntimeInvariant(projection.runtime),
+    transcript: projection.transcript,
+    stream: projection.stream,
+    childAgents: projection.childAgents,
+    goal: projection.goal,
+    activity: residentPrivateProjectionReportsActivity(projection),
+  });
+}
+
+function residentModelSelectionPublishedInvariantDigest(
+  snapshot: ThreadProjectionSnapshot,
+  runtime: RuntimeSessionSummary,
+): string {
+  return digestNormalizedJson({
+    cursor: {
+      generation: snapshot.latestCursor.generation,
+      sequence: snapshot.latestCursor.sequence,
+    },
+    runtime: residentModelSelectionRuntimeInvariant(runtime),
+    transcript: snapshot.materializedRecentBlocks,
+    stream: snapshot.inProgressStream,
+    childAgents: snapshot.childAgents,
+    goal: snapshot.goals[0],
+    activity: snapshot.thread.status === "running",
+  });
+}
+
+function residentModelSelectionSameCursorDeltaIsValid(
+  source: ThreadProjectionSnapshot,
+  candidate: ResidentProjectionSnapshot,
+  lineage: ResidentProjectionCursorLineage,
+  attempt: ModelSelectionAttempt,
+): boolean {
+  const previousRuntime = source.runtime;
+  if (
+    !previousRuntime ||
+    attempt.command.command.kind !== "model.select" ||
+    !residentProjectionSelectedModelMatchesCommand(candidate, attempt.command) ||
+    candidate.runtime.model !== residentSelectedModelIdentity(attempt.command) ||
+    !residentModelSelectionRuntimeDeltaIsValid(previousRuntime, candidate.runtime)
+  ) {
+    return false;
+  }
+  return (
+    residentPublishedProjectionDigest(source) === lineage.current.digest &&
+    residentModelSelectionPublishedInvariantDigest(source, previousRuntime) ===
+      residentModelSelectionPrivateInvariantDigest(candidate) &&
+    residentProjectionDigestWithRuntime(candidate, previousRuntime) === lineage.current.digest
+  );
 }
 
 function residentEndProjectionIsMaterialized(
@@ -11303,6 +12693,40 @@ function residentAbortReconciliationLeaseMatchesAttempt(
 
 function residentDispatchAttemptRetainsReconciliation(attempt: ResidentDispatchAttempt): boolean {
   return residentPromptAttemptRetainsLock(attempt) || residentAbortAttemptRetainsBarrier(attempt);
+}
+
+function residentControlOperation(attempt: ResidentDispatchAttempt): ResidentControlOperation {
+  let phase: ResidentControlOperation["phase"];
+  if (attempt.state === "admitted") {
+    phase = "admitted";
+  } else if (attempt.state === "dispatching") {
+    phase = "dispatching";
+  } else if (attempt.finalReceipt?.status === "running") {
+    phase = "acknowledged";
+  } else if (attempt.finalReceipt?.status === "uncertain") {
+    phase = "uncertain";
+  } else {
+    throw new HostStoreError(
+      "RESIDENT_CONTROL_STATE_INVALID",
+      "A retained resident control barrier has no current control phase",
+    );
+  }
+  return {
+    kind: attempt.command.command.kind as "prompt" | "abort",
+    deviceId: attempt.command.deviceId,
+    commandId: attempt.command.commandId,
+    phase,
+    admittedAt: attempt.admittedAt,
+    changedAt: attempt.updatedAt,
+  };
+}
+
+function residentControlProjectionMatchesSemantic(
+  current: ResidentControlProjectionSnapshot,
+  semantic: Omit<ResidentControlProjectionSnapshot, "controlSequence" | "changedAt">,
+): boolean {
+  const { controlSequence: _controlSequence, changedAt: _changedAt, ...currentSemantic } = current;
+  return isDeepStrictEqual(currentSemantic, semantic);
 }
 
 function residentPromptAttemptRetainsLock(attempt: ResidentDispatchAttempt): boolean {

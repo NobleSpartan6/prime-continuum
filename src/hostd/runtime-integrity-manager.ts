@@ -8,6 +8,8 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
+  unlink,
   type FileHandle,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -36,6 +38,7 @@ const MAX_RUNTIME_FILE_MANIFEST_BYTES = 16 * 1024 * 1024;
 const MAX_RUNTIME_FILE_BYTES = 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES = 256 * 1024;
 const RUNTIME_FILE_CONCURRENCY = 16;
+const MAX_RUNTIME_REPAIR_QUARANTINES = 2;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const WINDOWS_SHORT_NAME_PATTERN = /~[0-9]+(?:\.[^.]*)?$/i;
@@ -257,7 +260,8 @@ export type RuntimeIntegrityFaultPoint =
   | "before_final_rename"
   | "after_final_rename"
   | "before_pointer_write"
-  | "after_pointer_write";
+  | "after_pointer_write"
+  | "before_repair_quarantine_prune";
 
 export interface RuntimeIntegrityManagerOptions {
   readonly paths: HostDataPaths;
@@ -293,6 +297,7 @@ export class RuntimeIntegrityManager {
   private readonly writeCurrent: NonNullable<RuntimeIntegrityManagerOptions["writeCurrent"]>;
   private readonly onProgress?: RuntimeIntegrityManagerOptions["onProgress"];
   private ensurePromise?: Promise<InstalledRuntimeIntegrityIdentity>;
+  private repairPromise?: Promise<InstalledRuntimeIntegrityIdentity>;
   private publicationPoison?: RuntimeIntegrityPublicationPoisonedError;
 
   constructor(options: RuntimeIntegrityManagerOptions) {
@@ -317,8 +322,12 @@ export class RuntimeIntegrityManager {
 
   ensureInstalled(seedRoot?: string): Promise<InstalledRuntimeIntegrityIdentity> {
     if (this.publicationPoison) return Promise.reject(this.publicationPoison);
+    if (this.repairPromise) return Promise.reject(new Error("Runtime repair is already active"));
     if (this.ensurePromise) return this.ensurePromise;
-    const attempt = this.ensureInstalledOnce(seedRoot);
+    const attempt = this.ensureInstalledOnce(seedRoot).then(async (identity) => {
+      await this.pruneRuntimeRepairQuarantines();
+      return identity;
+    });
     this.ensurePromise = attempt;
     attempt.then(
       () => {
@@ -326,6 +335,37 @@ export class RuntimeIntegrityManager {
       },
       () => {
         if (this.ensurePromise === attempt) this.ensurePromise = undefined;
+      },
+    );
+    return attempt;
+  }
+
+  /**
+   * Replaces only this build's exact content-addressed installed image from
+   * the embedded-attestation seed. Existing pointer/image bytes are retained
+   * under the host runtime directory for support inspection; project, thread,
+   * workspace, credential, and resident state are never addressed here.
+   *
+   * Callers must separately prove that no verified runtime handle or resident
+   * lifecycle can still be active. RuntimeIntegrityManager intentionally has
+   * no access to those higher-level authorities.
+   */
+  repairInstalled(seedRoot: string): Promise<InstalledRuntimeIntegrityIdentity> {
+    if (this.publicationPoison) return Promise.reject(this.publicationPoison);
+    if (this.ensurePromise || this.repairPromise) {
+      return Promise.reject(new Error("Runtime integrity work is already active"));
+    }
+    const attempt = this.repairInstalledOnce(seedRoot).then(async (identity) => {
+      await this.pruneRuntimeRepairQuarantines();
+      return identity;
+    });
+    this.repairPromise = attempt;
+    attempt.then(
+      () => {
+        if (this.repairPromise === attempt) this.repairPromise = undefined;
+      },
+      () => {
+        if (this.repairPromise === attempt) this.repairPromise = undefined;
       },
     );
     return attempt;
@@ -490,6 +530,136 @@ export class RuntimeIntegrityManager {
     }
 
     return await this.verifyInstalledUnderLease();
+  }
+
+  private async repairInstalledOnce(seedRoot: string): Promise<InstalledRuntimeIntegrityIdentity> {
+    this.assertManagerUsable();
+    await this.ownershipLease.assertActive();
+    const signal = this.ownershipLease.signal;
+    throwIfRuntimeIntegrityCancelled(signal);
+    this.reportProgress("preparing");
+    await this.prepareRuntimeDirectories(signal);
+
+    // Prove the complete packaged source before moving a single installed
+    // byte. promoteSeed repeats the verification while copying, closing a
+    // later seed-change window without trusting this preflight result.
+    const sourceDirectory = await this.resolveAndValidateSeed(seedRoot, signal);
+    this.reportProgress("verifying");
+    try {
+      await verifyRuntimeDirectory(sourceDirectory, this.attestation, undefined, signal);
+    } catch (error) {
+      throw classifyRuntimeRepairFailure(
+        errorCodeInChain(error, "ENOENT") ? "packaged_seed_unavailable" : "packaged_seed_invalid",
+        error,
+        "Packaged runtime repair source verification failed",
+      );
+    }
+
+    const expectedPointer = installedPointerFromAttestation(this.attestation);
+    const finalDirectory = this.finalDirectory();
+    await this.quarantineInstalledTarget(finalDirectory, signal);
+    await this.promoteSeed(sourceDirectory, finalDirectory, expectedPointer);
+    return await this.verifyInstalledUnderLease();
+  }
+
+  private async quarantineInstalledTarget(finalDirectory: string, signal: AbortSignal): Promise<void> {
+    throwIfRuntimeIntegrityCancelled(signal);
+    const pointerExists = await entryExists(this.paths.runtimeCurrent, signal);
+    const finalExists = await entryExists(finalDirectory, signal);
+    if (!pointerExists && !finalExists) return;
+
+    const quarantineRoot = join(this.paths.runtime, "quarantine");
+    assertContainedPath(this.paths.runtime, quarantineRoot, "runtime repair quarantine");
+    await ensurePrivateDirectory(quarantineRoot);
+    await assertPlainDirectory(quarantineRoot, "runtime repair quarantine", signal);
+    const existing = await readPlainDirectory(quarantineRoot, "runtime repair quarantine", signal);
+    if (existing.length > MAX_RUNTIME_REPAIR_QUARANTINES) {
+      throw new Error("Runtime repair quarantine limit reached");
+    }
+    for (const entry of existing) {
+      if (!/^repair-[A-Za-z0-9_-]{6,64}$/.test(entry.name)) {
+        throw new Error("Runtime repair quarantine contains an unexpected entry");
+      }
+      await assertPlainDirectory(join(quarantineRoot, entry.name), "runtime repair quarantine entry", signal);
+    }
+
+    const quarantineDirectory = await mkdtemp(join(quarantineRoot, "repair-"));
+    assertContainedPath(quarantineRoot, quarantineDirectory, "runtime repair quarantine entry");
+    let moved = false;
+    try {
+      await this.withPublicationPermit(async () => {
+        // Cancellation is deliberately not observed after permit admission.
+        // The content-addressed final is the only install directory moved;
+        // other versions remain untouched.
+        try {
+          if (finalExists) {
+            await rename(finalDirectory, join(quarantineDirectory, "installed-image"));
+            moved = true;
+          }
+          if (pointerExists) {
+            await rename(this.paths.runtimeCurrent, join(quarantineDirectory, "current.json"));
+            moved = true;
+          }
+          await syncParentDirectory(finalDirectory);
+          await syncParentDirectory(this.paths.runtimeCurrent);
+          await syncParentDirectory(join(quarantineDirectory, "installed-image"));
+        } catch (error) {
+          if (moved) throw new AtomicWriteAmbiguousCommitError(quarantineDirectory, error);
+          throw error;
+        }
+      });
+    } catch (error) {
+      throw error;
+    } finally {
+      if (!moved) await rmdir(quarantineDirectory).catch(() => undefined);
+    }
+  }
+
+  private async pruneRuntimeRepairQuarantines(): Promise<void> {
+    const signal = this.ownershipLease.signal;
+    throwIfRuntimeIntegrityCancelled(signal);
+    const quarantineRoot = join(this.paths.runtime, "quarantine");
+    assertContainedPath(this.paths.runtime, quarantineRoot, "runtime repair quarantine");
+    if (!(await entryExists(quarantineRoot, signal))) return;
+    await assertPlainDirectory(quarantineRoot, "runtime repair quarantine", signal);
+    const entries = await readPlainDirectory(quarantineRoot, "runtime repair quarantine", signal);
+    const candidates: Array<{ path: string; name: string; mtimeNs: bigint; empty: boolean }> = [];
+    for (const entry of entries) {
+      if (!/^repair-[A-Za-z0-9_-]{6,64}$/.test(entry.name) || !entry.isDirectory()) {
+        throw new Error("Runtime repair quarantine contains an unexpected entry");
+      }
+      const path = join(quarantineRoot, entry.name);
+      assertContainedPath(quarantineRoot, path, "runtime repair quarantine entry");
+      const topLevel = await validateRepairQuarantineTree(path, signal);
+      const metadata = await lstat(path, { bigint: true });
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error("Runtime repair quarantine entry must remain a plain directory");
+      }
+      candidates.push({ path, name: entry.name, mtimeNs: metadata.mtimeNs, empty: topLevel === 0 });
+    }
+
+    const nonempty = candidates.filter((candidate) => !candidate.empty);
+    const excess = Math.max(0, nonempty.length - MAX_RUNTIME_REPAIR_QUARANTINES);
+    const selected = [
+      ...candidates.filter((candidate) => candidate.empty),
+      ...nonempty
+        .sort((left, right) => left.mtimeNs === right.mtimeNs
+          ? compareRuntimePaths(left.name, right.name)
+          : left.mtimeNs < right.mtimeNs ? -1 : 1)
+        .slice(0, excess),
+    ];
+    if (selected.length === 0) return;
+    await this.faultInjector?.("before_repair_quarantine_prune");
+    await this.withPublicationPermit(async () => {
+      try {
+        for (const candidate of selected) {
+          await removeValidatedRepairQuarantineTree(candidate.path, quarantineRoot);
+        }
+        await syncParentDirectory(join(quarantineRoot, "repair-prune-boundary"));
+      } catch (error) {
+        throw new AtomicWriteAmbiguousCommitError(quarantineRoot, error);
+      }
+    });
   }
 
   private async prepareRuntimeDirectories(signal: AbortSignal): Promise<void> {
@@ -1052,6 +1222,67 @@ async function cleanupAbandonedStaging(stagingRoot: string, signal?: AbortSignal
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
     await rm(path, { recursive: true, force: false });
   }
+}
+
+async function validateRepairQuarantineTree(path: string, signal?: AbortSignal): Promise<number> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  await assertPlainDirectory(path, "runtime repair quarantine entry", signal);
+  const children = await readdir(path);
+  for (const child of children) {
+    if (child !== "current.json" && child !== "installed-image") {
+      throw new Error("Runtime repair quarantine entry contains an unexpected top-level name");
+    }
+    await assertDisposableRepairQuarantineEntry(join(path, child), path, signal);
+  }
+  return children.length;
+}
+
+async function assertDisposableRepairQuarantineEntry(
+  path: string,
+  quarantineDirectory: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  assertContainedPath(quarantineDirectory, path, "runtime repair quarantine content");
+  const metadata = await lstat(path, { bigint: true });
+  if (metadata.isSymbolicLink() || metadata.isFile()) return;
+  if (!metadata.isDirectory()) {
+    throw new Error("Runtime repair quarantine contains an unsupported filesystem entry");
+  }
+  const children = await readdir(path);
+  for (const child of children) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
+    if (!isSafeRuntimePath(child) || child.includes("/")) {
+      throw new Error("Runtime repair quarantine contains an unsafe entry name");
+    }
+    await assertDisposableRepairQuarantineEntry(join(path, child), quarantineDirectory, signal);
+  }
+}
+
+async function removeValidatedRepairQuarantineTree(path: string, quarantineRoot: string): Promise<void> {
+  assertContainedPath(quarantineRoot, path, "runtime repair quarantine entry");
+  await validateRepairQuarantineTree(path);
+  await removeRepairQuarantineEntryNoFollow(path, quarantineRoot);
+}
+
+async function removeRepairQuarantineEntryNoFollow(path: string, quarantineRoot: string): Promise<void> {
+  assertContainedPath(quarantineRoot, path, "runtime repair quarantine content");
+  const metadata = await lstat(path, { bigint: true });
+  if (metadata.isSymbolicLink() || metadata.isFile()) {
+    await unlink(path);
+    return;
+  }
+  if (!metadata.isDirectory()) {
+    throw new Error("Runtime repair quarantine contains an unsupported filesystem entry");
+  }
+  const children = await readdir(path);
+  for (const child of children) {
+    if (!isSafeRuntimePath(child) || child.includes("/")) {
+      throw new Error("Runtime repair quarantine contains an unsafe entry name");
+    }
+    await removeRepairQuarantineEntryNoFollow(join(path, child), quarantineRoot);
+  }
+  await rmdir(path);
 }
 
 async function assertDisposableStagingTree(path: string, signal?: AbortSignal): Promise<void> {

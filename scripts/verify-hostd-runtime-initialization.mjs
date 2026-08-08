@@ -22,6 +22,7 @@ const READY_DEADLINE_MS = 180_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const BASE_HEALTH_CAPABILITIES = Object.freeze([
+  "resident_control_projection_v1",
   "runtime_integrity_v1",
   "snapshot_chunks_v1",
 ].sort());

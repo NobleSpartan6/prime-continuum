@@ -20,7 +20,9 @@ import {
   HealthSnapshotSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
   type CommandEnvelope,
@@ -115,6 +117,32 @@ describe("runtime integrity health contract", () => {
         trustAnchorId: `sha256:${DIGEST_A}`,
       }).success,
     ).toBe(false);
+  });
+
+  it("binds repair capability to an eligible nonretryable installed-runtime failure", () => {
+    const repair = repairRuntimeSnapshot();
+    expect(HealthSnapshotSchema.safeParse({
+      ...healthBase(),
+      serviceState: "degraded",
+      capabilities: [RUNTIME_INTEGRITY_CAPABILITY, RUNTIME_INTEGRITY_REPAIR_CAPABILITY],
+      runtimeIntegrity: repair,
+    }).success).toBe(true);
+    expect(HealthSnapshotSchema.safeParse({
+      ...healthBase(),
+      serviceState: "degraded",
+      capabilities: [
+        RUNTIME_INTEGRITY_CAPABILITY,
+        RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+        RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+      ],
+      runtimeIntegrity: repair,
+    }).success).toBe(false);
+    expect(HealthSnapshotSchema.safeParse({
+      ...healthBase(),
+      serviceState: "degraded",
+      capabilities: [RUNTIME_INTEGRITY_CAPABILITY, RUNTIME_INTEGRITY_REPAIR_CAPABILITY],
+      runtimeIntegrity: runtimeSnapshot("failed"),
+    }).success).toBe(false);
   });
 });
 
@@ -214,6 +242,75 @@ describe("HostService runtime integrity readiness", () => {
     await service.close();
   });
 
+  it("advertises and starts exact trusted-local repair only while resident state is quiescent", async () => {
+    let current: RuntimeIntegritySnapshot = repairRuntimeSnapshot();
+    const repair = vi.fn(() => {
+      current = runtimeSnapshot("initializing");
+      return true;
+    });
+    const provider: RuntimeIntegrityReadinessProvider = {
+      snapshot: () => current,
+      repairAvailable: () => current.status === "failed",
+      repair,
+    };
+    const { service, store } = await temporaryService(provider);
+    const host = await store.getHost();
+
+    expect((await healthSnapshot(service)).capabilities).toContain(RUNTIME_INTEGRITY_REPAIR_CAPABILITY);
+    expect((await healthSnapshot(service, SSH_BRIDGE_SESSION)).capabilities).not.toContain(
+      RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+    );
+    expect(await repairRuntimeIntegrity(service, host.hostId, repairRuntimeSnapshot())).toMatchObject({
+      ok: true,
+      method: "runtime.integrity.repair",
+      result: { status: "initializing" },
+    });
+    expect(repair).toHaveBeenCalledOnce();
+    expect((await healthSnapshot(service)).capabilities).not.toContain(RUNTIME_INTEGRITY_REPAIR_CAPABILITY);
+    await service.close();
+  });
+
+  it("rejects stale, remote, and resident-active repair without invoking the mutation", async () => {
+    const repair = vi.fn(() => true);
+    const provider: RuntimeIntegrityReadinessProvider = {
+      snapshot: repairRuntimeSnapshot,
+      repairAvailable: () => true,
+      repair,
+    };
+    const idle = await temporaryService(provider);
+    const idleHost = await idle.store.getHost();
+    const stale = repairRuntimeSnapshot();
+    expect(await repairRuntimeIntegrity(idle.service, idleHost.hostId, {
+      ...stale,
+      changedAt: "2026-08-06T00:00:00.000Z",
+    })).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_INTEGRITY_REPAIR_AUTHORITY_CHANGED", retryable: true },
+    });
+    expect(await repairRuntimeIntegrity(
+      idle.service,
+      idleHost.hostId,
+      stale,
+      SSH_BRIDGE_SESSION,
+    )).toMatchObject({
+      ok: false,
+      error: { code: "REMOTE_RUNTIME_INTEGRITY_REPAIR_FORBIDDEN" },
+    });
+    await idle.service.close();
+
+    const active = await temporaryService(provider, residentGateway());
+    const activeHost = await active.store.getHost();
+    expect((await healthSnapshot(active.service)).capabilities).not.toContain(
+      RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+    );
+    expect(await repairRuntimeIntegrity(active.service, activeHost.hostId, stale)).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_REPAIR_RESIDENT_STATE_ACTIVE" },
+    });
+    expect(repair).not.toHaveBeenCalled();
+    await active.service.close();
+  });
+
   it.each([
     ["initializing", "starting"],
     ["ready", "ready"],
@@ -227,7 +324,11 @@ describe("HostService runtime integrity readiness", () => {
     const health = await healthSnapshot(service);
 
     expect(health.serviceState).toBe(expectedServiceState);
-    expect(health.capabilities).toEqual(["snapshot_chunks_v1", RUNTIME_INTEGRITY_CAPABILITY]);
+    expect(health.capabilities).toEqual([
+      "snapshot_chunks_v1",
+      RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+      RUNTIME_INTEGRITY_CAPABILITY,
+    ]);
     expect(health.runtimeIntegrity).toEqual(runtimeIntegrity);
     await service.close();
   });
@@ -404,6 +505,16 @@ function runtimeSnapshot(status: RuntimeIntegritySnapshot["status"]): RuntimeInt
   }
 }
 
+function repairRuntimeSnapshot(): Extract<RuntimeIntegritySnapshot, { status: "failed" }> {
+  const snapshot = runtimeSnapshot("failed") as Extract<RuntimeIntegritySnapshot, { status: "failed" }>;
+  return {
+    ...snapshot,
+    code: "RUNTIME_REPAIR_REQUIRED",
+    retryable: false,
+    recoveryAction: "repair_application",
+  };
+}
+
 function healthBase(): Omit<HealthSnapshot, "runtimeIntegrity"> {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -497,6 +608,28 @@ async function retryRuntimeIntegrity(
       requestId: "runtime-integrity-retry",
       method: "runtime.integrity.retry",
       payload: { expectedHostId },
+    },
+    context,
+  );
+}
+
+async function repairRuntimeIntegrity(
+  service: HostService,
+  expectedHostId: string,
+  expected: Extract<RuntimeIntegritySnapshot, { status: "failed" }>,
+  context: HostSessionContext = TRUSTED_USER_SESSION,
+) {
+  return service.handle(
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "runtime-integrity-repair",
+      method: "runtime.integrity.repair",
+      payload: {
+        expectedHostId,
+        expectedTrustAnchorId: expected.trustAnchorId,
+        expectedTarget: expected.target,
+        expectedChangedAt: expected.changedAt,
+      },
     },
     context,
   );

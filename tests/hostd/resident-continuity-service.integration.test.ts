@@ -1,11 +1,13 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GatewayError,
+  UnavailablePrimeAgentGateway,
   type GatewayAdmission,
   type GatewayDispatchContext,
   type PrimeAgentGateway,
@@ -22,11 +24,13 @@ import {
   HostStore,
   validateResidentDispatchLease,
   type ResidentDispatchLease,
+  type HostStoreOptions,
 } from "../../src/hostd/store";
 import {
   PROTOCOL_VERSION,
   type CommandEnvelope,
   type CommandReceipt,
+  type ResidentControlProjectionSnapshot,
 } from "../../src/shared/protocol";
 import { encodeJsonFrame, LengthPrefixedJsonDecoder } from "../../src/shared/frame-codec";
 
@@ -37,6 +41,384 @@ afterEach(async () => {
 });
 
 describe("HostService resident continuity dispatch integration", () => {
+  it("publishes stable monotonic control state across distinct command-envelope identities without replay", async () => {
+    const gateway = residentGateway((command) => ({
+      disposition: command.command.kind === "prompt" ? "accepted" : "handled",
+      message: command.command.kind === "prompt"
+        ? "Prime Agent owns the prompt"
+        : "Prime Agent accepted Stop",
+    }));
+    const fixture = await serviceFixture(gateway);
+    await publishIdleResidentProjection(fixture, "resident-control-initial-idle");
+
+    const health = await fixture.service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-health",
+      method: "health.get",
+      payload: {},
+    }, TRUSTED_USER_SESSION);
+    expect(health).toMatchObject({
+      ok: true,
+      result: { capabilities: expect.arrayContaining(["resident_control_projection_v1"]) },
+    });
+
+    const idle = await controlSnapshot(fixture.service, fixture.hostId, "resident-control-idle");
+    expect(idle).toMatchObject({
+      hostId: fixture.hostId,
+      threadId: "test-thread",
+      executionGenerationId: "test-execution-1",
+      controlSequence: 0,
+      quiescence: { state: "idle_proven" },
+    });
+    expect(idle.operation).toBeUndefined();
+    expect(await controlSnapshot(fixture.service, fixture.hostId, "resident-control-idle-repeat"))
+      .toEqual(idle);
+
+    const prompt = {
+      ...residentCommand(fixture.hostId, "device-a-prompt", "prompt"),
+      deviceId: "device-a",
+    } satisfies CommandEnvelope;
+    expect(await submitCommand(fixture.service, prompt, "device-a-prompt-submit"))
+      .toMatchObject({ status: "running" });
+    const promptOwned = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-prompt-owned",
+    );
+    expect(promptOwned).toMatchObject({
+      controlSequence: idle.controlSequence + 1,
+      operation: {
+        kind: "prompt",
+        deviceId: "device-a",
+        commandId: prompt.commandId,
+        phase: "acknowledged",
+      },
+      quiescence: { state: "prompt_owned" },
+    });
+
+    const stop = {
+      ...residentCommand(fixture.hostId, "device-b-stop", "abort"),
+      deviceId: "device-b",
+    } satisfies CommandEnvelope;
+    expect(await submitCommand(fixture.service, stop, "device-b-stop-submit"))
+      .toMatchObject({ status: "running" });
+    const stopOwned = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-stop-owned",
+    );
+    expect(stopOwned).toMatchObject({
+      controlSequence: promptOwned.controlSequence + 1,
+      operation: {
+        kind: "abort",
+        deviceId: "device-b",
+        commandId: stop.commandId,
+        phase: "acknowledged",
+      },
+      quiescence: { state: "stop_owned" },
+    });
+    expect(await controlSnapshot(fixture.service, fixture.hostId, "resident-control-stop-repeat"))
+      .toEqual(stopOwned);
+    expect(gateway.submit).toHaveBeenCalledTimes(2);
+    await fixture.service.close();
+
+    const restartedStore = new HostStore(fixture.directory);
+    const restartedGateway = residentGateway(() => {
+      throw new Error("resident control polling must never replay a mutation");
+    });
+    const restartedService = new HostService(restartedStore, restartedGateway);
+    await restartedService.initialize();
+    expect(await controlSnapshot(restartedService, fixture.hostId, "resident-control-after-restart"))
+      .toEqual(stopOwned);
+    expect(restartedGateway.isLive).not.toHaveBeenCalled();
+    expect(restartedGateway.submit).not.toHaveBeenCalled();
+
+    const stale = await restartedService.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-stale-generation",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: fixture.hostId,
+        threadId: "test-thread",
+        expectedExecutionGenerationId: "test-execution-stale",
+      },
+    }, TRUSTED_USER_SESSION);
+    expect(stale).toMatchObject({
+      ok: false,
+      error: { code: "STALE_EXECUTION_GENERATION", retryable: false },
+    });
+    const wrongHost = await restartedService.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-wrong-host",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: "other-host",
+        threadId: "test-thread",
+        expectedExecutionGenerationId: "test-execution-1",
+      },
+    }, TRUSTED_USER_SESSION);
+    expect(wrongHost).toMatchObject({
+      ok: false,
+      error: { code: "HOST_AUTHORITY_MISMATCH", retryable: false },
+    });
+    await restartedService.close();
+  });
+
+  it("keeps an active binding uncertain when no exact resident projection lineage exists", async () => {
+    const gateway = residentGateway(() => {
+      throw new Error("resident control discovery must never dispatch a mutation");
+    });
+    const fixture = await serviceFixture(gateway);
+
+    const snapshot = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-placeholder-lineage",
+    );
+
+    expect(snapshot.quiescence).toEqual({ state: "uncertain", reason: "lifecycle_transition" });
+    expect(snapshot.operation).toBeUndefined();
+    expect(gateway.isResidentBindingLive).toHaveBeenCalledWith(fixture.binding);
+    expect(gateway.submit).not.toHaveBeenCalled();
+    await fixture.service.close();
+  });
+
+  it("keeps an exact inactive projection uncertain while the resident gateway is unavailable", async () => {
+    const fixture = await serviceFixture(new UnavailablePrimeAgentGateway());
+    await publishIdleResidentProjection(fixture, "resident-control-unavailable-gateway");
+
+    const snapshot = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-unavailable-gateway-read",
+    );
+
+    expect(snapshot.quiescence).toEqual({ state: "uncertain", reason: "lifecycle_transition" });
+    expect(snapshot.operation).toBeUndefined();
+    await fixture.service.close();
+  });
+
+  it("reports idle only when exact lineage and the gateway's exact prepared binding agree", async () => {
+    const gateway = residentGateway(() => {
+      throw new Error("resident control discovery must never dispatch a mutation");
+    });
+    const fixture = await serviceFixture(gateway);
+    await publishIdleResidentProjection(fixture, "resident-control-exact-live");
+
+    const snapshot = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-exact-live-read",
+    );
+
+    expect(snapshot.quiescence).toEqual({ state: "idle_proven" });
+    expect(snapshot.operation).toBeUndefined();
+    expect(gateway.isResidentBindingLive).toHaveBeenCalledWith(fixture.binding);
+    expect(gateway.isLive).not.toHaveBeenCalled();
+    expect(gateway.submit).not.toHaveBeenCalled();
+    await fixture.service.close();
+  });
+
+  it("stays uncertain after restart until the exact resident binding is prepared again", async () => {
+    const firstGateway = residentGateway(() => {
+      throw new Error("resident control discovery must never dispatch a mutation");
+    });
+    const fixture = await serviceFixture(firstGateway);
+    await publishIdleResidentProjection(fixture, "resident-control-restart-idle");
+    expect((await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-before-restart",
+    )).quiescence).toEqual({ state: "idle_proven" });
+    await fixture.service.close();
+
+    const restartedStore = new HostStore(fixture.directory);
+    const restartedGateway = residentGateway(() => {
+      throw new Error("resident reconnect discovery must never dispatch a mutation");
+    }, { bindingLive: false });
+    const restartedService = new HostService(restartedStore, restartedGateway);
+    await restartedService.initialize();
+
+    const reconnecting = await controlSnapshot(
+      restartedService,
+      fixture.hostId,
+      "resident-control-restart-before-reattach",
+    );
+    expect(reconnecting.quiescence).toEqual({ state: "uncertain", reason: "lifecycle_transition" });
+    expect(restartedGateway.submit).not.toHaveBeenCalled();
+
+    restartedGateway.isResidentBindingLive.mockResolvedValue(true);
+    const reattached = await controlSnapshot(
+      restartedService,
+      fixture.hostId,
+      "resident-control-restart-after-reattach",
+    );
+    expect(reattached).toMatchObject({
+      controlSequence: reconnecting.controlSequence + 1,
+      quiescence: { state: "idle_proven" },
+    });
+    expect(restartedGateway.submit).not.toHaveBeenCalled();
+    await restartedService.close();
+  });
+
+  it("keeps an explicitly detached generation uncertain across restart instead of synthesizing idle", async () => {
+    const fixture = await serviceFixture(residentGateway(() => {
+      throw new Error("detach control discovery must not dispatch a mutation");
+    }));
+    await publishIdleResidentProjection(fixture, "resident-control-before-detach");
+    const before = await controlSnapshot(fixture.service, fixture.hostId, "resident-control-before-detach");
+    expect(before.quiescence).toEqual({ state: "idle_proven" });
+
+    await fixture.store.detachResidentLifecycle({
+      operationId: "resident-control-explicit-detach",
+      expectedHostId: fixture.hostId,
+      projectId: "test-project",
+      workspaceId: "test-workspace",
+      threadId: "test-thread",
+      executionGenerationId: "test-execution-1",
+      requestDigest: "d".repeat(64),
+    }, fixture.binding);
+    const detached = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-after-detach",
+    );
+    expect(detached).toMatchObject({
+      controlSequence: before.controlSequence + 1,
+      quiescence: { state: "uncertain", reason: "lifecycle_transition" },
+    });
+    expect(detached.operation).toBeUndefined();
+    await fixture.service.close();
+
+    const restartedStore = new HostStore(fixture.directory);
+    const restartedService = new HostService(restartedStore, residentGateway(() => {
+      throw new Error("detached restart discovery must remain read-only");
+    }));
+    await restartedService.initialize();
+    expect(await controlSnapshot(restartedService, fixture.hostId, "resident-control-detached-restart"))
+      .toEqual(detached);
+    await restartedService.close();
+  });
+
+  it("fails closed on a corrupt durable resident control projection", async () => {
+    const fixture = await serviceFixture(residentGateway(() => {
+      throw new Error("control polling must remain read-only");
+    }));
+    await publishIdleResidentProjection(fixture, "resident-control-before-corruption");
+    await controlSnapshot(fixture.service, fixture.hostId, "resident-control-before-corruption");
+    await fixture.service.close();
+    const files = await readdir(fixture.store.paths.residentControlProjections);
+    expect(files).toHaveLength(1);
+    await writeFile(
+      join(fixture.store.paths.residentControlProjections, files[0]!),
+      "{\"projectionVersion\":1",
+      "utf8",
+    );
+
+    const restartedStore = new HostStore(fixture.directory);
+    const restartedService = new HostService(restartedStore, residentGateway(() => {
+      throw new Error("corrupt control state must not dispatch");
+    }));
+    await restartedService.initialize();
+    const response = await restartedService.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-corrupt-read",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: fixture.hostId,
+        threadId: "test-thread",
+        expectedExecutionGenerationId: "test-execution-1",
+      },
+    }, TRUSTED_USER_SESSION);
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "RESIDENT_CONTROL_PROJECTION_INVALID", retryable: false },
+    });
+    await restartedService.close();
+  });
+
+  it("compacts only a validated stale generation under pressure and preserves current state across restart", async () => {
+    const fixture = await serviceFixture(
+      residentGateway(() => {
+        throw new Error("control polling must remain read-only");
+      }),
+      { residentControlProjectionLimit: 1 },
+    );
+    await publishIdleResidentProjection(fixture, "resident-control-at-capacity");
+    const current = await controlSnapshot(fixture.service, fixture.hostId, "resident-control-at-capacity");
+    const staleExecutionGenerationId = "test-execution-stale";
+    const staleFileName = `${createHash("sha256")
+      .update(JSON.stringify(["test-thread", staleExecutionGenerationId]))
+      .digest("hex")}.json`;
+    await writeFile(
+      join(fixture.store.paths.residentControlProjections, staleFileName),
+      `${JSON.stringify({
+        ...current,
+        executionGenerationId: staleExecutionGenerationId,
+        authorityCursor: {
+          ...current.authorityCursor,
+          executionGenerationId: staleExecutionGenerationId,
+        },
+      })}\n`,
+      "utf8",
+    );
+    expect(await readdir(fixture.store.paths.residentControlProjections)).toHaveLength(2);
+    await fixture.service.close();
+
+    const restartedStore = new HostStore(fixture.directory, { residentControlProjectionLimit: 1 });
+    const restartedService = new HostService(restartedStore, residentGateway(() => {
+      throw new Error("control compaction must not dispatch a mutation");
+    }));
+    await restartedService.initialize();
+    expect(await readdir(restartedStore.paths.residentControlProjections)).toHaveLength(1);
+    expect(await controlSnapshot(restartedService, fixture.hostId, "resident-control-after-compaction"))
+      .toEqual(current);
+    await restartedService.close();
+  });
+
+  it("fails closed at the bound when every retained generation is still current", async () => {
+    const fixture = await serviceFixture(
+      residentGateway(() => {
+        throw new Error("control polling must remain read-only");
+      }),
+      { residentControlProjectionLimit: 1 },
+    );
+    await publishIdleResidentProjection(fixture, "resident-control-first-current");
+    await controlSnapshot(fixture.service, fixture.hostId, "resident-control-first-current");
+    const second = await bootstrapTestWorkspace(fixture.store, {
+      operationId: "resident-control-second-bootstrap",
+      projectId: "test-project-two",
+      workspaceId: "test-workspace-two",
+      threadId: "test-thread-two",
+      executionGenerationId: "test-execution-two",
+      projectionGeneration: "test-projection-two",
+    });
+    await fixture.store.persistResidentSessionBinding({
+      ...fixture.binding,
+      threadId: second.thread.threadId,
+      executionGenerationId: second.thread.currentLocation.executionGenerationId,
+      workspaceDirectory: second.workspaceDirectory,
+      activeSessionId: "resident-control-second-active",
+      sessionId: "resident-control-second-session",
+      sessionFile: join(second.workspaceDirectory, ".prime-agent", "resident-control-second.jsonl"),
+    });
+    const response = await fixture.service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-all-current-capacity",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: fixture.hostId,
+        threadId: second.thread.threadId,
+        expectedExecutionGenerationId: second.thread.currentLocation.executionGenerationId,
+      },
+    }, TRUSTED_USER_SESSION);
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "RESIDENT_CONTROL_PROJECTION_LIMIT", retryable: false },
+    });
+    await fixture.service.close();
+  });
+
   it("passes the exact opaque Store lease, records prompt ownership as running, and short-circuits duplicates", async () => {
     let observedLease: ResidentDispatchLease | undefined;
     const gateway = residentGateway((command, context) => {
@@ -351,7 +733,7 @@ describe("HostService resident continuity dispatch integration", () => {
   });
 });
 
-async function serviceFixture(gateway: FakeResidentGateway): Promise<{
+async function serviceFixture(gateway: PrimeAgentGateway, storeOptions: HostStoreOptions = {}): Promise<{
   directory: string;
   service: HostService;
   store: HostStore;
@@ -363,7 +745,7 @@ async function serviceFixture(gateway: FakeResidentGateway): Promise<{
   const workspacePath = join(directory, "workspace");
   await mkdir(workspacePath, { recursive: true });
   const workspaceDirectory = await realpath(workspacePath);
-  const store = new HostStore(directory);
+  const store = new HostStore(directory, storeOptions);
   const service = new HostService(store, gateway);
   await service.initialize();
   await bootstrapTestWorkspace(store, { workspaceDirectory });
@@ -385,6 +767,7 @@ async function serviceFixture(gateway: FakeResidentGateway): Promise<{
 
 type FakeResidentGateway = PrimeAgentGateway & {
   isLive: ReturnType<typeof vi.fn>;
+  isResidentBindingLive: ReturnType<typeof vi.fn>;
   submit: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
 };
@@ -394,14 +777,26 @@ function residentGateway(
     command: CommandEnvelope,
     context?: GatewayDispatchContext,
   ) => GatewayAdmission | Promise<GatewayAdmission>,
+  options: { bindingLive?: boolean } = {},
 ): FakeResidentGateway {
   return {
     continuity: "resident",
     isLive: vi.fn(async () => true),
+    isResidentBindingLive: vi.fn(async () => options.bindingLive ?? true),
     submit: vi.fn(async (command: CommandEnvelope, context?: GatewayDispatchContext) =>
       handler(command, context)),
     close: vi.fn(async () => undefined),
   };
+}
+
+async function publishIdleResidentProjection(
+  fixture: { store: HostStore; binding: ResidentSessionBinding },
+  generation: string,
+): Promise<void> {
+  await fixture.store.publishResidentProjectionSnapshot(
+    fixture.binding,
+    projection(fixture.binding, generation, 1, false),
+  );
 }
 
 function binding(workspaceDirectory: string): ResidentSessionBinding {
@@ -509,6 +904,27 @@ async function submitCommand(
   );
   if (!response.ok || response.method !== "command.submit") {
     throw new Error("Resident command submission failed at the host protocol boundary");
+  }
+  return response.result;
+}
+
+async function controlSnapshot(
+  service: HostService,
+  expectedHostId: string,
+  requestId: string,
+): Promise<ResidentControlProjectionSnapshot> {
+  const response = await service.handle({
+    protocolVersion: PROTOCOL_VERSION,
+    requestId,
+    method: "thread.control.snapshot",
+    payload: {
+      expectedHostId,
+      threadId: "test-thread",
+      expectedExecutionGenerationId: "test-execution-1",
+    },
+  }, TRUSTED_USER_SESSION);
+  if (!response.ok || response.method !== "thread.control.snapshot") {
+    throw new Error("Resident control projection request failed at the host protocol boundary");
   }
   return response.result;
 }

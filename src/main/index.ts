@@ -1,10 +1,15 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions, type Session } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { registerControlIpc } from './control/ipc'
+import { isTrustedRendererSender, registerControlIpc } from './control/ipc'
 import type { ConnectionState } from './control/contracts'
 import { stopPackageSmokeHostds } from './control/local-hostd'
 import { DesktopControlService } from './control/service'
+import {
+  createHudWindowPreferencesStore,
+  HudWindowController,
+  registerHudIpc,
+} from './hud-window'
 import { installOrderlyQuitDrain } from './orderly-quit'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
@@ -13,7 +18,9 @@ import { RESIDENT_LIFECYCLE_CAPABILITY } from '../shared/protocol'
 let mainWindow: BrowserWindow | undefined
 let trustedRendererUrl = ''
 let unregisterIpc: (() => void) | undefined
+let unregisterHudIpc: (() => void) | undefined
 let unregisterOrderlyQuit: (() => void) | undefined
+let hudWindowController: HudWindowController | undefined
 const configuredSessions = new WeakSet<Session>()
 const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
 
@@ -32,13 +39,7 @@ function createWindow(loadImmediately = true, showWhenReady = true): BrowserWind
     webPreferences: secureWebPreferences(resolvePreloadEntry(__dirname))
   })
 
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  window.webContents.on('will-navigate', (event, url) => {
-    if (!isSameDocumentNavigation(window.webContents.getURL(), url)) event.preventDefault()
-  })
-  window.webContents.on('will-redirect', (event) => event.preventDefault())
-  window.webContents.on('will-attach-webview', (event) => event.preventDefault())
-  configureSession(window.webContents.session)
+  hardenRendererWindow(window)
 
   if (showWhenReady) window.once('ready-to-show', () => window.show())
   window.once('closed', () => {
@@ -47,6 +48,36 @@ function createWindow(loadImmediately = true, showWhenReady = true): BrowserWind
 
   if (loadImmediately) loadRenderer(window, rendererFile)
   return window
+}
+
+function ensureMainWindow(): BrowserWindow {
+  const existing = mainWindow
+  if (existing && !existing.isDestroyed()) return existing
+  mainWindow = createWindow()
+  return mainWindow
+}
+
+function showMainWindow(): BrowserWindow {
+  const window = ensureMainWindow()
+  if (window.isMinimized()) window.restore()
+  if (!window.isVisible()) window.show()
+  window.focus()
+  return window
+}
+
+function trustedRendererWindows(): BrowserWindow[] {
+  const windows = [mainWindow, hudWindowController?.window()]
+  return windows.filter((window): window is BrowserWindow => Boolean(window && !window.isDestroyed()))
+}
+
+function hardenRendererWindow(window: BrowserWindow): void {
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  window.webContents.on('will-navigate', (event, url) => {
+    if (!isSameDocumentNavigation(window.webContents.getURL(), url)) event.preventDefault()
+  })
+  window.webContents.on('will-redirect', (event) => event.preventDefault())
+  window.webContents.on('will-attach-webview', (event) => event.preventDefault())
+  configureSession(window.webContents.session)
 }
 
 function configureSession(session: Session): void {
@@ -81,10 +112,15 @@ function configureSession(session: Session): void {
 
 function loadRenderer(
   window: BrowserWindow,
-  rendererFile = path.join(__dirname, '../renderer/index.html')
+  rendererFile = path.join(__dirname, '../renderer/index.html'),
+  query?: Readonly<Record<string, string>>,
 ): Promise<void> {
-  if (process.env.ELECTRON_RENDERER_URL) return window.loadURL(process.env.ELECTRON_RENDERER_URL)
-  return window.loadFile(rendererFile)
+  if (process.env.ELECTRON_RENDERER_URL) {
+    const rendererUrl = new URL(process.env.ELECTRON_RENDERER_URL)
+    for (const [key, value] of Object.entries(query ?? {})) rendererUrl.searchParams.set(key, value)
+    return window.loadURL(rendererUrl.href)
+  }
+  return window.loadFile(rendererFile, query ? { query: { ...query } } : undefined)
 }
 
 function isSameDocumentNavigation(currentValue: string, nextValue: string): boolean {
@@ -251,6 +287,7 @@ async function waitForPackageSmokeConnection(window: BrowserWindow): Promise<voi
 
 void app.whenReady().then(async () => {
   app.setAppUserModelId('ai.primeintellect.continuim')
+  const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
   const service = new DesktopControlService({
     app,
     openExternal: async (url) => {
@@ -271,10 +308,15 @@ void app.whenReady().then(async () => {
     }
   })
   unregisterOrderlyQuit = installOrderlyQuitDrain(app, {
-    drain: () => service.shutdown(),
+    drain: async () => {
+      await service.shutdown()
+      await hudWindowController?.dispose()
+    },
     cleanup: () => {
       unregisterIpc?.()
       unregisterIpc = undefined
+      unregisterHudIpc?.()
+      unregisterHudIpc = undefined
       unregisterOrderlyQuit?.()
       unregisterOrderlyQuit = undefined
     },
@@ -282,24 +324,49 @@ void app.whenReady().then(async () => {
       process.stderr.write(
         `Prime Continuim could not confirm sign-in shutdown: ${error instanceof Error ? error.message : 'unknown error'}\n`
       )
+      // A failed drain deliberately keeps host ownership alive. If the user
+      // closed the last HUD/workbench window first, restore a visible recovery
+      // surface instead of leaving that safety state as a headless process.
+      if (!packageSmoke) {
+        try {
+          showMainWindow()
+        } catch (recoveryError) {
+          process.stderr.write(
+            `Prime Continuim could not restore the workbench after shutdown failed: ${recoveryError instanceof Error ? recoveryError.message : 'unknown error'}\n`
+          )
+        }
+      }
     }
   })
-  const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
   mainWindow = createWindow(false, !packageSmoke)
+  hudWindowController = new HudWindowController({
+    preloadPath: resolvePreloadEntry(__dirname),
+    store: createHudWindowPreferencesStore(path.join(app.getPath('userData'), 'hud-window.json')),
+    getMainWindow: () => mainWindow,
+    restoreMainWindow: () => ensureMainWindow(),
+    loadWindow: (window) => loadRenderer(window, undefined, { surface: 'hud' }),
+    hardenWindow: (window) => hardenRendererWindow(window),
+    onError: (error) => {
+      process.stderr.write(
+        `Prime Continuim could not retain desktop HUD geometry: ${error instanceof Error ? error.message : 'unknown error'}\n`
+      )
+    },
+  })
+  await hudWindowController.initialize()
   unregisterIpc = registerControlIpc({
     ipcMain,
     service,
-    getWindow: () => mainWindow,
-    isTrustedSender: (event) => {
-      const window = mainWindow
-      return Boolean(
-        window &&
-          !window.isDestroyed() &&
-          event.sender === window.webContents &&
-          event.senderFrame === window.webContents.mainFrame &&
-          rendererUrlIsTrusted(event.senderFrame.url)
-      )
-    }
+    getWindows: trustedRendererWindows,
+    isTrustedSender: (event) =>
+      isTrustedRendererSender(event, trustedRendererWindows(), rendererUrlIsTrusted),
+  })
+  unregisterHudIpc = registerHudIpc({
+    ipcMain,
+    controller: hudWindowController,
+    isTrustedMainSender: (event) =>
+      isTrustedRendererSender(event, mainWindow ? [mainWindow] : [], rendererUrlIsTrusted),
+    isTrustedHudSender: (event, window) =>
+      isTrustedRendererSender(event, [window], rendererUrlIsTrusted),
   })
   if (packageSmoke) {
     try {
@@ -315,7 +382,7 @@ void app.whenReady().then(async () => {
   void loadRenderer(mainWindow)
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()
+    showMainWindow()
   })
 })
 

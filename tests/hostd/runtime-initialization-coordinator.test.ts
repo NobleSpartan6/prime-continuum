@@ -349,6 +349,98 @@ describe("RuntimeInitializationCoordinator", () => {
     expect(coordinator.snapshot()).toMatchObject({ status: "failed", ...failure });
   });
 
+  it("starts one scoped repair only for an eligible failed generation with an attested seed", async () => {
+    const scheduled: Array<() => void> = [];
+    const repairInstalled = vi.fn(async () => installedIdentity());
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => {
+          throw new RuntimeIntegrityRepairRequiredError(
+            "packaged_seed_unavailable",
+            new Error("seed was unavailable during initial promotion"),
+          );
+        },
+        repairInstalled,
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
+      }),
+    });
+
+    coordinator.start(createLease(), "C:\\runtime-seed");
+    scheduled.shift()?.();
+    await flushMicrotasks();
+    expect(coordinator.snapshot()).toMatchObject({
+      status: "failed",
+      code: "RUNTIME_REPAIR_REQUIRED",
+      retryable: false,
+    });
+    expect(coordinator.repairAvailable()).toBe(true);
+    expect(coordinator.repair()).toBe(true);
+    expect(coordinator.snapshot()).toMatchObject({
+      status: "initializing",
+      phase: "preparing",
+      attempt: 2,
+    });
+    expect(coordinator.repairAvailable()).toBe(false);
+    expect(coordinator.repair()).toBe(false);
+
+    scheduled.shift()?.();
+    await flushMicrotasks();
+    expect(repairInstalled).toHaveBeenCalledOnce();
+    expect(repairInstalled).toHaveBeenCalledWith("C:\\runtime-seed");
+    expect(coordinator.snapshot()).toMatchObject({ status: "ready" });
+  });
+
+  it("permanently restart-gates repair after any verified handle leaves the coordinator", async () => {
+    const scheduled: Array<() => void> = [];
+    const acquireVerifiedRuntimeHandle = vi
+      .fn<() => Promise<VerifiedInstalledRuntimeHandle>>()
+      .mockResolvedValueOnce(verifiedHandle())
+      .mockRejectedValueOnce(new RuntimeIntegrityInstalledCorruptionError(new Error("later drift")));
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => installedIdentity(),
+        repairInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle,
+      }),
+    });
+    coordinator.start(createLease(), "C:\\runtime-seed");
+    scheduled.shift()?.();
+    await flushMicrotasks();
+
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).resolves.toBeDefined();
+    await expect(coordinator.acquireVerifiedRuntimeHandle()).rejects.toBeInstanceOf(
+      RuntimeIntegrityInstalledCorruptionError,
+    );
+    expect(coordinator.snapshot()).toMatchObject({
+      status: "failed",
+      code: "RUNTIME_INSTALLED_CORRUPTION",
+    });
+    expect(coordinator.repairAvailable()).toBe(false);
+    expect(coordinator.repair()).toBe(false);
+  });
+
+  it("does not advertise repair without an immutable packaged seed", async () => {
+    const scheduled: Array<() => void> = [];
+    const coordinator = createCoordinator({
+      schedule: (work) => scheduled.push(work),
+      managerFactory: () => ({
+        ensureInstalled: async () => {
+          throw new RuntimeIntegrityInstalledCorruptionError(new Error("corrupt final"));
+        },
+        repairInstalled: async () => installedIdentity(),
+        acquireVerifiedRuntimeHandle: async () => verifiedHandle(),
+      }),
+    });
+    coordinator.start(createLease());
+    scheduled.shift()?.();
+    await flushMicrotasks();
+
+    expect(coordinator.snapshot()).toMatchObject({ status: "failed", retryable: false });
+    expect(coordinator.repairAvailable()).toBe(false);
+  });
+
   it("fails closed when a returned identity differs from the embedded target", async () => {
     const scheduled: Array<() => void> = [];
     const coordinator = createCoordinator({

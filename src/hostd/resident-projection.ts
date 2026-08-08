@@ -84,6 +84,11 @@ export interface ResidentProjectionQueueSummary {
   }>;
 }
 
+export interface ResidentProjectionSelectedModelIdentity {
+  readonly providerId: string;
+  readonly modelId: string;
+}
+
 /**
  * Private host-owned projection of a pinned Prime Agent v0.7.0 snapshot.
  * It is deliberately not a public IPC DTO: session paths remain host-private.
@@ -92,6 +97,8 @@ export interface ResidentProjectionSnapshot {
   readonly projectionVersion: 1;
   readonly identity: Readonly<ResidentProjectionIdentity>;
   readonly cursor: Readonly<ResidentProjectionCursor>;
+  /** Exact private identity; the public runtime model remains display-only. */
+  readonly selectedModel?: Readonly<ResidentProjectionSelectedModelIdentity>;
   readonly runtime: Readonly<RuntimeSessionSummary>;
   readonly transcript: readonly Readonly<TranscriptBlock>[];
   readonly stream?: Readonly<InProgressStream>;
@@ -300,7 +307,10 @@ const ContextUsageSchema = z
   .object({
     tokens: SafeIntegerSchema.nullable(),
     contextWindow: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-    percent: z.number().finite().min(0).max(100).nullable(),
+    // Prime can legitimately exceed the nominal context window before its
+    // compaction boundary settles. The percentage is informational and is not
+    // published; retain only its finite/nonnegative wire-shape constraint.
+    percent: z.number().finite().nonnegative().nullable(),
   })
   .strict();
 
@@ -444,6 +454,12 @@ export function normalizeResidentProjectionSnapshot(
     : undefined;
   const childAgents = (snapshot.children ?? []).map(normalizeChildAgent);
   const goal = normalizeGoal(snapshot.state.goal);
+  const selectedModel = snapshot.state.model
+    ? {
+        providerId: snapshot.state.model.provider,
+        modelId: snapshot.state.model.id,
+      }
+    : undefined;
   const runtime = normalizeRuntime(snapshot, binding);
   const queue = ResidentProjectionQueueSummarySchema.parse({
     queuedCount: snapshot.state.sessionActions.queuedCount,
@@ -463,6 +479,7 @@ export function normalizeResidentProjectionSnapshot(
       workspaceDirectory: binding.workspaceDirectory,
     }),
     cursor,
+    ...(selectedModel ? { selectedModel } : {}),
     runtime,
     transcript,
     ...(stream ? { stream } : {}),
@@ -558,7 +575,10 @@ function normalizeRuntime(snapshot: PinnedSnapshot, binding: ResidentSessionBind
           },
         }
       : {}),
-    ...(state.recap !== undefined ? { recap: state.recap } : {}),
+    // Prime may rehydrate a missing recap as an empty string. Both mean that no
+    // recap exists; canonicalize them so an otherwise identical attachment
+    // does not create a false resident semantic change.
+    ...(state.recap ? { recap: state.recap } : {}),
   });
 }
 

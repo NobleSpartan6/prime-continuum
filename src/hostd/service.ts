@@ -5,10 +5,12 @@ import {
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   ResidentLifecycleStatusSchema,
   SavedProjectSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
@@ -62,7 +64,7 @@ import {
 // rollback testing. Production hostd must not advertise executable handoff
 // until a destination transport/coordinator can materialize and verify state on
 // the destination host itself.
-export const HOST_CAPABILITIES = ["snapshot_chunks_v1"] as const;
+export const HOST_CAPABILITIES = ["snapshot_chunks_v1", RESIDENT_CONTROL_PROJECTION_CAPABILITY] as const;
 
 const HANDOFF_COORDINATOR_WARNING = {
   code: "DESTINATION_TRANSFER_UNAVAILABLE",
@@ -73,12 +75,14 @@ const HANDOFF_COORDINATOR_WARNING = {
 const KNOWN_METHODS = new Set([
   "health.get",
   "runtime.integrity.retry",
+  "runtime.integrity.repair",
   "runtime.model_catalog",
   "oauth.session.start",
   "oauth.session.status",
   "oauth.session.cancel",
   "catalog.snapshot",
   "thread.snapshot",
+  "thread.control.snapshot",
   "command.submit",
   "command.reconcile",
   "resident.provision",
@@ -120,6 +124,10 @@ export interface RuntimeIntegrityReadinessProvider {
   snapshot(): RuntimeIntegritySnapshot;
   /** Begins one bounded retry only when the current ownership generation permits it. */
   retry?(): boolean;
+  /** Reports whether this exact failed generation can enter scoped repair. */
+  repairAvailable?(): boolean;
+  /** Begins one scoped repair after HostService proves resident quiescence. */
+  repair?(): boolean;
   /** Settles any background integrity work before endpoint ownership is released. */
   close?(): Promise<void>;
 }
@@ -307,10 +315,17 @@ export class HostService {
   }
 
   private async authorizeAndDispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
-    if (request.method === "runtime.integrity.retry" && context.transport !== "trusted_user") {
+    if (
+      (request.method === "runtime.integrity.retry" || request.method === "runtime.integrity.repair") &&
+      context.transport !== "trusted_user"
+    ) {
       throw new PairingAuthorityError(
-        "REMOTE_RUNTIME_INTEGRITY_RETRY_FORBIDDEN",
-        "Runtime verification can be retried only by the trusted local desktop",
+        request.method === "runtime.integrity.repair"
+          ? "REMOTE_RUNTIME_INTEGRITY_REPAIR_FORBIDDEN"
+          : "REMOTE_RUNTIME_INTEGRITY_RETRY_FORBIDDEN",
+        request.method === "runtime.integrity.repair"
+          ? "Runtime repair can be started only by the trusted local desktop"
+          : "Runtime verification can be retried only by the trusted local desktop",
       );
     }
     if (isResidentLifecycleRequest(request) && context.transport !== "trusted_user") {
@@ -419,6 +434,22 @@ export class HostService {
           typeof this.runtimeIntegrityProvider?.retry === "function"
           ? [RUNTIME_INTEGRITY_RETRY_CAPABILITY]
           : [];
+        let runtimeIntegrityRepairReady = context.transport === "trusted_user" &&
+          runtimeIntegrity?.status === "failed" &&
+          !runtimeIntegrity.retryable &&
+          typeof this.runtimeIntegrityProvider?.repairAvailable === "function" &&
+          typeof this.runtimeIntegrityProvider?.repair === "function" &&
+          this.runtimeIntegrityProvider.repairAvailable();
+        if (runtimeIntegrityRepairReady) {
+          try {
+            await this.store.assertRuntimeRepairQuiescent();
+          } catch {
+            runtimeIntegrityRepairReady = false;
+          }
+        }
+        const runtimeIntegrityRepairCapabilities = runtimeIntegrityRepairReady
+          ? [RUNTIME_INTEGRITY_REPAIR_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -434,6 +465,7 @@ export class HostService {
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
                 ...runtimeIntegrityRetryCapabilities,
+                ...runtimeIntegrityRepairCapabilities,
               ]
             : [
                 ...HOST_CAPABILITIES,
@@ -443,6 +475,7 @@ export class HostService {
                 ...oauthCapabilities,
                 RUNTIME_INTEGRITY_CAPABILITY,
                 ...runtimeIntegrityRetryCapabilities,
+                ...runtimeIntegrityRepairCapabilities,
               ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
@@ -485,6 +518,57 @@ export class HostService {
         }
         return next;
       }
+      case "runtime.integrity.repair": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "Runtime repair was requested from a different host authority.",
+          );
+        }
+        const provider = this.runtimeIntegrityProvider;
+        const current = provider?.snapshot();
+        if (
+          !provider ||
+          typeof provider.repairAvailable !== "function" ||
+          typeof provider.repair !== "function" ||
+          current?.status !== "failed" ||
+          current.retryable ||
+          !provider.repairAvailable()
+        ) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_REPAIR_UNAVAILABLE",
+            "Runtime repair is not available for the current host generation.",
+          );
+        }
+        if (
+          request.payload.expectedTrustAnchorId !== current.trustAnchorId ||
+          request.payload.expectedChangedAt !== current.changedAt ||
+          !sameRuntimeIntegrityTarget(request.payload.expectedTarget, current.target)
+        ) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_REPAIR_AUTHORITY_CHANGED",
+            "Runtime repair authority changed before the operation could start.",
+            true,
+          );
+        }
+        await this.store.assertRuntimeRepairQuiescent();
+        if (!provider.repair()) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_REPAIR_REJECTED",
+            "Runtime repair could not start in this host generation.",
+            true,
+          );
+        }
+        const next = RuntimeIntegritySnapshotSchema.parse(provider.snapshot());
+        if (next.status !== "initializing" || !sameRuntimeIntegrityLineage(current, next)) {
+          throw new HostStoreError(
+            "RUNTIME_INTEGRITY_REPAIR_INVALID_STATE",
+            "Runtime repair did not enter a valid initialization attempt.",
+          );
+        }
+        return next;
+      }
       case "runtime.model_catalog": {
         const host = await this.store.getHost();
         if (request.payload.expectedHostId !== host.hostId) {
@@ -520,6 +604,33 @@ export class HostService {
         // A Phase 0 attach always returns an authoritative atomic snapshot. A
         // later replay adapter may use the supplied generation-aware cursor.
         return this.store.getThreadSnapshot(request.payload.threadId);
+      case "thread.control.snapshot":
+        {
+          const binding = await this.store.getResidentSessionBinding(
+            request.payload.threadId,
+            request.payload.expectedExecutionGenerationId,
+          );
+          let livePreparedBinding: typeof binding;
+          if (
+            binding &&
+            this.gateway.continuity === "resident" &&
+            this.gateway.isResidentBindingLive
+          ) {
+            try {
+              if (await this.gateway.isResidentBindingLive(binding)) livePreparedBinding = binding;
+            } catch {
+              // Liveness is optional runtime evidence. A failed or unavailable
+              // probe must degrade this read to lifecycle_transition, never
+              // turn a read-only projection into a runtime failure or retry.
+            }
+          }
+          return this.store.getResidentControlProjection(
+            request.payload.expectedHostId,
+            request.payload.threadId,
+            request.payload.expectedExecutionGenerationId,
+            livePreparedBinding,
+          );
+        }
       case "command.submit": {
         const command = request.payload.command;
         // Idempotency and command-key ownership precede every mutable
@@ -612,7 +723,7 @@ export class HostService {
           try {
             const gatewayAdmission = await this.gateway.submit(command, { residentBinding: binding });
             if (gatewayAdmission.disposition !== "handled") {
-              return this.store.finalizeModelSelectionDispatch(command, {
+              return await this.store.finalizeModelSelectionDispatch(command, {
                 status: "uncertain",
                 message: "Prime Agent returned an invalid model-selection acknowledgement",
                 error: {
@@ -622,7 +733,7 @@ export class HostService {
                 },
               });
             }
-            return this.store.finalizeModelSelectionDispatch(command, {
+            return await this.store.finalizeModelSelectionDispatch(command, {
               status: "completed",
               message: gatewayAdmission.message?.slice(0, 1_024) ?? "Prime Agent selected and verified the model",
             });
@@ -1023,6 +1134,7 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
     case "runtime.model_catalog":
     case "catalog.snapshot":
     case "thread.snapshot":
+    case "thread.control.snapshot":
     case "command.reconcile":
       return "projection.read";
     case "oauth.session.start":
@@ -1032,6 +1144,7 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       // the protocol switch exhaustive without granting remote OAuth access.
       return "host.admin";
     case "runtime.integrity.retry":
+    case "runtime.integrity.repair":
       // SSH and relay requests are rejected before scope evaluation. Keep the
       // protocol switch exhaustive without granting remote repair authority.
       return "host.admin";
@@ -1198,6 +1311,22 @@ function sameRuntimeIntegrityLineage(
     current.target.manifestSha256 === next.target.manifestSha256 &&
     current.target.treeSha256 === next.target.treeSha256 &&
     current.target.filesSha256 === next.target.filesSha256
+  );
+}
+
+function sameRuntimeIntegrityTarget(
+  current: RuntimeIntegritySnapshot["target"],
+  next: RuntimeIntegritySnapshot["target"],
+): boolean {
+  return (
+    current.runtime === next.runtime &&
+    current.releaseVersion === next.releaseVersion &&
+    current.runtimeBuildId === next.runtimeBuildId &&
+    current.platform === next.platform &&
+    current.arch === next.arch &&
+    current.manifestSha256 === next.manifestSha256 &&
+    current.treeSha256 === next.treeSha256 &&
+    current.filesSha256 === next.filesSha256
   );
 }
 

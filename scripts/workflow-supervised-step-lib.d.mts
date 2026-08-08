@@ -18,8 +18,10 @@ export function runSupervisedWorkflowStep(options: {
   }>
   awaitSupervisorExit?: (child: import('node:child_process').ChildProcess, timeoutMs: number) => Promise<boolean>
   teardownTimeoutMs?: number
+  stepTimeoutMs?: number
 }): Promise<{
   code: number | null
   signal: NodeJS.Signals | null
   supervisorExitedWithoutChildConfirmation: boolean
+  timedOut: boolean
 }>

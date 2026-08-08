@@ -14,6 +14,7 @@ import {
   RemoteDeviceScopesSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  ResidentControlProjectionSnapshotSchema,
   ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
@@ -161,6 +162,65 @@ describe("host protocol schemas", () => {
       generation: "daemon-generation-3",
       sequence: 99,
     });
+  });
+
+  it("binds resident control polling to one path-free host generation", () => {
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "resident-control-read-1",
+      method: "thread.control.snapshot",
+      payload: {
+        expectedHostId: "host-1",
+        threadId: "thread-1",
+        expectedExecutionGenerationId: "execution-2",
+      },
+    } as const;
+    expect(HostIpcRequestSchema.parse(request)).toEqual(request);
+    expect(HostIpcRequestSchema.safeParse({
+      ...request,
+      payload: { ...request.payload, workspaceDirectory: "C:\\private\\workspace" },
+    }).success).toBe(false);
+
+    const projection = {
+      projectionVersion: 1 as const,
+      hostId: "host-1",
+      threadId: "thread-1",
+      executionGenerationId: "execution-2",
+      bindingFingerprint: "a".repeat(64),
+      controlSequence: 7,
+      changedAt: "2026-08-08T12:01:00.000Z",
+      authorityCursor: {
+        threadId: "thread-1",
+        executionGenerationId: "execution-2",
+        generation: "daemon-generation-3",
+        sequence: 99,
+      },
+      operation: {
+        kind: "abort" as const,
+        deviceId: "mobile-b",
+        commandId: "stop-1",
+        phase: "acknowledged" as const,
+        admittedAt: "2026-08-08T12:00:00.000Z",
+        changedAt: "2026-08-08T12:00:30.000Z",
+      },
+      quiescence: { state: "stop_owned" as const },
+    };
+    expect(ResidentControlProjectionSnapshotSchema.parse(projection)).toEqual(projection);
+    expect(HostIpcResponseSchema.safeParse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: request.requestId,
+      method: request.method,
+      ok: true,
+      result: { ...projection, workspaceDirectory: "C:\\private\\workspace" },
+    }).success).toBe(false);
+    expect(ResidentControlProjectionSnapshotSchema.safeParse({
+      ...projection,
+      authorityCursor: { ...projection.authorityCursor, executionGenerationId: "execution-other" },
+    }).success).toBe(false);
+    expect(ResidentControlProjectionSnapshotSchema.safeParse({
+      ...projection,
+      operation: { ...projection.operation, kind: "prompt" },
+    }).success).toBe(false);
   });
 
   it("binds resident end to one path-free reviewed source cursor", () => {

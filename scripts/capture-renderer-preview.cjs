@@ -123,6 +123,24 @@ const targets = [
     expectedText: 'Workspace confirmation needed',
     expectScrollableEmpty: true,
   },
+  {
+    name: 'hud-expanded',
+    width: 620,
+    height: 380,
+    visualState: 'hud-expanded',
+    surface: 'hud',
+    expectedText: 'Seamless remote experience',
+    expectHud: 'expanded',
+  },
+  {
+    name: 'hud-buddy',
+    width: 184,
+    height: 64,
+    visualState: 'hud-buddy',
+    surface: 'hud',
+    expectedText: 'Seamless remote experience',
+    expectHud: 'buddy',
+  },
 ]
 
 function invariant(condition, message) {
@@ -130,9 +148,11 @@ function invariant(condition, message) {
 }
 
 async function waitForSurface(browserWindow, target) {
-  const selector = target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
-    ? '.empty-workbench'
-    : '.app-shell'
+  const selector = target.expectHud
+    ? `.hud-${target.expectHud}`
+    : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
+      ? '.empty-workbench'
+      : '.app-shell'
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     const found = await browserWindow.webContents.executeJavaScript(
@@ -197,7 +217,7 @@ async function capture(target, rendererOrigin) {
     useContentSize: true,
     width: target.width,
     height: target.height,
-    backgroundColor: '#0b0d0f',
+    backgroundColor: target.surface === 'hud' ? '#00000000' : '#0b0d0f',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -212,6 +232,7 @@ async function capture(target, rendererOrigin) {
     )
     const rendererUrl = new URL('/', rendererOrigin)
     if (target.visualState) rendererUrl.searchParams.set('visualState', target.visualState)
+    if (target.surface) rendererUrl.searchParams.set('surface', target.surface)
     await browserWindow.loadURL(rendererUrl.href)
     await waitForSurface(browserWindow, target)
     if (target.openResidentDialog) {
@@ -271,9 +292,11 @@ async function capture(target, rendererOrigin) {
       }
       await delay(300)
     }
-    const selector = target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
-      ? '.empty-workbench'
-      : '.app-shell'
+    const selector = target.expectHud
+      ? `.hud-${target.expectHud}`
+      : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
+        ? '.empty-workbench'
+        : '.app-shell'
     const layout = await browserWindow.webContents.executeJavaScript(`({
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -309,6 +332,9 @@ async function capture(target, rendererOrigin) {
       const residentEndDialogFooterRect = residentEndDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
       const emptyMain = document.querySelector('.empty-workbench__main')
       const emptyMainStyle = emptyMain ? window.getComputedStyle(emptyMain) : undefined
+      const hudSurface = document.querySelector(${JSON.stringify(target.expectHud ? `.hud-${target.expectHud}` : '.hud-never')})
+      const bodyStyle = window.getComputedStyle(document.body)
+      const rootStyle = window.getComputedStyle(document.documentElement)
       return {
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
@@ -353,6 +379,10 @@ async function capture(target, rendererOrigin) {
         emptyMainClientHeight: emptyMain?.clientHeight,
         emptyMainScrollHeight: emptyMain?.scrollHeight,
         emptyMainOverflowY: emptyMainStyle?.overflowY,
+        hudSurfaceVisible: Boolean(hudSurface && hudSurface.getBoundingClientRect().width > 0 && hudSurface.getBoundingClientRect().height > 0),
+        hudMode: document.querySelector('.hud-buddy') ? 'buddy' : document.querySelector('.hud-expanded') ? 'expanded' : undefined,
+        hudStatusVisible: Boolean(document.querySelector('.hud-status')),
+        hudHostTransparent: bodyStyle.backgroundColor === 'rgba(0, 0, 0, 0)' && rootStyle.backgroundColor === 'rgba(0, 0, 0, 0)',
       }
     })()`)
     invariant(
@@ -382,6 +412,12 @@ async function capture(target, rendererOrigin) {
         stateEvidence.emptyMainScrollable,
         `${target.name} did not preserve vertical access to resident recovery controls: ${JSON.stringify(stateEvidence)}`,
       )
+    }
+    if (target.expectHud) {
+      invariant(stateEvidence.hudSurfaceVisible, `${target.name} did not paint its HUD surface`)
+      invariant(stateEvidence.hudMode === target.expectHud, `${target.name} rendered the wrong HUD mode`)
+      invariant(stateEvidence.hudStatusVisible, `${target.name} hid its redundant HUD status`)
+      invariant(stateEvidence.hudHostTransparent, `${target.name} did not preserve a transparent native host layer`)
     }
     const image = await browserWindow.webContents.capturePage()
     const outputPath = join(outputDirectory, `${target.name}.png`)

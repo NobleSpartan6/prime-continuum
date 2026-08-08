@@ -29,6 +29,7 @@ const MAX_AUTOMATIC_RUNTIME_INITIALIZATION_ATTEMPTS = 2;
 
 export interface RuntimeIntegrityInstaller {
   ensureInstalled(seedRoot?: string): Promise<InstalledRuntimeIntegrityIdentity>;
+  repairInstalled?(seedRoot: string): Promise<InstalledRuntimeIntegrityIdentity>;
   acquireVerifiedRuntimeHandle(): Promise<VerifiedInstalledRuntimeHandle>;
 }
 
@@ -78,6 +79,8 @@ export class RuntimeInitializationCoordinator {
   private activeAttempt: Promise<void> | undefined;
   private readonly activeHandleAcquisitions = new Set<Promise<VerifiedInstalledRuntimeHandle>>();
   private attempt = 0;
+  private repairEligible = false;
+  private runtimeHandleIssued = false;
   private started = false;
   private closed = false;
 
@@ -136,7 +139,33 @@ export class RuntimeInitializationCoordinator {
     ) {
       return false;
     }
-    this.beginAttempt();
+    this.beginAttempt("verify");
+    return true;
+  }
+
+  /** True only while this exact failed generation can safely enter repair. */
+  repairAvailable(): boolean {
+    return Boolean(
+      !this.closed &&
+      this.started &&
+      this.activeAttempt === undefined &&
+      this.currentSnapshot.status === "failed" &&
+      !this.currentSnapshot.retryable &&
+      this.repairEligible &&
+      !this.runtimeHandleIssued &&
+      this.activeHandleAcquisitions.size === 0 &&
+      this.seedRoot &&
+      this.manager?.repairInstalled &&
+      this.lease &&
+      !this.lease.signal.aborted &&
+      this.attempt < MAX_RUNTIME_INITIALIZATION_ATTEMPTS
+    );
+  }
+
+  /** Begins one operator-authorized repair without waiting for its filesystem work. */
+  repair(): boolean {
+    if (!this.repairAvailable()) return false;
+    this.beginAttempt("repair");
     return true;
   }
 
@@ -185,6 +214,10 @@ export class RuntimeInitializationCoordinator {
   ): Promise<VerifiedInstalledRuntimeHandle> {
     try {
       const handle = await manager.acquireVerifiedRuntimeHandle();
+      // Once a private launch capability has crossed this boundary, this host
+      // generation can no longer prove that no consumer retains it. Repair is
+      // therefore restart-gated even after the acquisition promise settles.
+      this.runtimeHandleIssued = true;
       assertIdentityMatchesTarget(handle.identity, this.target);
       // The manager proves ownership after its full scan. This independent
       // coordinator proof closes the handoff window for alternate factories
@@ -206,6 +239,7 @@ export class RuntimeInitializationCoordinator {
           status: "failed",
           ...classifyInitializationFailure(error),
         });
+        this.repairEligible = repairEligibleInitializationFailure(error);
       }
       throw error;
     }
@@ -221,11 +255,12 @@ export class RuntimeInitializationCoordinator {
     );
   }
 
-  private beginAttempt(): void {
+  private beginAttempt(mode: "verify" | "repair" = "verify"): void {
     const lease = this.lease;
     if (!lease) throw new Error("Runtime initialization requires an endpoint ownership lease");
     const attempt = ++this.attempt;
     const generation = lease.generation;
+    this.repairEligible = false;
     this.currentSnapshot = this.parseSnapshot({
       ...this.baseSnapshot(),
       status: "initializing",
@@ -234,7 +269,7 @@ export class RuntimeInitializationCoordinator {
     });
 
     const scheduled = new Promise<void>((resolvePromise) => this.schedule(resolvePromise));
-    const work = scheduled.then(() => this.runAttempt(lease, generation, attempt));
+    const work = scheduled.then(() => this.runAttempt(lease, generation, attempt, mode));
     this.activeAttempt = work;
     const clearAttempt = (): void => {
       if (this.activeAttempt === work) this.activeAttempt = undefined;
@@ -246,6 +281,7 @@ export class RuntimeInitializationCoordinator {
     lease: HostOwnershipLease,
     generation: string,
     attempt: number,
+    mode: "verify" | "repair",
   ): Promise<void> {
     if (!this.isCurrent(lease, generation, attempt)) return;
     try {
@@ -259,7 +295,9 @@ export class RuntimeInitializationCoordinator {
           this.recordProgress(currentLease, currentLease.generation, this.attempt, phase);
         },
       });
-      const identity = await this.manager.ensureInstalled(this.seedRoot);
+      const identity = mode === "repair"
+        ? await this.requireRepairInstaller(this.manager, this.seedRoot)
+        : await this.manager.ensureInstalled(this.seedRoot);
       // The manager verifies again before returning, but this final assertion
       // closes the coordinator's own success window and lets a physical
       // endpoint/sidecar loss trigger the server-fatal ownership path before
@@ -272,6 +310,7 @@ export class RuntimeInitializationCoordinator {
         status: "ready",
         assurance: this.envelope.attestation.assurance,
       });
+      this.repairEligible = false;
     } catch (error) {
       if (!this.isCurrent(lease, generation, attempt)) return;
       try {
@@ -281,6 +320,7 @@ export class RuntimeInitializationCoordinator {
       }
       const failure = classifyInitializationFailure(error);
       if (
+        mode === "verify" &&
         error instanceof RuntimeIntegrityTransientVerificationError &&
         attempt < MAX_AUTOMATIC_RUNTIME_INITIALIZATION_ATTEMPTS &&
         !this.closed &&
@@ -297,7 +337,21 @@ export class RuntimeInitializationCoordinator {
         status: "failed",
         ...failure,
       });
+      this.repairEligible = repairEligibleInitializationFailure(error);
     }
+  }
+
+  private requireRepairInstaller(
+    manager: RuntimeIntegrityInstaller,
+    seedRoot: string | undefined,
+  ): Promise<InstalledRuntimeIntegrityIdentity> {
+    if (!seedRoot || typeof manager.repairInstalled !== "function") {
+      return Promise.reject(new RuntimeIntegrityRepairRequiredError(
+        "packaged_seed_unavailable",
+        new Error("No attested packaged runtime seed is available for repair"),
+      ));
+    }
+    return manager.repairInstalled(seedRoot);
   }
 
   private recordProgress(
@@ -423,6 +477,11 @@ function classifyInitializationFailure(error: unknown): {
     retryable: true,
     recoveryAction: "retry_runtime_verification",
   };
+}
+
+function repairEligibleInitializationFailure(error: unknown): boolean {
+  return error instanceof RuntimeIntegrityInstalledCorruptionError ||
+    error instanceof RuntimeIntegrityRepairRequiredError;
 }
 
 function errorChainHasCode(error: unknown): boolean {

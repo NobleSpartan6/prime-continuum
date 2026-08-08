@@ -22,6 +22,7 @@ import {
 import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
   ResidentRuntimeContractError,
+  validateResidentSessionBinding,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentOwnedSessionCreateInput,
@@ -153,18 +154,39 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       this.retireAttachedBinding(slot);
       return false;
     }
+    const attached = this.attachedBindings.get(slot);
+    if (
+      attached &&
+      attached.fingerprint !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      this.retireAttachedBinding(slot, attached);
+    }
+    return this.isResidentBindingLive(binding);
+  }
+
+  async isResidentBindingLive(bindingValue: ResidentSessionBinding): Promise<boolean> {
+    if (this.closed) return false;
+    const binding = validateResidentSessionBinding(bindingValue);
+    const slot = residentBindingSlotKeyFor(binding);
     const fingerprint = residentDispatchAuthorityFingerprint(binding);
     const attached = this.attachedBindings.get(slot);
     if (!attached || attached.fingerprint !== fingerprint || !this.adapter) {
-      if (attached) this.retireAttachedBinding(slot, attached);
+      // A stale caller must not retire a different, healthy authority that now
+      // occupies this generation slot. Only this exact binding can invalidate
+      // its own attachment.
+      if (attached?.fingerprint === fingerprint) this.retireAttachedBinding(slot, attached);
       return false;
     }
     const prepared = this.preparedBindings.get(slot);
     if (prepared !== attached) return false;
     try {
-      const live = await this.adapter.isLive(threadId, executionGenerationId);
-      if (!live) this.retireAttachedBinding(slot, attached);
-      return !this.closed && live;
+      const live = await this.adapter.isLive(binding.threadId, binding.executionGenerationId);
+      const stillPrepared = !this.closed &&
+        live &&
+        this.preparedBindings.get(slot) === attached &&
+        await this.isCurrentBinding(binding);
+      if (!stillPrepared) this.retireAttachedBinding(slot, attached);
+      return stillPrepared;
     } catch (error) {
       this.retireAttachedBinding(slot, attached);
       if (isDefinitivelyUnavailableResident(error)) return false;
@@ -769,25 +791,18 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
           await this.store.publishResidentProjectionSnapshot(binding, projection);
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
-          const slot = residentBindingSlotKeyFor(binding);
-          this.bindingPublicationRevisions.set(
-            slot,
-            (this.bindingPublicationRevisions.get(slot) ?? 0) + 1,
-          );
-          const attached = this.attachedBindings.get(slot);
-          if (attached) this.scheduleProjectionReadinessCheck(attached);
-          const change = Object.freeze({
-            threadId: binding.threadId,
-            executionGenerationId: binding.executionGenerationId,
-          });
-          for (const listener of this.projectionListeners) {
-            try {
-              listener(change);
-            } catch {
-              // Projection publication is already durable. One observer cannot
-              // roll it back or prevent another connection from refreshing.
-            }
+          this.publishProjectionChange(binding);
+        },
+        publishModelSelectionProjection: async (command, binding, projection) => {
+          if (this.closed || !(await this.isCurrentBinding(binding))) {
+            throw new GatewayError(
+              "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+              "The exact resident session authority changed before its proven model projection could be published",
+            );
           }
+          await this.store.publishResidentModelSelectionProjection(command, binding, projection);
+          if (this.closed || !(await this.isCurrentBinding(binding))) return;
+          this.publishProjectionChange(binding);
         },
       });
     } catch (error) {
@@ -801,6 +816,28 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     }
     this.runtimeModuleLoader = closeableModuleLoader;
     return adapter;
+  }
+
+  private publishProjectionChange(binding: ResidentSessionBinding): void {
+    const slot = residentBindingSlotKeyFor(binding);
+    this.bindingPublicationRevisions.set(
+      slot,
+      (this.bindingPublicationRevisions.get(slot) ?? 0) + 1,
+    );
+    const attached = this.attachedBindings.get(slot);
+    if (attached) this.scheduleProjectionReadinessCheck(attached);
+    const change = Object.freeze({
+      threadId: binding.threadId,
+      executionGenerationId: binding.executionGenerationId,
+    });
+    for (const listener of this.projectionListeners) {
+      try {
+        listener(change);
+      } catch {
+        // Projection publication is already durable. One observer cannot roll
+        // it back or prevent another connection from refreshing.
+      }
+    }
   }
 }
 

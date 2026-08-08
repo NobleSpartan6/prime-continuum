@@ -14,6 +14,9 @@ const nativeBridgeUnavailable = isNativeBridgeUnavailable(
   window.navigator.userAgent,
   Boolean(Reflect.get(window, 'prime')),
 )
+const surface = new URLSearchParams(window.location.search).get('surface') === 'hud' ? 'hud' : 'workbench'
+document.documentElement.dataset.surface = surface
+document.body.dataset.surface = surface
 
 const content = nativeBridgeUnavailable ? (
   <main className="startup-failure">
@@ -29,7 +32,7 @@ const content = nativeBridgeUnavailable ? (
     </section>
   </main>
 ) : (
-  <App />
+  <App surface={surface} />
 )
 
 createRoot(root).render(

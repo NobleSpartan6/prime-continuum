@@ -77,6 +77,12 @@ export interface PrimeAgentGateway {
   /** Schedule the read-only same-connection idle barrier after an acknowledged Stop. */
   scheduleResidentAbortReconciliation?(lease: ResidentAbortReconciliationLease): void;
   isLive(threadId: string, executionGenerationId: string): Promise<boolean>;
+  /**
+   * Proves that this exact durable binding is the gateway's current prepared
+   * connection. Callers must treat an absent implementation as unavailable;
+   * generation-only liveness cannot prove resident control quiescence.
+   */
+  isResidentBindingLive?(binding: ResidentSessionBinding): Promise<boolean>;
   submit(command: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission>;
   close(): Promise<void>;
 }
