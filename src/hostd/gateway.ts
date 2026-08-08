@@ -228,10 +228,7 @@ export class PrimeAgentRpcGateway implements PrimeAgentDiagnosticGateway {
     if (command.threadId !== this.options.threadId) {
       throw new GatewayError("GATEWAY_THREAD_MISMATCH", "RPC adapter belongs to another thread");
     }
-    if (
-      command.expectedExecutionGenerationId &&
-      command.expectedExecutionGenerationId !== this.options.executionGenerationId
-    ) {
+    if (command.expectedExecutionGenerationId !== this.options.executionGenerationId) {
       throw new GatewayError("GATEWAY_GENERATION_MISMATCH", "RPC adapter belongs to another execution generation");
     }
     this.assertRequestCapacity(command.commandId);

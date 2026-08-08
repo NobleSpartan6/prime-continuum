@@ -25,10 +25,11 @@ const clientCommand = z
     commandId: id,
     expectedHostId: id,
     kind: z.string().min(1).max(128),
-    threadId: id.optional(),
+    threadId: id,
     payload: jsonRecord.optional(),
     delivery: z.enum(['live_only', 'send_when_reconnected']).optional(),
-    expectedExecutionGenerationId: id.optional()
+    expectedExecutionGenerationId: id,
+    issuedAt: z.string().datetime({ offset: true })
   })
   .strict()
 const handoffPlan = z
@@ -137,6 +138,8 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
         deviceId: id,
         commandId: id,
         expectedHostId: id,
+        expectedExecutionGenerationId: id,
+        issuedAt: z.string().datetime({ offset: true }),
         threadId: id,
         approvalId: id,
         decision: z.enum(['approve', 'deny'])
@@ -151,6 +154,8 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
         deviceId: id,
         commandId: id,
         expectedHostId: id,
+        expectedExecutionGenerationId: id,
+        issuedAt: z.string().datetime({ offset: true }),
         threadId: id,
         targetCommandId: id.optional()
       })

@@ -1,11 +1,12 @@
 import { EventEmitter } from 'node:events'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import type { App } from 'electron'
 import {
   CapabilitySchema,
   CatalogProjectionSnapshotSchema,
   CommandEnvelopeSchema,
+  CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
@@ -14,10 +15,12 @@ import {
   RuntimeModelCatalogSnapshotSchema,
   RuntimeOAuthSessionSnapshotSchema,
   ThreadProjectionSnapshotSchema,
+  type CatalogProjectionSnapshot,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
   type RuntimeOAuthSessionSnapshot,
+  type ThreadProjectionSnapshot,
 } from '../../shared/protocol'
 import {
   CODEX_SUBSCRIPTION_PROVIDER_ID,
@@ -63,6 +66,7 @@ interface CachedHostProjection extends IndexedProjectionEntry {
   hostId: string
   catalog?: unknown
   lastSnapshot?: unknown
+  retiredExecutionGenerations?: Record<string, string[]>
   updatedAt?: string
 }
 
@@ -82,12 +86,33 @@ interface CacheEnvelope extends IndexedProjectionEnvelope {
   targetHostBindings: TargetHostBinding[]
 }
 
-type ScopedOutboxEntry = OutboxEntry & { hostId: string }
+type ScopedOutboxEntry = OutboxEntry & { hostId: string; command: ClientCommand }
 
 interface OutboxIdentity {
   hostId: string
+  deviceId: string
   commandId: string
-  deviceId?: string
+  threadId: string
+  expectedExecutionGenerationId: string
+  commandFingerprint: string
+}
+
+interface CommandIdentityLedgerEntry {
+  deviceId: string
+  commandId: string
+  hostId: string
+  envelopeSha256: string
+  reservedAt: string
+}
+
+interface CommandIdentityLedger {
+  version: 1
+  entries: CommandIdentityLedgerEntry[]
+}
+
+interface OutboxClassification {
+  actionable: ScopedOutboxEntry[]
+  quarantinedCount: number
 }
 
 interface CapturedProjectionAuthority {
@@ -145,6 +170,8 @@ const HEALTH_POLL_INITIALIZING_MS = 500
 const HEALTH_POLL_STEADY_MS = 15_000
 const HEALTH_POLL_TIMEOUT_MS = 10_000
 const OUTBOX_LIMIT = 1_000
+const COMMAND_IDENTITY_LEDGER_LIMIT = 10_000
+const RETIRED_GENERATIONS_PER_THREAD_LIMIT = 16
 const TARGET_BINDING_LIMIT = 128
 const TERMINAL_OR_DURABLE = new Set([
   'received',
@@ -170,7 +197,8 @@ export class DesktopControlService extends EventEmitter {
   private oauthTransitionGeneration = 0
   private oauthDrainPromise: Promise<void> | undefined
   private readonly cache: IndexedProjectionCacheStore<CacheEnvelope>
-  private readonly outbox: AtomicJsonStore<OutboxEntry[]>
+  private readonly outbox: AtomicJsonStore<unknown[]>
+  private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
   private readonly latency = new LatencyRecorder()
   private readonly discoveredAliases = new Set<string>()
   private readonly installPlans = new Map<string, HostInstallPlan>()
@@ -204,11 +232,23 @@ export class DesktopControlService extends EventEmitter {
       normalizeCache,
       emptyCache,
     )
-    this.outbox = new AtomicJsonStore(path.join(stateDirectory, 'command-outbox.json'), () => [], 4 * 1024 * 1024)
+    this.outbox = new AtomicJsonStore<unknown[]>(
+      path.join(stateDirectory, 'command-outbox.json'),
+      () => [],
+      4 * 1024 * 1024,
+      { malformedJson: 'error', validateRoot: (value): value is unknown[] => Array.isArray(value) },
+    )
+    this.commandIdentities = new AtomicJsonStore<CommandIdentityLedger>(
+      path.join(stateDirectory, 'command-identities.json'),
+      () => ({ version: 1, entries: [] }),
+      8 * 1024 * 1024,
+      { malformedJson: 'error', validateRoot: isCommandIdentityLedger },
+    )
   }
 
   async bootstrap(): Promise<BootstrapPayload> {
     return await this.latency.measure('cache.bootstrap', async () => {
+      await this.commandIdentities.read()
       const initialCache = await this.readCache()
       if (!this.target && initialCache.lastTarget) {
         this.target = initialCache.lastTarget
@@ -229,7 +269,7 @@ export class DesktopControlService extends EventEmitter {
         const activeHostId = this.authorityHostId
         const activeTarget = this.target
         const cache = retry === 0 ? initialCache : await this.readCache()
-        const outbox = await this.readOutbox()
+        const outbox = await this.readOutboxClassification(true)
         const connection = this.getConnectionState()
         if (
           generation === this.reconnectGeneration &&
@@ -238,11 +278,13 @@ export class DesktopControlService extends EventEmitter {
           sameOptionalTarget(activeTarget, connection.target) &&
           (!connection.hostId || connection.hostId === activeHostId)
         ) {
+          const actionableOutbox = outbox.actionable.filter((entry) =>
+            Boolean(activeHostId && entry.hostId === activeHostId)
+          )
           return {
             cache: visibleCacheForAuthority(cache, activeHostId),
-            outbox: outbox.filter((entry) =>
-              Boolean(activeHostId && isOutboxEntryForAuthority(entry, activeHostId))
-            ),
+            outbox: actionableOutbox,
+            quarantinedOutboxCount: outbox.quarantinedCount,
             connection,
             appVersion: this.app.getVersion()
           }
@@ -990,17 +1032,7 @@ export class DesktopControlService extends EventEmitter {
           }
         })
       }
-      await this.cache.update((current) => {
-        this.assertProjectionAuthority(authority, 'thread snapshot')
-        const cache = normalizeCache(current)
-        const previous = cache.entries[authority.hostId]
-        return replaceProjectionEntry(cache, authority.hostId, {
-          ...previous,
-          hostId: authority.hostId,
-          lastSnapshot: parsedSnapshot,
-          updatedAt: now(),
-        })
-      })
+      await this.persistThreadSnapshot(parsedSnapshot, authority)
       this.assertProjectionAuthority(authority, 'thread snapshot')
       return parsedSnapshot
     })
@@ -1021,6 +1053,13 @@ export class DesktopControlService extends EventEmitter {
         }
       )
     }
+    const pendingEntry: ScopedOutboxEntry = { hostId, command, state: 'uncertain', updatedAt: now() }
+    // A pre-ledger outbox from an older build owns this global identity first.
+    // Prove it is the exact same scoped envelope before reserving a new ledger
+    // record, otherwise a rejected cross-host attempt could poison recovery of
+    // the original command.
+    await this.assertOutboxIdentityAvailable(pendingEntry)
+    await this.reserveCommandIdentity(command, envelope)
     const connection = this.connection
     if (!connection || connection.isClosed) {
       if (!isExplicitOfflineFollowUp(command)) {
@@ -1030,8 +1069,16 @@ export class DesktopControlService extends EventEmitter {
           { retryable: true }
         )
       }
-      await this.putOutbox({ hostId, command, state: 'waiting_for_connection', updatedAt: now() })
-      return { hostId, deviceId: command.deviceId, commandId: command.commandId, status: 'waiting_for_connection', durable: false }
+      await this.putOutbox({ ...pendingEntry, state: 'waiting_for_connection' })
+      return {
+        hostId,
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
+        status: 'waiting_for_connection',
+        durable: false,
+      }
     }
 
     if (!this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) {
@@ -1042,7 +1089,7 @@ export class DesktopControlService extends EventEmitter {
       )
     }
 
-    await this.putOutbox({ hostId, command, state: 'uncertain', updatedAt: now() })
+    await this.putOutbox(pendingEntry)
     try {
       if (
         this.authorityHostId !== hostId ||
@@ -1059,25 +1106,39 @@ export class DesktopControlService extends EventEmitter {
         priority: isUrgentCommand(command.kind) ? 'urgent' : 'normal'
       })
       const receipt = { ...normalizeReceipt(command.commandId, result), hostId }
+      assertReceiptMatchesCommand(receipt, command)
       if (receipt.durable || TERMINAL_OR_DURABLE.has(receipt.status)) {
-        await this.removeOutbox([{ hostId, deviceId: command.deviceId, commandId: command.commandId }])
+        await this.removeOutbox([outboxIdentity(hostId, command)])
       }
       return receipt
     } catch (error) {
-      await this.putOutbox({ hostId, command, state: 'uncertain', updatedAt: now() })
+      const entry = { hostId, command, state: 'uncertain' as const, updatedAt: now() }
+      if (isDefinitiveCommandIdentityError(error)) {
+        await this.holdOutboxAfterReconciliationFailure(entry, error)
+      } else {
+        await this.putOutbox(entry)
+      }
       throw error
     }
   }
 
   async approve(input: ApprovalResolution): Promise<CommandReceipt> {
+    if (input.decision !== 'approve' && input.decision !== 'deny') {
+      throw new ControlError(
+        'command.approval_decision_invalid',
+        'An approval resolution must preserve an explicit approve or deny decision.',
+      )
+    }
     return await this.submitCommand({
       deviceId: input.deviceId,
       commandId: input.commandId,
       expectedHostId: input.expectedHostId,
+      expectedExecutionGenerationId: input.expectedExecutionGenerationId,
+      issuedAt: input.issuedAt,
       threadId: input.threadId,
       kind: 'approval.resolve',
       delivery: 'live_only',
-      payload: { approvalId: input.approvalId, decision: input.decision }
+      payload: { approvalId: input.approvalId, decision: input.decision === 'approve' ? 'approve' : 'reject' }
     })
   }
 
@@ -1086,6 +1147,8 @@ export class DesktopControlService extends EventEmitter {
       deviceId: input.deviceId,
       commandId: input.commandId,
       expectedHostId: input.expectedHostId,
+      expectedExecutionGenerationId: input.expectedExecutionGenerationId,
+      issuedAt: input.issuedAt,
       threadId: input.threadId,
       kind: 'thread.cancel',
       delivery: 'live_only',
@@ -1100,8 +1163,8 @@ export class DesktopControlService extends EventEmitter {
     return await this.latency.measure('command.reconcile', async () => {
       const hostId = this.requireAuthorityHostId()
       const connection = this.requireConnection()
-      const pending = (await this.readOutbox()).filter((entry) => isOutboxEntryForAuthority(entry, hostId))
-      const identities = commandIds.map((commandId) => {
+      const pending = (await this.readOutboxClassification(true)).actionable.filter((entry) => entry.hostId === hostId)
+      const entries = commandIds.map((commandId) => {
         const matches = pending.filter((candidate) => candidate.command.commandId === commandId)
         if (matches.length === 0) {
           throw new ControlError('command.identity_missing', 'A command cannot be reconciled without its device identity.', {
@@ -1113,28 +1176,35 @@ export class DesktopControlService extends EventEmitter {
             details: { commandId }
           })
         }
-        const entry = matches[0] as ScopedOutboxEntry
-        return { deviceId: entry.command.deviceId, commandId }
+        return matches[0] as ScopedOutboxEntry
       })
       const receipts: CommandReceipt[] = []
-      for (let offset = 0; offset < identities.length; offset += 256) {
+      // One exact envelope per request keeps even a maximum-size multibyte
+      // prompt comfortably below the transport's one-megabyte frame ceiling.
+      for (const entry of entries) {
         if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
           throw new ControlError('connection.superseded', 'The host connection changed during command reconciliation.', {
             retryable: true
           })
         }
-        const batch = identities.slice(offset, offset + 256)
+        const envelope = adaptCommand(entry.command)
+        await this.reserveCommandIdentity(entry.command, envelope)
         const result = await connection.request(
           'command.reconcile',
-          { expectedHostId: hostId, commands: batch },
+          { expectedHostId: hostId, commands: [envelope] },
           { priority: 'urgent' }
         )
-        receipts.push(...normalizeReconciliation(result, batch).map((receipt) => ({ ...receipt, hostId })))
+        const directReceipts = normalizeReceipts(result)
+        for (const receipt of directReceipts) assertReceiptMatchesCommand(receipt, entry.command)
+        receipts.push(
+          ...normalizeReconciliation(result, [entry.command]).map((receipt) => ({ ...receipt, hostId }))
+        )
       }
       await this.removeOutbox(
         receipts
-          .filter((receipt) => TERMINAL_OR_DURABLE.has(receipt.status) && receipt.deviceId)
-          .map((receipt) => ({ hostId, deviceId: receipt.deviceId, commandId: receipt.commandId }))
+          .filter((receipt) => TERMINAL_OR_DURABLE.has(receipt.status))
+          .map((receipt) => receiptToOutboxIdentity(hostId, receipt, entries))
+          .filter((identity): identity is OutboxIdentity => Boolean(identity))
       )
       return receipts
     })
@@ -1166,6 +1236,11 @@ export class DesktopControlService extends EventEmitter {
   }
 
   async diagnostics(): Promise<Diagnostics> {
+    const outbox = await this.readOutboxClassification(false)
+    const activeHostId = this.authorityHostId
+    const outboxCount = activeHostId
+      ? outbox.actionable.filter((entry) => entry.hostId === activeHostId).length
+      : 0
     return {
       platform: process.platform,
       arch: process.arch,
@@ -1173,7 +1248,8 @@ export class DesktopControlService extends EventEmitter {
       localEndpoint: await localHostdEndpoint(),
       connection: this.getConnectionState(),
       sshExecutable: this.sshExecutable,
-      outboxCount: (await this.readOutbox()).length,
+      outboxCount,
+      quarantinedOutboxCount: outbox.quarantinedCount,
       latencyTraces: this.latency.snapshot()
     }
   }
@@ -1312,7 +1388,26 @@ export class DesktopControlService extends EventEmitter {
       if (event.type.startsWith('handoff.')) this.emit('handoff-progress', event.payload)
       else if (event.type.startsWith('snapshot.') || event.type === 'thread.snapshot') {
         try {
-          this.emit('snapshot', snapshotEventForAuthority(event.payload, hostId))
+          const snapshot = snapshotEventForAuthority(event.payload, hostId)
+          const authority: CapturedProjectionAuthority = { hostId, connection, target, generation }
+          void (async () => {
+            const catalog = CatalogProjectionSnapshotSchema.safeParse(snapshot)
+            const accepted = catalog.success
+              ? await this.persistCatalog(catalog.data, authority)
+              : await this.persistThreadSnapshot(ThreadProjectionSnapshotSchema.parse(snapshot), authority)
+            if (accepted && this.isActiveConnection(connection, target, hostId, generation)) {
+              this.emit('snapshot', snapshot)
+            }
+          })().catch((error) => {
+            if (!this.isActiveConnection(connection, target, hostId, generation)) return
+            connection.terminate(
+              error instanceof ControlError
+                ? error
+                : new ControlError('protocol.snapshot_persistence_failed', 'The host snapshot could not be persisted safely.', {
+                    cause: error,
+                  }),
+            )
+          })
         } catch (error) {
           connection.terminate(
             error instanceof ControlError
@@ -1611,7 +1706,7 @@ export class DesktopControlService extends EventEmitter {
     }
   }
 
-  private async persistCatalog(catalog: unknown, authority: CapturedProjectionAuthority): Promise<void> {
+  private async persistCatalog(catalog: unknown, authority: CapturedProjectionAuthority): Promise<boolean> {
     const parsedCatalog = CatalogProjectionSnapshotSchema.parse(catalog)
     this.assertProjectionAuthority(authority, 'catalog refresh')
     if (parsedCatalog.host.hostId !== authority.hostId) {
@@ -1619,140 +1714,312 @@ export class DesktopControlService extends EventEmitter {
         details: { expectedHostId: authority.hostId, receivedHostId: parsedCatalog.host.hostId }
       })
     }
+    let accepted = false
     await this.cache.update((current) => {
       this.assertProjectionAuthority(authority, 'catalog refresh')
       const cache = normalizeCache(current)
       const previous = cache.entries[authority.hostId]
+      const decision = catalogProjectionDecision(previous, parsedCatalog)
+      if (!decision.accept) return cache
+      accepted = true
       return replaceProjectionEntry(cache, authority.hostId, {
         ...previous,
         hostId: authority.hostId,
         catalog: parsedCatalog,
+        retiredExecutionGenerations: decision.retiredExecutionGenerations,
         updatedAt: now(),
       })
     })
     this.assertProjectionAuthority(authority, 'catalog refresh')
+    return accepted
+  }
+
+  private async persistThreadSnapshot(
+    snapshot: ThreadProjectionSnapshot,
+    authority: CapturedProjectionAuthority,
+  ): Promise<boolean> {
+    this.assertProjectionAuthority(authority, 'thread snapshot')
+    if (snapshot.thread.currentLocation.hostId !== authority.hostId) {
+      throw new ControlError('protocol.authority_mismatch', 'The thread snapshot belongs to a different host authority.', {
+        details: { expectedHostId: authority.hostId, receivedHostId: snapshot.thread.currentLocation.hostId },
+      })
+    }
+    let accepted = false
+    await this.cache.update((current) => {
+      this.assertProjectionAuthority(authority, 'thread snapshot')
+      const cache = normalizeCache(current)
+      const previous = cache.entries[authority.hostId]
+      const decision = threadSnapshotProjectionDecision(previous, snapshot)
+      if (!decision.accept) return cache
+      accepted = true
+      return replaceProjectionEntry(cache, authority.hostId, {
+        ...previous,
+        hostId: authority.hostId,
+        lastSnapshot: snapshot,
+        retiredExecutionGenerations: decision.retiredExecutionGenerations,
+        updatedAt: now(),
+      })
+    })
+    this.assertProjectionAuthority(authority, 'thread snapshot')
+    return accepted
   }
 
   private async readCache(): Promise<CacheEnvelope> {
     return normalizeCache(await this.cache.read())
   }
 
-  private async readOutbox(): Promise<OutboxEntry[]> {
+  private async readRawOutbox(): Promise<unknown[]> {
     const entries = await this.outbox.read()
     if (!Array.isArray(entries)) return []
-    return entries.filter(isOutboxEntry).slice(-OUTBOX_LIMIT)
+    return entries
+  }
+
+  private async readOutboxClassification(reserveMissingIdentities: boolean): Promise<OutboxClassification> {
+    const raw = await this.readRawOutbox()
+    if (raw.length === 0) return { actionable: [], quarantinedCount: 0 }
+    let ledger = await this.commandIdentities.read()
+    let classification = classifyRawOutbox(raw, ledger)
+    if (!reserveMissingIdentities) return classification
+
+    const missing = classification.actionable.filter((entry) => !findCommandIdentity(ledger, entry.command))
+    if (missing.length > 0) {
+      ledger = await this.commandIdentities.update((current) => {
+        const entries = [...current.entries]
+        for (const pending of missing) {
+          const existing = entries.find(
+            (entry) =>
+              entry.deviceId === pending.command.deviceId &&
+              entry.commandId === pending.command.commandId,
+          )
+          if (existing) continue
+          if (entries.length >= COMMAND_IDENTITY_LEDGER_LIMIT) break
+          entries.push({
+            deviceId: pending.command.deviceId,
+            commandId: pending.command.commandId,
+            hostId: pending.command.expectedHostId,
+            envelopeSha256: commandEnvelopeSha256(adaptCommand(pending.command)),
+            reservedAt: now(),
+          })
+        }
+        return entries.length === current.entries.length ? current : { version: 1, entries }
+      })
+    }
+    classification = classifyRawOutbox(raw, ledger)
+    return classification
+  }
+
+  private async assertOutboxIdentityAvailable(entry: ScopedOutboxEntry): Promise<void> {
+    const matches = (await this.readRawOutbox()).filter((candidate) =>
+      rawOutboxIdentityMatches(candidate, entry.command.deviceId, entry.command.commandId)
+    )
+    if (matches.length === 0) return
+    if (matches.length === 1 && isExactReplaceableOutboxEntry(matches[0], entry)) return
+    throw new ControlError(
+      'command.identity_conflict',
+      'This device command ID is already held by another or unverifiable local command.',
+      { details: { deviceId: entry.command.deviceId, commandId: entry.command.commandId } },
+    )
+  }
+
+  private async reserveCommandIdentity(
+    command: ClientCommand,
+    envelope: CommandEnvelope = adaptCommand(command),
+  ): Promise<void> {
+    const envelopeSha256 = commandEnvelopeSha256(envelope)
+    await this.commandIdentities.update((current) => {
+      const existing = current.entries.find(
+        (entry) => entry.deviceId === command.deviceId && entry.commandId === command.commandId,
+      )
+      if (existing) {
+        if (existing.hostId === command.expectedHostId && existing.envelopeSha256 === envelopeSha256) {
+          return current
+        }
+        throw new ControlError(
+          'command.identity_conflict',
+          'This device command ID is permanently reserved for a different immutable envelope.',
+          { details: { deviceId: command.deviceId, commandId: command.commandId } },
+        )
+      }
+      if (current.entries.length >= COMMAND_IDENTITY_LEDGER_LIMIT) {
+        throw new ControlError(
+          'command.identity_ledger_full',
+          'The durable command identity ledger is full. New commands are blocked to prevent identity reuse.',
+          { details: { maxEntries: COMMAND_IDENTITY_LEDGER_LIMIT } },
+        )
+      }
+      return {
+        version: 1,
+        entries: [...current.entries, {
+          deviceId: command.deviceId,
+          commandId: command.commandId,
+          hostId: command.expectedHostId,
+          envelopeSha256,
+          reservedAt: now(),
+        }],
+      }
+    })
   }
 
   private async putOutbox(entry: ScopedOutboxEntry): Promise<void> {
-    await this.outbox.update(async () => {
-      const entries = await this.readOutbox()
-      const withoutCurrent = entries.filter((candidate) => !sameOutboxIdentity(candidate, entry))
-      withoutCurrent.push(entry)
-      if (withoutCurrent.length > OUTBOX_LIMIT) {
+    await this.outbox.update((current) => {
+      const entries = Array.isArray(current) ? current : []
+      const sameIdentity = entries.filter((candidate) =>
+        rawOutboxIdentityMatches(candidate, entry.command.deviceId, entry.command.commandId)
+      )
+      if (
+        sameIdentity.length > 1 ||
+        (sameIdentity.length === 1 && !isExactReplaceableOutboxEntry(sameIdentity[0], entry))
+      ) {
+        throw new ControlError(
+          'command.identity_conflict',
+          'This command ID is already held by another or unverifiable local command. The stored command remains quarantined.',
+          {
+            details: {
+              hostId: entry.hostId,
+              deviceId: entry.command.deviceId,
+              commandId: entry.command.commandId,
+            },
+          },
+        )
+      }
+      const withoutCurrent = entries.filter((candidate) =>
+        !isExactReplaceableOutboxEntry(candidate, entry)
+      )
+      if (withoutCurrent.length >= OUTBOX_LIMIT) {
         throw new ControlError('outbox.full', 'The local command outbox is full.', {
           details: { maxEntries: OUTBOX_LIMIT }
         })
       }
-      return withoutCurrent
+      return [...withoutCurrent, entry]
     })
   }
 
   private async removeOutbox(identities: OutboxIdentity[]): Promise<void> {
     if (identities.length === 0) return
-    await this.outbox.update(async () =>
-      (await this.readOutbox()).filter(
-        (entry) => !identities.some((identity) => matchesOutboxIdentity(entry, identity))
+    await this.outbox.update((current) =>
+      (Array.isArray(current) ? current : []).filter(
+        (entry) => !(
+          isOutboxEntry(entry) &&
+          identities.some((identity) => matchesOutboxIdentity(entry, identity))
+        )
       )
     )
+  }
+
+  private async holdOutboxAfterReconciliationFailure(
+    entry: ScopedOutboxEntry,
+    error: unknown,
+  ): Promise<void> {
+    const identity = outboxIdentity(entry.hostId, entry.command)
+    const quarantineReason =
+      isDefinitiveCommandIdentityError(error)
+        ? 'command_identity_conflict' as const
+        : undefined
+    await this.outbox.update((current) =>
+      (Array.isArray(current) ? current : []).map((candidate) =>
+        isOutboxEntry(candidate) && matchesOutboxIdentity(candidate, identity)
+          ? {
+              ...candidate,
+              state: 'uncertain' as const,
+              updatedAt: now(),
+              ...(quarantineReason ? { quarantineReason } : {}),
+            }
+          : candidate
+      )
+    )
+    this.emit('host-event', {
+      type: 'command.receipt',
+      payload: {
+        hostId: entry.hostId,
+        deviceId: entry.command.deviceId,
+        commandId: entry.command.commandId,
+        threadId: entry.command.threadId,
+        executionGenerationId: entry.command.expectedExecutionGenerationId,
+        status: 'uncertain',
+        durable: false,
+        detail: quarantineReason
+          ? 'This command identity conflicts with a different durable envelope and is held locally.'
+          : 'The host could not prove this command receipt. It remains uncertain and was not sent.',
+      } satisfies CommandReceipt,
+    })
   }
 
   private async reconcileOutboxAfterConnect(hostId: string, connection: FramedConnection): Promise<void> {
     if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
       throw new ControlError('connection.superseded', 'The host authority changed during command reconciliation.')
     }
+    // Reconciliation carries the complete v2 envelope. A legacy v1 host may
+    // implement the same method name with weaker ID-only semantics, so absence
+    // of the exact v2 capability makes the entire command surface read-only.
+    if (!this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) return
     // Entries for another host—or legacy entries with no immutable authority—
     // remain quarantined locally and are never disclosed to this connection.
-    const pending = (await this.readOutbox()).filter((entry) => isOutboxEntryForAuthority(entry, hostId))
+    const pending = (await this.readOutboxClassification(true)).actionable.filter((entry) => entry.hostId === hostId)
     if (pending.length === 0) return
 
-    const entriesByIdentity = new Map(
-      pending.map((entry) => [commandIdentityKey(entry.command.deviceId, entry.command.commandId), entry])
-    )
-    const durableIdentities = new Set<string>()
-    const explicitlyUnknownWaitingIdentities = new Set<string>()
+    const durableEntries: ScopedOutboxEntry[] = []
+    const durableReceipts: CommandReceipt[] = []
+    const explicitlyUnknownWaitingEntries: ScopedOutboxEntry[] = []
 
-    for (let offset = 0; offset < pending.length; offset += 256) {
+    for (const entry of pending) {
       if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
         throw new ControlError('connection.superseded', 'The host authority changed during command reconciliation.')
       }
-      const batch = pending.slice(offset, offset + 256)
-      const identities = batch.map((entry) => ({
-        deviceId: entry.command.deviceId,
-        commandId: entry.command.commandId
-      }))
-      const result = await connection.request(
-        'command.reconcile',
-        { expectedHostId: hostId, commands: identities },
-        { priority: 'urgent' }
-      )
+      try {
+        const envelope = adaptCommand(entry.command)
+        await this.reserveCommandIdentity(entry.command, envelope)
+        const result = await connection.request(
+          'command.reconcile',
+          { expectedHostId: hostId, commands: [envelope] },
+          { priority: 'urgent' }
+        )
 
-      for (const receipt of normalizeReceipts(result)) {
-        if (TERMINAL_OR_DURABLE.has(receipt.status) || receipt.durable) {
-          const matches = receipt.deviceId
-            ? [entriesByIdentity.get(commandIdentityKey(receipt.deviceId, receipt.commandId))].filter(
-                (entry): entry is ScopedOutboxEntry => Boolean(entry)
-              )
-            : batch.filter((entry) => entry.command.commandId === receipt.commandId)
-          if (matches.length === 1) {
-            const entry = matches[0] as ScopedOutboxEntry
-            durableIdentities.add(commandIdentityKey(entry.command.deviceId, entry.command.commandId))
+        const receivedReceipts = normalizeReceipts(result)
+        for (const receipt of receivedReceipts) {
+          assertReceiptMatchesCommand(receipt, entry.command)
+          if (TERMINAL_OR_DURABLE.has(receipt.status) || receipt.durable) {
+            durableEntries.push(entry)
+            durableReceipts.push({ ...receipt, hostId })
           }
         }
-      }
 
-      // Auto-delivery is limited to commands the user explicitly chose to send
-      // after reconnect, and only after this host authoritatively says it has no
-      // receipt for the same device/command identity. Commands that may have
-      // crossed the connection boundary remain uncertain and are never replayed.
-      if (isRecord(result) && Array.isArray(result.unknown)) {
-        for (const identity of result.unknown) {
-          if (!isRecord(identity)) continue
-          const commandId = typeof identity.commandId === 'string' ? identity.commandId : undefined
-          const deviceId = typeof identity.deviceId === 'string' ? identity.deviceId : undefined
-          if (!commandId || !deviceId) continue
-          const key = commandIdentityKey(deviceId, commandId)
-          const entry = entriesByIdentity.get(key)
+        // Auto-delivery is limited to commands the user explicitly chose to send
+        // after reconnect, and only after this host authoritatively says it has no
+        // receipt for the complete envelope. Ambiguous entries remain uncertain.
+        const unknown = normalizeUnknownCommandIdentities(result)
+        if (unknown.length > 1) {
+          throw new ControlError(
+            'protocol.command_reconciliation_identity_mismatch',
+            'The host returned more unknown command identities than were requested.',
+          )
+        }
+        for (const identity of unknown) {
           if (
-            entry?.state === 'waiting_for_connection' &&
-            isExplicitOfflineFollowUp(entry.command)
+            identity.deviceId !== entry.command.deviceId ||
+            identity.commandId !== entry.command.commandId ||
+            receivedReceipts.length > 0
           ) {
-            explicitlyUnknownWaitingIdentities.add(key)
+            throw new ControlError(
+              'protocol.command_reconciliation_identity_mismatch',
+              'The host reconciliation result did not match the exact stored command identity.',
+            )
+          }
+          if (entry.state === 'waiting_for_connection' && isExplicitOfflineFollowUp(entry.command)) {
+            explicitlyUnknownWaitingEntries.push(entry)
           }
         }
+      } catch (error) {
+        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) throw error
+        await this.holdOutboxAfterReconciliationFailure(entry, error)
       }
     }
 
-    await this.removeOutbox(
-      [...durableIdentities]
-        .map((key) => entriesByIdentity.get(key))
-        .filter((entry): entry is ScopedOutboxEntry => Boolean(entry))
-        .map((entry) => ({
-          hostId,
-          deviceId: entry.command.deviceId,
-          commandId: entry.command.commandId
-        }))
-    )
+    await this.removeOutbox(durableEntries.map((entry) => outboxIdentity(hostId, entry.command)))
+    for (const receipt of durableReceipts) {
+      this.emit('host-event', { type: 'command.receipt', payload: receipt })
+    }
 
-    // Receipt reconciliation is safe while runtime startup is incomplete, but
-    // queued execution remains local until the verified host advertises the
-    // resident command capability. The health-poll transition that gains that
-    // capability re-runs reconciliation before attempting delivery.
-    if (!this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) return
-
-    let firstDeliveryError: unknown
-    for (const key of explicitlyUnknownWaitingIdentities) {
-      const entry = entriesByIdentity.get(key)
-      if (!entry) continue
+    for (const entry of explicitlyUnknownWaitingEntries) {
       try {
         if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
           throw new ControlError('connection.superseded', 'The host authority changed before queued delivery.')
@@ -1760,80 +2027,174 @@ export class DesktopControlService extends EventEmitter {
         const receipt = await this.submitCommand(entry.command)
         this.emit('host-event', { type: 'command.receipt', payload: receipt })
       } catch (error) {
-        firstDeliveryError ??= error
+        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) throw error
+        // submitCommand has already retained or quarantined this exact envelope.
+        // A per-command admission failure must not take down a verified host.
       }
     }
-    if (firstDeliveryError) throw firstDeliveryError
   }
 }
 
-function normalizeReceipt(commandId: string, value: unknown): CommandReceipt {
-  if (!isRecord(value)) return { commandId, status: 'received', durable: true }
-  const status = typeof value.status === 'string' && isReceiptStatus(value.status) ? value.status : 'received'
+type HostCommandReceipt = Omit<CommandReceipt, 'hostId'>
+
+function normalizeReceipt(commandId: string, value: unknown): HostCommandReceipt {
+  const parsed = HostCommandReceiptSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new ControlError(
+      'protocol.command_receipt_invalid',
+      'The host returned a command receipt without its complete immutable identity.',
+      { details: { commandId, issues: parsed.error.issues.slice(0, 8).map((issue) => issue.path.join('.')) } },
+    )
+  }
+  const receipt = parsed.data
+  const status = receipt.status
   return {
-    commandId: typeof value.commandId === 'string' ? value.commandId : commandId,
-    ...(typeof value.deviceId === 'string' ? { deviceId: value.deviceId } : {}),
+    commandId: receipt.commandId,
+    deviceId: receipt.deviceId,
+    threadId: receipt.threadId,
+    executionGenerationId: receipt.executionGenerationId,
     status,
-    durable: typeof value.durable === 'boolean' ? value.durable : status !== 'uncertain',
-    ...(typeof value.detail === 'string'
-      ? { detail: value.detail.slice(0, 2_048) }
-      : typeof value.message === 'string'
-        ? { detail: value.message.slice(0, 2_048) }
-        : {})
+    durable: status !== 'uncertain',
+    ...(receipt.message ? { detail: receipt.message.slice(0, 2_048) } : {})
   }
 }
 
-function normalizeReceipts(value: unknown): CommandReceipt[] {
+function normalizeReceipts(value: unknown): HostCommandReceipt[] {
   const candidates = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.receipts) ? value.receipts : []
   return candidates
-    .filter(isRecord)
-    .filter((candidate) => typeof candidate.commandId === 'string')
     .slice(0, OUTBOX_LIMIT)
-    .map((candidate) => normalizeReceipt(candidate.commandId as string, candidate))
+    .map((candidate) => normalizeReceipt(isRecord(candidate) && typeof candidate.commandId === 'string' ? candidate.commandId : 'unknown', candidate))
 }
 
 function normalizeReconciliation(
   value: unknown,
-  requestedIdentities: Array<{ deviceId: string; commandId: string }>
-): CommandReceipt[] {
+  requestedCommands: ClientCommand[]
+): HostCommandReceipt[] {
   const receipts = normalizeReceipts(value)
   const seen = new Set(
     receipts
       .filter((receipt) => receipt.deviceId)
       .map((receipt) => commandIdentityKey(receipt.deviceId as string, receipt.commandId))
   )
-  const unknown = isRecord(value) && Array.isArray(value.unknown)
-    ? value.unknown
-        .filter(isRecord)
-        .map((identity) => ({ deviceId: identity.deviceId, commandId: identity.commandId }))
-        .filter(
-          (identity): identity is { deviceId: string; commandId: string } =>
-            typeof identity.deviceId === 'string' && typeof identity.commandId === 'string'
-        )
-    : requestedIdentities.filter(
-        (identity) => !seen.has(commandIdentityKey(identity.deviceId, identity.commandId))
-      )
+  const unknown = normalizeUnknownCommandIdentities(value)
   for (const identity of unknown) {
     const key = commandIdentityKey(identity.deviceId, identity.commandId)
     if (!seen.has(key)) {
+      const command = requestedCommands.find(
+        (candidate) => candidate.deviceId === identity.deviceId && candidate.commandId === identity.commandId,
+      )
+      if (!command) {
+        throw new ControlError(
+          'protocol.command_reconciliation_identity_mismatch',
+          'The host returned an unknown identity that was not requested.',
+        )
+      }
       receipts.push({
         deviceId: identity.deviceId,
         commandId: identity.commandId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
         status: 'uncertain',
         durable: false
       })
+      seen.add(key)
     }
   }
+  for (const command of requestedCommands) {
+    const key = commandIdentityKey(command.deviceId, command.commandId)
+    if (seen.has(key)) continue
+    receipts.push({
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'uncertain',
+      durable: false,
+      detail: 'The host did not confirm a receipt or exact absence for this command.',
+    })
+  }
   return receipts
+}
+
+function normalizeUnknownCommandIdentities(value: unknown): Array<{ deviceId: string; commandId: string }> {
+  if (!isRecord(value) || !Array.isArray(value.unknown)) return []
+  return value.unknown.map((identity) => {
+    if (!isRecord(identity) || typeof identity.deviceId !== 'string' || typeof identity.commandId !== 'string') {
+      throw new ControlError(
+        'protocol.command_reconciliation_invalid',
+        'The host returned a malformed unknown command identity.',
+      )
+    }
+    return { deviceId: identity.deviceId, commandId: identity.commandId }
+  })
 }
 
 function commandIdentityKey(deviceId: string, commandId: string): string {
   return `${deviceId}\u0000${commandId}`
 }
 
+function assertReceiptMatchesCommand(
+  receipt: HostCommandReceipt | CommandReceipt,
+  command: ClientCommand,
+): void {
+  if (
+    receipt.deviceId !== command.deviceId ||
+    receipt.commandId !== command.commandId ||
+    receipt.threadId !== command.threadId ||
+    receipt.executionGenerationId !== command.expectedExecutionGenerationId
+  ) {
+    throw new ControlError(
+      'protocol.command_receipt_identity_mismatch',
+      'The host receipt does not match the exact stored command generation and identity.',
+      {
+        details: {
+          expected: {
+            deviceId: command.deviceId,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            executionGenerationId: command.expectedExecutionGenerationId,
+          },
+          received: {
+            deviceId: receipt.deviceId,
+            commandId: receipt.commandId,
+            threadId: receipt.threadId,
+            executionGenerationId: receipt.executionGenerationId,
+          },
+        },
+      },
+    )
+  }
+}
+
+function receiptToOutboxIdentity(
+  hostId: string,
+  receipt: CommandReceipt,
+  entries: ScopedOutboxEntry[],
+): OutboxIdentity | undefined {
+  const entry = entries.find((candidate) =>
+    candidate.command.deviceId === receipt.deviceId &&
+    candidate.command.commandId === receipt.commandId &&
+    candidate.command.threadId === receipt.threadId &&
+    candidate.command.expectedExecutionGenerationId === receipt.executionGenerationId
+  )
+  return entry ? outboxIdentity(hostId, entry.command) : undefined
+}
+
 function adaptCommand(input: ClientCommand): CommandEnvelope {
-  if (!input.threadId) {
+  if (typeof input.threadId !== 'string' || input.threadId.length === 0) {
     throw new ControlError('command.thread_required', 'A thread ID is required for host commands.')
+  }
+  if (typeof input.expectedExecutionGenerationId !== 'string' || input.expectedExecutionGenerationId.length === 0) {
+    throw new ControlError(
+      'command.execution_generation_required',
+      'Refresh this thread before sending so its exact execution generation can be verified.',
+    )
+  }
+  if (typeof input.issuedAt !== 'string' || !Number.isFinite(Date.parse(input.issuedAt))) {
+    throw new ControlError(
+      'command.issued_at_required',
+      'This command is missing its stable issue time and cannot be sent or replayed.',
+    )
   }
   const payload = input.payload ?? {}
   const normalizedKind = input.kind.startsWith('thread.') ? input.kind.slice('thread.'.length) : input.kind
@@ -1852,11 +2213,29 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
     if (typeof payload.approvalId !== 'string') {
       throw new ControlError('command.approval_required', 'An approval ID is required.')
     }
+    if (payload.decision !== 'approve' && payload.decision !== 'reject') {
+      throw new ControlError(
+        'command.approval_decision_invalid',
+        'An approval command must preserve an explicit approve or reject decision.',
+      )
+    }
     command = {
       kind: 'approval.resolve',
       approvalId: payload.approvalId,
-      decision: payload.decision === 'approve' ? 'approve' : 'reject',
+      decision: payload.decision,
       ...(typeof payload.comment === 'string' ? { comment: payload.comment } : {})
+    }
+  } else if (normalizedKind === 'model.select') {
+    if (typeof payload.providerId !== 'string' || typeof payload.modelId !== 'string') {
+      throw new ControlError(
+        'command.model_selection_required',
+        'A provider and model are required to change this thread model.',
+      )
+    }
+    command = {
+      kind: 'model.select',
+      providerId: payload.providerId,
+      modelId: payload.modelId,
     }
   } else {
     throw new ControlError('command.unsupported_kind', 'This command kind is not supported by the host protocol.', {
@@ -1870,20 +2249,24 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
     commandId: input.commandId,
     expectedHostId: input.expectedHostId,
     threadId: input.threadId,
-    issuedAt: now(),
-    ...(input.expectedExecutionGenerationId
-      ? { expectedExecutionGenerationId: input.expectedExecutionGenerationId }
-      : {}),
+    issuedAt: input.issuedAt,
+    expectedExecutionGenerationId: input.expectedExecutionGenerationId,
     command
   })
 }
 
-function isReceiptStatus(value: string): value is CommandReceipt['status'] {
-  return value === 'waiting_for_connection' || value === 'uncertain' || TERMINAL_OR_DURABLE.has(value)
-}
-
 function isUrgentCommand(kind: string): boolean {
   return kind === 'approval.resolve' || kind === 'thread.cancel' || kind === 'thread.abort'
+}
+
+function isDefinitiveCommandIdentityError(error: unknown): boolean {
+  return error instanceof ControlError && (
+    error.code === 'command.identity_conflict' ||
+    error.code === 'host.command_id_reused' ||
+    error.code === 'host.command_identity_unverifiable' ||
+    error.code === 'host.command_identity_orphaned' ||
+    error.code === 'host.command_receipt_generation_mismatch'
+  )
 }
 
 function isExplicitOfflineFollowUp(command: ClientCommand): boolean {
@@ -1906,24 +2289,153 @@ function isOutboxEntry(value: unknown): value is OutboxEntry {
   )
 }
 
-function isOutboxEntryForAuthority(entry: OutboxEntry, hostId: string): entry is ScopedOutboxEntry {
-  return entry.hostId === hostId && entry.command.expectedHostId === hostId
+function isActionableOutboxEntry(entry: OutboxEntry): entry is ScopedOutboxEntry {
+  if (
+    entry.quarantineReason !== undefined ||
+    !entry.hostId ||
+    entry.command.expectedHostId !== entry.hostId ||
+    typeof entry.command.threadId !== 'string' ||
+    typeof entry.command.expectedExecutionGenerationId !== 'string' ||
+    typeof entry.command.issuedAt !== 'string'
+  ) return false
+  try {
+    adaptCommand(entry.command as ClientCommand)
+    return true
+  } catch {
+    return false
+  }
 }
 
-function sameOutboxIdentity(left: OutboxEntry, right: ScopedOutboxEntry): boolean {
+function isActionableOutboxEntryForAuthority(
+  entry: OutboxEntry,
+  hostId: string,
+): entry is ScopedOutboxEntry {
+  return isActionableOutboxEntry(entry) && entry.hostId === hostId
+}
+
+function samePersistedCommand(left: OutboxEntry['command'], right: ClientCommand): boolean {
+  return canonicalJson(left) === canonicalJson(right)
+}
+
+function rawOutboxIdentity(value: unknown): { deviceId: string; commandId: string } | undefined {
+  if (!isRecord(value) || !isRecord(value.command)) return undefined
+  if (typeof value.command.deviceId !== 'string' || typeof value.command.commandId !== 'string') return undefined
+  return { deviceId: value.command.deviceId, commandId: value.command.commandId }
+}
+
+function rawOutboxIdentityMatches(value: unknown, deviceId: string, commandId: string): boolean {
+  const identity = rawOutboxIdentity(value)
+  return identity?.deviceId === deviceId && identity.commandId === commandId
+}
+
+function isExactReplaceableOutboxEntry(value: unknown, entry: ScopedOutboxEntry): value is ScopedOutboxEntry {
   return (
-    left.hostId === right.hostId &&
-    left.command.deviceId === right.command.deviceId &&
-    left.command.commandId === right.command.commandId
+    isOutboxEntry(value) &&
+    isActionableOutboxEntry(value) &&
+    value.hostId === entry.hostId &&
+    samePersistedCommand(value.command, entry.command)
   )
+}
+
+function commandEnvelopeSha256(envelope: CommandEnvelope): string {
+  return createHash('sha256').update(canonicalJson(envelope), 'utf8').digest('hex')
+}
+
+function findCommandIdentity(
+  ledger: CommandIdentityLedger,
+  command: ClientCommand,
+): CommandIdentityLedgerEntry | undefined {
+  return ledger.entries.find(
+    (entry) => entry.deviceId === command.deviceId && entry.commandId === command.commandId,
+  )
+}
+
+function classifyRawOutbox(raw: unknown[], ledger: CommandIdentityLedger): OutboxClassification {
+  if (raw.length > OUTBOX_LIMIT) return { actionable: [], quarantinedCount: raw.length }
+
+  const identityCounts = new Map<string, number>()
+  for (const candidate of raw) {
+    const identity = rawOutboxIdentity(candidate)
+    if (!identity) continue
+    const key = commandIdentityKey(identity.deviceId, identity.commandId)
+    identityCounts.set(key, (identityCounts.get(key) ?? 0) + 1)
+  }
+
+  const actionable: ScopedOutboxEntry[] = []
+  for (const candidate of raw) {
+    if (!isOutboxEntry(candidate) || !isActionableOutboxEntry(candidate)) continue
+    const key = commandIdentityKey(candidate.command.deviceId, candidate.command.commandId)
+    if (identityCounts.get(key) !== 1) continue
+    const existing = findCommandIdentity(ledger, candidate.command)
+    if (existing) {
+      const envelopeSha256 = commandEnvelopeSha256(adaptCommand(candidate.command))
+      if (existing.hostId !== candidate.hostId || existing.envelopeSha256 !== envelopeSha256) continue
+    } else if (ledger.entries.length >= COMMAND_IDENTITY_LEDGER_LIMIT) {
+      continue
+    }
+    actionable.push(candidate)
+  }
+  return { actionable, quarantinedCount: raw.length - actionable.length }
 }
 
 function matchesOutboxIdentity(entry: OutboxEntry, identity: OutboxIdentity): boolean {
   return (
+    isActionableOutboxEntry(entry) &&
     entry.hostId === identity.hostId &&
+    entry.command.deviceId === identity.deviceId &&
     entry.command.commandId === identity.commandId &&
-    (identity.deviceId === undefined || entry.command.deviceId === identity.deviceId)
+    entry.command.threadId === identity.threadId &&
+    entry.command.expectedExecutionGenerationId === identity.expectedExecutionGenerationId &&
+    canonicalJson(entry.command) === identity.commandFingerprint
   )
+}
+
+function outboxIdentity(hostId: string, command: ClientCommand): OutboxIdentity {
+  return {
+    hostId,
+    deviceId: command.deviceId,
+    commandId: command.commandId,
+    threadId: command.threadId,
+    expectedExecutionGenerationId: command.expectedExecutionGenerationId,
+    commandFingerprint: canonicalJson(command),
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalJsonValue(value))
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, canonicalJsonValue(value[key])]),
+  )
+}
+
+function isCommandIdentityLedger(value: unknown): value is CommandIdentityLedger {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.entries)) return false
+  if (value.entries.length > COMMAND_IDENTITY_LEDGER_LIMIT) return false
+  const identities = new Set<string>()
+  for (const candidate of value.entries) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.deviceId !== 'string' ||
+      typeof candidate.commandId !== 'string' ||
+      !isHostId(candidate.hostId) ||
+      typeof candidate.envelopeSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(candidate.envelopeSha256) ||
+      typeof candidate.reservedAt !== 'string' ||
+      !Number.isFinite(Date.parse(candidate.reservedAt))
+    ) return false
+    const key = commandIdentityKey(candidate.deviceId, candidate.commandId)
+    if (identities.has(key)) return false
+    identities.add(key)
+  }
+  return true
 }
 
 function observationFromHealth(value: unknown): HealthObservation {
@@ -2145,6 +2657,133 @@ function visibleCacheForAuthority(cache: CacheEnvelope, hostId: string | undefin
   }
 }
 
+interface ProjectionWriteDecision {
+  accept: boolean
+  retiredExecutionGenerations: Record<string, string[]>
+}
+
+function catalogProjectionDecision(
+  previous: CachedHostProjection | undefined,
+  incoming: CatalogProjectionSnapshot,
+): ProjectionWriteDecision {
+  const retired = cloneRetiredExecutionGenerations(previous?.retiredExecutionGenerations)
+  for (const thread of incoming.threads) {
+    if (retired[thread.threadId]?.includes(thread.currentLocation.executionGenerationId)) {
+      return { accept: false, retiredExecutionGenerations: retired }
+    }
+  }
+  const parsedPrevious = CatalogProjectionSnapshotSchema.safeParse(previous?.catalog)
+  if (!parsedPrevious.success) return { accept: true, retiredExecutionGenerations: retired }
+  const current = parsedPrevious.data
+  if (Date.parse(incoming.generatedAt) < Date.parse(current.generatedAt)) {
+    return { accept: false, retiredExecutionGenerations: retired }
+  }
+
+  const currentThreads = new Map(current.threads.map((thread) => [thread.threadId, thread]))
+  const incomingThreadIds = new Set(incoming.threads.map((thread) => thread.threadId))
+  for (const currentThread of current.threads) {
+    if (!incomingThreadIds.has(currentThread.threadId)) {
+      if (!retireExecutionGeneration(
+        retired,
+        currentThread.threadId,
+        currentThread.currentLocation.executionGenerationId,
+      )) return { accept: false, retiredExecutionGenerations: retired }
+    }
+  }
+  for (const thread of incoming.threads) {
+    const incomingGeneration = thread.currentLocation.executionGenerationId
+    const currentThread = currentThreads.get(thread.threadId)
+    if (!currentThread) continue
+    const currentUpdatedAt = Date.parse(currentThread.updatedAt)
+    const incomingUpdatedAt = Date.parse(thread.updatedAt)
+    if (incomingUpdatedAt < currentUpdatedAt) {
+      return { accept: false, retiredExecutionGenerations: retired }
+    }
+    const currentGeneration = currentThread.currentLocation.executionGenerationId
+    if (incomingGeneration !== currentGeneration) {
+      if (incomingUpdatedAt <= currentUpdatedAt) {
+        return { accept: false, retiredExecutionGenerations: retired }
+      }
+      if (!retireExecutionGeneration(retired, thread.threadId, currentGeneration)) {
+        return { accept: false, retiredExecutionGenerations: retired }
+      }
+    }
+  }
+  return { accept: true, retiredExecutionGenerations: retired }
+}
+
+function threadSnapshotProjectionDecision(
+  previous: CachedHostProjection | undefined,
+  incoming: ThreadProjectionSnapshot,
+): ProjectionWriteDecision {
+  const retired = cloneRetiredExecutionGenerations(previous?.retiredExecutionGenerations)
+  const threadId = incoming.thread.threadId
+  const incomingGeneration = incoming.thread.currentLocation.executionGenerationId
+  if (retired[threadId]?.includes(incomingGeneration)) {
+    return { accept: false, retiredExecutionGenerations: retired }
+  }
+
+  const parsedCatalog = CatalogProjectionSnapshotSchema.safeParse(previous?.catalog)
+  if (parsedCatalog.success) {
+    const catalogThread = parsedCatalog.data.threads.find((thread) => thread.threadId === threadId)
+    if (
+      catalogThread &&
+      catalogThread.currentLocation.executionGenerationId !== incomingGeneration
+    ) {
+      return { accept: false, retiredExecutionGenerations: retired }
+    }
+  }
+
+  const parsedPrevious = ThreadProjectionSnapshotSchema.safeParse(previous?.lastSnapshot)
+  if (!parsedPrevious.success || parsedPrevious.data.thread.threadId !== threadId) {
+    return { accept: true, retiredExecutionGenerations: retired }
+  }
+  const current = parsedPrevious.data
+  const currentGeneration = current.thread.currentLocation.executionGenerationId
+  if (incomingGeneration === currentGeneration) {
+    const regresses =
+      incoming.latestCursor.sequence < current.latestCursor.sequence ||
+      Date.parse(incoming.thread.updatedAt) < Date.parse(current.thread.updatedAt)
+    return { accept: !regresses, retiredExecutionGenerations: retired }
+  }
+  if (Date.parse(incoming.thread.updatedAt) <= Date.parse(current.thread.updatedAt)) {
+    return { accept: false, retiredExecutionGenerations: retired }
+  }
+  if (!retireExecutionGeneration(retired, threadId, currentGeneration)) {
+    return { accept: false, retiredExecutionGenerations: retired }
+  }
+  return { accept: true, retiredExecutionGenerations: retired }
+}
+
+function cloneRetiredExecutionGenerations(value: unknown): Record<string, string[]> {
+  if (!isRecord(value)) return {}
+  const result: Record<string, string[]> = {}
+  for (const [threadId, generations] of Object.entries(value).slice(0, 10_000)) {
+    if (!isBoundedProjectionId(threadId) || !Array.isArray(generations)) continue
+    const normalized = [...new Set(generations.filter(isBoundedProjectionId))]
+      .slice(-RETIRED_GENERATIONS_PER_THREAD_LIMIT)
+    if (normalized.length > 0) result[threadId] = normalized
+  }
+  return result
+}
+
+function retireExecutionGeneration(
+  retired: Record<string, string[]>,
+  threadId: string,
+  executionGenerationId: string,
+): boolean {
+  const generations = retired[threadId] ?? []
+  if (generations.includes(executionGenerationId)) return true
+  if (generations.length >= RETIRED_GENERATIONS_PER_THREAD_LIMIT) return false
+  generations.push(executionGenerationId)
+  retired[threadId] = generations
+  return true
+}
+
+function isBoundedProjectionId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128
+}
+
 function replaceProjectionEntry(
   cache: CacheEnvelope,
   hostId: string,
@@ -2169,6 +2808,11 @@ function asCachedHostProjection(value: unknown, hostId: string): CachedHostProje
     hostId,
     ...(catalogMatches ? { catalog: catalog.data } : {}),
     ...(snapshotMatches ? { lastSnapshot: snapshot.data } : {}),
+    ...(
+      isRecord(value.retiredExecutionGenerations)
+        ? { retiredExecutionGenerations: cloneRetiredExecutionGenerations(value.retiredExecutionGenerations) }
+        : {}
+    ),
     ...(typeof value.updatedAt === 'string' ? { updatedAt: value.updatedAt } : {}),
   }
 }

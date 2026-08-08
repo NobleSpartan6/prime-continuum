@@ -98,7 +98,6 @@ describe("HostService handoff availability", () => {
     });
     const after = await store.getThreadSnapshot("demo-thread");
     expect(after.thread.currentLocation).toEqual(before.thread.currentLocation);
-    expect((await store.reconcileCommands([identity])).unknown).toEqual([identity]);
   });
 
   it("durably rejects commands when the default gateway is unavailable without queueing them", async () => {
@@ -153,6 +152,7 @@ describe("HostService handoff availability", () => {
       expectedHostId: "different-host",
       threadId: "demo-thread",
       issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "demo-execution-1",
       command: { kind: "prompt", text: "This must never reach the wrong host journal." },
     };
 
@@ -166,7 +166,7 @@ describe("HostService handoff availability", () => {
       ok: false,
       error: { code: "HOST_AUTHORITY_MISMATCH", retryable: false },
     });
-    expect((await store.reconcileCommands([{ deviceId: command.deviceId, commandId: command.commandId }])).unknown).toEqual([
+    expect((await store.reconcileCommands([command])).unknown).toEqual([
       { deviceId: command.deviceId, commandId: command.commandId },
     ]);
 
@@ -176,10 +176,23 @@ describe("HostService handoff availability", () => {
       method: "command.reconcile",
       payload: {
         expectedHostId: "different-host",
-        commands: [{ deviceId: command.deviceId, commandId: command.commandId }],
+        commands: [command],
       },
     }, TRUSTED_USER_SESSION);
     expect(reconcile).toMatchObject({
+      ok: false,
+      error: { code: "HOST_AUTHORITY_MISMATCH", retryable: false },
+    });
+    const envelopeMismatch = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "wrong-envelope-host-reconcile",
+      method: "command.reconcile",
+      payload: {
+        expectedHostId: host.hostId,
+        commands: [command],
+      },
+    }, TRUSTED_USER_SESSION);
+    expect(envelopeMismatch).toMatchObject({
       ok: false,
       error: { code: "HOST_AUTHORITY_MISMATCH", retryable: false },
     });
@@ -208,9 +221,6 @@ describe("HostService handoff availability", () => {
       ok: false,
       error: { code: "INVALID_REQUEST", retryable: false },
     });
-    expect(
-      (await store.reconcileCommands([{ deviceId: command.deviceId, commandId: command.commandId }])).unknown,
-    ).toEqual([{ deviceId: command.deviceId, commandId: command.commandId }]);
   });
 
   it("fails closed when a transport caller omits its session context", async () => {
@@ -261,6 +271,7 @@ describe("HostService handoff availability", () => {
       expectedHostId: host.hostId,
       threadId: "demo-thread",
       issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "demo-execution-1",
       command: { kind: "follow_up", text: "Continue from the phone." },
     };
     const denied = await service.handle(
@@ -296,7 +307,7 @@ describe("HostService handoff availability", () => {
     );
     expect(spoofed).toMatchObject({ ok: false, error: { code: "REMOTE_DEVICE_IDENTITY_MISMATCH" } });
     expect(
-      (await store.reconcileCommands([{ deviceId: "mobile-b", commandId: "spoofed-command" }])).unknown,
+      (await store.reconcileCommands([{ ...command, deviceId: "mobile-b", commandId: "spoofed-command" }])).unknown,
     ).toEqual([{ deviceId: "mobile-b", commandId: "spoofed-command" }]);
 
     const startCommand: CommandEnvelope = {

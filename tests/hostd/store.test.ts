@@ -62,12 +62,12 @@ describe("HostStore", () => {
 
     const restarted = new HostStore(directory);
     await restarted.initialize();
-    const reconciliation = await restarted.reconcileCommands([
-      { deviceId: command.deviceId, commandId: command.commandId },
-      { deviceId: command.deviceId, commandId: "unknown-command" },
-    ]);
+    const reconciliation = await restarted.reconcileCommands([command]);
     expect(reconciliation.receipts).toEqual([first.receipt]);
-    expect(reconciliation.unknown).toEqual([{ deviceId: command.deviceId, commandId: "unknown-command" }]);
+    expect(reconciliation.unknown).toEqual([]);
+    const unknown = await restarted.reconcileCommands([{ ...command, commandId: "unknown-command" }]);
+    expect(unknown.receipts).toEqual([]);
+    expect(unknown.unknown).toEqual([{ deviceId: command.deviceId, commandId: "unknown-command" }]);
 
     const journal = await readFile(store.paths.commandJournal, "utf8");
     expect(journal.trim().split("\n")).toHaveLength(2);
@@ -129,7 +129,6 @@ describe("HostStore", () => {
     ]);
     expect((await store.getThreadSnapshot("demo-thread")).thread.currentLocation.hostId).toBe("destination-host");
     expect(await store.commitHandoff(plan.handoffId, command)).toEqual({ ...committed, duplicate: true });
-    expect((await store.reconcileCommands([command])).receipts[0]?.status).toBe("completed");
   });
 
   it.each(["after_open", "after_write", "after_sync", "after_close"] satisfies AtomicCreateFaultPoint[])(

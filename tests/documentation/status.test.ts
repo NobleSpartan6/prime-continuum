@@ -23,4 +23,17 @@ describe('documented release boundary', () => {
     expect(readme).not.toMatch(/^Cross-platform desktop control plane.*can run locally or over SSH/m)
     expect(status).not.toContain('## Executable now')
   })
+
+  it('documents command-authority limits without turning time or IDs into hidden authority', () => {
+    const architecture = readRepositoryFile('docs/architecture.md')
+    const status = readRepositoryFile('docs/implementation-status.md')
+    const threatModel = readRepositoryFile('docs/relay-threat-model.md')
+
+    expect(architecture).toMatch(/issuedAt.*not trusted causal time/i)
+    expect(architecture).toMatch(/device-global.*deviceId, commandId/i)
+    expect(status).toMatch(/10,000 entries/i)
+    expect(status).toMatch(/durable generation-bound dispatch lease/i)
+    expect(status).toMatch(/command and handoff receipts must share one reserved/i)
+    expect(threatModel).toMatch(/clocks never grant authority/i)
+  })
 })

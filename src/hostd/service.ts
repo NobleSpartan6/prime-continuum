@@ -326,6 +326,12 @@ export class HostService {
         return this.store.getThreadSnapshot(request.payload.threadId);
       case "command.submit": {
         const command = request.payload.command;
+        // Idempotency and command-key ownership precede every mutable
+        // environmental observation. A known exact retry returns its original
+        // receipt even if runtime/gateway state has since changed; a reused key
+        // fails before `isLive` can obscure the durable identity conflict.
+        const knownReceipt = await this.store.preflightKnownCommand(command);
+        if (knownReceipt) return knownReceipt;
         const host = await this.store.getHost();
         if (command.expectedHostId !== host.hostId) {
           throw new HostStoreError(
@@ -347,14 +353,10 @@ export class HostService {
           const admission = await this.store.admitCommand(command, false, runtimeIntegrityRejection);
           return admission.receipt;
         }
-        const catalog = await this.store.getCatalogSnapshot();
-        const thread = catalog.threads.find((item) => item.threadId === command.threadId);
-        const generationId =
-          command.expectedExecutionGenerationId ?? thread?.currentLocation.executionGenerationId ?? "unknown-generation";
         let live = false;
         let liveCheckFailure: StructuredError | undefined;
         try {
-          live = await this.gateway.isLive(command.threadId, generationId);
+          live = await this.gateway.isLive(command.threadId, command.expectedExecutionGenerationId);
         } catch (error) {
           if (command.command.kind !== "model.select") throw error;
           liveCheckFailure = {
@@ -467,6 +469,12 @@ export class HostService {
           throw new HostStoreError(
             "HOST_AUTHORITY_MISMATCH",
             "The reconciliation identities belong to a different host authority.",
+          );
+        }
+        if (request.payload.commands.some((command) => command.expectedHostId !== host.hostId)) {
+          throw new HostStoreError(
+            "HOST_AUTHORITY_MISMATCH",
+            "The exact reconciliation envelope belongs to a different host authority.",
           );
         }
         return this.store.reconcileCommands(request.payload.commands);

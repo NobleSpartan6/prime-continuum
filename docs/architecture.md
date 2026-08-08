@@ -49,17 +49,20 @@ Connection, task, and command admission are modeled independently:
 | Task | `idle`, `running`, `waiting`, `needs_approval`, `complete`, `failed` |
 | Command | `draft`, `waiting_for_connection`, `sent`, `queued_on_host`, `uncertain`, `running`, `completed`, `rejected`, `cancelled`, `failed` |
 
-A dropped connection does not turn a running task into a failed task. A command becomes durable only after a host receipt. An ambiguous disconnect is reconciled by `(deviceId, commandId)` and is never blindly replayed.
+A dropped connection does not turn a running task into a failed task. A command becomes durable only after a host receipt. Every current command mutates an existing thread, so its immutable envelope includes the expected host, thread, execution generation, stable issue time, payload, and `(deviceId, commandId)`. An ambiguous disconnect is reconciled against that complete envelope and is never blindly replayed. A future thread-creation operation must be a separate host-authoritative transaction that mints its first generation; omission is not a creation signal.
 
 ## Host authority isolation
 
 SSH aliases and local-socket paths are locators, never identities. A successful `health.get` supplies hostd's immutable `hostId`; the desktop binds that verified identity to the locator and carries it in connection state.
 
-- The single-authority projection cache is tagged with `projectionHostId`. Catalogs, thread snapshots, and live snapshot events are schema-checked against it before use.
-- Every new outbox entry stores both an outer `hostId` scope and the command's `expectedHostId`. Legacy or mismatched entries remain quarantined and are never disclosed, reconciled, or replayed.
-- Submit, reconcile, and handoff requests carry `expectedHostId` through the framed protocol. Both the desktop and hostd reject an authority mismatch.
-- Reconciliation keys and removal use the full `(deviceId, commandId)` identity, including when command IDs collide across devices.
-- A host switch invalidates the previous renderer projection before the new authority can publish online. Stale connection, snapshot, bootstrap, and composer completions are generation-checked and ignored or rejected.
+- The workbench exposes one active authority at a time while retaining separately tagged per-host cache entries. Every catalog, thread snapshot, and live snapshot event is schema-checked against its `projectionHostId` and execution generation before it can enter the active projection.
+- Every new outbox entry stores both an outer `hostId` scope and the command's exact host/thread/generation authority plus one stable `issuedAt`. That timestamp is immutable identity and audit metadata, not trusted causal time or a substitute for an execution-generation fence. Legacy entries missing any immutable field, structurally invalid entries, and mismatched entries remain stored but quarantined and are never disclosed as actionable work, reconciled, or replayed.
+- Before an outbox write or network send, the desktop reserves the device-global `(deviceId, commandId)` in a private durable ledger using a SHA-256 digest of the canonical host envelope. Terminal outbox removal does not remove that reservation, so a later host switch or restart cannot reuse the identity for changed authority or content. The current JSON ledger is a bounded correctness checkpoint, not the final high-throughput store.
+- Submit and reconcile carry the complete command envelope through the framed protocol. Hostd never fills a missing generation from its current catalog, and both the desktop and hostd reject authority mismatch.
+- This exact-envelope contract is negotiated as `prime_agent_commands_v2`. The desktop treats `prime_agent_commands_v1` as a legacy, non-actionable capability, so mixed-version connections stay read-only instead of downgrading command semantics.
+- Host admission writes a private exact-envelope identity sidecar atomically with every new receipt. Exact duplicates can recover the recorded receipt; reusing `(deviceId, commandId)` with a changed host, thread, generation, issue time, kind, or payload fails closed. Reconciliation proves this same envelope before an outbox entry can be removed.
+- The current safe reconciliation transport sends one full envelope per read-only request so worst-case JSON escaping remains below the one-MiB frame. A future performance optimization may use a shared canonical digest or byte-aware batching, but it must preserve the same equality proof.
+- A host switch invalidates the previous renderer projection before the new authority can publish online. Stale connection, snapshot, bootstrap, composer completion, command receipt, and thread snapshot generations are ignored or rejected.
 - `lastTarget` means last verified target. A failed attempt is recorded separately and cannot replace the restart target or hide the last usable offline cache.
 
 ## Projection lifecycle

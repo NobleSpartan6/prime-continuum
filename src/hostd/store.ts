@@ -202,6 +202,27 @@ const HandoffCheckpointSchema = z.object({
 });
 export type HandoffCheckpoint = z.infer<typeof HandoffCheckpointSchema>;
 
+/**
+ * Protocol v1 originally admitted generation-less existing-thread commands.
+ * Keep that shape private to durable-history recovery; it must never be used
+ * by a live request boundary.
+ */
+const LegacyCommandEnvelopeSchema = z
+  .object({
+    protocolVersion: z.literal(PROTOCOL_VERSION),
+    deviceId: IdSchema,
+    commandId: IdSchema,
+    expectedHostId: IdSchema,
+    threadId: IdSchema,
+    issuedAt: IsoDateTimeSchema,
+    expectedExecutionGenerationId: IdSchema.optional(),
+    command: CommandEnvelopeSchema.shape.command,
+  })
+  .strict();
+type LegacyCommandEnvelope = z.infer<typeof LegacyCommandEnvelopeSchema>;
+
+const HistoricalCommandEnvelopeSchema = z.union([CommandEnvelopeSchema, LegacyCommandEnvelopeSchema]);
+
 const CommandJournalRecordSchema = z.object({
   version: z.literal(1),
   journalId: IdSchema,
@@ -212,8 +233,19 @@ const CommandJournalRecordSchema = z.object({
   commandKind: z.string().min(1).max(64),
   status: CommandReceiptStatusSchema,
   message: z.string().max(2_048).optional(),
-  envelope: CommandEnvelopeSchema.optional(),
+  // Historical audit records remain parseable after the live protocol fence
+  // became mandatory. A legacy envelope is evidence only, never dispatchable.
+  envelope: HistoricalCommandEnvelopeSchema.optional(),
 });
+
+const CommandIdentityRecordSchema = z
+  .object({
+    version: z.literal(1),
+    command: CommandEnvelopeSchema,
+    recordedAt: IsoDateTimeSchema,
+  })
+  .strict();
+type CommandIdentityRecord = z.infer<typeof CommandIdentityRecordSchema>;
 
 const ModelSelectionAttemptSchema = z
   .object({
@@ -260,9 +292,49 @@ const ModelSelectionIdentityRecordSchema = z
   });
 type ModelSelectionIdentityRecord = z.infer<typeof ModelSelectionIdentityRecordSchema>;
 
+const LegacyModelSelectionAttemptSchema = z
+  .object({
+    version: z.literal(1),
+    command: LegacyCommandEnvelopeSchema,
+    binding: ResidentSessionBindingSchema,
+    state: z.enum(["admitted", "dispatching"]),
+    admittedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    dispatchStartedAt: IsoDateTimeSchema.optional(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    if (
+      attempt.command.command.kind !== "model.select" ||
+      attempt.command.threadId !== attempt.binding.threadId ||
+      attempt.command.expectedExecutionGenerationId !== attempt.binding.executionGenerationId
+    ) {
+      context.addIssue({ code: "custom", message: "Legacy model selection attempt does not match its binding" });
+    }
+    if ((attempt.state === "dispatching") !== (attempt.dispatchStartedAt !== undefined)) {
+      context.addIssue({ code: "custom", path: ["dispatchStartedAt"], message: "Dispatch time must match attempt state" });
+    }
+  });
+type LegacyModelSelectionAttempt = z.infer<typeof LegacyModelSelectionAttemptSchema>;
+
+const LegacyModelSelectionIdentityRecordSchema = z
+  .object({
+    version: z.literal(1),
+    command: LegacyCommandEnvelopeSchema,
+    recordedAt: IsoDateTimeSchema,
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (record.command.command.kind !== "model.select") {
+      context.addIssue({ code: "custom", message: "Legacy model identity is not a model selection" });
+    }
+  });
+type LegacyModelSelectionIdentityRecord = z.infer<typeof LegacyModelSelectionIdentityRecordSchema>;
+
 export const MAX_PENDING_MODEL_SELECTION_ATTEMPTS = 10_000;
 export const MAX_MODEL_SELECTION_ATTEMPT_BYTES = 1024 * 1024;
 export const MAX_MODEL_SELECTION_IDENTITY_BYTES = 1024 * 1024;
+export const MAX_COMMAND_IDENTITY_BYTES = 1024 * 1024;
 
 const EventJournalRecordSchema = z.object({
   version: z.literal(1),
@@ -276,7 +348,7 @@ const EventJournalRecordSchema = z.object({
 
 const AdmissionTransactionSchema = z
   .object({
-    version: z.literal(1),
+    version: z.literal(2),
     kind: z.literal("command_admission"),
     transactionId: IdSchema,
     preparedAt: IsoDateTimeSchema,
@@ -286,18 +358,100 @@ const AdmissionTransactionSchema = z
     threadsFile: ThreadFileSchema.optional(),
     journalRecords: z.array(CommandJournalRecordSchema).min(2).max(3),
     eventRecord: EventJournalRecordSchema.optional(),
+    commandIdentity: CommandIdentityRecordSchema,
     modelSelectionIdentity: ModelSelectionIdentityRecordSchema.optional(),
     modelSelectionAttempt: ModelSelectionAttemptSchema.optional(),
   })
+  .strict()
   .superRefine((transaction, context) => {
     if ((transaction.snapshot === undefined) !== (transaction.threadsFile === undefined)) {
       context.addIssue({ code: "custom", message: "Admission snapshot and thread catalog must materialize together" });
     }
-    if (transaction.receipt.deviceId !== transaction.command.deviceId || transaction.receipt.commandId !== transaction.command.commandId) {
+    const requiresProjection =
+      transaction.receipt.status === "admitted" &&
+      transaction.command.command.kind !== "abort" &&
+      transaction.command.command.kind !== "model.select";
+    if (requiresProjection !== (transaction.snapshot !== undefined)) {
+      context.addIssue({ code: "custom", message: "Admission projection does not match its prepared outcome" });
+    }
+    if (
+      transaction.receipt.deviceId !== transaction.command.deviceId ||
+      transaction.receipt.commandId !== transaction.command.commandId ||
+      transaction.receipt.threadId !== transaction.command.threadId ||
+      transaction.receipt.executionGenerationId !== transaction.command.expectedExecutionGenerationId
+    ) {
       context.addIssue({ code: "custom", message: "Admission receipt identity does not match its command" });
     }
-    if (transaction.snapshot && transaction.snapshot.thread.threadId !== transaction.command.threadId) {
-      context.addIssue({ code: "custom", message: "Admission snapshot thread does not match its command" });
+    if (!isDeepStrictEqual(transaction.commandIdentity.command, transaction.command)) {
+      context.addIssue({ code: "custom", message: "Durable command identity does not match its admission command" });
+    }
+    if (
+      transaction.transactionId !==
+        deterministicId("admission", transaction.command.deviceId, transaction.command.commandId) ||
+      transaction.commandIdentity.recordedAt !== transaction.preparedAt ||
+      transaction.receipt.receivedAt !== transaction.preparedAt ||
+      transaction.receipt.updatedAt !== transaction.preparedAt
+    ) {
+      context.addIssue({ code: "custom", message: "Admission preparation boundary is internally inconsistent" });
+    }
+    const [received, terminal] = transaction.journalRecords;
+    if (
+      transaction.journalRecords.length !== 2 ||
+      !received ||
+      !terminal ||
+      received.status !== "received" ||
+      terminal.status !== transaction.receipt.status ||
+      !isDeepStrictEqual(received.envelope, transaction.command) ||
+      received.recordedAt !== transaction.preparedAt ||
+      terminal.recordedAt !== transaction.preparedAt ||
+      received.message !== undefined ||
+      terminal.message !== transaction.receipt.message ||
+      received.deviceId !== transaction.command.deviceId ||
+      terminal.deviceId !== transaction.command.deviceId ||
+      received.commandId !== transaction.command.commandId ||
+      terminal.commandId !== transaction.command.commandId ||
+      received.threadId !== transaction.command.threadId ||
+      terminal.threadId !== transaction.command.threadId ||
+      received.commandKind !== transaction.command.command.kind ||
+      terminal.commandKind !== transaction.command.command.kind ||
+      received.journalId !== deterministicId("journal", transaction.transactionId, "0", "received") ||
+      terminal.journalId !==
+        deterministicId("journal", transaction.transactionId, "1", transaction.receipt.status)
+    ) {
+      context.addIssue({ code: "custom", message: "Admission journal does not match its command and receipt" });
+    }
+    if (
+      transaction.snapshot &&
+      (!transaction.eventRecord ||
+        transaction.eventRecord.eventId !==
+          deterministicId("event", transaction.transactionId, "command-admitted") ||
+        transaction.eventRecord.recordedAt !== transaction.preparedAt ||
+        transaction.eventRecord.type !== "command.admitted" ||
+        transaction.eventRecord.threadId !== transaction.command.threadId ||
+        transaction.eventRecord.sequence !== transaction.snapshot.latestCursor.sequence ||
+        transaction.eventRecord.detail !== transaction.command.command.kind)
+    ) {
+      context.addIssue({ code: "custom", message: "Admission event does not match its snapshot" });
+    }
+    if (!transaction.snapshot && transaction.eventRecord) {
+      context.addIssue({ code: "custom", message: "Admission without a snapshot cannot publish an event" });
+    }
+    if (transaction.snapshot) {
+      const matchingThreads = transaction.threadsFile?.threads.filter(
+        (thread) => thread.threadId === transaction.command.threadId,
+      );
+      if (
+        transaction.snapshot.thread.threadId !== transaction.command.threadId ||
+        transaction.snapshot.thread.currentLocation.executionGenerationId !==
+          transaction.command.expectedExecutionGenerationId ||
+        transaction.snapshot.latestCursor.threadId !== transaction.command.threadId ||
+        transaction.snapshot.latestCursor.executionGenerationId !==
+          transaction.command.expectedExecutionGenerationId ||
+        matchingThreads?.length !== 1 ||
+        !isDeepStrictEqual(matchingThreads[0], transaction.snapshot.thread)
+      ) {
+        context.addIssue({ code: "custom", message: "Admission snapshot does not match its command authority" });
+      }
     }
     const requiresModelAttempt =
       transaction.command.command.kind === "model.select" && transaction.receipt.status === "admitted";
@@ -322,6 +476,82 @@ const AdmissionTransactionSchema = z
     }
   });
 type AdmissionTransaction = z.infer<typeof AdmissionTransactionSchema>;
+
+/** Version-one transactions are accepted only from durable storage recovery. */
+const LegacyAdmissionTransactionSchema = z
+  .object({
+    version: z.literal(1),
+    kind: z.literal("command_admission"),
+    transactionId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    command: LegacyCommandEnvelopeSchema,
+    receipt: CommandReceiptSchema,
+    snapshot: ThreadProjectionSnapshotSchema.optional(),
+    threadsFile: ThreadFileSchema.optional(),
+    journalRecords: z.array(CommandJournalRecordSchema).min(2).max(3),
+    eventRecord: EventJournalRecordSchema.optional(),
+    modelSelectionIdentity: LegacyModelSelectionIdentityRecordSchema.optional(),
+    modelSelectionAttempt: LegacyModelSelectionAttemptSchema.optional(),
+  })
+  .strict()
+  .superRefine((transaction, context) => {
+    if ((transaction.snapshot === undefined) !== (transaction.threadsFile === undefined)) {
+      context.addIssue({ code: "custom", message: "Legacy admission snapshot and catalog must materialize together" });
+    }
+    const requiresProjection =
+      transaction.receipt.status === "admitted" &&
+      transaction.command.command.kind !== "abort" &&
+      transaction.command.command.kind !== "model.select";
+    if (requiresProjection !== (transaction.snapshot !== undefined)) {
+      context.addIssue({ code: "custom", message: "Legacy admission projection does not match its prepared outcome" });
+    }
+    if (
+      transaction.receipt.deviceId !== transaction.command.deviceId ||
+      transaction.receipt.commandId !== transaction.command.commandId ||
+      transaction.receipt.threadId !== transaction.command.threadId
+    ) {
+      context.addIssue({ code: "custom", message: "Legacy admission receipt identity does not match its command" });
+    }
+    if (
+      transaction.command.expectedExecutionGenerationId !== undefined &&
+      transaction.receipt.executionGenerationId !== transaction.command.expectedExecutionGenerationId &&
+      !(
+        transaction.receipt.status === "rejected" &&
+        transaction.receipt.error?.code === "STALE_EXECUTION_GENERATION"
+      )
+    ) {
+      context.addIssue({ code: "custom", message: "Legacy admission receipt changed its explicit execution generation" });
+    }
+    if (transaction.snapshot && transaction.snapshot.thread.threadId !== transaction.command.threadId) {
+      context.addIssue({ code: "custom", message: "Legacy admission snapshot thread does not match its command" });
+    }
+    const modelSelection = transaction.command.command.kind === "model.select";
+    const requiresModelAttempt = modelSelection && transaction.receipt.status === "admitted";
+    if (modelSelection !== (transaction.modelSelectionIdentity !== undefined)) {
+      context.addIssue({ code: "custom", message: "Legacy model selection identity is incomplete" });
+    }
+    if (requiresModelAttempt !== (transaction.modelSelectionAttempt !== undefined)) {
+      context.addIssue({ code: "custom", message: "Legacy model selection attempt is incomplete" });
+    }
+    if (
+      transaction.modelSelectionIdentity &&
+      !isDeepStrictEqual(transaction.modelSelectionIdentity.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Legacy model identity changed its command envelope" });
+    }
+    if (
+      transaction.modelSelectionAttempt &&
+      !isDeepStrictEqual(transaction.modelSelectionAttempt.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Legacy model attempt changed its command envelope" });
+    }
+  });
+type LegacyAdmissionTransaction = z.infer<typeof LegacyAdmissionTransactionSchema>;
+
+const RecoverableAdmissionTransactionSchema = z.discriminatedUnion("version", [
+  LegacyAdmissionTransactionSchema,
+  AdmissionTransactionSchema,
+]);
 
 export const MAX_PENDING_ADMISSION_TRANSACTIONS = 1_024;
 export const MAX_ADMISSION_TRANSACTION_BYTES = 64 * 1024 * 1024;
@@ -388,6 +618,7 @@ export type AdmissionFaultPoint =
   | "after_prepare"
   | "after_snapshot"
   | "after_threads"
+  | "after_command_identity"
   | "after_model_selection_identity"
   | "after_model_selection_attempt"
   | "after_receipt"
@@ -468,6 +699,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.staging),
         ensurePrivateDirectory(this.paths.transactions),
         ensurePrivateDirectory(this.paths.residentProjectionTransactions),
+        ensurePrivateDirectory(this.commandIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionAttemptsDirectory()),
         ensurePrivateDirectory(this.paths.receipts),
@@ -1024,6 +1256,51 @@ export class HostStore {
     });
   }
 
+  /**
+   * Resolve an already-known command before callers consult mutable runtime or
+   * gateway state. `undefined` means the exact identity is genuinely unknown;
+   * every reserved-key mismatch or unverifiable legacy receipt fails closed.
+   */
+  async preflightKnownCommand(commandValue: CommandEnvelope): Promise<CommandReceipt | undefined> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const durableIdentity = await this.resolveCommandIdentityUnlocked(command);
+      const pending = await this.readAdmissionTransactionUnlocked(command);
+      if (pending) {
+        if (!isDeepStrictEqual(pending.command, command)) {
+          throw new HostStoreError("COMMAND_ID_REUSED", "This command identity is already bound to another envelope");
+        }
+        try {
+          await this.materializeAdmissionTransactionUnlocked(pending, true);
+        } catch (error) {
+          this.initialized = false;
+          throw error;
+        }
+        return pending.receipt;
+      }
+
+      const receipt = await this.readReceiptUnlocked(command);
+      if (receipt) {
+        if (!durableIdentity) {
+          throw new HostStoreError(
+            "COMMAND_IDENTITY_UNVERIFIABLE",
+            "This legacy receipt has no durable exact command envelope and cannot authorize a retry",
+          );
+        }
+        this.assertReceiptMatchesCommand(receipt, command);
+        return receipt;
+      }
+      if (durableIdentity) {
+        throw new HostStoreError(
+          "COMMAND_IDENTITY_ORPHANED",
+          "The durable command identity has no matching transaction or receipt",
+        );
+      }
+      return undefined;
+    });
+  }
+
   async admitCommand(
     commandValue: CommandEnvelope,
     canDispatchLive = false,
@@ -1032,10 +1309,7 @@ export class HostStore {
     const command = CommandEnvelopeSchema.parse(commandValue);
     return this.exclusive(async () => {
       this.assertInitialized();
-      const durableModelIdentity = await this.readModelSelectionIdentityUnlocked(command);
-      if (durableModelIdentity && !isDeepStrictEqual(durableModelIdentity.command, command)) {
-        throw new HostStoreError("COMMAND_ID_REUSED", "This command identity is already bound to another payload");
-      }
+      const durableIdentity = await this.resolveCommandIdentityUnlocked(command);
       const pending = await this.readAdmissionTransactionUnlocked(command);
       if (pending) {
         if (!isDeepStrictEqual(pending.command, command)) {
@@ -1053,18 +1327,19 @@ export class HostStore {
       }
       const existing = await this.readReceiptUnlocked(command);
       if (existing) {
-        if (command.command.kind === "model.select" && !durableModelIdentity) {
+        if (!durableIdentity) {
           throw new HostStoreError(
-            "COMMAND_ID_REUSED",
-            "This command identity already has a receipt without the exact model-selection envelope",
+            "COMMAND_IDENTITY_UNVERIFIABLE",
+            "This legacy receipt has no durable exact command envelope and cannot authorize a duplicate",
           );
         }
+        this.assertReceiptMatchesCommand(existing, command);
         return { receipt: existing, duplicate: true };
       }
-      if (durableModelIdentity) {
+      if (durableIdentity) {
         throw new HostStoreError(
-          "MODEL_SELECTION_IDENTITY_ORPHANED",
-          "The durable model-selection identity has no matching transaction or receipt",
+          "COMMAND_IDENTITY_ORPHANED",
+          "The durable command identity has no matching transaction or receipt",
         );
       }
       const transaction = await this.prepareAdmissionTransactionUnlocked(
@@ -1089,28 +1364,37 @@ export class HostStore {
   }
 
   async updateCommandReceipt(
-    identity: CommandIdentity,
+    commandValue: CommandEnvelope,
     update: Pick<CommandReceipt, "status"> & Partial<Pick<CommandReceipt, "message" | "error" | "queuePosition">>,
   ): Promise<CommandReceipt> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
     return this.exclusive(async () => {
       this.assertInitialized();
-      if (await this.readModelSelectionAttemptUnlocked(identity)) {
+      if (!(await this.resolveCommandIdentityUnlocked(command))) {
+        throw new HostStoreError(
+          "COMMAND_IDENTITY_UNVERIFIABLE",
+          "The command receipt cannot change without its exact durable envelope",
+        );
+      }
+      if (await this.readModelSelectionAttemptUnlocked(command)) {
         throw new HostStoreError(
           "MODEL_SELECTION_RECEIPT_PATH_REQUIRED",
           "Resident model selection must use its non-replayable receipt state machine",
         );
       }
-      const current = await this.readReceiptUnlocked(identity);
+      const current = await this.readReceiptUnlocked(command);
       if (!current) throw new HostStoreError("COMMAND_NOT_FOUND", "No receipt exists for this command identity");
+      this.assertReceiptMatchesCommand(current, command);
       const receipt = CommandReceiptSchema.parse({
         ...current,
         ...update,
         updatedAt: now(),
       });
-      await atomicWriteJson(this.receiptPath(identity), receipt);
+      await atomicWriteJson(this.receiptPath(command), receipt);
       await this.appendCommandJournalUnlocked(
         {
-          ...identity,
+          deviceId: command.deviceId,
+          commandId: command.commandId,
           threadId: current.threadId,
           command: { kind: "gateway" },
         },
@@ -1253,19 +1537,38 @@ export class HostStore {
     });
   }
 
-  async reconcileCommands(identities: CommandIdentity[]): Promise<{
+  async reconcileCommands(commandValues: CommandEnvelope[]): Promise<{
     receipts: CommandReceipt[];
     unknown: CommandIdentity[];
   }> {
-    if (identities.length > 256) throw new HostStoreError("RECONCILE_LIMIT", "At most 256 commands may be reconciled");
+    if (commandValues.length !== 1) {
+      throw new HostStoreError("RECONCILE_LIMIT", "Reconciliation requires one exact command envelope per request");
+    }
+    const commands = commandValues.map((command) => CommandEnvelopeSchema.parse(command));
     return this.exclusive(async () => {
       this.assertInitialized();
       const receipts: CommandReceipt[] = [];
       const unknown: CommandIdentity[] = [];
-      for (const identity of identities) {
-        const receipt = await this.readReceiptUnlocked(identity);
-        if (receipt) receipts.push(receipt);
-        else unknown.push(identity);
+      for (const command of commands) {
+        const durableIdentity = await this.resolveCommandIdentityUnlocked(command);
+        const receipt = await this.readReceiptUnlocked(command);
+        if (receipt) {
+          if (!durableIdentity) {
+            throw new HostStoreError(
+              "COMMAND_IDENTITY_UNVERIFIABLE",
+              "This legacy receipt has no durable exact command envelope and cannot be reconciled",
+            );
+          }
+          this.assertReceiptMatchesCommand(receipt, command);
+          receipts.push(receipt);
+        } else if (durableIdentity) {
+          throw new HostStoreError(
+            "COMMAND_IDENTITY_ORPHANED",
+            "The durable command identity has no matching transaction or receipt",
+          );
+        } else {
+          unknown.push({ deviceId: command.deviceId, commandId: command.commandId });
+        }
       }
       return { receipts, unknown };
     });
@@ -1681,17 +1984,25 @@ export class HostStore {
 
     if (!thread) {
       rejection = structured("THREAD_NOT_FOUND", `Thread ${command.threadId} does not exist`);
-    } else if (
-      command.expectedExecutionGenerationId &&
-      command.expectedExecutionGenerationId !== thread.currentLocation.executionGenerationId
-    ) {
+    } else if (command.expectedExecutionGenerationId !== thread.currentLocation.executionGenerationId) {
       rejection = structured(
         "STALE_EXECUTION_GENERATION",
         "The command targets a previous execution generation; refresh the thread before retrying",
       );
     } else {
       sourceSnapshot = await this.readSnapshotUnlocked(command.threadId);
-      rejection = dispatcherUnavailable ?? validateCommandAgainstState(command, sourceSnapshot, canDispatchLive);
+      if (
+        sourceSnapshot.thread.currentLocation.executionGenerationId !== command.expectedExecutionGenerationId ||
+        sourceSnapshot.latestCursor.executionGenerationId !== command.expectedExecutionGenerationId ||
+        sourceSnapshot.latestCursor.threadId !== command.threadId
+      ) {
+        rejection = structured(
+          "SNAPSHOT_AUTHORITY_MISMATCH",
+          "The thread catalog and authoritative snapshot do not identify the same execution generation",
+        );
+      } else {
+        rejection = dispatcherUnavailable ?? validateCommandAgainstState(command, sourceSnapshot, canDispatchLive);
+      }
       if (!rejection && command.command.kind === "model.select") {
         try {
           await this.assertModelSelectionAttemptCapacityUnlocked();
@@ -1744,8 +2055,9 @@ export class HostStore {
       status: initialStatus,
       receivedAt: preparedAt,
       updatedAt: preparedAt,
-      executionGenerationId:
-        thread?.currentLocation.executionGenerationId ?? command.expectedExecutionGenerationId ?? "unknown-generation",
+      // A receipt acknowledges the immutable envelope, including a stale
+      // rejection. It must never be rebound to the host's newer generation.
+      executionGenerationId: command.expectedExecutionGenerationId,
       queuePosition:
         initialStatus === "admitted" &&
         command.command.kind !== "abort" &&
@@ -1790,7 +2102,7 @@ export class HostStore {
       : undefined;
 
     return AdmissionTransactionSchema.parse({
-      version: 1,
+      version: 2,
       kind: "command_admission",
       transactionId,
       preparedAt,
@@ -1800,6 +2112,11 @@ export class HostStore {
       threadsFile,
       journalRecords,
       eventRecord,
+      commandIdentity: CommandIdentityRecordSchema.parse({
+        version: 1,
+        command,
+        recordedAt: preparedAt,
+      }),
       ...(command.command.kind === "model.select"
         ? {
             modelSelectionIdentity: ModelSelectionIdentityRecordSchema.parse({
@@ -1837,6 +2154,20 @@ export class HostStore {
       await atomicWriteJson(this.paths.threads, transaction.threadsFile);
       if (injectFaults) await this.injectAdmissionFault("after_threads", transaction.transactionId);
     }
+
+    const commandIdentityPath = this.commandIdentityPath(transaction.command);
+    const existingCommandIdentity = await readJsonFile(commandIdentityPath, CommandIdentityRecordSchema, {
+      optional: true,
+      maxBytes: MAX_COMMAND_IDENTITY_BYTES,
+    });
+    if (existingCommandIdentity && !isDeepStrictEqual(existingCommandIdentity, transaction.commandIdentity)) {
+      throw new HostStoreError(
+        "COMMAND_ID_REUSED",
+        `Admission transaction ${transaction.transactionId} conflicts with its durable command identity`,
+      );
+    }
+    await atomicWriteJson(commandIdentityPath, transaction.commandIdentity, MAX_COMMAND_IDENTITY_BYTES);
+    if (injectFaults) await this.injectAdmissionFault("after_command_identity", transaction.transactionId);
 
     if (transaction.modelSelectionIdentity) {
       const identityPath = this.modelSelectionIdentityPath(transaction.command);
@@ -1905,6 +2236,296 @@ export class HostStore {
     await rm(this.admissionTransactionPath(transaction.command), { force: true });
   }
 
+  /**
+   * Finish only the records that a v1 host had already prepared. A legacy
+   * envelope is deliberately not promoted into the live exact-identity index,
+   * so neither submit nor reconcile can replay it after recovery.
+   */
+  private async materializeLegacyAdmissionTransactionUnlocked(
+    transaction: LegacyAdmissionTransaction,
+  ): Promise<void> {
+    await this.validateLegacyAdmissionTransactionUnlocked(transaction);
+
+    if (transaction.snapshot && transaction.threadsFile) {
+      await atomicWriteJson(this.snapshotPath(transaction.command.threadId), transaction.snapshot);
+      await atomicWriteJson(this.paths.threads, transaction.threadsFile);
+    }
+
+    if (transaction.modelSelectionIdentity) {
+      const strictIdentity = ModelSelectionIdentityRecordSchema.parse(transaction.modelSelectionIdentity);
+      const path = this.modelSelectionIdentityPath(transaction.command);
+      const existing = await readJsonFile(path, ModelSelectionIdentityRecordSchema, {
+        optional: true,
+        maxBytes: MAX_MODEL_SELECTION_IDENTITY_BYTES,
+      });
+      if (existing && !isDeepStrictEqual(existing, strictIdentity)) {
+        throw new HostStoreError(
+          "COMMAND_ID_REUSED",
+          `Legacy admission transaction ${transaction.transactionId} conflicts with its model identity`,
+        );
+      }
+      await atomicWriteJson(path, strictIdentity, MAX_MODEL_SELECTION_IDENTITY_BYTES);
+    }
+
+    if (transaction.modelSelectionAttempt) {
+      const strictAttempt = ModelSelectionAttemptSchema.parse(transaction.modelSelectionAttempt);
+      const path = this.modelSelectionAttemptPath(transaction.command);
+      const existing = await readJsonFile(path, ModelSelectionAttemptSchema, {
+        optional: true,
+        maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+      });
+      if (existing && !isDeepStrictEqual(existing, strictAttempt)) {
+        throw new HostStoreError(
+          "MODEL_SELECTION_ATTEMPT_CONFLICT",
+          `Legacy admission transaction ${transaction.transactionId} conflicts with its model attempt`,
+        );
+      }
+      await atomicWriteJson(path, strictAttempt, MAX_MODEL_SELECTION_ATTEMPT_BYTES);
+    }
+
+    const existingReceipt = await this.readReceiptUnlocked(transaction.command);
+    if (existingReceipt && !isDeepStrictEqual(existingReceipt, transaction.receipt)) {
+      throw new HostStoreError(
+        "ADMISSION_RECEIPT_CONFLICT",
+        `Legacy admission transaction ${transaction.transactionId} conflicts with its durable receipt`,
+      );
+    }
+    await atomicWriteJson(this.receiptPath(transaction.command), transaction.receipt);
+    for (const record of transaction.journalRecords) {
+      await appendJsonLineOnce(this.paths.commandJournal, record, "journalId");
+    }
+    if (transaction.eventRecord) {
+      await appendJsonLineOnce(this.paths.eventJournal, transaction.eventRecord, "eventId");
+    }
+    await rm(this.admissionTransactionPath(transaction.command), { force: true });
+  }
+
+  private async validateLegacyAdmissionTransactionUnlocked(
+    transaction: LegacyAdmissionTransaction,
+  ): Promise<void> {
+    const expectedTransactionId = deterministicId(
+      "admission",
+      transaction.command.deviceId,
+      transaction.command.commandId,
+    );
+    if (transaction.transactionId !== expectedTransactionId) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission transaction identity does not match its command",
+      );
+    }
+    if (
+      transaction.receipt.status !== "admitted" &&
+      transaction.receipt.status !== "rejected"
+    ) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission transaction has an impossible prepared receipt status",
+      );
+    }
+    if (
+      transaction.receipt.receivedAt !== transaction.preparedAt ||
+      transaction.receipt.updatedAt !== transaction.preparedAt
+    ) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission receipt timestamps do not match its preparation boundary",
+      );
+    }
+
+    const host = await this.readHostUnlocked();
+    if (transaction.command.expectedHostId !== host.hostId) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission command belongs to a different host authority",
+      );
+    }
+
+    const targetGeneration = transaction.receipt.executionGenerationId;
+    if (
+      transaction.command.expectedExecutionGenerationId !== undefined &&
+      transaction.command.expectedExecutionGenerationId !== targetGeneration &&
+      !(
+        transaction.receipt.status === "rejected" &&
+        transaction.receipt.error?.code === "STALE_EXECUTION_GENERATION"
+      )
+    ) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission changed its explicit execution generation",
+      );
+    }
+
+    const threads = await this.readThreadsUnlocked();
+    const currentThread = threads.find((thread) => thread.threadId === transaction.command.threadId);
+    if (!currentThread) {
+      if (
+        transaction.receipt.status !== "rejected" ||
+        transaction.receipt.error?.code !== "THREAD_NOT_FOUND" ||
+        transaction.snapshot ||
+        transaction.threadsFile ||
+        transaction.eventRecord
+      ) {
+        throw new HostStoreError(
+          "INVALID_LEGACY_ADMISSION_TRANSACTION",
+          "Legacy admission references a missing thread without a matching terminal rejection",
+        );
+      }
+    } else {
+      if (currentThread.currentLocation.executionGenerationId !== targetGeneration) {
+        throw new HostStoreError(
+          "INVALID_LEGACY_ADMISSION_TRANSACTION",
+          "Legacy admission receipt does not match the durable thread generation",
+        );
+      }
+      const currentSnapshot = await this.readSnapshotUnlocked(transaction.command.threadId);
+      if (
+        currentSnapshot.thread.currentLocation.executionGenerationId !== targetGeneration ||
+        currentSnapshot.latestCursor.executionGenerationId !== targetGeneration
+      ) {
+        throw new HostStoreError(
+          "INVALID_LEGACY_ADMISSION_TRANSACTION",
+          "Legacy admission does not match the durable snapshot generation",
+        );
+      }
+    }
+
+    if (transaction.snapshot && transaction.threadsFile) {
+      await this.validateRecoveredAdmissionCatalogUnlocked(transaction);
+      const snapshot = transaction.snapshot;
+      const matchingThreads = transaction.threadsFile.threads.filter(
+        (thread) => thread.threadId === transaction.command.threadId,
+      );
+      if (
+        transaction.receipt.status !== "admitted" ||
+        snapshot.thread.currentLocation.executionGenerationId !== targetGeneration ||
+        snapshot.latestCursor.executionGenerationId !== targetGeneration ||
+        snapshot.latestCursor.threadId !== transaction.command.threadId ||
+        matchingThreads.length !== 1 ||
+        !isDeepStrictEqual(matchingThreads[0], snapshot.thread)
+      ) {
+        throw new HostStoreError(
+          "INVALID_LEGACY_ADMISSION_TRANSACTION",
+          "Legacy admission snapshot, catalog, and receipt do not describe one authority",
+        );
+      }
+    }
+
+    if (transaction.journalRecords.length !== 2) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission must contain its exact two prepared journal records",
+      );
+    }
+    const [received, terminal] = transaction.journalRecords;
+    if (
+      !received ||
+      !terminal ||
+      received.status !== "received" ||
+      terminal.status !== transaction.receipt.status ||
+      !isDeepStrictEqual(received.envelope, transaction.command) ||
+      received.deviceId !== transaction.command.deviceId ||
+      terminal.deviceId !== transaction.command.deviceId ||
+      received.commandId !== transaction.command.commandId ||
+      terminal.commandId !== transaction.command.commandId ||
+      received.threadId !== transaction.command.threadId ||
+      terminal.threadId !== transaction.command.threadId ||
+      received.commandKind !== transaction.command.command.kind ||
+      terminal.commandKind !== transaction.command.command.kind ||
+      received.recordedAt !== transaction.preparedAt ||
+      terminal.recordedAt !== transaction.preparedAt ||
+      received.message !== undefined ||
+      terminal.message !== transaction.receipt.message ||
+      received.journalId !== deterministicId("journal", transaction.transactionId, "0", "received") ||
+      terminal.journalId !==
+        deterministicId("journal", transaction.transactionId, "1", transaction.receipt.status)
+    ) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission journal does not exactly match its prepared command and receipt",
+      );
+    }
+
+    if (transaction.snapshot) {
+      const event = transaction.eventRecord;
+      if (
+        !event ||
+        event.eventId !== deterministicId("event", transaction.transactionId, "command-admitted") ||
+        event.type !== "command.admitted" ||
+        event.threadId !== transaction.command.threadId ||
+        event.sequence !== transaction.snapshot.latestCursor.sequence ||
+        event.detail !== transaction.command.command.kind ||
+        event.recordedAt !== transaction.preparedAt
+      ) {
+        throw new HostStoreError(
+          "INVALID_LEGACY_ADMISSION_TRANSACTION",
+          "Legacy admission event does not match its prepared snapshot",
+        );
+      }
+    } else if (transaction.eventRecord) {
+      throw new HostStoreError(
+        "INVALID_LEGACY_ADMISSION_TRANSACTION",
+        "Legacy admission without a snapshot cannot publish an event",
+      );
+    }
+  }
+
+  private async validateRecoveredAdmissionCatalogUnlocked(
+    transaction: Pick<
+      AdmissionTransaction | LegacyAdmissionTransaction,
+      "command" | "receipt" | "snapshot" | "threadsFile"
+    >,
+  ): Promise<void> {
+    if (!transaction.snapshot || !transaction.threadsFile) return;
+    const currentThreads = await this.readThreadsUnlocked();
+    const preparedThreads = transaction.threadsFile.threads;
+    const currentById = new Map(currentThreads.map((thread) => [thread.threadId, thread]));
+    const preparedById = new Map(preparedThreads.map((thread) => [thread.threadId, thread]));
+    if (
+      currentById.size !== currentThreads.length ||
+      preparedById.size !== preparedThreads.length ||
+      currentThreads.length !== preparedThreads.length ||
+      currentById.size !== preparedById.size
+    ) {
+      throw new HostStoreError(
+        "INVALID_ADMISSION_TRANSACTION_CATALOG",
+        "Prepared admission catalog changed its cardinality or contains duplicate thread identities",
+      );
+    }
+    for (const [threadId, current] of currentById) {
+      const prepared = preparedById.get(threadId);
+      if (!prepared) {
+        throw new HostStoreError(
+          "INVALID_ADMISSION_TRANSACTION_CATALOG",
+          "Prepared admission catalog removed a durable thread",
+        );
+      }
+      if (threadId !== transaction.command.threadId) {
+        if (!isDeepStrictEqual(prepared, current)) {
+          throw new HostStoreError(
+            "INVALID_ADMISSION_TRANSACTION_CATALOG",
+            "Prepared admission catalog changed an unrelated thread",
+          );
+        }
+        continue;
+      }
+      const currentLocation = current.currentLocation;
+      const preparedLocation = prepared.currentLocation;
+      if (
+        currentLocation.hostId !== preparedLocation.hostId ||
+        currentLocation.projectId !== preparedLocation.projectId ||
+        currentLocation.workspaceId !== preparedLocation.workspaceId ||
+        currentLocation.executionGenerationId !== transaction.receipt.executionGenerationId ||
+        preparedLocation.executionGenerationId !== transaction.receipt.executionGenerationId
+      ) {
+        throw new HostStoreError(
+          "INVALID_ADMISSION_TRANSACTION_CATALOG",
+          "Prepared admission target changed its execution authority",
+        );
+      }
+    }
+  }
+
   private async recoverAdmissionTransactionsUnlocked(): Promise<void> {
     const entries = await readdir(this.paths.transactions, { withFileTypes: true });
     if (entries.length > MAX_PENDING_ADMISSION_TRANSACTIONS) {
@@ -1936,14 +2557,26 @@ export class HostStore {
     transactionNames.sort();
     for (const name of transactionNames) {
       const path = join(this.paths.transactions, name);
-      const transaction = await readJsonFile(path, AdmissionTransactionSchema, {
+      const transaction = await readJsonFile(path, RecoverableAdmissionTransactionSchema, {
         maxBytes: MAX_ADMISSION_TRANSACTION_BYTES,
       });
       if (!transaction) throw new HostStoreError("INVALID_ADMISSION_TRANSACTION", `Missing transaction ${name}`);
       if (name !== `${storageKey(transaction.command.deviceId, transaction.command.commandId)}.json`) {
         throw new HostStoreError("INVALID_ADMISSION_TRANSACTION", `Transaction filename does not match ${transaction.transactionId}`);
       }
-      await this.materializeAdmissionTransactionUnlocked(transaction, false);
+      if (transaction.version === 1) {
+        await this.materializeLegacyAdmissionTransactionUnlocked(transaction);
+      } else {
+        const host = await this.readHostUnlocked();
+        if (transaction.command.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "INVALID_ADMISSION_TRANSACTION",
+            "Admission transaction belongs to a different host authority",
+          );
+        }
+        await this.validateRecoveredAdmissionCatalogUnlocked(transaction);
+        await this.materializeAdmissionTransactionUnlocked(transaction, false);
+      }
     }
   }
 
@@ -2113,6 +2746,61 @@ export class HostStore {
       optional: true,
       maxBytes: MAX_MODEL_SELECTION_IDENTITY_BYTES,
     });
+  }
+
+  private async readCommandIdentityUnlocked(
+    command: CommandIdentity,
+  ): Promise<CommandIdentityRecord | undefined> {
+    return readJsonFile(this.commandIdentityPath(command), CommandIdentityRecordSchema, {
+      optional: true,
+      maxBytes: MAX_COMMAND_IDENTITY_BYTES,
+    });
+  }
+
+  /**
+   * Resolve and prove the complete immutable command envelope. The model-only
+   * sidecar shipped before the generic index, so exact old model records are
+   * migrated lazily without weakening their existing evidence.
+   */
+  private async resolveCommandIdentityUnlocked(
+    command: CommandEnvelope,
+  ): Promise<CommandIdentityRecord | undefined> {
+    const identity = await this.readCommandIdentityUnlocked(command);
+    if (identity && !isDeepStrictEqual(identity.command, command)) {
+      throw new HostStoreError("COMMAND_ID_REUSED", "This command identity is already bound to another envelope");
+    }
+
+    // Probe the pre-generic model index by device+command identity regardless
+    // of the incoming kind. Otherwise a model identity could be overwritten by
+    // a later prompt that reused the same key.
+    const modelIdentity = await this.readModelSelectionIdentityUnlocked(command);
+    if (modelIdentity && !isDeepStrictEqual(modelIdentity.command, command)) {
+      throw new HostStoreError("COMMAND_ID_REUSED", "This command identity is already bound to another envelope");
+    }
+    if (identity) return identity;
+    if (!modelIdentity) return undefined;
+
+    const migrated = CommandIdentityRecordSchema.parse({
+      version: 1,
+      command: modelIdentity.command,
+      recordedAt: modelIdentity.recordedAt,
+    });
+    await atomicWriteJson(this.commandIdentityPath(command), migrated, MAX_COMMAND_IDENTITY_BYTES);
+    return migrated;
+  }
+
+  private assertReceiptMatchesCommand(receipt: CommandReceipt, command: CommandEnvelope): void {
+    if (
+      receipt.deviceId !== command.deviceId ||
+      receipt.commandId !== command.commandId ||
+      receipt.threadId !== command.threadId ||
+      receipt.executionGenerationId !== command.expectedExecutionGenerationId
+    ) {
+      throw new HostStoreError(
+        "COMMAND_RECEIPT_GENERATION_MISMATCH",
+        "The durable receipt does not acknowledge this exact thread execution envelope",
+      );
+    }
   }
 
   private async injectAdmissionFault(point: AdmissionFaultPoint, transactionId: string): Promise<void> {
@@ -2696,6 +3384,17 @@ export class HostStore {
 
   private modelSelectionIdentitiesDirectory(): string {
     return join(this.paths.root, "model-selection-identities");
+  }
+
+  private commandIdentitiesDirectory(): string {
+    return join(this.paths.root, "command-identities");
+  }
+
+  private commandIdentityPath(identity: CommandIdentity): string {
+    return join(
+      this.commandIdentitiesDirectory(),
+      `${storageKey(identity.deviceId, identity.commandId)}.json`,
+    );
   }
 
   private modelSelectionIdentityPath(identity: CommandIdentity): string {

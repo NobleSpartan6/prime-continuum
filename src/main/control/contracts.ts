@@ -130,16 +130,30 @@ export interface ConnectionState {
   error?: StructuredError
 }
 
-export interface ClientCommand {
+/**
+ * Persisted shape accepted only for crash-safe migration. Records written by
+ * older builds can be missing the immutable generation or issue time; those
+ * records remain quarantined and are never sent or reconciled.
+ */
+export interface PersistedClientCommand {
   deviceId: string
   commandId: string
   /** Authority the visible thread projection belonged to when composed. */
-  expectedHostId: string
+  expectedHostId?: string
   kind: string
   threadId?: string
   payload?: Record<string, unknown>
   delivery?: 'live_only' | 'send_when_reconnected'
   expectedExecutionGenerationId?: string
+  issuedAt?: string
+}
+
+export interface ClientCommand extends PersistedClientCommand {
+  expectedHostId: string
+  threadId: string
+  expectedExecutionGenerationId: string
+  /** Stable across persistence, reconnect, and every replay attempt. */
+  issuedAt: string
 }
 
 /** Renderer-safe OAuth state. Authorization URLs and challenge responses stay in main/hostd. */
@@ -168,8 +182,10 @@ export type CommandJournalStatus =
 
 export interface CommandReceipt {
   commandId: string
-  deviceId?: string
-  hostId?: string
+  deviceId: string
+  hostId: string
+  threadId: string
+  executionGenerationId: string
   status: CommandJournalStatus | 'waiting_for_connection'
   durable: boolean
   detail?: string
@@ -179,6 +195,8 @@ export interface ApprovalResolution {
   deviceId: string
   commandId: string
   expectedHostId: string
+  expectedExecutionGenerationId: string
+  issuedAt: string
   threadId: string
   approvalId: string
   decision: 'approve' | 'deny'
@@ -188,6 +206,8 @@ export interface CancelRequest {
   deviceId: string
   commandId: string
   expectedHostId: string
+  expectedExecutionGenerationId: string
+  issuedAt: string
   threadId: string
   targetCommandId?: string
 }
@@ -211,6 +231,8 @@ export interface HandoffCommitRequest {
 export interface BootstrapPayload {
   cache: unknown
   outbox: OutboxEntry[]
+  /** Parseable legacy/incomplete records excluded from every actionable path. */
+  quarantinedOutboxCount: number
   connection: ConnectionState
   appVersion: string
 }
@@ -222,9 +244,16 @@ export interface OutboxEntry {
    * those entries are never reconciled or replayed automatically.
    */
   hostId?: string
-  command: ClientCommand
+  command: PersistedClientCommand
   state: 'waiting_for_connection' | 'uncertain'
   updatedAt: string
+  quarantineReason?:
+    | 'legacy_missing_authority'
+    | 'legacy_missing_generation'
+    | 'legacy_missing_issued_at'
+    | 'legacy_invalid_issued_at'
+    | 'invalid_persisted_command'
+    | 'command_identity_conflict'
 }
 
 export interface Diagnostics {
@@ -235,6 +264,7 @@ export interface Diagnostics {
   connection: ConnectionState
   sshExecutable: string
   outboxCount: number
+  quarantinedOutboxCount: number
   latencyTraces: Array<{
     operation: string
     durationMs: number

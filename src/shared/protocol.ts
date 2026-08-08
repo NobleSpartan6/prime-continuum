@@ -50,7 +50,7 @@ export const CapabilitySchema = z
 export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
-export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v1" as const;
+export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
 export const IsoDateTimeSchema = z
@@ -877,10 +877,10 @@ const TextCommandFields = {
 };
 
 export const CommandPayloadSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("prompt"), ...TextCommandFields }),
-  z.object({ kind: z.literal("steer"), ...TextCommandFields }),
-  z.object({ kind: z.literal("follow_up"), ...TextCommandFields }),
-  z.object({ kind: z.literal("abort"), reason: z.string().max(1_024).optional() }),
+  z.object({ kind: z.literal("prompt"), ...TextCommandFields }).strict(),
+  z.object({ kind: z.literal("steer"), ...TextCommandFields }).strict(),
+  z.object({ kind: z.literal("follow_up"), ...TextCommandFields }).strict(),
+  z.object({ kind: z.literal("abort"), reason: z.string().max(1_024).optional() }).strict(),
   z
     .object({
       kind: z.literal("model.select"),
@@ -888,12 +888,14 @@ export const CommandPayloadSchema = z.discriminatedUnion("kind", [
       modelId: z.string().min(1).max(512).regex(/^[^\0\r\n]+$/),
     })
     .strict(),
-  z.object({
-    kind: z.literal("approval.resolve"),
-    approvalId: IdSchema,
-    decision: z.enum(["approve", "reject"]),
-    comment: z.string().max(4_096).optional(),
-  }),
+  z
+    .object({
+      kind: z.literal("approval.resolve"),
+      approvalId: IdSchema,
+      decision: z.enum(["approve", "reject"]),
+      comment: z.string().max(4_096).optional(),
+    })
+    .strict(),
 ]);
 export type CommandPayload = z.infer<typeof CommandPayloadSchema>;
 
@@ -905,18 +907,15 @@ export const CommandEnvelopeSchema = z
     expectedHostId: IdSchema,
     threadId: IdSchema,
     issuedAt: IsoDateTimeSchema,
-    expectedExecutionGenerationId: IdSchema.optional(),
+    /**
+     * Every v1 command mutates an existing thread execution. The composer must
+     * therefore name the exact generation it observed; the host never infers or
+     * substitutes the currently-authoritative generation.
+     */
+    expectedExecutionGenerationId: IdSchema,
     command: CommandPayloadSchema,
   })
-  .superRefine((envelope, context) => {
-    if (envelope.command.kind === "model.select" && envelope.expectedExecutionGenerationId === undefined) {
-      context.addIssue({
-        code: "custom",
-        path: ["expectedExecutionGenerationId"],
-        message: "Model selection requires an exact execution generation",
-      });
-    }
-  });
+  .strict();
 export type CommandEnvelope = z.infer<typeof CommandEnvelopeSchema>;
 
 export const CommandReceiptStatusSchema = z.enum([
@@ -1280,10 +1279,15 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   z.object({
     ...RequestBase,
     method: z.literal("command.reconcile"),
-    payload: z.object({
-      expectedHostId: IdSchema,
-      commands: z.array(CommandIdentitySchema).max(256),
-    }),
+    payload: z
+      .object({
+        expectedHostId: IdSchema,
+        // Reconciliation proves the complete immutable envelope, not merely its
+        // user-controlled identity. One envelope per request keeps worst-case
+        // UTF-8 and JSON escaping safely below the one-MiB transport frame.
+        commands: z.array(CommandEnvelopeSchema).length(1),
+      })
+      .strict(),
   }),
   z.object({
     ...RequestBase,
@@ -1303,10 +1307,15 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
 ]);
 export type HostIpcRequest = z.infer<typeof HostIpcRequestSchema>;
 
-export const CommandReconciliationSchema = z.object({
-  receipts: z.array(CommandReceiptSchema).max(256),
-  unknown: z.array(CommandIdentitySchema).max(256),
-});
+export const CommandReconciliationSchema = z
+  .object({
+    receipts: z.array(CommandReceiptSchema).max(1),
+    unknown: z.array(CommandIdentitySchema).max(1),
+  })
+  .strict()
+  .refine((result) => result.receipts.length + result.unknown.length === 1, {
+    message: "Reconciliation must return exactly one receipt or one unknown identity",
+  });
 export type CommandReconciliation = z.infer<typeof CommandReconciliationSchema>;
 
 export const HandoffCommitResultSchema = z.object({

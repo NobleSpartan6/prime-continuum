@@ -80,10 +80,16 @@ function recoveryCatalog() {
 }
 
 function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][number], body: string) {
+  const latestCursor = {
+    threadId: thread.threadId,
+    executionGenerationId: thread.currentLocation.executionGenerationId,
+    generation: `daemon-${thread.threadId}`,
+    sequence: 1,
+  }
   return {
     snapshotVersion: 1,
     generatedAt: '2026-08-05T20:00:01.000Z',
-    thread,
+    thread: { ...thread, lastKnownCursor: latestCursor },
     materializedRecentBlocks: [
       {
         blockId: `block-${thread.threadId}`,
@@ -136,6 +142,7 @@ function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][
     pendingAttention: [],
     git: { branch: 'main', stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
     evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
+    latestCursor,
   }
 }
 
@@ -147,7 +154,7 @@ function onlineConnection() {
     path: 'local_socket',
     since: '2026-08-05T20:00:00.000Z',
     attempt: 1,
-    capabilities: ['prime_agent_commands_v1'],
+    capabilities: ['prime_agent_commands_v2'],
   }
 }
 
@@ -211,6 +218,12 @@ describe('NativeRendererApi', () => {
       pendingAttention: [],
       git: { branch: 'main', stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
       evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
+      latestCursor: {
+        threadId: 'thread-seamless',
+        executionGenerationId: 'generation-1',
+        generation: 'daemon-thread-seamless',
+        sequence: 1,
+      },
     }
 
     const calls: string[] = []
@@ -506,18 +519,41 @@ describe('NativeRendererApi', () => {
     const firstSnapshot = recoverySnapshot(catalog.threads[0], 'Authoritative first thread.')
     const secondSnapshot = recoverySnapshot(catalog.threads[1], 'Authoritative second thread.')
     let hostEventListener: ((event: unknown) => void) | undefined
+    let deviceId = ''
     const bridge = {
       bootstrap: vi.fn(() =>
         ok({
           cache: { version: 1, catalog, lastSnapshot: firstSnapshot },
           outbox: [
             {
-              command: { commandId: 'command-one', threadId: 'thread-one' },
+              hostId: 'host-local',
+              command: {
+                deviceId,
+                commandId: 'command-one',
+                expectedHostId: 'host-local',
+                threadId: 'thread-one',
+                kind: 'thread.follow_up',
+                payload: { text: 'Continue one' },
+                delivery: 'send_when_reconnected',
+                expectedExecutionGenerationId: 'generation-one',
+                issuedAt: '2026-08-05T20:00:00.000Z',
+              },
               state: 'waiting_for_connection',
               updatedAt: '2026-08-05T20:00:00.000Z',
             },
             {
-              command: { commandId: 'command-two', threadId: 'thread-two' },
+              hostId: 'host-local',
+              command: {
+                deviceId,
+                commandId: 'command-two',
+                expectedHostId: 'host-local',
+                threadId: 'thread-two',
+                kind: 'thread.follow_up',
+                payload: { text: 'Continue two' },
+                delivery: 'send_when_reconnected',
+                expectedExecutionGenerationId: 'generation-two',
+                issuedAt: '2026-08-05T20:00:00.000Z',
+              },
               state: 'waiting_for_connection',
               updatedAt: '2026-08-05T20:00:00.000Z',
             },
@@ -539,6 +575,7 @@ describe('NativeRendererApi', () => {
       onHandoffProgress: vi.fn(() => () => undefined),
     }
     const api = new NativeRendererApi(bridge)
+    deviceId = (api as unknown as { deviceId: string }).deviceId
     const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
     const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
     const cached = await api.loadWorkbench()
@@ -547,14 +584,30 @@ describe('NativeRendererApi', () => {
 
     hostEventListener?.({
       type: 'command.receipt',
-      payload: { commandId: 'command-one', status: 'admitted', durable: true },
+      payload: {
+        hostId: 'host-local',
+        deviceId,
+        commandId: 'command-one',
+        threadId: 'thread-one',
+        executionGenerationId: 'generation-one',
+        status: 'admitted',
+        durable: true,
+      },
     })
     expect(published.at(-1)?.composerReceipt.state).toBe('sent')
 
     await api.selectThread('thread-two')
     hostEventListener?.({
       type: 'command.receipt',
-      payload: { commandId: 'command-two', status: 'uncertain', durable: false },
+      payload: {
+        hostId: 'host-local',
+        deviceId,
+        commandId: 'command-two',
+        threadId: 'thread-two',
+        executionGenerationId: 'generation-two',
+        status: 'uncertain',
+        durable: false,
+      },
     })
     expect(published.at(-1)?.composerReceipt.state).toBe('uncertain')
 
@@ -713,7 +766,7 @@ describe('NativeRendererApi', () => {
           path: 'ssh',
           since: '2026-08-05T20:00:00.000Z',
           attempt: 1,
-          capabilities: ['prime_agent_commands_v1', 'thread_handoff_v1'],
+          capabilities: ['prime_agent_commands_v2', 'thread_handoff_v1'],
         },
         appVersion: '0.1.0',
       })),
@@ -875,7 +928,7 @@ describe('NativeRendererApi', () => {
           outbox: [],
           connection: {
             ...onlineConnection(),
-            capabilities: ['prime_agent_commands_v1', 'thread_handoff_v1'],
+            capabilities: ['prime_agent_commands_v2', 'thread_handoff_v1'],
           },
           appVersion: '0.1.0',
         }),
@@ -957,6 +1010,505 @@ describe('NativeRendererApi', () => {
     expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
     await expect(api.loadRuntimeModelCatalog('host-remote')).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
     expect(runtimeModelCatalog).toHaveBeenCalledOnce()
+  })
+
+  it('captures one stable issue time and exact generation for a composer command', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Generation one transcript.')
+    let submitted: Record<string, unknown> | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      submitCommand: vi.fn((input: Record<string, unknown>) => {
+        submitted = input
+        return ok({
+          hostId: input.expectedHostId,
+          deviceId: input.deviceId,
+          commandId: input.commandId,
+          threadId: input.threadId,
+          executionGenerationId: input.expectedExecutionGenerationId,
+          status: 'admitted',
+          durable: true,
+        })
+      }),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.sendComposer({
+      threadId: 'thread-one',
+      text: 'Continue exactly here',
+      intent: 'follow_up',
+      sendWhenReconnected: false,
+    })).resolves.toMatchObject({ state: 'sent' })
+
+    expect(submitted).toMatchObject({
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      expectedExecutionGenerationId: 'generation-one',
+      kind: 'thread.follow_up',
+      payload: { text: 'Continue exactly here' },
+    })
+    expect(typeof submitted?.issuedAt).toBe('string')
+    expect(Number.isFinite(Date.parse(String(submitted?.issuedAt)))).toBe(true)
+    expect(bridge.submitCommand).toHaveBeenCalledOnce()
+  })
+
+  it('suppresses delayed G1 snapshots and receipts after the same host advances the thread to G2', async () => {
+    const catalogG1 = recoveryCatalog()
+    const threadG1 = catalogG1.threads[0]
+    const snapshotG1 = recoverySnapshot(threadG1, 'Generation one transcript.')
+    const threadG2 = {
+      ...threadG1,
+      currentLocation: { ...threadG1.currentLocation, executionGenerationId: 'generation-next' },
+      updatedAt: '2026-08-05T20:00:02.000Z',
+    }
+    const catalogG2 = { ...catalogG1, threads: [threadG2, catalogG1.threads[1]] }
+    const snapshotG2 = recoverySnapshot(threadG2, 'Generation two transcript.')
+    const submission = deferred<unknown>()
+    let submitted: Record<string, unknown> | undefined
+    let deviceId = ''
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    let hostEventListener: ((event: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog: catalogG1, lastSnapshot: snapshotG1 },
+        outbox: [{
+          hostId: 'host-local',
+          command: {
+            deviceId,
+            commandId: 'older-generation-outbox',
+            expectedHostId: 'host-local',
+            threadId: 'thread-one',
+            kind: 'thread.follow_up',
+            payload: { text: 'Older queued work' },
+            delivery: 'send_when_reconnected',
+            expectedExecutionGenerationId: 'generation-one',
+            issuedAt: '2026-08-05T20:00:00.000Z',
+          },
+          state: 'uncertain',
+          updatedAt: '2026-08-05T20:00:00.000Z',
+        }],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      submitCommand: vi.fn((input: Record<string, unknown>) => {
+        submitted = input
+        return submission.promise
+      }),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn((listener: (event: unknown) => void) => {
+        hostEventListener = listener
+        return () => undefined
+      }),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    deviceId = (api as unknown as { deviceId: string }).deviceId
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+
+    const sending = api.sendComposer({
+      threadId: 'thread-one',
+      text: 'Continue G1',
+      intent: 'follow_up',
+      sendWhenReconnected: false,
+    })
+    expect(submitted).toMatchObject({ expectedExecutionGenerationId: 'generation-one' })
+
+    snapshotListener?.(catalogG2)
+    expect(published.at(-1)?.operations.submitCommands).toBe(false)
+    expect(published.at(-1)?.composerReceipt.state).toBe('idle')
+    snapshotListener?.(snapshotG1)
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript).toEqual([])
+    snapshotListener?.(snapshotG2)
+    expect(published.at(-1)?.operations.submitCommands).toBe(true)
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body).toBe('Generation two transcript.')
+
+    submission.resolve({
+      ok: true,
+      value: {
+        hostId: submitted?.expectedHostId,
+        deviceId: submitted?.deviceId,
+        commandId: submitted?.commandId,
+        threadId: submitted?.threadId,
+        executionGenerationId: submitted?.expectedExecutionGenerationId,
+        status: 'admitted',
+        durable: true,
+      },
+    })
+    await expect(sending).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+
+    hostEventListener?.({
+      type: 'command.receipt',
+      payload: {
+        hostId: submitted?.expectedHostId,
+        deviceId: submitted?.deviceId,
+        commandId: submitted?.commandId,
+        threadId: submitted?.threadId,
+        executionGenerationId: submitted?.expectedExecutionGenerationId,
+        status: 'admitted',
+        durable: true,
+      },
+    })
+    expect(published.at(-1)?.composerReceipt.state).toBe('idle')
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body).toBe('Generation two transcript.')
+
+    const delayedThreadG1 = {
+      ...threadG1,
+      updatedAt: '2026-08-05T20:00:04.000Z',
+    }
+    const delayedCatalogG1 = {
+      ...catalogG1,
+      generatedAt: '2026-08-05T20:00:04.000Z',
+      threads: [delayedThreadG1, catalogG1.threads[1]],
+    }
+    snapshotListener?.(delayedCatalogG1)
+    snapshotListener?.(recoverySnapshot(delayedThreadG1, 'Delayed generation one transcript.'))
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.executionGenerationId).toBe('generation-next')
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body).toBe('Generation two transcript.')
+    unsubscribe()
+  })
+
+  it('keeps a same-connection G2 event authoritative over a delayed G1 bootstrap', async () => {
+    const catalogG1 = recoveryCatalog()
+    const threadG1 = catalogG1.threads[0]
+    const snapshotG1 = recoverySnapshot(threadG1, 'Bootstrap generation one.')
+    const threadG2 = {
+      ...threadG1,
+      currentLocation: { ...threadG1.currentLocation, executionGenerationId: 'generation-bootstrap-g2' },
+      updatedAt: '2026-08-05T20:00:02.000Z',
+    }
+    const catalogG2 = {
+      ...catalogG1,
+      generatedAt: '2026-08-05T20:00:02.000Z',
+      threads: [threadG2, catalogG1.threads[1]],
+    }
+    const snapshotG2 = recoverySnapshot(threadG2, 'Event generation two wins.')
+    const bootstrap = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => bootstrap.promise),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const deviceId = (api as unknown as { deviceId: string }).deviceId
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    connectionListener?.(onlineConnection())
+    const loading = api.loadWorkbench()
+
+    snapshotListener?.(catalogG2)
+    snapshotListener?.(snapshotG2)
+    bootstrap.resolve({
+      ok: true,
+      value: {
+        cache: { version: 2, projectionHostId: 'host-local', catalog: catalogG1, lastSnapshot: snapshotG1 },
+        outbox: [{
+          hostId: 'host-local',
+          command: {
+            deviceId,
+            commandId: 'bootstrap-race-command',
+            expectedHostId: 'host-local',
+            threadId: 'thread-one',
+            kind: 'thread.follow_up',
+            payload: { text: 'Preserve pending work' },
+            delivery: 'send_when_reconnected',
+            expectedExecutionGenerationId: 'generation-bootstrap-g2',
+            issuedAt: '2026-08-05T20:00:02.000Z',
+          },
+          state: 'uncertain',
+          updatedAt: '2026-08-05T20:00:02.000Z',
+        }],
+        quarantinedOutboxCount: 2,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      },
+    })
+    const loaded = await loading
+
+    expect(loaded.threads.find((thread) => thread.id === 'thread-one')?.executionGenerationId).toBe('generation-bootstrap-g2')
+    expect(loaded.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body).toBe('Event generation two wins.')
+    expect(loaded.composerReceipt.state).toBe('uncertain')
+    expect(loaded.attention).toContainEqual(expect.objectContaining({ id: 'native-quarantined-outbox' }))
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body).toBe('Event generation two wins.')
+    unsubscribe()
+  })
+
+  it('does not let a delayed refresh snapshot overwrite the generation that advanced while awaiting it', async () => {
+    const catalogG2 = recoveryCatalog()
+    const threadG2 = catalogG2.threads[0]
+    const snapshotG2 = recoverySnapshot(threadG2, 'Refresh generation two.')
+    const threadG3 = {
+      ...threadG2,
+      currentLocation: { ...threadG2.currentLocation, executionGenerationId: 'generation-refresh-g3' },
+      updatedAt: '2026-08-05T20:00:03.000Z',
+    }
+    const catalogG3 = {
+      ...catalogG2,
+      generatedAt: '2026-08-05T20:00:03.000Z',
+      threads: [threadG3, catalogG2.threads[1]],
+    }
+    const snapshotG3 = recoverySnapshot(threadG3, 'Refresh generation three wins.')
+    const request = deferred<unknown>()
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog: catalogG2, lastSnapshot: snapshotG2 },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalogG2)),
+      requestSnapshot: vi.fn(() => request.promise),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledOnce())
+
+    snapshotListener?.(catalogG3)
+    snapshotListener?.(snapshotG3)
+    request.resolve({ ok: true, value: snapshotG2 })
+    await vi.waitFor(() => {
+      expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body)
+        .toBe('Refresh generation three wins.')
+    })
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.executionGenerationId).toBe('generation-refresh-g3')
+    unsubscribe()
+  })
+
+  it.each(['success', 'failure'] as const)(
+    'does not restore or apply a delayed G2 selection %s after the catalog advances to G3',
+    async (outcome) => {
+      const catalogG2 = recoveryCatalog()
+      const threadG2 = catalogG2.threads[0]
+      const snapshotG2 = recoverySnapshot(threadG2, 'Selection generation two.')
+      const threadG3 = {
+        ...threadG2,
+        currentLocation: { ...threadG2.currentLocation, executionGenerationId: 'generation-selection-g3' },
+        updatedAt: '2026-08-05T20:00:03.000Z',
+      }
+      const catalogG3 = {
+        ...catalogG2,
+        generatedAt: '2026-08-05T20:00:03.000Z',
+        threads: [threadG3, catalogG2.threads[1]],
+      }
+      const snapshotG3 = recoverySnapshot(threadG3, 'Selection generation three wins.')
+      const request = deferred<unknown>()
+      let snapshotListener: ((snapshot: unknown) => void) | undefined
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog: catalogG2, lastSnapshot: snapshotG2 },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          connection: onlineConnection(),
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+        requestSnapshot: vi.fn(() => request.promise),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+          snapshotListener = listener
+          return () => undefined
+        }),
+        onHostEvent: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      const api = new NativeRendererApi(bridge)
+      const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+      const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+      await api.loadWorkbench()
+      const selection = api.selectThread('thread-one')
+      await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledOnce())
+      snapshotListener?.(catalogG3)
+      snapshotListener?.(snapshotG3)
+      if (outcome === 'success') request.resolve({ ok: true, value: snapshotG2 })
+      else request.reject(new Error('Delayed G2 selection failed'))
+      await expect(selection).resolves.toBeUndefined()
+
+      expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.executionGenerationId)
+        .toBe('generation-selection-g3')
+      expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.transcript[0]?.body)
+        .toBe('Selection generation three wins.')
+      unsubscribe()
+    },
+  )
+
+  it('keeps conflicting hydrated command fingerprints visible and ignores an old receipt', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Current transcript.')
+    let deviceId = ''
+    let hostEventListener: ((event: unknown) => void) | undefined
+    const command = {
+      deviceId,
+      commandId: 'hydrated-fingerprint-conflict',
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      kind: 'thread.follow_up',
+      payload: { text: 'First immutable command' },
+      delivery: 'send_when_reconnected',
+      expectedExecutionGenerationId: 'generation-one',
+      issuedAt: '2026-08-05T20:00:00.000Z',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [
+          { hostId: 'host-local', command: { ...command, deviceId }, state: 'uncertain', updatedAt: command.issuedAt },
+          {
+            hostId: 'host-local',
+            command: { ...command, deviceId, issuedAt: '2026-08-05T20:00:01.000Z' },
+            state: 'uncertain',
+            updatedAt: '2026-08-05T20:00:01.000Z',
+          },
+        ],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn((listener: (event: unknown) => void) => {
+        hostEventListener = listener
+        return () => undefined
+      }),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    deviceId = (api as unknown as { deviceId: string }).deviceId
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((view) => published.push(view))
+    const loaded = await api.loadWorkbench()
+    expect(loaded.composerReceipt.state).toBe('uncertain')
+
+    hostEventListener?.({
+      type: 'command.receipt',
+      payload: {
+        hostId: 'host-local',
+        deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
+        status: 'admitted',
+        durable: true,
+      },
+    })
+    expect((api as unknown as { projection?: { composerReceipt: { state: string } } }).projection?.composerReceipt.state)
+      .toBe('uncertain')
+    expect((api as unknown as { outbox: unknown[] }).outbox).toHaveLength(2)
+    unsubscribe()
+  })
+
+  it('does not reintroduce a retired generation after a complete catalog drops its thread', async () => {
+    const catalogG1 = recoveryCatalog()
+    const snapshotG1 = recoverySnapshot(catalogG1.threads[0], 'Generation one.')
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog: catalogG1, lastSnapshot: snapshotG1 },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((view) => published.push(view))
+    await api.loadWorkbench()
+    const withoutThreadOne = {
+      ...catalogG1,
+      generatedAt: '2026-08-05T20:00:02.000Z',
+      threads: [catalogG1.threads[1]],
+    }
+    snapshotListener?.(withoutThreadOne)
+    expect(published.at(-1)?.threads.some((thread) => thread.id === 'thread-one')).toBe(false)
+    snapshotListener?.({
+      ...catalogG1,
+      generatedAt: '2026-08-05T20:00:04.000Z',
+      threads: [{ ...catalogG1.threads[0], updatedAt: '2026-08-05T20:00:04.000Z' }, catalogG1.threads[1]],
+    })
+    expect(published.at(-1)?.threads.some((thread) => thread.id === 'thread-one')).toBe(false)
+    unsubscribe()
+  })
+
+  it('surfaces parseable legacy commands as held instead of composer work', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Current transcript.')
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 2,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      }),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+
+    const view = await api.loadWorkbench()
+    expect(view.attention).toContainEqual(expect.objectContaining({
+      id: 'native-quarantined-outbox',
+      title: '2 older or invalid commands are held locally and won’t be sent automatically',
+    }))
+    expect(view.composerReceipt.state).toBe('idle')
   })
 })
 

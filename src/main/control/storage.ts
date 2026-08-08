@@ -5,17 +5,30 @@ import { ControlError } from './errors'
 
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 
+export interface AtomicJsonStoreOptions<T> {
+  /** Disposable caches may recover empty; durable mutation logs must fail closed. */
+  malformedJson?: 'fallback' | 'error'
+  validateRoot?: (value: unknown) => value is T
+}
+
 /** Small crash-safe JSON store for disposable projections and the explicit outbox. */
 export class AtomicJsonStore<T> {
   private readonly filePath: string
   private readonly fallback: () => T
   private readonly maxBytes: number
+  private readonly options: AtomicJsonStoreOptions<T>
   private tail: Promise<void> = Promise.resolve()
 
-  constructor(filePath: string, fallback: () => T, maxBytes = DEFAULT_MAX_BYTES) {
+  constructor(
+    filePath: string,
+    fallback: () => T,
+    maxBytes = DEFAULT_MAX_BYTES,
+    options: AtomicJsonStoreOptions<T> = {},
+  ) {
     this.filePath = filePath
     this.fallback = fallback
     this.maxBytes = maxBytes
+    this.options = options
   }
 
   async read(): Promise<T> {
@@ -26,10 +39,26 @@ export class AtomicJsonStore<T> {
           details: { file: path.basename(this.filePath), maxBytes: this.maxBytes }
         })
       }
-      return JSON.parse(bytes.toString('utf8')) as T
+      const parsed: unknown = JSON.parse(bytes.toString('utf8'))
+      if (this.options.validateRoot && !this.options.validateRoot(parsed)) {
+        throw new ControlError(
+          'storage.invalid_root',
+          'A durable native state file has an invalid root shape and was preserved unchanged.',
+          { details: { file: path.basename(this.filePath) } },
+        )
+      }
+      return parsed as T
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code
-      if (code === 'ENOENT' || error instanceof SyntaxError) return this.fallback()
+      if (code === 'ENOENT') return this.fallback()
+      if (error instanceof SyntaxError) {
+        if (this.options.malformedJson !== 'error') return this.fallback()
+        throw new ControlError(
+          'storage.malformed_json',
+          'A durable native state file contains malformed JSON and was preserved unchanged.',
+          { details: { file: path.basename(this.filePath) } },
+        )
+      }
       throw error
     }
   }

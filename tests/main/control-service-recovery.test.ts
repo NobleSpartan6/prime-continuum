@@ -18,6 +18,7 @@ vi.mock('../../src/main/control/local-hostd', () => ({
 }))
 
 import { DesktopControlService } from '../../src/main/control/service'
+import { ControlError } from '../../src/main/control/errors'
 
 const temporaryDirectories: string[] = []
 
@@ -95,7 +96,7 @@ describe('DesktopControlService recovery', () => {
       if (method === 'health.get') {
         return {
           ...health(),
-          capabilities: ['prime_agent_commands_v1', 'invalid capability', 'prime_agent_commands_v1'],
+          capabilities: ['prime_agent_commands_v2', 'invalid capability', 'prime_agent_commands_v2'],
         }
       }
       if (method === 'command.reconcile') return { receipts: [], unknown: [] }
@@ -107,8 +108,34 @@ describe('DesktopControlService recovery', () => {
     await service.bootstrap()
     await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({
       phase: 'online',
+      capabilities: ['prime_agent_commands_v2'],
+    })
+  })
+
+  it('never downgrades v2 command delivery to a legacy v1 host capability', async () => {
+    const queued = followUp('device-a', 'legacy-reconcile-blocked')
+    const directory = await createUserData({ outbox: [waiting(queued)] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return { ...health(), capabilities: ['prime_agent_commands_v1'] }
+      }
+      throw new Error(`A legacy command host must not receive ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({
+      phase: 'online',
       capabilities: ['prime_agent_commands_v1'],
     })
+    await expect(service.submitCommand(followUp('device-a', 'legacy-capability-blocked'))).rejects.toMatchObject({
+      code: 'command.capability_unavailable',
+    })
+
+    expect(connection.requests.map((request) => request.method)).toEqual(['health.get'])
+    expect((await service.bootstrap()).outbox).toEqual([
+      expect.objectContaining({ command: expect.objectContaining({ commandId: queued.commandId }) }),
+    ])
   })
 
   it('keeps the bound authority and its capabilities when a replacement binding cannot persist', async () => {
@@ -172,7 +199,7 @@ describe('DesktopControlService recovery', () => {
       phase: 'online',
       target: { kind: 'local' },
       hostId: 'host-a',
-      capabilities: ['prime_agent_commands_v1'],
+      capabilities: ['prime_agent_commands_v2'],
     })
     await service.disconnect()
   })
@@ -206,7 +233,7 @@ describe('DesktopControlService recovery', () => {
       phase: 'online',
       target: { kind: 'local' },
       hostId: 'host-a',
-      capabilities: ['prime_agent_commands_v1'],
+      capabilities: ['prime_agent_commands_v2'],
     })
     await service.disconnect()
   })
@@ -225,21 +252,27 @@ describe('DesktopControlService recovery', () => {
       waiting(notExplicit)
     ]
     const directory = await createUserData({ outbox })
-    const connection = new TestConnection((method) => {
+    const connection = new TestConnection((method, params) => {
       if (method === 'health.get') return health()
       if (method === 'command.reconcile') {
+        const command = ((params as { commands: ClientCommand[] }).commands[0])
+        if (!command) throw new Error('Expected one exact reconciliation envelope')
+        const unknown = command.commandId === replayable.commandId
+          ? [{ deviceId: replayable.deviceId, commandId: replayable.commandId }]
+          : command.commandId === uncertain.commandId
+            ? [{ deviceId: uncertain.deviceId, commandId: uncertain.commandId }]
+            : command.commandId === mismatchedDevice.commandId
+              ? [{ deviceId: 'different-device', commandId: mismatchedDevice.commandId }]
+              : command.commandId === notExplicit.commandId
+                ? [{ deviceId: notExplicit.deviceId, commandId: notExplicit.commandId }]
+                : []
         return {
           receipts: [],
-          unknown: [
-            { deviceId: replayable.deviceId, commandId: replayable.commandId },
-            { deviceId: uncertain.deviceId, commandId: uncertain.commandId },
-            { deviceId: 'different-device', commandId: mismatchedDevice.commandId },
-            { deviceId: notExplicit.deviceId, commandId: notExplicit.commandId }
-          ]
+          unknown,
         }
       }
       if (method === 'command.submit') {
-        return { commandId: replayable.commandId, status: 'received', durable: true }
+        return commandReceipt(replayable)
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -255,6 +288,8 @@ describe('DesktopControlService recovery', () => {
         deviceId: replayable.deviceId,
         commandId: replayable.commandId,
         threadId: replayable.threadId,
+        issuedAt: replayable.issuedAt,
+        expectedExecutionGenerationId: replayable.expectedExecutionGenerationId,
         command: { kind: 'follow_up', text: 'Follow up' }
       }
     })
@@ -285,7 +320,7 @@ describe('DesktopControlService recovery', () => {
         }
       }
       if (method === 'command.submit') {
-        return { commandId: replayable.commandId, status: 'received', durable: true }
+        return commandReceipt(replayable)
       }
       if (method === 'catalog.snapshot') return catalog()
       throw new Error(`Unexpected request: ${method}`)
@@ -324,7 +359,7 @@ describe('DesktopControlService recovery', () => {
     ])
   })
 
-  it('publishes degraded without ever publishing online when restart reconciliation fails', async () => {
+  it('keeps a verified connection online while a failed reconciliation remains uncertain', async () => {
     const queued = followUp('device-a', 'blocked-follow-up')
     const directory = await createUserData({
       cache: {
@@ -349,15 +384,14 @@ describe('DesktopControlService recovery', () => {
     })
 
     await service.bootstrap()
-    await expect(service.reconnect()).resolves.toMatchObject({
-      phase: 'degraded',
-      error: { code: 'native.unexpected' }
-    })
+    await expect(service.reconnect()).resolves.toMatchObject({ phase: 'online' })
 
-    expect(phases).toEqual(['reconnecting', 'degraded'])
-    expect(authoritativeRefreshTriggered).toBe(false)
+    expect(phases).toEqual(['reconnecting', 'online'])
+    expect(authoritativeRefreshTriggered).toBe(true)
     expect(connection.requests.map((request) => request.method)).toEqual(['health.get', 'command.reconcile'])
-    expect((await service.bootstrap()).outbox).toEqual([waiting(queued)])
+    expect((await service.bootstrap()).outbox).toEqual([
+      expect.objectContaining({ command: queued, state: 'uncertain' }),
+    ])
   })
 
   it('never discloses or replays Host A outbox identities after Host B becomes authoritative', async () => {
@@ -417,7 +451,7 @@ describe('DesktopControlService recovery', () => {
         return { receipts: [], unknown: [{ deviceId: queued.deviceId, commandId: queued.commandId }] }
       }
       if (method === 'command.submit') {
-        return { commandId: queued.commandId, status: 'received', durable: true }
+        return commandReceipt(queued)
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -520,7 +554,7 @@ describe('DesktopControlService recovery', () => {
     const connectionB = new TestConnection((method, params) => {
       if (method === 'health.get') return health('host-b')
       if (method === 'command.reconcile') {
-        expect(params).toEqual({
+        expect(params).toMatchObject({
           expectedHostId: 'host-b',
           commands: [{ deviceId: queuedForB.deviceId, commandId: queuedForB.commandId }]
         })
@@ -537,7 +571,7 @@ describe('DesktopControlService recovery', () => {
             commandId: queuedForB.commandId
           }
         })
-        return { deviceId: queuedForB.deviceId, commandId: queuedForB.commandId, status: 'received', durable: true }
+        return commandReceipt(queuedForB)
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -573,18 +607,21 @@ describe('DesktopControlService recovery', () => {
     const connection = new TestConnection((method, params) => {
       if (method === 'health.get') return health('host-a')
       if (method === 'command.reconcile') {
+        const command = (params as { commands: Array<{ deviceId: string; commandId: string }> }).commands[0]
         expect(params).toMatchObject({
           expectedHostId: 'host-a',
-          commands: [
-            { deviceId: 'device-a', commandId: 'shared-command' },
-            { deviceId: 'device-b', commandId: 'shared-command' }
-          ]
+          commands: [{ deviceId: command?.deviceId, commandId: 'shared-command' }]
         })
-        return { receipts: [], unknown: [{ deviceId: 'device-a', commandId: 'shared-command' }] }
+        return {
+          receipts: [],
+          unknown: command?.deviceId === 'device-a'
+            ? [{ deviceId: 'device-a', commandId: 'shared-command' }]
+            : [],
+        }
       }
       if (method === 'command.submit') {
         expect(params).toMatchObject({ command: { deviceId: 'device-a', commandId: 'shared-command' } })
-        return { deviceId: 'device-a', commandId: 'shared-command', status: 'received', durable: true }
+        return commandReceipt(first)
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -616,7 +653,9 @@ describe('DesktopControlService recovery', () => {
 
     connectionA.emit('event', { type: 'snapshot.update', payload: catalog('host-a') })
     connectionB.emit('event', { type: 'snapshot.update', payload: catalog('host-b') })
-    expect(snapshots).toEqual([expect.objectContaining({ host: expect.objectContaining({ hostId: 'host-b' }) })])
+    await vi.waitFor(() => {
+      expect(snapshots).toEqual([expect.objectContaining({ host: expect.objectContaining({ hostId: 'host-b' }) })])
+    })
 
     connectionB.emit('event', { type: 'snapshot.update', payload: catalog('host-a') })
     expect(connectionB.terminatedWith).toMatchObject({ code: 'protocol.authority_mismatch' })
@@ -909,6 +948,517 @@ describe('DesktopControlService recovery', () => {
     })
     expect(connection.requests.filter(({ method }) => method === 'runtime.model_catalog')).toHaveLength(1)
   })
+
+  it('preserves and quarantines a legacy outbox record through bootstrap, connect, put, remove, and restart', async () => {
+    const legacy = {
+      hostId: 'host-a',
+      command: {
+        deviceId: 'legacy-device',
+        commandId: 'legacy-command',
+        expectedHostId: 'host-a',
+        threadId: 'thread-1',
+        kind: 'thread.follow_up',
+        delivery: 'send_when_reconnected',
+        payload: { text: 'Legacy follow up' },
+      },
+      state: 'waiting_for_connection',
+      updatedAt: timestamp,
+    }
+    const directory = await createUserData({ cache: verifiedCache('host-a'), outbox: [legacy] })
+    const modern = { ...followUp('device-a', 'modern-command'), delivery: 'live_only' as const }
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') return commandReceipt(modern)
+      throw new Error(`Legacy outbox must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({ phase: 'online' })
+    await expect(service.submitCommand(modern)).resolves.toMatchObject({ commandId: modern.commandId })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get', 'command.submit'])
+    expect(await readStoredOutbox(directory)).toEqual([legacy])
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    await expect(restarted.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    expect(await readStoredOutbox(directory)).toEqual([legacy])
+  })
+
+  it.each([
+    ['malformed JSON', '{not-json', 'storage.malformed_json'],
+    ['a non-array root', '{"commands":[]}', 'storage.invalid_root'],
+  ])('fails closed for an outbox with %s and preserves its exact bytes', async (_label, contents, code) => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const outboxPath = path.join(directory, 'control', 'command-outbox.json')
+    await writeFile(outboxPath, contents)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.bootstrap()).rejects.toMatchObject({ code })
+    await expect(service.submitCommand(followUp('device-a', 'must-not-overwrite'))).rejects.toMatchObject({ code })
+    await expect(
+      (service as unknown as { removeOutbox(identities: unknown[]): Promise<void> }).removeOutbox([]),
+    ).resolves.toBeUndefined()
+    await expect(
+      (service as unknown as { removeOutbox(identities: unknown[]): Promise<void> }).removeOutbox([{}]),
+    ).rejects.toMatchObject({ code })
+    expect(await readFile(outboxPath, 'utf8')).toBe(contents)
+  })
+
+  it('rejects missing generation or issue time before an outbox write or network request', async () => {
+    const directory = await createUserData({})
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`Invalid commands must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    const valid = followUp('device-a', 'missing-fence')
+    const { expectedExecutionGenerationId: _generation, ...withoutGeneration } = valid
+    const { issuedAt: _issuedAt, ...withoutIssuedAt } = valid
+
+    await expect(service.submitCommand(withoutGeneration as ClientCommand)).rejects.toMatchObject({
+      code: 'command.execution_generation_required',
+    })
+    await expect(service.submitCommand(withoutIssuedAt as ClientCommand)).rejects.toMatchObject({
+      code: 'command.issued_at_required',
+    })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    await expect(readStoredOutbox(directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('never coerces a malformed approval decision into a durable rejection', async () => {
+    const invalidApproval = {
+      ...followUp('device-a', 'invalid-approval-decision'),
+      kind: 'approval.resolve',
+      delivery: 'live_only',
+      payload: { approvalId: 'approval-one', decision: 'garbage' },
+    } as ClientCommand
+    const directory = await createUserData({ outbox: [waiting(invalidApproval)] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`Malformed approval must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({ phase: 'online' })
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    await expect(service.submitCommand(invalidApproval)).rejects.toMatchObject({
+      code: 'command.approval_decision_invalid',
+    })
+    await expect(service.approve({
+      deviceId: 'device-a',
+      commandId: 'invalid-approval-resolution',
+      expectedHostId: 'host-a',
+      expectedExecutionGenerationId: 'execution-1',
+      issuedAt: timestamp,
+      threadId: 'thread-1',
+      approvalId: 'approval-one',
+      decision: 'garbage',
+    } as never)).rejects.toMatchObject({ code: 'command.approval_decision_invalid' })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    expect(await readStoredOutbox(directory)).toEqual([waiting(invalidApproval)])
+  })
+
+  it('leaves a command uncertain when a durable receipt names a different generation', async () => {
+    const directory = await createUserData({})
+    const command = { ...followUp('device-a', 'wrong-generation-receipt'), delivery: 'live_only' as const }
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') {
+        return { ...commandReceipt(command), executionGenerationId: 'execution-2' }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await expect(service.submitCommand(command)).rejects.toMatchObject({
+      code: 'protocol.command_receipt_identity_mismatch',
+    })
+    expect((await service.bootstrap()).outbox).toEqual([
+      expect.objectContaining({ command, state: 'uncertain' }),
+    ])
+  })
+
+  it('keeps a healthy connection online, clears exact receipts, and quarantines a conflicting envelope without replay', async () => {
+    const conflicting = followUp('device-a', 'conflicting-envelope')
+    const exact = followUp('device-a', 'exact-envelope')
+    const directory = await createUserData({ outbox: [waiting(conflicting), waiting(exact)] })
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        const envelope = (params as { commands: Array<{ commandId: string }> }).commands[0]
+        if (envelope?.commandId === conflicting.commandId) {
+          throw new ControlError('host.command_identity_orphaned', 'The durable identity cannot be reconciled safely.')
+        }
+        if (envelope?.commandId === exact.commandId) {
+          return { receipts: [commandReceipt(exact, 'admitted')], unknown: [] }
+        }
+      }
+      throw new Error(`Conflicting reconciliation must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const receipts: unknown[] = []
+    service.on('host-event', (event) => receipts.push(event))
+
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({ phase: 'online' })
+    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toEqual([])
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({
+        command: conflicting,
+        state: 'uncertain',
+        quarantineReason: 'command_identity_conflict',
+      }),
+    ])
+    expect(receipts).toContainEqual(expect.objectContaining({
+      type: 'command.receipt',
+      payload: expect.objectContaining({
+        hostId: 'host-a',
+        deviceId: exact.deviceId,
+        commandId: exact.commandId,
+        threadId: exact.threadId,
+        executionGenerationId: exact.expectedExecutionGenerationId,
+        status: 'admitted',
+      }),
+    }))
+  })
+
+  it('keeps automatic delivery online when one unknown envelope fails and a later envelope succeeds', async () => {
+    const rejected = followUp('device-a', 'rejected-after-unknown')
+    const delivered = followUp('device-a', 'delivered-after-rejection')
+    const directory = await createUserData({ outbox: [waiting(rejected), waiting(delivered)] })
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        const envelope = (params as { commands: Array<{ deviceId: string; commandId: string }> }).commands[0]
+        return {
+          receipts: [],
+          unknown: envelope ? [{ deviceId: envelope.deviceId, commandId: envelope.commandId }] : [],
+        }
+      }
+      if (method === 'command.submit') {
+        const envelope = (params as { command: { commandId: string } }).command
+        if (envelope.commandId === rejected.commandId) {
+          throw new ControlError('host.command_receipt_generation_mismatch', 'The receipt generation is inconsistent.')
+        }
+        return commandReceipt(delivered, 'admitted')
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({ phase: 'online' })
+    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(2)
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({
+        command: rejected,
+        state: 'uncertain',
+        quarantineReason: 'command_identity_conflict',
+      }),
+    ])
+  })
+
+  it('never replaces a stored command with the same ID and a changed issue time or payload', async () => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.bootstrap()
+    const original = followUp('device-a', 'immutable-command')
+    const changed: ClientCommand = {
+      ...original,
+      issuedAt: '2026-08-05T12:00:01.000Z',
+      payload: { text: 'Changed follow up' },
+    }
+
+    await expect(service.submitCommand(original)).resolves.toMatchObject({ status: 'waiting_for_connection' })
+    await expect(service.submitCommand(changed)).rejects.toMatchObject({ code: 'command.identity_conflict' })
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ hostId: 'host-a', command: original, state: 'waiting_for_connection' }),
+    ])
+  })
+
+  it.each(['missing', 'mismatched', 'different'] as const)(
+    'treats a %s-host stored wrapper as a global command identity reservation',
+    async (variant) => {
+      const command = followUp('device-a', 'globally-reserved-command', 'host-b')
+      const storedCommand = variant === 'different'
+        ? followUp(command.deviceId, command.commandId, 'host-a')
+        : command
+      const stored = {
+        ...(variant === 'missing' ? {} : { hostId: 'host-a' }),
+        command: storedCommand,
+        state: 'uncertain' as const,
+        updatedAt: timestamp,
+      }
+      const directory = await createUserData({ cache: verifiedCache('host-b'), outbox: [stored] })
+      const service = new DesktopControlService({ app: testApp(directory) })
+      await service.bootstrap()
+
+      await expect(service.submitCommand(command)).rejects.toMatchObject({ code: 'command.identity_conflict' })
+      expect(await readStoredOutbox(directory)).toEqual([stored])
+    },
+  )
+
+  it('quarantines every duplicate or opaque global outbox identity before bootstrap or network use', async () => {
+    const original = followUp('device-a', 'duplicate-global-id')
+    const changed = {
+      ...original,
+      issuedAt: '2026-08-05T12:00:01.000Z',
+      payload: { text: 'Conflicting immutable payload' },
+    }
+    const directory = await createUserData({ outbox: [waiting(original), waiting(changed)] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`Quarantined duplicates must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.connect({ kind: 'local' })).resolves.toMatchObject({ phase: 'online' })
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 2 })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+
+    const opaque = { command: { deviceId: 'device-a', commandId: 'opaque-global-id' }, invalid: true }
+    const opaqueDirectory = await createUserData({ cache: verifiedCache('host-a'), outbox: [opaque] })
+    const opaqueService = new DesktopControlService({ app: testApp(opaqueDirectory) })
+    await opaqueService.bootstrap()
+    await expect(opaqueService.submitCommand(followUp('device-a', 'opaque-global-id'))).rejects.toMatchObject({
+      code: 'command.identity_conflict',
+    })
+    expect(await readStoredOutbox(opaqueDirectory)).toEqual([opaque])
+    await expect(opaqueService.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+  })
+
+  it('retains a terminal identity across restart and a rejected host switch without poisoning the original retry', async () => {
+    const directory = await createUserData({})
+    const original = { ...followUp('device-a', 'terminal-global-id'), delivery: 'live_only' as const }
+    const hostAFirst = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') return commandReceipt(original, 'admitted')
+      throw new Error(`Unexpected Host A request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(hostAFirst)
+    const first = new DesktopControlService({ app: testApp(directory) })
+    await first.connect({ kind: 'local' })
+    await expect(first.submitCommand(original)).resolves.toMatchObject({ status: 'admitted' })
+    await first.disconnect()
+    expect(await readStoredOutbox(directory)).toEqual([])
+
+    const changedHost = {
+      ...original,
+      expectedHostId: 'host-b',
+      payload: { text: 'Changed after host switch' },
+    }
+    const hostB = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-b')
+      throw new Error(`Rejected Host B reuse must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(hostB)
+    const second = new DesktopControlService({ app: testApp(directory) })
+    await second.connect({ kind: 'local' })
+    await expect(second.submitCommand(changedHost)).rejects.toMatchObject({ code: 'command.identity_conflict' })
+    expect(hostB.requests.map(({ method }) => method)).toEqual(['health.get'])
+    await second.disconnect()
+
+    const hostARetry = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') return commandReceipt(original, 'admitted')
+      throw new Error(`Unexpected Host A retry request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(hostARetry)
+    const third = new DesktopControlService({ app: testApp(directory) })
+    await third.connect({ kind: 'local' })
+    await expect(third.submitCommand(original)).resolves.toMatchObject({ status: 'admitted' })
+    expect(hostARetry.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(1)
+    const ledger = JSON.parse(
+      await readFile(path.join(directory, 'control', 'command-identities.json'), 'utf8'),
+    ) as { entries: Array<{ hostId: string; commandId: string }> }
+    expect(ledger.entries).toEqual([expect.objectContaining({ hostId: 'host-a', commandId: original.commandId })])
+    await third.disconnect()
+  })
+
+  it('allows an exact known retry when the durable ledger is full but rejects every new identity', async () => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const known = followUp('device-known', 'known-at-capacity')
+    const first = new DesktopControlService({ app: testApp(directory) })
+    await first.bootstrap()
+    await first.submitCommand(known)
+    const ledgerPath = path.join(directory, 'control', 'command-identities.json')
+    const ledger = JSON.parse(await readFile(ledgerPath, 'utf8')) as {
+      version: 1
+      entries: Array<Record<string, unknown>>
+    }
+    for (let index = ledger.entries.length; index < 10_000; index += 1) {
+      ledger.entries.push({
+        deviceId: `device-cap-${index}`,
+        commandId: `command-cap-${index}`,
+        hostId: 'host-a',
+        envelopeSha256: 'a'.repeat(64),
+        reservedAt: timestamp,
+      })
+    }
+    await writeFile(ledgerPath, JSON.stringify(ledger))
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    await expect(restarted.bootstrap()).resolves.toMatchObject({ outbox: [expect.objectContaining({ command: known })] })
+    await expect(restarted.submitCommand(known)).resolves.toMatchObject({ status: 'waiting_for_connection' })
+    await expect(restarted.submitCommand(followUp('device-new', 'blocked-at-capacity'))).rejects.toMatchObject({
+      code: 'command.identity_ledger_full',
+    })
+    expect((await readStoredOutbox(directory)).map((entry) => entry.command.commandId)).toEqual([known.commandId])
+  })
+
+  it.each([
+    ['malformed JSON', '{broken-ledger', 'storage.malformed_json'],
+    ['an invalid root', '[]', 'storage.invalid_root'],
+  ])('fails closed without overwriting a command identity ledger with %s', async (_label, contents, code) => {
+    const directory = await createUserData({})
+    const ledgerPath = path.join(directory, 'control', 'command-identities.json')
+    await writeFile(ledgerPath, contents)
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`Invalid ledger must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await expect(service.submitCommand(followUp('device-a', 'ledger-must-not-overwrite'))).rejects.toMatchObject({ code })
+    expect(await readFile(ledgerPath, 'utf8')).toBe(contents)
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    await service.disconnect()
+  })
+
+  it('persists a newer event generation and rejects a delayed older refresh across restart', async () => {
+    const directory = await createUserData({})
+    const delayedCatalog = deferred<unknown>()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'catalog.snapshot') return delayedCatalog.promise
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const published: unknown[] = []
+    service.on('snapshot', (snapshot) => published.push(snapshot))
+    await service.connect({ kind: 'local' })
+
+    const catalogG1 = catalogWithThread('host-a', 'execution-1', '2026-08-05T12:00:01.000Z')
+    const catalogG2 = catalogWithThread('host-a', 'execution-2', '2026-08-05T12:00:02.000Z')
+    connection.emit('event', { type: 'snapshot.update', payload: catalogG1 })
+    await vi.waitFor(() => expect(published).toHaveLength(1))
+    const refresh = service.requestSnapshot({})
+    await vi.waitFor(() => expect(connection.requests.some(({ method }) => method === 'catalog.snapshot')).toBe(true))
+    connection.emit('event', { type: 'snapshot.update', payload: catalogG2 })
+    await vi.waitFor(() => expect(published).toHaveLength(2))
+    delayedCatalog.resolve(catalogWithThread('host-a', 'execution-1', '2026-08-05T12:00:03.000Z'))
+    await refresh
+
+    const cache = (await service.bootstrap()).cache as { catalog?: ReturnType<typeof catalogWithThread> }
+    expect(cache.catalog?.threads[0]?.currentLocation.executionGenerationId).toBe('execution-2')
+    await service.disconnect()
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    const restartedCache = (await restarted.bootstrap()).cache as { catalog?: ReturnType<typeof catalogWithThread> }
+    expect(restartedCache.catalog?.threads[0]?.currentLocation.executionGenerationId).toBe('execution-2')
+  })
+
+  it('retires a generation when a complete catalog drops its thread', async () => {
+    const directory = await createUserData({})
+    const reintroduced = catalogWithThread('host-a', 'execution-2', '2026-08-05T12:00:04.000Z')
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'catalog.snapshot') return reintroduced
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const published: unknown[] = []
+    service.on('snapshot', (snapshot) => published.push(snapshot))
+    await service.connect({ kind: 'local' })
+    connection.emit('event', {
+      type: 'snapshot.update',
+      payload: catalogWithThread('host-a', 'execution-2', '2026-08-05T12:00:01.000Z'),
+    })
+    await vi.waitFor(() => expect(published).toHaveLength(1))
+    connection.emit('event', {
+      type: 'snapshot.update',
+      payload: { ...catalog('host-a'), generatedAt: '2026-08-05T12:00:02.000Z' },
+    })
+    await vi.waitFor(() => expect(published).toHaveLength(2))
+
+    await service.requestSnapshot({})
+    const cache = (await service.bootstrap()).cache as { catalog?: { threads?: unknown[] } }
+    expect(cache.catalog?.threads).toEqual([])
+    await service.disconnect()
+  })
+
+  it('adapts model selection, approval, and cancellation with one stable issue time and exact generation', async () => {
+    const directory = await createUserData({})
+    const submitted: Array<Record<string, unknown>> = []
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') {
+        const envelope = (params as { command: Record<string, unknown> }).command
+        submitted.push(envelope)
+        return receiptForEnvelope(envelope)
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    const modelCommand: ClientCommand = {
+      ...followUp('device-a', 'select-model'),
+      delivery: 'live_only',
+      kind: 'model.select',
+      payload: { providerId: 'openai-codex', modelId: 'gpt-5.3-codex' },
+    }
+
+    await service.submitCommand(modelCommand)
+    await service.approve({
+      deviceId: 'device-a',
+      commandId: 'approve-one',
+      expectedHostId: 'host-a',
+      expectedExecutionGenerationId: 'execution-1',
+      issuedAt: timestamp,
+      threadId: 'thread-1',
+      approvalId: 'approval-one',
+      decision: 'deny',
+    })
+    await service.cancel({
+      deviceId: 'device-a',
+      commandId: 'cancel-one',
+      expectedHostId: 'host-a',
+      expectedExecutionGenerationId: 'execution-1',
+      issuedAt: timestamp,
+      threadId: 'thread-1',
+    })
+
+    expect(submitted).toEqual([
+      expect.objectContaining({
+        issuedAt: timestamp,
+        expectedExecutionGenerationId: 'execution-1',
+        command: { kind: 'model.select', providerId: 'openai-codex', modelId: 'gpt-5.3-codex' },
+      }),
+      expect.objectContaining({
+        issuedAt: timestamp,
+        expectedExecutionGenerationId: 'execution-1',
+        command: { kind: 'approval.resolve', approvalId: 'approval-one', decision: 'reject' },
+      }),
+      expect.objectContaining({
+        issuedAt: timestamp,
+        expectedExecutionGenerationId: 'execution-1',
+        command: { kind: 'abort' },
+      }),
+    ])
+  })
 })
 
 const timestamp = '2026-08-05T12:00:00.000Z'
@@ -918,10 +1468,40 @@ function followUp(deviceId: string, commandId: string, expectedHostId = 'host-a'
     deviceId,
     commandId,
     expectedHostId,
+    expectedExecutionGenerationId: 'execution-1',
+    issuedAt: timestamp,
     threadId: 'thread-1',
     kind: 'thread.follow_up',
     delivery: 'send_when_reconnected',
     payload: { text: 'Follow up' }
+  }
+}
+
+function commandReceipt(command: ClientCommand, status: 'received' | 'admitted' | 'rejected' = 'received') {
+  return {
+    protocolVersion: 1,
+    receiptId: `receipt-${command.deviceId}-${command.commandId}`,
+    deviceId: command.deviceId,
+    commandId: command.commandId,
+    threadId: command.threadId,
+    status,
+    receivedAt: timestamp,
+    updatedAt: timestamp,
+    executionGenerationId: command.expectedExecutionGenerationId,
+  }
+}
+
+function receiptForEnvelope(envelope: Record<string, unknown>) {
+  return {
+    protocolVersion: 1,
+    receiptId: `receipt-${String(envelope.commandId)}`,
+    deviceId: envelope.deviceId,
+    commandId: envelope.commandId,
+    threadId: envelope.threadId,
+    status: 'received',
+    receivedAt: timestamp,
+    updatedAt: timestamp,
+    executionGenerationId: envelope.expectedExecutionGenerationId,
   }
 }
 
@@ -937,7 +1517,7 @@ function health(hostId = 'host-a') {
     checkedAt: timestamp,
     serviceState: 'ready',
     host: { hostId },
-    capabilities: ['prime_agent_commands_v1'],
+    capabilities: ['prime_agent_commands_v2'],
   }
 }
 
@@ -957,6 +1537,24 @@ function catalog(hostId = 'host-a') {
     },
     projects: [],
     threads: []
+  }
+}
+
+function catalogWithThread(hostId: string, executionGenerationId: string, observedAt: string) {
+  const snapshot = threadSnapshot('thread-1', hostId)
+  const thread = {
+    ...snapshot.thread,
+    currentLocation: { ...snapshot.thread.currentLocation, executionGenerationId },
+    updatedAt: observedAt,
+    lastKnownCursor: {
+      ...snapshot.thread.lastKnownCursor,
+      executionGenerationId,
+    },
+  }
+  return {
+    ...catalog(hostId),
+    generatedAt: observedAt,
+    threads: [thread],
   }
 }
 

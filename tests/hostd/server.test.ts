@@ -240,9 +240,7 @@ describe("hostd local transport", () => {
     try {
       expect(successorOwned).toHaveBeenCalledOnce();
       expect(
-        await successorStore.reconcileCommands([
-          { deviceId: command.deviceId, commandId: command.commandId },
-        ]),
+        await successorStore.reconcileCommands([command]),
       ).toMatchObject({
         receipts: [
           {

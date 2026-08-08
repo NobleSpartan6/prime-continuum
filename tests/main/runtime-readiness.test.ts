@@ -86,12 +86,12 @@ describe('DesktopControlService runtime readiness', () => {
       health({ runtime: runtimeSnapshot('initializing', { phase: 'verifying' }), checkedAt: '2026-08-07T12:00:00.500Z' }),
       health({
         runtime: runtimeSnapshot('ready'),
-        capabilities: ['prime_agent_commands_v1'],
+        capabilities: ['prime_agent_commands_v2'],
         checkedAt: '2026-08-07T12:00:01.000Z',
       }),
       health({
         runtime: { ...runtimeSnapshot('ready'), changedAt: '2026-08-07T12:00:16.000Z' },
-        capabilities: ['prime_agent_commands_v1'],
+        capabilities: ['prime_agent_commands_v2'],
         checkedAt: '2026-08-07T12:00:16.000Z',
       }),
     ]
@@ -117,7 +117,7 @@ describe('DesktopControlService runtime readiness', () => {
     expect(states).toHaveLength(2)
     expect(states[1]).toMatchObject({
       phase: 'online',
-      capabilities: ['prime_agent_commands_v1', 'runtime_integrity_v1'],
+      capabilities: ['prime_agent_commands_v2', 'runtime_integrity_v1'],
       runtimeReadiness: { kind: 'reported', snapshot: { status: 'ready' } },
     })
 
@@ -193,7 +193,7 @@ describe('DesktopControlService runtime readiness', () => {
       hostId: 'host-b',
       runtimeReadiness: { kind: 'not_reported', hostId: 'host-b' },
     })
-    delayedPoll.resolve(health({ runtime: runtimeSnapshot('ready'), capabilities: ['prime_agent_commands_v1'] }))
+    delayedPoll.resolve(health({ runtime: runtimeSnapshot('ready'), capabilities: ['prime_agent_commands_v2'] }))
     await Promise.resolve()
     expect(service.getConnectionState()).toMatchObject({
       hostId: 'host-b',
@@ -228,7 +228,7 @@ describe('DesktopControlService runtime readiness', () => {
         if (method === 'health.get') {
           return health({
             runtime: runtimeSnapshot(status),
-            capabilities: ['prime_agent_commands_v1'],
+            capabilities: ['prime_agent_commands_v2'],
           })
         }
         throw new Error(`Unexpected request: ${method}`)
@@ -252,7 +252,7 @@ describe('DesktopControlService runtime readiness', () => {
       if (method === 'health.get') {
         const sample = healthCount === 0
           ? health({ runtime: runtimeSnapshot('initializing') })
-          : health({ runtime: runtimeSnapshot('ready'), capabilities: ['prime_agent_commands_v1'] })
+          : health({ runtime: runtimeSnapshot('ready'), capabilities: ['prime_agent_commands_v2'] })
         healthCount += 1
         return sample
       }
@@ -263,7 +263,7 @@ describe('DesktopControlService runtime readiness', () => {
         }
       }
       if (method === 'command.submit') {
-        return { deviceId: queued.deviceId, commandId: queued.commandId, status: 'received', durable: true }
+        return commandReceipt(queued)
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -298,7 +298,6 @@ describe('DesktopControlService runtime readiness', () => {
 
     expect(connection.requests.map(({ method }) => method)).toEqual([
       'health.get',
-      'command.reconcile',
       'health.get',
       'command.reconcile',
       'command.submit',
@@ -472,10 +471,26 @@ function followUp(
     deviceId: 'device-a',
     commandId,
     expectedHostId: 'host-a',
+    expectedExecutionGenerationId: 'execution-1',
+    issuedAt: '2026-08-07T12:00:00.000Z',
     threadId: 'thread-a',
     kind: 'thread.follow_up',
     delivery,
     payload: { text: 'Continue' },
+  }
+}
+
+function commandReceipt(command: ClientCommand) {
+  return {
+    protocolVersion: 1,
+    receiptId: `receipt-${command.commandId}`,
+    deviceId: command.deviceId,
+    commandId: command.commandId,
+    threadId: command.threadId,
+    status: 'received' as const,
+    receivedAt: '2026-08-07T12:00:00.000Z',
+    updatedAt: '2026-08-07T12:00:00.000Z',
+    executionGenerationId: command.expectedExecutionGenerationId,
   }
 }
 

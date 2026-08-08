@@ -21,7 +21,7 @@ The target architecture, not the current Phase 3A feature set, follows these dec
 - The relay must not receive thread plaintext, command plaintext, credentials, artifact plaintext, application keys, or stable authorization credentials.
 - Pairing creates one durable grant for one named device on one immutable host identity. A ticket is not a device grant.
 - Hostd derives authorization from its durable paired-device registry. A relay message cannot supply or widen its own scopes.
-- Every remote mutation preserves `deviceId`, `commandId`, `expectedHostId`, and, when applicable, the expected execution generation.
+- Every existing-thread remote mutation preserves one stable `issuedAt` plus its exact `deviceId`, `commandId`, expected host, thread, execution generation, kind, and payload. `issuedAt` is identity and audit metadata only; clocks never grant authority or establish causal order. Thread creation is a separate host-authoritative operation.
 - Revocation is committed on the host before success is reported, closes live channels, and blocks new channels.
 - Unsupported capabilities remain absent. A scope such as `run_location.change` does not make handoff available when `thread_handoff_v1` is absent.
 
@@ -161,8 +161,8 @@ An unauthenticated candidate, paired device, or malicious relay may open many ch
 6. **Fresh channel keys.** Each connection or resumed channel uses fresh key material and direction-separated keys. A reconnect never reuses an AEAD nonce/key pair.
 7. **Replay-safe application traffic.** Every encrypted envelope binds a channel/session ID, direction, monotonic sequence, message class, and protocol version as authenticated data. Duplicate or stale sequences are rejected before dispatch.
 8. **Host-derived authorization.** The relay and device do not submit effective scopes. Hostd resolves the authenticated device against durable, unrevoked grants and current host capabilities.
-9. **Identity-bound mutations.** The authenticated device must match the command or handoff `deviceId`; `expectedHostId` and execution generation are checked before admission.
-10. **Durable idempotency.** Reconnect reconciles `(deviceId, commandId)` before any resend. A relay retry cannot produce a second mutation.
+9. **Identity-bound mutations.** The authenticated device must match the command or handoff `deviceId`; every existing-thread mutation names an exact expected host, thread, and execution generation before admission. Thread creation is a distinct host-authoritative operation, never an omitted-generation fallback.
+10. **Durable idempotency.** Reconnect reconciles the complete immutable command envelope—stable issue time, authority, kind, payload, and `(deviceId, commandId)`—before any resend. The host returns a receipt only after matching its private durable envelope identity; a relay retry cannot substitute content or produce a second mutation.
 11. **Immediate revocation boundary.** Successful revocation is durable before acknowledgment, increments the device grant epoch, closes its live channels, and blocks subsequent authorization.
 12. **Crash-safe authority.** Restart cannot resurrect a redeemed ticket, revoked device, superseded grant, or old channel. Phase 3A cancels every pending or reserved ticket on startup; ephemeral PSKs and channel keys are not restored from disk.
 13. **Opaque relay payloads.** Relay-visible records contain only the routing and delivery fields required for bounded forwarding; all application content and authorization claims are encrypted and authenticated.
@@ -274,7 +274,7 @@ For every request, hostd either reads the durable device grant or validates a ca
 - the session or grant epoch is stale;
 - the required scope is absent;
 - the request's device identity differs from the principal;
-- the expected host or execution generation differs from authority;
+- an existing-thread mutation omits its expected host/thread/execution generation, or any of them differs from authority;
 - the protocol capability is absent; or
 - the request exceeds resource or semantic bounds.
 
@@ -391,7 +391,7 @@ Each control needs executable evidence. Unit tests alone do not prove transport 
 | `REL-NET-01` | Outbound-only self-hosted relay | Network integration test works with no inbound host port and fails if a connector attempts LAN/public hostd exposure. |
 | `REL-RST-01` | Crash-safe security state | Fault injection at every ticket/grant/revoke persistence boundary recovers without double grant or resurrection. |
 | `REL-DOS-01` | Bounded resource use | Stress/fuzz tests enforce connection, handshake, frame, queue, journal, snapshot, and artifact limits. |
-| `REL-CMD-01` | Mutation idempotency | Disconnect at every send/admission/receipt boundary cannot duplicate `(deviceId, commandId)`. |
+| `REL-CMD-01` | Mutation idempotency | Disconnect at every send/admission/receipt boundary cannot duplicate or substitute the complete envelope bound to `(deviceId, commandId)`. |
 | `REL-NOTIFY-01` | Encrypted minimal notification | Relay capture contains no title, prompt, repo, host, path, approval text, or artifact name; duplicate delivery deep-links once. |
 | `REL-COMPAT-01` | Capability honesty | Unsupported feature requests are denied and corresponding UI/control/capability remains absent. |
 

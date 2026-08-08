@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ const faultPoints: AdmissionFaultPoint[] = [
   "after_prepare",
   "after_snapshot",
   "after_threads",
+  "after_command_identity",
   "after_receipt",
   "after_journal",
   "after_event",
@@ -35,6 +36,7 @@ describe("command admission crash recovery", () => {
       },
     });
     await crashing.initialize();
+    command.expectedHostId = (await crashing.getHost()).hostId;
 
     await expect(crashing.admitCommand(command, false)).rejects.toThrow(`simulated crash at ${faultPoint}`);
     const transaction = await readOnlyPendingTransaction(crashing);
@@ -144,6 +146,47 @@ describe("command admission crash recovery", () => {
     );
     expect(commandEvents).toEqual([]);
     expect(await readdir(recoveredStore.paths.transactions)).toEqual([]);
+  });
+
+  it("rejects a prepared v2 transaction copied from another host authority", async () => {
+    const directory = await createSeededDirectory();
+    const command: CommandEnvelope = {
+      ...promptCommand("foreign-host-v2"),
+      command: { kind: "abort", reason: "exercise host-bound recovery" },
+    };
+    let injected = false;
+    const crashing = new HostStore(directory, {
+      admissionFaultInjector(point) {
+        if (!injected && point === "after_prepare") {
+          injected = true;
+          throw new Error("simulated crash after foreign-host preparation");
+        }
+      },
+    });
+    await crashing.initialize();
+    command.expectedHostId = (await crashing.getHost()).hostId;
+    await expect(crashing.admitCommand(command, true)).rejects.toThrow(
+      "simulated crash after foreign-host preparation",
+    );
+
+    const names = (await readdir(crashing.paths.transactions)).filter((name) => name.endsWith(".json"));
+    expect(names).toHaveLength(1);
+    const name = names[0];
+    if (!name) throw new Error("pending admission transaction missing");
+    const transactionPath = join(crashing.paths.transactions, name);
+    const transaction = JSON.parse(await readFile(transactionPath, "utf8")) as Record<string, any>;
+    transaction.command.expectedHostId = "foreign-host";
+    transaction.commandIdentity.command.expectedHostId = "foreign-host";
+    transaction.journalRecords[0].envelope.expectedHostId = "foreign-host";
+    await writeFile(transactionPath, JSON.stringify(transaction), "utf8");
+
+    const recovered = new HostStore(directory);
+    await expect(recovered.initialize()).rejects.toMatchObject({
+      code: "INVALID_ADMISSION_TRANSACTION",
+    });
+    expect(await readdir(recovered.paths.receipts)).toEqual([]);
+    expect(await readdir(join(directory, "command-identities"))).toEqual([]);
+    expect(await readdir(recovered.paths.transactions)).toEqual([name]);
   });
 });
 

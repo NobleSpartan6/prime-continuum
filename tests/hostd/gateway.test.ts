@@ -316,6 +316,17 @@ describe("PrimeAgentRpcGateway strict JSONL", () => {
 });
 
 describe("PrimeAgentRpcGateway bounds and receipts", () => {
+  it("rejects a command for any execution generation other than its bound generation", async () => {
+    const harness = createHarness();
+    await expect(
+      harness.gateway.submit({
+        ...command("wrong-generation", { kind: "abort" }),
+        expectedExecutionGenerationId: "generation-stale",
+      }),
+    ).rejects.toMatchObject({ code: "GATEWAY_GENERATION_MISMATCH" });
+    expect(harness.processes).toEqual([]);
+  });
+
   it("maps successful and rejected acknowledgements to truthful admission outcomes", async () => {
     const harness = createHarness();
     await harness.gateway.isLive("thread-1", "generation-1");

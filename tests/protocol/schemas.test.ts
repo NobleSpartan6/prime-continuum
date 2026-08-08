@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CommandEnvelopeSchema,
+  CommandReconciliationSchema,
   HealthSnapshotSchema,
   HostIpcRequestSchema,
   HostIpcSnapshotTransferEnvelopeSchema,
@@ -102,12 +103,43 @@ describe("host protocol schemas", () => {
       expectedHostId: "host-1",
       threadId: "thread-1",
       issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "execution-1",
     } as const;
     expect(CommandEnvelopeSchema.safeParse({ ...base, command: { kind: "prompt", text: "hello" } }).success).toBe(true);
     expect(
       CommandEnvelopeSchema.safeParse({ ...base, command: { kind: "prompt", text: "x".repeat(65_537) } }).success,
     ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        ...base,
+        command: { kind: "prompt", text: "hello", hiddenMutation: true },
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandEnvelopeSchema.safeParse({ ...base, hiddenMutation: true, command: { kind: "abort" } }).success,
+    ).toBe(false);
     expect(CommandEnvelopeSchema.safeParse({ ...base, protocolVersion: 2, command: { kind: "abort" } }).success).toBe(false);
+  });
+
+  it.each([
+    { kind: "prompt", text: "hello" },
+    { kind: "steer", text: "redirect" },
+    { kind: "follow_up", text: "next" },
+    { kind: "abort" },
+    { kind: "approval.resolve", approvalId: "approval-1", decision: "approve" },
+    { kind: "model.select", providerId: "openai", modelId: "gpt-5.6-sol" },
+  ] as const)("requires an execution generation for $kind", (command) => {
+    expect(
+      CommandEnvelopeSchema.safeParse({
+        protocolVersion: PROTOCOL_VERSION,
+        deviceId: "device-1",
+        commandId: `command-${command.kind}`,
+        expectedHostId: "host-1",
+        threadId: "thread-1",
+        issuedAt: "2026-08-07T12:00:00.000Z",
+        command,
+      }).success,
+    ).toBe(false);
   });
 
   it("bounds model selection and requires an exact execution generation", () => {
@@ -164,13 +196,39 @@ describe("host protocol schemas", () => {
   });
 
   it("exposes one discriminated IPC request surface", () => {
+    const command = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: "device-1",
+      commandId: "command-1",
+      expectedHostId: "host-1",
+      threadId: "thread-1",
+      issuedAt: "2026-08-07T12:00:00.000Z",
+      expectedExecutionGenerationId: "execution-1",
+      command: { kind: "abort" as const },
+    };
     const request = HostIpcRequestSchema.parse({
       protocolVersion: PROTOCOL_VERSION,
       requestId: "request-1",
       method: "command.reconcile",
-      payload: { expectedHostId: "host-1", commands: [{ deviceId: "device-1", commandId: "command-1" }] },
+      payload: { expectedHostId: "host-1", commands: [command] },
     });
     expect(request.method).toBe("command.reconcile");
+    expect(
+      HostIpcRequestSchema.safeParse({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "empty-reconcile",
+        method: "command.reconcile",
+        payload: { expectedHostId: "host-1", commands: [] },
+      }).success,
+    ).toBe(false);
+    expect(
+      HostIpcRequestSchema.safeParse({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oversized-reconcile",
+        method: "command.reconcile",
+        payload: { expectedHostId: "host-1", commands: [command, { ...command, commandId: "command-2" }] },
+      }).success,
+    ).toBe(false);
     expect(
       HostIpcRequestSchema.safeParse({
         protocolVersion: PROTOCOL_VERSION,
@@ -180,6 +238,34 @@ describe("host protocol schemas", () => {
           expectedHostId: "host-1",
           commands: Array.from({ length: 257 }, (_, index) => ({ deviceId: "device-1", commandId: `c-${index}` })),
         },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires exactly one reconciliation outcome", () => {
+    const receipt = {
+      protocolVersion: PROTOCOL_VERSION,
+      receiptId: "receipt-1",
+      deviceId: "device-1",
+      commandId: "command-1",
+      threadId: "thread-1",
+      status: "rejected" as const,
+      receivedAt: "2026-08-07T12:00:00.000Z",
+      updatedAt: "2026-08-07T12:00:00.000Z",
+      executionGenerationId: "execution-1",
+    };
+    expect(CommandReconciliationSchema.safeParse({ receipts: [receipt], unknown: [] }).success).toBe(true);
+    expect(
+      CommandReconciliationSchema.safeParse({
+        receipts: [],
+        unknown: [{ deviceId: "device-1", commandId: "command-1" }],
+      }).success,
+    ).toBe(true);
+    expect(CommandReconciliationSchema.safeParse({ receipts: [], unknown: [] }).success).toBe(false);
+    expect(
+      CommandReconciliationSchema.safeParse({
+        receipts: [receipt],
+        unknown: [{ deviceId: "device-1", commandId: "command-1" }],
       }).success,
     ).toBe(false);
   });

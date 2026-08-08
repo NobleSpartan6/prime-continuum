@@ -817,6 +817,21 @@ function records(value: unknown): UnknownRecord[] {
   return Array.isArray(value) ? value.map(asRecord).filter((item): item is UnknownRecord => Boolean(item)) : []
 }
 
+function canonicalRendererJson(value: unknown): string {
+  const normalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(normalize)
+    const record = asRecord(candidate)
+    if (!record) return candidate
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .filter((key) => record[key] !== undefined)
+        .map((key) => [key, normalize(record[key])]),
+    )
+  }
+  return JSON.stringify(normalize(value))
+}
+
 function displayTime(value: unknown): string {
   const dateValue = asString(value)
   if (!dateValue || !Number.isFinite(Date.parse(dateValue))) return ''
@@ -992,14 +1007,17 @@ interface NativeProjectionInput {
   threadSnapshot?: unknown
   connection?: unknown
   outbox?: unknown
+  quarantinedOutboxCount?: unknown
   updatedAt?: unknown
   selectedThreadId?: string
+  deviceId?: string
 }
 
 interface NativeProjectionCacheEntry {
   hostId: string
   catalog?: unknown
   lastSnapshot?: unknown
+  retiredExecutionGenerations?: Record<string, string[]>
   updatedAt?: string
 }
 
@@ -1021,8 +1039,81 @@ function snapshotThreadId(value: unknown): string | undefined {
   return asString(asRecord(asRecord(value)?.thread)?.threadId)
 }
 
+function snapshotExecutionGenerationId(value: unknown): string | undefined {
+  const snapshot = asRecord(value)
+  const locationGenerationId = asString(
+    asRecord(asRecord(snapshot?.thread)?.currentLocation)?.executionGenerationId,
+  )
+  const cursorGenerationId = asString(asRecord(snapshot?.latestCursor)?.executionGenerationId)
+  return locationGenerationId && locationGenerationId === cursorGenerationId
+    ? locationGenerationId
+    : undefined
+}
+
 function protocolThreadId(thread: ThreadSummary): string {
   return thread.remoteId ?? thread.id
+}
+
+function catalogGenerationLineages(
+  value: unknown,
+  hostId: string,
+): Map<string, { generationId: string | undefined; updatedAt: number }> {
+  const catalog = asRecord(value)
+  return new Map(
+    records(catalog?.threads)
+      .map((thread) => {
+        const location = asRecord(thread.currentLocation)
+        if (asString(location?.hostId) !== hostId) return undefined
+        const threadId = asString(thread.threadId)
+        if (!threadId) return undefined
+        return [threadId, {
+          generationId: asString(location?.executionGenerationId),
+          updatedAt: Date.parse(asString(thread.updatedAt) ?? ''),
+        }] as const
+      })
+      .filter((entry): entry is readonly [string, { generationId: string | undefined; updatedAt: number }] => Boolean(entry)),
+  )
+}
+
+function catalogRegressesForHost(previous: unknown, incoming: unknown, hostId: string): boolean {
+  const previousCatalog = asRecord(previous)
+  const incomingCatalog = asRecord(incoming)
+  const previousGeneratedAt = Date.parse(asString(previousCatalog?.generatedAt) ?? '')
+  const incomingGeneratedAt = Date.parse(asString(incomingCatalog?.generatedAt) ?? '')
+  if (
+    Number.isFinite(previousGeneratedAt) &&
+    Number.isFinite(incomingGeneratedAt) &&
+    incomingGeneratedAt < previousGeneratedAt
+  ) return true
+
+  const previousLineages = catalogGenerationLineages(previousCatalog, hostId)
+  const incomingLineages = catalogGenerationLineages(incomingCatalog, hostId)
+  for (const [threadId, previousLineage] of previousLineages) {
+    const incomingLineage = incomingLineages.get(threadId)
+    if (!incomingLineage) continue
+    if (
+      Number.isFinite(previousLineage.updatedAt) &&
+      Number.isFinite(incomingLineage.updatedAt) &&
+      incomingLineage.updatedAt < previousLineage.updatedAt
+    ) return true
+    if (
+      incomingLineage.updatedAt === previousLineage.updatedAt &&
+      previousLineage.generationId &&
+      incomingLineage.generationId !== previousLineage.generationId
+    ) return true
+  }
+  return false
+}
+
+function snapshotRegresses(previous: unknown, incoming: unknown): boolean {
+  if (
+    snapshotThreadId(previous) !== snapshotThreadId(incoming) ||
+    snapshotHostId(previous) !== snapshotHostId(incoming) ||
+    snapshotExecutionGenerationId(previous) !== snapshotExecutionGenerationId(incoming)
+  ) return false
+  const previousSequence = asNumber(asRecord(asRecord(previous)?.latestCursor)?.sequence)
+  const incomingSequence = asNumber(asRecord(asRecord(incoming)?.latestCursor)?.sequence)
+  return previousSequence !== undefined && incomingSequence !== undefined && incomingSequence < previousSequence
 }
 
 function projectionEntriesFromCache(cache: unknown): Record<string, NativeProjectionCacheEntry> {
@@ -1042,6 +1133,9 @@ function projectionEntriesFromCache(cache: unknown): Record<string, NativeProjec
         hostId,
         ...(catalogMatches ? { catalog } : {}),
         ...(snapshotMatches ? { lastSnapshot: snapshot } : {}),
+        ...(asRecord(candidate.retiredExecutionGenerations)
+          ? { retiredExecutionGenerations: normalizedRetiredGenerations(candidate.retiredExecutionGenerations) }
+          : {}),
         ...(asString(candidate.updatedAt) ? { updatedAt: asString(candidate.updatedAt) } : {}),
       }
     }
@@ -1066,6 +1160,21 @@ function projectionEntriesFromCache(cache: unknown): Record<string, NativeProjec
     }
   }
   return entries
+}
+
+function normalizedRetiredGenerations(value: unknown): Record<string, string[]> {
+  const raw = asRecord(value)
+  if (!raw) return {}
+  const normalized: Record<string, string[]> = {}
+  for (const [threadId, generations] of Object.entries(raw).slice(0, 10_000)) {
+    if (!threadId || threadId.length > 128 || !Array.isArray(generations)) continue
+    const bounded = [...new Set(generations.filter(
+      (generation): generation is string =>
+        typeof generation === 'string' && generation.length > 0 && generation.length <= 128,
+    ))].slice(-64)
+    if (bounded.length > 0) normalized[threadId] = bounded
+  }
+  return normalized
 }
 
 function aggregateProjectionCatalog(
@@ -1136,6 +1245,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const updatedAt = asString(input.updatedAt)
   const snapshotThread = asRecord(threadSnapshot?.thread)
   const snapshotLocation = asRecord(snapshotThread?.currentLocation)
+  const snapshotLocationGenerationId = asString(snapshotLocation?.executionGenerationId)
+  const snapshotCursorGenerationId = asString(asRecord(threadSnapshot?.latestCursor)?.executionGenerationId)
+  const snapshotExecutionGenerationId =
+    snapshotLocationGenerationId && snapshotLocationGenerationId === snapshotCursorGenerationId
+      ? snapshotLocationGenerationId
+      : undefined
 
   const rawHosts = records(catalog?.hosts)
   const singleHost = asRecord(catalog?.host)
@@ -1237,7 +1352,15 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     const threadHostId = asString(location?.hostId) ?? hosts[0]?.id ?? ''
     const duplicateId = (threadIdCounts.get(threadId) ?? 0) > 1
     const rendererId = duplicateId ? `host:${threadHostId.length}:${threadHostId}:${threadId}` : threadId
-    const isMaterialized = threadId === snapshotThreadId && threadHostId === materializedHostId
+    const threadExecutionGenerationId = asString(location?.executionGenerationId)
+    const isMaterialized =
+      threadId === snapshotThreadId &&
+      threadHostId === materializedHostId &&
+      Boolean(
+        threadExecutionGenerationId &&
+        snapshotExecutionGenerationId &&
+        threadExecutionGenerationId === snapshotExecutionGenerationId
+      )
     return {
       id: rendererId,
       ...(duplicateId ? { remoteId: threadId } : {}),
@@ -1248,7 +1371,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       status: taskFromNative(thread.status),
       updatedAt: displayTime(thread.updatedAt) || 'Updated',
       unread: asBoolean(thread.unread) ?? false,
-      executionGenerationId: asString(location?.executionGenerationId),
+      executionGenerationId: threadExecutionGenerationId,
       workspaceId: asString(location?.workspaceId),
       transcript: isMaterialized ? recentBlocks : [],
     }
@@ -1272,7 +1395,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     snapshotThreadId &&
     selectedThread &&
     protocolThreadId(selectedThread) === snapshotThreadId &&
-    selectedThread.hostId === materializedHostId,
+    selectedThread.hostId === materializedHostId &&
+    Boolean(
+      selectedThread.executionGenerationId &&
+      snapshotExecutionGenerationId &&
+      selectedThread.executionGenerationId === snapshotExecutionGenerationId
+    ),
   )
 
   const childAgents = selectedSnapshotIsMaterialized ? records(threadSnapshot?.childAgents) : []
@@ -1450,16 +1578,38 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         hostName,
       }]
     })
+  const quarantinedOutboxCount = asNumber(input.quarantinedOutboxCount) ?? 0
+  if (quarantinedOutboxCount > 0 && selectedThreadId) {
+    attention.push({
+      id: 'native-quarantined-outbox',
+      threadId: selectedThreadId,
+      kind: 'failed',
+      title: `${quarantinedOutboxCount} older or invalid ${quarantinedOutboxCount === 1 ? 'command is' : 'commands are'} held locally and won’t be sent automatically`,
+      hostName,
+    })
+  }
 
   const outbox = records(input.outbox)
   const pending = selectedThread
-    ? outbox.find((entry) => asString(asRecord(entry.command)?.threadId) === protocolThreadId(selectedThread))
-    : outbox[0]
+    ? selectedThread.executionGenerationId
+      ? outbox.find((entry) => {
+        const command = asRecord(entry.command)
+        return (
+          asString(entry.hostId) === selectedThread.hostId &&
+          asString(command?.deviceId) === input.deviceId &&
+          asString(command?.expectedHostId) === selectedThread.hostId &&
+          asString(command?.threadId) === protocolThreadId(selectedThread) &&
+          asString(command?.expectedExecutionGenerationId) === selectedThread.executionGenerationId &&
+          Boolean(asString(command?.issuedAt))
+        )
+      })
+      : undefined
+    : undefined
   const pendingState = asString(pending?.state)
   const composerReceipt: WorkbenchSnapshot['composerReceipt'] = pending
     ? {
         state: pendingState === 'uncertain' ? 'uncertain' : 'waiting_for_connection',
-        message: pendingState === 'uncertain' ? 'Receipt uncertain · reconciling by command ID' : 'Waiting for connection',
+        message: pendingState === 'uncertain' ? 'Receipt uncertain · verifying with host' : 'Waiting for connection',
       }
     : { state: 'idle', message: hosts.find((host) => host.id === selectedThread?.hostId)?.connection === 'online' ? 'Ready to send' : 'Waiting for connection' }
 
@@ -1475,7 +1625,10 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     evidence,
     runtime,
     operations: {
-      submitCommands: selectedHostHasAuthority && advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY),
+      submitCommands:
+        selectedHostHasAuthority &&
+        selectedSnapshotIsMaterialized &&
+        advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY),
       crossHostHandoff:
         selectedHostHasAuthority &&
         activePhase === 'online' &&
@@ -1516,7 +1669,7 @@ function nativeComposerReceipt(raw: UnknownRecord): { state: ComposerReceiptStat
     return { state: 'waiting_for_connection', message: detail ?? 'Waiting for connection · saved in this device’s outbox', terminal: false }
   }
   if (status === 'uncertain') {
-    return { state: 'uncertain', message: detail ?? 'Receipt uncertain · reconciling by command ID', terminal: false }
+    return { state: 'uncertain', message: detail ?? 'Receipt uncertain · verifying with host', terminal: false }
   }
   if (status === 'received') return { state: 'sending', message: detail ?? 'Received by host · awaiting durable admission', terminal: false }
   if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
@@ -1533,6 +1686,7 @@ export class NativeRendererApi implements RendererApi {
   private threadSnapshot?: unknown
   private connection?: unknown
   private outbox?: unknown
+  private quarantinedOutboxCount = 0
   private cacheUpdatedAt?: unknown
   private projection?: WorkbenchSnapshot
   private activeProgress?: (phase: HandoffPhase, message: string) => void
@@ -1541,7 +1695,12 @@ export class NativeRendererApi implements RendererApi {
   private readonly handoffDestinations = new Map<string, string>()
   private readonly handoffSources = new Map<string, string>()
   private readonly composerCommands = new Map<string, string>()
+  private readonly composerDevices = new Map<string, string>()
   private readonly composerHosts = new Map<string, string>()
+  private readonly composerGenerations = new Map<string, string>()
+  private readonly composerFingerprints = new Map<string, string>()
+  private readonly composerIdentityConflicts = new Set<string>()
+  private readonly retiredExecutionGenerations = new Map<string, Set<string>>()
   private readonly listeners = new Set<(snapshot: WorkbenchSnapshot) => void>()
   private nativeSubscriptionsStarted = false
   private nativeUnsubscribers: Array<() => void> = []
@@ -1550,9 +1709,16 @@ export class NativeRendererApi implements RendererApi {
   private selectedThreadId?: string
   private threadSelectionGeneration = 0
   private connectionGeneration = 0
+  private projectionRevision = 0
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
-  private composerOverride?: { threadId: string; state: ComposerReceiptState; message: string }
+  private composerOverride?: {
+    threadId: string
+    expectedHostId: string
+    expectedExecutionGenerationId: string
+    state: ComposerReceiptState
+    message: string
+  }
 
   constructor(private readonly bridge: NativePrimeBridge) {}
 
@@ -1571,10 +1737,18 @@ export class NativeRendererApi implements RendererApi {
       threadSnapshot: this.threadSnapshot,
       connection: this.connection,
       outbox: this.outbox,
+      quarantinedOutboxCount: this.quarantinedOutboxCount,
       updatedAt: this.cacheUpdatedAt,
       selectedThreadId: this.selectedThreadId,
+      deviceId: this.deviceId,
     })
-    if (this.composerOverride && this.projection.selectedThreadId === this.composerOverride.threadId) {
+    const selectedThread = this.projection.threads.find((thread) => thread.id === this.projection?.selectedThreadId)
+    if (
+      this.composerOverride &&
+      selectedThread?.id === this.composerOverride.threadId &&
+      selectedThread.hostId === this.composerOverride.expectedHostId &&
+      selectedThread.executionGenerationId === this.composerOverride.expectedExecutionGenerationId
+    ) {
       this.projection = {
         ...this.projection,
         composerReceipt: { state: this.composerOverride.state, message: this.composerOverride.message },
@@ -1613,8 +1787,30 @@ export class NativeRendererApi implements RendererApi {
     this.catalog = aggregateProjectionCatalog(this.projectionEntries, activeHostId)
   }
 
-  private replaceCatalogEntry(hostId: string, catalog: unknown, updatedAt?: string): void {
+  private replaceCatalogEntry(hostId: string, catalog: unknown, updatedAt?: string): boolean {
     const previous = this.projectionEntries[hostId]
+    const incomingLineages = catalogGenerationLineages(catalog, hostId)
+    for (const [threadId, lineage] of incomingLineages) {
+      if (
+        lineage.generationId &&
+        this.retiredExecutionGenerations.get(`${hostId}\u0000${threadId}`)?.has(lineage.generationId)
+      ) return false
+    }
+    if (catalogRegressesForHost(previous?.catalog, catalog, hostId)) return false
+    const previousLineages = catalogGenerationLineages(previous?.catalog, hostId)
+    for (const [threadId, previousLineage] of previousLineages) {
+      if (incomingLineages.has(threadId) || !previousLineage.generationId) continue
+      if (!this.retireRendererExecutionGeneration(hostId, threadId, previousLineage.generationId)) return false
+    }
+    for (const [threadId, lineage] of incomingLineages) {
+      const previousGenerationId = previousLineages.get(threadId)?.generationId
+      if (
+        !previousGenerationId ||
+        !lineage.generationId ||
+        previousGenerationId === lineage.generationId
+      ) continue
+      if (!this.retireRendererExecutionGeneration(hostId, threadId, previousGenerationId)) return false
+    }
     this.projectionEntries = {
       ...this.projectionEntries,
       [hostId]: {
@@ -1625,10 +1821,27 @@ export class NativeRendererApi implements RendererApi {
       },
     }
     this.rebuildCatalog()
+    this.projectionRevision += 1
+    return true
   }
 
-  private replaceSnapshotEntry(hostId: string, snapshot: unknown, updatedAt?: string): void {
+  private replaceSnapshotEntry(hostId: string, snapshot: unknown, updatedAt?: string): boolean {
     const previous = this.projectionEntries[hostId]
+    const threadId = snapshotThreadId(snapshot)
+    const incomingGenerationId = snapshotExecutionGenerationId(snapshot)
+    if (!threadId || !incomingGenerationId || snapshotHostId(snapshot) !== hostId) return false
+    const catalogLineage = catalogGenerationLineages(previous?.catalog, hostId).get(threadId)
+    if (catalogLineage?.generationId !== incomingGenerationId) return false
+    if (this.retiredExecutionGenerations.get(`${hostId}\u0000${threadId}`)?.has(incomingGenerationId)) return false
+    if (snapshotRegresses(previous?.lastSnapshot, snapshot)) return false
+    const previousGenerationId = snapshotExecutionGenerationId(previous?.lastSnapshot)
+    if (
+      snapshotThreadId(previous?.lastSnapshot) === threadId &&
+      previousGenerationId &&
+      previousGenerationId !== incomingGenerationId
+    ) {
+      if (!this.retireRendererExecutionGeneration(hostId, threadId, previousGenerationId)) return false
+    }
     this.projectionEntries = {
       ...this.projectionEntries,
       [hostId]: {
@@ -1638,11 +1851,47 @@ export class NativeRendererApi implements RendererApi {
         updatedAt: updatedAt ?? new Date().toISOString(),
       },
     }
+    this.projectionRevision += 1
+    return true
   }
 
-  private cachedSnapshotForThread(threadId: string, hostId: string): unknown {
+  private retireRendererExecutionGeneration(hostId: string, threadId: string, generationId: string): boolean {
+    const key = `${hostId}\u0000${threadId}`
+    let retired = this.retiredExecutionGenerations.get(key)
+    if (!retired) {
+      if (this.retiredExecutionGenerations.size >= 512) {
+        return false
+      }
+      retired = new Set<string>()
+      this.retiredExecutionGenerations.set(key, retired)
+    }
+    if (retired.has(generationId)) return true
+    if (retired.size >= 64) return false
+    retired.add(generationId)
+    return true
+  }
+
+  private hydrateRetiredExecutionGenerations(): void {
+    this.retiredExecutionGenerations.clear()
+    for (const [hostId, entry] of Object.entries(this.projectionEntries)) {
+      for (const [threadId, generations] of Object.entries(entry.retiredExecutionGenerations ?? {})) {
+        for (const generationId of generations) {
+          if (!this.retireRendererExecutionGeneration(hostId, threadId, generationId)) {
+            throw new StaleHostAuthorityError()
+          }
+        }
+      }
+    }
+  }
+
+  private cachedSnapshotForThread(threadId: string, hostId: string, executionGenerationId?: string): unknown {
     const snapshot = this.projectionEntries[hostId]?.lastSnapshot
-    return snapshotThreadId(snapshot) === threadId && snapshotHostId(snapshot) === hostId
+    return (
+      executionGenerationId &&
+      snapshotThreadId(snapshot) === threadId &&
+      snapshotHostId(snapshot) === hostId &&
+      snapshotExecutionGenerationId(snapshot) === executionGenerationId
+    )
       ? snapshot
       : undefined
   }
@@ -1651,7 +1900,11 @@ export class NativeRendererApi implements RendererApi {
     this.outbox = []
     this.composerOverride = undefined
     this.composerCommands.clear()
+    this.composerDevices.clear()
     this.composerHosts.clear()
+    this.composerGenerations.clear()
+    this.composerFingerprints.clear()
+    this.composerIdentityConflicts.clear()
     this.handoffDestinations.clear()
     this.handoffSources.clear()
     this.activeProgress = undefined
@@ -1670,7 +1923,10 @@ export class NativeRendererApi implements RendererApi {
     if (targetChanged || authorityChanged) this.clearAuthorityMutationState()
     const connectionChanged = this.connectionKey(this.connection) !== this.connectionKey(state)
     this.connection = state
-    if (connectionChanged) this.connectionGeneration += 1
+    if (connectionChanged) {
+      this.connectionGeneration += 1
+      this.projectionRevision += 1
+    }
     if (authorityChanged && verifiedHostId) {
       const cached = this.projectionEntries[verifiedHostId]?.lastSnapshot
       this.threadSnapshot = cached
@@ -1694,25 +1950,70 @@ export class NativeRendererApi implements RendererApi {
 
   private hydrateComposerCommands(outbox: unknown): void {
     this.composerCommands.clear()
+    this.composerDevices.clear()
+    this.composerHosts.clear()
+    this.composerGenerations.clear()
+    this.composerFingerprints.clear()
+    this.composerIdentityConflicts.clear()
     for (const entry of records(outbox)) {
       const command = asRecord(entry.command)
       const commandId = asString(command?.commandId)
+      const deviceId = asString(command?.deviceId)
       const threadId = asString(command?.threadId)
-      const hostId = asString(command?.expectedHostId) ?? asString(entry.hostId)
-      if (commandId && threadId) {
+      const hostId = asString(command?.expectedHostId)
+      const entryHostId = asString(entry.hostId)
+      const generationId = asString(command?.expectedExecutionGenerationId)
+      const issuedAt = asString(command?.issuedAt)
+      if (
+        commandId &&
+        deviceId === this.deviceId &&
+        threadId &&
+        hostId &&
+        hostId === entryHostId &&
+        generationId &&
+        issuedAt
+      ) {
+        const fingerprint = canonicalRendererJson(command)
+        const previousFingerprint = this.composerFingerprints.get(commandId)
+        if (this.composerIdentityConflicts.has(commandId)) continue
+        if (previousFingerprint && previousFingerprint !== fingerprint) {
+          this.forgetComposerCommand(commandId)
+          this.composerIdentityConflicts.add(commandId)
+          continue
+        }
         this.composerCommands.set(commandId, threadId)
-        if (hostId) this.composerHosts.set(commandId, hostId)
+        this.composerDevices.set(commandId, deviceId)
+        this.composerHosts.set(commandId, hostId)
+        this.composerGenerations.set(commandId, generationId)
+        this.composerFingerprints.set(commandId, fingerprint)
       }
     }
   }
 
   private updateOutboxFromReceipt(
     commandId: string,
+    deviceId: string,
+    expectedHostId: string,
+    threadId: string,
+    expectedExecutionGenerationId: string,
+    expectedCommandFingerprint: string,
     receipt: { state: ComposerReceiptState; terminal: boolean },
   ): void {
     const entries = records(this.outbox)
+    const matches = (entry: UnknownRecord): boolean => {
+      const command = asRecord(entry.command)
+      return (
+        asString(entry.hostId) === expectedHostId &&
+        asString(command?.deviceId) === deviceId &&
+        asString(command?.commandId) === commandId &&
+        asString(command?.expectedHostId) === expectedHostId &&
+        asString(command?.threadId) === threadId &&
+        asString(command?.expectedExecutionGenerationId) === expectedExecutionGenerationId &&
+        canonicalRendererJson(command) === expectedCommandFingerprint
+      )
+    }
     if (receipt.terminal) {
-      this.outbox = entries.filter((entry) => asString(asRecord(entry.command)?.commandId) !== commandId)
+      this.outbox = entries.filter((entry) => !matches(entry))
       return
     }
 
@@ -1724,8 +2025,16 @@ export class NativeRendererApi implements RendererApi {
           : undefined
     if (!nextState) return
     this.outbox = entries.map((entry) =>
-      asString(asRecord(entry.command)?.commandId) === commandId ? { ...entry, state: nextState } : entry,
+      matches(entry) ? { ...entry, state: nextState } : entry,
     )
+  }
+
+  private forgetComposerCommand(commandId: string): void {
+    this.composerCommands.delete(commandId)
+    this.composerDevices.delete(commandId)
+    this.composerHosts.delete(commandId)
+    this.composerGenerations.delete(commandId)
+    this.composerFingerprints.delete(commandId)
   }
 
   private startNativeSubscriptions(): void {
@@ -1749,22 +2058,23 @@ export class NativeRendererApi implements RendererApi {
       if (!activeHostId || incomingHostId !== activeHostId) return
       if (value && incomingCatalogHostIds.length > 0) {
         if (!incomingCatalogHostIds.includes(activeHostId)) return
-        this.replaceCatalogEntry(activeHostId, snapshot)
+        if (!this.replaceCatalogEntry(activeHostId, snapshot)) return
       } else {
         const incomingThreadId = asString(asRecord(value?.thread)?.threadId)
         const selectedThread = this.projection?.threads.find((thread) => thread.id === this.selectedThreadId)
+        const incomingExecutionGenerationId = snapshotExecutionGenerationId(snapshot)
+        const projectedThread = this.projection?.threads.find(
+          (thread) => thread.hostId === activeHostId && protocolThreadId(thread) === incomingThreadId,
+        )
         if (
-          incomingThreadId &&
-          selectedThread &&
-          (selectedThread.hostId !== activeHostId || protocolThreadId(selectedThread) !== incomingThreadId)
+          !incomingThreadId ||
+          !projectedThread?.executionGenerationId ||
+          incomingExecutionGenerationId !== projectedThread.executionGenerationId ||
+          (selectedThread && selectedThread.id !== projectedThread.id)
         ) return
-        this.replaceSnapshotEntry(activeHostId, snapshot)
+        if (!this.replaceSnapshotEntry(activeHostId, snapshot)) return
         this.threadSnapshot = snapshot
-        if (!this.selectedThreadId && incomingThreadId) {
-          this.selectedThreadId = this.updateProjection().threads.find(
-            (thread) => thread.hostId === activeHostId && protocolThreadId(thread) === incomingThreadId,
-          )?.id
-        }
+        if (!this.selectedThreadId) this.selectedThreadId = projectedThread.id
       }
       this.publish()
     })
@@ -1774,7 +2084,10 @@ export class NativeRendererApi implements RendererApi {
       const receipt = asRecord(hostEvent?.payload)
       const commandId = asString(receipt?.commandId)
       const storedThreadId = commandId ? this.composerCommands.get(commandId) : undefined
+      const expectedDeviceId = commandId ? this.composerDevices.get(commandId) : undefined
       const expectedHostId = commandId ? this.composerHosts.get(commandId) : undefined
+      const expectedGenerationId = commandId ? this.composerGenerations.get(commandId) : undefined
+      const expectedCommandFingerprint = commandId ? this.composerFingerprints.get(commandId) : undefined
       const threadId = storedThreadId
         ? this.projection?.threads.find(
             (thread) =>
@@ -1783,19 +2096,51 @@ export class NativeRendererApi implements RendererApi {
           )?.id ?? storedThreadId
         : undefined
       const receiptHostId = asString(receipt?.hostId)
+      const receiptDeviceId = asString(receipt?.deviceId)
+      const receiptThreadId = asString(receipt?.threadId)
+      const receiptGenerationId = asString(receipt?.executionGenerationId)
       const activeHostId = asString(asRecord(this.connection)?.hostId)
       if (
-        (receiptHostId && expectedHostId && receiptHostId !== expectedHostId) ||
-        (receiptHostId && activeHostId && receiptHostId !== activeHostId)
+        !expectedDeviceId ||
+        !expectedHostId ||
+        !expectedGenerationId ||
+        !expectedCommandFingerprint ||
+        receiptDeviceId !== expectedDeviceId ||
+        receiptThreadId !== storedThreadId ||
+        receiptGenerationId !== expectedGenerationId ||
+        receiptHostId !== expectedHostId ||
+        activeHostId !== expectedHostId
       ) return
-      if (!receipt || !commandId || !threadId) return
-      const mapped = nativeComposerReceipt(receipt)
-      this.composerOverride = { threadId, state: mapped.state, message: mapped.message }
-      this.updateOutboxFromReceipt(commandId, mapped)
-      if (mapped.terminal) {
-        this.composerCommands.delete(commandId)
-        this.composerHosts.delete(commandId)
+      if (!receipt || !commandId || !threadId || !storedThreadId) return
+      if (!this.hasComposerAuthority(threadId, expectedHostId, expectedGenerationId)) {
+        this.forgetComposerCommand(commandId)
+        if (
+          this.composerOverride?.expectedHostId === expectedHostId &&
+          this.composerOverride.expectedExecutionGenerationId === expectedGenerationId
+        ) this.composerOverride = undefined
+        return
       }
+      const mapped = nativeComposerReceipt(receipt)
+      this.composerOverride = {
+        threadId,
+        expectedHostId,
+        expectedExecutionGenerationId: expectedGenerationId,
+        state: mapped.state,
+        message: mapped.message,
+      }
+      this.updateOutboxFromReceipt(
+        commandId,
+        expectedDeviceId,
+        expectedHostId,
+        storedThreadId,
+        expectedGenerationId,
+        expectedCommandFingerprint,
+        mapped,
+      )
+      if (mapped.terminal) {
+        this.forgetComposerCommand(commandId)
+      }
+      this.projectionRevision += 1
       this.publish()
     })
     subscribe('onHandoffProgress', (progress) => {
@@ -1836,7 +2181,11 @@ export class NativeRendererApi implements RendererApi {
     const remoteThreadId = selectedThread ? protocolThreadId(selectedThread) : undefined
     if (selectedThread?.hostId !== authorityHostId) {
       this.threadSnapshot = remoteThreadId && selectedThread
-        ? this.cachedSnapshotForThread(remoteThreadId, selectedThread.hostId)
+        ? this.cachedSnapshotForThread(
+            remoteThreadId,
+            selectedThread.hostId,
+            selectedThread.executionGenerationId,
+          )
         : undefined
       this.publish()
       return
@@ -1856,8 +2205,17 @@ export class NativeRendererApi implements RendererApi {
     }
 
     const incomingThreadId = asString(asRecord(asRecord(snapshot)?.thread)?.threadId)
-    if (incomingThreadId !== remoteThreadId || snapshotHostId(snapshot) !== authorityHostId) return
-    this.replaceSnapshotEntry(authorityHostId, snapshot)
+    const currentSelectedThread = this.projection?.threads.find((thread) => thread.id === selectedThreadId)
+    if (
+      incomingThreadId !== remoteThreadId ||
+      snapshotHostId(snapshot) !== authorityHostId ||
+      !selectedThread.executionGenerationId ||
+      currentSelectedThread?.hostId !== authorityHostId ||
+      protocolThreadId(currentSelectedThread) !== remoteThreadId ||
+      currentSelectedThread.executionGenerationId !== selectedThread.executionGenerationId ||
+      snapshotExecutionGenerationId(snapshot) !== currentSelectedThread.executionGenerationId
+    ) return
+    if (!this.replaceSnapshotEntry(authorityHostId, snapshot)) return
     this.threadSnapshot = snapshot
     this.publish()
   }
@@ -1918,23 +2276,62 @@ export class NativeRendererApi implements RendererApi {
   }
 
   async loadWorkbench(): Promise<WorkbenchSnapshot> {
-    const loadConnectionGeneration = this.connectionGeneration
-    const bootstrap = asRecord(await this.call<unknown>('bootstrap'))
-    if (loadConnectionGeneration !== this.connectionGeneration) {
-      // A newer native connection event won the race. Never hydrate its state
-      // with a bootstrap payload captured for the previous authority.
+    let bootstrap: UnknownRecord | undefined
+    for (let retry = 0; retry < 16; retry += 1) {
+      const loadConnectionGeneration = this.connectionGeneration
+      const loadProjectionRevision = this.projectionRevision
+      const candidate = asRecord(await this.call<unknown>('bootstrap'))
+      if (
+        loadConnectionGeneration === this.connectionGeneration &&
+        loadProjectionRevision === this.projectionRevision
+      ) {
+        bootstrap = candidate
+        break
+      }
+    }
+    if (!bootstrap) {
+      throw new StaleHostAuthorityError()
+    }
+    const cache = asRecord(bootstrap?.cache)
+    const bootstrapConnection = asRecord(bootstrap?.connection)
+    const connectionHostId = asString(bootstrapConnection?.hostId)
+    const currentVerifiedHostId = asString(asRecord(this.connection)?.hostId)
+    if (currentVerifiedHostId && connectionHostId && currentVerifiedHostId !== connectionHostId) {
+      // A stable but older bootstrap can still describe the authority that was
+      // superseded while its first read was in flight. Its outbox and cache are
+      // scoped to that host and must not hydrate the newly verified authority.
       this.workbenchLoaded = true
       const currentProjection = this.updateProjection()
       queueMicrotask(() => void this.reconcileInBackground())
       return currentProjection
     }
-    const cache = asRecord(bootstrap?.cache)
-    const bootstrapConnection = asRecord(bootstrap?.connection)
-    const connectionHostId = asString(bootstrapConnection?.hostId)
-    this.projectionEntries = projectionEntriesFromCache(cache)
+    const bootstrapEntries = projectionEntriesFromCache(cache)
+    if (Object.keys(this.projectionEntries).length === 0) {
+      this.projectionEntries = bootstrapEntries
+      this.hydrateRetiredExecutionGenerations()
+    } else {
+      for (const [hostId, entry] of Object.entries(bootstrapEntries)) {
+        for (const [threadId, generations] of Object.entries(entry.retiredExecutionGenerations ?? {})) {
+          for (const generationId of generations) {
+            if (!this.retireRendererExecutionGeneration(hostId, threadId, generationId)) {
+              throw new StaleHostAuthorityError()
+            }
+          }
+        }
+        if (!this.projectionEntries[hostId]) {
+          this.projectionEntries = { ...this.projectionEntries, [hostId]: entry }
+          continue
+        }
+        if (entry.catalog !== undefined) this.replaceCatalogEntry(hostId, entry.catalog, entry.updatedAt)
+        if (entry.lastSnapshot !== undefined) this.replaceSnapshotEntry(hostId, entry.lastSnapshot, entry.updatedAt)
+      }
+    }
     const connectionChanged = this.connectionKey(this.connection) !== this.connectionKey(bootstrap?.connection)
     this.connection = bootstrap?.connection
-    if (connectionChanged) this.connectionGeneration += 1
+    if (connectionChanged) {
+      this.connectionGeneration += 1
+      this.projectionRevision += 1
+    }
     this.rebuildCatalog()
     const preferredSnapshot = connectionHostId
       ? this.projectionEntries[connectionHostId]?.lastSnapshot
@@ -1943,6 +2340,7 @@ export class NativeRendererApi implements RendererApi {
           ?.lastSnapshot
     this.threadSnapshot = preferredSnapshot
     this.outbox = bootstrap?.outbox
+    this.quarantinedOutboxCount = asNumber(bootstrap?.quarantinedOutboxCount) ?? 0
     this.hydrateComposerCommands(this.outbox)
     this.cacheUpdatedAt = connectionHostId
       ? this.projectionEntries[connectionHostId]?.updatedAt
@@ -1995,6 +2393,7 @@ export class NativeRendererApi implements RendererApi {
     const selectionConnectionGeneration = this.connectionGeneration
     const selectedThread = this.projection?.threads.find((thread) => thread.id === threadId)
     const expectedHostId = selectedThread?.hostId
+    const expectedExecutionGenerationId = selectedThread?.executionGenerationId
     const remoteThreadId = selectedThread ? protocolThreadId(selectedThread) : undefined
     const activeHostId = asString(asRecord(this.connection)?.hostId)
     this.selectedThreadId = threadId
@@ -2003,7 +2402,7 @@ export class NativeRendererApi implements RendererApi {
     // previous thread's evidence, agents, or attention while the new request
     // is in flight.
     this.threadSnapshot = expectedHostId && remoteThreadId
-      ? this.cachedSnapshotForThread(remoteThreadId, expectedHostId)
+      ? this.cachedSnapshotForThread(remoteThreadId, expectedHostId, expectedExecutionGenerationId)
       : undefined
     this.publish()
 
@@ -2011,6 +2410,7 @@ export class NativeRendererApi implements RendererApi {
     // read-only until that exact immutable host becomes the verified authority.
     if (
       !expectedHostId ||
+      !expectedExecutionGenerationId ||
       !remoteThreadId ||
       expectedHostId !== activeHostId ||
       asString(asRecord(this.connection)?.phase) !== 'online'
@@ -2026,11 +2426,22 @@ export class NativeRendererApi implements RendererApi {
         selectionConnectionGeneration !== this.connectionGeneration
       ) return
 
+      const currentSelectedThread = this.projection?.threads.find((thread) => thread.id === threadId)
+      if (
+        currentSelectedThread?.hostId !== expectedHostId ||
+        protocolThreadId(currentSelectedThread) !== remoteThreadId ||
+        currentSelectedThread.executionGenerationId !== expectedExecutionGenerationId
+      ) return
+
       const incomingThreadId = asString(asRecord(asRecord(snapshot)?.thread)?.threadId)
-      if (incomingThreadId !== remoteThreadId || snapshotHostId(snapshot) !== expectedHostId) {
+      if (
+        incomingThreadId !== remoteThreadId ||
+        snapshotHostId(snapshot) !== expectedHostId ||
+        snapshotExecutionGenerationId(snapshot) !== expectedExecutionGenerationId
+      ) {
         throw new Error('The host returned a snapshot for a different thread. Try again.')
       }
-      this.replaceSnapshotEntry(expectedHostId, snapshot)
+      if (!this.replaceSnapshotEntry(expectedHostId, snapshot)) return
       this.threadSnapshot = snapshot
       this.publish()
     } catch (error) {
@@ -2038,6 +2449,12 @@ export class NativeRendererApi implements RendererApi {
         selectionGeneration !== this.threadSelectionGeneration ||
         threadId !== this.selectedThreadId ||
         selectionConnectionGeneration !== this.connectionGeneration
+      ) return
+      const currentSelectedThread = this.projection?.threads.find((thread) => thread.id === threadId)
+      if (
+        currentSelectedThread?.hostId !== expectedHostId ||
+        protocolThreadId(currentSelectedThread) !== remoteThreadId ||
+        currentSelectedThread.executionGenerationId !== expectedExecutionGenerationId
       ) return
       this.selectedThreadId = previousThreadId
       this.threadSnapshot = previousSnapshot
@@ -2211,61 +2628,91 @@ export class NativeRendererApi implements RendererApi {
     const thread = this.projection?.threads.find((item) => item.id === request.threadId)
     if (!thread?.hostId) throw new Error('Refresh this thread before sending so its host identity can be verified.')
     const expectedHostId = thread.hostId
+    const expectedExecutionGenerationId = thread.executionGenerationId
+    if (!expectedExecutionGenerationId) {
+      throw new Error('Refresh this thread before sending so its exact execution generation can be verified.')
+    }
     const remoteThreadId = protocolThreadId(thread)
     if (asString(asRecord(this.connection)?.hostId) !== expectedHostId) {
       throw new StaleHostAuthorityError()
     }
+    const issuedAt = new Date().toISOString()
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId,
+      threadId: remoteThreadId,
+      kind: request.intent === 'steer' ? 'thread.steer' : 'thread.follow_up',
+      payload: { text: request.text },
+      delivery: request.sendWhenReconnected ? 'send_when_reconnected' : 'live_only',
+      expectedExecutionGenerationId,
+      issuedAt,
+    }
     this.composerCommands.set(commandId, remoteThreadId)
+    this.composerDevices.set(commandId, this.deviceId)
     this.composerHosts.set(commandId, expectedHostId)
+    this.composerGenerations.set(commandId, expectedExecutionGenerationId)
+    this.composerFingerprints.set(commandId, canonicalRendererJson(clientCommand))
     let receipt: UnknownRecord | undefined
     try {
-      receipt = asRecord(await this.call<unknown>('submitCommand', {
-        deviceId: this.deviceId,
-        commandId,
-        expectedHostId,
-        threadId: remoteThreadId,
-        kind: request.intent === 'steer' ? 'thread.steer' : 'thread.follow_up',
-        payload: { text: request.text },
-        delivery: request.sendWhenReconnected ? 'send_when_reconnected' : 'live_only',
-        ...(thread?.executionGenerationId ? { expectedExecutionGenerationId: thread.executionGenerationId } : {}),
-      }))
+      receipt = asRecord(await this.call<unknown>('submitCommand', clientCommand))
+      if (
+        asString(receipt?.deviceId) !== this.deviceId ||
+        asString(receipt?.commandId) !== commandId ||
+        asString(receipt?.hostId) !== expectedHostId ||
+        asString(receipt?.threadId) !== remoteThreadId ||
+        asString(receipt?.executionGenerationId) !== expectedExecutionGenerationId
+      ) {
+        throw new Error('The host returned a receipt for a different command generation. The original receipt remains uncertain.')
+      }
     } catch (error) {
       if (error instanceof StaleHostAuthorityError) throw error
-      if (!this.hasComposerAuthority(request.threadId, expectedHostId)) {
-        this.composerCommands.delete(commandId)
-        this.composerHosts.delete(commandId)
+      if (!this.hasComposerAuthority(request.threadId, expectedHostId, expectedExecutionGenerationId)) {
+        this.forgetComposerCommand(commandId)
         throw new StaleHostAuthorityError()
       }
       this.composerOverride = {
         threadId: request.threadId,
+        expectedHostId,
+        expectedExecutionGenerationId,
         state: 'uncertain',
-        message: error instanceof Error ? `${error.message} Reconciling by command ID.` : 'Receipt uncertain · reconciling by command ID',
+        message: error instanceof Error ? `${error.message} Verifying the exact envelope with the host.` : 'Receipt uncertain · verifying with host',
       }
       this.publish()
       throw error
     }
-    if (!this.hasComposerAuthority(request.threadId, expectedHostId)) {
-      this.composerCommands.delete(commandId)
-      this.composerHosts.delete(commandId)
+    if (!this.hasComposerAuthority(request.threadId, expectedHostId, expectedExecutionGenerationId)) {
+      this.forgetComposerCommand(commandId)
       throw new StaleHostAuthorityError()
     }
     const mapped = nativeComposerReceipt(receipt ?? {})
-    this.composerOverride = { threadId: request.threadId, state: mapped.state, message: mapped.message }
+    this.composerOverride = {
+      threadId: request.threadId,
+      expectedHostId,
+      expectedExecutionGenerationId,
+      state: mapped.state,
+      message: mapped.message,
+    }
     if (mapped.terminal) {
-      this.composerCommands.delete(commandId)
-      this.composerHosts.delete(commandId)
+      this.forgetComposerCommand(commandId)
     }
     this.publish()
     return { state: mapped.state, message: mapped.message }
   }
 
-  private hasComposerAuthority(threadId: string, expectedHostId: string): boolean {
+  private hasComposerAuthority(
+    threadId: string,
+    expectedHostId: string,
+    expectedExecutionGenerationId: string,
+  ): boolean {
     const activeHostId = asString(asRecord(this.connection)?.hostId)
     const activeThread = this.projection?.threads.find((item) => item.id === threadId)
-    if (activeHostId) {
-      return activeHostId === expectedHostId && (!activeThread || activeThread.hostId === expectedHostId)
-    }
-    return false
+    return Boolean(
+      activeHostId === expectedHostId &&
+      activeThread &&
+      activeThread.hostId === expectedHostId &&
+      activeThread.executionGenerationId === expectedExecutionGenerationId
+    )
   }
 
   async planHandoff(input: {

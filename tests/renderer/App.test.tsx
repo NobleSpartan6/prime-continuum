@@ -940,13 +940,13 @@ describe('Prime Continuim renderer', () => {
     const loadWorkbench = api.loadWorkbench.bind(api)
     api.loadWorkbench = async () => ({
       ...(await loadWorkbench()),
-      composerReceipt: { state: 'uncertain', message: 'Receipt uncertain · reconciling by command ID' },
+      composerReceipt: { state: 'uncertain', message: 'Receipt uncertain · verifying with host' },
     })
 
     render(<App api={api} />)
 
     expect(await screen.findByRole('heading', { name: 'Needs you' })).toBeVisible()
-    expect(screen.getByRole('button', { name: /Receipt uncertain · reconciling by command ID/ })).toBeVisible()
+    expect(screen.getByRole('button', { name: /Receipt uncertain · verifying with host/ })).toBeVisible()
   })
 
   it('keeps an in-flight handoff visible when Escape or the backdrop is used', async () => {
