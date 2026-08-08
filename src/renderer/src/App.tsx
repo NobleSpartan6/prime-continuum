@@ -643,6 +643,10 @@ export default function App({ api: suppliedApi }: AppProps) {
 
   const compatibleHosts = snapshot.hosts.filter((host) => selectedProject.hostIds.includes(host.id))
   const isDisconnected = selectedHost.connection !== 'online'
+  const taskStateIsStale = isDisconnected && !['complete', 'failed'].includes(selectedThread.status)
+  const visibleTaskState = taskStateIsStale
+    ? `Last seen ${taskLabel(selectedThread.status).toLowerCase()}`
+    : taskLabel(selectedThread.status)
 
   if (surface === 'companion') {
     return (
@@ -697,15 +701,15 @@ export default function App({ api: suppliedApi }: AppProps) {
 
         <div className="topbar__controls">
           <div
-            className={cx('task-state', `task-state--${selectedThread.status}`)}
+            className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
             aria-hidden="true"
-            title={`Task state: ${taskLabel(selectedThread.status)}`}
+            title={`Task state: ${visibleTaskState}`}
           >
             <Icon icon={taskIcon(selectedThread.status)} size={14} />
-            <span className="task-state__label">{taskLabel(selectedThread.status)}</span>
+            <span className="task-state__label">{visibleTaskState}</span>
           </div>
           <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-            Task state: {taskLabel(selectedThread.status)}
+            Task state: {visibleTaskState}
           </span>
 
           <button
@@ -1335,9 +1339,10 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
                   <TranscriptBody body={block.body} kind={block.kind} />
                   {block.detail && <p className="message__detail">{block.detail}</p>}
                   {block.receipt && (
-                    <span className="message__receipt">
-                      Receipt <bdi>{block.receipt}</bdi>
-                    </span>
+                    <details className="message__receipt">
+                      <summary>Receipt details</summary>
+                      <code><bdi>{block.receipt}</bdi></code>
+                    </details>
                   )}
                 </div>
               </article>

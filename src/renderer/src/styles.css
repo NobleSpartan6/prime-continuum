@@ -163,6 +163,10 @@ body {
   line-height: 1.5;
 }
 
+body:has(dialog[open]) :is(.sidebar__scroll, .transcript__scroller, .inspector__panel) {
+  overflow-y: hidden;
+}
+
 .startup-failure {
   display: grid;
   min-block-size: 100%;
@@ -1097,6 +1101,11 @@ code,
   background: var(--color-warning-soft);
 }
 
+.task-state--stale {
+  color: var(--color-text-muted);
+  background: var(--color-surface-subtle);
+}
+
 .task-state--failed {
   color: var(--color-danger);
   background: var(--color-danger-soft);
@@ -1458,10 +1467,34 @@ code,
 }
 
 .message__receipt {
-  display: inline-block;
+  display: block;
+  inline-size: fit-content;
   margin-block-start: 0.55rem;
   color: var(--color-text-faint);
   font-size: var(--font-caption);
+}
+
+.message__receipt summary {
+  display: flex;
+  align-items: center;
+  min-block-size: 2rem;
+  cursor: pointer;
+  font-weight: 560;
+}
+
+.message__receipt summary:hover {
+  color: var(--color-text-muted);
+}
+
+.message__receipt code {
+  display: block;
+  max-inline-size: min(100%, 36rem);
+  padding: 0.35rem 0.5rem;
+  overflow-wrap: anywhere;
+  color: var(--color-text-muted);
+  background: var(--color-code);
+  border-radius: var(--radius-sm);
+  font-size: inherit;
 }
 
 .message--user {
@@ -5247,6 +5280,10 @@ dialog.pair-mobile-sheet {
   .model-chip,
   .provider-rail nav button,
   .catalog-scope button {
+    min-block-size: 2.75rem;
+  }
+
+  .message__receipt summary {
     min-block-size: 2.75rem;
   }
 

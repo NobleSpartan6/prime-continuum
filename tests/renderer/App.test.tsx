@@ -77,11 +77,13 @@ afterEach(() => {
 
 describe('Prime Continuim renderer', () => {
   it('keeps the durable thread primary while connection and task states remain separate', async () => {
+    const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)
 
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
     expect(document.querySelector('.topbar__brand-name')).toHaveTextContent('Prime Continuim')
-    expect(screen.getAllByText('Running').some((element) => element.getClientRects().length > 0 || !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.getByText('Last seen running', { selector: '.task-state__label' })).toBeVisible()
+    expect(document.querySelector('.task-state')).toHaveClass('task-state--stale')
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Send when reconnected' })).toBeEnabled()
@@ -90,6 +92,11 @@ describe('Prime Continuim renderer', () => {
     const continuity = screen.getByRole('region', { name: 'Session status' })
     expect(within(continuity).getByText(/Last reported resident on devbox · current status unverified/i)).toBeVisible()
     expect(within(continuity).queryByText(/Continues on devbox when this window closes/i)).not.toBeInTheDocument()
+    const receiptDetails = screen.getByText('Receipt details').closest('details')
+    expect(receiptDetails).not.toHaveAttribute('open')
+    await user.click(screen.getByText('Receipt details'))
+    expect(receiptDetails).toHaveAttribute('open')
+    expect(within(receiptDetails as HTMLElement).getByText('preview_simulation_receipt')).toBeVisible()
   })
 
   it('preserves the composer and cached transcript for an offline thread', async () => {

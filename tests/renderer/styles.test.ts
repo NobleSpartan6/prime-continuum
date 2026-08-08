@@ -30,6 +30,9 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.model-catalog\s*{[^}]*overflow-y:\s*auto;/s)
     expect(narrowLayout).toMatch(/\.model-list\s*{[^}]*flex:\s*none;[^}]*overflow-y:\s*visible;/s)
     expect(narrowLayout).toMatch(/\.model-search input,\s*\.command-palette__input input\s*{[^}]*font-size:\s*1rem;/s)
+    expect(css).toMatch(/body:has\(dialog\[open\]\) :is\(\.sidebar__scroll, \.transcript__scroller, \.inspector__panel\)\s*{[^}]*overflow-y:\s*hidden;/s)
+    expect(css).toMatch(/\.task-state--stale\s*{[^}]*color:\s*var\(--color-text-muted\);/s)
+    expect(css).toMatch(/\.message__receipt summary\s*{[^}]*min-block-size:\s*2rem;[^}]*cursor:\s*pointer;/s)
   })
 
   it('preserves a readable thread title and primary composer actions at 320 CSS pixels', async () => {
