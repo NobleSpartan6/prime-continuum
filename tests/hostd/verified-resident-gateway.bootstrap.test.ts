@@ -14,6 +14,7 @@ import {
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
   ResidentRuntimeContractError,
   type ResidentAbortIdleAuthorityEvidence,
+  type ResidentEndAcknowledgement,
   type ResidentOwnedSessionCreateInput,
   type ResidentRuntimeConnection,
   type ResidentPromptIdleAuthorityEvidence,
@@ -26,6 +27,7 @@ import {
   type HostStore,
   ResidentAbortReconciliationLease,
   ResidentPromptReconciliationLease,
+  type ResidentKillLease,
 } from "../../src/hostd/store";
 import {
   VerifiedResidentGateway,
@@ -491,6 +493,9 @@ async function gatewayFixture(
     readStableResidentProjection: vi.fn(async () => {
       throw new Error("No resident recovery projection was configured for this fixture");
     }),
+    endResidentSession: vi.fn(async () => {
+      throw new Error("No resident end was configured for this fixture");
+    }),
     attachResident: vi.fn(async (candidate: ResidentSessionBinding) => {
       const connection = attachResidentOverride
         ? await attachResidentOverride(candidate)
@@ -540,6 +545,7 @@ async function gatewayFixture(
 type ResidentGatewayAdapter = PrimeAgentGateway & {
   createOwnedCandidate(input: ResidentOwnedSessionCreateInput): Promise<ResidentOwnedRuntimeCandidate>;
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
+  endResidentSession(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,

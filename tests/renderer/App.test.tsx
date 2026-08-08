@@ -142,6 +142,100 @@ function createResidentProvisioningApi(operation?: ResidentLifecycleOperationSum
   return api
 }
 
+function residentEndStatus(phase: 'ending' | 'completed' = 'ending') {
+  return {
+    version: 1 as const,
+    kind: 'end' as const,
+    operationId: 'resident-end-operation-one',
+    phase,
+    expectedHostId: 'host-local',
+    projectId: 'project-prime',
+    workspaceId: 'workspace-end-one',
+    threadId: 'thread-protocol',
+    executionGenerationId: 'generation-end-one',
+    preparedAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: phase === 'completed' ? '2026-08-05T20:00:03.000Z' : '2026-08-05T20:00:01.000Z',
+    ...(phase === 'completed' ? { terminalAt: '2026-08-05T20:00:03.000Z' } : {}),
+  }
+}
+
+function residentEndOperation(
+  state: ResidentLifecycleOperationSummary['state'] = 'submitted',
+): ResidentLifecycleOperationSummary {
+  return {
+    kind: 'end',
+    operationId: 'resident-end-operation-one',
+    expectedHostId: 'host-local',
+    projectId: 'project-prime',
+    workspaceId: 'workspace-end-one',
+    threadId: 'thread-protocol',
+    executionGenerationId: 'generation-end-one',
+    sourceCursor: {
+      threadId: 'thread-protocol',
+      executionGenerationId: 'generation-end-one',
+      generation: 'daemon-end-one',
+      sequence: 7,
+    },
+    createdAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+    state,
+    lastStatus: residentEndStatus('ending'),
+  }
+}
+
+function createResidentEndApi(operation?: ResidentLifecycleOperationSummary) {
+  const api = createPreviewRendererApi()
+  const loadWorkbench = api.loadWorkbench.bind(api)
+  api.loadWorkbench = async () => {
+    const snapshot = await loadWorkbench()
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
+    if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected the local resident preview fixture')
+    snapshot.selectedThreadId = thread.id
+    snapshot.selectedProjectId = thread.projectId
+    thread.status = 'idle'
+    thread.workspaceId = 'workspace-end-one'
+    thread.executionGenerationId = 'generation-end-one'
+    host.connection = 'online'
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      residency: 'resident',
+      activeSessionId: 'active-end-one',
+      sessionId: 'session-end-one',
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    snapshot.residentLifecycleOperations = operation ? [operation] : []
+    snapshot.operations = {
+      ...snapshot.operations,
+      submitCommands: !operation,
+      startResidentTurn: !operation,
+      stopResidentTurn: false,
+      provisionResident: true,
+    }
+    snapshot.composerReceipt = operation
+      ? operation.lastStatus?.phase === 'quarantined'
+        ? { state: 'uncertain', operation: 'end', message: 'End outcome unknown · this resident session stays locked for inspection' }
+        : { state: 'sent', operation: 'end', message: 'Ending resident session · no kill will be replayed automatically' }
+      : { state: 'idle', message: 'Ready for a new prompt' }
+    return snapshot
+  }
+  api.prepareResidentEnd = vi.fn(async () => ({
+    confirmationToken: 'resident-end-confirmation-one',
+    operationId: 'resident-end-operation-one',
+    expectedHostId: 'host-local',
+    threadId: 'thread-protocol',
+    executionGenerationId: 'generation-end-one',
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }))
+  api.endResident = vi.fn(async () => residentEndStatus('ending'))
+  api.residentLifecycleStatus = vi.fn(async () => residentEndStatus('completed'))
+  return api
+}
+
 beforeAll(() => {
   Object.defineProperty(window, 'requestAnimationFrame', {
     configurable: true,
@@ -172,6 +266,136 @@ afterEach(() => {
 })
 
 describe('Prime Continuim renderer', () => {
+  it('requires explicit confirmation for permanent resident ending and checks an ambiguous result without replay', async () => {
+    const user = userEvent.setup()
+    const api = createResidentEndApi()
+    const endResult = deferred<ReturnType<typeof residentEndStatus>>()
+    api.endResident = vi.fn(() => endResult.promise)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus())
+    expect(within(dialog).getByText('Closing is different from ending.')).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    const confirmation = within(dialog).getByRole('checkbox', { name: /cannot be resumed/i })
+    expect(confirmation).toHaveFocus()
+    expect(api.endResident).not.toHaveBeenCalled()
+
+    await user.click(confirmation)
+    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    expect(api.endResident).toHaveBeenCalledTimes(1)
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(dialog).toBeVisible()
+
+    endResult.resolve(residentEndStatus('ending'))
+    const check = await within(dialog).findByRole('button', { name: 'Check status' })
+    await waitFor(() => expect(within(dialog).getByRole('status')).toHaveFocus())
+    await user.click(check)
+    expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      operationId: 'resident-end-operation-one',
+    })
+    expect(await within(dialog).findByText(/Resident session ended/i)).toBeVisible()
+    expect(api.endResident).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a null end-status observation outcome-unknown and never invites another kill', async () => {
+    const user = userEvent.setup()
+    const api = createResidentEndApi()
+    api.residentLifecycleStatus = vi.fn(async () => null)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
+    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
+    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    const check = await within(dialog).findByRole('button', { name: 'Check status' })
+    await user.click(check)
+
+    expect(await within(dialog).findByText(/end outcome remains unknown/i)).toBeVisible()
+    expect(within(dialog).getByText(/will not send another kill/i)).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    expect(api.endResident).toHaveBeenCalledTimes(1)
+    expect(api.residentLifecycleStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows a fresh review only after the exact stale-cursor rejection', async () => {
+    const user = userEvent.setup()
+    const api = createResidentEndApi()
+    const staleConsent = Object.assign(
+      new Error('Resident state changed after end consent was reviewed; refresh the thread and confirm again'),
+      { code: 'host.resident_end_source_cursor_changed' },
+    )
+    api.endResident = vi.fn(async () => { throw staleConsent })
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
+    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
+    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+
+    expect(await within(dialog).findByText(/No end was admitted/i)).toBeVisible()
+    expect(within(dialog).getByText(/refresh the thread.*review the permanent action again/i)).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    expect(api.endResident).toHaveBeenCalledTimes(1)
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
+  })
+
+  it('keeps an admitted resident end in a compact locked composer and resumes only its pre-effect review', async () => {
+    const user = userEvent.setup()
+    const operation = residentEndOperation('submitted')
+    const api = createResidentEndApi(operation)
+    render(<App api={api} />)
+
+    expect(await screen.findByText('Ending resident session', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Resident session end is durably pending' })).toBeDisabled()
+    expect(api.endResident).not.toHaveBeenCalled()
+
+    const review = screen.getByRole('button', { name: 'Review end again' })
+    await user.click(review)
+    expect(api.prepareResidentEnd).toHaveBeenCalledWith(expect.objectContaining({
+      resumeOperationId: operation.operationId,
+      expectedHostId: operation.expectedHostId,
+      threadId: operation.threadId,
+      executionGenerationId: operation.executionGenerationId,
+    }))
+    expect(await screen.findByRole('dialog', { name: 'End resident session?' })).toBeVisible()
+    expect(api.endResident).not.toHaveBeenCalled()
+  })
+
+  it('keeps a quarantined resident end check-only with a copyable path-free diagnostic', async () => {
+    const user = userEvent.setup()
+    const operation = {
+      ...residentEndOperation('terminal'),
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      lastStatus: {
+        ...residentEndStatus('ending'),
+        phase: 'quarantined' as const,
+        updatedAt: '2026-08-05T20:00:02.000Z',
+        quarantinedFrom: 'kill_dispatching' as const,
+        quarantineReason: 'external_outcome_unknown' as const,
+      },
+    }
+    const api = createResidentEndApi(operation)
+    render(<App api={api} />)
+
+    const card = await screen.findByRole('region', { name: 'End outcome needs inspection' })
+    expect(within(card).getByText(/will not send another kill/i)).toBeVisible()
+    expect(within(card).queryByRole('button', { name: /review end/i })).not.toBeInTheDocument()
+    const copy = within(card).getByRole('button', { name: 'Copy diagnostic' })
+    await user.click(copy)
+    expect(api.prepareResidentEnd).not.toHaveBeenCalled()
+    expect(api.endResident).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /outcome unknown/i })).toBeDisabled()
+  })
+
   it('resumes only the exact lifecycle operation selected from a recovery card', async () => {
     const user = userEvent.setup()
     const operation = lifecycleOperation('requires_reselection')

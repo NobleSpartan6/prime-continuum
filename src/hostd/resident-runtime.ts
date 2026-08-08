@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
+import type { ResidentKillLease } from "./store";
 
 const PRIME_AGENT_RELEASE_BASE_URL = "https://github.com/PrimeIntellect-ai/prime-agent/releases/download";
 
@@ -88,8 +89,7 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_DISPATCH_RETIRED"
   | "COMMAND_ID_REUSED"
   | "PRIME_RUNTIME_DISPATCH_IDENTITY_LIMIT"
-  | "PRIME_RUNTIME_LIFECYCLE_IDENTITY_LIMIT"
-  | "PRIME_RUNTIME_LIFECYCLE_RETIRED"
+  | "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID"
   | "PRIME_RUNTIME_ADAPTER_CLOSED"
   | "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT";
 
@@ -840,12 +840,15 @@ export interface ResidentRuntimeLifecycleSnapshot {
 export type ResidentRuntimeLifecycleListener = (snapshot: ResidentRuntimeLifecycleSnapshot) => void;
 
 /** Definitive Prime acknowledgement for one exact Store-authorized resident end. */
-export interface ResidentEndAcknowledgement {
-  readonly acknowledgementVersion: 1;
-  readonly operation: "end";
-  readonly activeSessionId: string;
-  readonly sessionId: string;
-}
+export const ResidentEndAcknowledgementSchema = z
+  .object({
+    acknowledgementVersion: z.literal(1),
+    operation: z.literal("end"),
+    activeSessionId: BoundedWireStringSchema,
+    sessionId: BoundedWireStringSchema,
+  })
+  .strict();
+export type ResidentEndAcknowledgement = z.infer<typeof ResidentEndAcknowledgementSchema>;
 
 /** Host-owned connection handle. It intentionally exposes no upstream state or event DTO. */
 export interface ResidentRuntimeConnection {
@@ -869,8 +872,6 @@ export interface ResidentRuntimeConnection {
   ): Promise<ResidentAbortIdleAuthorityEvidence>;
   /** Detach the client-side connection without stopping the resident worker. */
   detach(): Promise<void>;
-  /** Stop the resident worker only after an explicit user-facing end action. */
-  endSession(): Promise<void>;
 }
 
 /**
@@ -886,8 +887,8 @@ export interface ResidentRuntimeAdapter {
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   /** Read exact, stable Prime state without publishing it or mutating durable authority. */
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
-  /** Invoke one exact root kill only behind the caller's durable Store kill lease. */
-  endResidentSession(binding: ResidentSessionBinding): Promise<ResidentEndAcknowledgement>;
+  /** Consume one opaque Store-issued authority to invoke at most one exact root kill. */
+  endResidentSession(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
   /** Release only a matching process-local transport; never stops or completes Prime state. */
   detachResidentSession(binding: ResidentSessionBinding): Promise<void>;
   close(): Promise<void>;

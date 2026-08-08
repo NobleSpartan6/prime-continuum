@@ -208,6 +208,84 @@ function committedResidentLifecycleStatus() {
   }
 }
 
+function residentEndStatus(phase: 'ending' | 'completed' = 'ending') {
+  return {
+    version: 1 as const,
+    kind: 'end' as const,
+    operationId: 'resident-end-operation-one',
+    phase,
+    expectedHostId: 'host-local',
+    projectId: 'project-local',
+    workspaceId: 'workspace-local',
+    threadId: 'thread-one',
+    executionGenerationId: 'generation-one',
+    preparedAt: '2026-08-05T20:00:01.000Z',
+    updatedAt: phase === 'completed' ? '2026-08-05T20:00:04.000Z' : '2026-08-05T20:00:02.000Z',
+    ...(phase === 'completed' ? { terminalAt: '2026-08-05T20:00:04.000Z' } : {}),
+  }
+}
+
+function residentEndPreparation() {
+  return {
+    confirmationToken: 'resident-end-confirmation-one',
+    operationId: 'resident-end-operation-one',
+    expectedHostId: 'host-local',
+    threadId: 'thread-one',
+    executionGenerationId: 'generation-one',
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }
+}
+
+function residentEndOperation(
+  state: 'submitted' | 'outcome_unknown' | 'terminal_refresh_pending' | 'terminal' = 'submitted',
+  status = residentEndStatus(state === 'terminal' || state === 'terminal_refresh_pending' ? 'completed' : 'ending'),
+) {
+  return {
+    kind: 'end' as const,
+    operationId: 'resident-end-operation-one',
+    expectedHostId: 'host-local',
+    projectId: 'project-local',
+    workspaceId: 'workspace-local',
+    threadId: 'thread-one',
+    executionGenerationId: 'generation-one',
+    sourceCursor: recoverySnapshot(recoveryCatalog().threads[0], 'Source cursor.').latestCursor,
+    createdAt: '2026-08-05T20:00:01.000Z',
+    updatedAt: status.updatedAt,
+    state,
+    lastStatus: status,
+  }
+}
+
+function endedResidentSnapshot() {
+  const catalog = recoveryCatalog()
+  const source = recoverySnapshot(catalog.threads[0], 'Saved resident transcript remains readable.')
+  const { runtime: _runtime, goals: _goals, schedules: _schedules, ...retained } = source
+  return {
+    ...retained,
+    generatedAt: '2026-08-05T20:00:05.000Z',
+    thread: {
+      ...retained.thread,
+      status: 'idle',
+      recap: 'Resident session ended.',
+      updatedAt: '2026-08-05T20:00:05.000Z',
+    },
+    queueState: { pendingCommandIds: [], paused: false },
+    childAgents: [],
+    goals: [],
+    schedules: [],
+    pendingAttention: [],
+    residentLifecycle: {
+      version: 1,
+      state: 'ended',
+      operationId: 'resident-end-operation-one',
+      bindingFingerprint: 'a'.repeat(64),
+      endedAt: '2026-08-05T20:00:04.000Z',
+      sourceCursor: retained.latestCursor,
+      reason: 'user_end',
+    },
+  }
+}
+
 function catalogWithCommittedResidentThread() {
   const catalog = recoveryCatalog()
   return {
@@ -254,6 +332,108 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('consumes one exact resident end confirmation before the mutation and never retries it', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident end admission.')
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      prepareResidentEnd: vi.fn(() => ok(residentEndPreparation())),
+      endResident: vi.fn(() => ok(residentEndStatus('ending'))),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+
+    const preparation = await api.prepareResidentEnd({
+      expectedHostId: 'host-local',
+      projectId: 'project-local',
+      workspaceId: 'workspace-local',
+      threadId: 'thread-one',
+      executionGenerationId: 'generation-one',
+    })
+    await expect(api.endResident({
+      confirmationToken: preparation.confirmationToken,
+      consent: true,
+    })).resolves.toEqual(residentEndStatus('ending'))
+    await expect(api.endResident({
+      confirmationToken: preparation.confirmationToken,
+      consent: true,
+    })).rejects.toThrow(/review this resident session again/i)
+
+    expect(bridge.prepareResidentEnd).toHaveBeenCalledTimes(1)
+    expect(bridge.endResident).toHaveBeenCalledTimes(1)
+    unsubscribe()
+  })
+
+  it('materializes only an exact same-lineage ended disposition after a completed resident end', async () => {
+    const catalog = recoveryCatalog()
+    const source = recoverySnapshot(catalog.threads[0], 'Resident end source.')
+    const ended = endedResidentSnapshot()
+    const completed = residentEndStatus('completed')
+    let bootstrapReads = 0
+    const bridge = {
+      bootstrap: vi.fn(() => {
+        bootstrapReads += 1
+        return ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: source },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          durableUncertainReceipts: [],
+          residentLifecycleOperations: bootstrapReads === 1 ? [] : [residentEndOperation('terminal', completed)],
+          connection: residentLifecycleConnection(),
+          appVersion: '0.1.0',
+        })
+      }),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(ended)),
+      prepareResidentEnd: vi.fn(() => ok(residentEndPreparation())),
+      endResident: vi.fn(() => ok(completed)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((next) => published.push(next))
+    await api.loadWorkbench()
+    const preparation = await api.prepareResidentEnd({
+      expectedHostId: 'host-local',
+      projectId: 'project-local',
+      workspaceId: 'workspace-local',
+      threadId: 'thread-one',
+      executionGenerationId: 'generation-one',
+    })
+
+    await expect(api.endResident({ confirmationToken: preparation.confirmationToken, consent: true }))
+      .resolves.toEqual(completed)
+    const view = published.at(-1)!
+    expect(view.selectedThreadId).toBe('thread-one')
+    expect(view.threads.find((thread) => thread.id === 'thread-one')?.residentLifecycle).toEqual({
+      state: 'ended',
+      operationId: 'resident-end-operation-one',
+      endedAt: '2026-08-05T20:00:04.000Z',
+      reason: 'user_end',
+    })
+    expect(view.operations.startResidentTurn).toBe(false)
+    expect(view.operations.stopResidentTurn).toBe(false)
+    expect(view.composerReceipt).toMatchObject({ operation: 'end', state: 'idle' })
+    expect(bridge.endResident).toHaveBeenCalledTimes(1)
+    unsubscribe()
+  })
+
   it('returns an empty cold cache immediately, then publishes the local catalog and thread snapshot', async () => {
     const catalog = {
       snapshotVersion: 1,
@@ -865,7 +1045,7 @@ describe('NativeRendererApi', () => {
     await expect(api.residentLifecycleStatus({
       expectedHostId: 'host-local',
       operationId: 'resident-operation-one',
-    })).rejects.toThrow(/different resident thread/i)
+    })).rejects.toThrow(/does not prove this exact resident lifecycle operation/i)
     expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'resident-thread-one' })
     expect(published.at(-1)?.selectedThreadId).toBe('thread-one')
     expect(published.at(-1)?.residentLifecycleOperations).toEqual([

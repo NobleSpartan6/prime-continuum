@@ -27,6 +27,43 @@ describe('native atomic storage', () => {
     expect(JSON.parse(await readFile(file, 'utf8'))).toHaveLength(12)
   })
 
+  it('confirms the renamed directory entry after writes and queued updates', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'prime-store-durability-test-'))
+    temporaryDirectories.push(directory)
+    const file = path.join(directory, 'resident-lifecycle.json')
+    const visibleValues: number[][] = []
+    const store = new AtomicJsonStore<number[]>(file, () => [], 1024, {
+      syncParentDirectory: async (parentDirectory) => {
+        expect(parentDirectory).toBe(directory)
+        visibleValues.push(JSON.parse(await readFile(file, 'utf8')) as number[])
+      },
+    })
+
+    await store.write([1])
+    await store.update((current) => [...current, 2])
+
+    expect(visibleValues).toEqual([[1], [1, 2]])
+  })
+
+  it('reports an ambiguous commit when parent-directory durability fails after rename', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'prime-store-ambiguous-test-'))
+    temporaryDirectories.push(directory)
+    const file = path.join(directory, 'resident-lifecycle.json')
+    let syncAttempts = 0
+    const store = new AtomicJsonStore<number[]>(file, () => [], 1024, {
+      syncParentDirectory: async () => {
+        syncAttempts += 1
+        if (syncAttempts === 1) throw new Error('simulated parent-directory sync failure')
+      },
+    })
+
+    await expect(store.write([1])).rejects.toMatchObject({ code: 'storage.commit_uncertain' })
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual([1])
+
+    await store.write([2])
+    expect(await store.read()).toEqual([2])
+  })
+
   it.each([
     ['malformed JSON', '{not-json', 'storage.malformed_json'],
     ['a non-array root', '{"commands":[]}', 'storage.invalid_root'],

@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   PrimeAgentResidentAdapter,
   type PrimeDaemonAgentConnectionPublic,
@@ -22,7 +23,12 @@ import {
 } from "../../src/hostd/resident-runtime";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import { GatewayError } from "../../src/hostd/gateway";
-import type { ResidentPromptReconciliationLease } from "../../src/hostd/store";
+import {
+  HostStore,
+  type ResidentKillInvocationAuthorizer,
+  type ResidentKillLease,
+  type ResidentPromptReconciliationLease,
+} from "../../src/hostd/store";
 import { PROTOCOL_VERSION, type CommandEnvelope } from "../../src/shared/protocol";
 
 const RUNTIME_NODE = resolve("test-runtime", "node.exe");
@@ -36,6 +42,11 @@ const DAEMON_ENVIRONMENT = Object.freeze({
   ELECTRON_RUN_AS_NODE: "1",
   NODE_OPTIONS: "--import=C:\\attacker.mjs",
   PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
+});
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 function buildHarnessInvocation() {
@@ -157,7 +168,6 @@ interface HarnessState {
   launcherUnrefs: number;
   launcherExit?: readonly [number | null, string | null];
   persistCalls: ResidentSessionBinding[];
-  completeCalls: ResidentSessionBinding[];
   projectionCalls: Array<{
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
@@ -166,7 +176,6 @@ interface HarnessState {
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
   closeHandler?: () => void;
   persistHandler?: (binding: ResidentSessionBinding) => Promise<void>;
-  completeHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   publishProjectionHandler?: (
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
@@ -194,6 +203,7 @@ interface HarnessState {
   waitHandler?: (milliseconds: number) => Promise<void> | void;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
+  authorizeResidentKillInvocation?: ResidentKillInvocationAuthorizer;
 }
 
 function createHarness(overrides: Partial<HarnessState> = {}) {
@@ -212,7 +222,6 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     launcherKills: 0,
     launcherUnrefs: 0,
     persistCalls: [],
-    completeCalls: [],
     projectionCalls: [],
     waitForIdleCalls: 0,
     availableModelsCalls: 0,
@@ -370,16 +379,12 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       state.chronology.push("persist");
       await state.persistHandler?.(binding);
     },
-    completeBinding: async (binding) => {
-      state.completeCalls.push(binding);
-      state.chronology.push("complete");
-      await state.completeHandler?.(binding);
-    },
     publishProjection: async (projectionBinding, projection) => {
       state.projectionCalls.push({ binding: projectionBinding, projection });
       state.chronology.push("projection:publish");
       await state.publishProjectionHandler?.(projectionBinding, projection);
     },
+    authorizeResidentKillInvocation: state.authorizeResidentKillInvocation,
     spawnFactory: (executable, argv, options) => {
       state.spawnCalls.push({ executable, argv, options });
       state.chronology.push("spawn");
@@ -441,6 +446,45 @@ function binding(overrides: Partial<ResidentSessionBinding> = {}): ResidentSessi
     runtime: validateResidentDaemonHello(validHello()),
     ...overrides,
   };
+}
+
+async function issueResidentKillLease(
+  operationId = "resident-end-adapter",
+  bindingOverrides: Partial<ResidentSessionBinding> = {},
+): Promise<{ store: HostStore; lease: ResidentKillLease; binding: ResidentSessionBinding }> {
+  const directory = await mkdtemp(join(tmpdir(), "prime-adapter-end-"));
+  temporaryDirectories.push(directory);
+  const workspaceDirectory = join(directory, "workspace");
+  await mkdir(workspaceDirectory);
+  const store = new HostStore(directory);
+  await store.initialize({ seed: true });
+  const host = await store.getHost();
+  const snapshot = await store.getThreadSnapshot("demo-thread");
+  const canonicalWorkspace = await store.registerWorkspaceAuthority({
+    threadId: snapshot.thread.threadId,
+    executionGenerationId: snapshot.thread.currentLocation.executionGenerationId,
+    workspaceDirectory,
+  });
+  const durableBinding = binding({
+    threadId: snapshot.thread.threadId,
+    executionGenerationId: snapshot.thread.currentLocation.executionGenerationId,
+    workspaceDirectory: canonicalWorkspace,
+    ...bindingOverrides,
+  });
+  await store.persistResidentSessionBinding(durableBinding);
+  const input = {
+    operationId,
+    expectedHostId: host.hostId,
+    projectId: snapshot.thread.currentLocation.projectId,
+    workspaceId: snapshot.thread.currentLocation.workspaceId,
+    threadId: durableBinding.threadId,
+    executionGenerationId: durableBinding.executionGenerationId,
+    requestDigest: "e".repeat(64),
+    expectedSourceCursor: snapshot.latestCursor,
+  } as const;
+  await store.prepareResidentEnd(input, durableBinding);
+  const lease = await store.beginResidentKill(input);
+  return { store, lease, binding: durableBinding };
 }
 
 function residentDispatchLease(
@@ -1028,65 +1072,48 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
 });
 
 describe("PrimeAgentResidentAdapter session lifecycle", () => {
-  it("ends an exact resident independently of local attachment and memoizes one root kill", async () => {
-    const { adapter, state } = createHarness();
-    const durableBinding = binding();
-
-    const first = adapter.endResidentSession(durableBinding);
-    const duplicate = adapter.endResidentSession({
-      ...durableBinding,
-      runtime: {
-        ...durableBinding.runtime,
-        capabilities: [...durableBinding.runtime.capabilities].reverse(),
-        supervisorGeneration: "supervisor-refreshed",
+  it("accepts only one exact Store lease and invokes one independent list-fenced root kill", async () => {
+    const authority = await issueResidentKillLease();
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: (lease) => authority.store.authorizeResidentKillInvocation(lease),
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ cwd: authority.binding.workspaceDirectory })] },
+          };
+        }
+        return { type: "response", command: type, success: true };
       },
     });
 
-    expect(duplicate).toBe(first);
-    await expect(first).resolves.toEqual({
+    await expect(adapter.endResidentSession(authority.lease)).resolves.toEqual({
       acknowledgementVersion: 1,
       operation: "end",
-      activeSessionId: "active-1",
-      sessionId: "session-1",
+      activeSessionId: authority.binding.activeSessionId,
+      sessionId: authority.binding.sessionId,
     });
-    await expect(adapter.endResidentSession(durableBinding)).resolves.toEqual({
-      acknowledgementVersion: 1,
-      operation: "end",
-      activeSessionId: "active-1",
-      sessionId: "session-1",
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
     });
-
     expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
       "list",
       "kill",
+      "list",
     ]);
     expect(state.attachCalls).toHaveLength(0);
-    expect(state.persistCalls).toHaveLength(0);
-    expect(state.completeCalls).toHaveLength(0);
     await adapter.close();
   });
 
-  it("does not let local client-close failure turn a confirmed end into a replayable result", async () => {
-    let closeCalls = 0;
+  it("ends an exact promoted empty draft that Prime keeps list-visible as a ready resident worker", async () => {
+    const authority = await issueResidentKillLease("resident-end-promoted-draft");
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      authority.store.authorizeResidentKillInvocation(lease));
     const { adapter, state } = createHarness({
-      closeHandler: () => {
-        closeCalls += 1;
-        if (closeCalls === 2) throw new Error("local close failed after kill acknowledgement");
-      },
-    });
-
-    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
-    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
-    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
-      "list",
-      "kill",
-    ]);
-    await adapter.close();
-  });
-
-  it("retires settled end results fail-closed while admitting healthy work past the exact-result bound", async () => {
-    let expectedOrdinal = 0;
-    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
       requestHandler: async (command) => {
         const type = (command as { type?: string }).type ?? "unknown";
         if (type === "list") {
@@ -1096,46 +1123,35 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
             success: true,
             data: {
               sessions: [liveSummary({
-                id: `active-${expectedOrdinal}`,
-                activeSessionId: `active-${expectedOrdinal}`,
-                sessionId: `session-${expectedOrdinal}`,
-                sessionFile: `C:\\sessions\\session-${expectedOrdinal}.jsonl`,
+                lifecycle: "draft",
+                workerState: "ready",
+                attachedClients: 0,
+                messageCount: 0,
+                cwd: authority.binding.workspaceDirectory,
               })],
             },
           };
-        }
-        if (type === "kill") {
-          expect(command).toMatchObject({ activeSessionId: `active-${expectedOrdinal}` });
-          expectedOrdinal += 1;
         }
         return { type: "response", command: type, success: true };
       },
     });
 
-    for (let ordinal = 0; ordinal <= 10_000; ordinal += 1) {
-      await adapter.endResidentSession(binding({
-        activeSessionId: `active-${ordinal}`,
-        sessionId: `session-${ordinal}`,
-        sessionFile: `C:\\sessions\\session-${ordinal}.jsonl`,
-      }));
-    }
-    expect(expectedOrdinal).toBe(10_001);
-    const requestsBeforeRetiredReplay = state.requests.length;
-    await expectRuntimeError(
-      adapter.endResidentSession(binding({
-        activeSessionId: "active-0",
-        sessionId: "session-0",
-        sessionFile: "C:\\sessions\\session-0.jsonl",
-      })),
-      "PRIME_RUNTIME_LIFECYCLE_RETIRED",
-    );
-    expect(state.requests).toHaveLength(requestsBeforeRetiredReplay);
+    await expect(adapter.endResidentSession(authority.lease)).resolves.toMatchObject({
+      operation: "end",
+      activeSessionId: authority.binding.activeSessionId,
+      sessionId: authority.binding.sessionId,
+    });
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list", "kill"]);
     await adapter.close();
-  }, 30_000);
+  });
 
-  it("keeps exact-list fence failures definite and permits a later leased retry", async () => {
-    let liveSessionId = "different-session";
+  it("rejects an exact archived session before Store authorization and never invokes kill", async () => {
+    const authority = await issueResidentKillLease("resident-end-archived");
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      authority.store.authorizeResidentKillInvocation(lease));
     const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
       requestHandler: async (command) => {
         const type = (command as { type?: string }).type ?? "unknown";
         if (type === "list") {
@@ -1143,86 +1159,155 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
             type: "response",
             command: "list",
             success: true,
-            data: { sessions: [liveSummary({ sessionId: liveSessionId })] },
+            data: {
+              sessions: [liveSummary({
+                lifecycle: "archived",
+                cwd: authority.binding.workspaceDirectory,
+              })],
+            },
           };
         }
         return { type: "response", command: type, success: true };
       },
     });
 
-    await expectRuntimeError(adapter.endResidentSession(binding()), "PRIME_RUNTIME_SESSION_MISMATCH");
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_SESSION_NOT_FOUND",
+    });
+    expect(authorize).not.toHaveBeenCalled();
     expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
+    await authority.store.failResidentKillBeforeEffect(authority.lease);
+    await adapter.close();
+  });
 
-    liveSessionId = "session-1";
-    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
-    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
-      "list",
-      "list",
-      "kill",
-    ]);
+  it("does not let draft eligibility relax the exact durable session identity fence", async () => {
+    const authority = await issueResidentKillLease("resident-end-wrong-draft-session");
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      authority.store.authorizeResidentKillInvocation(lease));
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: {
+              sessions: [liveSummary({
+                lifecycle: "draft",
+                sessionId: "different-session",
+                cwd: authority.binding.workspaceDirectory,
+              })],
+            },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_SESSION_MISMATCH",
+    });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
+    await authority.store.failResidentKillBeforeEffect(authority.lease);
+    await adapter.close();
+  });
+
+  it("rejects a bare binding and a cross-Store lease without invoking kill", async () => {
+    const owner = await issueResidentKillLease("resident-end-owner");
+    const other = await issueResidentKillLease("resident-end-other");
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: (lease) => owner.store.authorizeResidentKillInvocation(lease),
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ cwd: other.binding.workspaceDirectory })] },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expect(adapter.endResidentSession(owner.binding as unknown as ResidentKillLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
+    });
+    await expect(adapter.endResidentSession(other.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
+    });
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("rechecks Store authority after a deferred list and never kills a lease settled meanwhile", async () => {
+    const authority = await issueResidentKillLease("resident-end-stale-after-list");
+    const listGate = deferred();
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: (lease) => authority.store.authorizeResidentKillInvocation(lease),
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          await listGate.promise;
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ cwd: authority.binding.workspaceDirectory })] },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    const ending = adapter.endResidentSession(authority.lease);
+    await vi.waitFor(() => expect(state.requests).toHaveLength(1));
+    await authority.store.failResidentKillBeforeEffect(authority.lease);
+    listGate.resolve();
+    await expect(ending).rejects.toMatchObject({ code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID" });
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
     await adapter.close();
   });
 
   it.each([
-    ["request rejection", async () => { throw new Error("kill response transport closed"); }],
+    ["transport rejection", async () => { throw new Error("kill response transport closed"); }],
     ["negative response", async () => ({ type: "response", command: "kill", success: false, error: "not found" })],
     ["malformed response", async () => ({ type: "response", command: "kill", success: "maybe" })],
-  ] as const)("treats a post-invocation %s as unknown and never replays root kill", async (_label, killResult) => {
+  ] as const)("classifies a post-invocation %s as unknown and the consumed lease cannot replay", async (_label, killResult) => {
+    const authority = await issueResidentKillLease(`resident-end-unknown-${_label.replace(/\s/g, "-")}`);
     const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: (lease) => authority.store.authorizeResidentKillInvocation(lease),
       requestHandler: async (command) => {
         const type = (command as { type?: string }).type ?? "unknown";
         if (type === "list") {
-          return { type: "response", command: "list", success: true, data: { sessions: [liveSummary()] } };
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ cwd: authority.binding.workspaceDirectory })] },
+          };
         }
         if (type === "kill") return killResult();
         return { type: "response", command: type, success: true };
       },
     });
 
-    const first = adapter.endResidentSession(binding());
-    const error = await expectRuntimeError(first, "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
-    expect(error.retryable).toBe(false);
-    const duplicate = adapter.endResidentSession(binding());
-    expect(duplicate).toBe(first);
-    await expectRuntimeError(duplicate, "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN");
-    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
-      "list",
-      "kill",
-    ]);
-    await adapter.close();
-  });
-
-  it("retries only when the worker proves root kill was not invoked", async () => {
-    let killCalls = 0;
-    const { adapter, state } = createHarness({
-      requestHandler: async (command) => {
-        const type = (command as { type?: string }).type ?? "unknown";
-        if (type === "list") {
-          return { type: "response", command: "list", success: true, data: { sessions: [liveSummary()] } };
-        }
-        if (type === "kill" && ++killCalls === 1) {
-          throw Object.assign(new Error("worker rejected before invocation"), { outcome: "definitive" });
-        }
-        return { type: "response", command: type, success: true };
-      },
-    });
-
-    const error = await expectRuntimeError(
-      adapter.endResidentSession(binding()),
-      "PRIME_RUNTIME_REQUEST_FAILED",
+    await expectRuntimeError(
+      adapter.endResidentSession(authority.lease),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
     );
-    expect(error.details).toMatchObject({ command: "kill", outcome: "definitive" });
-    await expect(adapter.endResidentSession(binding())).resolves.toMatchObject({ operation: "end" });
-    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual([
-      "list",
-      "kill",
-      "list",
-      "kill",
-    ]);
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
+    });
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(1);
     await adapter.close();
   });
 
-  it("detaches only the exact local transport and is idempotent without Store completion", async () => {
+  it("detaches only the exact local transport and is idempotent without stopping the worker", async () => {
     const { adapter, state } = createHarness();
     const connection = await adapter.attachResident(binding());
 
@@ -1239,7 +1324,6 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(connection.getLifecycle().state).toBe("closed");
     expect(state.eventListeners.size).toBe(0);
     expect(state.disposeCalls).toBe(0);
-    expect(state.completeCalls).toHaveLength(0);
     expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
     await adapter.close();
   });
@@ -1261,7 +1345,6 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
     expect(state.disposeCalls).toBe(1);
     expect(state.persistCalls).toHaveLength(0);
-    expect(state.completeCalls).toHaveLength(0);
     expect(state.projectionCalls).toHaveLength(0);
     await adapter.close();
   });
@@ -1330,40 +1413,6 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(state.disposeCalls).toBe(1);
     expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
     expect(connection.getLifecycle().state).toBe("closed");
-    await adapter.close();
-  });
-
-  it("uses kill only for explicit end and rejects a racing detach", async () => {
-    let releaseKill!: () => void;
-    const killGate = new Promise<void>((resolve) => {
-      releaseKill = resolve;
-    });
-    const { adapter, state } = createHarness({
-      requestHandler: async (command) => {
-        const type = (command as { type?: string }).type;
-        if (type === "create") {
-          return { type: "response", command: "create", success: true, data: liveSummary() };
-        }
-        if (type === "kill") {
-          await killGate;
-          return { type: "response", command: "kill", success: true };
-        }
-        return { type: "response", command: type ?? "unknown", success: true };
-      },
-    });
-    const connection = await adapter.createResident(createInput());
-
-    const end = connection.endSession();
-    await vi.waitFor(() => expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(true));
-    await expectRuntimeError(connection.detach(), "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT");
-    releaseKill();
-    await end;
-
-    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(1);
-    expect(state.disposeCalls).toBe(1);
-    expect(state.completeCalls).toHaveLength(1);
-    expect(state.chronology.indexOf("request:kill")).toBeLessThan(state.chronology.indexOf("dispose"));
-    expect(state.chronology.indexOf("dispose")).toBeLessThan(state.chronology.indexOf("complete"));
     await adapter.close();
   });
 
@@ -1549,25 +1598,6 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
       }),
     ).toThrow("observer failed");
     await expect(connection.detach()).resolves.toBeUndefined();
-    await adapter.close();
-  });
-
-  it("retries only durable completion after a confirmed kill", async () => {
-    let failCompletion = true;
-    const { adapter, state } = createHarness({
-      completeHandler: async () => {
-        if (failCompletion) throw new Error("binding store unavailable");
-      },
-    });
-    const connection = await adapter.createResident(createInput());
-
-    await expectRuntimeError(connection.endSession(), "PRIME_RUNTIME_BINDING_PERSIST_FAILED");
-    failCompletion = false;
-    await connection.endSession();
-
-    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(1);
-    expect(state.disposeCalls).toBe(1);
-    expect(state.completeCalls).toHaveLength(2);
     await adapter.close();
   });
 
@@ -1897,22 +1927,18 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     await adapter.close();
   });
 
-  it.each(["detach", "end"] as const)(
-    "%s disposes a never-settling idle barrier and cannot publish terminally stale evidence",
-    async (terminalAction) => {
+  it("detach disposes a never-settling idle barrier and cannot publish terminally stale evidence", async () => {
     const neverSettles = new Promise<void>(() => undefined);
     const { adapter, state } = createHarness({ waitForIdleHandler: () => neverSettles });
     const connection = await adapter.createResident(createInput());
     const request = promptIdleReconciliationRequest(
       connection.binding,
-      `dispatch-prompt-${terminalAction}-during-idle`,
+      "dispatch-prompt-detach-during-idle",
     );
     const reconciliation = connection.reconcileAcknowledgedPromptIdle(request);
     await vi.waitFor(() => expect(state.waitForIdleCalls).toBe(1));
 
-    const terminal = terminalAction === "detach"
-      ? connection.detach()
-      : connection.endSession();
+    const terminal = connection.detach();
 
     await expect(reconciliation).rejects.toMatchObject({
       code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
@@ -1921,14 +1947,12 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     await expect(terminal).resolves.toBeUndefined();
     expect(state.disposeCalls).toBe(1);
     expect(state.projectionCalls).toHaveLength(1);
-    expect(state.completeCalls).toHaveLength(terminalAction === "end" ? 1 : 0);
     await expect(connection.reconcileAcknowledgedPromptIdle(request)).rejects.toMatchObject({
       code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
     });
     expect(state.waitForIdleCalls).toBe(1);
     await adapter.close();
-    },
-  );
+  });
 
   it("adapter close actively cancels a never-settling idle barrier within the local shutdown bound", async () => {
     const neverSettles = new Promise<void>(() => undefined);

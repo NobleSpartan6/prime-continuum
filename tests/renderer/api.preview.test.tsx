@@ -100,6 +100,24 @@ describe('browser preview evidence labels', () => {
         canStart: false,
         canStop: false,
       },
+      {
+        visualState: 'resident-end-review' as const,
+        threadState: 'idle',
+        receiptState: 'idle',
+        operation: undefined,
+        message: 'Ready for a new prompt',
+        canStart: true,
+        canStop: false,
+      },
+      {
+        visualState: 'resident-end-pending' as const,
+        threadState: 'idle',
+        receiptState: 'sent',
+        operation: 'end',
+        message: 'Ending resident session · Prime Continuim will not send another kill automatically',
+        canStart: false,
+        canStop: false,
+      },
     ]
 
     for (const expected of cases) {

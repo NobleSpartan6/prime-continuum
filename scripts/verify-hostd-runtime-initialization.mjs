@@ -157,7 +157,17 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
   while (!readyHealth && Date.now() < readyDeadline) {
     assertChildAlive(child, stderrTail);
     await delay(POLL_INTERVAL_MS);
-    const response = await requestHealth(endpoint, HEALTH_REQUEST_DEADLINE_MS);
+    let response;
+    try {
+      response = await requestHealth(endpoint, HEALTH_REQUEST_DEADLINE_MS);
+    } catch (error) {
+      // Once runtime integrity turns ready, health also crosses the isolated
+      // resident-Worker module preflight. Keep each poll tightly bounded while
+      // that one cached preflight finishes; the outer readiness deadline still
+      // limits the complete initialization attempt.
+      lastError = error;
+      continue;
+    }
     latencies.push(response.latencyMs);
     const runtime = response.health.runtimeIntegrity;
     if (runtime?.status === "failed" || runtime?.status === "unavailable") {

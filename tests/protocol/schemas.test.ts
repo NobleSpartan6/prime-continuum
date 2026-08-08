@@ -12,6 +12,7 @@ import {
   PairingTicketDescriptorSchema,
   PROTOCOL_VERSION,
   RemoteDeviceScopesSchema,
+  ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
@@ -74,6 +75,36 @@ describe("host protocol schemas", () => {
     });
   });
 
+  it("binds resident end to one path-free reviewed source cursor", () => {
+    const request = {
+      expectedHostId: "host-1",
+      operationId: "resident-end-1",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      threadId: "thread-1",
+      executionGenerationId: "execution-1",
+      expectedSourceCursor: {
+        threadId: "thread-1",
+        executionGenerationId: "execution-1",
+        generation: "daemon-generation-1",
+        sequence: 42,
+      },
+    };
+    expect(ResidentEndRequestSchema.safeParse(request).success).toBe(true);
+    expect(ResidentEndRequestSchema.safeParse({
+      ...request,
+      expectedSourceCursor: undefined,
+    }).success).toBe(false);
+    expect(ResidentEndRequestSchema.safeParse({
+      ...request,
+      expectedSourceCursor: { ...request.expectedSourceCursor, sequence: 41, threadId: "other-thread" },
+    }).success).toBe(false);
+    expect(ResidentEndRequestSchema.safeParse({
+      ...request,
+      workspaceDirectory: "C:\\private\\workspace",
+    }).success).toBe(false);
+  });
+
   it("rejects snapshots whose cursors belong to another thread or execution generation", () => {
     const valid = threadSnapshot();
     expect(ThreadProjectionSnapshotSchema.safeParse(valid).success).toBe(true);
@@ -95,6 +126,81 @@ describe("host protocol schemas", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts only a self-consistent opaque resident end disposition", () => {
+    const source = threadSnapshot();
+    const ended = {
+      ...source,
+      generatedAt: "2026-08-06T00:00:01.000Z",
+      thread: {
+        ...source.thread,
+        recap: "Resident session ended.",
+        updatedAt: "2026-08-06T00:00:01.000Z",
+      },
+      residentLifecycle: {
+        version: 1 as const,
+        state: "ended" as const,
+        operationId: "resident-end-operation",
+        bindingFingerprint: "a".repeat(64),
+        endedAt: "2026-08-06T00:00:01.000Z",
+        sourceCursor: source.latestCursor,
+        reason: "user_end" as const,
+      },
+    };
+    expect(ThreadProjectionSnapshotSchema.safeParse(ended).success).toBe(true);
+    for (const status of ["complete", "failed"] as const) {
+      expect(ThreadProjectionSnapshotSchema.safeParse({
+        ...ended,
+        thread: { ...ended.thread, status },
+      }).success).toBe(true);
+    }
+    for (const status of ["running", "waiting", "needs_approval"] as const) {
+      expect(ThreadProjectionSnapshotSchema.safeParse({
+        ...ended,
+        thread: { ...ended.thread, status },
+      }).success).toBe(false);
+    }
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      thread: { ...ended.thread, recap: "Stale recap" },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      residentLifecycle: { ...ended.residentLifecycle, activeSessionId: "private-daemon-id" },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      runtime: {
+        runtime: "prime_agent",
+        residency: "resident",
+        isStreaming: false,
+        isCompacting: false,
+        isBashRunning: false,
+        retryAttempt: 0,
+        steeringMode: "all",
+        followUpMode: "all",
+        messageCount: 0,
+        compactionCount: 0,
+        queuedActionCount: 0,
+        activeToolNames: [],
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      queueState: { pendingCommandIds: ["still-live"], paused: false },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      residentLifecycle: {
+        ...ended.residentLifecycle,
+        sourceCursor: { ...ended.residentLifecycle.sourceCursor, sequence: 0 },
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...ended,
+      residentLifecycle: { ...ended.residentLifecycle, endedAt: "2026-08-06T00:00:02.000Z" },
+    }).success).toBe(false);
   });
 
   it("bounds command text and requires protocol v1", () => {

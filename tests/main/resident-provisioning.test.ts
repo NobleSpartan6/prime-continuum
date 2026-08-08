@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'electron'
-import type { ResidentLifecycleOperationView } from '../../src/main/control/contracts'
+import type {
+  ResidentLifecycleOperationView,
+  ResidentProvisionOperationView,
+} from '../../src/main/control/contracts'
 import type { ResidentLifecycleStatus } from '../../src/shared/protocol'
 import { ControlError } from '../../src/main/control/errors'
 
@@ -541,6 +544,7 @@ describe('DesktopControlService resident provisioning boundary', () => {
       executionGenerationId: record!.executionGenerationId,
     }, 'committed', new Date(Date.parse(timestamp) + 1_000).toISOString())
     await writeResidentLedger(directory, [{
+      kind: 'provision',
       operationId: selection.operationId,
       expectedHostId: selection.expectedHostId,
       projectId: record!.projectId,
@@ -1097,9 +1101,10 @@ function threadSnapshotFor(payload: Record<string, unknown>) {
 
 function ledgerEntry(
   operationId: string,
-  overrides: Partial<ResidentLifecycleOperationView>,
-): ResidentLifecycleOperationView {
+  overrides: Partial<ResidentProvisionOperationView>,
+): ResidentProvisionOperationView {
   return {
+    kind: 'provision',
     operationId,
     expectedHostId: 'host-a',
     projectId: `project-${operationId}`,
@@ -1135,7 +1140,7 @@ function lifecycleStatusForOperation(
   }
 }
 
-function ledgerPayload(entry: ResidentLifecycleOperationView): Record<string, unknown> {
+function ledgerPayload(entry: ResidentProvisionOperationView): Record<string, unknown> {
   return {
     expectedHostId: entry.expectedHostId,
     operationId: entry.operationId,

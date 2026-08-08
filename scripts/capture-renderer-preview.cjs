@@ -59,6 +59,15 @@ const targets = [
     expectCompactStatus: true,
   },
   {
+    name: 'desktop-end-pending-390',
+    width: 390,
+    height: 844,
+    visualState: 'resident-end-pending',
+    expectedText: 'Ending resident session · Prime Continuim will not send another kill automatically',
+    expectStatusVisible: true,
+    expectCompactStatus: true,
+  },
+  {
     name: 'resident-start-1600',
     width: 1600,
     height: 1000,
@@ -81,6 +90,23 @@ const targets = [
     expectedText: 'Start resident thread',
     openResidentDialog: true,
     expectShortResidentDialog: true,
+  },
+  {
+    name: 'resident-end-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'resident-end-review',
+    expectedText: 'End resident session?',
+    openResidentEndDialog: true,
+  },
+  {
+    name: 'resident-end-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'resident-end-review',
+    expectedText: 'End resident session?',
+    openResidentEndDialog: true,
+    expectShortResidentEndDialog: true,
   },
   {
     name: 'resident-recovery-320',
@@ -232,6 +258,38 @@ async function capture(target, rendererOrigin) {
       // 180ms sheet transition and the following compositor frame.
       await delay(300)
     }
+    if (target.openResidentEndDialog) {
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const runtimeTab = [...document.querySelectorAll('[role="tab"]')]
+          .find((candidate) => candidate.textContent?.trim() === 'Runtime')
+        if (!(runtimeTab instanceof HTMLButtonElement)) throw new Error('Runtime inspector tab was not found')
+        runtimeTab.click()
+      })()`)
+      const actionDeadline = Date.now() + 10_000
+      while (Date.now() < actionDeadline) {
+        const actionReady = await browserWindow.webContents.executeJavaScript(
+          `Boolean(document.querySelector('button.resident-end-trigger:not([disabled])'))`,
+        )
+        if (actionReady) break
+        await delay(25)
+      }
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = document.querySelector('button.resident-end-trigger:not([disabled])')
+        if (!(button instanceof HTMLButtonElement)) throw new Error('Resident end action was not found')
+        button.click()
+      })()`)
+      const dialogDeadline = Date.now() + 10_000
+      while (Date.now() < dialogDeadline) {
+        const open = await browserWindow.webContents.executeJavaScript(
+          `Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]'))`,
+        )
+        if (open) break
+        await delay(25)
+      }
+      await delay(300)
+    }
     const selector = target.surface === 'companion'
       ? '.companion-shell'
       : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
@@ -268,6 +326,10 @@ async function capture(target, rendererOrigin) {
       const residentDialogScrollStyle = residentDialogScroll ? window.getComputedStyle(residentDialogScroll) : undefined
       const residentDialogFooter = residentDialog?.querySelector('.sheet__footer')
       const residentDialogFooterRect = residentDialogFooter?.getBoundingClientRect()
+      const residentEndDialog = document.querySelector('dialog[aria-labelledby="resident-end-title"]')
+      const residentEndDialogScroll = residentEndDialog?.querySelector('.sheet__scroll')
+      const residentEndDialogScrollStyle = residentEndDialogScroll ? window.getComputedStyle(residentEndDialogScroll) : undefined
+      const residentEndDialogFooterRect = residentEndDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
       const emptyMain = document.querySelector('.empty-workbench__main')
       const emptyMainStyle = emptyMain ? window.getComputedStyle(emptyMain) : undefined
       return {
@@ -295,6 +357,16 @@ async function capture(target, rendererOrigin) {
           residentDialogFooterRect.height > 0 &&
           residentDialogFooterRect.bottom <= window.innerHeight
         ),
+        residentEndDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]')),
+        residentEndDialogContentReachable: Boolean(
+          residentEndDialogScroll &&
+          residentEndDialogScrollStyle &&
+          (residentEndDialogScrollStyle.overflowY === 'auto' || residentEndDialogScrollStyle.overflowY === 'scroll') &&
+          residentEndDialogScroll.clientHeight >= 48 &&
+          residentEndDialogFooterRect &&
+          residentEndDialogFooterRect.height > 0 &&
+          residentEndDialogFooterRect.bottom <= window.innerHeight
+        ),
         residentPickerBusy: document.querySelector('.empty-workbench__actions .button--primary')?.getAttribute('aria-busy'),
         emptyMainScrollable: Boolean(
           emptyMain &&
@@ -307,7 +379,10 @@ async function capture(target, rendererOrigin) {
         emptyMainOverflowY: emptyMainStyle?.overflowY,
       }
     })()`)
-    invariant(stateEvidence.expectedTextPresent, `${target.name} did not render its expected resident-state copy`)
+    invariant(
+      stateEvidence.expectedTextPresent,
+      `${target.name} did not render its expected resident-state copy: ${JSON.stringify(stateEvidence)}`,
+    )
     if (target.expectStatusVisible || target.expectCompactStatus) {
       invariant(stateEvidence.composerStatusVisible, `${target.name} hid its resident-state copy`)
     }
@@ -322,6 +397,12 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectShortResidentDialog) {
       invariant(stateEvidence.residentDialogContentReachable, `${target.name} did not keep the resident form and actions reachable`)
+    }
+    if (target.openResidentEndDialog) {
+      invariant(stateEvidence.residentEndDialogOpen, `${target.name} did not open the resident end review`)
+    }
+    if (target.expectShortResidentEndDialog) {
+      invariant(stateEvidence.residentEndDialogContentReachable, `${target.name} did not keep the resident end review and actions reachable`)
     }
     if (target.expectScrollableEmpty) {
       invariant(

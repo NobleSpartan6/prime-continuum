@@ -393,6 +393,20 @@ export const RuntimeSessionSummarySchema = z.object({
 });
 export type RuntimeSessionSummary = z.infer<typeof RuntimeSessionSummarySchema>;
 
+/** Host-owned terminal resident lifecycle fact; never inferred from runtime absence. */
+export const ResidentLifecycleDispositionSchema = z
+  .object({
+    version: z.literal(1),
+    state: z.literal("ended"),
+    operationId: IdSchema,
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    endedAt: IsoDateTimeSchema,
+    sourceCursor: SessionCursorSchema,
+    reason: z.literal("user_end"),
+  })
+  .strict();
+export type ResidentLifecycleDisposition = z.infer<typeof ResidentLifecycleDispositionSchema>;
+
 export const GitSummarySchema = z.object({
   branch: z.string().max(255).optional(),
   headCommit: z.string().max(128).optional(),
@@ -442,6 +456,7 @@ export const ThreadProjectionSnapshotSchema = z
     goals: z.array(GoalSummarySchema).max(1_000),
     schedules: z.array(ScheduleSummarySchema).max(1_000),
     runtime: RuntimeSessionSummarySchema.optional(),
+    residentLifecycle: ResidentLifecycleDispositionSchema.optional(),
     git: GitSummarySchema,
     evidence: EvidenceSummarySchema,
     pendingAttention: z.array(AttentionEventSchema).max(1_000),
@@ -463,6 +478,63 @@ export const ThreadProjectionSnapshotSchema = z
         code: "custom",
         path: ["latestCursor", "executionGenerationId"],
         message: "The latest cursor must belong to the current execution generation",
+      });
+    }
+    const residentLifecycle = snapshot.residentLifecycle;
+    if (!residentLifecycle) return;
+    if (
+      snapshot.thread.status !== "idle" &&
+      snapshot.thread.status !== "complete" &&
+      snapshot.thread.status !== "failed"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["thread", "status"],
+        message: "An ended resident lifecycle must have a non-actionable thread status",
+      });
+    }
+    if (snapshot.thread.recap !== "Resident session ended.") {
+      context.addIssue({
+        code: "custom",
+        path: ["thread", "recap"],
+        message: "An ended resident lifecycle must carry the exact terminal resident recap",
+      });
+    }
+    const liveStateRemains =
+      snapshot.runtime !== undefined ||
+      snapshot.inProgressStream !== undefined ||
+      snapshot.queueState.pendingCommandIds.length !== 0 ||
+      snapshot.queueState.paused ||
+      snapshot.approvals.length !== 0 ||
+      snapshot.childAgents.length !== 0 ||
+      snapshot.goals.length !== 0 ||
+      snapshot.schedules.length !== 0 ||
+      snapshot.pendingAttention.length !== 0;
+    if (liveStateRemains) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentLifecycle"],
+        message: "An ended resident lifecycle cannot retain live resident state",
+      });
+    }
+    const sourceCursor = residentLifecycle.sourceCursor;
+    if (
+      sourceCursor.threadId !== snapshot.latestCursor.threadId ||
+      sourceCursor.executionGenerationId !== snapshot.latestCursor.executionGenerationId ||
+      sourceCursor.generation !== snapshot.latestCursor.generation ||
+      sourceCursor.sequence !== snapshot.latestCursor.sequence
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentLifecycle", "sourceCursor"],
+        message: "The resident end source cursor must equal the preserved latest cursor",
+      });
+    }
+    if (Date.parse(residentLifecycle.endedAt) > Date.parse(snapshot.generatedAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentLifecycle", "endedAt"],
+        message: "The resident end time cannot be later than snapshot generation",
       });
     }
   });
@@ -1417,6 +1489,35 @@ export const ResidentProvisionRequestSchema = z
   .strict();
 export type ResidentProvisionRequest = z.infer<typeof ResidentProvisionRequestSchema>;
 
+/**
+ * Path-free trusted-desktop request to end one exact resident binding. Upstream
+ * session identities remain private to the host Store and verified adapter.
+ */
+export const ResidentEndRequestSchema = z
+  .object({
+    expectedHostId: IdSchema,
+    operationId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    expectedSourceCursor: SessionCursorSchema,
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (
+      request.expectedSourceCursor.threadId !== request.threadId ||
+      request.expectedSourceCursor.executionGenerationId !== request.executionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedSourceCursor"],
+        message: "Resident end consent cursor must belong to its exact thread generation",
+      });
+    }
+  });
+export type ResidentEndRequest = z.infer<typeof ResidentEndRequestSchema>;
+
 export const ResidentLifecycleLookupResultSchema = z
   .object({ status: ResidentLifecycleStatusSchema.nullable() })
   .strict();
@@ -1500,6 +1601,11 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     ...RequestBase,
+    method: z.literal("resident.end"),
+    payload: ResidentEndRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("resident.lifecycle.status"),
     payload: z.object({ expectedHostId: IdSchema, operationId: IdSchema }).strict(),
   }),
@@ -1555,6 +1661,7 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.reconcile"), result: CommandReconciliationSchema }),
   z.object({ ...SuccessBase, method: z.literal("resident.provision"), result: ResidentLifecycleStatusSchema }),
+  z.object({ ...SuccessBase, method: z.literal("resident.end"), result: ResidentLifecycleStatusSchema }),
   z.object({
     ...SuccessBase,
     method: z.literal("resident.lifecycle.status"),
@@ -1579,6 +1686,7 @@ export const HostIpcErrorResponseSchema = z.object({
     "command.submit",
     "command.reconcile",
     "resident.provision",
+    "resident.end",
     "resident.lifecycle.status",
     "handoff.plan",
     "handoff.commit",

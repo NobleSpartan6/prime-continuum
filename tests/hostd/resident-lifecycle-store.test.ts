@@ -10,8 +10,11 @@ import {
 } from "../../src/hostd/resident-runtime";
 import {
   HostStore,
+  type HostStoreOptions,
+  type ResidentEndLifecycleOperationInput,
   type ResidentLifecycleFaultPoint,
   type ResidentLifecycleOperationInput,
+  type ResidentKillLease,
   type ResidentOwnedSessionCandidate,
 } from "../../src/hostd/store";
 import { PROTOCOL_VERSION, type CommandEnvelope, type ThreadProjectionSnapshot } from "../../src/shared/protocol";
@@ -22,6 +25,16 @@ afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
+
+async function acknowledgeKill(store: HostStore, lease: ResidentKillLease) {
+  await store.authorizeResidentKillInvocation(lease);
+  return store.acknowledgeResidentKill(lease, {
+    acknowledgementVersion: 1,
+    operation: "end",
+    activeSessionId: lease.binding.activeSessionId,
+    sessionId: lease.binding.sessionId,
+  });
+}
 
 describe("HostStore resident provisioning lifecycle", () => {
   it("keeps an activating candidate out of dispatch until an exact leased projection is durable", async () => {
@@ -77,8 +90,9 @@ describe("HostStore resident provisioning lifecycle", () => {
     await expect(
       fixture.store.prepareResidentProvision({ ...input, requestDigest: "b".repeat(64) }),
     ).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED" });
+    const conflictingEndInput = await endOperationInput(fixture, input.operationId, "c");
     await expect(
-      fixture.store.prepareResidentEnd({ ...input, requestDigest: "c".repeat(64) }, legacyBinding(fixture)),
+      fixture.store.prepareResidentEnd(conflictingEndInput, legacyBinding(fixture)),
     ).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED" });
 
     const lease = await fixture.store.beginResidentOwnedCreate(input);
@@ -243,7 +257,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     const fixture = await createFixture();
     const active = legacyBinding(fixture);
     await fixture.store.persistResidentSessionBinding(active);
-    const endInput = operationInput(fixture, "resident-end", "e");
+    const endInput = await endOperationInput(fixture, "resident-end", "e");
     expect((await fixture.store.prepareResidentEnd(endInput, active)).phase).toBe("ending");
     expect(await fixture.store.listResidentSessionBindings()).toEqual([]);
     const command = promptCommand(fixture.hostId, "after-end-prompt", "demo-thread", "demo-execution-1");
@@ -252,7 +266,7 @@ describe("HostStore resident provisioning lifecycle", () => {
       error: { code: "RESIDENT_LIFECYCLE_IN_PROGRESS" },
     });
     const killLease = await fixture.store.beginResidentKill(endInput);
-    expect((await fixture.store.acknowledgeResidentKill(killLease)).phase).toBe("completed");
+    expect((await acknowledgeKill(fixture.store, killLease)).phase).toBe("completed");
 
     const restarted = new HostStore(fixture.directory);
     await restarted.initialize();
@@ -271,30 +285,63 @@ describe("HostStore resident provisioning lifecycle", () => {
     });
   });
 
+  it("ends valid opaque 4K daemon identities without exposing them in the public disposition", async () => {
+    const fixture = await createFixture();
+    const activeSessionId = `[daemon]/active?${"a".repeat(4_080)}`;
+    const sessionId = `session:#/${"b".repeat(4_086)}`;
+    expect(activeSessionId).toHaveLength(4_096);
+    expect(sessionId).toHaveLength(4_096);
+    const active = {
+      ...legacyBinding(fixture, "opaque-wire-identities"),
+      activeSessionId,
+      sessionId,
+    };
+    await fixture.store.persistResidentSessionBinding(active);
+    const input = await endOperationInput(fixture, "end-opaque-wire-identities", "d");
+    await fixture.store.prepareResidentEnd(input, active);
+    const lease = await fixture.store.beginResidentKill(input);
+    await acknowledgeKill(fixture.store, lease);
+
+    const snapshot = await fixture.store.getThreadSnapshot(active.threadId);
+    expect(snapshot.residentLifecycle).toMatchObject({
+      state: "ended",
+      operationId: input.operationId,
+      bindingFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    const publicJson = JSON.stringify(snapshot);
+    expect(publicJson).not.toContain(activeSessionId);
+    expect(publicJson).not.toContain(sessionId);
+  });
+
   it.each(["end", "detach"] as const)(
     "rejects a stale terminal %s operation retried against a newer resident binding",
     async (operation) => {
       const fixture = await createFixture();
       const original = legacyBinding(fixture, `stale-${operation}`);
       await fixture.store.persistResidentSessionBinding(original);
-      const input = operationInput(fixture, `stale-${operation}-operation`, operation === "end" ? "1" : "2");
+      const operationId = `stale-${operation}-operation`;
+      let staleRetry: Promise<unknown>;
       if (operation === "end") {
+        const input = await endOperationInput(fixture, operationId, "1");
         await fixture.store.prepareResidentEnd(input, original);
         const killLease = await fixture.store.beginResidentKill(input);
-        await fixture.store.acknowledgeResidentKill(killLease);
+        await acknowledgeKill(fixture.store, killLease);
+        const replacement = legacyBinding(fixture, `replacement-${operation}`);
+        await fixture.store.persistResidentSessionBinding(replacement);
+        staleRetry = fixture.store.prepareResidentEnd(input, replacement);
       } else {
+        const input = operationInput(fixture, operationId, "2");
         await fixture.store.detachResidentLifecycle(input, original);
+        const replacement = legacyBinding(fixture, `replacement-${operation}`);
+        await fixture.store.persistResidentSessionBinding(replacement);
+        staleRetry = fixture.store.detachResidentLifecycle(input, replacement);
       }
-
-      const replacement = legacyBinding(fixture, `replacement-${operation}`);
-      await fixture.store.persistResidentSessionBinding(replacement);
-      const staleRetry = operation === "end"
-        ? fixture.store.prepareResidentEnd(input, replacement)
-        : fixture.store.detachResidentLifecycle(input, replacement);
       await expect(staleRetry).rejects.toMatchObject({
         code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
       });
-      expect(await fixture.store.listResidentSessionBindings()).toEqual([replacement]);
+      expect(await fixture.store.listResidentSessionBindings()).toEqual([
+        expect.objectContaining({ activeSessionId: `active-replacement-${operation}` }),
+      ]);
     },
   );
 
@@ -339,12 +386,14 @@ describe("HostStore resident provisioning lifecycle", () => {
         projection(projectionLease.binding, successor === "end" ? 41 : 42),
       );
       const active = await fixture.store.commitResidentProvision(projectionLease);
-      const successorInput = operationInput(fixture, `linked-${successor}`, "2");
+      const successorOperationId = `linked-${successor}`;
       if (successor === "end") {
+        const successorInput = await endOperationInput(fixture, successorOperationId, "2");
         await fixture.store.prepareResidentEnd(successorInput, active);
         const killLease = await fixture.store.beginResidentKill(successorInput);
-        await fixture.store.acknowledgeResidentKill(killLease);
+        await acknowledgeKill(fixture.store, killLease);
       } else {
+        const successorInput = operationInput(fixture, successorOperationId, "2");
         await fixture.store.detachResidentLifecycle(successorInput, active);
       }
 
@@ -354,7 +403,7 @@ describe("HostStore resident provisioning lifecycle", () => {
       expect(await restarted.getResidentLifecycleStatus(provisionInput.operationId)).toMatchObject({
         phase: "committed",
       });
-      expect(await restarted.getResidentLifecycleStatus(successorInput.operationId)).toMatchObject({
+      expect(await restarted.getResidentLifecycleStatus(successorOperationId)).toMatchObject({
         phase: successor === "end" ? "completed" : "detached",
       });
     },
@@ -393,7 +442,7 @@ describe("HostStore resident provisioning lifecycle", () => {
     const provision = await provisionActiveBinding(fixture, "rollback-end-provision", "rollback-end", 52);
 
     vi.setSystemTime("2022-05-06T12:00:00.000Z");
-    const endInput = operationInput(fixture, "rollback-end-successor", "3");
+    const endInput = await endOperationInput(fixture, "rollback-end-successor", "3");
     const ending = await fixture.store.prepareResidentEnd(endInput, provision.binding);
     expect(ending.phase).toBe("ending");
     expect(Date.parse(ending.preparedAt)).toBeGreaterThanOrEqual(Date.parse(provision.binding.boundAt));
@@ -477,19 +526,21 @@ describe("HostStore resident provisioning lifecycle", () => {
       const reattached = new HostStore(fixture.directory);
       await reattached.initialize();
       expect(await reattached.listResidentSessionBindings()).toEqual([refreshed]);
-      const successorInput = operationInput(fixture, `refresh-${successor}`, "5");
+      const successorOperationId = `refresh-${successor}`;
       if (successor === "end") {
+        const successorInput = await endOperationInput(fixture, successorOperationId, "5", reattached);
         await reattached.prepareResidentEnd(successorInput, refreshed);
         const killLease = await reattached.beginResidentKill(successorInput);
-        await reattached.acknowledgeResidentKill(killLease);
+        await acknowledgeKill(reattached, killLease);
       } else {
+        const successorInput = operationInput(fixture, successorOperationId, "5");
         await reattached.detachResidentLifecycle(successorInput, refreshed);
       }
 
       const restarted = new HostStore(fixture.directory);
       await restarted.initialize();
       expect(await restarted.listResidentSessionBindings()).toEqual([]);
-      expect(await restarted.getResidentLifecycleStatus(successorInput.operationId)).toMatchObject({
+      expect(await restarted.getResidentLifecycleStatus(successorOperationId)).toMatchObject({
         phase: successor === "end" ? "completed" : "detached",
       });
     },
@@ -566,11 +617,12 @@ describe("HostStore resident provisioning lifecycle", () => {
     const killFixture = await createFixture();
     const active = legacyBinding(killFixture, "definite-kill-failure");
     await killFixture.store.persistResidentSessionBinding(active);
-    const killInput = operationInput(killFixture, "definite-kill-failure", "b");
+    const killInput = await endOperationInput(killFixture, "definite-kill-failure", "b");
     await killFixture.store.prepareResidentEnd(killInput, active);
     const firstKillLease = await killFixture.store.beginResidentKill(killInput);
     expect(await killFixture.store.failResidentKillBeforeEffect(firstKillLease)).toMatchObject({ phase: "ending" });
     const secondKillLease = await killFixture.store.beginResidentKill(killInput);
+    await killFixture.store.authorizeResidentKillInvocation(secondKillLease);
     expect(await killFixture.store.quarantineResidentLifecycleOutcomeUnknown(secondKillLease)).toMatchObject({
       phase: "quarantined",
       quarantinedFrom: "kill_dispatching",
@@ -644,13 +696,17 @@ describe("HostStore resident lifecycle crash boundaries", () => {
     "after_binding_revoked",
     "after_kill_dispatching",
     "after_kill_acknowledged",
+    "after_end_projection_prepare",
+    "after_end_projection_snapshot",
+    "after_end_projection_threads",
     "after_completed_binding",
     "after_completed",
   ] satisfies ResidentLifecycleFaultPoint[])("never replays an end mutation after %s", async (faultPoint) => {
     const fixture = await createFixture();
     const active = legacyBinding(fixture, faultPoint);
     await fixture.store.persistResidentSessionBinding(active);
-    const input = operationInput(fixture, `end-${faultPoint}`, "4");
+    const sourceSnapshot = await fixture.store.getThreadSnapshot(active.threadId);
+    const input = await endOperationInput(fixture, `end-${faultPoint}`, "4");
     let injected = false;
     const crashing = new HostStore(fixture.directory, {
       residentLifecycleFaultInjector(point) {
@@ -665,7 +721,7 @@ describe("HostStore resident lifecycle crash boundaries", () => {
     try {
       await crashing.prepareResidentEnd(input, active);
       const killLease = await crashing.beginResidentKill(input);
-      await crashing.acknowledgeResidentKill(killLease);
+      await acknowledgeKill(crashing, killLease);
     } catch (error) {
       thrown = error;
     }
@@ -684,10 +740,41 @@ describe("HostStore resident lifecycle crash boundaries", () => {
       await expect(restarted.beginResidentKill(input)).rejects.toMatchObject({
         code: "RESIDENT_LIFECYCLE_RECONCILIATION_REQUIRED",
       });
+      expect(await restarted.getThreadSnapshot(active.threadId)).toEqual(sourceSnapshot);
     } else if (faultPoint === "after_ending" || faultPoint === "after_binding_revoked") {
       expect(status?.phase).toBe("ending");
+      expect(await restarted.getThreadSnapshot(active.threadId)).toEqual(sourceSnapshot);
     } else {
       expect(status?.phase).toBe("completed");
+      const terminalSnapshot = await restarted.getThreadSnapshot(active.threadId);
+      expect(terminalSnapshot.latestCursor).toEqual(sourceSnapshot.latestCursor);
+      expect(terminalSnapshot).not.toHaveProperty("runtime");
+      expect(terminalSnapshot).not.toHaveProperty("inProgressStream");
+      expect(terminalSnapshot).toMatchObject({
+        queueState: { pendingCommandIds: [], paused: false },
+        approvals: [],
+        childAgents: [],
+        goals: [],
+        schedules: [],
+        pendingAttention: [],
+        residentLifecycle: {
+          version: 1,
+          state: "ended",
+          operationId: input.operationId,
+          endedAt: terminalSnapshot.generatedAt,
+          sourceCursor: sourceSnapshot.latestCursor,
+          reason: "user_end",
+        },
+      });
+      expect((await restarted.getCatalogSnapshot()).threads.find(
+        (thread) => thread.threadId === active.threadId,
+      )).toEqual(terminalSnapshot.thread);
+      await expect(restarted.beginResidentKill(input)).rejects.toMatchObject({
+        code: "RESIDENT_LIFECYCLE_PHASE_CONFLICT",
+      });
+      const restartedAgain = new HostStore(fixture.directory);
+      await restartedAgain.initialize();
+      expect(await restartedAgain.getThreadSnapshot(active.threadId)).toEqual(terminalSnapshot);
     }
   });
 
@@ -766,6 +853,135 @@ describe("HostStore resident lifecycle crash boundaries", () => {
   });
 });
 
+describe("HostStore resident lifecycle terminal retirement", () => {
+  it("keeps admitting work beyond the bounded registry while retired operation and session identities stay fenced", async () => {
+    const operationLimit = 4;
+    const lineageLimit = 4;
+    const fixture = await createFixture({
+      residentLifecycleOperationLimit: operationLimit,
+      residentProjectionLineageLimit: lineageLimit,
+    });
+    let firstProvision: Awaited<ReturnType<typeof provisionActiveBinding>> | undefined;
+    let firstEndInput: ResidentEndLifecycleOperationInput | undefined;
+    let firstLineageName: string | undefined;
+    for (let index = 0; index < operationLimit + 2; index += 1) {
+      const provisioned = await provisionActiveBinding(
+        fixture,
+        `retirement-provision-${index}`,
+        `retirement-candidate-${index}`,
+        100 + index,
+      );
+      const endInput = await endOperationInput(fixture, `retirement-end-${index}`, "b");
+      await fixture.store.prepareResidentEnd(endInput, provisioned.binding);
+      const lease = await fixture.store.beginResidentKill(endInput);
+      await acknowledgeKill(fixture.store, lease);
+      firstProvision ??= provisioned;
+      firstEndInput ??= endInput;
+      if (index === 0) {
+        [firstLineageName] = await readdir(fixture.store.paths.residentProjectionLineages);
+      }
+    }
+    if (!firstProvision || !firstEndInput || !firstLineageName) {
+      throw new Error("retirement fixture did not run");
+    }
+
+    expect((await readdir(fixture.store.paths.residentLifecycleOperations)).length).toBeLessThanOrEqual(operationLimit);
+    const remainingLineages = await readdir(fixture.store.paths.residentProjectionLineages);
+    expect(remainingLineages.length).toBeLessThan(lineageLimit);
+    expect(remainingLineages).not.toContain(firstLineageName);
+    expect(await fixture.store.getResidentLifecycleStatus(firstProvision.input.operationId)).toBeUndefined();
+    expect(await fixture.store.getResidentLifecycleStatus(firstEndInput.operationId)).toBeUndefined();
+    await expect(fixture.store.prepareResidentProvision(firstProvision.input)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+    });
+    await expect(fixture.store.prepareResidentEnd(firstEndInput, firstProvision.binding)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+    });
+    await expect(fixture.store.persistResidentSessionBinding(firstProvision.binding)).rejects.toMatchObject({
+      code: "RESIDENT_SESSION_REUSED",
+    });
+
+    const restarted = new HostStore(fixture.directory, {
+      residentLifecycleOperationLimit: operationLimit,
+      residentProjectionLineageLimit: lineageLimit,
+    });
+    await restarted.initialize();
+    expect(await readdir(restarted.paths.residentProjectionLineages)).not.toContain(firstLineageName);
+    await expect(restarted.prepareResidentProvision(firstProvision.input)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+    });
+    await expect(restarted.persistResidentSessionBinding(firstProvision.binding)).rejects.toMatchObject({
+      code: "RESIDENT_SESSION_REUSED",
+    });
+  });
+
+  it.each([
+    "after_retirement_prepare",
+    "after_retirement_fence",
+    "after_retirement_lineage",
+    "after_retirement_binding",
+    "after_retirement_operations",
+  ] satisfies ResidentLifecycleFaultPoint[])("recovers an interrupted terminal retirement after %s", async (faultPoint) => {
+    const operationLimit = 4;
+    const lineageLimit = 4;
+    const fixture = await createFixture({
+      residentLifecycleOperationLimit: operationLimit,
+      residentProjectionLineageLimit: lineageLimit,
+    });
+    let retiringLineageName: string | undefined;
+    for (let index = 0; index < 2; index += 1) {
+      const provisioned = await provisionActiveBinding(
+        fixture,
+        `retirement-crash-provision-${faultPoint}-${index}`,
+        `${index}-retirement-crash-candidate-${faultPoint}`,
+        200 + index,
+      );
+      const endInput = await endOperationInput(
+        fixture,
+        `retirement-crash-end-${faultPoint}-${index}`,
+        "c",
+      );
+      await fixture.store.prepareResidentEnd(endInput, provisioned.binding);
+      const lease = await fixture.store.beginResidentKill(endInput);
+      await acknowledgeKill(fixture.store, lease);
+      if (index === 1) {
+        [retiringLineageName] = await readdir(fixture.store.paths.residentProjectionLineages);
+      }
+    }
+    if (!retiringLineageName) throw new Error("retirement lineage fixture did not run");
+    const retiredOperationId = `retirement-crash-provision-${faultPoint}-0`;
+    let injected = false;
+    const crashing = new HostStore(fixture.directory, {
+      residentLifecycleOperationLimit: operationLimit,
+      residentProjectionLineageLimit: lineageLimit,
+      residentLifecycleFaultInjector(point) {
+        if (!injected && point === faultPoint) {
+          injected = true;
+          throw new Error(`simulated retirement crash at ${point}`);
+        }
+      },
+    });
+    await crashing.initialize();
+    const nextInput = operationInput(fixture, `retirement-crash-next-${faultPoint}`, "d");
+    await expect(crashing.prepareResidentProvision(nextInput)).rejects.toThrow(
+      `simulated retirement crash at ${faultPoint}`,
+    );
+
+    const restarted = new HostStore(fixture.directory, {
+      residentLifecycleOperationLimit: operationLimit,
+      residentProjectionLineageLimit: lineageLimit,
+    });
+    await restarted.initialize();
+    expect(await readdir(restarted.paths.residentProjectionLineages)).not.toContain(retiringLineageName);
+    await expect(restarted.prepareResidentProvision(operationInput(
+      fixture,
+      retiredOperationId,
+    ))).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED" });
+    await expect(restarted.prepareResidentProvision(nextInput)).resolves.toMatchObject({ phase: "prepared" });
+    expect((await readdir(restarted.paths.residentLifecycleOperations)).length).toBeLessThanOrEqual(operationLimit);
+  });
+});
+
 describe("HostStore resident lifecycle durable validation", () => {
   it("accepts legacy v1 active/completed records and rejects cross-kind quarantine corruption", async () => {
     const fixture = await createFixture();
@@ -812,10 +1028,10 @@ describe("HostStore resident lifecycle durable validation", () => {
       } else {
         const active = legacyBinding(fixture, "malformed-completed");
         await fixture.store.persistResidentSessionBinding(active);
-        const input = operationInput(fixture, "malformed-end", "9");
+        const input = await endOperationInput(fixture, "malformed-end", "9");
         await fixture.store.prepareResidentEnd(input, active);
         const killLease = await fixture.store.beginResidentKill(input);
-        await fixture.store.acknowledgeResidentKill(killLease);
+        await acknowledgeKill(fixture.store, killLease);
       }
       const file = JSON.parse(await readFile(fixture.store.paths.residentSessionBindings, "utf8")) as {
         records: Array<Record<string, unknown>>;
@@ -878,10 +1094,10 @@ describe("HostStore resident lifecycle durable validation", () => {
       } else if (state === "completed") {
         const active = legacyBinding(fixture, "missing-completed");
         await fixture.store.persistResidentSessionBinding(active);
-        const input = operationInput(fixture, "missing-completed-binding", "e");
+        const input = await endOperationInput(fixture, "missing-completed-binding", "e");
         await fixture.store.prepareResidentEnd(input, active);
         const killLease = await fixture.store.beginResidentKill(input);
-        await fixture.store.acknowledgeResidentKill(killLease);
+        await acknowledgeKill(fixture.store, killLease);
       } else {
         const active = legacyBinding(fixture, "missing-detached");
         await fixture.store.persistResidentSessionBinding(active);
@@ -911,13 +1127,13 @@ interface Fixture {
   hostId: string;
 }
 
-async function createFixture(): Promise<Fixture> {
+async function createFixture(options: HostStoreOptions = {}): Promise<Fixture> {
   const directory = await mkdtemp(join(tmpdir(), "prime-resident-lifecycle-"));
   temporaryDirectories.push(directory);
   const workspace = join(directory, "workspace");
   await mkdir(workspace, { recursive: true });
   const workspaceDirectory = await realpath(workspace);
-  const store = new HostStore(directory);
+  const store = new HostStore(directory, options);
   await store.initialize({ seed: true });
   await store.registerWorkspaceAuthority({
     threadId: "demo-thread",
@@ -936,6 +1152,19 @@ function operationInput(fixture: Fixture, operationId: string, digest = "a"): Re
     threadId: "demo-thread",
     executionGenerationId: "demo-execution-1",
     requestDigest: digest.repeat(64),
+  };
+}
+
+async function endOperationInput(
+  fixture: Fixture,
+  operationId: string,
+  digest = "a",
+  store: HostStore = fixture.store,
+): Promise<ResidentEndLifecycleOperationInput> {
+  const snapshot = await store.getThreadSnapshot("demo-thread");
+  return {
+    ...operationInput(fixture, operationId, digest),
+    expectedSourceCursor: snapshot.latestCursor,
   };
 }
 

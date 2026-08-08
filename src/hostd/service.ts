@@ -52,6 +52,7 @@ import {
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
 import {
   ResidentProvisionCoordinatorError,
+  type ResidentEndRequest as CoordinatorResidentEndRequest,
   type ResidentProvisionRequest as CoordinatorResidentProvisionRequest,
 } from "./resident-lifecycle-coordinator";
 
@@ -78,6 +79,7 @@ const KNOWN_METHODS = new Set([
   "command.submit",
   "command.reconcile",
   "resident.provision",
+  "resident.end",
   "resident.lifecycle.status",
   "handoff.plan",
   "handoff.commit",
@@ -120,6 +122,7 @@ export interface RuntimeIntegrityReadinessProvider {
 type ResidentLifecycleGateway = PrimeAgentGateway & {
   residentLifecycleCapabilityReady(): Promise<boolean>;
   provisionResident(request: CoordinatorResidentProvisionRequest): Promise<unknown>;
+  endResident(request: CoordinatorResidentEndRequest): Promise<unknown>;
 };
 
 type ResidentProvisionProtocolPayload = Extract<
@@ -756,6 +759,27 @@ export class HostService {
         });
         return ResidentLifecycleStatusSchema.parse(status);
       }
+      case "resident.end": {
+        const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+        if (runtimeIntegrity && runtimeIntegrity.status !== "ready") {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_RUNTIME_UNAVAILABLE",
+            "The verified Prime Agent runtime is not ready to end this resident session.",
+            runtimeIntegrity.status !== "unavailable",
+          );
+        }
+        if (!isResidentLifecycleGateway(this.gateway)) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_UNAVAILABLE",
+            "Resident session lifecycle control is not available on this host.",
+            true,
+          );
+        }
+        // The coordinator's first async boundary is durable Store preparation;
+        // runtime/adapter readiness is acquired only after `ending` exists.
+        const status = await this.gateway.endResident(request.payload);
+        return ResidentLifecycleStatusSchema.parse(status);
+      }
       case "resident.lifecycle.status": {
         const host = await this.store.getHost();
         if (request.payload.expectedHostId !== host.hostId) {
@@ -952,6 +976,7 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       // the protocol switch exhaustive without granting remote OAuth access.
       return "host.admin";
     case "resident.provision":
+    case "resident.end":
     case "resident.lifecycle.status":
       // Remote and SSH lifecycle requests are rejected before this scope is
       // evaluated. Keep the protocol switch exhaustive without granting a
@@ -979,13 +1004,16 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
 }
 
 function isResidentLifecycleRequest(request: HostIpcRequest): boolean {
-  return request.method === "resident.provision" || request.method === "resident.lifecycle.status";
+  return request.method === "resident.provision" ||
+    request.method === "resident.end" ||
+    request.method === "resident.lifecycle.status";
 }
 
 function isResidentLifecycleGateway(gateway: PrimeAgentGateway): gateway is ResidentLifecycleGateway {
   const candidate = gateway as Partial<ResidentLifecycleGateway>;
   return typeof candidate.residentLifecycleCapabilityReady === "function" &&
-    typeof candidate.provisionResident === "function";
+    typeof candidate.provisionResident === "function" &&
+    typeof candidate.endResident === "function";
 }
 
 function residentWorkspaceBootstrapOperationId(operationId: string): string {

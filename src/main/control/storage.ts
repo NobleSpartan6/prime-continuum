@@ -9,9 +9,11 @@ export interface AtomicJsonStoreOptions<T> {
   /** Disposable caches may recover empty; durable mutation logs must fail closed. */
   malformedJson?: 'fallback' | 'error'
   validateRoot?: (value: unknown) => value is T
+  /** Platform/test seam; defaults to a POSIX parent-directory fsync after rename. */
+  syncParentDirectory?: (directory: string) => Promise<void>
 }
 
-/** Small crash-safe JSON store for disposable projections and the explicit outbox. */
+/** Small crash-safe JSON store for bounded desktop projections and mutation ledgers. */
 export class AtomicJsonStore<T> {
   private readonly filePath: string
   private readonly fallback: () => T
@@ -64,31 +66,7 @@ export class AtomicJsonStore<T> {
   }
 
   async write(value: T): Promise<void> {
-    const operation = this.tail.then(async () => {
-      const bytes = Buffer.from(JSON.stringify(value), 'utf8')
-      if (bytes.length > this.maxBytes) {
-        throw new ControlError('storage.write_limit', 'The value is too large for the native cache.', {
-          details: { file: path.basename(this.filePath), maxBytes: this.maxBytes }
-        })
-      }
-      const directory = path.dirname(this.filePath)
-      await mkdir(directory, { recursive: true, mode: 0o700 })
-      const temporaryPath = path.join(directory, `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`)
-      const handle = await open(temporaryPath, 'wx', 0o600)
-      try {
-        await handle.writeFile(bytes)
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-
-      try {
-        await rename(temporaryPath, this.filePath)
-      } catch (error) {
-        await rm(temporaryPath, { force: true })
-        throw error
-      }
-    })
+    const operation = this.tail.then(() => this.writeUnqueued(value))
     this.tail = operation.catch(() => undefined)
     return await operation
   }
@@ -121,12 +99,37 @@ export class AtomicJsonStore<T> {
     } finally {
       await handle.close()
     }
+    let renamed = false
     try {
       await rename(temporaryPath, this.filePath)
+      renamed = true
+      await (this.options.syncParentDirectory ?? syncParentDirectory)(directory)
     } catch (error) {
       await rm(temporaryPath, { force: true })
+      if (renamed) {
+        throw new ControlError(
+          'storage.commit_uncertain',
+          'A native state replacement became visible, but its power-loss durability could not be confirmed.',
+          { details: { file: path.basename(this.filePath) }, cause: error },
+        )
+      }
       throw error
     }
+  }
+}
+
+/**
+ * POSIX requires the containing directory entry to be synced after rename.
+ * Node does not expose a portable directory fsync on Windows, where the
+ * flushed file plus atomic rename remains the strongest available contract.
+ */
+async function syncParentDirectory(directoryPath: string): Promise<void> {
+  if (process.platform === 'win32') return
+  const directory = await open(directoryPath, 'r')
+  try {
+    await directory.sync()
+  } finally {
+    await directory.close()
   }
 }
 export interface LatencyTrace {

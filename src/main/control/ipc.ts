@@ -54,6 +54,22 @@ const residentWorkspaceSelection = z
   .object({ resumeOperationId: id.optional() })
   .strict()
   .optional()
+const residentEndPreparation = z
+  .object({
+    expectedHostId: id,
+    projectId: id,
+    workspaceId: id,
+    threadId: id,
+    executionGenerationId: id,
+    resumeOperationId: id.optional(),
+  })
+  .strict()
+const residentEnd = z
+  .object({
+    confirmationToken: id,
+    consent: z.literal(true),
+  })
+  .strict()
 
 export interface ControlIpcOptions {
   ipcMain: IpcMain
@@ -144,6 +160,16 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     IPC.provisionResident,
     residentProvision,
     (input: z.infer<typeof residentProvision>) => service.provisionResident(input)
+  )
+  handle(
+    IPC.prepareResidentEnd,
+    residentEndPreparation,
+    (input: z.infer<typeof residentEndPreparation>) => service.prepareResidentEnd(input)
+  )
+  handle(
+    IPC.endResident,
+    residentEnd,
+    (input: z.infer<typeof residentEnd>) => service.endResident(input)
   )
   handle(
     IPC.residentLifecycleStatus,

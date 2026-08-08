@@ -55,6 +55,28 @@ Agent 0.7.0, protocol 7, schema revision 13, schema ID
 capability. Normal disposal detaches. Only an explicit end-session operation may
 complete or kill the session.
 
+An explicit `resident.end` is a path-free trusted-local lifecycle request bound
+to the exact host, thread, execution generation, and reviewed
+`expectedSourceCursor`. Cursor drift rejects the request before the ending WAL,
+binding revocation, adapter acquisition, or daemon kill. Once admitted,
+HostStore durably records `ending`, revokes resident command authority, and
+issues the one-shot end lease. The adapter then requires the unchanged active
+binding and an exact list-visible `draft` or `live` daemon session, including its
+session file, workspace, and verified runtime identity, before that lease can
+cross the single upstream kill call. A definitive acknowledgement commits the
+completed tombstone and terminal projection; an uncertain post-invocation
+result is quarantined and never replayed.
+
+A confirmed End preserves an existing `complete` or `failed` task outcome
+(otherwise it becomes `idle`), plus transcript, Git, evidence, and unrelated
+catalog history. It clears live runtime, stream, queue, approval, child-agent,
+goal, schedule, and attention state; sets the exact recap `Resident session
+ended.`; and publishes only
+`{ version: 1, state: "ended", operationId, bindingFingerprint, endedAt, sourceCursor, reason: "user_end" }`
+as the public resident disposition. No raw daemon identity is exposed. Restart
+and exact request replay return the same completed result without restoring a
+binding or session or invoking kill again.
+
 Resident `prompt` and `abort` use a store-minted opaque dispatch lease. The
 exact command and binding are journaled before the lease becomes dispatchable,
 `dispatching` is durable before the one upstream call, and a host restart never

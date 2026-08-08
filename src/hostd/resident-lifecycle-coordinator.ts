@@ -5,17 +5,22 @@ import {
 } from "./prime-agent-resident-adapter";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
+  ResidentEndAcknowledgementSchema,
   ResidentRuntimeContractError,
   validateResidentOwnedSessionCreateInput,
   type ResidentOwnedSessionCreateInput,
+  type ResidentEndAcknowledgement,
   type ResidentSessionBinding,
 } from "./resident-runtime";
 import {
+  ResidentEndLifecycleOperationInputSchema,
   ResidentLifecycleOperationInputSchema,
   type HostStore,
+  type ResidentEndLifecycleOperationInput,
   type ResidentLifecycleOperationInput,
   type ResidentLifecycleProjectionLease,
   type ResidentLifecycleStatus,
+  type ResidentKillLease,
   type ResidentOwnedSessionCandidate,
 } from "./store";
 
@@ -36,6 +41,7 @@ const ResidentProvisionSelectionSchema = z.discriminatedUnion("kind", [
 
 const ResidentProvisionRequestSchema = ResidentLifecycleOperationInputSchema.omit({
   requestDigest: true,
+  expectedSourceCursor: true,
 })
   .extend({ selection: ResidentProvisionSelectionSchema })
   .strict();
@@ -43,10 +49,20 @@ const ResidentProvisionRequestSchema = ResidentLifecycleOperationInputSchema.omi
 export type ResidentProvisionSelection = z.infer<typeof ResidentProvisionSelectionSchema>;
 export type ResidentProvisionRequest = z.infer<typeof ResidentProvisionRequestSchema>;
 
+const ResidentEndRequestSchema = ResidentLifecycleOperationInputSchema.omit({
+  requestDigest: true,
+})
+  .extend({ expectedSourceCursor: ResidentEndLifecycleOperationInputSchema.shape.expectedSourceCursor })
+  .strict();
+
+export type ResidentEndRequest = z.infer<typeof ResidentEndRequestSchema>;
+
 export interface ResidentProvisioningAdapter {
   createOwnedCandidate(input: ResidentOwnedSessionCreateInput): Promise<ResidentOwnedRuntimeCandidate>;
   /** Exact-binding, read-only recovery. It must not persist or publish by itself. */
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
+  /** Root kill accepts no binding or upstream identity outside this opaque Store authority. */
+  endResidentSession?(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
 }
 
 type ResidentProvisioningStore = Pick<
@@ -63,6 +79,12 @@ type ResidentProvisioningStore = Pick<
   | "acquireResidentProvisionRecoveryLease"
   | "publishResidentLifecycleProjection"
   | "commitResidentProvision"
+  | "prepareResidentEnd"
+  | "getResidentEndBinding"
+  | "beginResidentKill"
+  | "failResidentKillBeforeEffect"
+  | "acknowledgeResidentKill"
+  | "completeAcknowledgedResidentEnd"
   | "quarantineResidentLifecycleOutcomeUnknown"
 >;
 
@@ -71,6 +93,10 @@ export interface ResidentLifecycleCoordinatorOptions {
   readonly adapter: () => Promise<ResidentProvisioningAdapter>;
   /** Called only after the exact binding and projection are durably committed. */
   readonly onCommitted?: (binding: ResidentSessionBinding) => void | Promise<void>;
+  /** Called immediately after durable command-authority revocation. */
+  readonly onEnding?: (binding: ResidentSessionBinding) => void | Promise<void>;
+  /** Advisory refresh emitted only after exact terminal public materialization. */
+  readonly onEnded?: (binding: ResidentSessionBinding) => void | Promise<void>;
 }
 
 interface NormalizedResidentProvisionRequest {
@@ -98,7 +124,10 @@ export class ResidentLifecycleCoordinator {
   private readonly store: ResidentProvisioningStore;
   private readonly adapter: () => Promise<ResidentProvisioningAdapter>;
   private readonly onCommitted: (binding: ResidentSessionBinding) => void | Promise<void>;
+  private readonly onEnding: (binding: ResidentSessionBinding) => void | Promise<void>;
+  private readonly onEnded: (binding: ResidentSessionBinding) => void | Promise<void>;
   private readonly jobs = new Map<string, ResidentProvisionJob>();
+  private readonly endJobs = new Map<string, ResidentProvisionJob>();
   private readonly candidates = new Map<string, HeldResidentCandidate>();
   private closeRequested = false;
   private closePromise: Promise<void> | undefined;
@@ -107,6 +136,8 @@ export class ResidentLifecycleCoordinator {
     this.store = options.store;
     this.adapter = options.adapter;
     this.onCommitted = options.onCommitted ?? (() => undefined);
+    this.onEnding = options.onEnding ?? (() => undefined);
+    this.onEnded = options.onEnded ?? (() => undefined);
   }
 
   async provision(requestValue: ResidentProvisionRequest): Promise<ResidentLifecycleStatus> {
@@ -140,10 +171,44 @@ export class ResidentLifecycleCoordinator {
     return promise;
   }
 
+  async end(requestValue: ResidentEndRequest): Promise<ResidentLifecycleStatus> {
+    if (this.closeRequested) return Promise.reject(coordinatorClosed());
+    const request = ResidentEndRequestSchema.parse(requestValue);
+    const input = ResidentEndLifecycleOperationInputSchema.parse({
+      ...request,
+      requestDigest: residentEndRequestDigest(request),
+    });
+    const requestFingerprint = createHash("sha256")
+      .update(JSON.stringify({ operation: "resident.end", input }))
+      .digest("hex");
+    const existing = this.endJobs.get(input.operationId);
+    if (existing) {
+      if (existing.requestFingerprint !== requestFingerprint) {
+        throw new ResidentProvisionCoordinatorError(
+          "RESIDENT_END_OPERATION_ID_REUSED",
+          "This resident end operation is already bound to a different exact request.",
+        );
+      }
+      return existing.promise;
+    }
+
+    const promise = this.runEnd(input);
+    const job = Object.freeze({ requestFingerprint, promise });
+    this.endJobs.set(input.operationId, job);
+    promise.then(
+      () => this.finishEndJob(input.operationId, job),
+      () => this.finishEndJob(input.operationId, job),
+    );
+    return promise;
+  }
+
   close(): Promise<void> {
     this.closeRequested = true;
     this.closePromise ??= (async () => {
-      await Promise.allSettled([...this.jobs.values()].map((job) => job.promise));
+      await Promise.allSettled([
+        ...[...this.jobs.values()].map((job) => job.promise),
+        ...[...this.endJobs.values()].map((job) => job.promise),
+      ]);
       await Promise.allSettled(
         [...this.candidates.keys()].map((operationId) => this.releaseHeldCandidate(operationId)),
       );
@@ -153,6 +218,81 @@ export class ResidentLifecycleCoordinator {
 
   private finishJob(operationId: string, job: ResidentProvisionJob): void {
     if (this.jobs.get(operationId) === job) this.jobs.delete(operationId);
+  }
+
+  private finishEndJob(operationId: string, job: ResidentProvisionJob): void {
+    if (this.endJobs.get(operationId) === job) this.endJobs.delete(operationId);
+  }
+
+  private async runEnd(input: ResidentEndLifecycleOperationInput): Promise<ResidentLifecycleStatus> {
+    // This is intentionally the first await: Store resolves the exact active
+    // binding and persists `ending` atomically. A reconnecting status request
+    // queued afterward can therefore never observe null while this call later
+    // gains mutation authority.
+    let status = await this.store.prepareResidentEnd(input);
+    const binding = await this.store.getResidentEndBinding(input);
+    await Promise.resolve(this.onEnding(binding)).catch(() => undefined);
+    if (status.phase === "kill_acknowledged") {
+      const completed = await this.store.completeAcknowledgedResidentEnd(input);
+      await Promise.resolve(this.onEnded(binding)).catch(() => undefined);
+      return completed;
+    }
+    if (status.phase === "completed") {
+      await Promise.resolve(this.onEnded(binding)).catch(() => undefined);
+      return status;
+    }
+    if (isTerminalEndStatus(status) || status.phase === "kill_dispatching") return status;
+    if (status.phase !== "ending" || this.closeRequested) return status;
+
+    let adapter: ResidentProvisioningAdapter;
+    try {
+      adapter = await this.adapter();
+    } catch {
+      return status;
+    }
+    if (this.closeRequested || typeof adapter.endResidentSession !== "function") return status;
+
+    // Issuance is process-local only; durable state remains `ending` throughout
+    // daemon/list preflight. The adapter's final Store authorizer creates
+    // `kill_dispatching` immediately before invoking root kill.
+    const lease = await this.store.beginResidentKill(input);
+    if (this.closeRequested) return this.store.failResidentKillBeforeEffect(lease);
+    if (typeof adapter.endResidentSession !== "function") {
+      return this.store.failResidentKillBeforeEffect(lease);
+    }
+
+    let acknowledgement: ResidentEndAcknowledgement;
+    try {
+      const acknowledgementValue = await adapter.endResidentSession(lease);
+      const parsed = ResidentEndAcknowledgementSchema.safeParse(acknowledgementValue);
+      if (
+        !parsed.success ||
+        parsed.data.activeSessionId !== lease.binding.activeSessionId ||
+        parsed.data.sessionId !== lease.binding.sessionId
+      ) {
+        return this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+      }
+      acknowledgement = parsed.data;
+    } catch (error) {
+      return isDefinitiveRuntimeFailureBeforeEffect(error)
+        ? this.store.failResidentKillBeforeEffect(lease)
+        : this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+    }
+
+    // Once the adapter resolves, close must still drain this acknowledgement.
+    // If Store settlement itself is interrupted, quarantine only if the exact
+    // dispatch boundary remains; otherwise return the already-durable state.
+    try {
+      const completed = await this.store.acknowledgeResidentKill(lease, acknowledgement);
+      await Promise.resolve(this.onEnded(binding)).catch(() => undefined);
+      return completed;
+    } catch (error) {
+      try {
+        return await this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+      } catch {
+        return this.currentStatusOrThrow(input.operationId, error);
+      }
+    }
   }
 
   private async normalizeRequest(
@@ -468,6 +608,22 @@ export function residentProvisionRequestDigest(
     .digest("hex");
 }
 
+/** Stable path-free digest of the exact public resident-end authority. */
+export function residentEndRequestDigest(request: ResidentEndRequest): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      requestVersion: 1,
+      operation: "resident.end",
+      expectedHostId: request.expectedHostId,
+      projectId: request.projectId,
+      workspaceId: request.workspaceId,
+      threadId: request.threadId,
+      executionGenerationId: request.executionGenerationId,
+      expectedSourceCursor: request.expectedSourceCursor,
+    }))
+    .digest("hex");
+}
+
 function provisionSelectionFromCreateInput(
   input: ResidentOwnedSessionCreateInput,
 ): ResidentProvisionSelection {
@@ -503,6 +659,10 @@ function isDefinitiveRuntimeFailureBeforeEffect(error: unknown): boolean {
 
 function isTerminalProvisionStatus(status: ResidentLifecycleStatus): boolean {
   return status.phase === "committed" || status.phase === "completed" || status.phase === "quarantined";
+}
+
+function isTerminalEndStatus(status: ResidentLifecycleStatus): boolean {
+  return status.phase === "completed" || status.phase === "quarantined";
 }
 
 function coordinatorClosed(): ResidentProvisionCoordinatorError {

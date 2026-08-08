@@ -32,6 +32,7 @@ import type { VerifiedInstalledRuntimeHandle } from "./runtime-integrity-manager
 import type { VerifiedRuntimeHandleProvider } from "./runtime-model-catalog";
 import {
   ResidentLifecycleCoordinator,
+  type ResidentEndRequest,
   type ResidentProvisionRequest,
   type ResidentProvisioningAdapter,
 } from "./resident-lifecycle-coordinator";
@@ -53,6 +54,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES = 100;
 type ResidentGatewayAdapter = PrimeAgentGateway & {
   createOwnedCandidate?(input: Parameters<ResidentProvisioningAdapter["createOwnedCandidate"]>[0]): Promise<ResidentOwnedRuntimeCandidate>;
   readStableResidentProjection?(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
+  endResidentSession?: NonNullable<ResidentProvisioningAdapter["endResidentSession"]>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,
@@ -138,6 +140,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       store: this.store,
       adapter: () => this.ensureProvisioningAdapter(),
       onCommitted: (binding) => this.acceptCommittedBinding(binding),
+      onEnding: (binding) => this.acceptEndingBinding(binding),
+      onEnded: (binding) => this.publishEndedBindingChange(binding),
     });
   }
 
@@ -212,6 +216,14 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
     }
     return this.lifecycleCoordinator.provision(request);
+  }
+
+  /** Durable explicit end for one exact Store-authorized resident thread. */
+  endResident(request: ResidentEndRequest): Promise<ResidentLifecycleStatus> {
+    if (this.closed) {
+      return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
+    }
+    return this.lifecycleCoordinator.end(request);
   }
 
   subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
@@ -325,7 +337,6 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       if (abortDiscovery) await abortDiscovery.catch(() => undefined);
       await Promise.allSettled([...this.promptReconciliationJobs.values()]);
       await Promise.allSettled([...this.abortReconciliationJobs.values()]);
-      await this.adapter?.close();
       this.projectionListeners.clear();
       this.promptIdleListeners.clear();
       this.abortIdleListeners.clear();
@@ -359,7 +370,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     const adapter = await this.ensureAdapter();
     if (
       typeof adapter.createOwnedCandidate !== "function" ||
-      typeof adapter.readStableResidentProjection !== "function"
+      typeof adapter.readStableResidentProjection !== "function" ||
+      typeof adapter.endResidentSession !== "function"
     ) {
       throw new ResidentRuntimeContractError(
         "PRIME_RUNTIME_MODULE_INVALID",
@@ -370,6 +382,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       createOwnedCandidate: (input: ResidentOwnedSessionCreateInput) => adapter.createOwnedCandidate!(input),
       readStableResidentProjection: (binding: ResidentSessionBinding) =>
         adapter.readStableResidentProjection!(binding),
+      endResidentSession: (lease: Parameters<NonNullable<ResidentProvisioningAdapter["endResidentSession"]>>[0]) =>
+        adapter.endResidentSession!(lease),
     });
   }
 
@@ -382,6 +396,34 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     });
     this.desiredBindings.set(slot, desired);
     this.scheduleBindingPreparation(desired);
+  }
+
+  private async acceptEndingBinding(binding: ResidentSessionBinding): Promise<void> {
+    const slot = residentBindingSlotKeyFor(binding);
+    const desired = this.desiredBindings.get(slot);
+    if (desired?.fingerprint === residentDispatchAuthorityFingerprint(binding)) {
+      this.desiredBindings.delete(slot);
+    }
+    const attached = this.attachedBindings.get(slot);
+    if (attached?.fingerprint === residentDispatchAuthorityFingerprint(binding)) {
+      this.retireAttachedBinding(slot, attached);
+      await this.bindingRetirementJobs.get(slot)?.catch(() => undefined);
+    }
+  }
+
+  private publishEndedBindingChange(binding: ResidentSessionBinding): void {
+    if (this.closed) return;
+    const change = Object.freeze({
+      threadId: binding.threadId,
+      executionGenerationId: binding.executionGenerationId,
+    });
+    for (const listener of this.projectionListeners) {
+      try {
+        listener(change);
+      } catch {
+        // Terminal public state is already durable; refresh observers are advisory.
+      }
+    }
   }
 
   private synchronizeDesiredBindings(bindings: readonly ResidentSessionBinding[]): void {
@@ -722,7 +764,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
         environment: this.environment,
         loadRuntimeModule: moduleLoader,
         persistBinding: (binding) => this.store.persistResidentSessionBinding(binding),
-        completeBinding: (binding) => this.store.completeResidentSessionBinding(binding),
+        authorizeResidentKillInvocation: (lease) => this.store.authorizeResidentKillInvocation(lease),
         publishProjection: async (binding, projection) => {
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
           await this.store.publishResidentProjectionSnapshot(binding, projection);

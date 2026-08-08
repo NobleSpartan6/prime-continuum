@@ -56,6 +56,7 @@ import {
   type HostRuntimeReadiness,
   type HostSummary,
   type RendererApi,
+  type ResidentEndPreparation,
   type ResidentLifecycleOperationSummary,
   type ResidentWorkspaceSelection,
   type RuntimeModelCatalog,
@@ -73,7 +74,7 @@ type WorkbenchSurface = 'desktop' | 'companion'
 type ComposerReceiptView = {
   state: ComposerReceiptState
   message: string
-  operation?: 'prompt' | 'abort'
+  operation?: 'prompt' | 'abort' | 'end'
   retryable?: boolean
 }
 type ComposerLocalAction = {
@@ -93,6 +94,11 @@ type ResidentThreadFocusTarget = Pick<
   ResidentLifecycleStatusResult,
   'expectedHostId' | 'threadId' | 'executionGenerationId'
 >
+type ResidentEndDialogContext = {
+  preparation: ResidentEndPreparation
+  threadTitle: string
+  hostName: string
+}
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Write a prompt before running Prime Agent.'
 const MODEL_REVEAL_INCREMENT = 80
@@ -185,6 +191,15 @@ function actionableResidentLifecycleOperations(
   return operations.filter((operation, index) => {
     if (operation.lastStatus?.phase === 'quarantined') return true
     if (operation.state !== 'terminal') return true
+    if (operation.kind === 'end') {
+      if (operation.lastStatus?.phase !== 'completed') return false
+      return !threads.some((thread) =>
+        thread.hostId === operation.expectedHostId &&
+        (thread.remoteId ?? thread.id) === operation.threadId &&
+        thread.executionGenerationId === operation.executionGenerationId &&
+        thread.residentLifecycle?.operationId === operation.operationId,
+      )
+    }
     if (operation.lastStatus?.phase === 'committed') {
       return !threads.some((thread) =>
         thread.hostId === operation.expectedHostId &&
@@ -226,6 +241,15 @@ function residentProvisionMayNeedRecovery(error: unknown): boolean {
 
 function residentLifecycleAnnouncement(status: ResidentLifecycleStatusResult | null): string {
   if (!status) return 'No durable setup was found. You can start a new resident thread.'
+  if (status.kind === 'end') {
+    if (status.phase === 'completed') return 'Resident session ended. The saved thread and workspace remain available.'
+    if (status.phase === 'quarantined') {
+      return 'Status checked. The end outcome needs manual inspection; Prime Continuim will not send another kill.'
+    }
+    return status.phase === 'ending'
+      ? 'Status checked. Permanent ending is recorded but has not crossed the kill boundary.'
+      : 'Status checked. Permanent ending is still settling; no mutation was replayed.'
+  }
   if (status.phase === 'committed') {
     return 'Resident thread created. Opening its authoritative host snapshot.'
   }
@@ -451,6 +475,9 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [residentLifecycleFeedback, setResidentLifecycleFeedback] = useState('')
   const [residentRecoveryReference, setResidentRecoveryReference] = useState<ResidentLifecycleRecoveryReference | null>(null)
   const [residentThreadFocusTarget, setResidentThreadFocusTarget] = useState<ResidentThreadFocusTarget | null>(null)
+  const [residentEndContext, setResidentEndContext] = useState<ResidentEndDialogContext | null>(null)
+  const [residentEndPreparing, setResidentEndPreparing] = useState(false)
+  const [residentEndError, setResidentEndError] = useState('')
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [moveDestinationId, setMoveDestinationId] = useState('')
@@ -463,6 +490,7 @@ export default function App({ api: suppliedApi }: AppProps) {
   const addComputerTriggerRef = useRef<HTMLButtonElement>(null)
   const addComputerReturnTargetRef = useRef<HTMLElement | null>(null)
   const residentProvisionReturnTargetRef = useRef<HTMLElement | null>(null)
+  const residentEndReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
@@ -619,6 +647,25 @@ export default function App({ api: suppliedApi }: AppProps) {
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
     : []
+  const selectedResidentEnd = selectedThread?.executionGenerationId
+    ? snapshot?.residentLifecycleOperations.find((operation) =>
+        operation.kind === 'end' &&
+        operation.expectedHostId === selectedThread.hostId &&
+        operation.threadId === (selectedThread.remoteId ?? selectedThread.id) &&
+        operation.executionGenerationId === selectedThread.executionGenerationId,
+      )
+    : undefined
+  const canEndResident = Boolean(
+    canProvisionResident &&
+    selectedThreadIsMaterialized &&
+    selectedHost?.kind === 'local' &&
+    selectedHost.connection === 'online' &&
+    selectedRuntime.session?.residency === 'resident' &&
+    selectedThread?.workspaceId &&
+    selectedThread.executionGenerationId &&
+    !selectedResidentEnd &&
+    selectedThread.residentLifecycle?.state !== 'ended',
+  )
 
   useEffect(() => {
     if (
@@ -660,7 +707,14 @@ export default function App({ api: suppliedApi }: AppProps) {
     ) {
       setResidentThreadFocusTarget(null)
     }
-  }, [activeLocalHostId, residentRecoveryReference, residentThreadFocusTarget, residentWorkspaceSelection])
+    if (
+      activeLocalHostId &&
+      residentEndContext &&
+      residentEndContext.preparation.expectedHostId !== activeLocalHostId
+    ) {
+      setResidentEndContext(null)
+    }
+  }, [activeLocalHostId, residentEndContext, residentRecoveryReference, residentThreadFocusTarget, residentWorkspaceSelection])
 
   useEffect(() => {
     if (!snapshot || !residentThreadFocusTarget) return
@@ -900,17 +954,76 @@ export default function App({ api: suppliedApi }: AppProps) {
     }
   }
 
+  const reviewResidentEnd = async (
+    trigger: HTMLElement,
+    recovery?: ResidentLifecycleOperationSummary,
+  ) => {
+    const recoveryEnd = recovery?.kind === 'end' ? recovery : undefined
+    const thread = recoveryEnd
+      ? snapshot?.threads.find((candidate) =>
+          candidate.hostId === recoveryEnd.expectedHostId &&
+          (candidate.remoteId ?? candidate.id) === recoveryEnd.threadId &&
+          candidate.executionGenerationId === recoveryEnd.executionGenerationId,
+        )
+      : selectedThread
+    const host = snapshot?.hosts.find((candidate) =>
+      candidate.id === (recoveryEnd?.expectedHostId ?? thread?.hostId),
+    )
+    const expectedHostId = recoveryEnd?.expectedHostId ?? thread?.hostId
+    const projectId = recoveryEnd?.projectId ?? thread?.projectId
+    const workspaceId = recoveryEnd?.workspaceId ?? thread?.workspaceId
+    const threadId = recoveryEnd?.threadId ?? (thread ? thread.remoteId ?? thread.id : undefined)
+    const executionGenerationId = recoveryEnd?.executionGenerationId ?? thread?.executionGenerationId
+    if (!expectedHostId || !projectId || !workspaceId || !threadId || !executionGenerationId) {
+      setResidentEndError('Refresh this thread before reviewing permanent resident session ending.')
+      window.requestAnimationFrame(() => trigger.focus())
+      return
+    }
+    residentEndReturnTargetRef.current = trigger
+    setResidentEndError('')
+    setResidentEndPreparing(true)
+    try {
+      const preparation = await api.prepareResidentEnd({
+        expectedHostId,
+        projectId,
+        workspaceId,
+        threadId,
+        executionGenerationId,
+        ...(recoveryEnd ? { resumeOperationId: recoveryEnd.operationId } : {}),
+      })
+      setResidentEndContext({
+        preparation,
+        threadTitle: thread?.title ?? 'Resident thread',
+        hostName: host?.name ?? 'this computer',
+      })
+    } catch (error) {
+      setResidentEndError(error instanceof Error
+        ? error.message
+        : 'The resident session could not be prepared for review.')
+      window.requestAnimationFrame(() => trigger.focus())
+    } finally {
+      setResidentEndPreparing(false)
+    }
+  }
+
   const checkResidentLifecycle = async (operation: ResidentLifecycleOperationSummary) => {
     setResidentWorkspaceError('')
-    setResidentLifecycleFeedback('Checking the durable resident setup status…')
+    setResidentLifecycleFeedback(operation.kind === 'end'
+      ? 'Checking the durable resident end status…'
+      : 'Checking the durable resident setup status…')
     setResidentStatusChecking(true)
     try {
       const status = await api.residentLifecycleStatus({
         expectedHostId: operation.expectedHostId,
         operationId: operation.operationId,
       })
-      setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
-      if (status?.phase === 'committed') {
+      setResidentLifecycleFeedback(status === null && operation.kind === 'end'
+        ? 'No durable end record was returned. No permanent action was retried.'
+        : residentLifecycleAnnouncement(status))
+      if (status && (
+        (status.kind === 'provision' && status.phase === 'committed') ||
+        (status.kind === 'end' && status.phase === 'completed')
+      )) {
         setResidentThreadFocusTarget({
           expectedHostId: status.expectedHostId,
           threadId: status.threadId,
@@ -1050,7 +1163,9 @@ export default function App({ api: suppliedApi }: AppProps) {
                 host.id === operation.expectedHostId && host.kind === 'local' && host.connection === 'online',
               )}
               busy={residentWorkspacePicking || residentStatusChecking}
-              onChoose={(operation, event) => void chooseResidentWorkspace(event.currentTarget, operation.operationId)}
+              onChoose={(operation, event) => void (operation.kind === 'end'
+                ? reviewResidentEnd(event.currentTarget, operation)
+                : chooseResidentWorkspace(event.currentTarget, operation.operationId))}
               onCheck={(operation) => void checkResidentLifecycle(operation)}
             />
           )}
@@ -1258,7 +1373,9 @@ export default function App({ api: suppliedApi }: AppProps) {
         onRecoverResident={(operation, trigger) => {
           const returnTarget = sidebarIsOverlay ? sidebarToggleRef.current : trigger
           closeSidebar()
-          if (returnTarget) void chooseResidentWorkspace(returnTarget, operation.operationId)
+          if (returnTarget) void (operation.kind === 'end'
+            ? reviewResidentEnd(returnTarget, operation)
+            : chooseResidentWorkspace(returnTarget, operation.operationId))
         }}
         onCheckResident={(operation) => void checkResidentLifecycle(operation)}
         onRecoverResidentReference={(reference, trigger) => {
@@ -1361,6 +1478,10 @@ export default function App({ api: suppliedApi }: AppProps) {
         containerRef={inspectorPanelRef}
         modal={inspectorIsModal}
         inert={sidebarIsModal}
+        canEndResident={canEndResident}
+        residentEndPreparing={residentEndPreparing}
+        residentEndError={residentEndError}
+        onEndResident={(trigger) => void reviewResidentEnd(trigger)}
       />
 
       {(sidebarOpen || inspectorOpen) && (
@@ -1394,10 +1515,28 @@ export default function App({ api: suppliedApi }: AppProps) {
         onCommitted={residentProvisionCommitted}
       />
 
+      <ResidentEndDialog
+        api={api}
+        context={residentEndContext}
+        triggerRef={residentEndReturnTargetRef}
+        onClose={() => setResidentEndContext(null)}
+        onSettled={(status) => {
+          setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+          if (status.phase === 'completed') {
+            setResidentThreadFocusTarget({
+              expectedHostId: status.expectedHostId,
+              threadId: status.threadId,
+              executionGenerationId: status.executionGenerationId,
+            })
+          }
+        }}
+      />
+
       <CommandPaletteDialog
         open={commandPaletteOpen}
         snapshot={snapshot}
         selectedThreadId={selectedThread.id}
+        canEndResident={canEndResident}
         triggerRef={commandPaletteTriggerRef}
         onClose={() => setCommandPaletteOpen(false)}
         onSelectThread={selectThread}
@@ -1428,6 +1567,11 @@ export default function App({ api: suppliedApi }: AppProps) {
             if (composer && !composer.disabled) composer.focus()
             else document.querySelector<HTMLButtonElement>('#resident-turn-primary')?.focus()
           })
+        }}
+        onEndResident={() => {
+          const trigger = commandPaletteTriggerRef.current
+          setCommandPaletteOpen(false)
+          if (trigger) void reviewResidentEnd(trigger)
         }}
       />
 
@@ -2032,19 +2176,24 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
   const promptOutcomeUnknown = receipt.operation === 'prompt' && receipt.state === 'uncertain'
   const stopSending = receipt.operation === 'abort' && receipt.state === 'sending'
   const stopAwaitingProof = receipt.operation === 'abort' && receipt.state === 'sent'
+  const endLifecyclePresent = receipt.operation === 'end'
+  const endCompleted = endLifecyclePresent && receipt.state === 'idle'
+  const endOutcomeUnknown = endLifecyclePresent && receipt.state === 'uncertain'
+  const endPending = endLifecyclePresent && !endCompleted
   const abortControlPending = Boolean(
     receipt.operation === 'abort' &&
     (receipt.state === 'sending' || receipt.state === 'sent' || receipt.state === 'uncertain'),
   )
   const promptControlPending = promptAwaitingProof || promptOutcomeUnknown
-  const residentControlPending = abortControlPending || promptControlPending
+  const residentControlPending = abortControlPending || promptControlPending || endPending
   const running = projectionReportsRunning || canStopTurn || residentControlPending
   const residentAttached = runtime.session?.residency === 'resident' && Boolean(runtime.session.activeSessionId && runtime.session.sessionId)
   const canStartNow = canStartTurn && !disconnected
   const canStopNow = canStopTurn && !disconnected
   const retryingStop = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable !== false
   const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
-  const canAct = running ? canStopNow : canStartNow
+  const controlMode = running || endLifecyclePresent
+  const canAct = endLifecyclePresent ? false : running ? canStopNow : canStartNow
   const unavailableCopy = disconnected
     ? residentControlPending
       ? `Resident control is retained locally. Reconnect to ${hostName} for authoritative status.`
@@ -2080,7 +2229,13 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
     : receipt.state === 'idle' && !canAct
       ? 'waiting_for_connection'
       : receipt.state
-  const primaryLabel = running
+  const primaryLabel = endLifecyclePresent
+    ? endCompleted
+      ? 'Session ended'
+      : endOutcomeUnknown
+        ? 'End outcome unknown'
+        : 'End pending'
+    : running
     ? stopOutcomeUnknown
       ? 'Outcome unknown'
       : disconnected
@@ -2097,9 +2252,15 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
       : disconnected
       ? 'Reconnect to run'
       : 'Run prompt'
-  const compactComposer = running
+  const compactComposer = controlMode
   const textareaDisabled = !canStartNow
-  const intentCopy = stopOutcomeUnknown
+  const intentCopy = endLifecyclePresent
+    ? endCompleted
+      ? 'Resident session ended'
+      : endOutcomeUnknown
+        ? 'End outcome unknown'
+        : 'Ending resident session'
+    : stopOutcomeUnknown
     ? 'Stop outcome unknown'
     : retryingStop
       ? 'Stop outcome uncertain'
@@ -2125,7 +2286,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
       <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
       <form
-        className={cx('composer', compactComposer && 'composer--compact', running && 'composer--running')}
+        className={cx('composer', compactComposer && 'composer--compact', controlMode && 'composer--running')}
         onSubmit={(event) => {
           if (promptSending) {
             event.preventDefault()
@@ -2198,7 +2359,11 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
               </button>
             )}
             <span className="composer__hint" id="composer-hint">
-              {running
+              {endLifecyclePresent
+                ? endCompleted
+                  ? 'The saved thread and workspace remain available'
+                  : 'Resident mutations stay locked while the durable end outcome settles'
+                : running
                 ? disconnected
                   ? unavailableCopy
                   : 'Stop asks Prime Agent to end at the next safe boundary'
@@ -2212,12 +2377,18 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
               id="resident-turn-primary"
               className={cx(
                 'button',
-                running ? 'button--stop' : 'button--primary',
-                !running && !text.trim() && 'button--empty',
+                controlMode ? 'button--stop' : 'button--primary',
+                !controlMode && !text.trim() && 'button--empty',
               )}
-              type={running ? 'button' : 'submit'}
-              disabled={running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending}
-              aria-label={running
+              type={controlMode ? 'button' : 'submit'}
+              disabled={endLifecyclePresent || (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending)}
+              aria-label={endLifecyclePresent
+                ? endCompleted
+                  ? 'Resident session ended; the saved thread and workspace remain available'
+                  : endOutcomeUnknown
+                    ? 'Resident end outcome unknown; inspect the durable lifecycle status'
+                    : 'Resident session end is durably pending'
+                : running
                 ? disconnected
                   ? 'Reconnect to verify and control this resident turn'
                   : stopOutcomeUnknown
@@ -2232,9 +2403,15 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
                 : promptSending
                   ? 'Prompt is awaiting durable host admission'
                   : undefined}
-              onClick={running ? onStop : undefined}
+              onClick={!endLifecyclePresent && running ? onStop : undefined}
             >
-              {stopSending || promptSending
+              {endLifecyclePresent
+                ? endCompleted
+                  ? <Icon icon={Check} size={15} />
+                  : endOutcomeUnknown
+                    ? <Icon icon={AlertCircle} size={15} />
+                    : <Icon icon={Clock3} size={15} />
+                : stopSending || promptSending
                 ? <Icon icon={Loader2} size={15} />
                 : stopAwaitingProof
                   ? <Icon icon={Check} size={15} />
@@ -2265,9 +2442,13 @@ interface InspectorProps {
   containerRef: RefObject<HTMLElement | null>
   modal: boolean
   inert: boolean
+  canEndResident: boolean
+  residentEndPreparing: boolean
+  residentEndError: string
+  onEndResident: (trigger: HTMLElement) => void
 }
 
-function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert }: InspectorProps) {
+function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentEndPreparing, residentEndError, onEndResident }: InspectorProps) {
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const activateRelativeTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex = index
@@ -2326,7 +2507,17 @@ function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, ru
       >
         {activeTab === 'Changes' && <ChangesPanel snapshot={snapshot} />}
         {activeTab === 'Runtime' && (
-          <RuntimePanel key={selectedThread.id} snapshot={snapshot} thread={selectedThread} host={selectedHost} runtime={runtime} />
+          <RuntimePanel
+            key={selectedThread.id}
+            snapshot={snapshot}
+            thread={selectedThread}
+            host={selectedHost}
+            runtime={runtime}
+            canEndResident={canEndResident}
+            endPreparing={residentEndPreparing}
+            endError={residentEndError}
+            onEndResident={onEndResident}
+          />
         )}
         {activeTab === 'Evidence' && <EvidencePanel snapshot={snapshot} />}
         {activeTab === 'Context' && (
@@ -2504,11 +2695,19 @@ function RuntimePanel({
   thread,
   host,
   runtime,
+  canEndResident,
+  endPreparing,
+  endError,
+  onEndResident,
 }: {
   snapshot: WorkbenchSnapshot
   thread: ThreadSummary
   host: HostSummary
   runtime: RuntimeSummary
+  canEndResident: boolean
+  endPreparing: boolean
+  endError: string
+  onEndResident: (trigger: HTMLElement) => void
 }) {
   const [goalLimit, setGoalLimit] = useState(RUNTIME_GOAL_INCREMENT)
   const [agentLimit, setAgentLimit] = useState(RUNTIME_AGENT_INCREMENT)
@@ -2606,6 +2805,56 @@ function RuntimePanel({
         </dl>
         {!session && <p className="runtime-empty">This snapshot doesn’t report live Prime Agent session activity.</p>}
       </section>
+
+      {(thread.residentLifecycle?.state === 'ended' || session?.residency === 'resident') && (
+      <section className="runtime-section runtime-section--lifecycle" aria-labelledby="runtime-lifecycle-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-lifecycle-heading">Session lifecycle</h3>
+          <span>{thread.residentLifecycle?.state === 'ended' ? 'Ended' : 'Host-resident'}</span>
+        </div>
+        {thread.residentLifecycle?.state === 'ended' ? (
+          <div className="resident-end-state resident-end-state--complete" role="status">
+            <Icon icon={CheckCircle2} size={16} />
+            <span>
+              <strong>Resident session ended</strong>
+              <small>
+                The saved thread and workspace remain available
+                {scheduleTime(thread.residentLifecycle.endedAt) ? ` · ${scheduleTime(thread.residentLifecycle.endedAt)}` : ''}.
+              </small>
+            </span>
+          </div>
+        ) : (
+          <>
+            <p className="runtime-note">
+              Closing Prime Continuim only detaches this app. Prime Agent keeps running on <bdi>{`${host.name}.`}</bdi>
+            </p>
+            <p className="runtime-note">
+              Ending is permanent for this runtime session. The saved thread and workspace remain available.
+            </p>
+            {(canEndResident || endPreparing) && (
+              <button
+                className="button button--secondary resident-end-trigger"
+                type="button"
+                disabled={endPreparing}
+                aria-busy={endPreparing || undefined}
+                onClick={(event) => onEndResident(event.currentTarget)}
+              >
+                <Icon icon={endPreparing ? Loader2 : Square} size={14} />
+                {endPreparing ? 'Preparing end review…' : 'End resident session…'}
+              </button>
+            )}
+            {!canEndResident && !endPreparing && (
+              <small className="runtime-empty">
+                {host.connection === 'online'
+                  ? 'A verified attached resident session is required before permanent ending can be reviewed.'
+                  : `Reconnect to ${host.name} before reviewing permanent ending.`}
+              </small>
+            )}
+            {endError && <p className="form-error" role="alert">{endError}</p>}
+          </>
+        )}
+      </section>
+      )}
 
       <section className="runtime-section" aria-labelledby="runtime-work-heading">
         <div className="runtime-section__heading">
@@ -2821,6 +3070,7 @@ interface CommandPaletteDialogProps {
   open: boolean
   snapshot: WorkbenchSnapshot
   selectedThreadId: string
+  canEndResident: boolean
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
   onSelectThread: (thread: ThreadSummary) => void
@@ -2830,6 +3080,7 @@ interface CommandPaletteDialogProps {
   onOpenModels: () => void
   onOpenCompanion: () => void
   onFocusComposer: () => void
+  onEndResident: () => void
 }
 
 interface PaletteItem {
@@ -2846,6 +3097,7 @@ function CommandPaletteDialog({
   open,
   snapshot,
   selectedThreadId,
+  canEndResident,
   triggerRef,
   onClose,
   onSelectThread,
@@ -2855,6 +3107,7 @@ function CommandPaletteDialog({
   onOpenModels,
   onOpenCompanion,
   onFocusComposer,
+  onEndResident,
 }: CommandPaletteDialogProps) {
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)
@@ -2913,6 +3166,15 @@ function CommandPaletteDialog({
       keywords: 'models providers accounts oauth login inference',
       run: onOpenModels,
     }] : []),
+    ...(canEndResident ? [{
+      id: 'command:end-resident',
+      label: 'End resident session…',
+      detail: 'Permanently stop this runtime while preserving the saved thread and workspace',
+      group: 'Commands' as const,
+      icon: AlertCircle,
+      keywords: 'end resident session permanent stop runtime preserve thread workspace',
+      run: onEndResident,
+    }] : []),
     {
       id: 'command:companion',
       label: 'Open companion preview',
@@ -2931,7 +3193,7 @@ function CommandPaletteDialog({
       keywords: 'add computer ssh host remote machine',
       run: onAddComputer,
     },
-  ], [onAddComputer, onFocusComposer, onOpenCompanion, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
+  ], [canEndResident, onAddComputer, onEndResident, onFocusComposer, onOpenCompanion, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
 
   const filteredItems = useMemo(() => {
     const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
@@ -3548,6 +3810,11 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
 }
 
 function residentLifecycleQuarantineStatusDetail(status: ResidentLifecycleStatusResult | undefined): string {
+  if (status?.kind === 'end') {
+    return status.quarantineReason === 'authority_changed'
+      ? 'The verified host authority changed while permanent ending was being recorded. The resident session remains locked.'
+      : 'Prime Agent may have received the permanent end, but its exact outcome cannot be proven. Prime Continuim will not send another kill.'
+  }
   if (status?.quarantineReason === 'owned_client_lost') {
     return 'The temporary Prime Agent owner disconnected before promotion could be proven. Automatic retry is blocked.'
   }
@@ -3601,6 +3868,45 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
   diagnostic?: string
 } {
   const status = operation.lastStatus
+  if (operation.kind === 'end') {
+    if (status?.phase === 'quarantined') {
+      return {
+        label: 'End outcome needs inspection',
+        detail: residentLifecycleQuarantineDetail(operation),
+        tone: 'warning',
+        action: 'copy',
+        actionLabel: 'Copy diagnostic',
+        diagnostic: residentLifecycleQuarantineDiagnostic(operation),
+      }
+    }
+    if (operation.state === 'terminal_refresh_pending' || status?.phase === 'completed') {
+      return {
+        label: 'Resident session ended',
+        detail: 'Prime Agent confirmed the permanent end. The saved thread and workspace remain available.',
+        tone: 'success',
+        action: 'check',
+        actionLabel: 'Refresh saved thread',
+      }
+    }
+    if (status?.phase === 'ending') {
+      return {
+        label: 'End review required',
+        detail: 'Permanent ending was recorded before the kill boundary. Review the exact session again to continue.',
+        tone: 'warning',
+        action: 'choose',
+        actionLabel: 'Review end again',
+      }
+    }
+    return {
+      label: status?.phase === 'kill_dispatching' || status?.phase === 'kill_acknowledged'
+        ? 'Permanent end is settling'
+        : 'End outcome needs inspection',
+      detail: 'Prime Continuim will not send another kill automatically. Check the exact durable host status.',
+      tone: 'warning',
+      action: 'check',
+      actionLabel: 'Check status',
+    }
+  }
   if (operation.state === 'requires_reselection') {
     return {
       label: 'Workspace confirmation needed',
@@ -3847,7 +4153,11 @@ function ResidentLifecycleRecoveryCard({
       <div className="resident-recovery__body">
         <h2 id={`resident-recovery-${operation.operationId}`}>{presentation.label}</h2>
         <p>{presentation.detail}</p>
-        <small><bdi>{operation.projectDisplayName}</bdi> · <bdi>{operation.threadTitle}</bdi></small>
+        <small>
+          {operation.kind === 'provision'
+            ? <><bdi>{operation.projectDisplayName}</bdi> · <bdi>{operation.threadTitle}</bdi></>
+            : <>Resident session · <bdi>{operation.threadId}</bdi></>}
+        </small>
       </div>
       {presentation.action && (
         <button
@@ -4090,6 +4400,231 @@ function ResidentProvisionDialog({
         </footer>
       </form>
     </NativeDialog>
+  )
+}
+
+function ResidentEndDialog({
+  api,
+  context,
+  triggerRef,
+  onClose,
+  onSettled,
+}: {
+  api: RendererApi
+  context: ResidentEndDialogContext | null
+  triggerRef: RefObject<HTMLElement | null>
+  onClose: () => void
+  onSettled: (status: ResidentLifecycleStatusResult) => void
+}) {
+  const [confirmed, setConfirmed] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [settled, setSettled] = useState(false)
+  const [canCheckStatus, setCanCheckStatus] = useState(false)
+  const [checking, setChecking] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const confirmationRef = useRef<HTMLInputElement>(null)
+  const resultRef = useRef<HTMLParagraphElement>(null)
+
+  useEffect(() => {
+    if (!context) return
+    setConfirmed(false)
+    setSubmitting(false)
+    setSettled(false)
+    setCanCheckStatus(false)
+    setChecking(false)
+    setMessage('')
+    setError('')
+  }, [context])
+
+  useEffect(() => {
+    if (!context || !settled) return
+    window.requestAnimationFrame(() => resultRef.current?.focus())
+  }, [context, settled])
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!context || submitting || settled) return
+    if (!confirmed) {
+      setError('Confirm that you understand this resident session cannot be resumed.')
+      confirmationRef.current?.focus()
+      return
+    }
+    setError('')
+    setMessage('Recording the permanent end before asking Prime Agent to stop…')
+    setSubmitting(true)
+    try {
+      const status = await api.endResident({
+        confirmationToken: context.preparation.confirmationToken,
+        consent: true,
+      })
+      setSettled(true)
+      onSettled(status)
+      if (status.phase === 'completed') {
+        setCanCheckStatus(false)
+        setMessage('Resident session ended. The saved thread and workspace remain available.')
+      } else if (status.phase === 'quarantined') {
+        setCanCheckStatus(false)
+        setMessage('Permanent ending stopped at an uncertain boundary.')
+        setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
+      } else {
+        setCanCheckStatus(true)
+        setMessage('Permanent ending is durably recorded. Prime Continuim will check status without replaying the kill.')
+      }
+    } catch (reason) {
+      setSettled(true)
+      if (isResidentEndSourceCursorChangedError(reason)) {
+        setCanCheckStatus(false)
+        setError(reason instanceof Error
+          ? reason.message
+          : 'Resident state changed after this end review.')
+        setMessage('No end was admitted. Close this review, refresh the thread, and review the permanent action again.')
+      } else {
+        setCanCheckStatus(true)
+        setError(reason instanceof Error
+          ? reason.message
+          : 'The resident end outcome could not be confirmed.')
+        setMessage('Check the durable lifecycle status. Prime Continuim will not send another kill automatically.')
+      }
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const checkStatus = async () => {
+    if (!context || checking) return
+    setChecking(true)
+    setError('')
+    setMessage('Checking the durable resident end status…')
+    try {
+      const status = await api.residentLifecycleStatus({
+        expectedHostId: context.preparation.expectedHostId,
+        operationId: context.preparation.operationId,
+      })
+      if (!status) {
+        setCanCheckStatus(false)
+        setMessage('No durable status is available yet. The end outcome remains unknown, so Prime Continuim will not send another kill. Close this review and use Check status from recovery.')
+        return
+      }
+      onSettled(status)
+      if (status.kind !== 'end') {
+        setCanCheckStatus(false)
+        setError('The host returned a different lifecycle operation for this end review.')
+        setMessage('No permanent action was retried.')
+      } else if (status.phase === 'completed') {
+        setCanCheckStatus(false)
+        setMessage('Resident session ended. The saved thread and workspace remain available.')
+      } else if (status.phase === 'quarantined') {
+        setCanCheckStatus(false)
+        setMessage('Permanent ending stopped at an uncertain boundary.')
+        setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
+      } else {
+        setMessage('Status checked. Permanent ending is still settling; no mutation was replayed.')
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The durable resident end status is unavailable.')
+      setMessage('Status could not be checked. No permanent action was retried.')
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <NativeDialog
+      open={context !== null}
+      labelledBy="resident-end-title"
+      describedBy="resident-end-description"
+      triggerRef={triggerRef}
+      onClose={onClose}
+      className="sheet--resident-end"
+      dismissible={!submitting}
+    >
+      <form className="sheet__frame" onSubmit={submit} aria-busy={submitting || checking}>
+        <header className="sheet__header">
+          <div className="sheet__title-group">
+            <span className="sheet__title-icon sheet__title-icon--warning"><Icon icon={AlertCircle} size={18} /></span>
+            <div>
+              <h2 id="resident-end-title">End resident session?</h2>
+              <p id="resident-end-description">
+                This permanently stops the Prime Agent runtime for “{context?.threadTitle ?? 'this thread'}”. The saved thread and workspace remain available, but this resident session cannot be resumed.
+              </p>
+            </div>
+          </div>
+          <button className="icon-button" type="button" aria-label="Close resident end review" onClick={onClose} disabled={submitting}>
+            <Icon icon={X} size={17} />
+          </button>
+        </header>
+
+        <div className="sheet__scroll resident-end-dialog__body">
+          <div className="resident-end-dialog__distinction" role="note">
+            <Icon icon={Info} size={16} />
+            <span>
+              <strong>Closing is different from ending.</strong>
+              Closing Prime Continuim only detaches this app; Prime Agent keeps running on <bdi>{`${context?.hostName ?? 'this computer'}.`}</bdi>
+            </span>
+          </div>
+          <label className="resident-end-dialog__confirmation">
+            <input
+              ref={confirmationRef}
+              type="checkbox"
+              checked={confirmed}
+              disabled={submitting || settled}
+              aria-invalid={error && !confirmed ? 'true' : undefined}
+              aria-describedby="resident-end-error"
+              onChange={(event) => {
+                setConfirmed(event.target.checked)
+                if (event.target.checked) setError('')
+              }}
+            />
+            <span>I understand this resident session cannot be resumed.</span>
+          </label>
+          <p id="resident-end-error" className="form-error" role="alert">{error}</p>
+          <p
+            ref={resultRef}
+            className="form-status"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            tabIndex={settled ? -1 : undefined}
+          >
+            {message}
+          </p>
+        </div>
+
+        <footer className="sheet__footer">
+          <button
+            className="button button--secondary"
+            type="button"
+            data-dialog-autofocus
+            onClick={onClose}
+            disabled={submitting || checking}
+          >
+            {settled ? 'Close' : 'Cancel'}
+          </button>
+          {settled && canCheckStatus && (
+            <button className="button button--secondary" type="button" onClick={() => void checkStatus()} disabled={checking}>
+              <Icon icon={checking ? Loader2 : RefreshCw} size={14} />
+              {checking ? 'Checking…' : 'Check status'}
+            </button>
+          )}
+          {!settled && (
+            <button className="button button--stop" type="submit" disabled={submitting}>
+              <Icon icon={submitting ? Loader2 : Square} size={14} />
+              {submitting ? 'Ending resident session…' : 'End resident session'}
+            </button>
+          )}
+        </footer>
+      </form>
+    </NativeDialog>
+  )
+}
+
+function isResidentEndSourceCursorChangedError(reason: unknown): boolean {
+  return (
+    typeof reason === 'object' &&
+    reason !== null &&
+    'code' in reason &&
+    (reason as { code?: unknown }).code === 'host.resident_end_source_cursor_changed'
   )
 }
 

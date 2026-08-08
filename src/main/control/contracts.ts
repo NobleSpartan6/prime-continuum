@@ -32,6 +32,8 @@ export const IPC = {
   cancelRuntimeOAuth: 'prime:runtime:oauth:cancel',
   selectResidentWorkspace: 'prime:resident:workspace:select',
   provisionResident: 'prime:resident:provision',
+  prepareResidentEnd: 'prime:resident:end:prepare',
+  endResident: 'prime:resident:end',
   residentLifecycleStatus: 'prime:resident:lifecycle:status',
   requestSnapshot: 'prime:thread:snapshot',
   submitCommand: 'prime:command:submit',
@@ -203,17 +205,39 @@ export interface ResidentProvisionInput {
   sessionName?: string
 }
 
-/** Path-free durable operation state exposed during bootstrap and recovery. */
-export interface ResidentLifecycleOperationView {
+/** Exact path-free lineage reviewed before a permanent resident end. */
+export interface ResidentEndPreparationInput {
+  expectedHostId: string
+  projectId: string
+  workspaceId: string
+  threadId: string
+  executionGenerationId: string
+  /** Re-authorize only a host-proven pre-effect `ending` operation. */
+  resumeOperationId?: string
+}
+
+/** One-use, process-local confirmation authorization. */
+export interface ResidentEndPreparation {
+  confirmationToken: string
+  operationId: string
+  expectedHostId: string
+  threadId: string
+  executionGenerationId: string
+  expiresAt: string
+}
+
+export interface ResidentEndInput {
+  confirmationToken: string
+  consent: true
+}
+
+interface ResidentLifecycleOperationBase {
   operationId: string
   expectedHostId: string
   projectId: string
   workspaceId: string
   threadId: string
   executionGenerationId: string
-  projectDisplayName: string
-  threadTitle: string
-  sessionName?: string
   createdAt: string
   updatedAt: string
   state:
@@ -224,6 +248,24 @@ export interface ResidentLifecycleOperationView {
     | 'terminal'
   lastStatus?: ResidentLifecycleStatus
 }
+
+/** Path-free durable provisioning state exposed during bootstrap and recovery. */
+export interface ResidentProvisionOperationView extends ResidentLifecycleOperationBase {
+  kind: 'provision'
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+}
+
+/** Path-free durable permanent-end intent and its exact source projection. */
+export interface ResidentEndOperationView extends ResidentLifecycleOperationBase {
+  kind: 'end'
+  sourceCursor: SessionCursor
+}
+
+export type ResidentLifecycleOperationView =
+  | ResidentProvisionOperationView
+  | ResidentEndOperationView
 
 export type CommandJournalStatus =
   | 'received'
@@ -370,6 +412,8 @@ export interface PrimeBridge {
   cancelRuntimeOAuth(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
   selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<Result<ResidentWorkspaceSelection>>
   provisionResident(input: ResidentProvisionInput): Promise<Result<ResidentLifecycleStatus>>
+  prepareResidentEnd(input: ResidentEndPreparationInput): Promise<Result<ResidentEndPreparation>>
+  endResident(input: ResidentEndInput): Promise<Result<ResidentLifecycleStatus>>
   residentLifecycleStatus(input: {
     expectedHostId: string
     operationId: string

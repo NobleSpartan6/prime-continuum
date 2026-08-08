@@ -318,6 +318,7 @@ function residentLifecycleInput(request: ResidentGatewayProvisionInput) {
 function residentLifecycleGateway(store: HostStore): PrimeAgentGateway & {
   residentLifecycleCapabilityReady: ReturnType<typeof vi.fn>;
   provisionResident: ReturnType<typeof vi.fn>;
+  endResident: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
 } {
   return {
@@ -327,6 +328,9 @@ function residentLifecycleGateway(store: HostStore): PrimeAgentGateway & {
     residentLifecycleCapabilityReady: vi.fn(async () => true),
     provisionResident: vi.fn(async (request: ResidentGatewayProvisionInput) =>
       store.prepareResidentProvision(residentLifecycleInput(request))),
+    endResident: vi.fn(async () => {
+      throw new Error("resident end is outside this provisioning fixture");
+    }),
     submit: vi.fn(async () => ({ disposition: "accepted" as const })),
     close: vi.fn(async () => undefined),
   };

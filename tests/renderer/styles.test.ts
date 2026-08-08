@@ -32,7 +32,7 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.resident-recovery\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
     expect(narrowLayout).toMatch(/\.resident-recovery > \.button\s*{[^}]*grid-column:\s*1 \/ -1;[^}]*inline-size:\s*100%;/s)
     expect(narrowLayout).toMatch(/\.empty-workbench__actions\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*inline-size:\s*100%;/s)
-    expect(narrowLayout).toMatch(/\.empty-workbench__actions \.button,\s*\.sheet--resident \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;/s)
+    expect(narrowLayout).toMatch(/\.empty-workbench__actions \.button,\s*\.sheet--resident \.sheet__footer \.button,\s*\.sheet--resident-end \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;/s)
     expect(narrowLayout).toMatch(/\.model-search input,\s*\.command-palette__input input\s*{[^}]*font-size:\s*1rem;/s)
     expect(css).toMatch(/body:has\(dialog\[open\]\) :is\(\.sidebar__scroll, \.transcript__scroller, \.inspector__panel\)\s*{[^}]*overflow-y:\s*hidden;/s)
     expect(css).toMatch(/\.task-state--stale\s*{[^}]*color:\s*var\(--color-text-muted\);/s)
@@ -69,10 +69,13 @@ describe('renderer style contracts', () => {
       css.indexOf('@media (min-width: 38.001rem)'),
     )
 
-    expect(shortLayout).toMatch(/dialog\.sheet--resident\s*{[^}]*max-block-size:\s*calc\(100dvh - 0\.5rem\);/s)
-    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__scroll\s*{[^}]*max-block-size:\s*none;[^}]*padding:\s*0\.65rem 0\.75rem;/s)
-    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s)
-    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;[^}]*min-block-size:\s*2\.25rem;/s)
+    expect(shortLayout).toMatch(/dialog\.sheet--resident,\s*dialog\.sheet--resident-end\s*{[^}]*max-block-size:\s*calc\(100dvh - 0\.5rem\);/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__scroll,\s*\.sheet--resident-end \.sheet__scroll\s*{[^}]*max-block-size:\s*none;[^}]*padding:\s*0\.65rem 0\.75rem;/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer,\s*\.sheet--resident-end \.sheet__footer\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer \.button,\s*\.sheet--resident-end \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;[^}]*min-block-size:\s*2\.25rem;/s)
+    expect(css).toMatch(/dialog\.sheet--resident-end\s*{[^}]*inline-size:\s*min\(calc\(100% - 2rem\), 40rem\);/s)
+    expect(css).toMatch(/\.resident-end-dialog__confirmation:has\(input:focus-visible\)\s*{[^}]*outline:\s*2px solid var\(--color-focus\);/s)
+    expect(css).toMatch(/\.resident-end-state\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {

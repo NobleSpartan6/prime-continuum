@@ -30,6 +30,7 @@ import {
   type RuntimeOAuthSessionSnapshot,
   type ResidentLifecycleLookupResult,
   type ResidentLifecycleStatus,
+  type TaskState,
   type ThreadProjectionSnapshot,
 } from '../../shared/protocol'
 import {
@@ -50,7 +51,12 @@ import type {
   HostRuntimeReadiness,
   HostInstallPlan,
   OutboxEntry,
+  ResidentEndInput,
+  ResidentEndOperationView,
+  ResidentEndPreparation,
+  ResidentEndPreparationInput,
   ResidentLifecycleOperationView,
+  ResidentProvisionOperationView,
   ResidentProvisionInput,
   ResidentWorkspaceSelection,
   ResidentWorkspaceSelectionInput,
@@ -210,12 +216,30 @@ interface ResidentLifecycleLedger {
   entries: ResidentLifecycleOperationView[]
 }
 
+interface LegacyResidentProvisionOperationView extends Omit<ResidentProvisionOperationView, 'kind'> {
+  kind?: undefined
+}
+
+interface PersistedResidentLifecycleLedger {
+  version: 1
+  entries: Array<ResidentLifecycleOperationView | LegacyResidentProvisionOperationView>
+}
+
+interface ResidentEndConfirmationRecord {
+  readonly confirmation: ResidentEndPreparation
+  readonly authority: CapturedProjectionAuthority
+  readonly identity: Omit<ResidentEndPreparationInput, 'resumeOperationId'>
+  readonly sourceCursor: SessionCursor
+  readonly createdAt: string
+}
+
 interface ResidentLifecycleStatusMerge {
   readonly status: ResidentLifecycleStatus
   readonly state?: ResidentLifecycleOperationView['state']
 }
 
 type RetiredResidentSelectionReason = 'expired' | 'superseded' | 'authority_changed' | 'terminal'
+type RetiredResidentEndConfirmationReason = 'expired' | 'superseded' | 'authority_changed' | 'consumed'
 
 interface ServiceOptions {
   app: App
@@ -246,12 +270,17 @@ const RESIDENT_SELECTION_TTL_MS = 5 * 60_000
 const RESIDENT_SELECTION_LIMIT = 32
 const RETIRED_RESIDENT_SELECTION_LIMIT = 64
 const RESIDENT_LIFECYCLE_LEDGER_LIMIT = 128
+const RESIDENT_END_CONFIRMATION_TTL_MS = 2 * 60_000
+const RESIDENT_END_CONFIRMATION_LIMIT = 32
+const RETIRED_RESIDENT_END_CONFIRMATION_LIMIT = 64
 const RESIDENT_PROVISION_TIMEOUT_MS = 120_000
 const RESIDENT_RECONNECT_RECONCILE_LIMIT = 8
 const RESIDENT_RECONNECT_STATUS_TIMEOUT_MS = 15_000
 const RESIDENT_BACKGROUND_REFRESH_LIMIT = 8
 const RESIDENT_BACKGROUND_REFRESH_BUDGET_MS = 120_000
 const RESIDENT_BACKGROUND_REFRESH_REQUEST_TIMEOUT_MS = 30_000
+const RESIDENT_ENDED_RECAP = 'Resident session ended.'
+const HOST_RESIDENT_END_SOURCE_CURSOR_CHANGED = 'host.resident_end_source_cursor_changed'
 const TERMINAL_COMMAND_RECEIPTS = new Set([
   'completed',
   'rejected',
@@ -277,13 +306,16 @@ export class DesktopControlService extends EventEmitter {
   private readonly outbox: AtomicJsonStore<unknown[]>
   private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
   private readonly durableUncertainReceipts: AtomicJsonStore<DurableUncertainReceiptHistory>
-  private readonly residentLifecycleLedger: AtomicJsonStore<ResidentLifecycleLedger>
+  private readonly residentLifecycleLedger: AtomicJsonStore<PersistedResidentLifecycleLedger>
   private readonly latency = new LatencyRecorder()
   private readonly discoveredAliases = new Set<string>()
   private readonly installPlans = new Map<string, HostInstallPlan>()
   private readonly threadChangeRefreshes = new Map<string, ThreadChangeRefresh>()
   private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelectionRecord>()
   private readonly retiredResidentSelections = new Map<string, RetiredResidentSelectionReason>()
+  private readonly residentEndConfirmations = new Map<string, ResidentEndConfirmationRecord>()
+  private readonly retiredResidentEndConfirmations = new Map<string, RetiredResidentEndConfirmationReason>()
+  private readonly residentEndMutationTails = new Map<string, Promise<void>>()
   private residentProjectionRefreshPromise?: Promise<void>
   private residentProjectionRefreshTail: Promise<void> = Promise.resolve()
   /**
@@ -347,11 +379,11 @@ export class DesktopControlService extends EventEmitter {
       4 * 1024 * 1024,
       { malformedJson: 'error', validateRoot: isDurableUncertainReceiptHistory },
     )
-    this.residentLifecycleLedger = new AtomicJsonStore<ResidentLifecycleLedger>(
+    this.residentLifecycleLedger = new AtomicJsonStore<PersistedResidentLifecycleLedger>(
       path.join(stateDirectory, 'resident-lifecycle.json'),
       () => ({ version: 1, entries: [] }),
       2 * 1024 * 1024,
-      { malformedJson: 'error', validateRoot: isResidentLifecycleLedger },
+      { malformedJson: 'error', validateRoot: isPersistedResidentLifecycleLedger },
     )
   }
 
@@ -380,7 +412,7 @@ export class DesktopControlService extends EventEmitter {
         const activeTarget = this.target
         const cache = retry === 0 ? initialCache : await this.readCache()
         const outbox = await this.readOutboxClassification(true)
-        const residentLifecycle = await this.residentLifecycleLedger.read()
+        const residentLifecycle = normalizeResidentLifecycleLedger(await this.residentLifecycleLedger.read())
         const connection = this.getConnectionState()
         if (
           generation === this.reconnectGeneration &&
@@ -472,6 +504,7 @@ export class DesktopControlService extends EventEmitter {
   async connect(target: ConnectionTarget): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
+    this.revokeResidentEndConfirmations('authority_changed')
     try {
       if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
       const intentGeneration = ++this.controlIntentGeneration
@@ -524,6 +557,7 @@ export class DesktopControlService extends EventEmitter {
   async reconnect(): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
+    this.revokeResidentEndConfirmations('authority_changed')
     try {
       const target = this.target
       if (!target) {
@@ -550,6 +584,7 @@ export class DesktopControlService extends EventEmitter {
   async disconnect(): Promise<void> {
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
+    this.revokeResidentEndConfirmations('authority_changed')
     try {
       this.intentionallyOffline = true
       this.controlIntentGeneration += 1
@@ -876,6 +911,116 @@ export class DesktopControlService extends EventEmitter {
     })
     record.inFlight = operation
     return await operation
+  }
+
+  async prepareResidentEnd(input: ResidentEndPreparationInput): Promise<ResidentEndPreparation> {
+    return await this.latency.measure('resident.end.prepare', async () => {
+      const normalized = normalizeResidentEndPreparationInput(input)
+      const authority = this.captureResidentLifecycleAuthority(normalized.expectedHostId)
+      const ledger = await this.readResidentLifecycleLedger()
+      this.assertProjectionAuthority(authority, 'resident end confirmation')
+
+      let operationId = `resident-end-${randomUUID()}`
+      let createdAt = now()
+      let expectedSourceCursor: SessionCursor | undefined
+      if (normalized.resumeOperationId) {
+        const entry = ledger.entries.find(
+          (candidate) =>
+            candidate.expectedHostId === normalized.expectedHostId &&
+            candidate.operationId === normalized.resumeOperationId
+        )
+        if (!entry || entry.kind !== 'end') {
+          throw new ControlError(
+            'resident.end_resume_unknown',
+            'The resident end operation selected for recovery is not available.'
+          )
+        }
+        if (!residentEndIdentityMatches(entry, normalized)) {
+          throw new ControlError(
+            'resident.end_resume_identity_changed',
+            'The resident end operation belongs to a different thread lineage.'
+          )
+        }
+        if (
+          entry.state !== 'submitted' ||
+          entry.lastStatus?.kind !== 'end' ||
+          entry.lastStatus.phase !== 'ending'
+        ) {
+          throw new ControlError(
+            'resident.end_resume_not_allowed',
+            'This end operation may only be checked for durable status; it cannot send another end request.'
+          )
+        }
+        operationId = entry.operationId
+        createdAt = entry.createdAt
+        expectedSourceCursor = entry.sourceCursor
+      } else {
+        const existing = ledger.entries.find(
+          (candidate) => candidate.kind === 'end' && residentEndIdentityMatches(candidate, normalized)
+        )
+        if (existing) {
+          throw new ControlError(
+            'resident.end_recovery_required',
+            'A durable end operation already owns this resident session. Check its status before continuing.',
+            {
+              retryable: false,
+              details: { expectedHostId: existing.expectedHostId, operationId: existing.operationId },
+            }
+          )
+        }
+      }
+
+      const sourceCursor = await this.captureResidentEndSourceCursor(normalized, authority)
+      if (expectedSourceCursor && !sameSessionCursor(expectedSourceCursor, sourceCursor)) {
+        throw new ControlError(
+          'resident.end_source_projection_changed',
+          'The thread projection changed after this end operation was recorded. Check its durable status.'
+        )
+      }
+      this.assertProjectionAuthority(authority, 'resident end confirmation')
+      this.expireResidentEndConfirmations()
+      this.revokeResidentEndConfirmations('superseded')
+
+      const confirmationToken = randomUUID()
+      const confirmation = Object.freeze({
+        confirmationToken,
+        operationId,
+        expectedHostId: normalized.expectedHostId,
+        threadId: normalized.threadId,
+        executionGenerationId: normalized.executionGenerationId,
+        expiresAt: new Date(Date.now() + RESIDENT_END_CONFIRMATION_TTL_MS).toISOString(),
+      })
+      this.residentEndConfirmations.set(confirmationToken, {
+        confirmation,
+        authority,
+        identity: {
+          expectedHostId: normalized.expectedHostId,
+          projectId: normalized.projectId,
+          workspaceId: normalized.workspaceId,
+          threadId: normalized.threadId,
+          executionGenerationId: normalized.executionGenerationId,
+        },
+        sourceCursor,
+        createdAt,
+      })
+      this.enforceResidentEndConfirmationLimit()
+      return { ...confirmation }
+    })
+  }
+
+  async endResident(input: ResidentEndInput): Promise<ResidentLifecycleStatus> {
+    if (input.consent !== true) {
+      throw new ControlError(
+        'resident.end_consent_required',
+        'Ending a resident session requires explicit confirmation.'
+      )
+    }
+    const record = this.requireResidentEndConfirmation(input.confirmationToken)
+    // Confirmation authorization is consumed before any durable or host work.
+    // A raced renderer call therefore cannot produce a second kill request.
+    this.retireResidentEndConfirmation(input.confirmationToken, 'consumed')
+    this.assertResidentEndConfirmationAuthority(record)
+    return await this.runResidentEnd(record)
   }
 
   async residentLifecycleStatus(
@@ -1305,6 +1450,17 @@ export class DesktopControlService extends EventEmitter {
   }
 
   async submitCommand(command: ClientCommand): Promise<CommandReceipt> {
+    return await this.withResidentEndMutationFence(
+      residentEndMutationKey({
+        expectedHostId: command.expectedHostId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
+      }),
+      () => this.submitCommandUnlocked(command),
+    )
+  }
+
+  private async submitCommandUnlocked(command: ClientCommand): Promise<CommandReceipt> {
     const envelope = adaptCommand(command)
     const hostId = this.requireAuthorityHostId(
       'This command cannot be queued until the app has verified the destination host identity at least once.'
@@ -1319,6 +1475,7 @@ export class DesktopControlService extends EventEmitter {
         }
       )
     }
+    await this.assertResidentEndDoesNotBlockCommand(command)
     const pendingEntry: ScopedOutboxEntry = { hostId, command, state: 'uncertain', updatedAt: now() }
     // A pre-ledger outbox from an older build owns this global identity first.
     // Prove it is the exact same scoped envelope before reserving a new ledger
@@ -1594,6 +1751,7 @@ export class DesktopControlService extends EventEmitter {
     generation: number
   ): Promise<ConnectionState> {
     this.revokeResidentWorkspaceSelections('authority_changed')
+    this.revokeResidentEndConfirmations('authority_changed')
     this.stopHealthPolling()
     const previous = this.connection
     if (previous) this.cancelThreadChangeRefreshesForConnection(previous)
@@ -2314,7 +2472,7 @@ export class DesktopControlService extends EventEmitter {
     if (this.state.phase !== 'online') {
       throw new ControlError(
         'resident.lifecycle_live_connection_required',
-        'Resident provisioning requires a live, fully reconciled host connection.',
+        'Resident lifecycle control requires a live, fully reconciled host connection.',
         { retryable: true }
       )
     }
@@ -2331,7 +2489,7 @@ export class DesktopControlService extends EventEmitter {
     if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
       throw new ControlError(
         'resident.lifecycle_local_required',
-        'Resident workspace provisioning is available only on this computer.'
+        'Resident lifecycle control is available only on this computer.'
       )
     }
     if (
@@ -2340,11 +2498,191 @@ export class DesktopControlService extends EventEmitter {
     ) {
       throw new ControlError(
         'resident.lifecycle_unavailable',
-        'The connected host does not expose resident lifecycle provisioning.',
+        'The connected host does not expose resident lifecycle control.',
         { retryable: true }
       )
     }
     return authority
+  }
+
+  private async readResidentLifecycleLedger(): Promise<ResidentLifecycleLedger> {
+    return normalizeResidentLifecycleLedger(await this.residentLifecycleLedger.read())
+  }
+
+  private async assertResidentEndDoesNotBlockCommand(command: ClientCommand): Promise<void> {
+    const ledger = await this.readResidentLifecycleLedger()
+    const end = ledger.entries.find(
+      (entry) =>
+        entry.kind === 'end' &&
+        entry.expectedHostId === command.expectedHostId &&
+        entry.threadId === command.threadId &&
+        entry.executionGenerationId === command.expectedExecutionGenerationId
+    )
+    if (!end) return
+    throw new ControlError(
+      'command.resident_end_in_progress',
+      end.state === 'terminal'
+        ? 'This resident session has ended. Its saved thread is read-only.'
+        : 'This resident session is ending. Commands are blocked while its durable outcome is reconciled.',
+      {
+        retryable: false,
+        details: {
+          expectedHostId: end.expectedHostId,
+          operationId: end.operationId,
+          threadId: end.threadId,
+          executionGenerationId: end.executionGenerationId,
+          state: end.state,
+        },
+      }
+    )
+  }
+
+  private async captureResidentEndSourceCursor(
+    input: Omit<ResidentEndPreparationInput, 'resumeOperationId'>,
+    authority: CapturedProjectionAuthority,
+  ): Promise<SessionCursor> {
+    const cache = await this.readCache()
+    this.assertProjectionAuthority(authority, 'resident end projection review')
+    const rawSnapshot = cache.entries[authority.hostId]?.lastSnapshot
+    const parsed = ThreadProjectionSnapshotSchema.safeParse(rawSnapshot)
+    if (!parsed.success) {
+      throw new ControlError(
+        'resident.end_projection_required',
+        'Refresh this resident thread before reviewing its permanent end.'
+      )
+    }
+    const snapshot = parsed.data
+    if (
+      snapshot.thread.threadId !== input.threadId ||
+      snapshot.thread.currentLocation.hostId !== input.expectedHostId ||
+      snapshot.thread.currentLocation.projectId !== input.projectId ||
+      snapshot.thread.currentLocation.workspaceId !== input.workspaceId ||
+      snapshot.thread.currentLocation.executionGenerationId !== input.executionGenerationId
+    ) {
+      throw new ControlError(
+        'resident.end_lineage_changed',
+        'The reviewed resident thread lineage no longer matches the native projection.'
+      )
+    }
+    if (snapshot.residentLifecycle) {
+      throw new ControlError(
+        'resident.end_already_completed',
+        'This resident session has already ended.'
+      )
+    }
+    if (snapshot.runtime?.residency !== 'resident') {
+      throw new ControlError(
+        'resident.end_runtime_not_proven',
+        'The selected thread does not have a verified resident runtime to end.'
+      )
+    }
+    return structuredClone(snapshot.latestCursor)
+  }
+
+  private requireResidentEndConfirmation(confirmationToken: string): ResidentEndConfirmationRecord {
+    this.expireResidentEndConfirmations()
+    const record = this.residentEndConfirmations.get(confirmationToken)
+    if (record) return record
+    const reason = this.retiredResidentEndConfirmations.get(confirmationToken)
+    if (reason === 'expired') {
+      throw new ControlError(
+        'resident.end_confirmation_expired',
+        'The end confirmation expired. Review the resident session again.'
+      )
+    }
+    if (reason === 'superseded') {
+      throw new ControlError(
+        'resident.end_confirmation_superseded',
+        'A newer resident end review replaced this confirmation.'
+      )
+    }
+    if (reason === 'authority_changed') {
+      throw new ControlError(
+        'resident.end_confirmation_authority_changed',
+        'The host connection changed after this resident end was reviewed.',
+        { retryable: true }
+      )
+    }
+    if (reason === 'consumed') {
+      throw new ControlError(
+        'resident.end_confirmation_consumed',
+        'This end confirmation has already been used. Check the durable operation status.'
+      )
+    }
+    throw new ControlError(
+      'resident.end_confirmation_unknown',
+      'The end confirmation is unavailable. Review the resident session again.'
+    )
+  }
+
+  private assertResidentEndConfirmationAuthority(record: ResidentEndConfirmationRecord): void {
+    const authority = this.captureResidentLifecycleAuthority(record.identity.expectedHostId)
+    if (
+      authority.connection !== record.authority.connection ||
+      authority.generation !== record.authority.generation ||
+      !sameTarget(authority.target, record.authority.target)
+    ) {
+      throw new ControlError(
+        'resident.end_confirmation_authority_changed',
+        'The host connection changed after this resident end was reviewed.',
+        { retryable: true }
+      )
+    }
+    this.assertProjectionAuthority(record.authority, 'resident end confirmation')
+  }
+
+  private expireResidentEndConfirmations(): void {
+    const timestamp = Date.now()
+    for (const record of [...this.residentEndConfirmations.values()]) {
+      if (Date.parse(record.confirmation.expiresAt) <= timestamp) {
+        this.retireResidentEndConfirmation(record.confirmation.confirmationToken, 'expired')
+      }
+    }
+  }
+
+  private revokeResidentEndConfirmations(reason: RetiredResidentEndConfirmationReason): void {
+    for (const confirmationToken of [...this.residentEndConfirmations.keys()]) {
+      this.retireResidentEndConfirmation(confirmationToken, reason)
+    }
+  }
+
+  private retireResidentEndConfirmation(
+    confirmationToken: string,
+    reason: RetiredResidentEndConfirmationReason,
+  ): void {
+    this.residentEndConfirmations.delete(confirmationToken)
+    this.retiredResidentEndConfirmations.delete(confirmationToken)
+    this.retiredResidentEndConfirmations.set(confirmationToken, reason)
+    while (this.retiredResidentEndConfirmations.size > RETIRED_RESIDENT_END_CONFIRMATION_LIMIT) {
+      const oldest = this.retiredResidentEndConfirmations.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retiredResidentEndConfirmations.delete(oldest)
+    }
+  }
+
+  private enforceResidentEndConfirmationLimit(): void {
+    while (this.residentEndConfirmations.size > RESIDENT_END_CONFIRMATION_LIMIT) {
+      const oldest = this.residentEndConfirmations.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retireResidentEndConfirmation(oldest, 'superseded')
+    }
+  }
+
+  private async withResidentEndMutationFence<T>(
+    key: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.residentEndMutationTails.get(key) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(() => undefined, () => undefined)
+    this.residentEndMutationTails.set(key, tail)
+    try {
+      return await result
+    } finally {
+      if (this.residentEndMutationTails.get(key) === tail) {
+        this.residentEndMutationTails.delete(key)
+      }
+    }
   }
 
   private requireResidentWorkspaceSelection(selectionToken: string): ResidentWorkspaceSelectionRecord {
@@ -2386,14 +2724,14 @@ export class DesktopControlService extends EventEmitter {
   private async requireResidentWorkspaceRecoveryEntry(
     operationId: string,
     authority: CapturedProjectionAuthority,
-  ): Promise<ResidentLifecycleOperationView> {
+  ): Promise<ResidentProvisionOperationView> {
     if (!isHostId(operationId)) {
       throw new ControlError(
         'resident.workspace_resume_invalid',
         'The resident operation selected for recovery is invalid.'
       )
     }
-    const ledger = await this.residentLifecycleLedger.read()
+    const ledger = await this.readResidentLifecycleLedger()
     const entry = ledger.entries.find((candidate) => candidate.operationId === operationId)
     if (!entry) {
       throw new ControlError(
@@ -2407,7 +2745,7 @@ export class DesktopControlService extends EventEmitter {
         'The resident operation selected for recovery belongs to a different host.'
       )
     }
-    if (!isRecoverableResidentWorkspaceEntry(entry)) {
+    if (entry.kind !== 'provision' || !isRecoverableResidentWorkspaceEntry(entry)) {
       throw new ControlError(
         'resident.workspace_resume_not_allowed',
         'This resident operation cannot be resumed by selecting a workspace.'
@@ -2469,6 +2807,219 @@ export class DesktopControlService extends EventEmitter {
       if (oldest === undefined) break
       this.retireResidentWorkspaceSelection(oldest, 'superseded')
     }
+  }
+
+  private async runResidentEnd(record: ResidentEndConfirmationRecord): Promise<ResidentLifecycleStatus> {
+    const mutationKey = residentEndMutationKey(record.identity)
+    await this.withResidentEndMutationFence(mutationKey, async () => {
+      this.assertResidentEndConfirmationAuthority(record)
+      await this.recordResidentEndSubmission(record)
+      this.assertResidentEndConfirmationAuthority(record)
+    })
+
+    let raw: unknown
+    try {
+      // No await may separate this exact-generation fence from the mutation
+      // invocation. A reconnect after durable admission therefore cannot send
+      // the reviewed operation over a replacement authority.
+      this.assertResidentEndConfirmationAuthority(record)
+      raw = await record.authority.connection.request(
+        'resident.end',
+        {
+          operationId: record.confirmation.operationId,
+          expectedHostId: record.identity.expectedHostId,
+          projectId: record.identity.projectId,
+          workspaceId: record.identity.workspaceId,
+          threadId: record.identity.threadId,
+          executionGenerationId: record.identity.executionGenerationId,
+          expectedSourceCursor: record.sourceCursor,
+        },
+        { timeoutMs: RESIDENT_PROVISION_TIMEOUT_MS, priority: 'urgent' }
+      )
+    } catch (error) {
+      if (isResidentEndSourceCursorChanged(error)) {
+        await this.retireDefinitivelyRejectedResidentEnd(record)
+        throw error
+      }
+      await this.updateResidentLifecycleLedgerState(
+        record.authority,
+        record.confirmation.operationId,
+        'outcome_unknown'
+      ).catch(() => undefined)
+      const reconciled = await this.tryReconcileResidentEnd(record)
+      if (reconciled) return reconciled
+      throw new ControlError(
+        'resident.end_outcome_unknown',
+        'The host did not confirm the resident end. Check its durable status; do not send another end request.',
+        {
+          retryable: false,
+          details: {
+            expectedHostId: record.identity.expectedHostId,
+            operationId: record.confirmation.operationId,
+          },
+        }
+      )
+    }
+
+    this.assertProjectionAuthority(record.authority, 'resident end')
+    let status: ResidentLifecycleStatus
+    try {
+      status = ResidentLifecycleStatusSchema.parse(raw)
+    } catch {
+      await this.updateResidentLifecycleLedgerState(
+        record.authority,
+        record.confirmation.operationId,
+        'outcome_unknown'
+      ).catch(() => undefined)
+      const reconciled = await this.tryReconcileResidentEnd(record)
+      if (reconciled) return reconciled
+      throw new ControlError(
+        'protocol.resident_lifecycle_invalid',
+        'The host returned an invalid resident end lifecycle response.',
+        {
+          retryable: false,
+          details: {
+            expectedHostId: record.identity.expectedHostId,
+            operationId: record.confirmation.operationId,
+          },
+        }
+      )
+    }
+    return await this.acceptResidentLifecycleStatus(
+      status,
+      record.authority,
+      record.confirmation.operationId,
+    )
+  }
+
+  private async retireDefinitivelyRejectedResidentEnd(
+    record: ResidentEndConfirmationRecord,
+  ): Promise<void> {
+    this.assertProjectionAuthority(record.authority, 'resident end pre-effect rejection')
+    let retired = false
+    await this.residentLifecycleLedger.update((persisted) => {
+      this.assertProjectionAuthority(record.authority, 'resident end pre-effect rejection')
+      const current = normalizeResidentLifecycleLedger(persisted)
+      const index = current.entries.findIndex(
+        (entry) =>
+          entry.expectedHostId === record.identity.expectedHostId &&
+          entry.operationId === record.confirmation.operationId
+      )
+      const existing = index < 0 ? undefined : current.entries[index]
+      if (
+        !existing ||
+        existing.kind !== 'end' ||
+        !residentEndIdentityMatches(existing, record.identity) ||
+        !sameSessionCursor(existing.sourceCursor, record.sourceCursor) ||
+        existing.lastStatus !== undefined ||
+        existing.state !== 'submitted'
+      ) {
+        throw new ControlError(
+          'protocol.resident_end_rejection_conflict',
+          'The local resident end record changed after the host rejected it before effect.'
+        )
+      }
+      const entries = [...current.entries]
+      entries.splice(index, 1)
+      retired = true
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(record.authority, 'resident end pre-effect rejection')
+    if (!retired) {
+      throw new ControlError(
+        'protocol.resident_end_rejection_conflict',
+        'The rejected resident end record could not be retired safely.'
+      )
+    }
+  }
+
+  private async tryReconcileResidentEnd(
+    record: ResidentEndConfirmationRecord,
+  ): Promise<ResidentLifecycleStatus | undefined> {
+    if (!this.isActiveConnection(
+      record.authority.connection,
+      record.authority.target,
+      record.authority.hostId,
+      record.authority.generation,
+    )) return undefined
+    try {
+      const raw = await record.authority.connection.request(
+        'resident.lifecycle.status',
+        {
+          expectedHostId: record.identity.expectedHostId,
+          operationId: record.confirmation.operationId,
+        },
+        { timeoutMs: 30_000 }
+      )
+      this.assertProjectionAuthority(record.authority, 'resident end reconciliation')
+      const lookup = ResidentLifecycleLookupResultSchema.parse(raw)
+      if (!lookup.status) {
+        await this.markResidentLifecycleStatusMissing(
+          record.authority,
+          record.confirmation.operationId,
+        )
+        return undefined
+      }
+      return await this.acceptResidentLifecycleStatus(
+        lookup.status,
+        record.authority,
+        record.confirmation.operationId,
+      )
+    } catch (error) {
+      if (error instanceof ControlError && error.code === 'resident.projection_refresh_failed') throw error
+      return undefined
+    }
+  }
+
+  private async recordResidentEndSubmission(record: ResidentEndConfirmationRecord): Promise<void> {
+    const entry: ResidentEndOperationView = {
+      kind: 'end',
+      operationId: record.confirmation.operationId,
+      expectedHostId: record.identity.expectedHostId,
+      projectId: record.identity.projectId,
+      workspaceId: record.identity.workspaceId,
+      threadId: record.identity.threadId,
+      executionGenerationId: record.identity.executionGenerationId,
+      sourceCursor: structuredClone(record.sourceCursor),
+      createdAt: record.createdAt,
+      updatedAt: now(),
+      state: 'submitted',
+    }
+    this.assertProjectionAuthority(record.authority, 'resident end admission')
+    await this.residentLifecycleLedger.update((persisted) => {
+      this.assertProjectionAuthority(record.authority, 'resident end admission')
+      const current = normalizeResidentLifecycleLedger(persisted)
+      const existingIndex = current.entries.findIndex(
+        (candidate) => candidate.operationId === entry.operationId
+      )
+      if (existingIndex >= 0) {
+        const existing = current.entries[existingIndex]
+        if (!existing || !sameResidentLifecycleIdentity(existing, entry)) {
+          throw new ControlError(
+            'resident.end_ledger_conflict',
+            'The resident end operation is already bound to different immutable details.'
+          )
+        }
+        if (
+          existing.kind !== 'end' ||
+          existing.state !== 'submitted' ||
+          existing.lastStatus?.kind !== 'end' ||
+          existing.lastStatus.phase !== 'ending'
+        ) {
+          throw new ControlError(
+            'resident.end_replay_blocked',
+            'This durable end operation cannot send another end request. Check its status.'
+          )
+        }
+        return current
+      }
+
+      const entries = [...current.entries]
+      makeRoomForResidentLifecycleEntry(entries)
+      entries.push(entry)
+      return { version: 1, entries }
+    })
+    this.assertProjectionAuthority(record.authority, 'resident end admission')
   }
 
   private async runResidentProvision(record: ResidentWorkspaceSelectionRecord): Promise<ResidentLifecycleStatus> {
@@ -2590,7 +3141,8 @@ export class DesktopControlService extends EventEmitter {
     record: ResidentWorkspaceSelectionRecord,
     metadata: ResidentProvisionMetadata,
   ): Promise<void> {
-    const entry: ResidentLifecycleOperationView = {
+    const entry: ResidentProvisionOperationView = {
+      kind: 'provision',
       operationId: record.selection.operationId,
       expectedHostId: record.selection.expectedHostId,
       projectId: record.projectId,
@@ -2605,8 +3157,9 @@ export class DesktopControlService extends EventEmitter {
       state: 'submitted',
     }
     this.assertProjectionAuthority(record.authority, 'resident lifecycle submission')
-    await this.residentLifecycleLedger.update((current) => {
+    await this.residentLifecycleLedger.update((persisted) => {
       this.assertProjectionAuthority(record.authority, 'resident lifecycle submission')
+      const current = normalizeResidentLifecycleLedger(persisted)
       const existingIndex = current.entries.findIndex(
         (candidate) => candidate.operationId === entry.operationId
       )
@@ -2636,16 +3189,7 @@ export class DesktopControlService extends EventEmitter {
       }
 
       const entries = [...current.entries]
-      while (entries.length >= RESIDENT_LIFECYCLE_LEDGER_LIMIT) {
-        const terminalIndex = entries.findIndex((candidate) => candidate.state === 'terminal')
-        if (terminalIndex < 0) {
-          throw new ControlError(
-            'resident.lifecycle_ledger_full',
-            'Too many resident lifecycle operations still require reconciliation.'
-          )
-        }
-        entries.splice(terminalIndex, 1)
-      }
+      makeRoomForResidentLifecycleEntry(entries)
       entries.push(entry)
       return { version: 1, entries }
     })
@@ -2658,11 +3202,12 @@ export class DesktopControlService extends EventEmitter {
     state: ResidentLifecycleOperationView['state'],
   ): Promise<void> {
     this.assertProjectionAuthority(authority, 'resident lifecycle state update')
-    await this.residentLifecycleLedger.update((current) => {
+    await this.residentLifecycleLedger.update((persisted) => {
       // This fence deliberately runs inside the store's serialized callback.
       // An old connection waiting behind another ledger write cannot mutate
       // durable state after its generation has been replaced.
       this.assertProjectionAuthority(authority, 'resident lifecycle state update')
+      const current = normalizeResidentLifecycleLedger(persisted)
       const index = current.entries.findIndex(
         (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
       )
@@ -2693,8 +3238,9 @@ export class DesktopControlService extends EventEmitter {
   ): Promise<void> {
     this.expireResidentWorkspaceSelections()
     this.assertProjectionAuthority(authority, 'resident lifecycle missing status')
-    await this.residentLifecycleLedger.update((current) => {
+    await this.residentLifecycleLedger.update((persisted) => {
       this.assertProjectionAuthority(authority, 'resident lifecycle missing status')
+      const current = normalizeResidentLifecycleLedger(persisted)
       const index = current.entries.findIndex(
         (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
       )
@@ -2710,7 +3256,7 @@ export class DesktopControlService extends EventEmitter {
           'The host omitted a resident lifecycle record that was observed previously.'
         )
       }
-      const hasLiveSelection = [...this.residentWorkspaceSelections.values()].some(
+      const hasLiveSelection = existing.kind === 'provision' && [...this.residentWorkspaceSelections.values()].some(
         (record) =>
           record.selection.expectedHostId === authority.hostId &&
           record.selection.operationId === operationId
@@ -2719,7 +3265,9 @@ export class DesktopControlService extends EventEmitter {
       entries[index] = {
         ...existing,
         updatedAt: now(),
-        state: hasLiveSelection ? 'outcome_unknown' : 'requires_reselection',
+        state: existing.kind === 'end'
+          ? 'outcome_unknown'
+          : hasLiveSelection ? 'outcome_unknown' : 'requires_reselection',
       }
       return { version: 1, entries }
     })
@@ -2732,7 +3280,7 @@ export class DesktopControlService extends EventEmitter {
     if (authority.target.kind !== 'local') return
     let ledger: ResidentLifecycleLedger
     try {
-      ledger = await this.residentLifecycleLedger.read()
+      ledger = await this.readResidentLifecycleLedger()
     } catch {
       // A malformed durable ledger is surfaced by bootstrap. It must not make
       // an otherwise verified host connection unavailable or trigger replay.
@@ -2817,12 +3365,12 @@ export class DesktopControlService extends EventEmitter {
   private async refreshPendingResidentProjections(
     authority: CapturedProjectionAuthority,
   ): Promise<void> {
-    const ledger = await this.residentLifecycleLedger.read()
+    const ledger = await this.readResidentLifecycleLedger()
     const pending = ledger.entries
       .flatMap((entry) =>
         entry.expectedHostId === authority.hostId &&
         entry.state === 'terminal_refresh_pending' &&
-        entry.lastStatus?.phase === 'committed'
+        entry.lastStatus !== undefined && residentLifecycleStatusNeedsProjectionRefresh(entry.lastStatus)
           ? [{ entry, status: entry.lastStatus }]
           : []
       )
@@ -2880,7 +3428,17 @@ export class DesktopControlService extends EventEmitter {
       const representative = group[0]
       if (!representative) continue
       try {
-        this.assertCommittedResidentCatalogIdentity(representative.status, catalog)
+        const expectedThreadStatus = this.assertCommittedResidentCatalogIdentity(
+          representative.status,
+          catalog,
+          representative.entry,
+        )
+        await this.assertResidentCatalogProjectionPersisted(
+          representative.status,
+          representative.entry,
+          authority,
+          expectedThreadStatus,
+        )
         await this.refreshCommittedResidentThread(
           representative.status,
           authority,
@@ -2888,6 +3446,8 @@ export class DesktopControlService extends EventEmitter {
             RESIDENT_BACKGROUND_REFRESH_REQUEST_TIMEOUT_MS,
             Math.max(1, deadline - Date.now()),
           ),
+          representative.entry,
+          expectedThreadStatus,
         )
         for (const item of group) {
           await this.markResidentProjectionRefreshed(
@@ -2898,7 +3458,7 @@ export class DesktopControlService extends EventEmitter {
         }
       } catch {
         // Leave this exact status refresh-pending. A later reconnect or an
-        // explicit status lookup retries it without replaying provisioning.
+        // explicit status lookup retries it without replaying a lifecycle mutation.
       }
     }
   }
@@ -2936,7 +3496,7 @@ export class DesktopControlService extends EventEmitter {
       }
     }
     if (
-      acceptedStatus.phase === 'committed' &&
+      residentLifecycleStatusNeedsProjectionRefresh(acceptedStatus) &&
       merged.state !== 'terminal' &&
       options.refreshCommittedProjection !== false
     ) {
@@ -2958,11 +3518,12 @@ export class DesktopControlService extends EventEmitter {
   ): Promise<ResidentLifecycleStatusMerge> {
     let merged: ResidentLifecycleStatusMerge = { status }
     this.assertProjectionAuthority(authority, 'resident lifecycle status merge')
-    await this.residentLifecycleLedger.update((current) => {
+    await this.residentLifecycleLedger.update((persisted) => {
       // Reads followed by a separate update admit a classic stale-response
       // race. Compare and replace under the store's one serialized callback so
       // the status with the newest host timestamp is the only possible winner.
       this.assertProjectionAuthority(authority, 'resident lifecycle status merge')
+      const current = normalizeResidentLifecycleLedger(persisted)
       const index = current.entries.findIndex(
         (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
       )
@@ -3034,8 +3595,9 @@ export class DesktopControlService extends EventEmitter {
   ): Promise<ResidentLifecycleStatus> {
     let currentStatus = refreshedStatus
     this.assertProjectionAuthority(authority, 'resident projection refresh commit')
-    await this.residentLifecycleLedger.update((current) => {
+    await this.residentLifecycleLedger.update((persisted) => {
       this.assertProjectionAuthority(authority, 'resident projection refresh commit')
+      const current = normalizeResidentLifecycleLedger(persisted)
       const index = current.entries.findIndex(
         (entry) => entry.expectedHostId === authority.hostId && entry.operationId === operationId
       )
@@ -3069,7 +3631,10 @@ export class DesktopControlService extends EventEmitter {
       }
       currentStatus = persistedStatus
       if (existing.state === 'terminal') return current
-      if (existing.state !== 'terminal_refresh_pending' || persistedStatus.phase !== 'committed') {
+      if (
+        existing.state !== 'terminal_refresh_pending' ||
+        !residentLifecycleStatusNeedsProjectionRefresh(persistedStatus)
+      ) {
         return current
       }
       const entries = [...current.entries]
@@ -3094,6 +3659,18 @@ export class DesktopControlService extends EventEmitter {
     authority: CapturedProjectionAuthority,
   ): Promise<void> {
     try {
+      const ledger = await this.readResidentLifecycleLedger()
+      const entry = ledger.entries.find(
+        (candidate) =>
+          candidate.expectedHostId === status.expectedHostId &&
+          candidate.operationId === status.operationId
+      )
+      if (!entry || !residentStatusMatchesLedger(status, entry)) {
+        throw new ControlError(
+          'protocol.resident_lifecycle_identity_mismatch',
+          'The durable lifecycle entry changed before its projection refresh.'
+        )
+      }
       const rawCatalog = await authority.connection.request(
         'catalog.snapshot',
         {},
@@ -3101,7 +3678,7 @@ export class DesktopControlService extends EventEmitter {
       )
       this.assertProjectionAuthority(authority, 'resident catalog refresh')
       const catalog = CatalogProjectionSnapshotSchema.parse(rawCatalog)
-      this.assertCommittedResidentCatalogIdentity(status, catalog)
+      const expectedThreadStatus = this.assertCommittedResidentCatalogIdentity(status, catalog, entry)
       const accepted = await this.persistCatalog(catalog, authority)
       if (accepted && this.isActiveConnection(
         authority.connection,
@@ -3109,12 +3686,24 @@ export class DesktopControlService extends EventEmitter {
         authority.hostId,
         authority.generation,
       )) this.emit('snapshot', catalog)
-      await this.refreshCommittedResidentThread(status, authority, 45_000)
+      await this.assertResidentCatalogProjectionPersisted(
+        status,
+        entry,
+        authority,
+        expectedThreadStatus,
+      )
+      await this.refreshCommittedResidentThread(
+        status,
+        authority,
+        45_000,
+        entry,
+        expectedThreadStatus,
+      )
     } catch (error) {
       if (error instanceof ControlError && error.code.startsWith('protocol.resident_')) throw error
       throw new ControlError(
         'resident.projection_refresh_failed',
-        'Resident provisioning committed, but the new catalog projection could not be refreshed.',
+        'The resident lifecycle completed, but its terminal projection could not be refreshed.',
         {
           retryable: true,
           details: { expectedHostId: status.expectedHostId, operationId: status.operationId },
@@ -3126,7 +3715,8 @@ export class DesktopControlService extends EventEmitter {
   private assertCommittedResidentCatalogIdentity(
     status: ResidentLifecycleStatus,
     catalog: CatalogProjectionSnapshot,
-  ): void {
+    entry: ResidentLifecycleOperationView,
+  ): TaskState {
     const project = catalog.projects.find((candidate) => candidate.projectId === status.projectId)
     const thread = catalog.threads.find((candidate) => candidate.threadId === status.threadId)
     if (
@@ -3136,11 +3726,43 @@ export class DesktopControlService extends EventEmitter {
       !thread ||
       thread.currentLocation.projectId !== status.projectId ||
       thread.currentLocation.workspaceId !== status.workspaceId ||
-      thread.currentLocation.executionGenerationId !== status.executionGenerationId
+      thread.currentLocation.executionGenerationId !== status.executionGenerationId ||
+      (status.kind === 'end' && (
+        entry.kind !== 'end' ||
+        !isResidentEndedTaskState(thread.status) ||
+        thread.recap !== RESIDENT_ENDED_RECAP ||
+        !thread.lastKnownCursor ||
+        !sameSessionCursor(thread.lastKnownCursor, entry.sourceCursor)
+      ))
     ) {
       throw new ControlError(
         'protocol.resident_catalog_identity_mismatch',
         'The refreshed catalog did not contain the committed resident operation.'
+      )
+    }
+    return thread.status
+  }
+
+  private async assertResidentCatalogProjectionPersisted(
+    status: ResidentLifecycleStatus,
+    entry: ResidentLifecycleOperationView,
+    authority: CapturedProjectionAuthority,
+    expectedThreadStatus: TaskState,
+  ): Promise<void> {
+    const cache = await this.readCache()
+    this.assertProjectionAuthority(authority, 'resident catalog persistence proof')
+    const parsed = CatalogProjectionSnapshotSchema.safeParse(cache.entries[authority.hostId]?.catalog)
+    if (!parsed.success) {
+      throw new ControlError(
+        'protocol.resident_catalog_persistence_mismatch',
+        'The terminal resident catalog was not persisted.'
+      )
+    }
+    const persistedThreadStatus = this.assertCommittedResidentCatalogIdentity(status, parsed.data, entry)
+    if (persistedThreadStatus !== expectedThreadStatus) {
+      throw new ControlError(
+        'protocol.resident_catalog_persistence_mismatch',
+        'The persisted terminal resident catalog changed its authoritative thread status.'
       )
     }
   }
@@ -3149,6 +3771,8 @@ export class DesktopControlService extends EventEmitter {
     status: ResidentLifecycleStatus,
     authority: CapturedProjectionAuthority,
     timeoutMs: number,
+    entry: ResidentLifecycleOperationView,
+    expectedThreadStatus: TaskState,
   ): Promise<void> {
     const rawSnapshot = await authority.connection.request(
       'thread.snapshot',
@@ -3162,7 +3786,13 @@ export class DesktopControlService extends EventEmitter {
       snapshot.thread.currentLocation.hostId !== status.expectedHostId ||
       snapshot.thread.currentLocation.projectId !== status.projectId ||
       snapshot.thread.currentLocation.workspaceId !== status.workspaceId ||
-      snapshot.thread.currentLocation.executionGenerationId !== status.executionGenerationId
+      snapshot.thread.currentLocation.executionGenerationId !== status.executionGenerationId ||
+      (status.kind === 'end' && !residentEndProjectionMatchesOperation(
+        snapshot,
+        status,
+        entry,
+        expectedThreadStatus,
+      ))
     ) {
       throw new ControlError(
         'protocol.resident_snapshot_identity_mismatch',
@@ -3176,6 +3806,28 @@ export class DesktopControlService extends EventEmitter {
       authority.hostId,
       authority.generation,
     )) this.emit('snapshot', snapshot)
+    const cache = await this.readCache()
+    this.assertProjectionAuthority(authority, 'resident thread persistence proof')
+    const persisted = ThreadProjectionSnapshotSchema.safeParse(cache.entries[authority.hostId]?.lastSnapshot)
+    if (
+      !persisted.success ||
+      persisted.data.thread.threadId !== status.threadId ||
+      persisted.data.thread.currentLocation.hostId !== status.expectedHostId ||
+      persisted.data.thread.currentLocation.projectId !== status.projectId ||
+      persisted.data.thread.currentLocation.workspaceId !== status.workspaceId ||
+      persisted.data.thread.currentLocation.executionGenerationId !== status.executionGenerationId ||
+      (status.kind === 'end' && !residentEndProjectionMatchesOperation(
+        persisted.data,
+        status,
+        entry,
+        expectedThreadStatus,
+      ))
+    ) {
+      throw new ControlError(
+        'protocol.resident_snapshot_persistence_mismatch',
+        'The terminal resident thread projection was not persisted.'
+      )
+    }
   }
 
   private assertProjectionAuthority(authority: CapturedProjectionAuthority, operation: string): void {
@@ -4908,7 +5560,7 @@ function normalizeResidentLabel(value: unknown, label: string): string {
   return normalized
 }
 
-function isRecoverableResidentWorkspaceEntry(entry: ResidentLifecycleOperationView): boolean {
+function isRecoverableResidentWorkspaceEntry(entry: ResidentProvisionOperationView): boolean {
   if (entry.state === 'requires_reselection') return true
   const status = entry.lastStatus
   if (
@@ -4935,7 +5587,7 @@ function isRecoverableResidentWorkspaceEntry(entry: ResidentLifecycleOperationVi
   )
 }
 
-function shouldReuseResidentLifecycleOperation(entry: ResidentLifecycleOperationView): boolean {
+function shouldReuseResidentLifecycleOperation(entry: ResidentProvisionOperationView): boolean {
   return !(
     entry.state === 'terminal' &&
     entry.lastStatus?.kind === 'provision' &&
@@ -4944,8 +5596,8 @@ function shouldReuseResidentLifecycleOperation(entry: ResidentLifecycleOperation
 }
 
 function sameResidentWorkspaceRecoverySource(
-  left: ResidentLifecycleOperationView,
-  right: ResidentLifecycleOperationView,
+  left: ResidentProvisionOperationView,
+  right: ResidentProvisionOperationView,
 ): boolean {
   return (
     sameResidentLifecycleIdentity(left, right) &&
@@ -4966,10 +5618,27 @@ function sameResidentLifecycleIdentity(
     left.workspaceId === right.workspaceId &&
     left.threadId === right.threadId &&
     left.executionGenerationId === right.executionGenerationId &&
-    left.projectDisplayName === right.projectDisplayName &&
-    left.threadTitle === right.threadTitle &&
-    left.sessionName === right.sessionName &&
-    left.createdAt === right.createdAt
+    left.kind === right.kind &&
+    left.createdAt === right.createdAt &&
+    (left.kind === 'provision'
+      ? right.kind === 'provision' &&
+        left.projectDisplayName === right.projectDisplayName &&
+        left.threadTitle === right.threadTitle &&
+        left.sessionName === right.sessionName
+      : right.kind === 'end' && sameSessionCursor(left.sourceCursor, right.sourceCursor))
+  )
+}
+
+function residentEndIdentityMatches(
+  entry: ResidentEndOperationView,
+  input: Omit<ResidentEndPreparationInput, 'resumeOperationId'>,
+): boolean {
+  return (
+    entry.expectedHostId === input.expectedHostId &&
+    entry.projectId === input.projectId &&
+    entry.workspaceId === input.workspaceId &&
+    entry.threadId === input.threadId &&
+    entry.executionGenerationId === input.executionGenerationId
   )
 }
 
@@ -4993,7 +5662,7 @@ function residentStatusMatchesLedger(
   entry: ResidentLifecycleOperationView,
 ): boolean {
   return (
-    status.kind === 'provision' &&
+    status.kind === entry.kind &&
     status.operationId === entry.operationId &&
     status.expectedHostId === entry.expectedHostId &&
     status.projectId === entry.projectId &&
@@ -5023,7 +5692,7 @@ function sameResidentLifecycleStatusIdentity(
 function residentLifecycleStateForStatus(
   status: ResidentLifecycleStatus,
 ): ResidentLifecycleOperationView['state'] {
-  if (status.phase === 'committed') return 'terminal_refresh_pending'
+  if (residentLifecycleStatusNeedsProjectionRefresh(status)) return 'terminal_refresh_pending'
   return isTerminalResidentLifecycleStatus(status) ? 'terminal' : 'submitted'
 }
 
@@ -5033,7 +5702,7 @@ function convergedResidentLifecycleState(
 ): ResidentLifecycleOperationView['state'] {
   const statusState = residentLifecycleStateForStatus(status)
   if (existingState === 'terminal' && isTerminalResidentLifecycleStatus(status)) return 'terminal'
-  if (existingState === 'terminal_refresh_pending' && status.phase === 'committed') {
+  if (existingState === 'terminal_refresh_pending' && residentLifecycleStatusNeedsProjectionRefresh(status)) {
     return 'terminal_refresh_pending'
   }
   return statusState
@@ -5043,12 +5712,21 @@ function residentProjectionIdentityKey(status: ResidentLifecycleStatus): string 
   return createHash('sha256')
     .update(JSON.stringify([
       status.expectedHostId,
+      status.kind,
+      ...(status.kind === 'end' ? [status.operationId] : []),
       status.projectId,
       status.workspaceId,
       status.threadId,
       status.executionGenerationId,
     ]))
     .digest('hex')
+}
+
+function residentLifecycleStatusNeedsProjectionRefresh(status: ResidentLifecycleStatus): boolean {
+  return (
+    (status.kind === 'provision' && status.phase === 'committed') ||
+    (status.kind === 'end' && status.phase === 'completed')
+  )
 }
 
 function isTerminalResidentLifecycleStatus(status: ResidentLifecycleStatus): boolean {
@@ -5061,6 +5739,7 @@ function isTerminalResidentLifecycleStatus(status: ResidentLifecycleStatus): boo
 }
 
 const RESIDENT_LEDGER_ENTRY_KEYS = new Set([
+  'kind',
   'operationId',
   'expectedHostId',
   'projectId',
@@ -5070,31 +5749,33 @@ const RESIDENT_LEDGER_ENTRY_KEYS = new Set([
   'projectDisplayName',
   'threadTitle',
   'sessionName',
+  'sourceCursor',
   'createdAt',
   'updatedAt',
   'state',
   'lastStatus',
 ])
 
-function isResidentLifecycleLedger(value: unknown): value is ResidentLifecycleLedger {
+function isPersistedResidentLifecycleLedger(value: unknown): value is PersistedResidentLifecycleLedger {
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.entries)) return false
   if (Object.keys(value).some((key) => key !== 'version' && key !== 'entries')) return false
   if (value.entries.length > RESIDENT_LIFECYCLE_LEDGER_LIMIT) return false
-  return value.entries.every(isResidentLifecycleLedgerEntry)
+  return value.entries.every(isPersistedResidentLifecycleLedgerEntry)
 }
 
-function isResidentLifecycleLedgerEntry(value: unknown): value is ResidentLifecycleOperationView {
+function isPersistedResidentLifecycleLedgerEntry(
+  value: unknown,
+): value is ResidentLifecycleOperationView | LegacyResidentProvisionOperationView {
   if (!isRecord(value) || Object.keys(value).some((key) => !RESIDENT_LEDGER_ENTRY_KEYS.has(key))) return false
+  const kind = value.kind === undefined ? 'provision' : value.kind
   if (
+    (kind !== 'provision' && kind !== 'end') ||
     !isHostId(value.operationId) ||
     !isHostId(value.expectedHostId) ||
     !isHostId(value.projectId) ||
     !isHostId(value.workspaceId) ||
     !isHostId(value.threadId) ||
     !isHostId(value.executionGenerationId) ||
-    !isBoundedResidentLabel(value.projectDisplayName) ||
-    !isBoundedResidentLabel(value.threadTitle) ||
-    (value.sessionName !== undefined && !isBoundedResidentLabel(value.sessionName)) ||
     !isBoundedIsoDate(value.createdAt) ||
     !isBoundedIsoDate(value.updatedAt) ||
     ![
@@ -5106,23 +5787,193 @@ function isResidentLifecycleLedgerEntry(value: unknown): value is ResidentLifecy
     ].includes(String(value.state))
   ) return false
 
+  if (
+    kind === 'provision'
+      ? (
+          !isBoundedResidentLabel(value.projectDisplayName) ||
+          !isBoundedResidentLabel(value.threadTitle) ||
+          (value.sessionName !== undefined && !isBoundedResidentLabel(value.sessionName)) ||
+          value.sourceCursor !== undefined
+        )
+      : (
+          value.projectDisplayName !== undefined ||
+          value.threadTitle !== undefined ||
+          value.sessionName !== undefined ||
+          !isResidentEndSourceCursor(value.sourceCursor, value.threadId, value.executionGenerationId)
+        )
+  ) return false
+
   const parsedStatus = value.lastStatus === undefined
     ? undefined
     : ResidentLifecycleStatusSchema.safeParse(value.lastStatus)
   if (parsedStatus && !parsedStatus.success) return false
   const status = parsedStatus?.success ? parsedStatus.data : undefined
-  const entry = value as unknown as ResidentLifecycleOperationView
+  const entry = (
+    kind === 'provision'
+      ? { ...value, kind: 'provision' }
+      : value
+  ) as unknown as ResidentLifecycleOperationView
   if (status && !residentStatusMatchesLedger(status, entry)) return false
   if (value.state === 'terminal' && !(status && isTerminalResidentLifecycleStatus(status))) return false
-  if (value.state === 'terminal_refresh_pending' && status?.phase !== 'committed') return false
+  if (value.state === 'terminal_refresh_pending' && !(status && residentLifecycleStatusNeedsProjectionRefresh(status))) {
+    return false
+  }
   if (
     status &&
     isTerminalResidentLifecycleStatus(status) &&
     value.state !== 'terminal' &&
     value.state !== 'terminal_refresh_pending'
   ) return false
-  if (value.state === 'requires_reselection' && status !== undefined) return false
+  if (value.state === 'requires_reselection' && (kind !== 'provision' || status !== undefined)) return false
   return true
+}
+
+function normalizeResidentLifecycleLedger(
+  value: PersistedResidentLifecycleLedger,
+): ResidentLifecycleLedger {
+  return {
+    version: 1,
+    entries: value.entries.map((entry) => (
+      entry.kind === undefined
+        ? { ...entry, kind: 'provision' as const }
+        : structuredClone(entry)
+    )),
+  }
+}
+
+function isResidentEndSourceCursor(
+  value: unknown,
+  threadId: unknown,
+  executionGenerationId: unknown,
+): value is SessionCursor {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((key) => [
+      'threadId',
+      'executionGenerationId',
+      'generation',
+      'sequence',
+    ].includes(key)) &&
+    value.threadId === threadId &&
+    value.executionGenerationId === executionGenerationId &&
+    isHostId(value.generation) &&
+    typeof value.sequence === 'number' &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence >= 0
+  )
+}
+
+function normalizeResidentEndPreparationInput(
+  input: ResidentEndPreparationInput,
+): ResidentEndPreparationInput {
+  if (
+    !isRecord(input) ||
+    Object.keys(input).some((key) => ![
+      'expectedHostId',
+      'projectId',
+      'workspaceId',
+      'threadId',
+      'executionGenerationId',
+      'resumeOperationId',
+    ].includes(key)) ||
+    !isHostId(input.expectedHostId) ||
+    !isHostId(input.projectId) ||
+    !isHostId(input.workspaceId) ||
+    !isHostId(input.threadId) ||
+    !isHostId(input.executionGenerationId) ||
+    (input.resumeOperationId !== undefined && !isHostId(input.resumeOperationId))
+  ) {
+    throw new ControlError(
+      'resident.end_lineage_invalid',
+      'The resident end review did not contain one exact path-free thread lineage.'
+    )
+  }
+  return {
+    expectedHostId: input.expectedHostId,
+    projectId: input.projectId,
+    workspaceId: input.workspaceId,
+    threadId: input.threadId,
+    executionGenerationId: input.executionGenerationId,
+    ...(input.resumeOperationId === undefined ? {} : { resumeOperationId: input.resumeOperationId }),
+  }
+}
+
+function residentEndMutationKey(input: {
+  expectedHostId: string
+  threadId: string
+  executionGenerationId: string
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      input.expectedHostId,
+      input.threadId,
+      input.executionGenerationId,
+    ]))
+    .digest('hex')
+}
+
+function sameSessionCursor(left: SessionCursor, right: SessionCursor): boolean {
+  return (
+    left.threadId === right.threadId &&
+    left.executionGenerationId === right.executionGenerationId &&
+    left.generation === right.generation &&
+    left.sequence === right.sequence
+  )
+}
+
+function residentEndProjectionMatchesOperation(
+  snapshot: ThreadProjectionSnapshot,
+  status: ResidentLifecycleStatus,
+  entry: ResidentLifecycleOperationView,
+  expectedThreadStatus: TaskState,
+): boolean {
+  if (status.kind !== 'end' || status.phase !== 'completed' || entry.kind !== 'end') return false
+  const disposition = snapshot.residentLifecycle
+  return (
+    isResidentEndedTaskState(snapshot.thread.status) &&
+    snapshot.thread.status === expectedThreadStatus &&
+    snapshot.thread.recap === RESIDENT_ENDED_RECAP &&
+    sameSessionCursor(snapshot.latestCursor, entry.sourceCursor) &&
+    disposition?.state === 'ended' &&
+    disposition.operationId === status.operationId &&
+    disposition.reason === 'user_end' &&
+    sameSessionCursor(disposition.sourceCursor, entry.sourceCursor)
+  )
+}
+
+function isResidentEndedTaskState(status: TaskState): status is 'idle' | 'complete' | 'failed' {
+  return status === 'idle' || status === 'complete' || status === 'failed'
+}
+
+function isResidentEndSourceCursorChanged(error: unknown): error is ControlError {
+  return error instanceof ControlError && error.code === HOST_RESIDENT_END_SOURCE_CURSOR_CHANGED
+}
+
+function makeRoomForResidentLifecycleEntry(entries: ResidentLifecycleOperationView[]): void {
+  while (entries.length >= RESIDENT_LIFECYCLE_LEDGER_LIMIT) {
+    const evictableIndex = entries.findIndex(canEvictResidentLifecycleEntry)
+    if (evictableIndex < 0) {
+      throw new ControlError(
+        'resident.lifecycle_ledger_full',
+        'Too many resident lifecycle operations still require reconciliation.'
+      )
+    }
+    entries.splice(evictableIndex, 1)
+  }
+}
+
+function canEvictResidentLifecycleEntry(entry: ResidentLifecycleOperationView): boolean {
+  return (
+    entry.state === 'terminal' &&
+    entry.lastStatus !== undefined &&
+    entry.lastStatus.phase !== 'quarantined' &&
+    (
+      (entry.kind === 'provision' && (
+        entry.lastStatus.phase === 'committed' || entry.lastStatus.phase === 'completed'
+      )) ||
+      (entry.kind === 'end' && entry.lastStatus.phase === 'completed')
+    )
+  )
 }
 
 function isBoundedResidentLabel(value: unknown): value is string {

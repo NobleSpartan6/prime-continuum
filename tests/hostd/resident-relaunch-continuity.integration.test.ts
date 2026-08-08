@@ -170,11 +170,6 @@ class SharedFakePrimeDaemon {
     this.chronology.push(`store:persist:${binding.activeSessionId}`);
   }
 
-  async completeThrough(store: HostStore, binding: ResidentSessionBinding): Promise<void> {
-    await store.completeResidentSessionBinding(binding);
-    this.chronology.push(`store:complete:${binding.activeSessionId}`);
-  }
-
   spawnLauncher(): ResidentDaemonLauncher {
     this.launcherSpawnCount += 1;
     return {
@@ -317,7 +312,7 @@ function createAdapter(
     environment: {},
     loadRuntimeModule: async () => runtimeModule,
     persistBinding: (binding) => daemon.persistThrough(store, binding),
-    completeBinding: (binding) => daemon.completeThrough(store, binding),
+    authorizeResidentKillInvocation: (lease) => store.authorizeResidentKillInvocation(lease),
     publishProjection: async (binding, projection) => {
       await store.publishResidentProjectionSnapshot(binding, projection);
       daemon.chronology.push(`store:projection:${binding.activeSessionId}`);
@@ -499,17 +494,36 @@ describe("resident continuity across hostd/store relaunch", () => {
     expect(daemon.requests.map((request) => (request as { type?: string }).type)).toEqual(["create", "list"]);
 
     const endAdapter = createAdapter(relaunchedStore, daemon, runtimeModule, paths);
-    const endConnection = await endAdapter.attachResident(reloadedBinding);
-    await endConnection.endSession();
+    await endAdapter.attachResident(reloadedBinding);
+    const hostId = (await relaunchedStore.getHost()).hostId;
+    const endSourceSnapshot = await relaunchedStore.getThreadSnapshot(THREAD_ID);
+    const endInput = {
+      operationId: "resident-relaunch-explicit-end",
+      expectedHostId: hostId,
+      projectId: "demo-project",
+      workspaceId: "demo-workspace",
+      threadId: THREAD_ID,
+      executionGenerationId: EXECUTION_GENERATION_ID,
+      requestDigest: "e".repeat(64),
+      expectedSourceCursor: endSourceSnapshot.latestCursor,
+    };
+    await relaunchedStore.prepareResidentEnd(endInput, reloadedBinding);
+    const killLease = await relaunchedStore.beginResidentKill(endInput);
+    const acknowledgement = await endAdapter.endResidentSession(killLease);
+    await relaunchedStore.acknowledgeResidentKill(killLease, acknowledgement);
     await endAdapter.close();
 
     expect(daemon.createCount).toBe(1);
     expect(daemon.killCount).toBe(1);
-    expect(daemon.connectionDisposeCount).toBe(3);
+    // Production retires the attached read transport through the gateway's
+    // onEnding hook; this adapter/store seam exercises only the independent
+    // list-fenced kill client.
+    expect(daemon.connectionDisposeCount).toBe(2);
     expect(daemon.launcherSpawnCount).toBe(0);
     expect(daemon.launcherKillCount).toBe(0);
     expect(daemon.requests.map((request) => (request as { type?: string }).type)).toEqual([
       "create",
+      "list",
       "list",
       "list",
       "kill",
@@ -520,12 +534,13 @@ describe("resident continuity across hostd/store relaunch", () => {
     })).toBe(false);
 
     const bindingFile = JSON.parse(await readFile(relaunchedStore.paths.residentSessionBindings, "utf8")) as {
-      records: Array<{ state: string; binding: ResidentSessionBinding; completedAt?: string }>;
+      records: Array<{ state: string; binding: ResidentSessionBinding; operationId?: string; completedAt?: string }>;
     };
     expect(bindingFile.records).toEqual([
       {
         state: "completed",
         binding: exactBinding,
+        operationId: endInput.operationId,
         completedAt: expect.any(String),
       },
     ]);

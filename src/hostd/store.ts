@@ -51,8 +51,10 @@ import {
 import { getHostDataPaths, type HostDataPaths } from "./paths";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
+  ResidentEndAcknowledgementSchema,
   ResidentSessionBindingSchema,
   validateResidentSessionBinding,
+  type ResidentEndAcknowledgement,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentSessionBinding,
@@ -127,6 +129,11 @@ const WorkspaceAuthorityFileSchema = z
 
 export const MAX_RESIDENT_LIFECYCLE_OPERATIONS = 10_000;
 export const MAX_RESIDENT_LIFECYCLE_OPERATION_BYTES = 2 * 1024 * 1024;
+const RESIDENT_LIFECYCLE_RETIRED_FENCE_BITS = 1 << 20;
+const RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES = RESIDENT_LIFECYCLE_RETIRED_FENCE_BITS / 8;
+const RESIDENT_LIFECYCLE_RETIRED_FENCE_HASHES = 7;
+const MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES = 512 * 1024;
+const MAX_RESIDENT_LIFECYCLE_RETIREMENT_BYTES = 8 * 1024 * 1024;
 export const MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS = 10_000;
 export const MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES = 32 * 1024 * 1024;
 
@@ -353,9 +360,29 @@ export const ResidentLifecycleOperationInputSchema = z
     threadId: IdSchema,
     executionGenerationId: IdSchema,
     requestDigest: Sha256DigestSchema,
+    /** Required only for explicit end; binds consent to the reviewed public state. */
+    expectedSourceCursor: SessionCursorSchema.optional(),
   })
   .strict();
 export type ResidentLifecycleOperationInput = z.infer<typeof ResidentLifecycleOperationInputSchema>;
+
+export const ResidentEndLifecycleOperationInputSchema = ResidentLifecycleOperationInputSchema.extend({
+  expectedSourceCursor: SessionCursorSchema,
+})
+  .strict()
+  .superRefine((input, context) => {
+    if (
+      input.expectedSourceCursor.threadId !== input.threadId ||
+      input.expectedSourceCursor.executionGenerationId !== input.executionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedSourceCursor"],
+        message: "Resident end consent cursor must belong to its exact thread generation",
+      });
+    }
+  });
+export type ResidentEndLifecycleOperationInput = z.infer<typeof ResidentEndLifecycleOperationInputSchema>;
 
 export const ResidentOwnedSessionCandidateSchema = ResidentSessionBindingSchema.pick({
   workspaceDirectory: true,
@@ -460,6 +487,18 @@ const ResidentLifecycleOperationRecordSchema = z
       record.input.executionGenerationId !== record.authority.executionGenerationId
     ) {
       context.addIssue({ code: "custom", message: "Resident lifecycle operation authority changed" });
+    }
+    if (
+      (record.kind === "end") !== (record.input.expectedSourceCursor !== undefined) ||
+      (record.input.expectedSourceCursor !== undefined &&
+        (record.input.expectedSourceCursor.threadId !== record.input.threadId ||
+          record.input.expectedSourceCursor.executionGenerationId !== record.input.executionGenerationId))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["input", "expectedSourceCursor"],
+        message: "Only resident end must carry its exact reviewed source cursor",
+      });
     }
     if (Date.parse(record.updatedAt) < Date.parse(record.preparedAt)) {
       context.addIssue({ code: "custom", path: ["updatedAt"], message: "Lifecycle update cannot precede preparation" });
@@ -642,6 +681,46 @@ export interface ResidentKillLease {
   readonly dispatchStartedAt: string;
 }
 
+export type ResidentKillInvocationAuthorizer = (
+  lease: ResidentKillLease,
+) => Promise<ResidentSessionBinding>;
+
+/**
+ * Validate the non-forgeable, frozen Store envelope before an adapter may even
+ * ask its owning Store to consume the one-shot invocation authority. Store
+ * ownership, durable freshness, and prior consumption are checked separately
+ * by `authorizeResidentKillInvocation`.
+ */
+export function validateResidentKillLeaseEnvelope(value: unknown): ResidentKillLease {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !Object.isFrozen(value) ||
+    (value as ResidentKillLease)[residentKillLeaseBrand] !== true ||
+    (value as ResidentKillLease).leaseVersion !== 1
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_LIFECYCLE_LEASE_INVALID",
+      "Resident kill requires a frozen opaque authority issued by HostStore",
+    );
+  }
+  const lease = value as ResidentKillLease;
+  const binding = validateResidentSessionBinding(lease.binding);
+  if (
+    !Object.isFrozen(lease.binding) ||
+    !isDeepStrictEqual(binding, lease.binding) ||
+    !IdSchema.safeParse(lease.operationId).success ||
+    !/^[a-f0-9]{64}$/.test(lease.operationFingerprint) ||
+    !IsoDateTimeSchema.safeParse(lease.dispatchStartedAt).success
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_LIFECYCLE_LEASE_INVALID",
+      "Resident kill authority has malformed exact dispatch metadata",
+    );
+  }
+  return lease;
+}
+
 const ResidentSessionBindingRecordSchema = z.discriminatedUnion("state", [
   z
     .object({
@@ -719,6 +798,26 @@ const ResidentSessionBindingFileSchema = z
       }
     }
   });
+
+const ResidentLifecycleRetiredFenceSchema = z
+  .object({
+    version: z.literal(1),
+    bitCount: z.literal(RESIDENT_LIFECYCLE_RETIRED_FENCE_BITS),
+    hashCount: z.literal(RESIDENT_LIFECYCLE_RETIRED_FENCE_HASHES),
+    retiredKeyCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    bits: z.string().min(1).max(MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES),
+  })
+  .strict()
+  .superRefine((fence, context) => {
+    const decoded = Buffer.from(fence.bits, "base64");
+    if (
+      decoded.length !== RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES ||
+      decoded.toString("base64") !== fence.bits
+    ) {
+      context.addIssue({ code: "custom", path: ["bits"], message: "Retired lifecycle fence has invalid bits" });
+    }
+  });
+type ResidentLifecycleRetiredFence = z.infer<typeof ResidentLifecycleRetiredFenceSchema>;
 
 const HandoffRecordSchema = z.object({
   version: z.literal(1),
@@ -1555,6 +1654,77 @@ const ResidentProjectionCursorLineageSchema = z
   });
 type ResidentProjectionCursorLineage = z.infer<typeof ResidentProjectionCursorLineageSchema>;
 
+const ResidentLifecycleRetirementTransactionSchema = z
+  .object({
+    version: z.literal(1),
+    transactionId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    operations: z.array(ResidentLifecycleOperationRecordSchema).min(1).max(2),
+    bindingRecord: ResidentSessionBindingRecordSchema.optional(),
+    projectionLineage: ResidentProjectionCursorLineageSchema.optional(),
+  })
+  .strict()
+  .superRefine((transaction, context) => {
+    const operationIds = new Set(transaction.operations.map((operation) => operation.operationId));
+    if (operationIds.size !== transaction.operations.length) {
+      context.addIssue({ code: "custom", path: ["operations"], message: "Retired operations must be unique" });
+    }
+    const bindingRecord = transaction.bindingRecord;
+    if (bindingRecord) {
+      const terminal = transaction.operations.find(
+        (operation) =>
+          operation.operationId === bindingRecord.operationId &&
+          operation.binding !== undefined &&
+          isDeepStrictEqual(operation.binding, bindingRecord.binding),
+      );
+      const validTerminal =
+        (bindingRecord.state === "completed" && terminal?.kind === "end" && terminal.phase === "completed") ||
+        (bindingRecord.state === "detached" && terminal?.kind === "detach" && terminal.phase === "detached");
+      if (!validTerminal) {
+        context.addIssue({
+          code: "custom",
+          path: ["bindingRecord"],
+          message: "Retired binding must match its exact terminal successor",
+        });
+      }
+      const expectedAuthority = residentProjectionAuthorityFromBinding(bindingRecord.binding);
+      if (
+        transaction.projectionLineage &&
+        (transaction.projectionLineage.authorityId !== residentProjectionAuthorityId(expectedAuthority) ||
+          !isDeepStrictEqual(transaction.projectionLineage.authority, expectedAuthority))
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["projectionLineage"],
+          message: "Retired projection lineage must match its exact terminal binding",
+        });
+      }
+    } else {
+      if (transaction.projectionLineage !== undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["projectionLineage"],
+          message: "Binding-free retirement cannot remove projection authority lineage",
+        });
+      }
+      if (
+        transaction.operations.some(
+          (operation) =>
+            operation.kind !== "provision" ||
+            operation.phase !== "completed" ||
+            operation.binding !== undefined,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["operations"],
+          message: "Only binding-free completed provisioning may retire without a binding tombstone",
+        });
+      }
+    }
+  });
+type ResidentLifecycleRetirementTransaction = z.infer<typeof ResidentLifecycleRetirementTransactionSchema>;
+
 const ResidentProjectionTransactionSchema = z
   .object({
     version: z.literal(1),
@@ -1680,6 +1850,89 @@ const ResidentProjectionTransactionSchema = z
   });
 type ResidentProjectionTransaction = z.infer<typeof ResidentProjectionTransactionSchema>;
 
+const ResidentEndProjectionTransactionSchema = z
+  .object({
+    version: z.literal(1),
+    kind: z.literal("resident_end_projection_materialization"),
+    transactionId: IdSchema,
+    operationId: IdSchema,
+    preparedAt: IsoDateTimeSchema,
+    binding: ResidentSessionBindingSchema,
+    sourceSnapshotDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    preservedProjectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    catalogPeersDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    sourceThread: ThreadSummarySchema,
+    sourceCursor: SessionCursorSchema,
+    expectedSourceCursor: SessionCursorSchema,
+    snapshot: ThreadProjectionSnapshotSchema,
+    threadsFile: ThreadFileSchema,
+  })
+  .strict()
+  .superRefine((transaction, context) => {
+    const { binding, snapshot, sourceThread, threadsFile } = transaction;
+    if (
+      snapshot.runtime !== undefined ||
+      snapshot.inProgressStream !== undefined ||
+      snapshot.queueState.pendingCommandIds.length !== 0 ||
+      snapshot.queueState.paused ||
+      snapshot.approvals.length !== 0 ||
+      snapshot.childAgents.length !== 0 ||
+      snapshot.goals.length !== 0 ||
+      snapshot.schedules.length !== 0 ||
+      snapshot.pendingAttention.length !== 0 ||
+      snapshot.thread.status !== residentEndedThreadStatus(sourceThread.status) ||
+      snapshot.thread.recap !== "Resident session ended." ||
+      snapshot.residentLifecycle?.state !== "ended" ||
+      snapshot.residentLifecycle.operationId !== transaction.operationId ||
+      snapshot.residentLifecycle.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+      snapshot.residentLifecycle.endedAt !== snapshot.generatedAt ||
+      snapshot.residentLifecycle.reason !== "user_end" ||
+      !isDeepStrictEqual(snapshot.residentLifecycle.sourceCursor, snapshot.latestCursor) ||
+      !isDeepStrictEqual(transaction.sourceCursor, snapshot.latestCursor) ||
+      !isDeepStrictEqual(transaction.expectedSourceCursor, transaction.sourceCursor) ||
+      transaction.preparedAt !== snapshot.generatedAt ||
+      snapshot.latestCursor.threadId !== binding.threadId ||
+      snapshot.latestCursor.executionGenerationId !== binding.executionGenerationId ||
+      snapshot.generatedAt !== snapshot.thread.updatedAt
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident end projection must preserve its cursor while clearing all live runtime state",
+      });
+    }
+    const expectedThread = ThreadSummarySchema.safeParse({
+      ...sourceThread,
+      status: residentEndedThreadStatus(sourceThread.status),
+      recap: "Resident session ended.",
+      updatedAt: snapshot.generatedAt,
+      lastKnownCursor: transaction.sourceCursor,
+    });
+    if (
+      !expectedThread.success ||
+      !isDeepStrictEqual(snapshot.thread, expectedThread.data) ||
+      residentEndPreservedProjectionDigest(snapshot) !== transaction.preservedProjectionDigest ||
+      residentEndCatalogPeersDigest(threadsFile.threads, binding.threadId) !== transaction.catalogPeersDigest
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident end projection is not the exact deterministic derivation of its source",
+      });
+    }
+    const catalogThread = threadsFile.threads.find((thread) => thread.threadId === binding.threadId);
+    if (!catalogThread || !isDeepStrictEqual(catalogThread, snapshot.thread)) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident end snapshot and thread catalog must materialize together",
+      });
+    }
+  });
+type ResidentEndProjectionTransaction = z.infer<typeof ResidentEndProjectionTransactionSchema>;
+
+const ResidentStateTransactionSchema = z.union([
+  ResidentProjectionTransactionSchema,
+  ResidentEndProjectionTransactionSchema,
+]);
+
 export const MAX_PENDING_RESIDENT_PROJECTION_TRANSACTIONS = 1_024;
 export const MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES = 64 * 1024 * 1024;
 
@@ -1736,10 +1989,18 @@ export type ResidentLifecycleFaultPoint =
   | "after_binding_revoked"
   | "after_kill_dispatching"
   | "after_kill_acknowledged"
+  | "after_end_projection_prepare"
+  | "after_end_projection_snapshot"
+  | "after_end_projection_threads"
   | "after_completed_binding"
   | "after_completed"
   | "after_detached"
-  | "after_detached_binding";
+  | "after_detached_binding"
+  | "after_retirement_prepare"
+  | "after_retirement_fence"
+  | "after_retirement_lineage"
+  | "after_retirement_binding"
+  | "after_retirement_operations";
 
 export type WorkspaceThreadBootstrapFaultPoint =
   | "after_prepared"
@@ -1779,6 +2040,10 @@ export interface HostStoreOptions {
     point: ResidentLifecycleFaultPoint,
     operationId: string,
   ) => void | Promise<void>;
+  /** Test-only pressure override; production always uses the exported maximum. */
+  residentLifecycleOperationLimit?: number;
+  /** Test-only pressure override for exact projection-lineage churn. */
+  residentProjectionLineageLimit?: number;
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
 
@@ -1827,6 +2092,8 @@ export class HostStore {
   private initialized = false;
   private residentSubsystemFault: HostStoreError | undefined;
   private readonly options: HostStoreOptions;
+  private readonly residentLifecycleOperationLimit: number;
+  private readonly residentProjectionLineageLimit: number;
   private readonly residentPromptReconciliationLeases = new WeakSet<object>();
   private readonly residentPromptReconciliationLeaseCache = new Map<string, ResidentPromptReconciliationLease>();
   private readonly residentAbortReconciliationLeases = new WeakSet<object>();
@@ -1835,10 +2102,22 @@ export class HostStore {
   private readonly residentPromotionLeases = new WeakSet<object>();
   private readonly residentLifecycleProjectionLeases = new WeakSet<object>();
   private readonly residentKillLeases = new WeakSet<object>();
+  private readonly authorizedResidentKillLeases = new WeakSet<object>();
+  private readonly residentKillLeaseByOperation = new Map<string, ResidentKillLease>();
 
   constructor(dataDir: string, options: HostStoreOptions = {}) {
     this.paths = getHostDataPaths(dataDir);
     this.options = options;
+    const operationLimit = options.residentLifecycleOperationLimit ?? MAX_RESIDENT_LIFECYCLE_OPERATIONS;
+    if (!Number.isInteger(operationLimit) || operationLimit < 4 || operationLimit > MAX_RESIDENT_LIFECYCLE_OPERATIONS) {
+      throw new TypeError("residentLifecycleOperationLimit must be an integer from 4 through the production maximum");
+    }
+    this.residentLifecycleOperationLimit = operationLimit;
+    const lineageLimit = options.residentProjectionLineageLimit ?? MAX_RESIDENT_PROJECTION_LINEAGES;
+    if (!Number.isInteger(lineageLimit) || lineageLimit < 1 || lineageLimit > MAX_RESIDENT_PROJECTION_LINEAGES) {
+      throw new TypeError("residentProjectionLineageLimit must be an integer from 1 through the production maximum");
+    }
+    this.residentProjectionLineageLimit = lineageLimit;
   }
 
   async initialize(options: { seed?: boolean } = {}): Promise<SeedResult> {
@@ -1906,6 +2185,12 @@ export class HostStore {
             MAX_RESIDENT_SESSION_BINDING_FILE_BYTES,
           );
         }
+        await atomicWriteJsonIfAbsent(
+          this.paths.residentLifecycleRetiredFence,
+          emptyResidentLifecycleRetiredFence(),
+          MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES,
+        );
+        await this.recoverResidentLifecycleRetirementUnlocked();
         await this.validateResidentLifecycleOperationDirectoryUnlocked();
         await this.recoverResidentLifecycleOperationsUnlocked("before_projection_recovery");
         await this.validateResidentProjectionLineageDirectoryUnlocked();
@@ -1940,11 +2225,22 @@ export class HostStore {
         // unlike an unrelated resident-state degradation, replay failure is a
         // global public-consistency failure and therefore aborts initialize().
         await this.recoverResidentProjectionTransactionsUnlocked();
-        await this.recoverResidentLifecycleOperationsUnlocked("after_projection_recovery");
         try {
+          await this.recoverResidentLifecycleOperationsUnlocked("after_projection_recovery");
           await this.validateResidentStateUnlocked();
         } catch (error) {
           this.residentSubsystemFault = residentSubsystemUnavailable(error);
+          const pendingProjection = (await readdir(this.paths.residentProjectionTransactions, {
+            withFileTypes: true,
+          })).some((entry) => entry.isFile() && entry.name.endsWith(".json"));
+          if (pendingProjection) {
+            throw new HostStoreError(
+              "RESIDENT_PROJECTION_RECOVERY_UNAVAILABLE",
+              "A prepared resident projection cannot be recovered while its private authority state is unavailable",
+              false,
+              { cause: this.residentSubsystemFault },
+            );
+          }
         }
       }
 
@@ -2527,11 +2823,57 @@ export class HostStore {
         leaseVersion: 1 as const,
         operationId: record.operationId,
         operationFingerprint: record.operationFingerprint,
-        binding: validateResidentSessionBinding(record.binding),
+        binding: Object.freeze(validateResidentSessionBinding(record.binding)),
         dispatchStartedAt,
       });
       this.residentPromotionLeases.add(lease);
       return lease;
+    });
+  }
+
+  /**
+   * The adapter's final pre-read boundary. It consumes this Store instance's
+   * process-local authority exactly once while leaving the lease settleable by
+   * fail-before-effect, quarantine, or exact acknowledgement.
+   */
+  async authorizeResidentKillInvocation(
+    leaseValue: ResidentKillLease,
+  ): Promise<ResidentSessionBinding> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const lease = this.validateResidentKillLease(leaseValue);
+      if (this.authorizedResidentKillLeases.has(lease as object)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_CONSUMED",
+          "This resident kill authority has already crossed the runtime invocation boundary",
+        );
+      }
+      const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        !record ||
+        record.kind !== "end" ||
+        record.phase !== "ending" ||
+        !record.binding ||
+        record.operationFingerprint !== lease.operationFingerprint ||
+        !isDeepStrictEqual(record.binding, lease.binding) ||
+        this.residentKillLeaseByOperation.get(record.operationId) !== lease
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_STALE",
+          "Resident kill authority no longer follows its exact durable ending boundary",
+        );
+      }
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(record);
+      await this.assertResidentBindingRevokedForOperationUnlocked(record);
+      const dispatching = ResidentLifecycleOperationRecordSchema.parse({
+        ...record,
+        phase: "kill_dispatching",
+        updatedAt: lease.dispatchStartedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(dispatching, "after_kill_dispatching");
+      this.authorizedResidentKillLeases.add(lease as object);
+      return validateResidentSessionBinding(lease.binding);
     });
   }
 
@@ -2657,28 +2999,41 @@ export class HostStore {
   }
 
   async prepareResidentEnd(
-    inputValue: ResidentLifecycleOperationInput,
-    bindingValue: ResidentSessionBinding,
+    inputValue: ResidentEndLifecycleOperationInput,
+    bindingValue?: ResidentSessionBinding,
   ): Promise<ResidentLifecycleStatus> {
-    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
-    const binding = validateResidentSessionBinding(bindingValue);
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
+    let binding = bindingValue === undefined ? undefined : validateResidentSessionBinding(bindingValue);
     return this.exclusive(async () => {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const existing = await this.resolveExactResidentLifecycleOperationUnlocked("end", input, { optional: true });
       if (existing) {
-        if (!existing.binding || !isDeepStrictEqual(existing.binding, binding)) {
+        if (!existing.binding || (binding !== undefined && !isDeepStrictEqual(existing.binding, binding))) {
           throw new HostStoreError(
             "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
             "This resident end operation is already bound to a different exact resident binding",
           );
         }
+        await this.assertResidentEndExpectedSourceCursorUnlocked(input);
         await this.guardResidentLifecycleMaterializationUnlocked(() =>
           this.materializeEndingResidentBindingRevocationUnlocked(existing),
         );
         return residentLifecycleStatus(existing);
       }
       const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
+      binding ??= (await this.readResidentSessionBindingRecordsUnlocked()).find(
+        (candidate) =>
+          candidate.state === "active" &&
+          candidate.binding.threadId === input.threadId &&
+          candidate.binding.executionGenerationId === input.executionGenerationId,
+      )?.binding;
+      if (!binding) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_NOT_FOUND",
+          "No exact active resident binding exists for this end operation",
+        );
+      }
       await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
       await this.assertNoResidentDispatchTransitionUnlocked(
         input.threadId,
@@ -2686,6 +3041,7 @@ export class HostStore {
       );
       this.assertBindingMatchesLifecycleAuthority(binding, authority);
       await this.assertExactActiveResidentBindingUnlocked(binding);
+      await this.assertResidentEndExpectedSourceCursorUnlocked(input);
       const timestamp = await this.residentLifecycleSuccessorPreparedAtUnlocked(binding, authority);
       const record = ResidentLifecycleOperationRecordSchema.parse({
         version: 1,
@@ -2708,8 +3064,26 @@ export class HostStore {
     });
   }
 
-  async beginResidentKill(inputValue: ResidentLifecycleOperationInput): Promise<ResidentKillLease> {
-    const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
+  async getResidentEndBinding(
+    inputValue: ResidentEndLifecycleOperationInput,
+  ): Promise<ResidentSessionBinding> {
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const operation = await this.requireExactResidentLifecycleOperationUnlocked("end", input);
+      if (!operation.binding) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_NOT_FOUND",
+          "Resident end operation has no exact binding authority",
+        );
+      }
+      return validateResidentSessionBinding(operation.binding);
+    });
+  }
+
+  async beginResidentKill(inputValue: ResidentEndLifecycleOperationInput): Promise<ResidentKillLease> {
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
     return this.exclusive(async () => {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
@@ -2719,22 +3093,24 @@ export class HostStore {
         throw residentLifecycleMutationAlreadyCrossed(record, "resident kill");
       }
       await this.assertResidentBindingRevokedForOperationUnlocked(record);
+      if (this.residentKillLeaseByOperation.has(record.operationId)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_ACTIVE",
+          "This resident end operation already has a process-local kill authority",
+          true,
+        );
+      }
       const dispatchStartedAt = causalNow(record.updatedAt);
-      const dispatching = ResidentLifecycleOperationRecordSchema.parse({
-        ...record,
-        phase: "kill_dispatching",
-        updatedAt: dispatchStartedAt,
-      });
-      await this.writeResidentLifecycleBoundaryUnlocked(dispatching, "after_kill_dispatching");
       const lease = Object.freeze({
         [residentKillLeaseBrand]: true as const,
         leaseVersion: 1 as const,
         operationId: record.operationId,
         operationFingerprint: record.operationFingerprint,
-        binding: validateResidentSessionBinding(record.binding),
+        binding: Object.freeze(validateResidentSessionBinding(record.binding)),
         dispatchStartedAt,
       });
       this.residentKillLeases.add(lease);
+      this.residentKillLeaseByOperation.set(record.operationId, lease);
       return lease;
     });
   }
@@ -2744,6 +3120,21 @@ export class HostStore {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const lease = this.validateResidentKillLease(leaseValue);
+      const current = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
+      if (
+        current?.kind === "end" &&
+        current.phase === "ending" &&
+        current.operationFingerprint === lease.operationFingerprint &&
+        current.binding &&
+        isDeepStrictEqual(current.binding, lease.binding) &&
+        !this.authorizedResidentKillLeases.has(lease as object)
+      ) {
+        this.residentKillLeases.delete(lease as object);
+        if (this.residentKillLeaseByOperation.get(lease.operationId) === lease) {
+          this.residentKillLeaseByOperation.delete(lease.operationId);
+        }
+        return residentLifecycleStatus(current);
+      }
       const record = await this.requireLifecycleLeaseRecordUnlocked(lease, "end", "kill_dispatching");
       const retryable = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
@@ -2752,6 +3143,10 @@ export class HostStore {
       });
       await this.writeResidentLifecycleBoundaryUnlocked(retryable, "after_mutation_failed_before_effect");
       this.residentKillLeases.delete(lease as object);
+      this.authorizedResidentKillLeases.delete(lease as object);
+      if (this.residentKillLeaseByOperation.get(lease.operationId) === lease) {
+        this.residentKillLeaseByOperation.delete(lease.operationId);
+      }
       return residentLifecycleStatus(retryable);
     });
   }
@@ -2784,6 +3179,10 @@ export class HostStore {
         lease = this.validateResidentKillLease(leaseValue as ResidentKillLease);
         record = await this.requireLifecycleLeaseRecordUnlocked(lease, "end", "kill_dispatching");
         this.residentKillLeases.delete(lease as object);
+        this.authorizedResidentKillLeases.delete(lease as object);
+        if (this.residentKillLeaseByOperation.get(lease.operationId) === lease) {
+          this.residentKillLeaseByOperation.delete(lease.operationId);
+        }
       }
       const quarantined = ResidentLifecycleOperationRecordSchema.parse({
         ...record,
@@ -2797,11 +3196,30 @@ export class HostStore {
     });
   }
 
-  async acknowledgeResidentKill(leaseValue: ResidentKillLease): Promise<ResidentLifecycleStatus> {
+  async acknowledgeResidentKill(
+    leaseValue: ResidentKillLease,
+    acknowledgementValue: ResidentEndAcknowledgement,
+  ): Promise<ResidentLifecycleStatus> {
     return this.exclusive(async () => {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
       const lease = this.validateResidentKillLease(leaseValue);
+      if (!this.authorizedResidentKillLeases.has(lease as object)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_LEASE_NOT_CONSUMED",
+          "Resident kill cannot be acknowledged before its Store authority crosses the runtime boundary",
+        );
+      }
+      const acknowledgement = ResidentEndAcknowledgementSchema.parse(acknowledgementValue);
+      if (
+        acknowledgement.activeSessionId !== lease.binding.activeSessionId ||
+        acknowledgement.sessionId !== lease.binding.sessionId
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_ACKNOWLEDGEMENT_MISMATCH",
+          "The resident end acknowledgement does not match its exact Store authority",
+        );
+      }
       const record = await this.readResidentLifecycleOperationUnlocked(lease.operationId);
       if (
         !record ||
@@ -2824,6 +3242,7 @@ export class HostStore {
         updatedAt: acknowledgedAt,
       });
       await this.writeResidentLifecycleBoundaryUnlocked(acknowledged, "after_kill_acknowledged");
+      await this.prepareResidentEndProjectionUnlocked(acknowledged);
       await this.guardResidentLifecycleMaterializationUnlocked(async () => {
         await this.materializeCompletedResidentBindingUnlocked(acknowledged);
         await this.injectResidentLifecycleFault("after_completed_binding", record.operationId);
@@ -2837,7 +3256,44 @@ export class HostStore {
       });
       await this.writeResidentLifecycleBoundaryUnlocked(completed, "after_completed");
       this.residentKillLeases.delete(lease as object);
+      this.authorizedResidentKillLeases.delete(lease as object);
+      if (this.residentKillLeaseByOperation.get(lease.operationId) === lease) {
+        this.residentKillLeaseByOperation.delete(lease.operationId);
+      }
       return residentLifecycleStatus(completed);
+    });
+  }
+
+  /** Finish only the local, idempotent half of a durably acknowledged end. */
+  async completeAcknowledgedResidentEnd(
+    inputValue: ResidentEndLifecycleOperationInput,
+  ): Promise<ResidentLifecycleStatus> {
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      let operation = await this.requireExactResidentLifecycleOperationUnlocked("end", input);
+      if (operation.phase === "completed") {
+        await this.prepareResidentEndProjectionUnlocked(operation);
+        await this.materializeCompletedResidentBindingUnlocked(operation);
+        return residentLifecycleStatus(operation);
+      }
+      if (operation.phase !== "kill_acknowledged") {
+        throw residentLifecycleMutationAlreadyCrossed(operation, "resident end materialization");
+      }
+      await this.prepareResidentEndProjectionUnlocked(operation);
+      await this.guardResidentLifecycleMaterializationUnlocked(() =>
+        this.materializeCompletedResidentBindingUnlocked(operation),
+      );
+      const completedAt = causalNow(operation.updatedAt);
+      operation = ResidentLifecycleOperationRecordSchema.parse({
+        ...operation,
+        phase: "completed",
+        updatedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(operation, "after_completed");
+      return residentLifecycleStatus(operation);
     });
   }
 
@@ -2959,6 +3415,7 @@ export class HostStore {
       }
 
       const records = await this.readResidentSessionBindingRecordsUnlocked();
+      await this.assertResidentBindingNotRetiredUnlocked(binding);
       const existingIndex = records.findIndex(
         (record) => record.state === "active" && record.binding.threadId === binding.threadId,
       );
@@ -4862,6 +5319,200 @@ export class HostStore {
     await rm(this.residentProjectionTransactionPath(binding), { force: true });
   }
 
+  private async prepareResidentEndProjectionUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (
+      operation.kind !== "end" ||
+      (operation.phase !== "kill_acknowledged" && operation.phase !== "completed") ||
+      !operation.binding
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_END_INVALID",
+        "Only a kill-acknowledged end operation can materialize terminal public state",
+      );
+    }
+    const binding = validateResidentSessionBinding(operation.binding);
+    const expectedSourceCursor = operation.input.expectedSourceCursor;
+    if (!expectedSourceCursor) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_AUTHORITY_MISMATCH",
+        "Resident end projection lost its reviewed source cursor authority",
+      );
+    }
+    const [source, threads] = await Promise.all([
+      this.readSnapshotUnlocked(binding.threadId),
+      this.readThreadsUnlocked(),
+    ]);
+    const threadIndex = threads.findIndex((thread) => thread.threadId === binding.threadId);
+    const catalogThread = threadIndex >= 0 ? threads[threadIndex] : undefined;
+    if (!catalogThread || !isDeepStrictEqual(catalogThread, source.thread)) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_CONFLICT",
+        "Resident end cannot materialize from a divergent snapshot and thread catalog",
+      );
+    }
+    if (residentEndProjectionIsMaterialized(source, binding, operation)) return;
+    if (
+      (source.runtime !== undefined && (
+        source.runtime.residency !== "resident" ||
+        source.runtime.activeSessionId !== binding.activeSessionId ||
+        source.runtime.sessionId !== binding.sessionId
+      )) ||
+      source.latestCursor.threadId !== binding.threadId ||
+      source.latestCursor.executionGenerationId !== binding.executionGenerationId ||
+      !isDeepStrictEqual(source.latestCursor, expectedSourceCursor) ||
+      !isDeepStrictEqual(source.thread.lastKnownCursor, expectedSourceCursor)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_CONFLICT",
+        "Resident end source projection does not match its exact killed runtime authority",
+      );
+    }
+
+    const generatedAt = causalNow(source.generatedAt, source.thread.updatedAt, operation.updatedAt);
+    const thread = ThreadSummarySchema.parse({
+      ...source.thread,
+      status: residentEndedThreadStatus(source.thread.status),
+      recap: "Resident session ended.",
+      updatedAt: generatedAt,
+      lastKnownCursor: source.latestCursor,
+    });
+    const snapshot = ThreadProjectionSnapshotSchema.parse({
+      snapshotVersion: SNAPSHOT_VERSION,
+      generatedAt,
+      thread,
+      transcriptBlockIndex: source.transcriptBlockIndex,
+      materializedRecentBlocks: source.materializedRecentBlocks,
+      queueState: { pendingCommandIds: [], paused: false },
+      approvals: [],
+      childAgents: [],
+      goals: [],
+      schedules: [],
+      git: source.git,
+      evidence: source.evidence,
+      pendingAttention: [],
+      latestCursor: source.latestCursor,
+      residentLifecycle: {
+        version: 1,
+        state: "ended",
+        operationId: operation.operationId,
+        bindingFingerprint: residentDispatchAuthorityFingerprint(binding),
+        endedAt: generatedAt,
+        sourceCursor: source.latestCursor,
+        reason: "user_end",
+      },
+    });
+    const updatedThreads = [...threads];
+    updatedThreads[threadIndex] = thread;
+    const transaction = ResidentEndProjectionTransactionSchema.parse({
+      version: 1,
+      kind: "resident_end_projection_materialization",
+      transactionId: deterministicId("resident-end-projection", operation.operationId),
+      operationId: operation.operationId,
+      preparedAt: generatedAt,
+      binding,
+      sourceSnapshotDigest: digestNormalizedJson(source),
+      preservedProjectionDigest: residentEndPreservedProjectionDigest(source),
+      catalogPeersDigest: residentEndCatalogPeersDigest(threads, binding.threadId),
+      sourceThread: source.thread,
+      sourceCursor: source.latestCursor,
+      expectedSourceCursor,
+      snapshot,
+      threadsFile: ThreadFileSchema.parse({ version: 1, threads: updatedThreads }),
+    });
+    try {
+      await atomicWriteJson(
+        this.residentProjectionTransactionPath(binding),
+        transaction,
+        MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES,
+      );
+      await this.injectResidentLifecycleFault("after_end_projection_prepare", operation.operationId);
+      await this.materializeResidentEndProjectionTransactionUnlocked(transaction, true);
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
+  private async materializeResidentEndProjectionTransactionUnlocked(
+    transaction: ResidentEndProjectionTransaction,
+    injectFaults: boolean,
+  ): Promise<void> {
+    const binding = validateResidentSessionBinding(transaction.binding);
+    const operation = await this.readResidentLifecycleOperationUnlocked(transaction.operationId);
+    if (
+      !operation ||
+      operation.kind !== "end" ||
+      (operation.phase !== "kill_acknowledged" && operation.phase !== "completed") ||
+      !operation.binding ||
+      !isDeepStrictEqual(operation.binding, binding) ||
+      !operation.input.expectedSourceCursor ||
+      !isDeepStrictEqual(operation.input.expectedSourceCursor, transaction.expectedSourceCursor)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_AUTHORITY_MISMATCH",
+        "Prepared resident end projection lost its exact kill acknowledgement",
+      );
+    }
+    const scope = await this.currentWorkspaceScopeUnlocked(
+      binding.threadId,
+      binding.executionGenerationId,
+    );
+    const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+    this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+    const bindingRecord = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+      (record) => isDeepStrictEqual(record.binding, binding),
+    );
+    if (
+      !bindingRecord ||
+      bindingRecord.operationId !== operation.operationId ||
+      (bindingRecord.state !== "detached" && bindingRecord.state !== "completed")
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_AUTHORITY_MISMATCH",
+        "Prepared resident end projection has no exact revoked binding authority",
+      );
+    }
+
+    const [currentSnapshot, currentThreads] = await Promise.all([
+      this.readSnapshotUnlocked(binding.threadId),
+      this.readThreadsUnlocked(),
+    ]);
+    const currentThread = currentThreads.find((thread) => thread.threadId === binding.threadId);
+    const snapshotIsSource = digestNormalizedJson(currentSnapshot) === transaction.sourceSnapshotDigest;
+    const snapshotIsTarget = isDeepStrictEqual(currentSnapshot, transaction.snapshot);
+    const threadIsSource = isDeepStrictEqual(currentThread, transaction.sourceThread);
+    const targetThread = transaction.snapshot.thread;
+    const threadIsTarget = isDeepStrictEqual(currentThread, targetThread);
+    if ((!snapshotIsSource && !snapshotIsTarget) || (!threadIsSource && !threadIsTarget)) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_CONFLICT",
+        "Prepared resident end projection no longer follows its exact public source state",
+      );
+    }
+    if (
+      (snapshotIsSource &&
+        (residentEndPreservedProjectionDigest(currentSnapshot) !== transaction.preservedProjectionDigest ||
+          !isDeepStrictEqual(currentSnapshot.latestCursor, transaction.sourceCursor))) ||
+      residentEndCatalogPeersDigest(currentThreads, binding.threadId) !== transaction.catalogPeersDigest
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_END_PROJECTION_CONFLICT",
+        "Prepared resident end projection changed preserved history or unrelated catalog state",
+      );
+    }
+    await atomicWriteJson(this.snapshotPath(binding.threadId), transaction.snapshot);
+    if (injectFaults) {
+      await this.injectResidentLifecycleFault("after_end_projection_snapshot", operation.operationId);
+    }
+    await atomicWriteJson(this.paths.threads, transaction.threadsFile);
+    if (injectFaults) {
+      await this.injectResidentLifecycleFault("after_end_projection_threads", operation.operationId);
+    }
+    await rm(this.residentProjectionTransactionPath(binding), { force: true });
+  }
+
   private async recoverResidentProjectionTransactionsUnlocked(): Promise<void> {
     const entries = await readdir(this.paths.residentProjectionTransactions, { withFileTypes: true });
     if (entries.length > MAX_PENDING_RESIDENT_PROJECTION_TRANSACTIONS) {
@@ -4896,7 +5547,7 @@ export class HostStore {
     transactionNames.sort();
     for (const name of transactionNames) {
       const path = join(this.paths.residentProjectionTransactions, name);
-      const transaction = await readJsonFile(path, ResidentProjectionTransactionSchema, {
+      const transaction = await readJsonFile(path, ResidentStateTransactionSchema, {
         maxBytes: MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES,
       });
       if (!transaction) {
@@ -4914,6 +5565,20 @@ export class HostStore {
           "INVALID_RESIDENT_PROJECTION_TRANSACTION",
           `Resident projection transaction filename does not match ${transaction.transactionId}`,
         );
+      }
+      if (transaction.kind === "resident_end_projection_materialization") {
+        const expectedTransactionId = deterministicId(
+          "resident-end-projection",
+          transaction.operationId,
+        );
+        if (transaction.transactionId !== expectedTransactionId) {
+          throw new HostStoreError(
+            "INVALID_RESIDENT_PROJECTION_TRANSACTION",
+            "Resident end projection transaction identity does not match its lifecycle operation",
+          );
+        }
+        await this.materializeResidentEndProjectionTransactionUnlocked(transaction, false);
+        continue;
       }
       const expectedTransactionId = transaction.abortIdleProofAttempt
         ? deterministicId(
@@ -4941,10 +5606,10 @@ export class HostStore {
 
   private async validateResidentProjectionLineageDirectoryUnlocked(): Promise<void> {
     const entries = await readdir(this.paths.residentProjectionLineages, { withFileTypes: true });
-    if (entries.length > MAX_RESIDENT_PROJECTION_LINEAGES) {
+    if (entries.length > this.residentProjectionLineageLimit) {
       throw new HostStoreError(
         "RESIDENT_PROJECTION_LINEAGE_LIMIT",
-        `Resident projection lineage directory exceeds ${MAX_RESIDENT_PROJECTION_LINEAGES} entries`,
+        `Resident projection lineage directory exceeds ${this.residentProjectionLineageLimit} entries`,
       );
     }
     const authorityIds = new Set<string>();
@@ -4995,7 +5660,7 @@ export class HostStore {
   private async assertResidentProjectionLineageCapacityUnlocked(): Promise<void> {
     const entries = await readdir(this.paths.residentProjectionLineages, { withFileTypes: true });
     const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
-    if (files.length >= MAX_RESIDENT_PROJECTION_LINEAGES) {
+    if (files.length >= this.residentProjectionLineageLimit) {
       throw new HostStoreError(
         "RESIDENT_PROJECTION_LINEAGE_LIMIT",
         "The resident projection authority lineage registry is full",
@@ -8065,6 +8730,285 @@ export class HostStore {
     return join(this.paths.residentLifecycleOperations, `${storageKey(operationId)}.json`);
   }
 
+  private async readResidentLifecycleRetiredFenceUnlocked(): Promise<ResidentLifecycleRetiredFence> {
+    const fence = await readJsonFile(
+      this.paths.residentLifecycleRetiredFence,
+      ResidentLifecycleRetiredFenceSchema,
+      { maxBytes: MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES },
+    );
+    if (!fence) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "The retired resident lifecycle authority fence is missing",
+      );
+    }
+    return fence;
+  }
+
+  private async residentLifecycleRetiredKeyIsFencedUnlocked(key: string): Promise<boolean> {
+    return residentLifecycleRetiredFenceHas(
+      await this.readResidentLifecycleRetiredFenceUnlocked(),
+      key,
+    );
+  }
+
+  private async recoverResidentLifecycleRetirementUnlocked(): Promise<void> {
+    const transaction = await readJsonFile(
+      this.paths.residentLifecycleRetirement,
+      ResidentLifecycleRetirementTransactionSchema,
+      { optional: true, maxBytes: MAX_RESIDENT_LIFECYCLE_RETIREMENT_BYTES },
+    );
+    if (transaction) await this.materializeResidentLifecycleRetirementUnlocked(transaction);
+  }
+
+  private async retireOneResidentLifecycleTerminalGroupUnlocked(threadId?: string): Promise<boolean> {
+    await this.recoverResidentLifecycleRetirementUnlocked();
+    const [operations, bindingRecords] = await Promise.all([
+      this.readResidentLifecycleOperationsUnlocked(),
+      this.readResidentSessionBindingRecordsUnlocked(),
+    ]);
+    const terminalCandidates = operations
+      .filter((operation) => {
+        if (threadId !== undefined && operation.input.threadId !== threadId) return false;
+        if (operation.kind === "provision") {
+          return operation.phase === "completed" && operation.binding === undefined;
+        }
+        const bindingRecord = bindingRecords.find(
+          (record) =>
+            record.operationId === operation.operationId &&
+            operation.binding !== undefined &&
+            isDeepStrictEqual(record.binding, operation.binding),
+        );
+        return (
+          (operation.kind === "end" && operation.phase === "completed" && bindingRecord?.state === "completed") ||
+          (operation.kind === "detach" && operation.phase === "detached" && bindingRecord?.state === "detached")
+        );
+      })
+      .sort((left, right) =>
+        (left.terminalAt ?? left.updatedAt).localeCompare(right.terminalAt ?? right.updatedAt) ||
+        left.operationId.localeCompare(right.operationId),
+      );
+    const terminal = terminalCandidates[0];
+    if (!terminal) return false;
+
+    const bindingRecord = terminal.binding
+      ? bindingRecords.find(
+          (record) =>
+            record.operationId === terminal.operationId &&
+            isDeepStrictEqual(record.binding, terminal.binding),
+        )
+      : undefined;
+    const predecessor = terminal.binding
+      ? operations.find(
+          (operation) =>
+            operation.kind === "provision" &&
+            operation.phase === "committed" &&
+            operation.binding !== undefined &&
+            residentDispatchAuthorityFingerprint(operation.binding) ===
+              residentDispatchAuthorityFingerprint(terminal.binding!),
+        )
+      : undefined;
+    const retiredOperations = predecessor ? [predecessor, terminal] : [terminal];
+    const projectionLineage = terminal.binding
+      ? await this.readResidentProjectionLineageUnlocked(
+          residentProjectionAuthorityFromBinding(terminal.binding),
+        )
+      : undefined;
+    const transaction = ResidentLifecycleRetirementTransactionSchema.parse({
+      version: 1,
+      transactionId: deterministicId(
+        "resident-lifecycle-retirement",
+        ...retiredOperations.map((operation) => operation.operationId).sort(),
+      ),
+      preparedAt: causalNow(...retiredOperations.map((operation) => operation.updatedAt)),
+      operations: retiredOperations,
+      ...(bindingRecord ? { bindingRecord } : {}),
+      ...(projectionLineage ? { projectionLineage } : {}),
+    });
+    await this.assertResidentLifecycleRetirementPublicProofUnlocked(transaction);
+    const created = await atomicWriteJsonIfAbsent(
+      this.paths.residentLifecycleRetirement,
+      transaction,
+      MAX_RESIDENT_LIFECYCLE_RETIREMENT_BYTES,
+    );
+    if (!created) {
+      const existing = await readJsonFile(
+        this.paths.residentLifecycleRetirement,
+        ResidentLifecycleRetirementTransactionSchema,
+        { maxBytes: MAX_RESIDENT_LIFECYCLE_RETIREMENT_BYTES },
+      );
+      if (!existing || !isDeepStrictEqual(existing, transaction)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A different resident lifecycle retirement is already prepared",
+        );
+      }
+    }
+    await this.injectResidentLifecycleFault("after_retirement_prepare", terminal.operationId);
+    await this.materializeResidentLifecycleRetirementUnlocked(transaction);
+    return true;
+  }
+
+  private async assertResidentLifecycleRetirementPublicProofUnlocked(
+    transaction: ResidentLifecycleRetirementTransaction,
+  ): Promise<void> {
+    const bindingRecord = transaction.bindingRecord;
+    if (!bindingRecord) return;
+    const terminal = transaction.operations.find(
+      (operation) => operation.operationId === bindingRecord.operationId,
+    );
+    if (!terminal?.binding || !isDeepStrictEqual(terminal.binding, bindingRecord.binding)) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "Resident lifecycle retirement lost its exact terminal binding",
+      );
+    }
+    const pendingProjection = await readJsonFile(
+      this.residentProjectionTransactionPath(bindingRecord.binding),
+      ResidentStateTransactionSchema,
+      { optional: true, maxBytes: MAX_RESIDENT_PROJECTION_TRANSACTION_BYTES },
+    );
+    if (pendingProjection) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "Resident lifecycle retirement cannot remove lineage while public projection recovery is pending",
+      );
+    }
+    if (terminal.kind !== "end") return;
+
+    const [snapshot, threads] = await Promise.all([
+      this.readSnapshotUnlocked(bindingRecord.binding.threadId),
+      this.readThreadsUnlocked(),
+    ]);
+    const catalogThread = threads.find((thread) => thread.threadId === bindingRecord.binding.threadId);
+    if (
+      !catalogThread ||
+      !isDeepStrictEqual(catalogThread, snapshot.thread) ||
+      !residentEndProjectionIsMaterialized(snapshot, bindingRecord.binding, terminal)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "Resident end lineage can retire only after its exact terminal public proof is durable",
+      );
+    }
+    const lineage = transaction.projectionLineage;
+    const expectedSourceCursor = terminal.input.expectedSourceCursor;
+    if (
+      lineage &&
+      (!expectedSourceCursor ||
+        lineage.current.generation !== expectedSourceCursor.generation ||
+        lineage.current.sequence !== expectedSourceCursor.sequence)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "Resident end lineage does not preserve the exact reviewed source cursor",
+      );
+    }
+  }
+
+  private async materializeResidentLifecycleRetirementUnlocked(
+    transaction: ResidentLifecycleRetirementTransaction,
+  ): Promise<void> {
+    for (const operation of transaction.operations) {
+      const current = await this.readResidentLifecycleOperationUnlocked(operation.operationId);
+      if (current && !isDeepStrictEqual(current, operation)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A prepared retirement operation changed before local compaction",
+        );
+      }
+    }
+    const records = await this.readResidentSessionBindingRecordsUnlocked();
+    const bindingRecord = transaction.bindingRecord;
+    if (bindingRecord) {
+      const overlapping = records.find((record) =>
+        residentSessionIdentitiesOverlap(record.binding, bindingRecord.binding),
+      );
+      if (overlapping && !isDeepStrictEqual(overlapping, bindingRecord)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A retired resident binding identity changed before compaction",
+        );
+      }
+    }
+
+    await this.assertResidentLifecycleRetirementPublicProofUnlocked(transaction);
+
+    let fence = await this.readResidentLifecycleRetiredFenceUnlocked();
+    const retiredKeys = [
+      ...transaction.operations.map((operation) => residentLifecycleRetiredOperationKey(operation.operationId)),
+      ...(bindingRecord ? residentLifecycleRetiredBindingKeys(bindingRecord.binding) : []),
+      ...(bindingRecord
+        ? [residentLifecycleRetiredProjectionAuthorityKey(
+            residentProjectionAuthorityId(residentProjectionAuthorityFromBinding(bindingRecord.binding)),
+          )]
+        : []),
+    ];
+    const exactRetirementWasFenced = retiredKeys.every((key) => residentLifecycleRetiredFenceHas(fence, key));
+    const projectionLineage = transaction.projectionLineage;
+    const currentLineage = bindingRecord
+      ? await this.readResidentProjectionLineageUnlocked(
+          residentProjectionAuthorityFromBinding(bindingRecord.binding),
+        )
+      : undefined;
+    if (projectionLineage) {
+      if (currentLineage && !isDeepStrictEqual(currentLineage, projectionLineage)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "A retired resident projection lineage changed before compaction",
+        );
+      }
+      if (!currentLineage && !exactRetirementWasFenced) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "Resident projection lineage disappeared before its exact retirement fence",
+        );
+      }
+    } else if (currentLineage) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "A resident projection lineage appeared after terminal retirement was prepared",
+      );
+    }
+    fence = residentLifecycleRetiredFenceAdd(fence, retiredKeys);
+    await atomicWriteJson(
+      this.paths.residentLifecycleRetiredFence,
+      fence,
+      MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES,
+    );
+    await this.injectResidentLifecycleFault(
+      "after_retirement_fence",
+      transaction.operations.at(-1)!.operationId,
+    );
+
+    if (projectionLineage) {
+      await durableRemoveFile(this.residentProjectionLineagePath(projectionLineage.authorityId));
+    }
+    await this.injectResidentLifecycleFault(
+      "after_retirement_lineage",
+      transaction.operations.at(-1)!.operationId,
+    );
+
+    if (bindingRecord) {
+      const remaining = records.filter((record) => !isDeepStrictEqual(record, bindingRecord));
+      if (remaining.length !== records.length) {
+        await this.writeResidentSessionBindingRecordsUnlocked(remaining);
+      }
+    }
+    await this.injectResidentLifecycleFault(
+      "after_retirement_binding",
+      transaction.operations.at(-1)!.operationId,
+    );
+    for (const operation of transaction.operations) {
+      await durableRemoveFile(this.residentLifecycleOperationPath(operation.operationId));
+    }
+    await this.injectResidentLifecycleFault(
+      "after_retirement_operations",
+      transaction.operations.at(-1)!.operationId,
+    );
+    await durableRemoveFile(this.paths.residentLifecycleRetirement);
+  }
+
   private async validateResidentLifecycleOperationDirectoryUnlocked(): Promise<void> {
     const records = await this.readResidentLifecycleOperationsUnlocked(true);
     const nonterminalThreads = new Set<string>();
@@ -8150,8 +9094,19 @@ export class HostStore {
     const record = ResidentLifecycleOperationRecordSchema.parse(recordValue);
     const existing = await this.readResidentLifecycleOperationUnlocked(record.operationId);
     if (!existing) {
-      const entries = await readdir(this.paths.residentLifecycleOperations, { withFileTypes: true });
-      if (entries.length >= MAX_RESIDENT_LIFECYCLE_OPERATIONS) {
+      if (record.kind === "provision") {
+        while (await this.retireOneResidentLifecycleTerminalGroupUnlocked(record.input.threadId)) {
+          // A fresh lifecycle generation supersedes prior terminal history for
+          // this thread; retire it before a live projection can replace the
+          // exact public end proof used to validate that history.
+        }
+      }
+      let records = await this.readResidentLifecycleOperationsUnlocked();
+      while (records.length >= this.residentLifecycleOperationLimit) {
+        if (!await this.retireOneResidentLifecycleTerminalGroupUnlocked()) break;
+        records = await this.readResidentLifecycleOperationsUnlocked();
+      }
+      if (records.length >= this.residentLifecycleOperationLimit) {
         throw new HostStoreError(
           "RESIDENT_LIFECYCLE_LIMIT_REACHED",
           "The resident lifecycle operation registry is full",
@@ -8196,6 +9151,14 @@ export class HostStore {
   ): Promise<ResidentLifecycleOperationRecord | undefined> {
     const record = await this.readResidentLifecycleOperationUnlocked(input.operationId);
     if (!record) {
+      if (await this.residentLifecycleRetiredKeyIsFencedUnlocked(
+        residentLifecycleRetiredOperationKey(input.operationId),
+      )) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+          "This retired resident lifecycle operation ID can never regain mutation authority",
+        );
+      }
       if (options.optional) return undefined;
       throw new HostStoreError(
         "RESIDENT_LIFECYCLE_OPERATION_NOT_FOUND",
@@ -8218,6 +9181,34 @@ export class HostStore {
     const record = await this.resolveExactResidentLifecycleOperationUnlocked(kind, input, { optional: false });
     if (!record) throw new HostStoreError("RESIDENT_LIFECYCLE_OPERATION_NOT_FOUND", "Lifecycle operation is missing");
     return record;
+  }
+
+  /**
+   * Consent is reviewed against the public snapshot cursor. Verify snapshot
+   * and catalog as one Store-serialized read before `ending` can be written;
+   * cursor drift is always a pre-effect rejection requiring fresh consent.
+   */
+  private async assertResidentEndExpectedSourceCursorUnlocked(
+    inputValue: ResidentEndLifecycleOperationInput,
+  ): Promise<void> {
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
+    const [snapshot, threads] = await Promise.all([
+      this.readSnapshotUnlocked(input.threadId),
+      this.readThreadsUnlocked(),
+    ]);
+    const catalogThread = threads.find((thread) => thread.threadId === input.threadId);
+    if (
+      !catalogThread ||
+      !isDeepStrictEqual(catalogThread, snapshot.thread) ||
+      !isDeepStrictEqual(snapshot.latestCursor, input.expectedSourceCursor) ||
+      !isDeepStrictEqual(snapshot.thread.lastKnownCursor, input.expectedSourceCursor) ||
+      !isDeepStrictEqual(catalogThread.lastKnownCursor, input.expectedSourceCursor)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_END_SOURCE_CURSOR_CHANGED",
+        "Resident state changed after end consent was reviewed; refresh the thread and confirm again",
+      );
+    }
   }
 
   private async resolveResidentLifecycleAuthorityUnlocked(
@@ -8348,6 +9339,7 @@ export class HostStore {
     operation: ResidentLifecycleOperationRecord,
     binding: ResidentSessionBinding,
   ): Promise<void> {
+    await this.assertResidentBindingNotRetiredUnlocked(binding);
     const bindingRecords = await this.readResidentSessionBindingRecordsUnlocked();
     const lifecycleRecords = await this.readResidentLifecycleOperationsUnlocked();
     const reusedBinding = bindingRecords.find((record) => residentSessionIdentitiesOverlap(record.binding, binding));
@@ -8374,6 +9366,17 @@ export class HostStore {
         "RESIDENT_BINDING_ALREADY_ACTIVE",
         "The lifecycle thread already has an active or activating resident binding",
       );
+    }
+  }
+
+  private async assertResidentBindingNotRetiredUnlocked(binding: ResidentSessionBinding): Promise<void> {
+    for (const key of residentLifecycleRetiredBindingKeys(binding)) {
+      if (await this.residentLifecycleRetiredKeyIsFencedUnlocked(key)) {
+        throw new HostStoreError(
+          "RESIDENT_SESSION_REUSED",
+          "A retired resident session identity cannot regain command authority",
+        );
+      }
     }
   }
 
@@ -8761,19 +9764,16 @@ export class HostStore {
   }
 
   private validateResidentKillLease(value: ResidentKillLease): ResidentKillLease {
+    const lease = validateResidentKillLeaseEnvelope(value);
     if (
-      !value ||
-      typeof value !== "object" ||
-      !this.residentKillLeases.has(value as object) ||
-      value[residentKillLeaseBrand] !== true ||
-      value.leaseVersion !== 1
+      !this.residentKillLeases.has(lease as object)
     ) {
       throw new HostStoreError(
         "RESIDENT_LIFECYCLE_LEASE_INVALID",
-        "Resident kill requires an opaque lease issued by this HostStore process",
+        "Resident kill requires an opaque lease issued by this exact HostStore process",
       );
     }
-    return value;
+    return lease;
   }
 
   private async requireLifecycleLeaseRecordUnlocked(
@@ -8845,18 +9845,6 @@ export class HostStore {
               (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching"))
           ) {
             await this.materializeEndingResidentBindingRevocationUnlocked(operation);
-          } else if (operation.phase === "kill_acknowledged" || operation.phase === "completed") {
-            await this.materializeCompletedResidentBindingUnlocked(operation);
-            if (operation.phase === "kill_acknowledged") {
-              const completedAt = causalNow(operation.updatedAt);
-              operation = ResidentLifecycleOperationRecordSchema.parse({
-                ...operation,
-                phase: "completed",
-                updatedAt: completedAt,
-                terminalAt: completedAt,
-              });
-              await this.writeResidentLifecycleOperationUnlocked(operation);
-            }
           }
         } else if (operation.kind === "detach") {
           await this.materializeDetachedResidentBindingUnlocked(operation);
@@ -8897,6 +9885,24 @@ export class HostStore {
             });
             await this.writeResidentLifecycleOperationUnlocked(committed);
           }
+        }
+      }
+      if (
+        stage === "after_projection_recovery" &&
+        operation.kind === "end" &&
+        (operation.phase === "kill_acknowledged" || operation.phase === "completed")
+      ) {
+        await this.prepareResidentEndProjectionUnlocked(operation);
+        await this.materializeCompletedResidentBindingUnlocked(operation);
+        if (operation.phase === "kill_acknowledged") {
+          const completedAt = causalNow(operation.updatedAt);
+          operation = ResidentLifecycleOperationRecordSchema.parse({
+            ...operation,
+            phase: "completed",
+            updatedAt: completedAt,
+            terminalAt: completedAt,
+          });
+          await this.writeResidentLifecycleOperationUnlocked(operation);
         }
       }
     }
@@ -9201,6 +10207,19 @@ export class HostStore {
             throw new HostStoreError(
               "RESIDENT_LIFECYCLE_STATE_INVALID",
               "A completed resident end operation has no exact completed binding record",
+            );
+          }
+          const completedSnapshot = operationBinding
+            ? await this.readSnapshotUnlocked(operationBinding.threadId)
+            : undefined;
+          if (!operationBinding || !completedSnapshot || !residentEndProjectionIsMaterialized(
+            completedSnapshot,
+            operationBinding,
+            operation,
+          )) {
+            throw new HostStoreError(
+              "RESIDENT_LIFECYCLE_STATE_INVALID",
+              "A completed resident end operation still exposes live runtime projection state",
             );
           }
         }
@@ -9785,6 +10804,72 @@ function residentSessionIdentitiesOverlap(
     (left.sessionFile !== undefined && right.sessionFile !== undefined && left.sessionFile === right.sessionFile);
 }
 
+function emptyResidentLifecycleRetiredFence(): ResidentLifecycleRetiredFence {
+  return ResidentLifecycleRetiredFenceSchema.parse({
+    version: 1,
+    bitCount: RESIDENT_LIFECYCLE_RETIRED_FENCE_BITS,
+    hashCount: RESIDENT_LIFECYCLE_RETIRED_FENCE_HASHES,
+    retiredKeyCount: 0,
+    bits: Buffer.alloc(RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES).toString("base64"),
+  });
+}
+
+function residentLifecycleRetiredOperationKey(operationId: string): string {
+  return `operation:${operationId}`;
+}
+
+function residentLifecycleRetiredProjectionAuthorityKey(authorityId: string): string {
+  return `projection-authority:${authorityId}`;
+}
+
+function residentLifecycleRetiredBindingKeys(binding: ResidentSessionBinding): string[] {
+  return [
+    `binding:${residentDispatchAuthorityFingerprint(binding)}`,
+    `active-session:${digestNormalizedJson(binding.activeSessionId)}`,
+    `session:${digestNormalizedJson(binding.sessionId)}`,
+    ...(binding.sessionFile ? [`session-file:${digestNormalizedJson(binding.sessionFile)}`] : []),
+  ];
+}
+
+function residentLifecycleRetiredFenceIndexes(key: string): number[] {
+  const digest = createHash("sha256")
+    .update("prime-resident-lifecycle-retired-v1\0")
+    .update(key)
+    .digest();
+  return Array.from({ length: RESIDENT_LIFECYCLE_RETIRED_FENCE_HASHES }, (_, index) =>
+    digest.readUInt32BE(index * 4) % RESIDENT_LIFECYCLE_RETIRED_FENCE_BITS,
+  );
+}
+
+function residentLifecycleRetiredFenceHas(
+  fence: ResidentLifecycleRetiredFence,
+  key: string,
+): boolean {
+  const bits = Buffer.from(fence.bits, "base64");
+  return residentLifecycleRetiredFenceIndexes(key).every((bitIndex) =>
+    (bits[Math.floor(bitIndex / 8)]! & (1 << (bitIndex % 8))) !== 0,
+  );
+}
+
+function residentLifecycleRetiredFenceAdd(
+  fence: ResidentLifecycleRetiredFence,
+  keys: readonly string[],
+): ResidentLifecycleRetiredFence {
+  const bits = Buffer.from(fence.bits, "base64");
+  let retiredKeyCount = fence.retiredKeyCount;
+  for (const key of keys) {
+    if (!residentLifecycleRetiredFenceHas(fence, key)) retiredKeyCount += 1;
+    for (const bitIndex of residentLifecycleRetiredFenceIndexes(key)) {
+      bits[Math.floor(bitIndex / 8)]! |= 1 << (bitIndex % 8);
+    }
+  }
+  return ResidentLifecycleRetiredFenceSchema.parse({
+    ...fence,
+    retiredKeyCount,
+    bits: bits.toString("base64"),
+  });
+}
+
 function parseWorkspaceLookup(threadId: string, executionGenerationId: string): {
   threadId: string;
   executionGenerationId: string;
@@ -9881,6 +10966,56 @@ function residentPublishedProjectionDigest(snapshot: ThreadProjectionSnapshot): 
     goal: snapshot.goals[0],
     activity: snapshot.thread.status === "running",
   });
+}
+
+function residentEndProjectionIsMaterialized(
+  snapshot: ThreadProjectionSnapshot,
+  binding: ResidentSessionBinding,
+  operation: ResidentLifecycleOperationRecord,
+): boolean {
+  const expectedSourceCursor = operation.input.expectedSourceCursor;
+  return snapshot.latestCursor.threadId === binding.threadId &&
+    snapshot.latestCursor.executionGenerationId === binding.executionGenerationId &&
+    snapshot.runtime === undefined &&
+    snapshot.inProgressStream === undefined &&
+    snapshot.queueState.pendingCommandIds.length === 0 &&
+    snapshot.queueState.paused === false &&
+    snapshot.approvals.length === 0 &&
+    snapshot.childAgents.length === 0 &&
+    snapshot.goals.length === 0 &&
+    snapshot.schedules.length === 0 &&
+    snapshot.pendingAttention.length === 0 &&
+    snapshot.thread.status !== "running" &&
+    snapshot.thread.status !== "waiting" &&
+    snapshot.thread.status !== "needs_approval" &&
+    snapshot.thread.recap === "Resident session ended." &&
+    snapshot.residentLifecycle?.state === "ended" &&
+    snapshot.residentLifecycle.operationId === operation.operationId &&
+    snapshot.residentLifecycle.bindingFingerprint === residentDispatchAuthorityFingerprint(binding) &&
+    snapshot.residentLifecycle.endedAt === snapshot.generatedAt &&
+    snapshot.residentLifecycle.reason === "user_end" &&
+    expectedSourceCursor !== undefined &&
+    isDeepStrictEqual(snapshot.latestCursor, expectedSourceCursor) &&
+    isDeepStrictEqual(snapshot.thread.lastKnownCursor, expectedSourceCursor) &&
+    isDeepStrictEqual(snapshot.residentLifecycle.sourceCursor, expectedSourceCursor);
+}
+
+function residentEndedThreadStatus(status: ThreadSummary["status"]): ThreadSummary["status"] {
+  return status === "complete" || status === "failed" ? status : "idle";
+}
+
+function residentEndPreservedProjectionDigest(snapshot: ThreadProjectionSnapshot): string {
+  return digestNormalizedJson({
+    latestCursor: snapshot.latestCursor,
+    transcriptBlockIndex: snapshot.transcriptBlockIndex,
+    materializedRecentBlocks: snapshot.materializedRecentBlocks,
+    git: snapshot.git,
+    evidence: snapshot.evidence,
+  });
+}
+
+function residentEndCatalogPeersDigest(threads: readonly ThreadSummary[], threadId: string): string {
+  return digestNormalizedJson(threads.filter((thread) => thread.threadId !== threadId));
 }
 
 function digestNormalizedJson(value: unknown): string {

@@ -4,6 +4,7 @@ import {
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
+  ResidentLifecycleDispositionSchema,
   RuntimeModelCatalogSnapshotSchema,
   THREAD_HANDOFF_CAPABILITY,
   type ResidentLifecycleStatus,
@@ -75,6 +76,12 @@ export interface ThreadSummary {
   unread?: boolean
   executionGenerationId?: string
   workspaceId?: string
+  residentLifecycle?: {
+    state: 'ended'
+    operationId: string
+    endedAt: string
+    reason: 'user_end'
+  }
   transcript: TranscriptBlock[]
 }
 
@@ -216,7 +223,7 @@ export interface WorkbenchSnapshot {
   composerReceipt: {
     state: ComposerReceiptState
     message?: string
-    operation?: 'prompt' | 'abort'
+    operation?: 'prompt' | 'abort' | 'end'
     retryable?: boolean
   }
 }
@@ -228,27 +235,54 @@ export type ResidentLifecycleOperationState =
   | 'terminal_refresh_pending'
   | 'terminal'
 
-export interface ResidentLifecycleOperationSummary {
+interface ResidentLifecycleOperationBase {
   operationId: string
   expectedHostId: string
   projectId: string
   workspaceId: string
   threadId: string
   executionGenerationId: string
-  projectDisplayName: string
-  threadTitle: string
-  sessionName?: string
   createdAt: string
   updatedAt: string
   state: ResidentLifecycleOperationState
   lastStatus?: ResidentLifecycleStatus
 }
 
+export interface ResidentProvisionOperationSummary extends ResidentLifecycleOperationBase {
+  kind: 'provision'
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+}
+
+export interface ResidentEndOperationSummary extends ResidentLifecycleOperationBase {
+  kind: 'end'
+  sourceCursor: {
+    threadId: string
+    executionGenerationId: string
+    generation: string
+    sequence: number
+  }
+}
+
+export type ResidentLifecycleOperationSummary =
+  | ResidentProvisionOperationSummary
+  | ResidentEndOperationSummary
+
 export interface ResidentWorkspaceSelection {
   selectionToken: string
   operationId: string
   expectedHostId: string
   suggestedName: string
+  expiresAt: string
+}
+
+export interface ResidentEndPreparation {
+  confirmationToken: string
+  operationId: string
+  expectedHostId: string
+  threadId: string
+  executionGenerationId: string
   expiresAt: string
 }
 
@@ -316,6 +350,15 @@ export interface RendererApi {
     threadTitle: string
     sessionName?: string
   }): Promise<ResidentLifecycleStatus>
+  prepareResidentEnd(input: {
+    expectedHostId: string
+    projectId: string
+    workspaceId: string
+    threadId: string
+    executionGenerationId: string
+    resumeOperationId?: string
+  }): Promise<ResidentEndPreparation>
+  endResident(input: { confirmationToken: string; consent: true }): Promise<ResidentLifecycleStatus>
   residentLifecycleStatus(input: {
     expectedHostId: string
     operationId: string
@@ -626,6 +669,8 @@ export type PreviewVisualState =
   | 'nonretryable-uncertainty'
   | 'resident-start'
   | 'resident-recovery'
+  | 'resident-end-review'
+  | 'resident-end-pending'
 
 const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
@@ -636,6 +681,8 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'nonretryable-uncertainty',
   'resident-start',
   'resident-recovery',
+  'resident-end-review',
+  'resident-end-pending',
 ])
 
 function previewVisualStateFromSearch(search: string): PreviewVisualState {
@@ -674,6 +721,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     snapshot.composerReceipt = { state: 'idle', message: 'Ready to start a resident thread' }
     snapshot.residentLifecycleOperations = visualState === 'resident-recovery'
       ? [{
+          kind: 'provision',
           operationId: 'resident-preview-recovery',
           expectedHostId: host?.id ?? 'local-preview',
           projectId: 'project-preview-recovery',
@@ -687,6 +735,81 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
           state: 'requires_reselection',
         }]
       : []
+    return snapshot
+  }
+
+  if (visualState === 'resident-end-review' || visualState === 'resident-end-pending') {
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
+    if (!thread || !host || !snapshot.runtime.session) return snapshot
+    snapshot.selectedProjectId = thread.projectId
+    snapshot.selectedThreadId = thread.id
+    thread.status = 'idle'
+    thread.workspaceId = 'workspace-preview-end'
+    thread.executionGenerationId = 'execution-preview-end'
+    host.connection = 'online'
+    host.connectionPath = 'Local socket'
+    host.latencyMs = 2
+    delete host.lastSynchronized
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      residency: 'resident',
+      activeSessionId: 'active-preview-end',
+      sessionId: 'session-preview-end',
+      sessionName: thread.title,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    snapshot.operations = {
+      ...snapshot.operations,
+      submitCommands: visualState === 'resident-end-review',
+      startResidentTurn: visualState === 'resident-end-review',
+      stopResidentTurn: false,
+      provisionResident: true,
+    }
+    snapshot.residentLifecycleOperations = visualState === 'resident-end-pending'
+      ? [{
+          kind: 'end',
+          operationId: 'resident-preview-end',
+          expectedHostId: host.id,
+          projectId: thread.projectId,
+          workspaceId: thread.workspaceId,
+          threadId: thread.id,
+          executionGenerationId: thread.executionGenerationId,
+          sourceCursor: {
+            threadId: thread.id,
+            executionGenerationId: thread.executionGenerationId,
+            generation: 'daemon-preview-end',
+            sequence: 4,
+          },
+          createdAt: '2026-08-07T12:00:00.000Z',
+          updatedAt: '2026-08-07T12:00:01.000Z',
+          state: 'submitted',
+          lastStatus: {
+            version: 1,
+            kind: 'end',
+            operationId: 'resident-preview-end',
+            phase: 'ending',
+            expectedHostId: host.id,
+            projectId: thread.projectId,
+            workspaceId: thread.workspaceId,
+            threadId: thread.id,
+            executionGenerationId: thread.executionGenerationId,
+            preparedAt: '2026-08-07T12:00:00.000Z',
+            updatedAt: '2026-08-07T12:00:01.000Z',
+          },
+        }]
+      : []
+    snapshot.composerReceipt = visualState === 'resident-end-pending'
+      ? {
+          state: 'sent',
+          operation: 'end',
+          message: 'Ending resident session · Prime Continuim will not send another kill automatically',
+        }
+      : { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
   }
 
@@ -947,6 +1070,31 @@ class BrowserPreviewApi implements RendererApi {
     sessionName?: string
   }): Promise<ResidentLifecycleStatus> {
     throw new Error('Resident provisioning is unavailable in the browser preview.')
+  }
+
+  async prepareResidentEnd(_input: {
+    expectedHostId: string
+    projectId: string
+    workspaceId: string
+    threadId: string
+    executionGenerationId: string
+    resumeOperationId?: string
+  }): Promise<ResidentEndPreparation> {
+    if (this.visualState === 'resident-end-review') {
+      return {
+        confirmationToken: 'preview-end-confirmation',
+        operationId: _input.resumeOperationId ?? 'resident-preview-end',
+        expectedHostId: _input.expectedHostId,
+        threadId: _input.threadId,
+        executionGenerationId: _input.executionGenerationId,
+        expiresAt: '2099-08-07T12:05:00.000Z',
+      }
+    }
+    throw new Error('Resident session ending is unavailable in the browser preview.')
+  }
+
+  async endResident(_input: { confirmationToken: string; consent: true }): Promise<ResidentLifecycleStatus> {
+    throw new Error('Resident session ending is unavailable in the browser preview.')
   }
 
   async residentLifecycleStatus(_input: {
@@ -1271,6 +1419,36 @@ function residentWorkspaceSelectionFromNative(value: unknown): ResidentWorkspace
   return { selectionToken, operationId, expectedHostId, suggestedName, expiresAt }
 }
 
+const RESIDENT_END_PREPARATION_KEYS = new Set([
+  'confirmationToken',
+  'operationId',
+  'expectedHostId',
+  'threadId',
+  'executionGenerationId',
+  'expiresAt',
+])
+
+function residentEndPreparationFromNative(value: unknown): ResidentEndPreparation {
+  const raw = asRecord(value)
+  const confirmationToken = asString(raw?.confirmationToken)
+  const operationId = asString(raw?.operationId)
+  const expectedHostId = asString(raw?.expectedHostId)
+  const threadId = asString(raw?.threadId)
+  const executionGenerationId = asString(raw?.executionGenerationId)
+  const expiresAt = asString(raw?.expiresAt)
+  if (
+    !raw ||
+    Object.keys(raw).some((key) => !RESIDENT_END_PREPARATION_KEYS.has(key)) ||
+    !confirmationToken || confirmationToken.length > 512 || /[\0\r\n]/.test(confirmationToken) ||
+    !operationId || operationId.length > 512 || /[\0\r\n]/.test(operationId) ||
+    !expectedHostId || expectedHostId.length > 512 || /[\0\r\n]/.test(expectedHostId) ||
+    !threadId || threadId.length > 512 || /[\0\r\n]/.test(threadId) ||
+    !executionGenerationId || executionGenerationId.length > 512 || /[\0\r\n]/.test(executionGenerationId) ||
+    !expiresAt || !Number.isFinite(Date.parse(expiresAt))
+  ) throw new Error('The native service returned an invalid resident end confirmation.')
+  return { confirmationToken, operationId, expectedHostId, threadId, executionGenerationId, expiresAt }
+}
+
 function createStableId(prefix: string): string {
   const uuid = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
   return `${prefix}:${uuid}`
@@ -1341,6 +1519,7 @@ function residentLifecycleOperationsFromNative(
       const workspaceId = asString(entry.workspaceId)
       const threadId = asString(entry.threadId)
       const executionGenerationId = asString(entry.executionGenerationId)
+      const kind = asString(entry.kind) === 'end' ? 'end' : 'provision'
       const projectDisplayName = asString(entry.projectDisplayName)
       const threadTitle = asString(entry.threadTitle)
       const sessionName = asString(entry.sessionName)
@@ -1350,6 +1529,7 @@ function residentLifecycleOperationsFromNative(
       const parsedStatus = entry.lastStatus === undefined
         ? undefined
         : ResidentLifecycleStatusSchema.safeParse(entry.lastStatus)
+      const sourceCursor = nativeSessionCursor(entry.sourceCursor)
       if (
         !operationId ||
         !expectedHostId ||
@@ -1358,31 +1538,50 @@ function residentLifecycleOperationsFromNative(
         !workspaceId ||
         !threadId ||
         !executionGenerationId ||
-        !projectDisplayName ||
-        !threadTitle ||
         !createdAt ||
         !updatedAt ||
         !state ||
         !RESIDENT_LIFECYCLE_OPERATION_STATES.has(state) ||
-        (parsedStatus !== undefined && !parsedStatus.success)
+        (parsedStatus !== undefined && !parsedStatus.success) ||
+        (parsedStatus?.success && parsedStatus.data.kind !== kind) ||
+        (kind === 'provision' && (!projectDisplayName || !threadTitle)) ||
+        (kind === 'end' && !sourceCursor)
       ) return []
-      return [{
+      const base = {
         operationId,
         expectedHostId,
         projectId,
         workspaceId,
         threadId,
         executionGenerationId,
-        projectDisplayName,
-        threadTitle,
-        ...(sessionName ? { sessionName } : {}),
         createdAt,
         updatedAt,
         state,
         ...(parsedStatus?.success ? { lastStatus: parsedStatus.data } : {}),
-      }]
+      }
+      return kind === 'end'
+        ? [{ ...base, kind, sourceCursor: sourceCursor! }]
+        : [{
+            ...base,
+            kind,
+            projectDisplayName: projectDisplayName!,
+            threadTitle: threadTitle!,
+            ...(sessionName ? { sessionName } : {}),
+          }]
     })
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+}
+
+function nativeSessionCursor(value: unknown): ResidentEndOperationSummary['sourceCursor'] | undefined {
+  const cursor = asRecord(value)
+  const threadId = asString(cursor?.threadId)
+  const executionGenerationId = asString(cursor?.executionGenerationId)
+  const generation = asString(cursor?.generation)
+  const sequence = asNumber(cursor?.sequence)
+  if (!threadId || !executionGenerationId || !generation || sequence === undefined || !Number.isSafeInteger(sequence) || sequence < 0) {
+    return undefined
+  }
+  return { threadId, executionGenerationId, generation, sequence }
 }
 
 function residentLifecycleMaterializationKey(value: unknown): string {
@@ -1395,6 +1594,14 @@ function residentLifecycleMaterializationKey(value: unknown): string {
     asString(entry?.threadId) ?? '',
     asString(entry?.executionGenerationId) ?? '',
   ])
+}
+
+function residentLifecycleNeedsProjectionMaterialization(
+  status: ResidentLifecycleStatus | null | undefined,
+): status is ResidentLifecycleStatus {
+  return status?.kind === 'provision'
+    ? status.phase === 'committed'
+    : status?.kind === 'end' && status.phase === 'completed'
 }
 
 interface NativeProjectionCacheEntry {
@@ -1727,6 +1934,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const recentBlocks = records(threadSnapshot?.materializedRecentBlocks)
     .map(nativeTranscriptBlock)
     .filter((block): block is TranscriptBlock => Boolean(block))
+  const parsedResidentLifecycle = ResidentLifecycleDispositionSchema.safeParse(threadSnapshot?.residentLifecycle)
   const rawThreads = records(catalog?.threads)
   if (rawThreads.length === 0 && snapshotThread) rawThreads.push(snapshotThread)
   const threadIdCounts = new Map<string, number>()
@@ -1762,6 +1970,16 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       unread: asBoolean(thread.unread) ?? false,
       executionGenerationId: threadExecutionGenerationId,
       workspaceId: asString(location?.workspaceId),
+      ...(isMaterialized && parsedResidentLifecycle.success
+        ? {
+            residentLifecycle: {
+              state: parsedResidentLifecycle.data.state,
+              operationId: parsedResidentLifecycle.data.operationId,
+              endedAt: parsedResidentLifecycle.data.endedAt,
+              reason: parsedResidentLifecycle.data.reason,
+            },
+          }
+        : {}),
       transcript: isMaterialized ? recentBlocks : [],
     }
   })
@@ -2136,6 +2354,18 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       }
     : { state: 'idle', message: hosts.find((host) => host.id === selectedThread?.hostId)?.connection === 'online' ? 'Ready to send' : 'Waiting for connection' }
 
+  const residentLifecycleOperations = residentLifecycleOperationsFromNative(
+    input.residentLifecycleOperations,
+    activeHostId,
+  )
+  const selectedResidentEnd = selectedThread?.executionGenerationId
+    ? residentLifecycleOperations.find((operation) =>
+        operation.kind === 'end' &&
+        operation.expectedHostId === selectedThread.hostId &&
+        operation.threadId === protocolThreadId(selectedThread) &&
+        operation.executionGenerationId === selectedThread.executionGenerationId,
+      )
+    : undefined
   const residentSessionReady = Boolean(
     input.mutationAuthorityReady !== false &&
     selectedHostHasAuthority &&
@@ -2144,11 +2374,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
     runtime.session?.residency === 'resident' &&
     runtime.session.activeSessionId &&
-    runtime.session.sessionId,
-  )
-  const residentLifecycleOperations = residentLifecycleOperationsFromNative(
-    input.residentLifecycleOperations,
-    activeHostId,
+    runtime.session.sessionId &&
+    !selectedResidentEnd &&
+    selectedThread?.residentLifecycle?.state !== 'ended',
   )
   const residentProvisioningReady = Boolean(
     input.mutationAuthorityReady !== false &&
@@ -2198,7 +2426,21 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         ? { modelCatalog: true }
         : {}),
     },
-    composerReceipt,
+    composerReceipt: selectedResidentEnd
+      ? {
+          state: selectedResidentEnd.lastStatus?.phase === 'completed'
+            ? 'idle'
+            : selectedResidentEnd.state === 'outcome_unknown' || selectedResidentEnd.lastStatus?.phase === 'quarantined'
+              ? 'uncertain'
+              : 'sent',
+          operation: 'end',
+          message: selectedResidentEnd.lastStatus?.phase === 'quarantined'
+            ? 'End outcome unknown · this resident session stays locked for inspection'
+            : selectedResidentEnd.lastStatus?.phase === 'completed'
+              ? 'Resident session ended · saved thread remains available'
+              : 'Ending resident session · Prime Continuim will not send another kill automatically',
+        }
+      : composerReceipt,
   }
 }
 
@@ -2300,6 +2542,7 @@ export class NativeRendererApi implements RendererApi {
   private readonly installPlans = new Map<string, UnknownRecord>()
   private readonly discoveredComputers = new Map<string, DiscoveredComputer>()
   private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelection>()
+  private readonly residentEndPreparations = new Map<string, ResidentEndPreparation>()
   private readonly pendingResidentMaterializations = new Set<string>()
   private readonly handoffDestinations = new Map<string, string>()
   private readonly handoffSources = new Map<string, string>()
@@ -2601,6 +2844,7 @@ export class NativeRendererApi implements RendererApi {
     this.handoffDestinations.clear()
     this.handoffSources.clear()
     this.residentWorkspaceSelections.clear()
+    this.residentEndPreparations.clear()
     this.pendingResidentMaterializations.clear()
     this.activeProgress = undefined
     this.mutationAuthorityReadyHostId = undefined
@@ -3214,12 +3458,13 @@ export class NativeRendererApi implements RendererApi {
   }
 
   private applyPendingResidentMaterializations(): void {
-    this.residentLifecycleOperations = records(this.residentLifecycleOperations).map((entry) =>
-      this.pendingResidentMaterializations.has(residentLifecycleMaterializationKey(entry)) &&
-      asString(asRecord(entry.lastStatus)?.phase) === 'committed'
-        ? { ...entry, state: 'terminal_refresh_pending' }
-        : entry
-    )
+    this.residentLifecycleOperations = records(this.residentLifecycleOperations).map((entry) => {
+      const parsedStatus = ResidentLifecycleStatusSchema.safeParse(entry.lastStatus)
+      return this.pendingResidentMaterializations.has(residentLifecycleMaterializationKey(entry)) &&
+        residentLifecycleNeedsProjectionMaterialization(parsedStatus.success ? parsedStatus.data : undefined)
+          ? { ...entry, state: 'terminal_refresh_pending' }
+          : entry
+    })
   }
 
   private projectedResidentThread(status: ResidentLifecycleStatus): ThreadSummary | undefined {
@@ -3265,6 +3510,9 @@ export class NativeRendererApi implements RendererApi {
     if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
     const currentThread = this.projectedResidentThread(status)
     const snapshotLocation = asRecord(asRecord(asRecord(snapshot)?.thread)?.currentLocation)
+    const endDisposition = ResidentLifecycleDispositionSchema.safeParse(
+      asRecord(snapshot)?.residentLifecycle,
+    )
     if (
       !currentThread ||
       currentThread.id !== projectedThread.id ||
@@ -3272,10 +3520,17 @@ export class NativeRendererApi implements RendererApi {
       snapshotHostId(snapshot) !== status.expectedHostId ||
       snapshotExecutionGenerationId(snapshot) !== status.executionGenerationId ||
       asString(snapshotLocation?.projectId) !== status.projectId ||
-      asString(snapshotLocation?.workspaceId) !== status.workspaceId
+      asString(snapshotLocation?.workspaceId) !== status.workspaceId ||
+      (status.kind === 'end' && (
+        !endDisposition.success ||
+        endDisposition.data.operationId !== status.operationId ||
+        asRecord(snapshot)?.runtime !== undefined ||
+        asRecord(snapshot)?.inProgressStream !== undefined
+      )) ||
+      (status.kind === 'provision' && endDisposition.success)
     ) {
       throw new Error(
-        'The host returned a snapshot for a different resident thread. Check the durable setup status before trying again.',
+        'The host returned a snapshot that does not prove this exact resident lifecycle operation. Check its durable status before trying again.',
       )
     }
 
@@ -3481,8 +3736,8 @@ export class NativeRendererApi implements RendererApi {
       (options.requireCapability && !capabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY))
     ) {
       throw new Error(options.requireCapability
-        ? 'Resident thread creation is not ready on this verified local host.'
-        : 'Reconnect this local host before checking resident setup recovery.')
+        ? 'Resident lifecycle control is not ready on this verified local host.'
+        : 'Reconnect this verified local host before checking resident lifecycle status.')
     }
     return { expectedHostId, generation: this.connectionGeneration }
   }
@@ -3576,6 +3831,81 @@ export class NativeRendererApi implements RendererApi {
     return status
   }
 
+  async prepareResidentEnd(input: {
+    expectedHostId: string
+    projectId: string
+    workspaceId: string
+    threadId: string
+    executionGenerationId: string
+    resumeOperationId?: string
+  }): Promise<ResidentEndPreparation> {
+    const authority = this.residentLifecycleAuthority({ requireCapability: true })
+    if (input.expectedHostId !== authority.expectedHostId) throw new StaleHostAuthorityError()
+    const preparation = residentEndPreparationFromNative(
+      await this.call<unknown>('prepareResidentEnd', input),
+    )
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (
+      preparation.expectedHostId !== authority.expectedHostId ||
+      preparation.threadId !== input.threadId ||
+      preparation.executionGenerationId !== input.executionGenerationId ||
+      (input.resumeOperationId && preparation.operationId !== input.resumeOperationId) ||
+      Date.parse(preparation.expiresAt) <= Date.now()
+    ) throw new StaleHostAuthorityError()
+    this.residentEndPreparations.clear()
+    this.residentEndPreparations.set(preparation.confirmationToken, preparation)
+    return { ...preparation }
+  }
+
+  async endResident(input: { confirmationToken: string; consent: true }): Promise<ResidentLifecycleStatus> {
+    const authority = this.residentLifecycleAuthority({ requireCapability: true })
+    const preparation = this.residentEndPreparations.get(input.confirmationToken)
+    if (
+      !preparation ||
+      preparation.expectedHostId !== authority.expectedHostId ||
+      Date.parse(preparation.expiresAt) <= Date.now()
+    ) throw new Error('Review this resident session again before ending it.')
+
+    // Both renderer and main consume the authorization before the mutation
+    // boundary. An ambiguous response can only be reconciled by operation ID.
+    this.residentEndPreparations.delete(input.confirmationToken)
+    let status: ResidentLifecycleStatus | undefined
+    let statusAccepted = false
+    try {
+      status = ResidentLifecycleStatusSchema.parse(
+        await this.call<unknown>('endResident', input),
+      )
+      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      if (
+        status.kind !== 'end' ||
+        status.operationId !== preparation.operationId ||
+        status.expectedHostId !== authority.expectedHostId ||
+        status.threadId !== preparation.threadId ||
+        status.executionGenerationId !== preparation.executionGenerationId
+      ) throw new StaleHostAuthorityError()
+      statusAccepted = true
+    } finally {
+      if (
+        authority.generation === this.connectionGeneration &&
+        asString(asRecord(this.connection)?.hostId) === authority.expectedHostId
+      ) {
+        const hydration = this.rehydrateAuthorityMutationState(
+          authority.expectedHostId,
+          authority.generation,
+        )
+        if (statusAccepted && status?.phase === 'completed') await hydration
+        else await hydration.catch(() => undefined)
+      }
+    }
+    if (!status) throw new Error('The native resident end response was unavailable.')
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    if (status.phase === 'completed') {
+      await this.forceCommittedResidentMaterialization(status, authority)
+    }
+    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    return status
+  }
+
   async residentLifecycleStatus(input: {
     expectedHostId: string
     operationId: string
@@ -3595,10 +3925,10 @@ export class NativeRendererApi implements RendererApi {
       authority.expectedHostId,
       authority.generation,
     )
-    if (result.status?.phase === 'committed') await hydration
+    if (residentLifecycleNeedsProjectionMaterialization(result.status)) await hydration
     else await hydration.catch(() => undefined)
     this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
-    if (result.status?.phase === 'committed') {
+    if (residentLifecycleNeedsProjectionMaterialization(result.status)) {
       await this.forceCommittedResidentMaterialization(result.status, authority)
     }
     this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)

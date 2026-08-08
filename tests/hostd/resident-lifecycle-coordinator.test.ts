@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ResidentLifecycleCoordinator,
+  type ResidentEndRequest,
   type ResidentProvisionRequest,
 } from "../../src/hostd/resident-lifecycle-coordinator";
 import type { ResidentOwnedRuntimeCandidate } from "../../src/hostd/prime-agent-resident-adapter";
@@ -15,6 +16,7 @@ import {
 import type {
   ResidentLifecyclePhase,
   ResidentLifecycleStatus,
+  ResidentKillLease,
 } from "../../src/hostd/store";
 
 describe("ResidentLifecycleCoordinator", () => {
@@ -466,6 +468,132 @@ describe("ResidentLifecycleCoordinator", () => {
     } as ResidentProvisionRequest)).rejects.toThrow();
     expect(store.resolveWorkspaceDirectory).not.toHaveBeenCalled();
   });
+
+  it("persists end intent before deferred adapter readiness and coalesces the exact envelope", async () => {
+    const order: string[] = [];
+    const store = fakeEndStore(order);
+    const adapterGate = deferred<{
+      createOwnedCandidate: never;
+      readStableResidentProjection: never;
+      endResidentSession(lease: ResidentKillLease): Promise<{
+        acknowledgementVersion: 1;
+        operation: "end";
+        activeSessionId: string;
+        sessionId: string;
+      }>;
+    }>();
+    const adapterFactory = vi.fn(() => adapterGate.promise);
+    const endResidentSession = vi.fn(async (lease: ResidentKillLease) => {
+      order.push("runtime.end");
+      return {
+        acknowledgementVersion: 1 as const,
+        operation: "end" as const,
+        activeSessionId: lease.binding.activeSessionId,
+        sessionId: lease.binding.sessionId,
+      };
+    });
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: store.value,
+      adapter: adapterFactory as never,
+      onEnding: () => { order.push("gateway.ending"); },
+      onEnded: () => { order.push("gateway.ended"); },
+    });
+
+    const first = coordinator.end(endRequest());
+    const duplicate = coordinator.end(endRequest());
+    await vi.waitFor(() => expect(adapterFactory).toHaveBeenCalledOnce());
+    expect(await store.getResidentLifecycleStatus()).toMatchObject({ kind: "end", phase: "ending" });
+    expect(store.beginResidentKill).not.toHaveBeenCalled();
+    await expect(coordinator.end(endRequest({
+      expectedSourceCursor: {
+        ...endRequest().expectedSourceCursor,
+        sequence: endRequest().expectedSourceCursor.sequence + 1,
+      },
+    }))).rejects.toMatchObject({ code: "RESIDENT_END_OPERATION_ID_REUSED" });
+
+    adapterGate.resolve({
+      createOwnedCandidate: undefined as never,
+      readStableResidentProjection: undefined as never,
+      endResidentSession,
+    });
+    await expect(Promise.all([first, duplicate])).resolves.toEqual([
+      expect.objectContaining({ kind: "end", phase: "completed" }),
+      expect.objectContaining({ kind: "end", phase: "completed" }),
+    ]);
+    expect(endResidentSession).toHaveBeenCalledOnce();
+    expect(order).toEqual([
+      "store.prepare-end",
+      "store.get-end-binding",
+      "gateway.ending",
+      "store.get-status",
+      "store.begin-kill",
+      "runtime.end",
+      "store.ack-kill",
+      "gateway.ended",
+    ]);
+  });
+
+  it("drains an already-dispatched end acknowledgement before close retires the coordinator", async () => {
+    const store = fakeEndStore();
+    const acknowledgement = deferred<{
+      acknowledgementVersion: 1;
+      operation: "end";
+      activeSessionId: string;
+      sessionId: string;
+    }>();
+    const endResidentSession = vi.fn(() => acknowledgement.promise);
+    const onEnded = vi.fn();
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: store.value,
+      adapter: async () => ({
+        createOwnedCandidate: undefined as never,
+        readStableResidentProjection: undefined as never,
+        endResidentSession,
+      }),
+      onEnded,
+    });
+    const ending = coordinator.end(endRequest());
+    await vi.waitFor(() => expect(endResidentSession).toHaveBeenCalledOnce());
+    let closeSettled = false;
+    const closing = coordinator.close().then(() => { closeSettled = true; });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    acknowledgement.resolve({
+      acknowledgementVersion: 1,
+      operation: "end",
+      activeSessionId: residentBinding().activeSessionId,
+      sessionId: residentBinding().sessionId,
+    });
+    await expect(ending).resolves.toMatchObject({ phase: "completed" });
+    await closing;
+    expect(store.acknowledgeResidentKill).toHaveBeenCalledOnce();
+    expect(onEnded).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["unknown rejection", () => Promise.reject(unknownMutation("kill"))],
+    ["malformed acknowledgement", () => Promise.resolve({ acknowledgementVersion: 1, operation: "end" })],
+  ] as const)("quarantines a %s after the adapter boundary and never emits terminal refresh", async (_label, result) => {
+    const store = fakeEndStore();
+    const onEnded = vi.fn();
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: store.value,
+      adapter: async () => ({
+        createOwnedCandidate: undefined as never,
+        readStableResidentProjection: undefined as never,
+        endResidentSession: result as never,
+      }),
+      onEnded,
+    });
+
+    await expect(coordinator.end(endRequest())).resolves.toMatchObject({
+      kind: "end",
+      phase: "quarantined",
+      quarantinedFrom: "kill_dispatching",
+    });
+    expect(store.acknowledgeResidentKill).not.toHaveBeenCalled();
+    expect(onEnded).not.toHaveBeenCalled();
+  });
 });
 
 function request(overrides: Partial<ResidentProvisionRequest> = {}): ResidentProvisionRequest {
@@ -479,6 +607,92 @@ function request(overrides: Partial<ResidentProvisionRequest> = {}): ResidentPro
     selection: { kind: "new" },
     ...overrides,
   };
+}
+
+function endRequest(overrides: Partial<ResidentEndRequest> = {}): ResidentEndRequest {
+  return {
+    operationId: "end-operation-a",
+    expectedHostId: "host-a",
+    projectId: "project-a",
+    workspaceId: "workspace-a",
+    threadId: "thread-a",
+    executionGenerationId: "execution-a",
+    expectedSourceCursor: {
+      threadId: "thread-a",
+      executionGenerationId: "execution-a",
+      generation: "generation-a",
+      sequence: 1,
+    },
+    ...overrides,
+  };
+}
+
+function fakeEndStore(order: string[] = []) {
+  const binding = residentBinding();
+  let status = lifecycleStatus("ending", {
+    kind: "end",
+    operationId: "end-operation-a",
+  });
+  const lease = {
+    leaseVersion: 1,
+    operationId: status.operationId,
+    operationFingerprint: "a".repeat(64),
+    binding,
+    dispatchStartedAt: NOW,
+  } as unknown as ResidentKillLease;
+  const getResidentLifecycleStatus = vi.fn(async () => {
+    order.push("store.get-status");
+    return status;
+  });
+  const prepareResidentEnd = vi.fn(async () => {
+    order.push("store.prepare-end");
+    status = lifecycleStatus("ending", { kind: "end", operationId: "end-operation-a" });
+    return status;
+  });
+  const getResidentEndBinding = vi.fn(async () => {
+    order.push("store.get-end-binding");
+    return binding;
+  });
+  const beginResidentKill = vi.fn(async () => {
+    order.push("store.begin-kill");
+    return lease;
+  });
+  const failResidentKillBeforeEffect = vi.fn(async () => {
+    order.push("store.fail-kill");
+    status = lifecycleStatus("ending", { kind: "end", operationId: "end-operation-a" });
+    return status;
+  });
+  const quarantineResidentLifecycleOutcomeUnknown = vi.fn(async () => {
+    order.push("store.quarantine-kill");
+    status = lifecycleStatus("quarantined", {
+      kind: "end",
+      operationId: "end-operation-a",
+      quarantinedFrom: "kill_dispatching",
+      quarantineReason: "external_outcome_unknown",
+    });
+    return status;
+  });
+  const acknowledgeResidentKill = vi.fn(async () => {
+    order.push("store.ack-kill");
+    status = lifecycleStatus("completed", {
+      kind: "end",
+      operationId: "end-operation-a",
+      terminalAt: NOW,
+    });
+    return status;
+  });
+  const completeAcknowledgedResidentEnd = vi.fn(async () => status);
+  const value = {
+    getResidentLifecycleStatus,
+    prepareResidentEnd,
+    getResidentEndBinding,
+    beginResidentKill,
+    failResidentKillBeforeEffect,
+    quarantineResidentLifecycleOutcomeUnknown,
+    acknowledgeResidentKill,
+    completeAcknowledgedResidentEnd,
+  };
+  return { value: value as never, ...value };
 }
 
 function fakeStore(initialPhase: ResidentLifecyclePhase, order: string[] = []) {
