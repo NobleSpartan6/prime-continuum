@@ -2,7 +2,7 @@
 
 Development-stage native control-plane foundation for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
 
-> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release. Production resident commands, remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
+> **Current status:** this repository is a Phase 0/Phase 1 protocol and desktop-UI foundation, not a production remote-agent release. Production resident commands are not authorized or available out of the box. The release-attested local composition contains a fail-closed gateway for reattaching an existing durable Prime Agent binding and exposing generation-fenced **Run prompt** and **Stop** controls; focused adapter/store/service tests cover that contract, but the packaged-runtime smoke has not yet exercised a real resident binding or prompt. The app still cannot create or provision that binding for a fresh project. Remote SSH installation and upgrades, cross-host handoff, relay connectivity, and mobile control remain deferred and fail closed. Packaging has been verified only as an unsigned Windows x64 development artifact; macOS and Linux packaging still require platform CI and release verification.
 
 The intended product is a cross-platform workbench that preserves one project-and-conversation experience across local and SSH-backed hosts. The current build provides the security, protocol, persistence, and interface seams needed to continue that work without presenting the deferred execution paths as available.
 
@@ -33,11 +33,11 @@ Run the renderer by itself for browser-based visual checks:
 pnpm dev:web
 ```
 
-The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search the active host projection and open controls that its negotiated capabilities allow. The production composition does not yet advertise resident command execution or cross-host handoff. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
+The desktop workbench keeps one durable thread as the primary surface. Press `Ctrl+K` (or `Cmd+K`) to search the active host projection and open controls that its negotiated capabilities allow. A release-attested host advertises resident commands only after every pre-existing durable resident binding has reattached exactly; an absent, changed, or failed binding keeps the controls unavailable. `pnpm dev` intentionally builds an unattested hostd and therefore does not enable this resident gateway. Browser preview data is illustrative and never executes a prompt. Cross-host handoff remains unavailable. The evidence inspector is contextual and closed by default; reported runtime facts stay scoped to the active thread.
 
 Open **Models & accounts** to inspect the secret-free compatibility catalog reported by the verified Prime Agent runtime on the selected host. The exact Prime Agent v0.7.0 artifact currently projects 1,169 model routes across 32 providers, including current GPT-5.6, Claude 5, Gemini 3.6, DeepSeek V4, Kimi K3, GLM-5.2, Qwen3.6, MiniMax M3, Mistral, and gpt-oss families. This list is generated from the installed runtime rather than maintained as a renderer allow-list. The runtime reports OAuth compatibility metadata for ChatGPT Plus/Pro (Codex), Claude Pro/Max, and GitHub Copilot.
 
-Host-only development foundations now exist for generation-bound resident model selection and local ChatGPT sign-in through Prime Agent's pinned `openai-codex` provider. They are not yet exposed as renderer controls, and production host startup does not enable the OAuth path. Prime Agent v0.7.0 persists those OAuth credentials to plaintext `auth.json`, so Continuim requires an exact development opt-in and does not describe that path as secure credential storage. A production release remains blocked on OS-backed credential custody, durable OAuth restart reconciliation, and the resident execution gateway. Until the renderer integration lands, authenticate by running `/login` in Prime Agent on that host. [OpenAI's authentication documentation](https://developers.openai.com/codex/auth) distinguishes ChatGPT subscription access from separately billed API-key usage.
+Host-only development foundations now exist for generation-bound resident model selection and local ChatGPT sign-in through Prime Agent's pinned `openai-codex` provider. They are not yet exposed as renderer controls, and normal host startup does not enable the OAuth path. Prime Agent v0.7.0 persists those OAuth credentials to plaintext `auth.json`, so Continuim requires an exact development opt-in and does not describe that path as secure credential storage. A production release remains blocked on OS-backed credential custody, durable OAuth restart reconciliation, fresh resident-session provisioning, and the user-facing account flow. Until the renderer integration lands, authenticate by running `/login` in Prime Agent on that host. [OpenAI's authentication documentation](https://developers.openai.com/codex/auth) distinguishes ChatGPT subscription access from separately billed API-key usage.
 
 Open **Companion preview** from the sidebar to inspect the pairing requirements and launch the read-only phone projection. For a direct browser preview, visit:
 
@@ -60,10 +60,14 @@ See `docs/architecture.md` for the detailed boundary and protocol decisions.
 ```powershell
 pnpm typecheck
 pnpm test
-pnpm build
 pnpm build:runtime
 pnpm verify:runtime:smoke
+pnpm build:release
+pnpm verify:hostd-runtime:smoke
+pnpm verify:renderer-visual
 ```
+
+`verify:renderer-visual` builds the renderer, captures the browser-preview fixture through real Electron at 1600×1000 plus exact 390×844 and 320×704 desktop/Companion viewports, and fails on page or surface-level horizontal overflow. It writes reviewable PNGs and layout metrics under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
 
 On the verified Windows x64 development path, `pnpm package` keeps Windows
 executable resource editing and ASAR integrity enabled, then rejects a

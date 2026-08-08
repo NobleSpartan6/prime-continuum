@@ -180,6 +180,14 @@ export type CommandJournalStatus =
   | 'failed'
   | 'uncertain'
 
+export interface CommandDiagnostic {
+  code: string
+  message: string
+  retryable: boolean
+  diagnosticId?: string
+  details?: Record<string, string | number | boolean | null>
+}
+
 export interface CommandReceipt {
   commandId: string
   deviceId: string
@@ -189,6 +197,7 @@ export interface CommandReceipt {
   status: CommandJournalStatus | 'waiting_for_connection'
   durable: boolean
   detail?: string
+  error?: CommandDiagnostic
 }
 
 export interface ApprovalResolution {
@@ -233,6 +242,8 @@ export interface BootstrapPayload {
   outbox: OutboxEntry[]
   /** Parseable legacy/incomplete records excluded from every actionable path. */
   quarantinedOutboxCount: number
+  /** Bounded local history of host-durable outcomes that must never replay. */
+  durableUncertainReceipts: CommandReceipt[]
   connection: ConnectionState
   appVersion: string
 }
@@ -245,7 +256,18 @@ export interface OutboxEntry {
    */
   hostId?: string
   command: PersistedClientCommand
-  state: 'waiting_for_connection' | 'uncertain'
+  /**
+   * `awaiting_idle_proof` is an exact, non-replayable resident prompt that the
+   * host acknowledged as running. It may only be reconciled, never submitted.
+   * `awaiting_abort_idle_proof` is the corresponding accepted Stop whose ack
+   * cannot itself prove that the resident runtime is idle.
+   */
+  state:
+    | 'waiting_for_connection'
+    | 'uncertain'
+    | 'awaiting_reconciliation'
+    | 'awaiting_idle_proof'
+    | 'awaiting_abort_idle_proof'
   updatedAt: string
   quarantineReason?:
     | 'legacy_missing_authority'

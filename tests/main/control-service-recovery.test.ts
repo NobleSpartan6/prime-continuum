@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -1084,6 +1085,367 @@ describe('DesktopControlService recovery', () => {
     ])
   })
 
+  it('lets a coalesced idle proof dominate the running submit continuation without recreating the prompt outbox', async () => {
+    const directory = await createUserData({})
+    const command = prompt('device-a', 'coalesced-prompt-proof')
+    let connection!: TestConnection
+    connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') {
+        queueMicrotask(() => connection.emit('event', {
+          type: 'resident.prompt_idle_observed',
+          payload: {
+            eventVersion: 1,
+            attemptId: residentAttemptId(command),
+            receipt: commandReceipt(command, 'completed'),
+          },
+        }))
+        return commandReceipt(command, 'running')
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const events: Array<{ type: string; payload: unknown }> = []
+    service.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
+    await service.connect({ kind: 'local' })
+
+    await service.submitCommand(command)
+    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toEqual([]))
+    await Promise.resolve()
+
+    expect(connection.terminatedWith).toBeUndefined()
+    expect(events.filter(({ type }) => type === 'resident.prompt_idle_observed')).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ commandId: command.commandId, status: 'completed' }),
+      }),
+    ])
+    expect(await readStoredOutbox(directory)).toEqual([])
+  })
+
+  it('supervises exact read-only cleanup when direct resident proof wins before local cleanup fails', async () => {
+    const directory = await createUserData({})
+    const command = prompt('device-a', 'direct-proof-cleanup-recovery')
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') return commandReceipt(command, 'completed')
+      if (method === 'command.reconcile') {
+        return { receipts: [commandReceipt(command, 'completed')], unknown: [] }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    const internals = service as unknown as {
+      recordDurableUncertainReceipt(receipt: Record<string, unknown>, command: ClientCommand): Promise<void>
+      retireDurableUncertainReceipt(receipt: Record<string, unknown>): Promise<void>
+    }
+    await internals.recordDurableUncertainReceipt({
+      ...commandReceipt(command, 'uncertain'),
+      hostId: 'host-a',
+      durable: true,
+      error: {
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        message: 'Seeded diagnostic must be retired by exact proof.',
+        retryable: false,
+        diagnosticId: 'diagnostic-direct-proof-cleanup',
+      },
+    }, command)
+    const retireDurableUncertainReceipt = internals.retireDurableUncertainReceipt.bind(service)
+    let failCleanupOnce = true
+    internals.retireDurableUncertainReceipt = async (receipt) => {
+      if (failCleanupOnce) {
+        failCleanupOnce = false
+        throw new Error('Injected post-proof diagnostic cleanup failure')
+      }
+      await retireDurableUncertainReceipt(receipt)
+    }
+
+    await expect(service.submitCommand(command)).resolves.toMatchObject({
+      commandId: command.commandId,
+      status: 'completed',
+    })
+    await expect(service.bootstrap()).resolves.toMatchObject({
+      outbox: [expect.objectContaining({ command, state: 'uncertain' })],
+      durableUncertainReceipts: [expect.objectContaining({
+        commandId: command.commandId,
+        error: expect.objectContaining({ diagnosticId: 'diagnostic-direct-proof-cleanup' }),
+      })],
+    })
+
+    await vi.waitFor(async () => {
+      await expect(service.bootstrap()).resolves.toMatchObject({
+        outbox: [],
+        durableUncertainReceipts: [],
+      })
+    }, { timeout: 2_000 })
+    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(1)
+    expect(connection.requests.filter(({ method }) => method === 'command.reconcile')).toHaveLength(1)
+    expect(connection.terminatedWith).toBeUndefined()
+    await service.disconnect()
+  })
+
+  it('normalizes a restart-reconciled completed prompt into the dedicated idle proof event', async () => {
+    const command = prompt('device-a', 'restart-completed-prompt')
+    const directory = await createUserData({ outbox: [{
+      hostId: 'host-a',
+      command,
+      state: 'awaiting_idle_proof',
+      updatedAt: timestamp,
+    }] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        return { receipts: [commandReceipt(command, 'completed')], unknown: [] }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const events: Array<{ type: string; payload: unknown }> = []
+    service.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
+
+    await service.connect({ kind: 'local' })
+
+    expect(await readStoredOutbox(directory)).toEqual([])
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'resident.prompt_idle_observed',
+      payload: expect.objectContaining({ commandId: command.commandId, status: 'completed' }),
+    }))
+    expect(events).not.toContainEqual(expect.objectContaining({
+      type: 'command.receipt',
+      payload: expect.objectContaining({ commandId: command.commandId }),
+    }))
+  })
+
+  it('consumes duplicate exact prompt-idle signals once and ignores a different device identity', async () => {
+    const command = prompt('device-a', 'duplicate-prompt-proof')
+    const directory = await createUserData({ outbox: [{
+      hostId: 'host-a', command, state: 'awaiting_idle_proof', updatedAt: timestamp,
+    }] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') return { receipts: [commandReceipt(command, 'running')], unknown: [] }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const events: Array<{ type: string; payload: unknown }> = []
+    service.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
+    await service.connect({ kind: 'local' })
+    const proof = {
+      eventVersion: 1,
+      attemptId: residentAttemptId(command),
+      receipt: commandReceipt(command, 'completed'),
+    }
+
+    connection.emit('event', {
+      type: 'resident.prompt_idle_observed',
+      payload: { ...proof, receipt: { ...proof.receipt, deviceId: 'device-b' } },
+    })
+    connection.emit('event', { type: 'resident.prompt_idle_observed', payload: proof })
+    connection.emit('event', { type: 'resident.prompt_idle_observed', payload: proof })
+
+    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toEqual([]))
+    expect(connection.terminatedWith).toBeUndefined()
+    expect(events.filter(({ type }) => type === 'resident.prompt_idle_observed')).toHaveLength(1)
+  })
+
+  it.each([
+    ['wrong attempt', (command: ClientCommand) => ({
+      attemptId: 'resident-dispatch-wrong-attempt',
+      receipt: commandReceipt(command, 'completed'),
+    })],
+    ['wrong generation', (command: ClientCommand) => ({
+      attemptId: residentAttemptId(command),
+      receipt: { ...commandReceipt(command, 'completed'), executionGenerationId: 'execution-2' },
+    })],
+  ] as const)('terminates on an exact local prompt proof with %s without consuming ownership', async (_label, mutate) => {
+    const command = prompt('device-a', `invalid-proof-${_label.replace(' ', '-')}`)
+    const retained = { hostId: 'host-a', command, state: 'awaiting_idle_proof' as const, updatedAt: timestamp }
+    const directory = await createUserData({ outbox: [retained] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') return { receipts: [commandReceipt(command, 'running')], unknown: [] }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'resident.prompt_idle_observed',
+      payload: { eventVersion: 1, ...mutate(command) },
+    })
+
+    await vi.waitFor(() => expect(connection.terminatedWith).toBeDefined())
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ command, state: 'awaiting_idle_proof' }),
+    ])
+  })
+
+  it('retains an accepted Stop without polling and consumes only its exact abort-idle proof', async () => {
+    const command = abortCommand('device-a', 'accepted-stop-proof')
+    const directory = await createUserData({ outbox: [{
+      hostId: 'host-a', command, state: 'awaiting_abort_idle_proof', updatedAt: timestamp,
+    }] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') return { receipts: [commandReceipt(command, 'running')], unknown: [] }
+      throw new Error(`Accepted Stop must not invoke ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const events: Array<{ type: string; payload: unknown }> = []
+    service.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'resident.abort_idle_observed',
+      payload: {
+        eventVersion: 1,
+        attemptId: residentAttemptId(command),
+        receipt: commandReceipt(command, 'completed'),
+      },
+    })
+
+    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toEqual([]))
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'resident.abort_idle_observed',
+      payload: expect.objectContaining({ commandId: command.commandId, status: 'completed' }),
+    }))
+    expect(connection.requests.filter(({ method }) => method === 'command.reconcile')).toHaveLength(1)
+  })
+
+  it('fails closed instead of evicting a proof fence whose submit continuation is still active', async () => {
+    const command = prompt('device-a', 'proof-fence-capacity')
+    const directory = await createUserData({ outbox: [{
+      hostId: 'host-a', command, state: 'awaiting_idle_proof', updatedAt: timestamp,
+    }] })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') return { receipts: [commandReceipt(command, 'running')], unknown: [] }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    const internals = service as unknown as {
+      completedResidentProofs: Map<string, unknown>
+      activeCommandSubmissions: Map<string, number>
+    }
+    for (let index = 0; index < 1_000; index += 1) {
+      const key = `active-proof-${index}`
+      internals.completedResidentProofs.set(key, { commandId: key })
+      internals.activeCommandSubmissions.set(key, 1)
+    }
+
+    connection.emit('event', {
+      type: 'resident.prompt_idle_observed',
+      payload: {
+        eventVersion: 1,
+        attemptId: residentAttemptId(command),
+        receipt: commandReceipt(command, 'completed'),
+      },
+    })
+
+    await vi.waitFor(() => expect(connection.terminatedWith).toMatchObject({
+      code: 'command.proof_fence_capacity',
+    }))
+    expect(internals.completedResidentProofs.size).toBe(1_000)
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ command, state: 'awaiting_idle_proof' }),
+    ])
+  })
+
+  it('polls an admitted non-replayable prompt until the old dispatch publishes its completed proof', async () => {
+    const command = prompt('device-a', 'admitted-old-session')
+    const directory = await createUserData({ outbox: [{
+      hostId: 'host-a',
+      command,
+      state: 'awaiting_reconciliation',
+      updatedAt: timestamp,
+    }] })
+    let reconciliations = 0
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        reconciliations += 1
+        return {
+          receipts: [commandReceipt(command, reconciliations === 1 ? 'admitted' : 'completed')],
+          unknown: [],
+        }
+      }
+      throw new Error(`Pending reconciliation must never invoke ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    expect(reconciliations).toBe(1)
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ state: 'awaiting_reconciliation' }),
+    ])
+
+    await vi.waitFor(() => expect(reconciliations).toBe(2), { timeout: 2_000 })
+    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toEqual([]), { timeout: 2_000 })
+
+    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toEqual([])
+    await service.disconnect()
+  })
+
+  it('isolates one permanent polled identity failure while a later pending command converges', async () => {
+    const conflicting = followUp('device-a', 'polled-conflict')
+    const transient = followUp('device-a', 'polled-transient')
+    const converging = followUp('device-a', 'polled-converges')
+    const directory = await createUserData({ outbox: [conflicting, transient, converging].map((command) => ({
+      hostId: 'host-a', command, state: 'awaiting_reconciliation', updatedAt: timestamp,
+    })) })
+    const counts = new Map<string, number>()
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        const commandId = (params as { commands: Array<{ commandId: string }> }).commands[0]!.commandId
+        const count = (counts.get(commandId) ?? 0) + 1
+        counts.set(commandId, count)
+        if (count === 1) {
+          const command = commandId === conflicting.commandId ? conflicting : converging
+          return { receipts: [commandReceipt(command, 'admitted')], unknown: [] }
+        }
+        if (commandId === conflicting.commandId) {
+          throw new ControlError('host.command_identity_orphaned', 'This identity cannot be repaired safely.')
+        }
+        if (commandId === transient.commandId && count === 2) {
+          throw new Error('One receipt lookup timed out without closing the connection.')
+        }
+        if (commandId === transient.commandId) {
+          return { receipts: [commandReceipt(transient, 'completed')], unknown: [] }
+        }
+        return { receipts: [commandReceipt(converging, 'completed')], unknown: [] }
+      }
+      throw new Error(`Polling must never invoke ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await vi.waitFor(() => expect(counts.get(converging.commandId)).toBe(2), { timeout: 2_000 })
+    await vi.waitFor(() => expect(counts.get(transient.commandId)).toBe(3), { timeout: 3_000 })
+    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toHaveLength(1), { timeout: 2_000 })
+
+    expect(service.getConnectionState().phase).toBe('online')
+    expect(connection.terminatedWith).toBeUndefined()
+    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toEqual([])
+    await expect(service.bootstrap()).resolves.toMatchObject({ outbox: [], quarantinedOutboxCount: 1 })
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({
+        command: conflicting,
+        quarantineReason: 'command_identity_conflict',
+      }),
+    ])
+    await service.disconnect()
+  })
+
   it('keeps a healthy connection online, clears exact receipts, and quarantines a conflicting envelope without replay', async () => {
     const conflicting = followUp('device-a', 'conflicting-envelope')
     const exact = followUp('device-a', 'exact-envelope')
@@ -1096,7 +1458,7 @@ describe('DesktopControlService recovery', () => {
           throw new ControlError('host.command_identity_orphaned', 'The durable identity cannot be reconciled safely.')
         }
         if (envelope?.commandId === exact.commandId) {
-          return { receipts: [commandReceipt(exact, 'admitted')], unknown: [] }
+          return { receipts: [commandReceipt(exact, 'completed')], unknown: [] }
         }
       }
       throw new Error(`Conflicting reconciliation must not trigger ${method}`)
@@ -1124,7 +1486,7 @@ describe('DesktopControlService recovery', () => {
         commandId: exact.commandId,
         threadId: exact.threadId,
         executionGenerationId: exact.expectedExecutionGenerationId,
-        status: 'admitted',
+        status: 'completed',
       }),
     }))
   })
@@ -1147,7 +1509,7 @@ describe('DesktopControlService recovery', () => {
         if (envelope.commandId === rejected.commandId) {
           throw new ControlError('host.command_receipt_generation_mismatch', 'The receipt generation is inconsistent.')
         }
-        return commandReceipt(delivered, 'admitted')
+        return commandReceipt(delivered, 'completed')
       }
       throw new Error(`Unexpected request: ${method}`)
     })
@@ -1241,13 +1603,13 @@ describe('DesktopControlService recovery', () => {
     const original = { ...followUp('device-a', 'terminal-global-id'), delivery: 'live_only' as const }
     const hostAFirst = new TestConnection((method) => {
       if (method === 'health.get') return health('host-a')
-      if (method === 'command.submit') return commandReceipt(original, 'admitted')
+      if (method === 'command.submit') return commandReceipt(original, 'completed')
       throw new Error(`Unexpected Host A request: ${method}`)
     })
     connectLocalHostd.mockResolvedValueOnce(hostAFirst)
     const first = new DesktopControlService({ app: testApp(directory) })
     await first.connect({ kind: 'local' })
-    await expect(first.submitCommand(original)).resolves.toMatchObject({ status: 'admitted' })
+    await expect(first.submitCommand(original)).resolves.toMatchObject({ status: 'completed' })
     await first.disconnect()
     expect(await readStoredOutbox(directory)).toEqual([])
 
@@ -1269,13 +1631,13 @@ describe('DesktopControlService recovery', () => {
 
     const hostARetry = new TestConnection((method) => {
       if (method === 'health.get') return health('host-a')
-      if (method === 'command.submit') return commandReceipt(original, 'admitted')
+      if (method === 'command.submit') return commandReceipt(original, 'completed')
       throw new Error(`Unexpected Host A retry request: ${method}`)
     })
     connectLocalHostd.mockResolvedValueOnce(hostARetry)
     const third = new DesktopControlService({ app: testApp(directory) })
     await third.connect({ kind: 'local' })
-    await expect(third.submitCommand(original)).resolves.toMatchObject({ status: 'admitted' })
+    await expect(third.submitCommand(original)).resolves.toMatchObject({ status: 'completed' })
     expect(hostARetry.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(1)
     const ledger = JSON.parse(
       await readFile(path.join(directory, 'control', 'command-identities.json'), 'utf8'),
@@ -1399,6 +1761,464 @@ describe('DesktopControlService recovery', () => {
     await service.disconnect()
   })
 
+  it('terminates a connection that sends an invalid thread-change signal', async () => {
+    const directory = await createUserData({})
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`An invalid thread-change signal must not trigger ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'thread.changed',
+      payload: {
+        threadId: 'thread-1',
+        executionGenerationId: 'execution-1',
+        unexpected: true,
+      },
+    })
+
+    expect(connection.terminatedWith).toMatchObject({ code: 'protocol.invalid_thread_change' })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    await service.disconnect()
+  })
+
+  it('coalesces a 20-signal burst into a leading and trailing authoritative thread refresh', async () => {
+    const directory = await createUserData({})
+    const firstRefresh = deferred<unknown>()
+    const firstRefreshStarted = deferred<void>()
+    let refreshCount = 0
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') {
+        refreshCount += 1
+        if (refreshCount === 1) {
+          firstRefreshStarted.resolve()
+          return firstRefresh.promise
+        }
+        if (refreshCount === 2) {
+          return threadSnapshotAt({
+            cursorGeneration: 'daemon-1',
+            cursorSequence: 2,
+            status: 'idle',
+            updatedAt: '2026-08-05T12:00:02.000Z',
+          })
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const snapshots: Array<ReturnType<typeof threadSnapshotAt>> = []
+    service.on('snapshot', (snapshot) => snapshots.push(snapshot as ReturnType<typeof threadSnapshotAt>))
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'thread.changed',
+      payload: { threadId: 'thread-1', executionGenerationId: 'execution-1' },
+    })
+    await firstRefreshStarted.promise
+    for (let index = 1; index < 20; index += 1) {
+      connection.emit('event', {
+        type: 'thread.changed',
+        payload: { threadId: 'thread-1', executionGenerationId: 'execution-1' },
+      })
+    }
+    firstRefresh.resolve(threadSnapshotAt({
+      cursorGeneration: 'daemon-1',
+      cursorSequence: 1,
+      status: 'running',
+      updatedAt: '2026-08-05T12:00:01.000Z',
+    }))
+
+    await vi.waitFor(() => {
+      expect(refreshCount).toBe(2)
+      expect(snapshots).toHaveLength(2)
+      expect(snapshots[1]?.thread.status).toBe('idle')
+    }, { timeout: 2_000 })
+    expect(connection.requests.filter(({ method }) => method === 'thread.snapshot')).toHaveLength(2)
+    await service.disconnect()
+  })
+
+  it('retries a retryable thread refresh failure and publishes the final idle snapshot', async () => {
+    const directory = await createUserData({})
+    let refreshCount = 0
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') {
+        refreshCount += 1
+        if (refreshCount === 1) {
+          throw new ControlError('transport.request_failed', 'The first snapshot request failed.', {
+            retryable: true,
+          })
+        }
+        return threadSnapshotAt({
+          cursorGeneration: 'daemon-1',
+          cursorSequence: 3,
+          status: 'idle',
+          updatedAt: '2026-08-05T12:00:03.000Z',
+        })
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const snapshots: Array<ReturnType<typeof threadSnapshotAt>> = []
+    service.on('snapshot', (snapshot) => snapshots.push(snapshot as ReturnType<typeof threadSnapshotAt>))
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'thread.changed',
+      payload: { threadId: 'thread-1', executionGenerationId: 'execution-1' },
+    })
+
+    await vi.waitFor(() => {
+      expect(refreshCount).toBe(2)
+      expect(snapshots).toHaveLength(1)
+      expect(snapshots[0]?.thread.status).toBe('idle')
+    }, { timeout: 2_000 })
+    expect(connection.terminatedWith).toBeUndefined()
+    await service.disconnect()
+  })
+
+  it('ignores a late thread-refresh response after disconnect', async () => {
+    const directory = await createUserData({})
+    const refresh = deferred<unknown>()
+    const refreshStarted = deferred<void>()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') {
+        refreshStarted.resolve()
+        return refresh.promise
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const snapshots: unknown[] = []
+    service.on('snapshot', (snapshot) => snapshots.push(snapshot))
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', {
+      type: 'thread.changed',
+      payload: { threadId: 'thread-1', executionGenerationId: 'execution-1' },
+    })
+    await refreshStarted.promise
+    await service.disconnect()
+    refresh.resolve(threadSnapshotAt({
+      cursorGeneration: 'daemon-1',
+      cursorSequence: 4,
+      status: 'idle',
+      updatedAt: '2026-08-05T12:00:04.000Z',
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    expect(snapshots).toEqual([])
+    expect((await service.bootstrap()).cache).not.toHaveProperty('lastSnapshot')
+  })
+
+  it('releases a superseded connection full thread-refresh budget before admitting the new authority', async () => {
+    const directory = await createUserData({})
+    const oldConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') return new Promise<never>(() => undefined)
+      throw new Error(`Unexpected old-connection request: ${method}`)
+    })
+    const newConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') {
+        return threadSnapshotAt({
+          cursorGeneration: 'daemon-new',
+          cursorSequence: 1,
+          status: 'idle',
+          updatedAt: '2026-08-05T12:00:05.000Z',
+        })
+      }
+      throw new Error(`Unexpected new-connection request: ${method}`)
+    })
+    connectLocalHostd
+      .mockResolvedValueOnce(oldConnection)
+      .mockResolvedValueOnce(newConnection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const snapshots: unknown[] = []
+    service.on('snapshot', (snapshot) => snapshots.push(snapshot))
+    await service.connect({ kind: 'local' })
+
+    for (let index = 0; index < 1_024; index += 1) {
+      oldConnection.emit('event', {
+        type: 'thread.changed',
+        payload: { threadId: `stale-thread-${index}`, executionGenerationId: 'execution-old' },
+      })
+    }
+
+    await expect(service.reconnect()).resolves.toMatchObject({ phase: 'online', hostId: 'host-a' })
+    newConnection.emit('event', {
+      type: 'thread.changed',
+      payload: { threadId: 'thread-1', executionGenerationId: 'execution-1' },
+    })
+
+    await vi.waitFor(() => {
+      expect(newConnection.requests.filter(({ method }) => method === 'thread.snapshot')).toHaveLength(1)
+      expect(snapshots).toHaveLength(1)
+    }, { timeout: 2_000 })
+    expect(newConnection.terminatedWith).toBeUndefined()
+    await service.disconnect()
+  })
+
+  it('retires replaced cursor generations monotonically and preserves the fence across restart', async () => {
+    const directory = await createUserData({})
+    const responses = [
+      threadSnapshotAt({
+        cursorGeneration: 'cursor-a',
+        cursorSequence: 100,
+        status: 'running',
+        updatedAt: '2026-08-05T12:00:01.000Z',
+      }),
+      threadSnapshotAt({
+        cursorGeneration: 'cursor-b',
+        cursorSequence: 0,
+        status: 'running',
+        updatedAt: '2026-08-05T12:00:02.000Z',
+      }),
+      threadSnapshotAt({
+        cursorGeneration: 'cursor-a',
+        cursorSequence: 101,
+        status: 'running',
+        updatedAt: '2026-08-05T12:00:03.000Z',
+      }),
+      threadSnapshotAt({
+        cursorGeneration: 'cursor-b',
+        cursorSequence: 1,
+        status: 'idle',
+        updatedAt: '2026-08-05T12:00:04.000Z',
+      }),
+    ]
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') {
+        const response = responses.shift()
+        if (!response) throw new Error('No thread snapshot response remains')
+        return response
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const afterRestart = threadSnapshotAt({
+      cursorGeneration: 'cursor-a',
+      cursorSequence: 102,
+      status: 'idle',
+      updatedAt: '2026-08-05T12:00:05.000Z',
+    })
+    const restartedConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'thread.snapshot') return afterRestart
+      throw new Error(`Unexpected restart request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(connection).mockResolvedValueOnce(restartedConnection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await service.requestSnapshot({ threadId: 'thread-1' })
+    await service.requestSnapshot({ threadId: 'thread-1' })
+    await service.requestSnapshot({ threadId: 'thread-1' })
+    let cached = (await service.bootstrap()).cache as { lastSnapshot?: ReturnType<typeof threadSnapshotAt> }
+    expect(cached.lastSnapshot?.latestCursor).toMatchObject({ generation: 'cursor-b', sequence: 0 })
+    await service.requestSnapshot({ threadId: 'thread-1' })
+    cached = (await service.bootstrap()).cache as { lastSnapshot?: ReturnType<typeof threadSnapshotAt> }
+    expect(cached.lastSnapshot?.latestCursor).toMatchObject({ generation: 'cursor-b', sequence: 1 })
+    await service.disconnect()
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    await restarted.bootstrap()
+    await restarted.reconnect()
+    await restarted.requestSnapshot({ threadId: 'thread-1' })
+    const restartedCache = (await restarted.bootstrap()).cache as {
+      lastSnapshot?: ReturnType<typeof threadSnapshotAt>
+    }
+    expect(restartedCache.lastSnapshot?.latestCursor).toMatchObject({ generation: 'cursor-b', sequence: 1 })
+    await restarted.disconnect()
+  })
+
+  it('removes a host-durable uncertain receipt from replay and restores its bootstrap history', async () => {
+    const directory = await createUserData({})
+    const command = followUp('device-a', 'durable-uncertain')
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') {
+        return {
+          ...commandReceipt(command),
+          status: 'uncertain',
+          message: 'The resident runtime accepted this identity, but its final outcome is unknown.',
+          error: {
+            code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+            message: 'Host restart interrupted resident delivery confirmation.',
+            retryable: false,
+            diagnosticId: 'diagnostic-resident-restart',
+            details: { operation: 'prompt', replayed: false },
+          },
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const restartedConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`A durable uncertain command must not replay through ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(connection).mockResolvedValueOnce(restartedConnection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await expect(service.submitCommand(command)).resolves.toMatchObject({
+      hostId: 'host-a',
+      commandId: command.commandId,
+      status: 'uncertain',
+      durable: true,
+      error: expect.objectContaining({
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        retryable: false,
+        diagnosticId: 'diagnostic-resident-restart',
+      }),
+    })
+    expect(await readStoredOutbox(directory)).toEqual([])
+    expect((await service.bootstrap()).durableUncertainReceipts).toEqual([
+      expect.objectContaining({
+        commandId: command.commandId,
+        status: 'uncertain',
+        durable: true,
+        error: expect.objectContaining({ code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN', retryable: false }),
+      }),
+    ])
+    await service.disconnect()
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    const offlineBootstrap = await restarted.bootstrap()
+    expect(offlineBootstrap.outbox).toEqual([])
+    expect(offlineBootstrap.durableUncertainReceipts).toEqual([
+      expect.objectContaining({
+        commandId: command.commandId,
+        status: 'uncertain',
+        durable: true,
+        error: expect.objectContaining({ code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN', retryable: false }),
+      }),
+    ])
+    await restarted.reconnect()
+    const onlineBootstrap = await restarted.bootstrap()
+    expect(onlineBootstrap.outbox).toEqual([])
+    expect(onlineBootstrap.durableUncertainReceipts).toEqual([
+      expect.objectContaining({
+        commandId: command.commandId,
+        status: 'uncertain',
+        durable: true,
+        error: expect.objectContaining({ code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN', retryable: false }),
+      }),
+    ])
+    expect(restartedConnection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    await restarted.disconnect()
+  })
+
+  it('retains a host-durable uncertain Stop and its exact diagnostic until completed proof', async () => {
+    const directory = await createUserData({})
+    const command = abortCommand('device-a', 'durable-uncertain-stop')
+    const uncertainReceipt = {
+      ...commandReceipt(command, 'uncertain'),
+      message: 'The Stop outcome is unknown and will not be replayed.',
+      error: {
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        message: 'Host restart interrupted Stop confirmation.',
+        retryable: false,
+        diagnosticId: 'diagnostic-uncertain-stop',
+      },
+    }
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.submit') return uncertainReceipt
+      throw new Error(`Unexpected first-session request: ${method}`)
+    })
+    const restartedConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') return { receipts: [uncertainReceipt], unknown: [] }
+      throw new Error(`An uncertain Stop must never replay through ${method}`)
+    })
+    const proofConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        return { receipts: [commandReceipt(command, 'completed')], unknown: [] }
+      }
+      throw new Error(`Completed Stop proof must never replay through ${method}`)
+    })
+    connectLocalHostd
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(restartedConnection)
+      .mockResolvedValueOnce(proofConnection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+
+    await expect(service.submitCommand(command)).resolves.toMatchObject({
+      status: 'uncertain',
+      durable: true,
+      error: expect.objectContaining({ retryable: false }),
+    })
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ command, state: 'uncertain' }),
+    ])
+    expect((await service.bootstrap()).durableUncertainReceipts).toEqual([
+      expect.objectContaining({
+        hostId: 'host-a',
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
+        error: expect.objectContaining({
+          code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+          retryable: false,
+          diagnosticId: 'diagnostic-uncertain-stop',
+        }),
+      }),
+    ])
+    await service.disconnect()
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    await expect(restarted.bootstrap()).resolves.toMatchObject({
+      outbox: [expect.objectContaining({ command, state: 'uncertain' })],
+      durableUncertainReceipts: [expect.objectContaining({
+        commandId: command.commandId,
+        error: expect.objectContaining({ diagnosticId: 'diagnostic-uncertain-stop' }),
+      })],
+    })
+    await restarted.reconnect()
+    await expect(restarted.bootstrap()).resolves.toMatchObject({
+      outbox: [expect.objectContaining({ command, state: 'uncertain' })],
+      durableUncertainReceipts: [expect.objectContaining({
+        commandId: command.commandId,
+        error: expect.objectContaining({ diagnosticId: 'diagnostic-uncertain-stop' }),
+      })],
+    })
+    await expect(restarted.submitCommand(command)).rejects.toMatchObject({
+      code: 'command.awaiting_reconciliation',
+      retryable: false,
+    })
+    expect(restartedConnection.requests.filter(({ method }) => method === 'command.submit')).toEqual([])
+    const events: Array<{ type: string; payload: unknown }> = []
+    restarted.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
+    await restarted.reconnect()
+    await expect(restarted.bootstrap()).resolves.toMatchObject({
+      outbox: [],
+      durableUncertainReceipts: [],
+    })
+    expect(events).toContainEqual({
+      type: 'resident.abort_idle_observed',
+      payload: expect.objectContaining({
+        hostId: 'host-a',
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        status: 'completed',
+      }),
+    })
+    expect(proofConnection.requests.filter(({ method }) => method === 'command.submit')).toEqual([])
+    await restarted.disconnect()
+  })
+
   it('adapts model selection, approval, and cancellation with one stable issue time and exact generation', async () => {
     const directory = await createUserData({})
     const submitted: Array<Record<string, unknown>> = []
@@ -1477,7 +2297,35 @@ function followUp(deviceId: string, commandId: string, expectedHostId = 'host-a'
   }
 }
 
-function commandReceipt(command: ClientCommand, status: 'received' | 'admitted' | 'rejected' = 'received') {
+function prompt(deviceId: string, commandId: string, expectedHostId = 'host-a'): ClientCommand {
+  return {
+    ...followUp(deviceId, commandId, expectedHostId),
+    kind: 'thread.prompt',
+    delivery: 'live_only',
+    payload: { text: 'Run the resident task' },
+  }
+}
+
+function abortCommand(deviceId: string, commandId: string, expectedHostId = 'host-a'): ClientCommand {
+  return {
+    ...followUp(deviceId, commandId, expectedHostId),
+    kind: 'thread.cancel',
+    delivery: 'live_only',
+    payload: undefined,
+  }
+}
+
+function residentAttemptId(command: ClientCommand): string {
+  return `resident-dispatch-${createHash('sha256')
+    .update(JSON.stringify([command.deviceId, command.commandId]))
+    .digest('hex')
+    .slice(0, 48)}`
+}
+
+function commandReceipt(
+  command: ClientCommand,
+  status: 'received' | 'admitted' | 'running' | 'completed' | 'rejected' | 'uncertain' = 'completed',
+) {
   return {
     protocolVersion: 1,
     receiptId: `receipt-${command.deviceId}-${command.commandId}`,
@@ -1498,7 +2346,7 @@ function receiptForEnvelope(envelope: Record<string, unknown>) {
     deviceId: envelope.deviceId,
     commandId: envelope.commandId,
     threadId: envelope.threadId,
-    status: 'received',
+    status: 'completed',
     receivedAt: timestamp,
     updatedAt: timestamp,
     executionGenerationId: envelope.expectedExecutionGenerationId,
@@ -1624,6 +2472,31 @@ function threadSnapshot(threadId: string, hostId: string) {
     evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
     pendingAttention: [],
     latestCursor: cursor
+  }
+}
+
+function threadSnapshotAt(input: {
+  cursorGeneration: string
+  cursorSequence: number
+  status: 'idle' | 'running'
+  updatedAt: string
+}) {
+  const snapshot = threadSnapshot('thread-1', 'host-a')
+  const cursor = {
+    ...snapshot.latestCursor,
+    generation: input.cursorGeneration,
+    sequence: input.cursorSequence,
+  }
+  return {
+    ...snapshot,
+    generatedAt: input.updatedAt,
+    thread: {
+      ...snapshot.thread,
+      status: input.status,
+      updatedAt: input.updatedAt,
+      lastKnownCursor: cursor,
+    },
+    latestCursor: cursor,
   }
 }
 

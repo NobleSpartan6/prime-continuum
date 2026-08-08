@@ -53,6 +53,15 @@ export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 
+/** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
+export const ThreadChangedEventPayloadSchema = z
+  .object({
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+  })
+  .strict();
+export type ThreadChangedEventPayload = z.infer<typeof ThreadChangedEventPayloadSchema>;
+
 export const IsoDateTimeSchema = z
   .string()
   .min(20)
@@ -945,6 +954,44 @@ export const CommandReceiptSchema = z.object({
   error: StructuredErrorSchema.optional(),
 });
 export type CommandReceipt = z.infer<typeof CommandReceiptSchema>;
+
+/** Public, bounded post-commit signal for one proof-completed resident prompt. */
+export const ResidentPromptIdleObservedSignalSchema = z
+  .object({
+    eventVersion: z.literal(1),
+    attemptId: IdSchema,
+    receipt: CommandReceiptSchema,
+  })
+  .strict()
+  .superRefine((signal, context) => {
+    if (signal.receipt.status !== "completed") {
+      context.addIssue({
+        code: "custom",
+        path: ["receipt", "status"],
+        message: "A resident prompt idle-observed signal requires its exact completed receipt",
+      });
+    }
+  });
+export type ResidentPromptIdleObservedSignal = z.infer<typeof ResidentPromptIdleObservedSignalSchema>;
+
+/** Public, bounded post-commit signal for one proof-completed resident stop. */
+export const ResidentAbortIdleObservedSignalSchema = z
+  .object({
+    eventVersion: z.literal(1),
+    attemptId: IdSchema,
+    receipt: CommandReceiptSchema,
+  })
+  .strict()
+  .superRefine((signal, context) => {
+    if (signal.receipt.status !== "completed") {
+      context.addIssue({
+        code: "custom",
+        path: ["receipt", "status"],
+        message: "A resident abort idle-observed signal requires its exact completed receipt",
+      });
+    }
+  });
+export type ResidentAbortIdleObservedSignal = z.infer<typeof ResidentAbortIdleObservedSignalSchema>;
 
 export const BranchPlanSchema = z.object({
   sourceBranch: z.string().max(255).optional(),

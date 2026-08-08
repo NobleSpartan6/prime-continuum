@@ -33,28 +33,100 @@ describe('browser preview evidence labels', () => {
     expect(toolReceipt?.receipt).toMatch(/^preview_simulation_/)
     expect(snapshot.composerReceipt.message).toMatch(/^Preview simulation ·/)
 
-    const liveOnly = api.sendComposer({
+    const firstPrompt = api.sendComposer({
       threadId: snapshot.selectedThreadId,
       text: 'Run a preview command',
-      intent: 'follow_up',
-      sendWhenReconnected: false,
     })
     await vi.advanceTimersByTimeAsync(240)
 
-    const queued = api.sendComposer({
+    const secondPrompt = api.sendComposer({
       threadId: snapshot.selectedThreadId,
-      text: 'Queue a preview command',
-      intent: 'follow_up',
-      sendWhenReconnected: true,
+      text: 'Run another preview command',
     })
     await vi.advanceTimersByTimeAsync(240)
 
-    const messages = [(await liveOnly).message, (await queued).message]
+    const messages = [(await firstPrompt).message, (await secondPrompt).message]
     expect(messages).toEqual([
-      `${previewPrefix} command not sent to a host`,
-      `${previewPrefix} command saved only in the in-memory preview outbox`,
+      `${previewPrefix} prompt not sent to a host`,
+      `${previewPrefix} prompt not sent to a host`,
     ])
     expect(messages.join(' ')).not.toMatch(/durably admitted by host|host receipt/i)
+  })
+
+  it('materializes coherent resident visual states without mutating the default reconnect fixture', async () => {
+    const cases = [
+      {
+        visualState: 'idle' as const,
+        threadState: 'idle',
+        receiptState: 'idle',
+        operation: undefined,
+        message: 'Ready for a new prompt',
+        canStart: true,
+        canStop: false,
+      },
+      {
+        visualState: 'prompt-admission' as const,
+        threadState: 'idle',
+        receiptState: 'sending',
+        operation: 'prompt',
+        message: 'Host received the prompt · awaiting durable admission',
+        canStart: true,
+        canStop: false,
+      },
+      {
+        visualState: 'prompt-awaiting-idle-proof' as const,
+        threadState: 'running',
+        receiptState: 'sent',
+        operation: 'prompt',
+        message: 'Prime Agent owns this prompt · waiting for authoritative idle proof',
+        canStart: false,
+        canStop: true,
+      },
+      {
+        visualState: 'stop-awaiting-idle-proof' as const,
+        threadState: 'idle',
+        receiptState: 'sent',
+        operation: 'abort',
+        message: 'Stop accepted · waiting for authoritative idle proof',
+        canStart: false,
+        canStop: false,
+      },
+      {
+        visualState: 'nonretryable-uncertainty' as const,
+        threadState: 'idle',
+        receiptState: 'uncertain',
+        operation: 'abort',
+        message: 'Outcome unknown · recovery required; this Stop will not be replayed',
+        canStart: false,
+        canStop: false,
+      },
+    ]
+
+    for (const expected of cases) {
+      const request = createPreviewRendererApi(expected.visualState).loadWorkbench()
+      await vi.advanceTimersByTimeAsync(120)
+      const snapshot = await request
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+
+      expect(host?.connection, expected.visualState).toBe('online')
+      expect(thread?.status, expected.visualState).toBe(expected.threadState)
+      expect(snapshot.composerReceipt, expected.visualState).toMatchObject({
+        state: expected.receiptState,
+        message: expected.message,
+        ...(expected.operation ? { operation: expected.operation } : {}),
+      })
+      expect(snapshot.operations.startResidentTurn, expected.visualState).toBe(expected.canStart)
+      expect(snapshot.operations.stopResidentTurn, expected.visualState).toBe(expected.canStop)
+    }
+
+    const reconnectRequest = createPreviewRendererApi().loadWorkbench()
+    await vi.advanceTimersByTimeAsync(120)
+    const reconnectSnapshot = await reconnectRequest
+    const reconnectThread = reconnectSnapshot.threads.find((thread) => thread.id === reconnectSnapshot.selectedThreadId)
+    const reconnectHost = reconnectSnapshot.hosts.find((host) => host.id === reconnectThread?.hostId)
+    expect(reconnectHost?.connection).toBe('reconnecting')
+    expect(reconnectSnapshot.composerReceipt.message).toBe(`${previewPrefix} waiting for a sample connection`)
   })
 
   it('labels the handoff plan, progress, checkpoint, and receipt as a simulation', async () => {

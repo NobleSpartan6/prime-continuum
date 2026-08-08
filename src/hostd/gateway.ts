@@ -1,7 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
-import type { CommandEnvelope } from "../shared/protocol";
+import { CommandEnvelopeSchema, type CommandEnvelope } from "../shared/protocol";
 import type { ResidentSessionBinding } from "./resident-runtime";
+import type {
+  ResidentAbortIdleObservedEvent,
+  ResidentAbortReconciliationLease,
+  ResidentDispatchLease,
+  ResidentPromptIdleObservedEvent,
+  ResidentPromptReconciliationLease,
+} from "./store";
 
 export const PRIME_RPC_MAX_COMMAND_BYTES = 128 * 1024;
 export const PRIME_RPC_MAX_PENDING_REQUESTS = 256;
@@ -36,6 +44,12 @@ export interface PrimeAgentGatewayEvent {
  */
 export interface GatewayDispatchContext {
   readonly residentBinding?: ResidentSessionBinding;
+  readonly residentDispatch?: ResidentDispatchLease;
+}
+
+export interface PrimeAgentProjectionChange {
+  readonly threadId: string;
+  readonly executionGenerationId: string;
 }
 
 /**
@@ -46,6 +60,22 @@ export interface GatewayDispatchContext {
 export interface PrimeAgentGateway {
   /** Only durable resident adapters may be installed in HostService. */
   readonly continuity: "resident" | "unavailable";
+  /** Optional nonblocking capability gate for production resident composition. */
+  capabilityReady?(): Promise<boolean>;
+  /** Tiny post-commit notification; consumers fetch the authoritative snapshot. */
+  subscribeProjectionChanges?(listener: (change: PrimeAgentProjectionChange) => void): () => void;
+  /** Dedicated post-commit signal for one proof-completed resident prompt. */
+  subscribeResidentPromptIdleObserved?(
+    listener: (event: ResidentPromptIdleObservedEvent) => void,
+  ): () => void;
+  /** Dedicated post-commit signal for one proof-completed resident Stop. */
+  subscribeResidentAbortIdleObserved?(
+    listener: (event: ResidentAbortIdleObservedEvent) => void,
+  ): () => void;
+  /** Schedule the read-only same-connection idle barrier without delaying the prompt receipt. */
+  scheduleResidentPromptReconciliation?(lease: ResidentPromptReconciliationLease): void;
+  /** Schedule the read-only same-connection idle barrier after an acknowledged Stop. */
+  scheduleResidentAbortReconciliation?(lease: ResidentAbortReconciliationLease): void;
   isLive(threadId: string, executionGenerationId: string): Promise<boolean>;
   submit(command: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission>;
   close(): Promise<void>;
@@ -85,6 +115,24 @@ export class GatewayError extends Error {
     this.retryable = retryable;
     this.uncertain = uncertain;
   }
+}
+
+/** SHA-256 over the strict, key-sorted v2 envelope used by private leases. */
+export function residentCommandEnvelopeFingerprint(value: CommandEnvelope): string {
+  const command = CommandEnvelopeSchema.parse(value);
+  return createHash("sha256")
+    .update(JSON.stringify(sortGatewayJsonValue(command)))
+    .digest("hex");
+}
+
+function sortGatewayJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortGatewayJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => [key, sortGatewayJsonValue((value as Record<string, unknown>)[key])]),
+  );
 }
 
 export type PrimeRpcRequest =

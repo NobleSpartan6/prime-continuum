@@ -263,7 +263,7 @@ describe('DesktopControlService runtime readiness', () => {
         }
       }
       if (method === 'command.submit') {
-        return commandReceipt(queued)
+        return { ...commandReceipt(queued), status: 'completed' }
       }
       throw new Error(`Unexpected request: ${method}`)
     })

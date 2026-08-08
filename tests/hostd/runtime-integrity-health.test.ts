@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,10 @@ import {
   type RuntimeIntegrityReadinessProvider,
 } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
+import {
+  PINNED_PRIME_AGENT_RUNTIME,
+  REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
+} from "../../src/hostd/resident-runtime";
 import {
   HealthSnapshotSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
@@ -222,7 +226,13 @@ describe("HostService runtime integrity readiness", () => {
     expect(response).toMatchObject({ status: "running" });
     expect(gateway.isLive).toHaveBeenCalledOnce();
     expect(gateway.submit).toHaveBeenCalledOnce();
-    expect(gateway.submit).toHaveBeenCalledWith(command);
+    expect(gateway.submit).toHaveBeenCalledWith(command, {
+      residentDispatch: expect.objectContaining({
+        leaseVersion: 1,
+        command,
+        binding: expect.objectContaining({ threadId: command.threadId }),
+      }),
+    });
     await service.close();
   });
 
@@ -325,6 +335,37 @@ async function temporaryService(
   const store = new HostStore(directory);
   const service = new HostService(store, gateway, undefined, { runtimeIntegrityProvider });
   await service.initialize({ seed: true });
+  if (gateway?.continuity === "resident") {
+    const workspacePath = join(directory, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+    const workspaceDirectory = await realpath(workspacePath);
+    await store.registerWorkspaceAuthority({
+      threadId: "demo-thread",
+      executionGenerationId: "demo-execution-1",
+      workspaceDirectory,
+    });
+    await store.persistResidentSessionBinding({
+      bindingVersion: 1,
+      lifecycle: "resident",
+      threadId: "demo-thread",
+      executionGenerationId: "demo-execution-1",
+      workspaceDirectory,
+      activeSessionId: "runtime-health-active-session",
+      sessionId: "runtime-health-session",
+      sessionFile: join(workspaceDirectory, "runtime-health-session.jsonl"),
+      boundAt: "2026-08-06T00:00:01.500Z",
+      runtime: {
+        releaseVersion: PINNED_PRIME_AGENT_RUNTIME.releaseVersion,
+        appVersion: PINNED_PRIME_AGENT_RUNTIME.expectedAppVersion,
+        protocolName: PINNED_PRIME_AGENT_RUNTIME.daemon.protocolName,
+        protocolVersion: PINNED_PRIME_AGENT_RUNTIME.daemon.protocolVersion,
+        schemaRevision: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaRevision,
+        schemaId: PINNED_PRIME_AGENT_RUNTIME.daemon.schemaId,
+        capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES],
+        runtimeBuildId: PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId,
+      },
+    });
+  }
   return { service, store };
 }
 

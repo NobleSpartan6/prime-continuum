@@ -8,6 +8,7 @@ import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
 import { RuntimeInitializationCoordinator } from "./runtime-initialization-coordinator";
 import { VerifiedRuntimeModelCatalog } from "./runtime-model-catalog";
 import { VerifiedRuntimeOAuthComposition } from "./runtime-oauth";
+import { VerifiedResidentGateway } from "./verified-resident-gateway";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
 import { HostService } from "./service";
 import { HostStore } from "./store";
@@ -23,6 +24,7 @@ export * from "./runtime-initialization-coordinator";
 export * from "./runtime-integrity-manager";
 export * from "./runtime-model-catalog";
 export * from "./runtime-oauth";
+export * from "./verified-resident-gateway";
 export * from "./server";
 export * from "./service";
 export * from "./store";
@@ -116,9 +118,16 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
     const runtimeOAuthComposition = runtimeInitialization && plaintextRuntimeOAuthDevelopmentEnabled(process.env)
       ? new VerifiedRuntimeOAuthComposition({ runtimeHandles: runtimeInitialization })
       : undefined;
+    const residentGateway = runtimeInitialization
+      ? new VerifiedResidentGateway({
+          store,
+          runtimeHandles: runtimeInitialization,
+          environment: process.env,
+        })
+      : undefined;
     const service = new HostService(
       store,
-      undefined,
+      residentGateway,
       new PairingAuthority(store.paths.pairingAuthority, {
         onChannelCloseFailure: reportChannelCloseFailure,
       }),

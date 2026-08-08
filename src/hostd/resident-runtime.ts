@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { isAbsolute, resolve as resolvePath } from "node:path";
+import type { ResidentProjectionSnapshot } from "./resident-projection";
 
 const PRIME_AGENT_RELEASE_BASE_URL = "https://github.com/PrimeIntellect-ai/prime-agent/releases/download";
 
@@ -75,6 +76,17 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_BINDING_INVALID"
   | "PRIME_RUNTIME_BINDING_PERSIST_FAILED"
   | "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED"
+  | "PRIME_RUNTIME_PROMPT_RECONCILIATION_INVALID"
+  | "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED"
+  | "PRIME_RUNTIME_ABORT_RECONCILIATION_INVALID"
+  | "PRIME_RUNTIME_ABORT_RECONCILIATION_AUTHORITY_CHANGED"
+  | "PRIME_RUNTIME_ABORT_IDLE_NOT_OBSERVED"
+  | "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED"
+  | "PRIME_RUNTIME_DISPATCH_LEASE_INVALID"
+  | "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED"
+  | "PRIME_RUNTIME_DISPATCH_RETIRED"
+  | "COMMAND_ID_REUSED"
+  | "PRIME_RUNTIME_DISPATCH_IDENTITY_LIMIT"
   | "PRIME_RUNTIME_ADAPTER_CLOSED"
   | "PRIME_RUNTIME_TERMINAL_ACTION_CONFLICT";
 
@@ -500,6 +512,178 @@ export function validateResidentSessionBinding(value: unknown): ResidentSessionB
   });
 }
 
+export type ResidentDispatchOperation = "prompt" | "abort";
+
+/**
+ * Ephemeral capability minted only after hostd has durably moved a resident
+ * dispatch attempt to its non-replayable dispatching state. Carrying the full
+ * binding makes the capability generation- and session-specific; the adapter
+ * never infers authority from its currently attached connection.
+ */
+export interface ResidentGenerationDispatchLease {
+  readonly leaseVersion: 1;
+  readonly dispatchAttemptId: string;
+  /** SHA-256 of the schema-normalized full host command envelope. */
+  readonly commandFingerprint: string;
+  readonly operation: ResidentDispatchOperation;
+  readonly binding: ResidentSessionBinding;
+}
+
+const ResidentGenerationDispatchLeaseSchema = z
+  .object({
+    leaseVersion: z.literal(1),
+    dispatchAttemptId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+    commandFingerprint: z.string().regex(/^[A-Fa-f0-9]{64}$/),
+    operation: z.enum(["prompt", "abort"]),
+    binding: ResidentSessionBindingSchema,
+  })
+  .strict();
+
+/** Validate and deeply freeze the private host-to-adapter dispatch capability. */
+export function validateResidentGenerationDispatchLease(value: unknown): ResidentGenerationDispatchLease {
+  const parsed = ResidentGenerationDispatchLeaseSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join(".") || "lease"}: ${issue.message}`)
+      .join("; ")
+      .slice(0, 2_048);
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+      "The durable resident dispatch lease is invalid.",
+      { details: { issues } },
+    );
+  }
+  return Object.freeze({
+    leaseVersion: 1,
+    dispatchAttemptId: parsed.data.dispatchAttemptId,
+    commandFingerprint: parsed.data.commandFingerprint.toLowerCase(),
+    operation: parsed.data.operation,
+    binding: validateResidentSessionBinding(parsed.data.binding),
+  });
+}
+
+/**
+ * A resolved mutation reports only upstream ownership of the request. Agent
+ * turn completion and abort completion are observed later through projections.
+ */
+export type ResidentDispatchResult =
+  | Readonly<{
+      operation: ResidentDispatchOperation;
+      disposition: "accepted";
+      completion: "not_observed";
+    }>
+  | Readonly<{
+      operation: "abort";
+      disposition: "not_needed";
+      completion: "not_observed";
+      reason: "prompt_admission_cancelled";
+    }>;
+
+/**
+ * Exact, read-only request passed only after HostStore validates its opaque
+ * acknowledged-prompt reconciliation lease. This structural form never grants
+ * durable authority by itself; the resident adapter's public entry point owns
+ * that capability check.
+ */
+export interface ResidentPromptIdleReconciliationRequest {
+  readonly reconciliationVersion: 1;
+  readonly dispatchAttemptId: string;
+  readonly binding: ResidentSessionBinding;
+}
+
+/**
+ * Same-connection evidence that Prime Agent crossed its public idle barrier and
+ * that the resulting exact-binding idle projection was durably published.
+ */
+export interface ResidentPromptIdleAuthorityEvidence {
+  readonly evidenceVersion: 1;
+  readonly dispatchAttemptId: string;
+  readonly binding: ResidentSessionBinding;
+  readonly projection: ResidentProjectionSnapshot;
+}
+
+/**
+ * Exact, read-only request for reconciling one already-acknowledged resident
+ * Stop. It never grants mutation authority and is valid only on the same
+ * attached Prime connection that accepted the abort.
+ */
+export interface ResidentAbortIdleReconciliationRequest {
+  readonly reconciliationVersion: 1;
+  readonly dispatchAttemptId: string;
+  readonly binding: ResidentSessionBinding;
+}
+
+/** Same-connection evidence that an acknowledged Stop reached authoritative idle. */
+export interface ResidentAbortIdleAuthorityEvidence {
+  readonly evidenceVersion: 1;
+  readonly dispatchAttemptId: string;
+  readonly binding: ResidentSessionBinding;
+  readonly projection: ResidentProjectionSnapshot;
+}
+
+const ResidentPromptIdleReconciliationRequestSchema = z
+  .object({
+    reconciliationVersion: z.literal(1),
+    dispatchAttemptId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+    binding: ResidentSessionBindingSchema,
+  })
+  .strict();
+
+const ResidentAbortIdleReconciliationRequestSchema = z
+  .object({
+    reconciliationVersion: z.literal(1),
+    dispatchAttemptId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+    binding: ResidentSessionBindingSchema,
+  })
+  .strict();
+
+export function validateResidentPromptIdleReconciliationRequest(
+  value: unknown,
+): ResidentPromptIdleReconciliationRequest {
+  const parsed = ResidentPromptIdleReconciliationRequestSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join(".") || "request"}: ${issue.message}`)
+      .join("; ")
+      .slice(0, 2_048);
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROMPT_RECONCILIATION_INVALID",
+      "The acknowledged resident prompt idle-reconciliation request is invalid.",
+      { details: { issues } },
+    );
+  }
+  return Object.freeze({
+    reconciliationVersion: 1,
+    dispatchAttemptId: parsed.data.dispatchAttemptId,
+    binding: validateResidentSessionBinding(parsed.data.binding),
+  });
+}
+
+export function validateResidentAbortIdleReconciliationRequest(
+  value: unknown,
+): ResidentAbortIdleReconciliationRequest {
+  const parsed = ResidentAbortIdleReconciliationRequestSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join(".") || "request"}: ${issue.message}`)
+      .join("; ")
+      .slice(0, 2_048);
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_ABORT_RECONCILIATION_INVALID",
+      "The acknowledged resident Stop idle-reconciliation request is invalid.",
+      { details: { issues } },
+    );
+  }
+  return Object.freeze({
+    reconciliationVersion: 1,
+    dispatchAttemptId: parsed.data.dispatchAttemptId,
+    binding: validateResidentSessionBinding(parsed.data.binding),
+  });
+}
+
 export type ResidentRuntimeLifecycleState =
   | "idle"
   | "starting_daemon"
@@ -526,6 +710,21 @@ export interface ResidentRuntimeConnection {
   readonly binding: ResidentSessionBinding;
   getLifecycle(): ResidentRuntimeLifecycleSnapshot;
   subscribeLifecycle(listener: ResidentRuntimeLifecycleListener): () => void;
+  /** Resolve when Prime Agent owns the prompt, never when the turn completes. */
+  prompt(message: string, lease: ResidentGenerationDispatchLease): Promise<ResidentDispatchResult>;
+  /** Resolve when Prime Agent accepts the abort request, never when the turn has stopped. */
+  abort(lease: ResidentGenerationDispatchLease): Promise<ResidentDispatchResult>;
+  /**
+   * Cross Prime Agent's public idle barrier and publish a fresh exact-binding
+   * idle projection. The adapter admits this only from a Store-branded lease.
+   */
+  reconcileAcknowledgedPromptIdle(
+    request: ResidentPromptIdleReconciliationRequest,
+  ): Promise<ResidentPromptIdleAuthorityEvidence>;
+  /** Cross the same public idle barrier after one acknowledged Stop. */
+  reconcileAcknowledgedAbortIdle(
+    request: ResidentAbortIdleReconciliationRequest,
+  ): Promise<ResidentAbortIdleAuthorityEvidence>;
   /** Detach the client-side connection without stopping the resident worker. */
   detach(): Promise<void>;
   /** Stop the resident worker only after an explicit user-facing end action. */

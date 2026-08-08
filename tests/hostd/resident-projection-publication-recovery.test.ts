@@ -13,9 +13,16 @@ import {
   type HostStoreOptions,
   type ResidentProjectionFaultPoint,
 } from "../../src/hostd/store";
+import { PROTOCOL_VERSION, type CommandEnvelope } from "../../src/shared/protocol";
 
 const temporaryDirectories: string[] = [];
-const faultPoints: ResidentProjectionFaultPoint[] = ["after_prepare", "after_snapshot", "after_threads"];
+const faultPoints: ResidentProjectionFaultPoint[] = [
+  "after_prepare",
+  "after_lineage",
+  "after_snapshot",
+  "after_threads",
+  "after_prompt_locks",
+];
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -50,7 +57,7 @@ describe("resident projection publication recovery", () => {
     const transaction = await readPendingProjectionTransaction(crashing);
     const onDiskSnapshot = await readSnapshot(crashing, "demo-thread");
     const onDiskCatalogThread = await readCatalogThread(crashing, "demo-thread");
-    if (faultPoint === "after_prepare") {
+    if (faultPoint === "after_prepare" || faultPoint === "after_lineage") {
       expect(onDiskSnapshot).toEqual(baselineSnapshot);
       expect(onDiskCatalogThread).toEqual(baselineCatalogThread);
     } else if (faultPoint === "after_snapshot") {
@@ -137,6 +144,130 @@ describe("resident projection publication recovery", () => {
     expect(await readSnapshot(restarted, "demo-thread")).toEqual(baselineSnapshot);
     expect(await readdir(restarted.paths.residentProjectionTransactions)).toHaveLength(1);
   });
+
+  it("rejects cursor regression and equal-cursor conflicts, while exact equal publication is a no-op", async () => {
+    const fixture = await createFixture();
+    const input = projection(fixture.binding, 10, "Stable cursor content.", "resident-lineage-a");
+    const first = await fixture.bootstrap.publishResidentProjectionSnapshot(fixture.binding, input);
+    const duplicate = await fixture.bootstrap.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, 10, "Stable cursor content.", "resident-lineage-a"),
+    );
+    expect(duplicate).toEqual(first);
+    await expect(
+      fixture.bootstrap.publishResidentProjectionSnapshot(
+        fixture.binding,
+        projection(fixture.binding, 10, "Conflicting content.", "resident-lineage-a"),
+      ),
+    ).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_CURSOR_CONFLICT" });
+    await expect(
+      fixture.bootstrap.publishResidentProjectionSnapshot(
+        fixture.binding,
+        projection(fixture.binding, 9, "Regressed content.", "resident-lineage-a"),
+      ),
+    ).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_CURSOR_REGRESSION" });
+    expect((await readdir(fixture.bootstrap.paths.residentProjectionLineages)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+  });
+
+  it("retires old daemon generations durably across restart and survives a supervisor refresh", async () => {
+    const fixture = await createFixture();
+    await fixture.bootstrap.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, 11, "Generation A.", "resident-lineage-a"),
+    );
+    const refreshed: ResidentSessionBinding = {
+      ...fixture.binding,
+      runtime: {
+        ...fixture.binding.runtime,
+        capabilities: [...fixture.binding.runtime.capabilities].reverse(),
+        supervisorGeneration: "refreshed-supervisor",
+      },
+    };
+    await fixture.bootstrap.persistResidentSessionBinding(refreshed);
+    await fixture.bootstrap.publishResidentProjectionSnapshot(
+      refreshed,
+      projection(refreshed, 0, "Generation B.", "resident-lineage-b"),
+    );
+    expect((await readdir(fixture.bootstrap.paths.residentProjectionLineages)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+
+    const restarted = new HostStore(fixture.directory);
+    await restarted.initialize();
+    await expect(
+      restarted.publishResidentProjectionSnapshot(
+        refreshed,
+        projection(refreshed, 12, "Delayed generation A.", "resident-lineage-a"),
+      ),
+    ).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_GENERATION_RETIRED" });
+  });
+
+  it("fails closed when the bounded retired-generation set is full", async () => {
+    const fixture = await createFixture();
+    await fixture.bootstrap.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, 0, "Generation 0.", "bounded-generation-0"),
+    );
+    for (let index = 1; index <= 64; index += 1) {
+      await fixture.bootstrap.publishResidentProjectionSnapshot(
+        fixture.binding,
+        projection(fixture.binding, 0, `Generation ${index}.`, `bounded-generation-${index}`),
+      );
+    }
+    await expect(
+      fixture.bootstrap.publishResidentProjectionSnapshot(
+        fixture.binding,
+        projection(fixture.binding, 0, "Generation 65.", "bounded-generation-65"),
+      ),
+    ).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_RETIREMENT_LIMIT" });
+  });
+
+  it("clears speculative host queue state and derives task status only from authoritative resident activity", async () => {
+    const fixture = await createFixture();
+    const host = await fixture.bootstrap.getHost();
+    const queued = promptCommand(host.hostId, "offline-speculative-prompt");
+    expect((await fixture.bootstrap.admitCommand(queued, false)).receipt.status).toBe("admitted");
+    const speculative = await fixture.bootstrap.getThreadSnapshot("demo-thread");
+    expect(speculative.thread.status).toBe("waiting");
+    expect(speculative.queueState.pendingCommandIds).toEqual([queued.commandId]);
+
+    const idle = await fixture.bootstrap.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, 20, "Authoritative idle.", "resident-status", false),
+    );
+    expect(idle.thread.status).toBe("idle");
+    expect(idle.queueState).toEqual({ pendingCommandIds: [], paused: false });
+
+    const active = await fixture.bootstrap.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, 21, "Authoritative active.", "resident-status", true),
+    );
+    expect(active.thread.status).toBe("running");
+    expect(active.queueState).toEqual({ pendingCommandIds: [], paused: false });
+
+    const queueOnlyBase = projection(
+      fixture.binding,
+      22,
+      "Authoritative active queue.",
+      "resident-status",
+      false,
+    );
+    const queueOnly: ResidentProjectionSnapshot = {
+      ...queueOnlyBase,
+      queue: {
+        ...queueOnlyBase.queue,
+        active: { kind: "turn", phase: "running", label: "Resident turn" },
+      },
+    };
+    const queuedActive = await fixture.bootstrap.publishResidentProjectionSnapshot(fixture.binding, queueOnly);
+    expect(queuedActive.runtime).toMatchObject({
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    });
+    expect(queuedActive.thread.status).toBe("running");
+    expect((await fixture.bootstrap.admitCommand(promptCommand(host.hostId, "queue-active-prompt"), true)).receipt)
+      .toMatchObject({ status: "rejected", error: { code: "RESIDENT_SESSION_BUSY" } });
+  });
 });
 
 async function createFixture(options: HostStoreOptions = {}): Promise<{
@@ -185,6 +316,8 @@ function projection(
   binding: ResidentSessionBinding,
   sequence: number,
   recap?: string,
+  generation = "resident-event-generation-1",
+  active = false,
 ): ResidentProjectionSnapshot {
   return {
     projectionVersion: 1,
@@ -194,14 +327,14 @@ function projection(
       sessionFile: binding.sessionFile,
       workspaceDirectory: binding.workspaceDirectory,
     },
-    cursor: { generation: "resident-event-generation-1", sequence },
+    cursor: { generation, sequence },
     runtime: {
       runtime: "prime_agent",
       residency: "resident",
       appVersion: binding.runtime.appVersion,
       activeSessionId: binding.activeSessionId,
       sessionId: binding.sessionId,
-      isStreaming: false,
+      isStreaming: active,
       isCompacting: false,
       isBashRunning: false,
       retryAttempt: 0,
@@ -209,7 +342,7 @@ function projection(
       followUpMode: "all",
       messageCount: 1,
       compactionCount: 0,
-      queuedActionCount: 0,
+      queuedActionCount: active ? 1 : 0,
       activeToolNames: [],
       ...(recap === undefined ? {} : { recap }),
     },
@@ -223,7 +356,27 @@ function projection(
       },
     ],
     childAgents: [],
-    queue: { queuedCount: 0, steeringCount: 0, followUpCount: 0 },
+    queue: active
+      ? {
+          queuedCount: 0,
+          steeringCount: 0,
+          followUpCount: 0,
+          active: { kind: "turn", phase: "running", label: "Resident turn" },
+        }
+      : { queuedCount: 0, steeringCount: 0, followUpCount: 0 },
+  };
+}
+
+function promptCommand(expectedHostId: string, commandId: string): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "projection-test-device",
+    commandId,
+    expectedHostId,
+    threadId: "demo-thread",
+    issuedAt: "2026-08-07T12:00:03.000Z",
+    expectedExecutionGenerationId: "demo-execution-1",
+    command: { kind: "prompt", text: "Queue this only in speculative host state." },
   };
 }
 

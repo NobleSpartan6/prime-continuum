@@ -19,7 +19,9 @@ import {
   PROTOCOL_VERSION,
   RunLocationSchema,
   SavedProjectSchema,
+  SessionCursorSchema,
   SNAPSHOT_VERSION,
+  StructuredErrorSchema,
   ThreadProjectionSnapshotSchema,
   ThreadSummarySchema,
   type CatalogProjectionSnapshot,
@@ -51,6 +53,8 @@ import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
   ResidentSessionBindingSchema,
   validateResidentSessionBinding,
+  type ResidentAbortIdleAuthorityEvidence,
+  type ResidentPromptIdleAuthorityEvidence,
   type ResidentSessionBinding,
 } from "./resident-runtime";
 
@@ -247,6 +251,355 @@ const CommandIdentityRecordSchema = z
   .strict();
 type CommandIdentityRecord = z.infer<typeof CommandIdentityRecordSchema>;
 
+const ResidentDispatchCommandSchema = CommandEnvelopeSchema.refine(
+  (command) => command.command.kind === "prompt" || command.command.kind === "abort",
+  "Resident dispatch accepts only prompt and abort envelopes",
+);
+
+const ResidentPromptCommandSchema = CommandEnvelopeSchema.refine(
+  (command) => command.command.kind === "prompt",
+  "Resident prompt reconciliation accepts only prompt envelopes",
+);
+
+const ResidentAbortCommandSchema = CommandEnvelopeSchema.refine(
+  (command) => command.command.kind === "abort",
+  "Resident abort reconciliation accepts only abort envelopes",
+);
+
+export const ResidentPromptIdleObservedEventSchema = z
+  .object({
+    eventVersion: z.literal(1),
+    attemptId: IdSchema,
+    observedAt: IsoDateTimeSchema,
+    command: ResidentPromptCommandSchema,
+    acknowledgedReceipt: CommandReceiptSchema,
+    receipt: CommandReceiptSchema,
+    binding: ResidentSessionBindingSchema,
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    observedCursor: SessionCursorSchema,
+  })
+  .strict()
+  .superRefine((event, context) => {
+    if (
+      event.attemptId !== deterministicId("resident-dispatch", event.command.deviceId, event.command.commandId) ||
+      event.receipt.deviceId !== event.command.deviceId ||
+      event.receipt.commandId !== event.command.commandId ||
+      event.receipt.threadId !== event.command.threadId ||
+      event.receipt.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.acknowledgedReceipt.deviceId !== event.command.deviceId ||
+      event.acknowledgedReceipt.commandId !== event.command.commandId ||
+      event.acknowledgedReceipt.threadId !== event.command.threadId ||
+      event.acknowledgedReceipt.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.acknowledgedReceipt.status !== "running" ||
+      event.acknowledgedReceipt.receiptId !== event.receipt.receiptId ||
+      event.acknowledgedReceipt.receivedAt !== event.receipt.receivedAt ||
+      event.acknowledgedReceipt.queuePosition !== undefined ||
+      event.acknowledgedReceipt.error !== undefined ||
+      event.receipt.status !== "completed" ||
+      event.receipt.updatedAt !== event.observedAt ||
+      Date.parse(event.acknowledgedReceipt.updatedAt) > Date.parse(event.observedAt) ||
+      event.bindingFingerprint !== residentDispatchAuthorityFingerprint(event.binding) ||
+      event.binding.threadId !== event.command.threadId ||
+      event.binding.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.observedCursor.threadId !== event.command.threadId ||
+      event.observedCursor.executionGenerationId !== event.command.expectedExecutionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident prompt idle observation does not match one exact prompt, receipt, and binding",
+      });
+    }
+  });
+export type ResidentPromptIdleObservedEvent = z.infer<typeof ResidentPromptIdleObservedEventSchema>;
+
+export const ResidentAbortIdleObservedEventSchema = z
+  .object({
+    eventVersion: z.literal(1),
+    attemptId: IdSchema,
+    observedAt: IsoDateTimeSchema,
+    command: ResidentAbortCommandSchema,
+    acknowledgedReceipt: CommandReceiptSchema,
+    receipt: CommandReceiptSchema,
+    binding: ResidentSessionBindingSchema,
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    observedCursor: SessionCursorSchema,
+  })
+  .strict()
+  .superRefine((event, context) => {
+    if (
+      event.attemptId !== deterministicId("resident-dispatch", event.command.deviceId, event.command.commandId) ||
+      event.receipt.deviceId !== event.command.deviceId ||
+      event.receipt.commandId !== event.command.commandId ||
+      event.receipt.threadId !== event.command.threadId ||
+      event.receipt.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.acknowledgedReceipt.deviceId !== event.command.deviceId ||
+      event.acknowledgedReceipt.commandId !== event.command.commandId ||
+      event.acknowledgedReceipt.threadId !== event.command.threadId ||
+      event.acknowledgedReceipt.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.acknowledgedReceipt.status !== "running" ||
+      event.acknowledgedReceipt.receiptId !== event.receipt.receiptId ||
+      event.acknowledgedReceipt.receivedAt !== event.receipt.receivedAt ||
+      event.acknowledgedReceipt.queuePosition !== undefined ||
+      event.acknowledgedReceipt.error !== undefined ||
+      event.receipt.status !== "completed" ||
+      event.receipt.updatedAt !== event.observedAt ||
+      Date.parse(event.acknowledgedReceipt.updatedAt) > Date.parse(event.observedAt) ||
+      event.bindingFingerprint !== residentDispatchAuthorityFingerprint(event.binding) ||
+      event.binding.threadId !== event.command.threadId ||
+      event.binding.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      event.observedCursor.threadId !== event.command.threadId ||
+      event.observedCursor.executionGenerationId !== event.command.expectedExecutionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident abort idle observation does not match one exact Stop, receipt, and binding",
+      });
+    }
+  });
+export type ResidentAbortIdleObservedEvent = z.infer<typeof ResidentAbortIdleObservedEventSchema>;
+
+const ResidentDispatchAttemptSchema = z
+  .object({
+    version: z.literal(1),
+    attemptId: IdSchema,
+    command: ResidentDispatchCommandSchema,
+    binding: ResidentSessionBindingSchema,
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    admissionCursor: SessionCursorSchema,
+    promptSettlementCursor: SessionCursorSchema.optional(),
+    promptIdleObservation: ResidentPromptIdleObservedEventSchema.optional(),
+    abortSettlementCursor: SessionCursorSchema.optional(),
+    abortIdleObservation: ResidentAbortIdleObservedEventSchema.optional(),
+    state: z.enum(["admitted", "dispatching", "settled"]),
+    admittedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    dispatchStartedAt: IsoDateTimeSchema.optional(),
+    settledAt: IsoDateTimeSchema.optional(),
+    finalReceipt: CommandReceiptSchema.optional(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    const expectedAttemptId = deterministicId(
+      "resident-dispatch",
+      attempt.command.deviceId,
+      attempt.command.commandId,
+    );
+    if (attempt.attemptId !== expectedAttemptId) {
+      context.addIssue({ code: "custom", path: ["attemptId"], message: "Resident attempt identity changed" });
+    }
+    if (
+      attempt.command.threadId !== attempt.binding.threadId ||
+      attempt.command.expectedExecutionGenerationId !== attempt.binding.executionGenerationId
+    ) {
+      context.addIssue({ code: "custom", message: "Resident attempt does not match its exact session binding" });
+    }
+    if (
+      attempt.admissionCursor.threadId !== attempt.command.threadId ||
+      attempt.admissionCursor.executionGenerationId !== attempt.command.expectedExecutionGenerationId
+    ) {
+      context.addIssue({ code: "custom", path: ["admissionCursor"], message: "Admission cursor changed authority" });
+    }
+    if (
+      attempt.promptSettlementCursor &&
+      (attempt.promptSettlementCursor.threadId !== attempt.command.threadId ||
+        attempt.promptSettlementCursor.executionGenerationId !== attempt.command.expectedExecutionGenerationId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["promptSettlementCursor"],
+        message: "Prompt settlement cursor changed authority",
+      });
+    }
+    if (
+      attempt.abortSettlementCursor &&
+      (attempt.abortSettlementCursor.threadId !== attempt.command.threadId ||
+        attempt.abortSettlementCursor.executionGenerationId !== attempt.command.expectedExecutionGenerationId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["abortSettlementCursor"],
+        message: "Abort settlement cursor changed authority",
+      });
+    }
+    if (attempt.bindingFingerprint !== residentDispatchAuthorityFingerprint(attempt.binding)) {
+      context.addIssue({ code: "custom", path: ["bindingFingerprint"], message: "Resident binding fingerprint changed" });
+    }
+    const dispatchStarted = attempt.dispatchStartedAt !== undefined;
+    const settled = attempt.settledAt !== undefined || attempt.finalReceipt !== undefined;
+    if (
+      (attempt.state === "admitted" && dispatchStarted) ||
+      (attempt.state === "dispatching" && !dispatchStarted)
+    ) {
+      context.addIssue({ code: "custom", path: ["dispatchStartedAt"], message: "Dispatch time must match attempt state" });
+    }
+    if ((attempt.state === "settled") !== settled || (attempt.settledAt === undefined) !== (attempt.finalReceipt === undefined)) {
+      context.addIssue({ code: "custom", path: ["settledAt"], message: "Settlement evidence must match attempt state" });
+    }
+    if (attempt.finalReceipt) {
+      if (
+        attempt.finalReceipt.deviceId !== attempt.command.deviceId ||
+        attempt.finalReceipt.commandId !== attempt.command.commandId ||
+        attempt.finalReceipt.threadId !== attempt.command.threadId ||
+        attempt.finalReceipt.executionGenerationId !== attempt.command.expectedExecutionGenerationId ||
+        attempt.finalReceipt.status === "received" ||
+        attempt.finalReceipt.status === "admitted" ||
+        attempt.finalReceipt.status === "rejected" ||
+        attempt.finalReceipt.status === "cancelled"
+      ) {
+        context.addIssue({ code: "custom", path: ["finalReceipt"], message: "Settled receipt is not an exact dispatch outcome" });
+      }
+      if (!attempt.dispatchStartedAt && attempt.finalReceipt.status !== "failed") {
+        context.addIssue({
+          code: "custom",
+          path: ["finalReceipt", "status"],
+          message: "A pre-dispatch settlement must be definitively failed",
+        });
+      }
+    }
+    const requiresPromptSettlementCursor =
+      attempt.command.command.kind === "prompt" &&
+      attempt.state === "settled" &&
+      (attempt.finalReceipt?.status === "running" || attempt.finalReceipt?.status === "uncertain");
+    if (requiresPromptSettlementCursor !== (attempt.promptSettlementCursor !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["promptSettlementCursor"],
+        message: "A retained prompt lock requires its exact settlement cursor baseline",
+      });
+    }
+    const requiresAbortSettlementCursor =
+      attempt.command.command.kind === "abort" &&
+      attempt.state === "settled" &&
+      (attempt.finalReceipt?.status === "running" || attempt.finalReceipt?.status === "uncertain");
+    if (requiresAbortSettlementCursor !== (attempt.abortSettlementCursor !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["abortSettlementCursor"],
+        message: "An acknowledged Stop retained for idle proof requires its exact settlement cursor baseline",
+      });
+    }
+    if (attempt.promptIdleObservation) {
+      if (
+        attempt.command.command.kind !== "prompt" ||
+        attempt.state !== "settled" ||
+        attempt.finalReceipt?.status !== "completed" ||
+        !isDeepStrictEqual(attempt.promptIdleObservation.command, attempt.command) ||
+        !isDeepStrictEqual(attempt.promptIdleObservation.receipt, attempt.finalReceipt) ||
+        !isDeepStrictEqual(attempt.promptIdleObservation.binding, attempt.binding) ||
+        attempt.promptIdleObservation.bindingFingerprint !== attempt.bindingFingerprint ||
+        attempt.promptIdleObservation.attemptId !== attempt.attemptId ||
+        attempt.promptIdleObservation.acknowledgedReceipt.updatedAt !== attempt.settledAt ||
+        Date.parse(attempt.promptIdleObservation.observedAt) < Date.parse(attempt.settledAt ?? attempt.updatedAt)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["promptIdleObservation"],
+          message: "Prompt idle observation must be the exact proof-backed completion of this settled prompt",
+        });
+      }
+    }
+    if (
+      attempt.command.command.kind === "prompt" &&
+      attempt.finalReceipt?.status === "completed" &&
+      !attempt.promptIdleObservation
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["promptIdleObservation"],
+        message: "A completed prompt requires its dedicated durable idle-observation proof record",
+      });
+    }
+    if (attempt.abortIdleObservation) {
+      if (
+        attempt.command.command.kind !== "abort" ||
+        attempt.state !== "settled" ||
+        attempt.finalReceipt?.status !== "completed" ||
+        !isDeepStrictEqual(attempt.abortIdleObservation.command, attempt.command) ||
+        !isDeepStrictEqual(attempt.abortIdleObservation.receipt, attempt.finalReceipt) ||
+        !isDeepStrictEqual(attempt.abortIdleObservation.binding, attempt.binding) ||
+        attempt.abortIdleObservation.bindingFingerprint !== attempt.bindingFingerprint ||
+        attempt.abortIdleObservation.attemptId !== attempt.attemptId ||
+        attempt.abortIdleObservation.acknowledgedReceipt.updatedAt !== attempt.settledAt ||
+        Date.parse(attempt.abortIdleObservation.observedAt) < Date.parse(attempt.settledAt ?? attempt.updatedAt)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["abortIdleObservation"],
+          message: "Abort idle observation must be the exact proof-backed completion of this acknowledged Stop",
+        });
+      }
+    }
+    if (
+      attempt.command.command.kind === "abort" &&
+      attempt.finalReceipt?.status === "completed" &&
+      !attempt.abortIdleObservation
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["abortIdleObservation"],
+        message: "A completed Stop requires its dedicated durable idle-observation proof record",
+      });
+    }
+  });
+type ResidentDispatchAttempt = z.infer<typeof ResidentDispatchAttemptSchema>;
+
+const residentDispatchLeaseBrand: unique symbol = Symbol("resident-dispatch-lease");
+
+/**
+ * Process-local proof that HostStore durably crossed one exact resident
+ * dispatch boundary. Only HostStore can construct a valid branded instance.
+ */
+export interface ResidentDispatchLease {
+  readonly [residentDispatchLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly attemptId: string;
+  readonly command: CommandEnvelope;
+  readonly binding: ResidentSessionBinding;
+  readonly bindingFingerprint: string;
+  readonly dispatchStartedAt: string;
+}
+
+const residentPromptReconciliationLeaseBrand: unique symbol = Symbol("resident-prompt-reconciliation-lease");
+
+/**
+ * Process-local, Store-issued authority for one already-settled acknowledged
+ * prompt. It authorizes only a read-only Prime idle barrier and its exact
+ * proof completion; it can never authorize another mutation or an uncertain
+ * prompt outcome.
+ */
+export interface ResidentPromptReconciliationLease {
+  readonly [residentPromptReconciliationLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly attemptId: string;
+  readonly command: CommandEnvelope;
+  readonly binding: ResidentSessionBinding;
+  readonly bindingFingerprint: string;
+  readonly dispatchStartedAt: string;
+  readonly settledAt: string;
+  readonly receiptUpdatedAt: string;
+  readonly settlementCursor: z.infer<typeof SessionCursorSchema>;
+}
+
+const residentAbortReconciliationLeaseBrand: unique symbol = Symbol("resident-abort-reconciliation-lease");
+
+/**
+ * Process-local, Store-issued authority for the read-only idle proof that must
+ * follow one definitively acknowledged Stop. The completed dispatch receipt
+ * proves only request acceptance; this lease never authorizes another abort.
+ */
+export interface ResidentAbortReconciliationLease {
+  readonly [residentAbortReconciliationLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly attemptId: string;
+  readonly command: CommandEnvelope;
+  readonly binding: ResidentSessionBinding;
+  readonly bindingFingerprint: string;
+  readonly dispatchStartedAt: string;
+  readonly settledAt: string;
+  readonly receiptUpdatedAt: string;
+  readonly settlementCursor: z.infer<typeof SessionCursorSchema>;
+}
+
 const ModelSelectionAttemptSchema = z
   .object({
     version: z.literal(1),
@@ -332,19 +685,71 @@ const LegacyModelSelectionIdentityRecordSchema = z
 type LegacyModelSelectionIdentityRecord = z.infer<typeof LegacyModelSelectionIdentityRecordSchema>;
 
 export const MAX_PENDING_MODEL_SELECTION_ATTEMPTS = 10_000;
+export const MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS = 10_000;
 export const MAX_MODEL_SELECTION_ATTEMPT_BYTES = 1024 * 1024;
+export const MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES = 1024 * 1024;
 export const MAX_MODEL_SELECTION_IDENTITY_BYTES = 1024 * 1024;
 export const MAX_COMMAND_IDENTITY_BYTES = 1024 * 1024;
 
-const EventJournalRecordSchema = z.object({
-  version: z.literal(1),
-  eventId: IdSchema,
-  recordedAt: IsoDateTimeSchema,
-  type: z.string().min(1).max(64),
-  threadId: IdSchema.optional(),
-  sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-  detail: z.string().max(1_024).optional(),
-});
+const EventJournalRecordSchema = z
+  .object({
+    version: z.literal(1),
+    eventId: IdSchema,
+    recordedAt: IsoDateTimeSchema,
+    type: z.string().min(1).max(64),
+    threadId: IdSchema.optional(),
+    sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    detail: z.string().max(1_024).optional(),
+    residentPromptIdleObserved: ResidentPromptIdleObservedEventSchema.optional(),
+    residentAbortIdleObserved: ResidentAbortIdleObservedEventSchema.optional(),
+  })
+  .strict()
+  .superRefine((event, context) => {
+    const observation = event.residentPromptIdleObserved;
+    if ((event.type === "resident.prompt_idle_observed") !== (observation !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentPromptIdleObserved"],
+        message: "Only the dedicated resident prompt idle event may carry its exact proof record",
+      });
+      return;
+    }
+    if (
+      observation &&
+      (event.eventId !== deterministicId("event", "resident-prompt-idle", observation.attemptId) ||
+        event.recordedAt !== observation.observedAt ||
+        event.threadId !== observation.command.threadId ||
+        event.sequence !== observation.observedCursor.sequence ||
+        event.detail !== observation.command.commandId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident prompt idle event metadata changed its exact proof identity",
+      });
+    }
+    const abortObservation = event.residentAbortIdleObserved;
+    if ((event.type === "resident.abort_idle_observed") !== (abortObservation !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentAbortIdleObserved"],
+        message: "Only the dedicated resident abort idle event may carry its exact proof record",
+      });
+      return;
+    }
+    if (
+      abortObservation &&
+      (event.eventId !== deterministicId("event", "resident-abort-idle", abortObservation.attemptId) ||
+        event.recordedAt !== abortObservation.observedAt ||
+        event.threadId !== abortObservation.command.threadId ||
+        event.sequence !== abortObservation.observedCursor.sequence ||
+        event.detail !== abortObservation.command.commandId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident abort idle event metadata changed its exact proof identity",
+      });
+    }
+  });
 
 const AdmissionTransactionSchema = z
   .object({
@@ -359,6 +764,7 @@ const AdmissionTransactionSchema = z
     journalRecords: z.array(CommandJournalRecordSchema).min(2).max(3),
     eventRecord: EventJournalRecordSchema.optional(),
     commandIdentity: CommandIdentityRecordSchema,
+    residentDispatchAttempt: ResidentDispatchAttemptSchema.optional(),
     modelSelectionIdentity: ModelSelectionIdentityRecordSchema.optional(),
     modelSelectionAttempt: ModelSelectionAttemptSchema.optional(),
   })
@@ -370,7 +776,8 @@ const AdmissionTransactionSchema = z
     const requiresProjection =
       transaction.receipt.status === "admitted" &&
       transaction.command.command.kind !== "abort" &&
-      transaction.command.command.kind !== "model.select";
+      transaction.command.command.kind !== "model.select" &&
+      transaction.residentDispatchAttempt === undefined;
     if (requiresProjection !== (transaction.snapshot !== undefined)) {
       context.addIssue({ code: "custom", message: "Admission projection does not match its prepared outcome" });
     }
@@ -474,6 +881,22 @@ const AdmissionTransactionSchema = z
     ) {
       context.addIssue({ code: "custom", message: "Model selection attempt does not match its admission command" });
     }
+    if (
+      transaction.residentDispatchAttempt &&
+      !isDeepStrictEqual(transaction.residentDispatchAttempt.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Resident dispatch attempt does not match its admission command" });
+    }
+    if (
+      transaction.residentDispatchAttempt &&
+      (transaction.receipt.status !== "admitted" ||
+        (transaction.command.command.kind !== "prompt" && transaction.command.command.kind !== "abort") ||
+        transaction.residentDispatchAttempt.state !== "admitted" ||
+        transaction.residentDispatchAttempt.admittedAt !== transaction.preparedAt ||
+        transaction.residentDispatchAttempt.updatedAt !== transaction.preparedAt)
+    ) {
+      context.addIssue({ code: "custom", message: "Resident dispatch attempt is not an admitted prompt or abort" });
+    }
   });
 type AdmissionTransaction = z.infer<typeof AdmissionTransactionSchema>;
 
@@ -556,6 +979,50 @@ const RecoverableAdmissionTransactionSchema = z.discriminatedUnion("version", [
 export const MAX_PENDING_ADMISSION_TRANSACTIONS = 1_024;
 export const MAX_ADMISSION_TRANSACTION_BYTES = 64 * 1024 * 1024;
 
+export const MAX_RESIDENT_PROJECTION_LINEAGES = 10_000;
+export const MAX_RETIRED_RESIDENT_CURSOR_GENERATIONS = 64;
+export const MAX_RESIDENT_PROJECTION_LINEAGE_BYTES = 1024 * 1024;
+
+const ResidentProjectionAuthoritySchema = z
+  .object({
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    workspaceDirectory: WorkspaceDirectorySchema,
+    activeSessionId: z.string().min(1).max(4_096),
+    sessionId: z.string().min(1).max(4_096),
+    sessionFile: z.string().min(1).max(4_096).optional(),
+  })
+  .strict();
+type ResidentProjectionAuthority = z.infer<typeof ResidentProjectionAuthoritySchema>;
+
+const ResidentProjectionCursorLineageSchema = z
+  .object({
+    authorityId: IdSchema,
+    authority: ResidentProjectionAuthoritySchema,
+    current: z
+      .object({
+        generation: IdSchema,
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        digest: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict(),
+    retiredGenerations: z.array(IdSchema).max(MAX_RETIRED_RESIDENT_CURSOR_GENERATIONS),
+  })
+  .strict()
+  .superRefine((lineage, context) => {
+    if (lineage.authorityId !== residentProjectionAuthorityId(lineage.authority)) {
+      context.addIssue({ code: "custom", path: ["authorityId"], message: "Projection authority ID changed" });
+    }
+    const retired = new Set(lineage.retiredGenerations);
+    if (retired.size !== lineage.retiredGenerations.length) {
+      context.addIssue({ code: "custom", path: ["retiredGenerations"], message: "Retired generations must be unique" });
+    }
+    if (retired.has(lineage.current.generation)) {
+      context.addIssue({ code: "custom", path: ["current", "generation"], message: "Current generation is retired" });
+    }
+  });
+type ResidentProjectionCursorLineage = z.infer<typeof ResidentProjectionCursorLineageSchema>;
+
 const ResidentProjectionTransactionSchema = z
   .object({
     version: z.literal(1),
@@ -563,12 +1030,75 @@ const ResidentProjectionTransactionSchema = z
     transactionId: IdSchema,
     preparedAt: IsoDateTimeSchema,
     binding: ResidentSessionBindingSchema,
+    projectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    previousLineage: ResidentProjectionCursorLineageSchema.optional(),
+    nextLineage: ResidentProjectionCursorLineageSchema,
+    // Prompt ownership is retired only by the dedicated waitForIdle proof
+    // transaction. Generic cursor publication can never consume the lock.
+    retiredPromptAttempts: z.array(ResidentDispatchAttemptSchema).max(0),
+    // Only a Store-branded acknowledged Stop may authorize replacing active
+    // content at one unchanged upstream cursor after waitForIdle proves the
+    // previous same-cursor view stale.
+    abortIdleProofAttempt: ResidentDispatchAttemptSchema.optional(),
     snapshot: ThreadProjectionSnapshotSchema,
     threadsFile: ThreadFileSchema,
   })
   .strict()
   .superRefine((transaction, context) => {
     const { binding, snapshot, threadsFile } = transaction;
+    const authority = residentProjectionAuthorityFromBinding(binding);
+    const authorityId = residentProjectionAuthorityId(authority);
+    const nextLineage = transaction.nextLineage;
+    if (
+      nextLineage.authorityId !== authorityId ||
+      !isDeepStrictEqual(nextLineage.authority, authority) ||
+      nextLineage.current.generation !== snapshot.latestCursor.generation ||
+      nextLineage.current.sequence !== snapshot.latestCursor.sequence ||
+      nextLineage.current.digest !== transaction.projectionDigest ||
+      transaction.projectionDigest !== residentPublishedProjectionDigest(snapshot) ||
+      (transaction.previousLineage !== undefined && transaction.previousLineage.authorityId !== authorityId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection transaction lineage does not match its binding and cursor",
+      });
+    }
+    if (!residentProjectionLineageTransitionIsValid(
+      transaction.previousLineage,
+      nextLineage,
+      transaction.abortIdleProofAttempt !== undefined,
+    )) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident projection transaction does not advance its exact prior lineage",
+      });
+    }
+    const abortProof = transaction.abortIdleProofAttempt;
+    if (
+      abortProof &&
+      (!residentAcknowledgedAbortAttemptRetainsLock(abortProof) ||
+        abortProof.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+        !isDeepStrictEqual(
+          residentProjectionAuthorityFromBinding(abortProof.binding),
+          residentProjectionAuthorityFromBinding(binding),
+        ) ||
+        snapshot.thread.status === "running" ||
+        residentSnapshotReportsActivity(snapshot) ||
+        !transaction.previousLineage ||
+        transaction.previousLineage.current.generation !== nextLineage.current.generation ||
+        transaction.previousLineage.current.sequence !== nextLineage.current.sequence ||
+        transaction.transactionId !== deterministicId(
+          "resident-abort-idle-projection",
+          abortProof.attemptId,
+          nextLineage.current.generation,
+          String(nextLineage.current.sequence),
+        ))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Resident abort idle projection does not match its exact acknowledged Stop proof",
+      });
+    }
     if (
       snapshot.thread.threadId !== binding.threadId ||
       snapshot.thread.currentLocation.executionGenerationId !== binding.executionGenerationId ||
@@ -619,13 +1149,35 @@ export type AdmissionFaultPoint =
   | "after_snapshot"
   | "after_threads"
   | "after_command_identity"
+  | "after_resident_dispatch_attempt"
   | "after_model_selection_identity"
   | "after_model_selection_attempt"
   | "after_receipt"
   | "after_journal"
   | "after_event";
 
-export type ResidentProjectionFaultPoint = "after_prepare" | "after_snapshot" | "after_threads";
+export type ResidentProjectionFaultPoint =
+  | "after_prepare"
+  | "after_lineage"
+  | "after_snapshot"
+  | "after_threads"
+  | "after_prompt_locks";
+
+export type ResidentDispatchFaultPoint =
+  | "after_dispatch_attempt"
+  | "after_dispatch_receipt"
+  | "after_dispatch_journal"
+  | "after_settled_attempt"
+  | "after_settled_receipt"
+  | "after_settled_journal"
+  | "after_prompt_idle_attempt"
+  | "after_prompt_idle_receipt"
+  | "after_prompt_idle_journal"
+  | "after_prompt_idle_event"
+  | "after_abort_idle_attempt"
+  | "after_abort_idle_receipt"
+  | "after_abort_idle_journal"
+  | "after_abort_idle_event";
 
 export type HandoffCheckpointWriter = (path: string, checkpoint: HandoffCheckpoint) => Promise<boolean>;
 
@@ -634,6 +1186,10 @@ export interface HostStoreOptions {
   residentProjectionFaultInjector?: (
     point: ResidentProjectionFaultPoint,
     transactionId: string,
+  ) => void | Promise<void>;
+  residentDispatchFaultInjector?: (
+    point: ResidentDispatchFaultPoint,
+    attemptId: string,
   ) => void | Promise<void>;
   handoffCheckpointWriter?: HandoffCheckpointWriter;
 }
@@ -683,6 +1239,10 @@ export class HostStore {
   private initialized = false;
   private residentSubsystemFault: HostStoreError | undefined;
   private readonly options: HostStoreOptions;
+  private readonly residentPromptReconciliationLeases = new WeakSet<object>();
+  private readonly residentPromptReconciliationLeaseCache = new Map<string, ResidentPromptReconciliationLease>();
+  private readonly residentAbortReconciliationLeases = new WeakSet<object>();
+  private readonly residentAbortReconciliationLeaseCache = new Map<string, ResidentAbortReconciliationLease>();
 
   constructor(dataDir: string, options: HostStoreOptions = {}) {
     this.paths = getHostDataPaths(dataDir);
@@ -699,6 +1259,8 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.staging),
         ensurePrivateDirectory(this.paths.transactions),
         ensurePrivateDirectory(this.paths.residentProjectionTransactions),
+        ensurePrivateDirectory(this.paths.residentProjectionLineages),
+        ensurePrivateDirectory(this.paths.residentDispatchAttempts),
         ensurePrivateDirectory(this.commandIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionIdentitiesDirectory()),
         ensurePrivateDirectory(this.modelSelectionAttemptsDirectory()),
@@ -742,6 +1304,7 @@ export class HostStore {
             MAX_RESIDENT_SESSION_BINDING_FILE_BYTES,
           );
         }
+        await this.validateResidentProjectionLineageDirectoryUnlocked();
       } catch (error) {
         this.residentSubsystemFault = residentSubsystemUnavailable(error);
       }
@@ -775,6 +1338,7 @@ export class HostStore {
       // replayed by a new hostd/Prime client identity. Startup converts the
       // incomplete receipt to `uncertain` before serving reconciliation.
       await this.recoverInterruptedModelSelectionsUnlocked();
+      await this.recoverInterruptedResidentDispatchesUnlocked();
 
       this.initialized = true;
       if (options.seed !== true) return { seeded: false };
@@ -871,6 +1435,10 @@ export class HostStore {
         const current = threads[existing];
         if (!current) throw new HostStoreError("THREAD_STATE_INVALID", "The thread catalog index is invalid");
         if (!isDeepStrictEqual(current.currentLocation, thread.currentLocation)) {
+          await this.assertNoResidentDispatchTransitionUnlocked(
+            thread.threadId,
+            "Execution authority cannot change while a resident dispatch is unresolved",
+          );
           const residentBindings = await this.readResidentSessionBindingsUnlocked();
           if (residentBindings.some((binding) => binding.threadId === thread.threadId)) {
             throw new HostStoreError(
@@ -946,6 +1514,12 @@ export class HostStore {
             : now(),
       });
       if (existing && isDeepStrictEqual(existing, authority)) return canonicalDirectory;
+      if (existing) {
+        await this.assertNoResidentDispatchTransitionUnlocked(
+          input.threadId,
+          "Workspace authority cannot change while a resident dispatch is unresolved",
+        );
+      }
       if (existingIndex >= 0) authorities[existingIndex] = authority;
       else {
         if (authorities.length >= MAX_WORKSPACE_AUTHORITIES) {
@@ -1039,6 +1613,15 @@ export class HostStore {
       );
       const existingRecord = existingIndex >= 0 ? records[existingIndex] : undefined;
       const existing = existingRecord?.state === "active" ? existingRecord.binding : undefined;
+      if (
+        existing &&
+        residentDispatchAuthorityFingerprint(existing) !== residentDispatchAuthorityFingerprint(binding)
+      ) {
+        await this.assertNoResidentDispatchTransitionUnlocked(
+          binding.threadId,
+          "Resident binding cannot change while a dispatch is unresolved",
+        );
+      }
       if (existing && !sameResidentBindingIdentity(existing, binding)) {
         throw new HostStoreError(
           "RESIDENT_BINDING_CONFLICT",
@@ -1081,6 +1664,7 @@ export class HostStore {
   async publishResidentProjectionSnapshot(
     bindingValue: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
+    abortIdleLeaseValue?: ResidentAbortReconciliationLease,
   ): Promise<ThreadProjectionSnapshot> {
     return this.exclusive(async () => {
       this.assertInitialized();
@@ -1121,6 +1705,13 @@ export class HostStore {
           "The resident projection does not belong to its durable binding",
         );
       }
+      const abortIdleProofAttempt = abortIdleLeaseValue
+        ? await this.assertResidentAbortIdleProjectionAuthorityUnlocked(
+            validateResidentAbortReconciliationLease(abortIdleLeaseValue),
+            binding,
+            projection,
+          )
+        : undefined;
 
       const source = await this.readSnapshotUnlocked(binding.threadId);
       if (
@@ -1141,6 +1732,99 @@ export class HostStore {
           "The durable snapshot and thread catalog must agree before publishing resident state",
         );
       }
+      const projectionDigest = residentProjectionDigest(projection);
+      const authority = residentProjectionAuthorityFromBinding(binding);
+      const authorityId = residentProjectionAuthorityId(authority);
+      const previousLineage = await this.readResidentProjectionLineageUnlocked(authority);
+      let nextLineage: ResidentProjectionCursorLineage;
+      if (!previousLineage) {
+        await this.assertResidentProjectionLineageCapacityUnlocked();
+        nextLineage = ResidentProjectionCursorLineageSchema.parse({
+          authorityId,
+          authority,
+          current: {
+            generation: projection.cursor.generation,
+            sequence: projection.cursor.sequence,
+            digest: projectionDigest,
+          },
+          retiredGenerations: [],
+        });
+      } else if (projection.cursor.generation === previousLineage.current.generation) {
+        if (projection.cursor.sequence < previousLineage.current.sequence) {
+          throw new HostStoreError(
+            "RESIDENT_PROJECTION_CURSOR_REGRESSION",
+            "Resident projection sequence regressed within the current daemon generation",
+          );
+        }
+        if (projection.cursor.sequence === previousLineage.current.sequence) {
+          if (projectionDigest !== previousLineage.current.digest) {
+            if (!abortIdleProofAttempt) {
+              throw new HostStoreError(
+                "RESIDENT_PROJECTION_CURSOR_CONFLICT",
+                "The same resident projection cursor was reused for different authoritative content",
+              );
+            }
+            nextLineage = ResidentProjectionCursorLineageSchema.parse({
+              ...previousLineage,
+              current: {
+                ...previousLineage.current,
+                digest: projectionDigest,
+              },
+            });
+          } else {
+            if (
+              source.latestCursor.generation !== projection.cursor.generation ||
+              source.latestCursor.sequence !== projection.cursor.sequence
+            ) {
+              throw new HostStoreError(
+                "RESIDENT_PROJECTION_LINEAGE_DIVERGED",
+                "Resident projection lineage and public snapshot no longer identify the same cursor",
+              );
+            }
+            if (abortIdleProofAttempt && residentSnapshotReportsActivity(source)) {
+              throw new HostStoreError(
+                "RESIDENT_ABORT_IDLE_PROJECTION_CONFLICT",
+                "The durable projection remained active despite matching the acknowledged Stop idle proof digest",
+              );
+            }
+            return source;
+          }
+        } else {
+          nextLineage = ResidentProjectionCursorLineageSchema.parse({
+            ...previousLineage,
+            current: {
+              generation: projection.cursor.generation,
+              sequence: projection.cursor.sequence,
+              digest: projectionDigest,
+            },
+          });
+        }
+      } else {
+        if (previousLineage.retiredGenerations.includes(projection.cursor.generation)) {
+          throw new HostStoreError(
+            "RESIDENT_PROJECTION_GENERATION_RETIRED",
+            "A retired resident daemon cursor generation cannot publish again",
+          );
+        }
+        if (previousLineage.retiredGenerations.length >= MAX_RETIRED_RESIDENT_CURSOR_GENERATIONS) {
+          throw new HostStoreError(
+            "RESIDENT_PROJECTION_RETIREMENT_LIMIT",
+            "Resident cursor retirement history is full; publication fails closed",
+          );
+        }
+        nextLineage = ResidentProjectionCursorLineageSchema.parse({
+          ...previousLineage,
+          current: {
+            generation: projection.cursor.generation,
+            sequence: projection.cursor.sequence,
+            digest: projectionDigest,
+          },
+          retiredGenerations: [
+            ...previousLineage.retiredGenerations,
+            previousLineage.current.generation,
+          ],
+        });
+      }
       const generatedAt = now();
       const latestCursor = {
         threadId: binding.threadId,
@@ -1148,8 +1832,19 @@ export class HostStore {
         generation: projection.cursor.generation,
         sequence: projection.cursor.sequence,
       };
+      const runtimeActive =
+        projection.runtime.isStreaming ||
+        projection.runtime.isCompacting ||
+        projection.runtime.isBashRunning ||
+        projection.queue.active !== undefined;
+      const projectedStatus = runtimeActive
+        ? "running"
+        : source.thread.status === "complete" || source.thread.status === "failed"
+          ? source.thread.status
+          : "idle";
       const threadValue: ThreadSummary = {
         ...source.thread,
+        status: projectedStatus,
         updatedAt: generatedAt,
         lastKnownCursor: latestCursor,
       };
@@ -1169,7 +1864,10 @@ export class HostStore {
         })),
         materializedRecentBlocks: projection.transcript,
         ...(projection.stream ? { inProgressStream: projection.stream } : {}),
-        queueState: source.queueState,
+        // Prime v0.7 exposes bounded queue counts but no stable host command
+        // identities. Once its exact snapshot is authoritative, speculative
+        // host admission IDs must not survive as phantom queued work.
+        queueState: { pendingCommandIds: [], paused: false },
         approvals: source.approvals,
         childAgents: projection.childAgents,
         goals: projection.goal ? [projection.goal] : [],
@@ -1182,18 +1880,47 @@ export class HostStore {
       });
       const updatedThreads = [...threads];
       updatedThreads[threadIndex] = published.thread;
+      const promptLock = await this.findResidentPromptLockUnlocked(binding.threadId);
+      if (
+        promptLock &&
+        !isDeepStrictEqual(residentProjectionAuthorityFromBinding(promptLock.binding), authority)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_LOCK_AUTHORITY_MISMATCH",
+          "The resident prompt ownership lock belongs to a different stable session authority",
+        );
+      }
+      const retiredPromptAttempts: readonly ResidentDispatchAttempt[] = [];
       const transaction = ResidentProjectionTransactionSchema.parse({
         version: 1,
         kind: "resident_projection_publication",
-        transactionId: deterministicId(
-          "resident-projection",
-          binding.threadId,
-          binding.executionGenerationId,
-          projection.cursor.generation,
-          String(projection.cursor.sequence),
-        ),
+        transactionId: abortIdleProofAttempt && previousLineage &&
+          previousLineage.current.generation === projection.cursor.generation &&
+          previousLineage.current.sequence === projection.cursor.sequence
+          ? deterministicId(
+              "resident-abort-idle-projection",
+              abortIdleProofAttempt.attemptId,
+              projection.cursor.generation,
+              String(projection.cursor.sequence),
+            )
+          : deterministicId(
+              "resident-projection",
+              binding.threadId,
+              binding.executionGenerationId,
+              projection.cursor.generation,
+              String(projection.cursor.sequence),
+            ),
         preparedAt: generatedAt,
         binding,
+        projectionDigest,
+        previousLineage,
+        nextLineage,
+        retiredPromptAttempts,
+        ...(abortIdleProofAttempt && previousLineage &&
+        previousLineage.current.generation === projection.cursor.generation &&
+        previousLineage.current.sequence === projection.cursor.sequence
+          ? { abortIdleProofAttempt }
+          : {}),
         snapshot: published,
         threadsFile: ThreadFileSchema.parse({ version: 1, threads: updatedThreads }),
       });
@@ -1247,6 +1974,10 @@ export class HostStore {
           "Only the exact current resident session binding may be completed",
         );
       }
+      await this.assertNoResidentDispatchTransitionUnlocked(
+        binding.threadId,
+        "Resident binding cannot complete while a dispatch is unresolved",
+      );
       records[existingIndex] = ResidentSessionBindingRecordSchema.parse({
         state: "completed",
         binding: existing.binding,
@@ -1382,6 +2113,12 @@ export class HostStore {
           "Resident model selection must use its non-replayable receipt state machine",
         );
       }
+      if (await this.readResidentDispatchAttemptUnlocked(command)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_RECEIPT_PATH_REQUIRED",
+          "Resident prompt and abort dispatch must use their exact lease receipt state machine",
+        );
+      }
       const current = await this.readReceiptUnlocked(command);
       if (!current) throw new HostStoreError("COMMAND_NOT_FOUND", "No receipt exists for this command identity");
       this.assertReceiptMatchesCommand(current, command);
@@ -1402,6 +2139,737 @@ export class HostStore {
         receipt.message,
       );
       return receipt;
+    });
+  }
+
+  /**
+   * Definitively retires an admitted resident attempt when local authority
+   * revalidation fails before a dispatch lease is issued. This path cannot act
+   * after the no-replay boundary has been crossed.
+   */
+  async failResidentDispatchBeforeStart(
+    commandValue: CommandEnvelope,
+    errorValue: StructuredError,
+  ): Promise<CommandReceipt> {
+    const command = ResidentDispatchCommandSchema.parse(commandValue);
+    const error = StructuredErrorSchema.parse(errorValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const identity = await this.resolveCommandIdentityUnlocked(command);
+      const attempt = await this.readResidentDispatchAttemptUnlocked(command);
+      const current = await this.readReceiptUnlocked(command);
+      if (
+        !identity ||
+        !attempt ||
+        !current ||
+        attempt.state !== "admitted" ||
+        current.status !== "admitted" ||
+        !isDeepStrictEqual(identity.command, command) ||
+        !isDeepStrictEqual(attempt.command, command)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_NOT_ADMITTED",
+          "Only an exact pre-dispatch resident admission may be failed locally",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, command);
+      const settledAt = now();
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        status: "failed",
+        queuePosition: undefined,
+        message: error.message.slice(0, 1_024),
+        error,
+        updatedAt: settledAt,
+      });
+      const settled = ResidentDispatchAttemptSchema.parse({
+        ...attempt,
+        state: "settled",
+        updatedAt: settledAt,
+        settledAt,
+        finalReceipt: receipt,
+      });
+      try {
+        await atomicWriteJson(
+          this.residentDispatchAttemptPath(command),
+          settled,
+          MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+        );
+        await this.injectResidentDispatchFault("after_settled_attempt", attempt.attemptId);
+        await atomicWriteJson(this.receiptPath(command), receipt);
+        await this.injectResidentDispatchFault("after_settled_receipt", attempt.attemptId);
+        await this.appendResidentDispatchJournalUnlocked(
+          command,
+          "failed",
+          receipt.updatedAt,
+          receipt.message,
+          "failed-before-start",
+        );
+        await this.injectResidentDispatchFault("after_settled_journal", attempt.attemptId);
+        await rm(this.residentDispatchAttemptPath(command), { force: true });
+      } catch (cause) {
+        this.initialized = false;
+        throw cause;
+      }
+      return receipt;
+    });
+  }
+
+  /**
+   * Durably crosses the one-way boundary after which an exact resident prompt
+   * or abort may be invoked upstream. The returned lease is process-local,
+   * immutable, and bound to the complete command and resident-session record.
+   */
+  async beginResidentDispatch(commandValue: CommandEnvelope): Promise<ResidentDispatchLease> {
+    const command = ResidentDispatchCommandSchema.parse(commandValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const identity = await this.resolveCommandIdentityUnlocked(command);
+      if (!identity) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_IDENTITY_MISSING",
+          "Resident dispatch requires the exact durable command envelope",
+        );
+      }
+      const attempt = await this.readResidentDispatchAttemptUnlocked(command);
+      if (!attempt || !isDeepStrictEqual(attempt.command, command)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_MISSING",
+          "No exact durable resident prompt or abort admission exists for this command",
+        );
+      }
+      const receipt = await this.readReceiptUnlocked(command);
+      if (!receipt) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_RECEIPT_MISSING",
+          "The resident dispatch attempt has no durable command receipt",
+        );
+      }
+      this.assertReceiptMatchesCommand(receipt, command);
+      if (receipt.status !== "admitted" || attempt.state !== "admitted") {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ALREADY_STARTED",
+          "This resident command cannot cross its dispatch boundary again",
+        );
+      }
+
+      const latestSnapshot = await this.readSnapshotUnlocked(command.threadId);
+      const promptLock = await this.findResidentPromptLockUnlocked(command.threadId);
+      if (command.command.kind === "prompt") {
+        if (!promptLock || !isDeepStrictEqual(promptLock, attempt)) {
+          throw new HostStoreError(
+            "RESIDENT_PROMPT_LOCK_CONFLICT",
+            "The admitted prompt no longer owns the exact resident dispatch lock",
+          );
+        }
+        if (residentSnapshotReportsActivity(latestSnapshot)) {
+          throw new HostStoreError(
+            "RESIDENT_SESSION_BUSY",
+            "The authoritative resident projection became active before prompt dispatch",
+            true,
+          );
+        }
+      } else if (
+        !residentSnapshotReportsActivity(latestSnapshot) &&
+        (!promptLock || !residentPromptAttemptRetainsLock(promptLock))
+      ) {
+        throw promptLock
+          ? new HostStoreError(
+              "RESIDENT_PROMPT_DELIVERY_PENDING",
+              "The admitted prompt has not reached an acknowledged resident dispatch boundary",
+              true,
+            )
+          : new HostStoreError(
+              "RESIDENT_SESSION_IDLE",
+              "The resident session became idle before the stop request crossed dispatch",
+            );
+      }
+
+      const binding = await this.resolveResidentDispatchBindingUnlocked(command);
+      const fingerprint = residentDispatchAuthorityFingerprint(binding);
+      if (fingerprint !== attempt.bindingFingerprint) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_CONFLICT",
+          "The resident session binding changed after command admission",
+        );
+      }
+
+      const dispatchStartedAt = now();
+      const dispatching = ResidentDispatchAttemptSchema.parse({
+        ...attempt,
+        // A verified reconnect may refresh mutable supervisor metadata while
+        // preserving the stable dispatch authority fingerprint.
+        binding,
+        bindingFingerprint: fingerprint,
+        state: "dispatching",
+        updatedAt: dispatchStartedAt,
+        dispatchStartedAt,
+      });
+      const dispatchingReceipt = CommandReceiptSchema.parse({
+        ...receipt,
+        // Crossing the private no-replay boundary is not an upstream
+        // acknowledgement. Public callers continue to see admitted until the
+        // exact Prime mutation settles.
+        status: "admitted",
+        queuePosition: undefined,
+        message: command.command.kind === "prompt"
+          ? "Delivering the prompt to the resident Prime Agent session"
+          : "Delivering the stop request to the resident Prime Agent session",
+        error: undefined,
+        updatedAt: dispatchStartedAt,
+      });
+      try {
+        // This marker is the one-way no-replay boundary. A restart after it is
+        // necessarily uncertain even if the caller had not yet reached Prime.
+        await atomicWriteJson(
+          this.residentDispatchAttemptPath(command),
+          dispatching,
+          MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+        );
+        await this.injectResidentDispatchFault("after_dispatch_attempt", attempt.attemptId);
+        await atomicWriteJson(this.receiptPath(command), dispatchingReceipt);
+        await this.injectResidentDispatchFault("after_dispatch_receipt", attempt.attemptId);
+        await this.appendResidentDispatchJournalUnlocked(
+          command,
+          "admitted",
+          dispatchingReceipt.updatedAt,
+          dispatchingReceipt.message,
+          "dispatching",
+        );
+        await this.injectResidentDispatchFault("after_dispatch_journal", attempt.attemptId);
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return createResidentDispatchLease(dispatching);
+    });
+  }
+
+  /**
+   * Persists an upstream acknowledgement before retiring the non-replayable
+   * marker. If hostd stops during this method, startup completes only these
+   * local receipt writes and never invokes Prime Agent again.
+   */
+  async finalizeResidentDispatch(
+    leaseValue: ResidentDispatchLease,
+    update: Pick<CommandReceipt, "status"> & Partial<Pick<CommandReceipt, "message" | "error">>,
+  ): Promise<CommandReceipt> {
+    const lease = validateResidentDispatchLease(leaseValue);
+    if (
+      update.status !== "running" &&
+      update.status !== "completed" &&
+      update.status !== "failed" &&
+      update.status !== "uncertain"
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_STATUS_INVALID",
+        "Resident dispatch may settle only as running, completed, failed, or uncertain",
+      );
+    }
+    if (lease.command.command.kind === "abort" && update.status === "completed") {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_STATUS_INVALID",
+        "A Stop may complete only after the dedicated authoritative idle-observation proof",
+      );
+    }
+    if (lease.command.command.kind === "prompt" && update.status === "completed") {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_STATUS_INVALID",
+        "A prompt may complete only after the dedicated authoritative idle-observation proof",
+      );
+    }
+
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readResidentDispatchAttemptUnlocked(lease.command);
+      if (!attempt || attempt.state !== "dispatching" || !residentDispatchLeaseMatchesAttempt(lease, attempt)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_LEASE_INVALID",
+          "No exact dispatching resident attempt matches this process-local lease",
+        );
+      }
+      const current = await this.readReceiptUnlocked(lease.command);
+      if (!current || current.status !== "admitted") {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_RECEIPT_INVALID",
+          "The resident dispatch receipt is not at its durable admitted dispatch boundary",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, lease.command);
+      const currentBinding = await this.resolveResidentDispatchBindingUnlocked(lease.command);
+      if (
+        residentDispatchAuthorityFingerprint(currentBinding) !== attempt.bindingFingerprint
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_CONFLICT",
+          "The resident session binding changed before dispatch acknowledgement",
+        );
+      }
+
+      const settledAt = now();
+      const promptSettlementCursor =
+        lease.command.command.kind === "prompt" &&
+        (update.status === "running" || update.status === "uncertain")
+          ? (await this.readSnapshotUnlocked(lease.command.threadId)).latestCursor
+          : undefined;
+      const abortSettlementCursor =
+        lease.command.command.kind === "abort" &&
+        (update.status === "running" || update.status === "uncertain")
+          ? (await this.readSnapshotUnlocked(lease.command.threadId)).latestCursor
+          : undefined;
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        ...update,
+        queuePosition: undefined,
+        updatedAt: settledAt,
+      });
+      const settled = ResidentDispatchAttemptSchema.parse({
+        ...attempt,
+        // Preserve the exact current durable record at the acknowledgement
+        // boundary. Stable authority is unchanged, but mutable supervisor
+        // metadata may have refreshed since beginResidentDispatch.
+        binding: currentBinding,
+        state: "settled",
+        updatedAt: settledAt,
+        settledAt,
+        finalReceipt: receipt,
+        ...(promptSettlementCursor ? { promptSettlementCursor } : {}),
+        ...(abortSettlementCursor ? { abortSettlementCursor } : {}),
+      });
+      try {
+        await atomicWriteJson(
+          this.residentDispatchAttemptPath(lease.command),
+          settled,
+          MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+        );
+        await this.injectResidentDispatchFault("after_settled_attempt", attempt.attemptId);
+        await atomicWriteJson(this.receiptPath(lease.command), receipt);
+        await this.injectResidentDispatchFault("after_settled_receipt", attempt.attemptId);
+        await this.appendResidentDispatchJournalUnlocked(
+          lease.command,
+          receipt.status,
+          receipt.updatedAt,
+          receipt.message,
+          "settled",
+        );
+        await this.injectResidentDispatchFault("after_settled_journal", attempt.attemptId);
+        if (!residentDispatchAttemptRetainsReconciliation(settled)) {
+          await rm(this.residentDispatchAttemptPath(lease.command), { force: true });
+        }
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return receipt;
+    });
+  }
+
+  /**
+   * Issue a separate read-only reconciliation authority after one exact prompt
+   * was definitively acknowledged. The dispatch lease itself cannot be reused
+   * for this purpose and uncertain outcomes are deliberately ineligible.
+   */
+  async beginResidentPromptReconciliation(
+    dispatchLeaseValue: ResidentDispatchLease,
+  ): Promise<ResidentPromptReconciliationLease> {
+    const dispatchLease = validateResidentDispatchLease(dispatchLeaseValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readResidentDispatchAttemptUnlocked(dispatchLease.command);
+      if (
+        !attempt ||
+        attempt.attemptId !== dispatchLease.attemptId ||
+        attempt.dispatchStartedAt !== dispatchLease.dispatchStartedAt ||
+        attempt.bindingFingerprint !== dispatchLease.bindingFingerprint ||
+        !isDeepStrictEqual(attempt.command, dispatchLease.command)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_RECONCILIATION_INELIGIBLE",
+          "No exact settled resident prompt matches this dispatch authority",
+        );
+      }
+      return this.createResidentPromptReconciliationLeaseUnlocked(attempt);
+    });
+  }
+
+  /** Reissue process-local read-only authorities for eligible locks after restart. */
+  async listResidentPromptReconciliationLeases(): Promise<readonly ResidentPromptReconciliationLease[]> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+      if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+          "Resident prompt reconciliation cannot inspect an over-capacity attempt store",
+        );
+      }
+      const leases: ResidentPromptReconciliationLease[] = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Resident prompt reconciliation encountered an unexpected attempt entry",
+          );
+        }
+        const attempt = await readJsonFile(
+          join(this.paths.residentDispatchAttempts, entry.name),
+          ResidentDispatchAttemptSchema,
+          { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+        );
+        if (
+          !attempt ||
+          entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Resident prompt reconciliation attempt does not match its durable filename",
+          );
+        }
+        if (!residentAcknowledgedPromptAttemptRetainsLock(attempt)) continue;
+        leases.push(await this.createResidentPromptReconciliationLeaseUnlocked(attempt));
+      }
+      return Object.freeze(leases);
+    });
+  }
+
+  /**
+   * Commit one exact same-connection idle proof. This is the only path that may
+   * turn an acknowledged prompt receipt from running into completed without a
+   * later Prime cursor. Every authority and the current durable idle snapshot
+   * are revalidated while the Store mutation lock is held.
+   */
+  async completeResidentPromptReconciliation(
+    leaseValue: ResidentPromptReconciliationLease,
+    evidence: ResidentPromptIdleAuthorityEvidence,
+  ): Promise<ResidentPromptIdleObservedEvent> {
+    const lease = validateResidentPromptReconciliationLease(leaseValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      if (!this.residentPromptReconciliationLeases.has(lease as object)) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+          "Prompt idle completion requires a lease issued by this exact HostStore instance",
+        );
+      }
+      const attempt = await this.readResidentDispatchAttemptUnlocked(lease.command);
+      if (!attempt || !residentPromptReconciliationLeaseMatchesAttempt(lease, attempt)) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+          "The settled acknowledged prompt changed before idle proof completion",
+        );
+      }
+      const currentReceipt = await this.readReceiptUnlocked(lease.command);
+      if (
+        !currentReceipt ||
+        currentReceipt.status !== "running" ||
+        !attempt.finalReceipt ||
+        !isDeepStrictEqual(currentReceipt, attempt.finalReceipt) ||
+        currentReceipt.updatedAt !== lease.receiptUpdatedAt
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_RECONCILIATION_RECEIPT_CHANGED",
+          "The prompt receipt is no longer at its exact acknowledged-running boundary",
+        );
+      }
+      const currentBinding = await this.resolveResidentDispatchBindingUnlocked(lease.command);
+      if (!isDeepStrictEqual(currentBinding, lease.binding)) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_RECONCILIATION_BINDING_CHANGED",
+          "The resident binding changed after the idle barrier began",
+        );
+      }
+      if (
+        !evidence ||
+        evidence.evidenceVersion !== 1 ||
+        evidence.dispatchAttemptId !== lease.attemptId ||
+        !isDeepStrictEqual(evidence.binding, lease.binding) ||
+        evidence.projection.identity.activeSessionId !== lease.binding.activeSessionId ||
+        evidence.projection.identity.sessionId !== lease.binding.sessionId ||
+        evidence.projection.identity.sessionFile !== lease.binding.sessionFile ||
+        !sameCanonicalPath(evidence.projection.identity.workspaceDirectory, lease.binding.workspaceDirectory) ||
+        residentPrivateProjectionReportsActivity(evidence.projection)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_IDLE_EVIDENCE_INVALID",
+          "The adapter did not return exact inactive authority evidence for this acknowledged prompt",
+        );
+      }
+      const currentSnapshot = await this.readSnapshotUnlocked(lease.command.threadId);
+      if (
+        currentSnapshot.latestCursor.threadId !== lease.command.threadId ||
+        currentSnapshot.latestCursor.executionGenerationId !== lease.command.expectedExecutionGenerationId ||
+        currentSnapshot.runtime?.residency !== "resident" ||
+        currentSnapshot.runtime.activeSessionId !== lease.binding.activeSessionId ||
+        currentSnapshot.runtime.sessionId !== lease.binding.sessionId ||
+        residentSnapshotReportsActivity(currentSnapshot)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_IDLE_EVIDENCE_SUPERSEDED",
+          "A newer authoritative active projection superseded the observed idle state",
+          true,
+        );
+      }
+
+      const observedAt = now();
+      const completedReceipt = CommandReceiptSchema.parse({
+        ...currentReceipt,
+        status: "completed",
+        queuePosition: undefined,
+        message: "Prime Agent is authoritatively idle after the acknowledged prompt",
+        error: undefined,
+        updatedAt: observedAt,
+      });
+      const observation = ResidentPromptIdleObservedEventSchema.parse({
+        eventVersion: 1,
+        attemptId: attempt.attemptId,
+        observedAt,
+        command: attempt.command,
+        acknowledgedReceipt: currentReceipt,
+        receipt: completedReceipt,
+        binding: currentBinding,
+        bindingFingerprint: attempt.bindingFingerprint,
+        observedCursor: currentSnapshot.latestCursor,
+      });
+      const { promptSettlementCursor: _settlementCursor, ...attemptWithoutSettlementCursor } = attempt;
+      const completedAttempt = ResidentDispatchAttemptSchema.parse({
+        ...attemptWithoutSettlementCursor,
+        binding: currentBinding,
+        updatedAt: observedAt,
+        finalReceipt: completedReceipt,
+        promptIdleObservation: observation,
+      });
+      try {
+        // The completed attempt is the recovery intent. Startup can finish the
+        // remaining local writes without rerunning Prime or trusting a generic
+        // completed receipt as idle evidence.
+        await atomicWriteJson(
+          this.residentDispatchAttemptPath(lease.command),
+          completedAttempt,
+          MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+        );
+        await this.injectResidentDispatchFault("after_prompt_idle_attempt", attempt.attemptId);
+        await atomicWriteJson(this.receiptPath(lease.command), completedReceipt);
+        await this.injectResidentDispatchFault("after_prompt_idle_receipt", attempt.attemptId);
+        await this.appendResidentDispatchJournalUnlocked(
+          lease.command,
+          "completed",
+          observedAt,
+          completedReceipt.message,
+          "idle-completed",
+        );
+        await this.injectResidentDispatchFault("after_prompt_idle_journal", attempt.attemptId);
+        await this.appendResidentPromptIdleEventUnlocked(observation);
+        await this.injectResidentDispatchFault("after_prompt_idle_event", attempt.attemptId);
+        await rm(this.residentDispatchAttemptPath(lease.command), { force: true });
+        this.residentPromptReconciliationLeaseCache.delete(attempt.attemptId);
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return observation;
+    });
+  }
+
+  /** Issue read-only idle-proof authority after one exact Stop was acknowledged. */
+  async beginResidentAbortReconciliation(
+    dispatchLeaseValue: ResidentDispatchLease,
+  ): Promise<ResidentAbortReconciliationLease> {
+    const dispatchLease = validateResidentDispatchLease(dispatchLeaseValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readResidentDispatchAttemptUnlocked(dispatchLease.command);
+      if (
+        !attempt ||
+        attempt.attemptId !== dispatchLease.attemptId ||
+        attempt.dispatchStartedAt !== dispatchLease.dispatchStartedAt ||
+        attempt.bindingFingerprint !== dispatchLease.bindingFingerprint ||
+        !isDeepStrictEqual(attempt.command, dispatchLease.command)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_RECONCILIATION_INELIGIBLE",
+          "No exact acknowledged resident Stop matches this dispatch authority",
+        );
+      }
+      return this.createResidentAbortReconciliationLeaseUnlocked(attempt);
+    });
+  }
+
+  /** Reissue process-local read-only Stop authorities after a host restart. */
+  async listResidentAbortReconciliationLeases(): Promise<readonly ResidentAbortReconciliationLease[]> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+      if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+          "Resident Stop reconciliation cannot inspect an over-capacity attempt store",
+        );
+      }
+      const leases: ResidentAbortReconciliationLease[] = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Resident Stop reconciliation encountered an unexpected attempt entry",
+          );
+        }
+        const attempt = await readJsonFile(
+          join(this.paths.residentDispatchAttempts, entry.name),
+          ResidentDispatchAttemptSchema,
+          { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+        );
+        if (
+          !attempt ||
+          entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`
+        ) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Resident Stop reconciliation attempt does not match its durable filename",
+          );
+        }
+        if (!residentAcknowledgedAbortAttemptRetainsLock(attempt)) continue;
+        leases.push(await this.createResidentAbortReconciliationLeaseUnlocked(attempt));
+      }
+      return Object.freeze(leases);
+    });
+  }
+
+  /**
+   * Commit the dedicated Stop idle observation. A running abort receipt is
+   * only request-acceptance evidence until this path validates the exact
+   * same-connection idle projection and its durable public materialization.
+   */
+  async completeResidentAbortReconciliation(
+    leaseValue: ResidentAbortReconciliationLease,
+    evidence: ResidentAbortIdleAuthorityEvidence,
+  ): Promise<ResidentAbortIdleObservedEvent> {
+    const lease = validateResidentAbortReconciliationLease(leaseValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      if (!this.residentAbortReconciliationLeases.has(lease as object)) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+          "Stop idle completion requires a lease issued by this exact HostStore instance",
+        );
+      }
+      const attempt = await this.readResidentDispatchAttemptUnlocked(lease.command);
+      if (!attempt || !residentAbortReconciliationLeaseMatchesAttempt(lease, attempt)) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+          "The acknowledged Stop changed before idle proof completion",
+        );
+      }
+      const currentReceipt = await this.readReceiptUnlocked(lease.command);
+      if (
+        !currentReceipt ||
+        currentReceipt.status !== "running" ||
+        !attempt.finalReceipt ||
+        !isDeepStrictEqual(currentReceipt, attempt.finalReceipt) ||
+        currentReceipt.updatedAt !== lease.receiptUpdatedAt
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_RECONCILIATION_RECEIPT_CHANGED",
+          "The Stop receipt is no longer at its exact acknowledged-request boundary",
+        );
+      }
+      const currentBinding = await this.resolveResidentDispatchBindingUnlocked(lease.command);
+      if (!isDeepStrictEqual(currentBinding, lease.binding)) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_RECONCILIATION_BINDING_CHANGED",
+          "The resident binding changed after the Stop idle barrier began",
+        );
+      }
+      if (
+        !evidence ||
+        evidence.evidenceVersion !== 1 ||
+        evidence.dispatchAttemptId !== lease.attemptId ||
+        !isDeepStrictEqual(evidence.binding, lease.binding) ||
+        evidence.projection.identity.activeSessionId !== lease.binding.activeSessionId ||
+        evidence.projection.identity.sessionId !== lease.binding.sessionId ||
+        evidence.projection.identity.sessionFile !== lease.binding.sessionFile ||
+        !sameCanonicalPath(evidence.projection.identity.workspaceDirectory, lease.binding.workspaceDirectory) ||
+        residentPrivateProjectionReportsActivity(evidence.projection)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_IDLE_EVIDENCE_INVALID",
+          "The adapter did not return exact inactive authority evidence for this acknowledged Stop",
+        );
+      }
+      const currentSnapshot = await this.readSnapshotUnlocked(lease.command.threadId);
+      if (
+        currentSnapshot.latestCursor.threadId !== lease.command.threadId ||
+        currentSnapshot.latestCursor.executionGenerationId !== lease.command.expectedExecutionGenerationId ||
+        currentSnapshot.latestCursor.generation !== evidence.projection.cursor.generation ||
+        currentSnapshot.latestCursor.sequence !== evidence.projection.cursor.sequence ||
+        currentSnapshot.runtime?.residency !== "resident" ||
+        currentSnapshot.runtime.activeSessionId !== lease.binding.activeSessionId ||
+        currentSnapshot.runtime.sessionId !== lease.binding.sessionId ||
+        residentSnapshotReportsActivity(currentSnapshot) ||
+        residentPublishedProjectionDigest(currentSnapshot) !== residentProjectionDigest(evidence.projection)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_IDLE_EVIDENCE_SUPERSEDED",
+          "The proof-backed Stop idle projection was not durably materialized under the exact authority",
+          true,
+        );
+      }
+
+      const observedAt = now();
+      const completedReceipt = CommandReceiptSchema.parse({
+        ...currentReceipt,
+        status: "completed",
+        queuePosition: undefined,
+        message: "Prime Agent is authoritatively idle after the acknowledged stop request",
+        error: undefined,
+        updatedAt: observedAt,
+      });
+      const observation = ResidentAbortIdleObservedEventSchema.parse({
+        eventVersion: 1,
+        attemptId: attempt.attemptId,
+        observedAt,
+        command: attempt.command,
+        acknowledgedReceipt: currentReceipt,
+        receipt: completedReceipt,
+        binding: currentBinding,
+        bindingFingerprint: attempt.bindingFingerprint,
+        observedCursor: currentSnapshot.latestCursor,
+      });
+      const { abortSettlementCursor: _settlementCursor, ...attemptWithoutSettlementCursor } = attempt;
+      const completedAttempt = ResidentDispatchAttemptSchema.parse({
+        ...attemptWithoutSettlementCursor,
+        binding: currentBinding,
+        updatedAt: observedAt,
+        finalReceipt: completedReceipt,
+        abortIdleObservation: observation,
+      });
+      try {
+        await atomicWriteJson(
+          this.residentDispatchAttemptPath(lease.command),
+          completedAttempt,
+          MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+        );
+        await this.injectResidentDispatchFault("after_abort_idle_attempt", attempt.attemptId);
+        await atomicWriteJson(this.receiptPath(lease.command), completedReceipt);
+        await this.injectResidentDispatchFault("after_abort_idle_receipt", attempt.attemptId);
+        await this.appendResidentDispatchJournalUnlocked(
+          lease.command,
+          "completed",
+          observedAt,
+          completedReceipt.message,
+          "abort-idle-completed",
+        );
+        await this.injectResidentDispatchFault("after_abort_idle_journal", attempt.attemptId);
+        await this.appendResidentAbortIdleEventUnlocked(observation);
+        await this.injectResidentDispatchFault("after_abort_idle_event", attempt.attemptId);
+        await rm(this.residentDispatchAttemptPath(lease.command), { force: true });
+        this.residentAbortReconciliationLeaseCache.delete(attempt.attemptId);
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return observation;
     });
   }
 
@@ -1887,6 +3355,12 @@ export class HostStore {
       );
     }
 
+    await this.assertResidentProjectionPromptRetirementsUnlocked(transaction, currentSnapshot);
+    await this.assertResidentProjectionAbortIdleProofUnlocked(transaction, currentSnapshot);
+    await this.materializeResidentProjectionLineageUnlocked(transaction);
+    if (injectFaults) {
+      await this.injectResidentProjectionFault("after_lineage", transaction.transactionId);
+    }
     await atomicWriteJson(this.snapshotPath(binding.threadId), transaction.snapshot);
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_snapshot", transaction.transactionId);
@@ -1894,6 +3368,20 @@ export class HostStore {
     await atomicWriteJson(this.paths.threads, transaction.threadsFile);
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_threads", transaction.transactionId);
+    }
+    for (const retired of transaction.retiredPromptAttempts) {
+      const path = this.residentDispatchAttemptPath(retired.command);
+      const current = await this.readResidentDispatchAttemptUnlocked(retired.command);
+      if (current && !isDeepStrictEqual(current, retired)) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_LOCK_CONFLICT",
+          "A resident projection cannot retire a different prompt ownership lock",
+        );
+      }
+      if (current) await rm(path, { force: true });
+    }
+    if (injectFaults) {
+      await this.injectResidentProjectionFault("after_prompt_locks", transaction.transactionId);
     }
     await rm(this.residentProjectionTransactionPath(binding), { force: true });
   }
@@ -1951,13 +3439,20 @@ export class HostStore {
           `Resident projection transaction filename does not match ${transaction.transactionId}`,
         );
       }
-      const expectedTransactionId = deterministicId(
-        "resident-projection",
-        transaction.binding.threadId,
-        transaction.binding.executionGenerationId,
-        transaction.snapshot.latestCursor.generation,
-        String(transaction.snapshot.latestCursor.sequence),
-      );
+      const expectedTransactionId = transaction.abortIdleProofAttempt
+        ? deterministicId(
+            "resident-abort-idle-projection",
+            transaction.abortIdleProofAttempt.attemptId,
+            transaction.snapshot.latestCursor.generation,
+            String(transaction.snapshot.latestCursor.sequence),
+          )
+        : deterministicId(
+            "resident-projection",
+            transaction.binding.threadId,
+            transaction.binding.executionGenerationId,
+            transaction.snapshot.latestCursor.generation,
+            String(transaction.snapshot.latestCursor.sequence),
+          );
       if (transaction.transactionId !== expectedTransactionId) {
         throw new HostStoreError(
           "INVALID_RESIDENT_PROJECTION_TRANSACTION",
@@ -1965,6 +3460,178 @@ export class HostStore {
         );
       }
       await this.materializeResidentProjectionTransactionUnlocked(transaction, false);
+    }
+  }
+
+  private async validateResidentProjectionLineageDirectoryUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentProjectionLineages, { withFileTypes: true });
+    if (entries.length > MAX_RESIDENT_PROJECTION_LINEAGES) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_LINEAGE_LIMIT",
+        `Resident projection lineage directory exceeds ${MAX_RESIDENT_PROJECTION_LINEAGES} entries`,
+      );
+    }
+    const authorityIds = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_LINEAGE_INVALID",
+          "Resident projection lineage directory contains a non-file entry",
+        );
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        await rm(join(this.paths.residentProjectionLineages, entry.name), { force: true });
+        continue;
+      }
+      if (!entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_LINEAGE_INVALID",
+          `Unexpected resident projection lineage file ${entry.name}`,
+        );
+      }
+      const lineage = await readJsonFile(
+        join(this.paths.residentProjectionLineages, entry.name),
+        ResidentProjectionCursorLineageSchema,
+        { maxBytes: MAX_RESIDENT_PROJECTION_LINEAGE_BYTES },
+      );
+      if (!lineage) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_LINEAGE_INVALID",
+          `Missing resident projection lineage ${entry.name}`,
+        );
+      }
+      if (entry.name !== this.residentProjectionLineageName(lineage.authorityId)) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_LINEAGE_INVALID",
+          "Resident projection lineage filename does not match its stable authority",
+        );
+      }
+      if (authorityIds.has(lineage.authorityId)) {
+        throw new HostStoreError(
+          "RESIDENT_PROJECTION_LINEAGE_INVALID",
+          "Resident projection authority has duplicate durable lineage files",
+        );
+      }
+      authorityIds.add(lineage.authorityId);
+    }
+  }
+
+  private async assertResidentProjectionLineageCapacityUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentProjectionLineages, { withFileTypes: true });
+    const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+    if (files.length >= MAX_RESIDENT_PROJECTION_LINEAGES) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_LINEAGE_LIMIT",
+        "The resident projection authority lineage registry is full",
+      );
+    }
+    if (files.length !== entries.length) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_LINEAGE_INVALID",
+        "Resident projection lineage storage contains an unexpected entry",
+      );
+    }
+  }
+
+  private async readResidentProjectionLineageUnlocked(
+    authority: ResidentProjectionAuthority,
+  ): Promise<ResidentProjectionCursorLineage | undefined> {
+    const authorityId = residentProjectionAuthorityId(authority);
+    const lineage = await readJsonFile(
+      this.residentProjectionLineagePath(authorityId),
+      ResidentProjectionCursorLineageSchema,
+      { optional: true, maxBytes: MAX_RESIDENT_PROJECTION_LINEAGE_BYTES },
+    );
+    if (
+      lineage &&
+      (lineage.authorityId !== authorityId || !isDeepStrictEqual(lineage.authority, authority))
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_LINEAGE_INVALID",
+        "Resident projection lineage does not match its stable authority",
+      );
+    }
+    return lineage;
+  }
+
+  private async materializeResidentProjectionLineageUnlocked(
+    transaction: ResidentProjectionTransaction,
+  ): Promise<void> {
+    const authority = residentProjectionAuthorityFromBinding(transaction.binding);
+    const current = await this.readResidentProjectionLineageUnlocked(authority);
+    const alreadyMaterialized = current && isDeepStrictEqual(current, transaction.nextLineage);
+    const matchesPrevious =
+      transaction.previousLineage === undefined
+        ? current === undefined
+        : current !== undefined && isDeepStrictEqual(current, transaction.previousLineage);
+    if (!alreadyMaterialized && !matchesPrevious) {
+      throw new HostStoreError(
+        "RESIDENT_PROJECTION_LINEAGE_CONFLICT",
+        "Prepared resident projection no longer follows its exact durable lineage",
+      );
+    }
+    await atomicWriteJson(
+      this.residentProjectionLineagePath(transaction.nextLineage.authorityId),
+      transaction.nextLineage,
+      MAX_RESIDENT_PROJECTION_LINEAGE_BYTES,
+    );
+  }
+
+  private async assertResidentProjectionPromptRetirementsUnlocked(
+    transaction: ResidentProjectionTransaction,
+    currentSnapshot: ThreadProjectionSnapshot,
+  ): Promise<void> {
+    if (transaction.retiredPromptAttempts.length === 0) return;
+    const authority = residentProjectionAuthorityFromBinding(transaction.binding);
+    const [currentLineage, threads] = await Promise.all([
+      this.readResidentProjectionLineageUnlocked(authority),
+      this.readThreadsUnlocked(),
+    ]);
+    const catalogThread = threads.find((thread) => thread.threadId === transaction.binding.threadId);
+    const publicationAlreadyMaterialized =
+      isDeepStrictEqual(currentLineage, transaction.nextLineage) &&
+      isDeepStrictEqual(currentSnapshot, transaction.snapshot) &&
+      isDeepStrictEqual(catalogThread, transaction.snapshot.thread);
+    for (const retired of transaction.retiredPromptAttempts) {
+      const current = await this.readResidentDispatchAttemptUnlocked(retired.command);
+      if (current && !isDeepStrictEqual(current, retired)) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_LOCK_CONFLICT",
+          "Prepared resident projection targets a different prompt ownership lock",
+        );
+      }
+      if (!current && !publicationAlreadyMaterialized) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_LOCK_MISSING",
+          "Prepared resident projection lost its prompt lock before public materialization",
+        );
+      }
+    }
+  }
+
+  private async assertResidentProjectionAbortIdleProofUnlocked(
+    transaction: ResidentProjectionTransaction,
+    currentSnapshot: ThreadProjectionSnapshot,
+  ): Promise<void> {
+    const expected = transaction.abortIdleProofAttempt;
+    if (!expected) return;
+    const current = await this.readResidentDispatchAttemptUnlocked(expected.command);
+    const currentLineage = await this.readResidentProjectionLineageUnlocked(
+      residentProjectionAuthorityFromBinding(transaction.binding),
+    );
+    const threads = await this.readThreadsUnlocked();
+    const catalogThread = threads.find((thread) => thread.threadId === transaction.binding.threadId);
+    const publicationAlreadyMaterialized =
+      isDeepStrictEqual(currentLineage, transaction.nextLineage) &&
+      isDeepStrictEqual(currentSnapshot, transaction.snapshot) &&
+      isDeepStrictEqual(catalogThread, transaction.snapshot.thread);
+    if (!current || !isDeepStrictEqual(current, expected)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_LOCK_CONFLICT",
+        publicationAlreadyMaterialized
+          ? "A materialized Stop idle projection lost its exact proof lock before transaction retirement"
+          : "A prepared Stop idle projection no longer matches its exact acknowledged Stop lock",
+      );
     }
   }
 
@@ -1980,6 +3647,7 @@ export class HostStore {
     const thread = threadIndex >= 0 ? threads[threadIndex] : undefined;
     let rejection: StructuredError | undefined;
     let sourceSnapshot: ThreadProjectionSnapshot | undefined;
+    let residentDispatchBinding: ResidentSessionBinding | undefined;
     let modelSelectionBinding: ResidentSessionBinding | undefined;
 
     if (!thread) {
@@ -2013,6 +3681,88 @@ export class HostStore {
             : structured("RESIDENT_BINDING_UNAVAILABLE", "Resident session authority is unavailable", true);
         }
       }
+      let promptLock: ResidentDispatchAttempt | undefined;
+      let abortLock: ResidentDispatchAttempt | undefined;
+      if (
+        !rejection &&
+        canDispatchLive &&
+        (command.command.kind === "prompt" || command.command.kind === "abort")
+      ) {
+        try {
+          promptLock = await this.findResidentPromptLockUnlocked(command.threadId);
+          abortLock = await this.findResidentAbortLockUnlocked(command.threadId);
+          if (abortLock) {
+            const abortBarrier = residentAcknowledgedAbortAttemptRetainsLock(abortLock)
+              ? {
+                  code: "RESIDENT_ABORT_IDLE_PROOF_PENDING",
+                  message: "The acknowledged Stop is still waiting for authoritative idle proof",
+                  retryable: true,
+                }
+              : residentAbortAttemptRetainsBarrier(abortLock)
+                ? {
+                    code: "RESIDENT_ABORT_OUTCOME_UNCERTAIN",
+                    message: "A previous Stop may still take effect; new resident mutations require stronger quiescence proof or verified session rotation",
+                    retryable: false,
+                  }
+                : {
+                    code: "RESIDENT_ABORT_DELIVERY_PENDING",
+                    message: "A Stop is already crossing its non-replayable resident dispatch boundary",
+                    retryable: true,
+                  };
+            rejection = structured(
+              abortBarrier.code,
+              abortBarrier.message,
+              abortBarrier.retryable,
+            );
+          } else if (
+            command.command.kind === "prompt" &&
+            (promptLock || (sourceSnapshot && residentSnapshotReportsActivity(sourceSnapshot)))
+          ) {
+            rejection = structured(
+              promptLock ? "RESIDENT_PROMPT_ALREADY_OWNED" : "RESIDENT_SESSION_BUSY",
+              promptLock
+                ? "A resident prompt is already admitted or awaiting authoritative idle projection"
+                : "The authoritative resident projection already reports active work",
+              true,
+            );
+          } else if (
+            command.command.kind === "abort" &&
+            sourceSnapshot &&
+            !residentSnapshotReportsActivity(sourceSnapshot) &&
+            (!promptLock || !residentPromptAttemptRetainsLock(promptLock))
+          ) {
+            rejection = promptLock
+              ? structured(
+                  "RESIDENT_PROMPT_DELIVERY_PENDING",
+                  "The admitted prompt has not reached an acknowledged resident dispatch boundary",
+                  true,
+                )
+              : structured(
+                  "RESIDENT_SESSION_IDLE",
+                  "The resident session has no active turn or acknowledged prompt to stop",
+                  false,
+                );
+          }
+        } catch (error) {
+          rejection = error instanceof HostStoreError
+            ? error.toStructuredError()
+            : structured("RESIDENT_DISPATCH_STATE_UNAVAILABLE", "Resident dispatch ownership is unavailable", true);
+        }
+      }
+      if (
+        !rejection &&
+        canDispatchLive &&
+        (command.command.kind === "prompt" || command.command.kind === "abort")
+      ) {
+        try {
+          await this.assertResidentDispatchAttemptCapacityUnlocked();
+          residentDispatchBinding = await this.resolveResidentDispatchBindingUnlocked(command);
+        } catch (error) {
+          rejection = error instanceof HostStoreError
+            ? error.toStructuredError()
+            : structured("RESIDENT_BINDING_UNAVAILABLE", "Resident session authority is unavailable", true);
+        }
+      }
       if (
         !rejection &&
         command.command.kind !== "abort" &&
@@ -2030,6 +3780,8 @@ export class HostStore {
         ? "Abort admitted for live dispatch"
         : command.command.kind === "model.select"
           ? "Model selection admitted for live dispatch"
+          : command.command.kind === "prompt" && residentDispatchBinding
+            ? "Prompt admitted for resident dispatch"
           : "Queued durably on host");
     let snapshot: ThreadProjectionSnapshot | undefined;
     let threadsFile: z.infer<typeof ThreadFileSchema> | undefined;
@@ -2038,7 +3790,8 @@ export class HostStore {
       sourceSnapshot &&
       thread &&
       command.command.kind !== "abort" &&
-      command.command.kind !== "model.select"
+      command.command.kind !== "model.select" &&
+      residentDispatchBinding === undefined
     ) {
       snapshot = applyCommand(sourceSnapshot, command, canDispatchLive);
       const updatedThreads = [...threads];
@@ -2061,7 +3814,8 @@ export class HostStore {
       queuePosition:
         initialStatus === "admitted" &&
         command.command.kind !== "abort" &&
-        command.command.kind !== "model.select"
+        command.command.kind !== "model.select" &&
+        residentDispatchBinding === undefined
           ? (sourceSnapshot?.queueState.pendingCommandIds.length ?? 0) + 1
           : undefined,
       message: initialMessage,
@@ -2117,6 +3871,21 @@ export class HostStore {
         command,
         recordedAt: preparedAt,
       }),
+      ...(initialStatus === "admitted" && residentDispatchBinding
+        ? {
+            residentDispatchAttempt: ResidentDispatchAttemptSchema.parse({
+              version: 1,
+              attemptId: deterministicId("resident-dispatch", command.deviceId, command.commandId),
+              command,
+              binding: residentDispatchBinding,
+              bindingFingerprint: residentDispatchAuthorityFingerprint(residentDispatchBinding),
+              admissionCursor: sourceSnapshot?.latestCursor,
+              state: "admitted",
+              admittedAt: preparedAt,
+              updatedAt: preparedAt,
+            }),
+          }
+        : {}),
       ...(command.command.kind === "model.select"
         ? {
             modelSelectionIdentity: ModelSelectionIdentityRecordSchema.parse({
@@ -2168,6 +3937,28 @@ export class HostStore {
     }
     await atomicWriteJson(commandIdentityPath, transaction.commandIdentity, MAX_COMMAND_IDENTITY_BYTES);
     if (injectFaults) await this.injectAdmissionFault("after_command_identity", transaction.transactionId);
+
+    if (transaction.residentDispatchAttempt) {
+      const attemptPath = this.residentDispatchAttemptPath(transaction.command);
+      const existingAttempt = await readJsonFile(attemptPath, ResidentDispatchAttemptSchema, {
+        optional: true,
+        maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+      });
+      if (existingAttempt && !isDeepStrictEqual(existingAttempt, transaction.residentDispatchAttempt)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_CONFLICT",
+          `Admission transaction ${transaction.transactionId} conflicts with its durable resident dispatch attempt`,
+        );
+      }
+      await atomicWriteJson(
+        attemptPath,
+        transaction.residentDispatchAttempt,
+        MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+      );
+      if (injectFaults) {
+        await this.injectAdmissionFault("after_resident_dispatch_attempt", transaction.transactionId);
+      }
+    }
 
     if (transaction.modelSelectionIdentity) {
       const identityPath = this.modelSelectionIdentityPath(transaction.command);
@@ -2697,6 +4488,554 @@ export class HostStore {
     }
   }
 
+  private async recoverInterruptedResidentDispatchesUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        `Resident dispatch attempt directory exceeds ${MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS} entries`,
+      );
+    }
+
+    const attemptNames: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt directory contains a non-file entry",
+        );
+      }
+      if (entry.name.endsWith(".json")) {
+        attemptNames.push(entry.name);
+        continue;
+      }
+      if (entry.name.includes(".json.tmp-")) {
+        await rm(join(this.paths.residentDispatchAttempts, entry.name), { force: true });
+        continue;
+      }
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+        `Unexpected resident dispatch attempt file ${entry.name}`,
+      );
+    }
+
+    attemptNames.sort();
+    for (const name of attemptNames) {
+      const path = join(this.paths.residentDispatchAttempts, name);
+      const attempt = await readJsonFile(path, ResidentDispatchAttemptSchema, {
+        maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+      });
+      if (!attempt) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          `Missing resident dispatch attempt ${name}`,
+        );
+      }
+      const expectedName = `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`;
+      if (name !== expectedName) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt filename does not match its command identity",
+        );
+      }
+      const identity = await this.readCommandIdentityUnlocked(attempt.command);
+      if (!identity || !isDeepStrictEqual(identity.command, attempt.command)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt has no exact durable command identity",
+        );
+      }
+      const host = await this.readHostUnlocked();
+      if (attempt.command.expectedHostId !== host.hostId) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt belongs to a different host authority",
+        );
+      }
+      const currentBinding = await this.resolveResidentDispatchBindingUnlocked(attempt.command);
+      if (
+        residentDispatchAuthorityFingerprint(currentBinding) !== attempt.bindingFingerprint
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt no longer matches its durable session authority",
+        );
+      }
+      const current = await this.readReceiptUnlocked(attempt.command);
+      if (!current) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch attempt has no durable command receipt",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, attempt.command);
+
+      if (attempt.state === "settled") {
+        const finalReceipt = attempt.finalReceipt;
+        if (!finalReceipt) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Settled resident dispatch attempt has no final receipt",
+          );
+        }
+        if (attempt.promptIdleObservation) {
+          const observation = attempt.promptIdleObservation;
+          if (
+            !isDeepStrictEqual(current, observation.acknowledgedReceipt) &&
+            !isDeepStrictEqual(current, finalReceipt)
+          ) {
+            throw new HostStoreError(
+              "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+              "Proof-backed prompt completion conflicts with its durable receipt lifecycle",
+            );
+          }
+          // The persisted observation is the recovery intent. Complete the
+          // exact local ordering without invoking Prime, replaying the prompt,
+          // or treating an unrelated completed receipt as idle evidence.
+          await atomicWriteJson(this.receiptPath(attempt.command), finalReceipt);
+          await this.appendResidentDispatchJournalUnlocked(
+            attempt.command,
+            "completed",
+            observation.observedAt,
+            finalReceipt.message,
+            "idle-completed",
+          );
+          await this.appendResidentPromptIdleEventUnlocked(observation);
+          await rm(path, { force: true });
+          this.residentPromptReconciliationLeaseCache.delete(attempt.attemptId);
+          continue;
+        }
+        if (attempt.abortIdleObservation) {
+          const observation = attempt.abortIdleObservation;
+          if (
+            !isDeepStrictEqual(current, observation.acknowledgedReceipt) &&
+            !isDeepStrictEqual(current, finalReceipt)
+          ) {
+            throw new HostStoreError(
+              "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+              "Proof-backed Stop completion conflicts with its durable receipt lifecycle",
+            );
+          }
+          await atomicWriteJson(this.receiptPath(attempt.command), finalReceipt);
+          await this.appendResidentDispatchJournalUnlocked(
+            attempt.command,
+            "completed",
+            observation.observedAt,
+            finalReceipt.message,
+            "abort-idle-completed",
+          );
+          await this.appendResidentAbortIdleEventUnlocked(observation);
+          await rm(path, { force: true });
+          this.residentAbortReconciliationLeaseCache.delete(attempt.attemptId);
+          continue;
+        }
+        const preparedStatus = "admitted";
+        if (current.status !== preparedStatus && !isDeepStrictEqual(current, finalReceipt)) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Settled resident dispatch conflicts with its durable receipt",
+          );
+        }
+        await atomicWriteJson(this.receiptPath(attempt.command), finalReceipt);
+        await this.appendResidentDispatchJournalUnlocked(
+          attempt.command,
+          finalReceipt.status,
+          finalReceipt.updatedAt,
+          finalReceipt.message,
+          attempt.dispatchStartedAt ? "settled" : "failed-before-start",
+        );
+        if (!residentDispatchAttemptRetainsReconciliation(attempt)) {
+          await rm(path, { force: true });
+        }
+        continue;
+      }
+
+      if (attempt.state === "admitted") {
+        const alreadyRecovered =
+          current.status === "failed" && current.error?.code === "RESIDENT_DISPATCH_NOT_STARTED";
+        if (current.status !== "admitted" && !alreadyRecovered) {
+          throw new HostStoreError(
+            "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+            "Prepared resident dispatch conflicts with its pre-dispatch receipt",
+          );
+        }
+        const failed = alreadyRecovered
+          ? current
+          : CommandReceiptSchema.parse({
+              ...current,
+              status: "failed",
+              queuePosition: undefined,
+              message: "Host service restarted before resident dispatch began; nothing was sent to Prime Agent",
+              error: {
+                code: "RESIDENT_DISPATCH_NOT_STARTED",
+                message: "The admitted resident command never crossed the upstream dispatch boundary",
+                retryable: false,
+              },
+              updatedAt: now(),
+            });
+        await atomicWriteJson(this.receiptPath(attempt.command), failed);
+        await this.appendResidentDispatchJournalUnlocked(
+          attempt.command,
+          "failed",
+          failed.updatedAt,
+          failed.message,
+          "recovered-not-started",
+        );
+        await rm(path, { force: true });
+        continue;
+      }
+
+      const alreadyRecovered =
+        current.status === "uncertain" && current.error?.code === "RESIDENT_DISPATCH_RESTART_UNCERTAIN";
+      if (current.status !== "admitted" && current.status !== "running" && !alreadyRecovered) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Dispatching resident attempt conflicts with its no-replay receipt lifecycle",
+        );
+      }
+      const recoveryError = {
+        code: "RESIDENT_DISPATCH_RESTART_UNCERTAIN" as const,
+        message: "The Prime Agent outcome cannot be proven after the host process identity changed",
+        retryable: false,
+        diagnosticId: attempt.attemptId,
+        details: {
+          operation: attempt.command.command.kind,
+          replayed: false,
+        },
+      };
+      const uncertain = CommandReceiptSchema.parse({
+        ...current,
+        status: "uncertain",
+        queuePosition: undefined,
+        ...(alreadyRecovered
+          ? {}
+          : {
+              message: "Host service restarted after resident dispatch began; the command was not replayed",
+              updatedAt: now(),
+            }),
+        error: recoveryError,
+      });
+      const settledAttempt = ResidentDispatchAttemptSchema.parse({
+        ...attempt,
+        state: "settled",
+        updatedAt: uncertain.updatedAt,
+        settledAt: uncertain.updatedAt,
+        finalReceipt: uncertain,
+        ...(attempt.command.command.kind === "prompt"
+          ? { promptSettlementCursor: (await this.readSnapshotUnlocked(attempt.command.threadId)).latestCursor }
+          : attempt.command.command.kind === "abort"
+            ? { abortSettlementCursor: (await this.readSnapshotUnlocked(attempt.command.threadId)).latestCursor }
+            : {}),
+      });
+      await atomicWriteJson(path, settledAttempt, MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES);
+      await atomicWriteJson(this.receiptPath(attempt.command), uncertain);
+      await this.appendResidentDispatchJournalUnlocked(
+        attempt.command,
+        "uncertain",
+        uncertain.updatedAt,
+        uncertain.message,
+        "recovered-uncertain",
+      );
+      if (!residentDispatchAttemptRetainsReconciliation(settledAttempt)) {
+        await rm(path, { force: true });
+      }
+    }
+  }
+
+  private async assertResidentDispatchAttemptCapacityUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    const attempts = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+    if (attempts.length >= MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "The host is already tracking the maximum number of non-replayable resident commands",
+        true,
+      );
+    }
+    if (
+      entries.some(
+        (entry) =>
+          !entry.isFile() ||
+          (!entry.name.endsWith(".json") && !entry.name.includes(".json.tmp-")),
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+        "Resident dispatch attempt storage contains an unexpected entry",
+      );
+    }
+  }
+
+  private async findResidentPromptLockUnlocked(threadId: string): Promise<ResidentDispatchAttempt | undefined> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "Resident prompt ownership cannot be inspected because its bounded store is full",
+      );
+    }
+    let match: ResidentDispatchAttempt | undefined;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident prompt ownership storage contains an unexpected entry",
+        );
+      }
+      const attempt = await readJsonFile(
+        join(this.paths.residentDispatchAttempts, entry.name),
+        ResidentDispatchAttemptSchema,
+        { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+      );
+      if (
+        !attempt ||
+        entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident prompt ownership file does not match its exact command identity",
+        );
+      }
+      if (attempt.command.command.kind !== "prompt" || attempt.command.threadId !== threadId) continue;
+      if (match) {
+        throw new HostStoreError(
+          "RESIDENT_PROMPT_LOCK_CONFLICT",
+          "A thread has more than one durable resident prompt ownership lock",
+        );
+      }
+      match = attempt;
+    }
+    return match;
+  }
+
+  private async findResidentAbortLockUnlocked(threadId: string): Promise<ResidentDispatchAttempt | undefined> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "Resident Stop ownership cannot be inspected because its bounded store is full",
+      );
+    }
+    let match: ResidentDispatchAttempt | undefined;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident Stop ownership storage contains an unexpected entry",
+        );
+      }
+      const attempt = await readJsonFile(
+        join(this.paths.residentDispatchAttempts, entry.name),
+        ResidentDispatchAttemptSchema,
+        { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+      );
+      if (
+        !attempt ||
+        entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident Stop ownership file does not match its exact command identity",
+        );
+      }
+      if (
+        attempt.command.command.kind !== "abort" ||
+        attempt.command.threadId !== threadId
+      ) continue;
+      if (match) {
+        throw new HostStoreError(
+          "RESIDENT_ABORT_LOCK_CONFLICT",
+          "A thread has more than one acknowledged resident Stop idle-proof lock",
+        );
+      }
+      match = attempt;
+    }
+    return match;
+  }
+
+  private async createResidentPromptReconciliationLeaseUnlocked(
+    attempt: ResidentDispatchAttempt,
+  ): Promise<ResidentPromptReconciliationLease> {
+    if (
+      !residentAcknowledgedPromptAttemptRetainsLock(attempt) ||
+      !attempt.dispatchStartedAt ||
+      !attempt.settledAt ||
+      !attempt.finalReceipt ||
+      !attempt.promptSettlementCursor
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROMPT_RECONCILIATION_INELIGIBLE",
+        "Only an exact settled acknowledged-running prompt may acquire an idle reconciliation lease",
+      );
+    }
+    const currentReceipt = await this.readReceiptUnlocked(attempt.command);
+    if (!currentReceipt || !isDeepStrictEqual(currentReceipt, attempt.finalReceipt)) {
+      throw new HostStoreError(
+        "RESIDENT_PROMPT_RECONCILIATION_RECEIPT_CHANGED",
+        "The acknowledged prompt receipt changed before idle reconciliation could begin",
+      );
+    }
+    const binding = await this.resolveResidentDispatchBindingUnlocked(attempt.command);
+    if (
+      !isDeepStrictEqual(
+        residentProjectionAuthorityFromBinding(binding),
+        residentProjectionAuthorityFromBinding(attempt.binding),
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROMPT_RECONCILIATION_BINDING_CHANGED",
+        "The resident session authority changed before idle reconciliation could begin",
+      );
+    }
+    const cached = this.residentPromptReconciliationLeaseCache.get(attempt.attemptId);
+    if (
+      cached &&
+      cached.dispatchStartedAt === attempt.dispatchStartedAt &&
+      cached.settledAt === attempt.settledAt &&
+      cached.receiptUpdatedAt === currentReceipt.updatedAt &&
+      isDeepStrictEqual(cached.command, attempt.command) &&
+      isDeepStrictEqual(cached.binding, binding) &&
+      isDeepStrictEqual(cached.settlementCursor, attempt.promptSettlementCursor)
+    ) {
+      return cached;
+    }
+    const lease = createResidentPromptReconciliationLease(attempt, binding);
+    this.residentPromptReconciliationLeases.add(lease as object);
+    this.residentPromptReconciliationLeaseCache.set(attempt.attemptId, lease);
+    return lease;
+  }
+
+  private async createResidentAbortReconciliationLeaseUnlocked(
+    attempt: ResidentDispatchAttempt,
+  ): Promise<ResidentAbortReconciliationLease> {
+    if (
+      !residentAcknowledgedAbortAttemptRetainsLock(attempt) ||
+      !attempt.dispatchStartedAt ||
+      !attempt.settledAt ||
+      !attempt.finalReceipt ||
+      !attempt.abortSettlementCursor
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_INELIGIBLE",
+        "Only an exact acknowledged-running Stop may acquire an idle reconciliation lease",
+      );
+    }
+    const currentReceipt = await this.readReceiptUnlocked(attempt.command);
+    if (!currentReceipt || !isDeepStrictEqual(currentReceipt, attempt.finalReceipt)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_RECEIPT_CHANGED",
+        "The acknowledged Stop receipt changed before idle reconciliation could begin",
+      );
+    }
+    const binding = await this.resolveResidentDispatchBindingUnlocked(attempt.command);
+    if (
+      !isDeepStrictEqual(
+        residentProjectionAuthorityFromBinding(binding),
+        residentProjectionAuthorityFromBinding(attempt.binding),
+      )
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_BINDING_CHANGED",
+        "The resident session authority changed before Stop idle reconciliation could begin",
+      );
+    }
+    const cached = this.residentAbortReconciliationLeaseCache.get(attempt.attemptId);
+    if (
+      cached &&
+      cached.dispatchStartedAt === attempt.dispatchStartedAt &&
+      cached.settledAt === attempt.settledAt &&
+      cached.receiptUpdatedAt === currentReceipt.updatedAt &&
+      isDeepStrictEqual(cached.command, attempt.command) &&
+      isDeepStrictEqual(cached.binding, binding) &&
+      isDeepStrictEqual(cached.settlementCursor, attempt.abortSettlementCursor)
+    ) {
+      return cached;
+    }
+    const lease = createResidentAbortReconciliationLease(attempt, binding);
+    this.residentAbortReconciliationLeases.add(lease as object);
+    this.residentAbortReconciliationLeaseCache.set(attempt.attemptId, lease);
+    return lease;
+  }
+
+  private async assertResidentAbortIdleProjectionAuthorityUnlocked(
+    lease: ResidentAbortReconciliationLease,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ): Promise<ResidentDispatchAttempt> {
+    if (!this.residentAbortReconciliationLeases.has(lease as object)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+        "A same-cursor idle projection requires a lease issued by this exact HostStore instance",
+      );
+    }
+    const attempt = await this.readResidentDispatchAttemptUnlocked(lease.command);
+    if (!attempt || !residentAbortReconciliationLeaseMatchesAttempt(lease, attempt)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+        "The acknowledged Stop changed before its idle projection could be published",
+      );
+    }
+    const currentReceipt = await this.readReceiptUnlocked(lease.command);
+    if (!currentReceipt || !isDeepStrictEqual(currentReceipt, attempt.finalReceipt)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_RECEIPT_CHANGED",
+        "The Stop receipt changed before its idle projection could be published",
+      );
+    }
+    const currentBinding = await this.resolveResidentDispatchBindingUnlocked(lease.command);
+    if (!isDeepStrictEqual(currentBinding, lease.binding) || !isDeepStrictEqual(binding, lease.binding)) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_RECONCILIATION_BINDING_CHANGED",
+        "The resident binding changed before the Stop idle projection could be published",
+      );
+    }
+    if (
+      projection.identity.activeSessionId !== binding.activeSessionId ||
+      projection.identity.sessionId !== binding.sessionId ||
+      projection.identity.sessionFile !== binding.sessionFile ||
+      !sameCanonicalPath(projection.identity.workspaceDirectory, binding.workspaceDirectory) ||
+      residentPrivateProjectionReportsActivity(projection)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_ABORT_IDLE_EVIDENCE_INVALID",
+        "Only exact inactive same-connection evidence may publish the Stop idle projection",
+      );
+    }
+    return attempt;
+  }
+
+  private async assertNoResidentDispatchTransitionUnlocked(threadId: string, message: string): Promise<void> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "Resident dispatch authority cannot be inspected because its bounded store is full",
+      );
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch authority cannot be inspected because its storage contains an unexpected entry",
+        );
+      }
+      const attempt = await readJsonFile(
+        join(this.paths.residentDispatchAttempts, entry.name),
+        ResidentDispatchAttemptSchema,
+        { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+      );
+      if (!attempt) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch authority cannot be inspected because an attempt is missing",
+        );
+      }
+      if (attempt.command.threadId === threadId) {
+        throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+      }
+    }
+  }
+
   private async assertModelSelectionAttemptCapacityUnlocked(): Promise<void> {
     const entries = await readdir(this.modelSelectionAttemptsDirectory(), { withFileTypes: true });
     const attempts = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
@@ -2736,6 +5075,15 @@ export class HostStore {
     return readJsonFile(this.modelSelectionAttemptPath(command), ModelSelectionAttemptSchema, {
       optional: true,
       maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+    });
+  }
+
+  private async readResidentDispatchAttemptUnlocked(
+    command: CommandIdentity,
+  ): Promise<ResidentDispatchAttempt | undefined> {
+    return readJsonFile(this.residentDispatchAttemptPath(command), ResidentDispatchAttemptSchema, {
+      optional: true,
+      maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
     });
   }
 
@@ -2812,6 +5160,13 @@ export class HostStore {
     transactionId: string,
   ): Promise<void> {
     await this.options.residentProjectionFaultInjector?.(point, transactionId);
+  }
+
+  private async injectResidentDispatchFault(
+    point: ResidentDispatchFaultPoint,
+    attemptId: string,
+  ): Promise<void> {
+    await this.options.residentDispatchFaultInjector?.(point, attemptId);
   }
 
   private async seedIfEmptyUnlocked(): Promise<SeedResult> {
@@ -2967,6 +5322,55 @@ export class HostStore {
       throw new HostStoreError(
         "MODEL_SELECTION_AUTHORITY_INVALID",
         "The authoritative thread snapshot does not match model-selection admission",
+      );
+    }
+    const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+    const binding = (await this.readResidentSessionBindingsUnlocked()).find(
+      (candidate) => candidate.threadId === scope.threadId,
+    );
+    if (!binding) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_NOT_FOUND",
+        "No active resident Prime Agent session is bound to this execution generation",
+        true,
+      );
+    }
+    this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+    return validateResidentSessionBinding(binding);
+  }
+
+  private async resolveResidentDispatchBindingUnlocked(command: CommandEnvelope): Promise<ResidentSessionBinding> {
+    if (command.command.kind !== "prompt" && command.command.kind !== "abort") {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_COMMAND_REQUIRED",
+        "Resident dispatch accepts only prompt and abort commands",
+      );
+    }
+    this.assertResidentSubsystemAvailable();
+    const host = await this.readHostUnlocked();
+    if (command.expectedHostId !== host.hostId) {
+      throw new HostStoreError(
+        "HOST_AUTHORITY_MISMATCH",
+        "The resident command was composed for a different host authority",
+      );
+    }
+    const scope = await this.currentWorkspaceScopeUnlocked(
+      command.threadId,
+      command.expectedExecutionGenerationId,
+    );
+    const snapshot = await this.readSnapshotUnlocked(command.threadId);
+    if (
+      snapshot.thread.threadId !== scope.threadId ||
+      snapshot.thread.currentLocation.hostId !== scope.hostId ||
+      snapshot.thread.currentLocation.projectId !== scope.projectId ||
+      snapshot.thread.currentLocation.workspaceId !== scope.workspaceId ||
+      snapshot.thread.currentLocation.executionGenerationId !== scope.executionGenerationId ||
+      snapshot.latestCursor.threadId !== scope.threadId ||
+      snapshot.latestCursor.executionGenerationId !== scope.executionGenerationId
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_AUTHORITY_INVALID",
+        "The authoritative thread snapshot does not match resident dispatch admission",
       );
     }
     const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
@@ -3243,6 +5647,89 @@ export class HostStore {
     );
   }
 
+  private async appendResidentDispatchJournalUnlocked(
+    command: CommandEnvelope,
+    status: CommandReceiptStatus,
+    recordedAt: string,
+    message: string | undefined,
+    phase:
+      | "dispatching"
+      | "settled"
+      | "idle-completed"
+      | "abort-idle-completed"
+      | "failed-before-start"
+      | "recovered-not-started"
+      | "recovered-uncertain",
+  ): Promise<void> {
+    if (command.command.kind !== "prompt" && command.command.kind !== "abort") {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_COMMAND_REQUIRED",
+        "The resident dispatch journal accepts only exact prompt and abort envelopes",
+      );
+    }
+    await appendJsonLineOnce(
+      this.paths.commandJournal,
+      CommandJournalRecordSchema.parse({
+        version: 1,
+        journalId: deterministicId(
+          "journal",
+          "resident-dispatch",
+          command.deviceId,
+          command.commandId,
+          phase,
+        ),
+        recordedAt,
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        commandKind: command.command.kind,
+        status,
+        message,
+      }),
+      "journalId",
+    );
+  }
+
+  private async appendResidentPromptIdleEventUnlocked(
+    observationValue: ResidentPromptIdleObservedEvent,
+  ): Promise<void> {
+    const observation = ResidentPromptIdleObservedEventSchema.parse(observationValue);
+    await appendJsonLineOnce(
+      this.paths.eventJournal,
+      EventJournalRecordSchema.parse({
+        version: 1,
+        eventId: deterministicId("event", "resident-prompt-idle", observation.attemptId),
+        recordedAt: observation.observedAt,
+        type: "resident.prompt_idle_observed",
+        threadId: observation.command.threadId,
+        sequence: observation.observedCursor.sequence,
+        detail: observation.command.commandId,
+        residentPromptIdleObserved: observation,
+      }),
+      "eventId",
+    );
+  }
+
+  private async appendResidentAbortIdleEventUnlocked(
+    observationValue: ResidentAbortIdleObservedEvent,
+  ): Promise<void> {
+    const observation = ResidentAbortIdleObservedEventSchema.parse(observationValue);
+    await appendJsonLineOnce(
+      this.paths.eventJournal,
+      EventJournalRecordSchema.parse({
+        version: 1,
+        eventId: deterministicId("event", "resident-abort-idle", observation.attemptId),
+        recordedAt: observation.observedAt,
+        type: "resident.abort_idle_observed",
+        threadId: observation.command.threadId,
+        sequence: observation.observedCursor.sequence,
+        detail: observation.command.commandId,
+        residentAbortIdleObserved: observation,
+      }),
+      "eventId",
+    );
+  }
+
   private async appendEventUnlocked(event: {
     type: string;
     threadId?: string;
@@ -3411,6 +5898,21 @@ export class HostStore {
     );
   }
 
+  private residentDispatchAttemptPath(identity: CommandIdentity): string {
+    return join(
+      this.paths.residentDispatchAttempts,
+      `${storageKey(identity.deviceId, identity.commandId)}.json`,
+    );
+  }
+
+  private residentProjectionLineageName(authorityId: string): string {
+    return `${storageKey(authorityId)}.json`;
+  }
+
+  private residentProjectionLineagePath(authorityId: string): string {
+    return join(this.paths.residentProjectionLineages, this.residentProjectionLineageName(authorityId));
+  }
+
   private handoffPath(handoffId: string): string {
     return join(this.paths.handoffs, `${storageKey(handoffId)}.json`);
   }
@@ -3478,6 +5980,528 @@ function parseWorkspaceLookup(threadId: string, executionGenerationId: string): 
     );
   }
   return parsed.data;
+}
+
+export function residentDispatchAuthorityFingerprint(bindingValue: ResidentSessionBinding): string {
+  const binding = ResidentSessionBindingSchema.parse(bindingValue);
+  const authority = {
+    bindingVersion: binding.bindingVersion,
+    lifecycle: binding.lifecycle,
+    threadId: binding.threadId,
+    executionGenerationId: binding.executionGenerationId,
+    workspaceDirectory: canonicalPathKey(binding.workspaceDirectory),
+    activeSessionId: binding.activeSessionId,
+    sessionId: binding.sessionId,
+    sessionFile: binding.sessionFile,
+    boundAt: binding.boundAt,
+    runtime: {
+      releaseVersion: binding.runtime.releaseVersion,
+      appVersion: binding.runtime.appVersion,
+      protocolName: binding.runtime.protocolName,
+      protocolVersion: binding.runtime.protocolVersion,
+      schemaRevision: binding.runtime.schemaRevision,
+      schemaId: binding.runtime.schemaId,
+      runtimeBuildId: binding.runtime.runtimeBuildId,
+      capabilities: [...binding.runtime.capabilities].sort(),
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(authority)).digest("hex");
+}
+
+function residentProjectionAuthorityFromBinding(
+  bindingValue: ResidentSessionBinding,
+): ResidentProjectionAuthority {
+  const binding = ResidentSessionBindingSchema.parse(bindingValue);
+  return ResidentProjectionAuthoritySchema.parse({
+    threadId: binding.threadId,
+    executionGenerationId: binding.executionGenerationId,
+    workspaceDirectory: binding.workspaceDirectory,
+    activeSessionId: binding.activeSessionId,
+    sessionId: binding.sessionId,
+    sessionFile: binding.sessionFile,
+  });
+}
+
+function residentProjectionAuthorityId(authorityValue: ResidentProjectionAuthority): string {
+  const authority = ResidentProjectionAuthoritySchema.parse(authorityValue);
+  return deterministicId(
+    "resident-authority",
+    authority.threadId,
+    authority.executionGenerationId,
+    canonicalPathKey(authority.workspaceDirectory),
+    authority.activeSessionId,
+    authority.sessionId,
+    authority.sessionFile ?? "",
+  );
+}
+
+function residentProjectionDigest(projection: ResidentProjectionSnapshot): string {
+  const semantic = {
+    cursor: projection.cursor,
+    runtime: projection.runtime,
+    transcript: projection.transcript,
+    stream: projection.stream,
+    childAgents: projection.childAgents,
+    goal: projection.goal,
+    activity:
+      projection.runtime.isStreaming ||
+      projection.runtime.isCompacting ||
+      projection.runtime.isBashRunning ||
+      projection.queue.active !== undefined,
+  };
+  return digestNormalizedJson(semantic);
+}
+
+function residentPublishedProjectionDigest(snapshot: ThreadProjectionSnapshot): string {
+  return digestNormalizedJson({
+    cursor: {
+      generation: snapshot.latestCursor.generation,
+      sequence: snapshot.latestCursor.sequence,
+    },
+    runtime: snapshot.runtime,
+    transcript: snapshot.materializedRecentBlocks,
+    stream: snapshot.inProgressStream,
+    childAgents: snapshot.childAgents,
+    goal: snapshot.goals[0],
+    activity: snapshot.thread.status === "running",
+  });
+}
+
+function digestNormalizedJson(value: unknown): string {
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) throw new TypeError("Projection is not JSON serializable");
+    const normalized = sortJsonValue(JSON.parse(json) as unknown);
+    return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  } catch (cause) {
+    throw new HostStoreError(
+      "RESIDENT_PROJECTION_DIGEST_INVALID",
+      "Resident projection could not be normalized for durable lineage",
+      false,
+      { cause },
+    );
+  }
+}
+
+function residentProjectionLineageTransitionIsValid(
+  previous: ResidentProjectionCursorLineage | undefined,
+  next: ResidentProjectionCursorLineage,
+  allowSameCursorAbortIdleRewrite = false,
+): boolean {
+  if (!previous) return next.retiredGenerations.length === 0;
+  if (
+    previous.authorityId !== next.authorityId ||
+    !isDeepStrictEqual(previous.authority, next.authority)
+  ) {
+    return false;
+  }
+  if (previous.current.generation === next.current.generation) {
+    return (
+      (next.current.sequence > previous.current.sequence ||
+        (allowSameCursorAbortIdleRewrite &&
+          next.current.sequence === previous.current.sequence &&
+          next.current.digest !== previous.current.digest)) &&
+      isDeepStrictEqual(next.retiredGenerations, previous.retiredGenerations)
+    );
+  }
+  return (
+    !previous.retiredGenerations.includes(next.current.generation) &&
+    previous.retiredGenerations.length < MAX_RETIRED_RESIDENT_CURSOR_GENERATIONS &&
+    isDeepStrictEqual(next.retiredGenerations, [
+      ...previous.retiredGenerations,
+      previous.current.generation,
+    ])
+  );
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (value && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = sortJsonValue((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+function createResidentDispatchLease(attempt: ResidentDispatchAttempt): ResidentDispatchLease {
+  if (attempt.state !== "dispatching" || !attempt.dispatchStartedAt) {
+    throw new HostStoreError(
+      "RESIDENT_DISPATCH_LEASE_INVALID",
+      "Only a durable dispatching attempt can create a resident dispatch lease",
+    );
+  }
+  const command = CommandEnvelopeSchema.parse(attempt.command);
+  const immutableCommand = Object.freeze({
+    ...command,
+    command: Object.freeze({ ...command.command }),
+  }) as CommandEnvelope;
+  const binding = validateResidentSessionBinding(attempt.binding);
+  return Object.freeze({
+    [residentDispatchLeaseBrand]: true as const,
+    leaseVersion: 1 as const,
+    attemptId: attempt.attemptId,
+    command: immutableCommand,
+    binding,
+    bindingFingerprint: attempt.bindingFingerprint,
+    dispatchStartedAt: attempt.dispatchStartedAt,
+  });
+}
+
+/** Runtime proof that a lease came from this process's private HostStore brand. */
+export function validateResidentDispatchLease(value: ResidentDispatchLease): ResidentDispatchLease {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value[residentDispatchLeaseBrand] !== true ||
+    value.leaseVersion !== 1 ||
+    !Object.isFrozen(value) ||
+    !Object.isFrozen(value.command) ||
+    !Object.isFrozen(value.command.command) ||
+    !Object.isFrozen(value.binding) ||
+    !Object.isFrozen(value.binding.runtime) ||
+    !Object.isFrozen(value.binding.runtime.capabilities)
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_DISPATCH_LEASE_INVALID",
+      "Resident dispatch finalization requires an opaque lease from this HostStore process",
+    );
+  }
+  let command: CommandEnvelope;
+  let binding: ResidentSessionBinding;
+  try {
+    command = ResidentDispatchCommandSchema.parse(value.command);
+    binding = validateResidentSessionBinding(value.binding);
+    IsoDateTimeSchema.parse(value.dispatchStartedAt);
+    IdSchema.parse(value.attemptId);
+  } catch (cause) {
+    throw new HostStoreError(
+      "RESIDENT_DISPATCH_LEASE_INVALID",
+      "Resident dispatch lease fields are invalid",
+      false,
+      { cause },
+    );
+  }
+  const fingerprint = residentDispatchAuthorityFingerprint(binding);
+  if (
+    value.attemptId !== deterministicId("resident-dispatch", command.deviceId, command.commandId) ||
+    value.bindingFingerprint !== fingerprint ||
+    command.threadId !== binding.threadId ||
+    command.expectedExecutionGenerationId !== binding.executionGenerationId
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_DISPATCH_LEASE_INVALID",
+      "Resident dispatch lease no longer identifies one exact command and binding",
+    );
+  }
+  return value;
+}
+
+function residentDispatchLeaseMatchesAttempt(
+  lease: ResidentDispatchLease,
+  attempt: ResidentDispatchAttempt,
+): boolean {
+  return (
+    attempt.state === "dispatching" &&
+    attempt.dispatchStartedAt === lease.dispatchStartedAt &&
+    attempt.attemptId === lease.attemptId &&
+    attempt.bindingFingerprint === lease.bindingFingerprint &&
+    isDeepStrictEqual(attempt.command, lease.command) &&
+    isDeepStrictEqual(attempt.binding, lease.binding)
+  );
+}
+
+function createResidentPromptReconciliationLease(
+  attempt: ResidentDispatchAttempt,
+  bindingValue: ResidentSessionBinding,
+): ResidentPromptReconciliationLease {
+  if (
+    !residentAcknowledgedPromptAttemptRetainsLock(attempt) ||
+    !attempt.dispatchStartedAt ||
+    !attempt.settledAt ||
+    !attempt.finalReceipt ||
+    !attempt.promptSettlementCursor
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_PROMPT_RECONCILIATION_INELIGIBLE",
+      "Only a durable acknowledged-running prompt can create a reconciliation lease",
+    );
+  }
+  const command = ResidentPromptCommandSchema.parse(attempt.command);
+  const immutableCommand = Object.freeze({
+    ...command,
+    command: Object.freeze({ ...command.command }),
+  }) as CommandEnvelope;
+  const binding = validateResidentSessionBinding(bindingValue);
+  const settlementCursor = Object.freeze(SessionCursorSchema.parse(attempt.promptSettlementCursor));
+  return Object.freeze({
+    [residentPromptReconciliationLeaseBrand]: true as const,
+    leaseVersion: 1 as const,
+    attemptId: attempt.attemptId,
+    command: immutableCommand,
+    binding,
+    bindingFingerprint: residentDispatchAuthorityFingerprint(binding),
+    dispatchStartedAt: attempt.dispatchStartedAt,
+    settledAt: attempt.settledAt,
+    receiptUpdatedAt: attempt.finalReceipt.updatedAt,
+    settlementCursor,
+  });
+}
+
+/** Runtime proof that this is a privately branded, immutable prompt lease. */
+export function validateResidentPromptReconciliationLease(
+  value: ResidentPromptReconciliationLease,
+): ResidentPromptReconciliationLease {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value[residentPromptReconciliationLeaseBrand] !== true ||
+    value.leaseVersion !== 1 ||
+    !Object.isFrozen(value) ||
+    !Object.isFrozen(value.command) ||
+    !Object.isFrozen(value.command.command) ||
+    !Object.isFrozen(value.binding) ||
+    !Object.isFrozen(value.binding.runtime) ||
+    !Object.isFrozen(value.binding.runtime.capabilities) ||
+    !Object.isFrozen(value.settlementCursor)
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+      "Prompt idle reconciliation requires an opaque immutable HostStore lease",
+    );
+  }
+  let command: CommandEnvelope;
+  let binding: ResidentSessionBinding;
+  let settlementCursor: z.infer<typeof SessionCursorSchema>;
+  try {
+    command = ResidentPromptCommandSchema.parse(value.command);
+    binding = validateResidentSessionBinding(value.binding);
+    settlementCursor = SessionCursorSchema.parse(value.settlementCursor);
+    IdSchema.parse(value.attemptId);
+    IsoDateTimeSchema.parse(value.dispatchStartedAt);
+    IsoDateTimeSchema.parse(value.settledAt);
+    IsoDateTimeSchema.parse(value.receiptUpdatedAt);
+  } catch (cause) {
+    throw new HostStoreError(
+      "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+      "Prompt idle reconciliation lease fields are invalid",
+      false,
+      { cause },
+    );
+  }
+  if (
+    value.attemptId !== deterministicId("resident-dispatch", command.deviceId, command.commandId) ||
+    value.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+    command.threadId !== binding.threadId ||
+    command.expectedExecutionGenerationId !== binding.executionGenerationId ||
+    settlementCursor.threadId !== command.threadId ||
+    settlementCursor.executionGenerationId !== command.expectedExecutionGenerationId ||
+    Date.parse(value.dispatchStartedAt) > Date.parse(value.settledAt) ||
+    Date.parse(value.settledAt) > Date.parse(value.receiptUpdatedAt)
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+      "Prompt idle reconciliation lease no longer identifies one exact acknowledged command and authority",
+    );
+  }
+  return value;
+}
+
+function residentPromptReconciliationLeaseMatchesAttempt(
+  lease: ResidentPromptReconciliationLease,
+  attempt: ResidentDispatchAttempt,
+): boolean {
+  return (
+    residentAcknowledgedPromptAttemptRetainsLock(attempt) &&
+    attempt.dispatchStartedAt === lease.dispatchStartedAt &&
+    attempt.settledAt === lease.settledAt &&
+    attempt.finalReceipt?.updatedAt === lease.receiptUpdatedAt &&
+    attempt.attemptId === lease.attemptId &&
+    attempt.bindingFingerprint === lease.bindingFingerprint &&
+    isDeepStrictEqual(attempt.command, lease.command) &&
+    isDeepStrictEqual(attempt.promptSettlementCursor, lease.settlementCursor) &&
+    isDeepStrictEqual(
+      residentProjectionAuthorityFromBinding(attempt.binding),
+      residentProjectionAuthorityFromBinding(lease.binding),
+    )
+  );
+}
+
+function createResidentAbortReconciliationLease(
+  attempt: ResidentDispatchAttempt,
+  bindingValue: ResidentSessionBinding,
+): ResidentAbortReconciliationLease {
+  if (
+    !residentAcknowledgedAbortAttemptRetainsLock(attempt) ||
+    !attempt.dispatchStartedAt ||
+    !attempt.settledAt ||
+    !attempt.finalReceipt ||
+    !attempt.abortSettlementCursor
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_ABORT_RECONCILIATION_INELIGIBLE",
+      "Only a durable acknowledged-running Stop can create a reconciliation lease",
+    );
+  }
+  const command = ResidentAbortCommandSchema.parse(attempt.command);
+  const immutableCommand = Object.freeze({
+    ...command,
+    command: Object.freeze({ ...command.command }),
+  }) as CommandEnvelope;
+  const binding = validateResidentSessionBinding(bindingValue);
+  const settlementCursor = Object.freeze(SessionCursorSchema.parse(attempt.abortSettlementCursor));
+  return Object.freeze({
+    [residentAbortReconciliationLeaseBrand]: true as const,
+    leaseVersion: 1 as const,
+    attemptId: attempt.attemptId,
+    command: immutableCommand,
+    binding,
+    bindingFingerprint: residentDispatchAuthorityFingerprint(binding),
+    dispatchStartedAt: attempt.dispatchStartedAt,
+    settledAt: attempt.settledAt,
+    receiptUpdatedAt: attempt.finalReceipt.updatedAt,
+    settlementCursor,
+  });
+}
+
+/** Runtime proof that this is a privately branded, immutable Stop lease. */
+export function validateResidentAbortReconciliationLease(
+  value: ResidentAbortReconciliationLease,
+): ResidentAbortReconciliationLease {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value[residentAbortReconciliationLeaseBrand] !== true ||
+    value.leaseVersion !== 1 ||
+    !Object.isFrozen(value) ||
+    !Object.isFrozen(value.command) ||
+    !Object.isFrozen(value.command.command) ||
+    !Object.isFrozen(value.binding) ||
+    !Object.isFrozen(value.binding.runtime) ||
+    !Object.isFrozen(value.binding.runtime.capabilities) ||
+    !Object.isFrozen(value.settlementCursor)
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+      "Stop idle reconciliation requires an opaque immutable HostStore lease",
+    );
+  }
+  let command: CommandEnvelope;
+  let binding: ResidentSessionBinding;
+  let settlementCursor: z.infer<typeof SessionCursorSchema>;
+  try {
+    command = ResidentAbortCommandSchema.parse(value.command);
+    binding = validateResidentSessionBinding(value.binding);
+    settlementCursor = SessionCursorSchema.parse(value.settlementCursor);
+    IdSchema.parse(value.attemptId);
+    IsoDateTimeSchema.parse(value.dispatchStartedAt);
+    IsoDateTimeSchema.parse(value.settledAt);
+    IsoDateTimeSchema.parse(value.receiptUpdatedAt);
+  } catch (cause) {
+    throw new HostStoreError(
+      "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+      "Stop idle reconciliation lease fields are invalid",
+      false,
+      { cause },
+    );
+  }
+  if (
+    value.attemptId !== deterministicId("resident-dispatch", command.deviceId, command.commandId) ||
+    value.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+    command.threadId !== binding.threadId ||
+    command.expectedExecutionGenerationId !== binding.executionGenerationId ||
+    settlementCursor.threadId !== command.threadId ||
+    settlementCursor.executionGenerationId !== command.expectedExecutionGenerationId ||
+    Date.parse(value.dispatchStartedAt) > Date.parse(value.settledAt) ||
+    Date.parse(value.settledAt) > Date.parse(value.receiptUpdatedAt)
+  ) {
+    throw new HostStoreError(
+      "RESIDENT_ABORT_RECONCILIATION_LEASE_INVALID",
+      "Stop idle reconciliation lease no longer identifies one exact acknowledged command and authority",
+    );
+  }
+  return value;
+}
+
+function residentAbortReconciliationLeaseMatchesAttempt(
+  lease: ResidentAbortReconciliationLease,
+  attempt: ResidentDispatchAttempt,
+): boolean {
+  return (
+    residentAcknowledgedAbortAttemptRetainsLock(attempt) &&
+    attempt.dispatchStartedAt === lease.dispatchStartedAt &&
+    attempt.settledAt === lease.settledAt &&
+    attempt.finalReceipt?.updatedAt === lease.receiptUpdatedAt &&
+    attempt.attemptId === lease.attemptId &&
+    attempt.bindingFingerprint === lease.bindingFingerprint &&
+    isDeepStrictEqual(attempt.command, lease.command) &&
+    isDeepStrictEqual(attempt.abortSettlementCursor, lease.settlementCursor) &&
+    isDeepStrictEqual(
+      residentProjectionAuthorityFromBinding(attempt.binding),
+      residentProjectionAuthorityFromBinding(lease.binding),
+    )
+  );
+}
+
+function residentDispatchAttemptRetainsReconciliation(attempt: ResidentDispatchAttempt): boolean {
+  return residentPromptAttemptRetainsLock(attempt) || residentAbortAttemptRetainsBarrier(attempt);
+}
+
+function residentPromptAttemptRetainsLock(attempt: ResidentDispatchAttempt): boolean {
+  return (
+    attempt.command.command.kind === "prompt" &&
+    attempt.state === "settled" &&
+    (attempt.finalReceipt?.status === "running" || attempt.finalReceipt?.status === "uncertain")
+  );
+}
+
+function residentAcknowledgedPromptAttemptRetainsLock(attempt: ResidentDispatchAttempt): boolean {
+  return (
+    attempt.command.command.kind === "prompt" &&
+    attempt.state === "settled" &&
+    attempt.finalReceipt?.status === "running"
+  );
+}
+
+function residentAcknowledgedAbortAttemptRetainsLock(attempt: ResidentDispatchAttempt): boolean {
+  return (
+    attempt.command.command.kind === "abort" &&
+    attempt.state === "settled" &&
+    attempt.finalReceipt?.status === "running"
+  );
+}
+
+function residentAbortAttemptRetainsBarrier(attempt: ResidentDispatchAttempt): boolean {
+  return (
+    attempt.command.command.kind === "abort" &&
+    attempt.state === "settled" &&
+    (attempt.finalReceipt?.status === "running" || attempt.finalReceipt?.status === "uncertain")
+  );
+}
+
+function residentPrivateProjectionReportsActivity(projection: ResidentProjectionSnapshot): boolean {
+  return Boolean(
+    projection.runtime.isStreaming ||
+      projection.runtime.isCompacting ||
+      projection.runtime.isBashRunning ||
+      projection.queue.active !== undefined ||
+      projection.queue.queuedCount > 0
+  );
+}
+
+function residentSnapshotReportsActivity(snapshot: ThreadProjectionSnapshot): boolean {
+  const runtime = snapshot.runtime;
+  return Boolean(
+    runtime &&
+      runtime.residency === "resident" &&
+      (snapshot.thread.status === "running" ||
+        runtime.isStreaming ||
+        runtime.isCompacting ||
+        runtime.isBashRunning ||
+        runtime.queuedActionCount > 0),
+  );
 }
 
 function parseWorkspaceRegistration(value: WorkspaceAuthorityRegistration): WorkspaceAuthorityRegistration {

@@ -11,11 +11,18 @@ import {
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
   ResidentRuntimeContractError,
   buildResidentDaemonStartInvocation,
+  validateResidentAbortIdleReconciliationRequest,
   validateResidentDaemonHello,
+  validateResidentGenerationDispatchLease,
+  validateResidentPromptIdleReconciliationRequest,
+  type ResidentGenerationDispatchLease,
+  type ResidentAbortIdleReconciliationRequest,
+  type ResidentPromptIdleReconciliationRequest,
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
 import { GatewayError } from "../../src/hostd/gateway";
+import type { ResidentPromptReconciliationLease } from "../../src/hostd/store";
 import { PROTOCOL_VERSION, type CommandEnvelope } from "../../src/shared/protocol";
 
 const RUNTIME_NODE = resolve("test-runtime", "node.exe");
@@ -153,6 +160,7 @@ interface HarnessState {
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
   }>;
+  waitForIdleCalls: number;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
   persistHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   completeHandler?: (binding: ResidentSessionBinding) => Promise<void>;
@@ -161,10 +169,22 @@ interface HarnessState {
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
   snapshotHandler?: () => Promise<unknown> | unknown;
+  waitForIdleHandler?: () => Promise<void> | void;
   availableModelsCalls: number;
   setModelCalls: Array<{ providerId: string; modelId: string }>;
+  promptCalls: Array<{
+    message: string;
+    options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined;
+  }>;
+  abortCalls: number;
   availableModelsHandler?: () => Promise<unknown> | unknown;
   setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
+  promptHandler?: (
+    message: string,
+    options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
+  ) => Promise<void> | void;
+  abortHandler?: () => Promise<void> | void;
+  waitHandler?: (milliseconds: number) => Promise<void> | void;
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
 }
@@ -185,8 +205,11 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     persistCalls: [],
     completeCalls: [],
     projectionCalls: [],
+    waitForIdleCalls: 0,
     availableModelsCalls: 0,
     setModelCalls: [],
+    promptCalls: [],
+    abortCalls: 0,
     ...overrides,
   };
 
@@ -245,6 +268,11 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             ? state.snapshotHandler()
             : validSnapshot();
         },
+        waitForIdle: async () => {
+          state.waitForIdleCalls += 1;
+          state.chronology.push("wait:idle");
+          await state.waitForIdleHandler?.();
+        },
         getAvailableModels: async () => {
           state.availableModelsCalls += 1;
           state.chronology.push("models:available");
@@ -258,6 +286,16 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           return state.setModelHandler
             ? state.setModelHandler(providerId, modelId)
             : { provider: providerId, id: modelId, rawCredential: "discarded" };
+        },
+        prompt: async (message, options) => {
+          state.promptCalls.push({ message, options });
+          state.chronology.push("prompt");
+          await state.promptHandler?.(message, options);
+        },
+        abort: async () => {
+          state.abortCalls += 1;
+          state.chronology.push("abort");
+          await state.abortHandler?.();
         },
         subscribe: (listener) => {
           state.eventListeners.add(listener);
@@ -323,7 +361,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     connectTimeoutMs: 10,
     startupTimeoutMs: 100,
     requestTimeoutMs: 100,
-    wait: async () => undefined,
+    wait: async (milliseconds) => void (await state.waitHandler?.(milliseconds)),
     now: () => new Date("2026-08-06T17:00:00.000Z"),
   });
 
@@ -359,6 +397,43 @@ function binding(overrides: Partial<ResidentSessionBinding> = {}): ResidentSessi
   };
 }
 
+function residentDispatchLease(
+  operation: "prompt" | "abort",
+  durableBinding: ResidentSessionBinding,
+  dispatchAttemptId = `dispatch-${operation}-1`,
+  commandFingerprint = "a".repeat(64),
+): ResidentGenerationDispatchLease {
+  return validateResidentGenerationDispatchLease({
+    leaseVersion: 1,
+    dispatchAttemptId,
+    commandFingerprint,
+    operation,
+    binding: durableBinding,
+  });
+}
+
+function promptIdleReconciliationRequest(
+  durableBinding: ResidentSessionBinding,
+  dispatchAttemptId = "dispatch-prompt-idle-1",
+): ResidentPromptIdleReconciliationRequest {
+  return validateResidentPromptIdleReconciliationRequest({
+    reconciliationVersion: 1,
+    dispatchAttemptId,
+    binding: durableBinding,
+  });
+}
+
+function abortIdleReconciliationRequest(
+  durableBinding: ResidentSessionBinding,
+  dispatchAttemptId = "dispatch-abort-idle-1",
+): ResidentAbortIdleReconciliationRequest {
+  return validateResidentAbortIdleReconciliationRequest({
+    reconciliationVersion: 1,
+    dispatchAttemptId,
+    binding: durableBinding,
+  });
+}
+
 function modelSelectionCommand(commandId = "select-model-1"): CommandEnvelope {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -381,6 +456,20 @@ async function expectRuntimeError(promise: Promise<unknown>, code: string): Prom
     return error as ResidentRuntimeContractError;
   }
   throw new Error(`Expected ${code}`);
+}
+
+function promptAdmissionError(status: "cancelled" | "owned" | "unknown" | "unsupported"): Error {
+  return Object.assign(new Error(`prompt admission ${status}`), { status });
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void } {
+  let resolvePromise!: () => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<void>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 describe("PrimeAgentResidentAdapter daemon ownership", () => {
@@ -775,6 +864,1078 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
   });
 });
 
+describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
+  it("validates and canonicalizes the generation-bound command fingerprint", () => {
+    expect(() => residentDispatchLease("prompt", binding(), "dispatch-bad-fingerprint", "not-a-digest"))
+      .toThrow(expect.objectContaining({ code: "PRIME_RUNTIME_DISPATCH_LEASE_INVALID" }));
+    expect(
+      residentDispatchLease("prompt", binding(), "dispatch-uppercase-fingerprint", "A".repeat(64))
+        .commandFingerprint,
+    ).toBe("a".repeat(64));
+  });
+
+  it("rejects a structural prompt-idle lease before reaching the managed connection", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const forged = {
+      leaseVersion: 1,
+      attemptId: "dispatch-forged-prompt-idle",
+      command: {
+        ...modelSelectionCommand("forged-prompt-idle"),
+        command: { kind: "prompt", text: "Forged." },
+      },
+      binding: connection.binding,
+      bindingFingerprint: "0".repeat(64),
+      dispatchStartedAt: "2026-08-06T17:00:00.000Z",
+      settledAt: "2026-08-06T17:00:00.000Z",
+      receiptUpdatedAt: "2026-08-06T17:00:00.000Z",
+      settlementCursor: {
+        threadId: "thread-1",
+        executionGenerationId: "generation-1",
+        generation: "events-1",
+        sequence: 4,
+      },
+    } as unknown as ResidentPromptReconciliationLease;
+
+    await expect(adapter.reconcileAcknowledgedPromptIdle(forged)).rejects.toMatchObject({
+      code: "RESIDENT_PROMPT_RECONCILIATION_LEASE_INVALID",
+    });
+    expect(state.waitForIdleCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("reports prompt ownership and abort request admission without claiming completion", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+
+    await expect(
+      connection.prompt(
+        "Inspect the resident workspace.",
+        residentDispatchLease("prompt", connection.binding),
+      ),
+    ).resolves.toEqual({ operation: "prompt", disposition: "accepted", completion: "not_observed" });
+    await expect(
+      connection.abort(residentDispatchLease("abort", connection.binding)),
+    ).resolves.toEqual({ operation: "abort", disposition: "accepted", completion: "not_observed" });
+
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.promptCalls[0]).toMatchObject({
+      message: "Inspect the resident workspace.",
+      options: { queueIfBusy: false },
+    });
+    expect(state.promptCalls[0]?.options?.signal).toBeInstanceOf(AbortSignal);
+    expect(state.promptCalls[0]?.options?.signal?.aborted).toBe(false);
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("never infers idle from an abort acknowledgement and deduplicates the explicit no-event barrier", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease("abort", connection.binding, "dispatch-abort-no-event");
+
+    await expect(connection.abort(dispatch)).resolves.toEqual({
+      operation: "abort",
+      disposition: "accepted",
+      completion: "not_observed",
+    });
+    expect(state.waitForIdleCalls).toBe(0);
+    expect(state.projectionCalls).toHaveLength(1);
+
+    const request = abortIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId);
+    const first = connection.reconcileAcknowledgedAbortIdle(request);
+    const duplicate = connection.reconcileAcknowledgedAbortIdle(request);
+    expect(duplicate).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      evidenceVersion: 1,
+      dispatchAttemptId: dispatch.dispatchAttemptId,
+      binding: connection.binding,
+      projection: { cursor: { generation: "events-1", sequence: 4 } },
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+    // Abort proof publication is Store-owned because only its opaque lease may
+    // authorize an active-to-idle rewrite at this unchanged upstream cursor.
+    expect(state.projectionCalls).toHaveLength(1);
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("refuses Stop idle authority when the stable post-barrier projection remains active", async () => {
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ state: { isStreaming: true } }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(connection.reconcileAcknowledgedAbortIdle(
+      abortIdleReconciliationRequest(connection.binding, "dispatch-abort-still-active"),
+    )).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_ABORT_IDLE_NOT_OBSERVED",
+      retryable: true,
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+    expect(state.projectionCalls).toHaveLength(1);
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rejects Stop idle evidence when the exact binding changes during the barrier", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const originalBinding = connection.binding;
+    state.waitForIdleHandler = () => {
+      state.hello = validHello({ supervisorGeneration: "supervisor-abort-reconciliation" });
+      for (const listener of state.eventListeners) {
+        void listener({ type: "connection_status", status: "reconnecting" });
+        void listener({ type: "session_resynced", snapshot: validSnapshot() });
+        void listener({ type: "connection_status", status: "connected" });
+      }
+    };
+
+    await expect(connection.reconcileAcknowledgedAbortIdle(
+      abortIdleReconciliationRequest(originalBinding, "dispatch-abort-binding-change"),
+    )).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_ABORT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("adapter close cancels a never-settling Stop idle barrier within the local shutdown bound", async () => {
+    const neverSettles = new Promise<void>(() => undefined);
+    const { adapter, state } = createHarness({ waitForIdleHandler: () => neverSettles });
+    const connection = await adapter.createResident(createInput());
+    const reconciliation = connection.reconcileAcknowledgedAbortIdle(
+      abortIdleReconciliationRequest(connection.binding, "dispatch-abort-adapter-close"),
+    );
+    await vi.waitFor(() => expect(state.waitForIdleCalls).toBe(1));
+
+    const closed = adapter.close();
+    await vi.waitFor(() => expect(state.disposeCalls).toBe(1), { timeout: 250 });
+    await expect(reconciliation).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_ABORT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    await expect(Promise.race([
+      closed.then(() => "closed" as const),
+      new Promise<"timeout">((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), 250)),
+    ])).resolves.toBe("closed");
+    expect(state.projectionCalls).toHaveLength(1);
+  });
+
+  it("deduplicates one exact same-connection idle barrier and republishes its unchanged cursor", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const request = promptIdleReconciliationRequest(connection.binding);
+
+    const first = connection.reconcileAcknowledgedPromptIdle(request);
+    const duplicate = connection.reconcileAcknowledgedPromptIdle(request);
+
+    expect(duplicate).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      evidenceVersion: 1,
+      dispatchAttemptId: request.dispatchAttemptId,
+      binding: connection.binding,
+      projection: { cursor: { generation: "events-1", sequence: 4 } },
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+    expect(state.projectionCalls).toHaveLength(2);
+    expect(state.projectionCalls[0]?.projection.cursor).toEqual(
+      state.projectionCalls[1]?.projection.cursor,
+    );
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("refuses idle authority when a stable post-barrier projection still reports active work", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    state.snapshotHandler = () => validSnapshot({
+      state: {
+        isStreaming: true,
+        sessionActions: {
+          queuedCount: 1,
+          steering: [],
+          followUps: [],
+          active: { kind: "turn", phase: "running" },
+        },
+      },
+    });
+
+    await expect(
+      connection.reconcileAcknowledgedPromptIdle(
+        promptIdleReconciliationRequest(connection.binding, "dispatch-prompt-still-active"),
+      ),
+    ).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+      retryable: true,
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+    expect(state.projectionCalls).toHaveLength(1);
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("drains the upstream event tail and every scheduled projection refresh before idle evidence", async () => {
+    const eventPublication = deferred();
+    const refreshEntered = deferred();
+    const refreshPublication = deferred();
+    let gateEventPublication = false;
+    const { adapter, state } = createHarness({
+      publishProjectionHandler: async (_binding, projection) => {
+        if (gateEventPublication && projection.runtime.recap === "Event tail publication") {
+          await eventPublication.promise;
+        }
+      },
+      waitHandler: async (milliseconds) => {
+        if (milliseconds !== 100) return;
+        refreshEntered.resolve();
+        await refreshPublication.promise;
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    gateEventPublication = true;
+    state.snapshotHandler = () => validSnapshot({ state: { recap: "Forced idle publication" } });
+    state.waitForIdleHandler = () => {
+      for (const listener of state.eventListeners) {
+        void listener({
+          type: "session_resynced",
+          snapshot: validSnapshot({ state: { recap: "Event tail publication" } }),
+        });
+        void listener({ type: "session_event", event: { type: "agent_end" } });
+      }
+    };
+
+    let reconciled = false;
+    const result = connection
+      .reconcileAcknowledgedPromptIdle(promptIdleReconciliationRequest(connection.binding))
+      .then((evidence) => {
+        reconciled = true;
+        return evidence;
+      });
+
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+    expect(reconciled).toBe(false);
+    expect(state.chronology.indexOf("wait:idle")).toBeLessThan(
+      state.chronology.lastIndexOf("projection:publish"),
+    );
+
+    eventPublication.resolve();
+    await refreshEntered.promise;
+    expect(reconciled).toBe(false);
+
+    refreshPublication.resolve();
+    await expect(result).resolves.toMatchObject({
+      projection: {
+        cursor: { generation: "events-1", sequence: 4 },
+        runtime: { recap: "Forced idle publication" },
+      },
+    });
+    expect(state.projectionCalls).toHaveLength(4);
+    expect(state.projectionCalls.at(-1)?.projection.cursor).toEqual(
+      state.projectionCalls.at(-2)?.projection.cursor,
+    );
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rejects idle evidence when the exact binding changes while the public barrier is pending", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const originalBinding = connection.binding;
+    state.waitForIdleHandler = () => {
+      state.hello = validHello({ supervisorGeneration: "supervisor-idle-reconciliation" });
+      for (const listener of state.eventListeners) {
+        void listener({ type: "connection_status", status: "reconnecting" });
+        void listener({ type: "session_resynced", snapshot: validSnapshot() });
+        void listener({ type: "connection_status", status: "connected" });
+      }
+    };
+
+    await expect(
+      connection.reconcileAcknowledgedPromptIdle(
+        promptIdleReconciliationRequest(originalBinding, "dispatch-prompt-binding-change"),
+      ),
+    ).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    expect(connection.binding.runtime.supervisorGeneration).toBe(
+      "supervisor-idle-reconciliation",
+    );
+    expect(state.waitForIdleCalls).toBe(1);
+
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it.each(["detach", "end"] as const)(
+    "%s disposes a never-settling idle barrier and cannot publish terminally stale evidence",
+    async (terminalAction) => {
+    const neverSettles = new Promise<void>(() => undefined);
+    const { adapter, state } = createHarness({ waitForIdleHandler: () => neverSettles });
+    const connection = await adapter.createResident(createInput());
+    const request = promptIdleReconciliationRequest(
+      connection.binding,
+      `dispatch-prompt-${terminalAction}-during-idle`,
+    );
+    const reconciliation = connection.reconcileAcknowledgedPromptIdle(request);
+    await vi.waitFor(() => expect(state.waitForIdleCalls).toBe(1));
+
+    const terminal = terminalAction === "detach"
+      ? connection.detach()
+      : connection.endSession();
+
+    await expect(reconciliation).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    await expect(terminal).resolves.toBeUndefined();
+    expect(state.disposeCalls).toBe(1);
+    expect(state.projectionCalls).toHaveLength(1);
+    expect(state.completeCalls).toHaveLength(terminalAction === "end" ? 1 : 0);
+    await expect(connection.reconcileAcknowledgedPromptIdle(request)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+    });
+    expect(state.waitForIdleCalls).toBe(1);
+    await adapter.close();
+    },
+  );
+
+  it("adapter close actively cancels a never-settling idle barrier within the local shutdown bound", async () => {
+    const neverSettles = new Promise<void>(() => undefined);
+    const { adapter, state } = createHarness({ waitForIdleHandler: () => neverSettles });
+    const connection = await adapter.createResident(createInput());
+    const reconciliation = connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, "dispatch-prompt-adapter-close"),
+    );
+    await vi.waitFor(() => expect(state.waitForIdleCalls).toBe(1));
+
+    const closed = adapter.close();
+    await vi.waitFor(() => expect(state.disposeCalls).toBe(1), { timeout: 250 });
+    await expect(reconciliation).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+    });
+    const boundedClose = await Promise.race([
+      closed.then(() => "closed" as const),
+      new Promise<"timeout">((resolveTimeout) => {
+        setTimeout(() => resolveTimeout("timeout"), 250);
+      }),
+    ]);
+    expect(boundedClose).toBe("closed");
+    expect(state.projectionCalls).toHaveLength(1);
+    expect(adapter.getLifecycle().state).toBe("closed");
+  });
+
+  it("keeps one invocation for exact retries and rejects changed text, operation, or binding as COMMAND_ID_REUSED", async () => {
+    const { adapter, state } = createHarness({
+      promptHandler: async () => {
+        throw new Error("response transport disconnected");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const lease = residentDispatchLease("prompt", connection.binding, "dispatch-reused-1");
+
+    await expect(connection.prompt("same prompt", lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+      retryable: false,
+    });
+    await expect(connection.prompt("same prompt", lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    await expect(connection.prompt("changed prompt", lease)).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
+    await expect(
+      connection.abort(residentDispatchLease("abort", connection.binding, "dispatch-reused-1")),
+    ).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
+    await expect(
+      connection.prompt(
+        "same prompt",
+        residentDispatchLease(
+          "prompt",
+          binding({ executionGenerationId: "generation-changed" }),
+          "dispatch-reused-1",
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "COMMAND_ID_REUSED" });
+
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.abortCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("continues beyond the exact-result window while retired IDs remain permanently non-invocable", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const exactResultWindow = 10_000;
+    const leaseFor = (index: number) => residentDispatchLease(
+      "abort",
+      connection.binding,
+      `dispatch-retirement-${index}`,
+      index.toString(16).padStart(64, "0"),
+    );
+    const oldestLease = leaseFor(0);
+
+    await connection.abort(oldestLease);
+    for (let index = 1; index <= exactResultWindow; index += 1) {
+      await connection.abort(leaseFor(index));
+    }
+    expect(state.abortCalls).toBe(exactResultWindow + 1);
+
+    await expect(connection.abort(oldestLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_DISPATCH_RETIRED",
+      retryable: false,
+    });
+    expect(state.abortCalls).toBe(exactResultWindow + 1);
+
+    const finalAbort = deferred();
+    state.abortHandler = () => finalAbort.promise;
+    const inFlight = connection.abort(leaseFor(exactResultWindow + 1));
+    await vi.waitFor(() => expect(state.abortCalls).toBe(exactResultWindow + 2));
+    const detached = connection.detach();
+    await Promise.resolve();
+    expect(state.disposeCalls).toBe(0);
+
+    finalAbort.resolve();
+    await expect(inFlight).resolves.toMatchObject({ operation: "abort", disposition: "accepted" });
+    await expect(detached).resolves.toBeUndefined();
+    expect(state.disposeCalls).toBe(1);
+    await adapter.close();
+  }, 30_000);
+
+  it("uses the prompt admission signal to recover an owned prompt after the local timeout", async () => {
+    let signalWasLive = false;
+    const { adapter, state } = createHarness({
+      promptHandler: (_message, options) => new Promise<void>((resolvePrompt) => {
+        const signal = options?.signal;
+        signalWasLive = signal instanceof AbortSignal && !signal.aborted;
+        signal?.addEventListener("abort", () => resolvePrompt(), { once: true });
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(
+      connection.prompt(
+        "Own this prompt exactly once.",
+        residentDispatchLease("prompt", connection.binding, "dispatch-owned-after-timeout"),
+      ),
+    ).resolves.toEqual({ operation: "prompt", disposition: "accepted", completion: "not_observed" });
+
+    expect(signalWasLive).toBe(true);
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.promptCalls[0]?.options?.signal?.aborted).toBe(true);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("cancels a same-tick prompt placeholder before either upstream mutation can run", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+
+    const prompt = connection.prompt(
+      "Never invoke this after Stop.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-same-tick-prompt"),
+    );
+    const abort = connection.abort(
+      residentDispatchLease("abort", connection.binding, "dispatch-same-tick-abort"),
+    );
+
+    await expect(prompt).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_REQUEST_FAILED",
+      details: { outcome: "not_accepted", status: "cancelled" },
+    });
+    await expect(abort).resolves.toEqual({
+      operation: "abort",
+      disposition: "not_needed",
+      completion: "not_observed",
+      reason: "prompt_admission_cancelled",
+    });
+    expect(state.promptCalls).toHaveLength(0);
+    expect(state.abortCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("signals an invoked prompt immediately, then sends exactly one abort after ownership", async () => {
+    const promptOwned = deferred();
+    const { adapter, state } = createHarness({
+      promptHandler: (_message, options) => {
+        options?.signal?.addEventListener("abort", promptOwned.resolve, { once: true });
+        return promptOwned.promise;
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const prompt = connection.prompt(
+      "Own before Stop is forwarded.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-signal-prompt"),
+    );
+    await vi.waitFor(() => expect(state.promptCalls).toHaveLength(1));
+
+    const abort = connection.abort(
+      residentDispatchLease("abort", connection.binding, "dispatch-signal-abort"),
+    );
+    expect(state.promptCalls[0]?.options?.signal?.aborted).toBe(true);
+    await vi.waitFor(() => expect(state.abortCalls).toBe(1), { timeout: 250 });
+
+    await expect(prompt).resolves.toMatchObject({ operation: "prompt", disposition: "accepted" });
+    await expect(abort).resolves.toMatchObject({ operation: "abort", disposition: "accepted" });
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("does not invoke or replay abort when prompt cancellation remains unknown", async () => {
+    const { adapter, state } = createHarness({
+      promptHandler: (_message, options) => new Promise<void>((_resolve, rejectPrompt) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => rejectPrompt(promptAdmissionError("unknown")),
+          { once: true },
+        );
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const prompt = connection.prompt(
+      "Transport may lose ownership evidence.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-unknown-before-abort"),
+    );
+    await vi.waitFor(() => expect(state.promptCalls).toHaveLength(1));
+    const abortLease = residentDispatchLease(
+      "abort",
+      connection.binding,
+      "dispatch-abort-after-unknown",
+    );
+    const abort = connection.abort(abortLease);
+
+    await expect(prompt).rejects.toMatchObject({ code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN" });
+    await expect(abort).rejects.toMatchObject({ code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN" });
+    await expect(connection.abort(abortLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(0);
+    expect(state.promptCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("allows a new Stop after an advanced active projection proves an uncertain prompt is owned", async () => {
+    let projectionPhase: "idle" | "active" = "idle";
+    const { adapter, state, emit } = createHarness({
+      promptHandler: async () => {
+        throw promptAdmissionError("unknown");
+      },
+      snapshotHandler: () => projectionPhase === "idle"
+        ? validSnapshot({ cursorSequence: 4 })
+        : validSnapshot({ cursorSequence: 5, state: { isStreaming: true } }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const promptLease = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-unknown-before-projection-proof",
+    );
+    const preProofAbortLease = residentDispatchLease(
+      "abort",
+      connection.binding,
+      "dispatch-abort-before-projection-proof",
+    );
+
+    await expect(connection.prompt("Ownership evidence may arrive later.", promptLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    await expect(connection.abort(preProofAbortLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(0);
+
+    projectionPhase = "active";
+    await emit({ type: "session_event", event: { type: "message_update" } });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+    await Promise.resolve();
+    expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
+      cursor: { generation: "events-1", sequence: 5 },
+      runtime: { isStreaming: true },
+    });
+
+    const postProofAbortLease = residentDispatchLease(
+      "abort",
+      connection.binding,
+      "dispatch-abort-after-projection-proof",
+    );
+    await expect(connection.abort(postProofAbortLease)).resolves.toEqual({
+      operation: "abort",
+      disposition: "accepted",
+      completion: "not_observed",
+    });
+    expect(state.abortCalls).toBe(1);
+
+    // Store no-replay authority is preserved: the original dispatch identity
+    // keeps its memoized uncertain outcome and cannot gain a later invocation.
+    await expect(connection.abort(preProofAbortLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("accepts an active resync in a new non-retired cursor generation as prompt ownership proof", async () => {
+    const { adapter, state, emit } = createHarness({
+      promptHandler: async () => {
+        throw promptAdmissionError("unknown");
+      },
+      snapshotHandler: () => validSnapshot({ cursorGeneration: "events-a", cursorSequence: 4 }),
+    });
+    const connection = await adapter.createResident(createInput());
+    await expect(
+      connection.prompt(
+        "Ownership will be proven after daemon cursor rollover.",
+        residentDispatchLease("prompt", connection.binding, "dispatch-unknown-before-resync-rollover"),
+      ),
+    ).rejects.toMatchObject({ code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN" });
+
+    const preProofAbortLease = residentDispatchLease(
+      "abort",
+      connection.binding,
+      "dispatch-abort-before-resync-rollover",
+    );
+    await expect(connection.abort(preProofAbortLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(0);
+
+    await emit({
+      type: "session_resynced",
+      snapshot: validSnapshot({
+        cursorGeneration: "events-b",
+        cursorSequence: 0,
+        state: {
+          sessionActions: {
+            queuedCount: 0,
+            steering: [],
+            followUps: [],
+            active: { kind: "session_command", phase: "running", label: "Stopping" },
+          },
+        },
+      }),
+    });
+    expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
+      cursor: { generation: "events-b", sequence: 0 },
+      runtime: { isStreaming: false },
+      queue: { active: { kind: "session_command", phase: "running" } },
+    });
+
+    await expect(
+      connection.abort(
+        residentDispatchLease("abort", connection.binding, "dispatch-abort-after-resync-rollover"),
+      ),
+    ).resolves.toMatchObject({ operation: "abort", disposition: "accepted" });
+    expect(state.abortCalls).toBe(1);
+
+    await expect(connection.abort(preProofAbortLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("retires a stale cancelled admission only after a later active projection advances", async () => {
+    let projectionPhase: "idle" | "active" = "idle";
+    const { adapter, state, emit } = createHarness({
+      promptHandler: async () => {
+        throw promptAdmissionError("cancelled");
+      },
+      snapshotHandler: () => projectionPhase === "idle"
+        ? validSnapshot({ cursorSequence: 4 })
+        : validSnapshot({ cursorSequence: 5, state: { isStreaming: true } }),
+    });
+    const connection = await adapter.createResident(createInput());
+    await expect(
+      connection.prompt(
+        "The admission was reported cancelled.",
+        residentDispatchLease("prompt", connection.binding, "dispatch-cancelled-before-proof"),
+      ),
+    ).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_REQUEST_FAILED",
+      details: { outcome: "not_accepted", status: "cancelled" },
+    });
+
+    const preProofAbortLease = residentDispatchLease(
+      "abort",
+      connection.binding,
+      "dispatch-cancelled-abort-before-proof",
+    );
+    await expect(connection.abort(preProofAbortLease)).resolves.toEqual({
+      operation: "abort",
+      disposition: "not_needed",
+      completion: "not_observed",
+      reason: "prompt_admission_cancelled",
+    });
+    expect(state.abortCalls).toBe(0);
+
+    projectionPhase = "active";
+    await emit({ type: "session_event", event: { type: "agent_end" } });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+    await Promise.resolve();
+
+    await expect(
+      connection.abort(
+        residentDispatchLease("abort", connection.binding, "dispatch-cancelled-abort-after-proof"),
+      ),
+    ).resolves.toMatchObject({ operation: "abort", disposition: "accepted" });
+    expect(state.abortCalls).toBe(1);
+
+    await expect(connection.abort(preProofAbortLease)).resolves.toMatchObject({
+      operation: "abort",
+      disposition: "not_needed",
+    });
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("lets abort bypass a model catalog read that has not settled", async () => {
+    const modelCatalog = deferred();
+    const { adapter, state } = createHarness({
+      availableModelsHandler: async () => {
+        await modelCatalog.promise;
+        return [{ provider: "openai", id: "gpt-5" }];
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const modelSelection = adapter.submit(modelSelectionCommand("select-model-blocked-catalog"), {
+      residentBinding: connection.binding,
+    });
+    await vi.waitFor(() => expect(state.availableModelsCalls).toBe(1));
+
+    const abort = connection.abort(
+      residentDispatchLease("abort", connection.binding, "dispatch-abort-bypasses-model"),
+    );
+    await vi.waitFor(() => expect(state.abortCalls).toBe(1), { timeout: 250 });
+    await expect(abort).resolves.toMatchObject({ operation: "abort", disposition: "accepted" });
+
+    modelCatalog.resolve();
+    await expect(modelSelection).resolves.toMatchObject({ disposition: "handled" });
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("serializes prompt admission behind model selection while Stop keeps its priority lane", async () => {
+    const modelCatalog = deferred();
+    const { adapter, state } = createHarness({
+      availableModelsHandler: async () => {
+        await modelCatalog.promise;
+        return [{ provider: "openai", id: "gpt-5" }];
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const modelSelection = adapter.submit(modelSelectionCommand("select-before-prompt"), {
+      residentBinding: connection.binding,
+    });
+    await vi.waitFor(() => expect(state.availableModelsCalls).toBe(1));
+
+    const prompt = connection.prompt(
+      "Use only the selected model.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-after-model"),
+    );
+    await Promise.resolve();
+    expect(state.promptCalls).toHaveLength(0);
+
+    modelCatalog.resolve();
+    await expect(modelSelection).resolves.toMatchObject({ disposition: "handled" });
+    await expect(prompt).resolves.toMatchObject({ operation: "prompt", disposition: "accepted" });
+    expect(state.promptCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("distinguishes confirmed prompt cancellation from an unknown admission outcome", async () => {
+    const cancelledHarness = createHarness({
+      promptHandler: (_message, options) => new Promise<void>((_resolve, rejectPrompt) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => rejectPrompt(promptAdmissionError("cancelled")),
+          { once: true },
+        );
+      }),
+    });
+    const cancelledConnection = await cancelledHarness.adapter.createResident(createInput());
+
+    await expect(
+      cancelledConnection.prompt(
+        "Cancel before ownership.",
+        residentDispatchLease("prompt", cancelledConnection.binding, "dispatch-cancelled"),
+      ),
+    ).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_REQUEST_FAILED",
+      retryable: false,
+      details: { outcome: "not_accepted", status: "cancelled" },
+    });
+    expect(cancelledHarness.state.promptCalls).toHaveLength(1);
+    await cancelledConnection.detach();
+    await cancelledHarness.adapter.close();
+
+    const unknownHarness = createHarness({
+      promptHandler: (_message, options) => new Promise<void>((_resolve, rejectPrompt) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => rejectPrompt(promptAdmissionError("unknown")),
+          { once: true },
+        );
+      }),
+    });
+    const unknownConnection = await unknownHarness.adapter.createResident(createInput());
+    await expect(
+      unknownConnection.prompt(
+        "Do not replay this prompt.",
+        residentDispatchLease("prompt", unknownConnection.binding, "dispatch-unknown"),
+      ),
+    ).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+      retryable: false,
+      details: { outcome: "unknown" },
+    });
+    await expect(
+      unknownConnection.prompt(
+        "Do not replay this prompt.",
+        residentDispatchLease("prompt", unknownConnection.binding, "dispatch-unknown"),
+      ),
+    ).rejects.toMatchObject({ code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN" });
+    expect(unknownHarness.state.promptCalls).toHaveLength(1);
+    await unknownConnection.detach();
+    await unknownHarness.adapter.close();
+  });
+
+  it("marks abort rejection ambiguous and never invokes the same dispatch twice", async () => {
+    const { adapter, state } = createHarness({
+      abortHandler: async () => {
+        throw new Error("daemon response disconnected");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const lease = residentDispatchLease("abort", connection.binding, "dispatch-abort-unknown");
+
+    await expect(connection.abort(lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+      retryable: false,
+    });
+    await expect(connection.abort(lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    });
+    expect(state.abortCalls).toBe(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rechecks the exact binding when a queued dispatch reaches its one mutation call", async () => {
+    const firstPrompt = deferred();
+    const { adapter, state, emit } = createHarness({
+      promptHandler: () => firstPrompt.promise,
+    });
+    const connection = await adapter.createResident(createInput());
+    const originalBinding = connection.binding;
+    const first = connection.prompt(
+      "Hold admission briefly.",
+      residentDispatchLease("prompt", originalBinding, "dispatch-before-binding-refresh"),
+    );
+    await vi.waitFor(() => expect(state.promptCalls).toHaveLength(1));
+    const second = connection.abort(
+      residentDispatchLease("abort", originalBinding, "dispatch-after-binding-refresh"),
+    );
+
+    await emit({ type: "connection_status", status: "reconnecting" });
+    state.hello = validHello({ supervisorGeneration: "supervisor-dispatch-refresh" });
+    await emit({ type: "session_resynced", snapshot: validSnapshot() });
+    await emit({ type: "connection_status", status: "connected" });
+    firstPrompt.resolve();
+
+    await expect(first).resolves.toMatchObject({ disposition: "accepted" });
+    await expect(second).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    expect(state.abortCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("drains an invoked prompt on close and rejects queued work before an upstream call", async () => {
+    const firstPrompt = deferred();
+    const { adapter, state } = createHarness({ promptHandler: () => firstPrompt.promise });
+    const connection = await adapter.createResident(createInput());
+    const promptResult = connection.prompt(
+      "Drain this admission.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-before-close"),
+    );
+    await vi.waitFor(() => expect(state.promptCalls).toHaveLength(1));
+    const queuedAbort = connection
+      .abort(residentDispatchLease("abort", connection.binding, "dispatch-queued-before-close"))
+      .catch((error: unknown) => error);
+    const closed = adapter.close();
+    await Promise.resolve();
+    expect(state.disposeCalls).toBe(0);
+
+    firstPrompt.resolve();
+    await expect(promptResult).resolves.toMatchObject({ disposition: "accepted" });
+    await expect(queuedAbort).resolves.toMatchObject({ code: "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED" });
+    await expect(closed).resolves.toBeUndefined();
+    expect(state.abortCalls).toBe(0);
+    expect(state.disposeCalls).toBe(1);
+  });
+
+  it("waits for independent model and abort lanes before terminal disposal", async () => {
+    const modelCatalog = deferred();
+    const abortAdmission = deferred();
+    const { adapter, state } = createHarness({
+      availableModelsHandler: async () => {
+        await modelCatalog.promise;
+        return [{ provider: "openai", id: "gpt-5" }];
+      },
+      abortHandler: () => abortAdmission.promise,
+    });
+    const connection = await adapter.createResident(createInput());
+    const modelSelection = adapter.submit(modelSelectionCommand("select-model-terminal-drain"), {
+      residentBinding: connection.binding,
+    });
+    await vi.waitFor(() => expect(state.availableModelsCalls).toBe(1));
+    const abort = connection.abort(
+      residentDispatchLease("abort", connection.binding, "dispatch-abort-terminal-drain"),
+    );
+    await vi.waitFor(() => expect(state.abortCalls).toBe(1));
+
+    const detached = connection.detach();
+    await Promise.resolve();
+    expect(state.disposeCalls).toBe(0);
+    abortAdmission.resolve();
+    await expect(abort).resolves.toMatchObject({ disposition: "accepted" });
+    expect(state.disposeCalls).toBe(0);
+    modelCatalog.resolve();
+    await expect(modelSelection).rejects.toMatchObject({
+      code: "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+      uncertain: false,
+    });
+    await expect(detached).resolves.toBeUndefined();
+    expect(state.disposeCalls).toBe(1);
+    await adapter.close();
+  });
+
+  it("attaches while snapshots advance and publishes only after a quiet authoritative pair", async () => {
+    let reads = 0;
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => {
+        reads += 1;
+        const cursorSequence = reads <= 4 ? reads : 5;
+        return validSnapshot({
+          cursorSequence,
+          state: { recap: cursorSequence === 5 ? "Streaming settled." : `Streaming ${cursorSequence}` },
+        });
+      },
+    });
+
+    const connection = await adapter.createResident(createInput());
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(1));
+
+    expect(connection.getLifecycle().state).toBe("ready");
+    expect(state.projectionCalls[0]?.projection.cursor.sequence).toBe(5);
+    expect(state.projectionCalls[0]?.projection.runtime.recap).toBe("Streaming settled.");
+    expect(reads).toBe(6);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("keeps a continuously changing stream live, bounds each retry, and publishes after quiet", async () => {
+    let phase: "initial" | "streaming" = "initial";
+    let streamingReads = 0;
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => {
+        if (phase === "initial") return validSnapshot();
+        streamingReads += 1;
+        const cursorSequence = streamingReads <= 8 ? 4 + streamingReads : 12;
+        return validSnapshot({
+          cursorSequence,
+          state: { recap: streamingReads <= 8 ? "Still streaming." : "Stream is quiet." },
+        });
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    phase = "streaming";
+
+    await emit({ type: "session_event", event: { type: "message_delta" } });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+
+    expect(connection.getLifecycle().state).toBe("ready");
+    expect(state.projectionCalls[1]?.projection.cursor.sequence).toBe(12);
+    expect(state.projectionCalls[1]?.projection.runtime.recap).toBe("Stream is quiet.");
+    expect(streamingReads).toBe(10);
+    expect(state.disposeCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("coalesces prompt and abort events into stable authoritative transcript and status publications", async () => {
+    let phase = 0;
+    let projectionGate = deferred();
+    const { adapter, state, emit } = createHarness({
+      waitHandler: (milliseconds) => milliseconds === 100 ? projectionGate.promise : undefined,
+      snapshotHandler: () => phase === 0
+        ? validSnapshot()
+        : phase === 1
+          ? validSnapshot({
+              messages: [{ role: "user", content: "Run the resident task.", timestamp: 1_786_100_000_000 }],
+              cursorSequence: 5,
+              state: { isStreaming: true, recap: "Prime Agent owns the prompt." },
+            })
+          : validSnapshot({
+              messages: [{ role: "user", content: "Run the resident task.", timestamp: 1_786_100_000_000 }],
+              cursorSequence: 6,
+              state: { isStreaming: false, recap: "Abort requested; waiting for the runtime to settle." },
+            }),
+    });
+    const connection = await adapter.createResident(createInput());
+    await connection.prompt(
+      "Run the resident task.",
+      residentDispatchLease("prompt", connection.binding, "dispatch-event-prompt"),
+    );
+    phase = 1;
+    await Promise.all(
+      Array.from({ length: 20 }, () => emit({ type: "session_event", event: { type: "message_update" } })),
+    );
+    expect(state.projectionCalls).toHaveLength(1);
+    projectionGate.resolve();
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+    expect(JSON.stringify(state.projectionCalls[1]?.projection.transcript)).toContain("Run the resident task.");
+    expect(state.projectionCalls[1]?.projection.runtime.recap).toBe("Prime Agent owns the prompt.");
+
+    await Promise.resolve();
+    projectionGate = deferred();
+    await connection.abort(
+      residentDispatchLease("abort", connection.binding, "dispatch-event-abort"),
+    );
+    phase = 2;
+    await emit({ type: "session_status", recap: "Abort requested" });
+    projectionGate.resolve();
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(3));
+    expect(state.projectionCalls[2]?.projection.runtime.recap).toBe(
+      "Abort requested; waiting for the runtime to settle.",
+    );
+    // Initial attach and each event refresh use two matching reads; the burst
+    // never creates one authoritative read per token event.
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
+    await connection.detach();
+    await adapter.close();
+  });
+});
+
 describe("PrimeAgentResidentAdapter model-selection gateway", () => {
   it("prechecks, mutates once, and publishes a fresh authoritative projection", async () => {
     const { adapter, state } = createHarness();
@@ -791,7 +1952,7 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
 
     expect(state.availableModelsCalls).toBe(1);
     expect(state.setModelCalls).toEqual([{ providerId: "openai", modelId: "gpt-5" }]);
-    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(3);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(4);
     expect(state.projectionCalls).toHaveLength(2);
     expect(state.projectionCalls.at(-1)?.projection.runtime.model).toBe("openai/gpt-5");
     await connection.detach();
@@ -826,7 +1987,10 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
   it("marks reconciliation uncertain when authoritative snapshot cursors never stabilize", async () => {
     let snapshotRead = 0;
     const { adapter, state } = createHarness({
-      snapshotHandler: () => validSnapshot({ cursorSequence: 4 + snapshotRead++ }),
+      snapshotHandler: () => {
+        snapshotRead += 1;
+        return validSnapshot({ cursorSequence: snapshotRead <= 2 ? 4 : 2 + snapshotRead });
+      },
     });
     const connection = await adapter.createResident(createInput());
 
@@ -840,7 +2004,7 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
       retryable: false,
     });
     expect(state.setModelCalls).toHaveLength(1);
-    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(5);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
     expect(state.projectionCalls).toHaveLength(1);
     await connection.detach();
     await adapter.close();
@@ -886,7 +2050,7 @@ describe("PrimeAgentResidentAdapter model-selection gateway", () => {
 
     expect(state.availableModelsCalls).toBe(1);
     expect(state.setModelCalls).toHaveLength(1);
-    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(1);
+    expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
     await connection.detach();
     await adapter.close();
   });

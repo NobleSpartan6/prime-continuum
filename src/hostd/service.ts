@@ -15,7 +15,12 @@ import {
   type RuntimeIntegritySnapshot,
   type StructuredError,
 } from "../shared/protocol";
-import { GatewayError, type PrimeAgentGateway, UnavailablePrimeAgentGateway } from "./gateway";
+import {
+  GatewayError,
+  type PrimeAgentGateway,
+  type PrimeAgentProjectionChange,
+  UnavailablePrimeAgentGateway,
+} from "./gateway";
 import {
   PairingAuthority,
   PairingAuthorityError,
@@ -33,7 +38,12 @@ import {
   OAuthBrokerError,
   type HostOAuthComposition,
 } from "./oauth-session-broker";
-import { HostStore, HostStoreError } from "./store";
+import {
+  HostStore,
+  HostStoreError,
+  type ResidentAbortIdleObservedEvent,
+  type ResidentPromptIdleObservedEvent,
+} from "./store";
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
 
 // The durable store contains a single-process handoff harness for protocol and
@@ -106,6 +116,12 @@ export class HostService {
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
   private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
+  private readonly projectionChangeListeners = new Set<(change: PrimeAgentProjectionChange) => void>();
+  private readonly promptIdleListeners = new Set<(event: ResidentPromptIdleObservedEvent) => void>();
+  private readonly abortIdleListeners = new Set<(event: ResidentAbortIdleObservedEvent) => void>();
+  private readonly unsubscribeGatewayProjection: () => void;
+  private readonly unsubscribeGatewayPromptIdle: () => void;
+  private readonly unsubscribeGatewayAbortIdle: () => void;
   private oauthSessionBroker: HostOAuthSessionBroker | undefined;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
@@ -125,6 +141,36 @@ export class HostService {
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
     this.runtimeOAuthComposition = options.runtimeOAuthComposition;
+    this.unsubscribeGatewayProjection = this.gateway.subscribeProjectionChanges?.((change) => {
+      for (const listener of this.projectionChangeListeners) {
+        try {
+          listener(change);
+        } catch {
+          // Notifications are advisory; the durable projection remains the
+          // source of truth and other sessions must still be notified.
+        }
+      }
+    }) ?? (() => undefined);
+    this.unsubscribeGatewayPromptIdle = this.gateway.subscribeResidentPromptIdleObserved?.((event) => {
+      for (const listener of this.promptIdleListeners) {
+        try {
+          listener(event);
+        } catch {
+          // The proof-backed completion is already durable. Continue notifying
+          // the other local framed sessions.
+        }
+      }
+    }) ?? (() => undefined);
+    this.unsubscribeGatewayAbortIdle = this.gateway.subscribeResidentAbortIdleObserved?.((event) => {
+      for (const listener of this.abortIdleListeners) {
+        try {
+          listener(event);
+        } catch {
+          // The proof-backed completion is already durable. Continue notifying
+          // the other local framed sessions.
+        }
+      }
+    }) ?? (() => undefined);
     if (!Number.isSafeInteger(this.identityLoadTimeoutMs) || this.identityLoadTimeoutMs < 10 || this.identityLoadTimeoutMs > 30_000) {
       throw new TypeError("Identity load timeout must be an integer from 10 to 30000 milliseconds");
     }
@@ -157,11 +203,20 @@ export class HostService {
       // can the composition surface a helper termination failure latched by
       // that run; starting these two closes concurrently would race the latch.
       await this.runtimeOAuthComposition?.close?.();
+      this.unsubscribeGatewayProjection();
+      this.unsubscribeGatewayPromptIdle();
+      this.unsubscribeGatewayAbortIdle();
+      this.projectionChangeListeners.clear();
+      this.promptIdleListeners.clear();
+      this.abortIdleListeners.clear();
+      // Resident adapters can still hold verified runtime objects and daemon
+      // requests. Drain them before releasing the integrity authority that
+      // proved those exact files.
+      await this.gateway.close();
       const closeResults = await Promise.allSettled([
         Promise.resolve().then(() => this.runtimeIntegrityProvider?.close?.()),
         Promise.resolve().then(() => this.pairingAuthority.close()),
         Promise.resolve().then(() => (this.hostIdentityProviderUsed ? this.hostIdentityProvider.close() : undefined)),
-        Promise.resolve().then(() => this.gateway.close()),
       ]);
       const failures = closeResults
         .flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
@@ -170,6 +225,25 @@ export class HostService {
       }
     })();
     return this.closePromise;
+  }
+
+  subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
+    this.projectionChangeListeners.add(listener);
+    return () => this.projectionChangeListeners.delete(listener);
+  }
+
+  subscribeResidentPromptIdleObserved(
+    listener: (event: ResidentPromptIdleObservedEvent) => void,
+  ): () => void {
+    this.promptIdleListeners.add(listener);
+    return () => this.promptIdleListeners.delete(listener);
+  }
+
+  subscribeResidentAbortIdleObserved(
+    listener: (event: ResidentAbortIdleObservedEvent) => void,
+  ): () => void {
+    this.abortIdleListeners.add(listener);
+    return () => this.abortIdleListeners.delete(listener);
   }
 
   async handle(value: unknown, context: HostSessionContext): Promise<HostIpcResponse> {
@@ -257,7 +331,20 @@ export class HostService {
       case "health.get": {
         const host = await this.store.getHost();
         const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+        let residentGatewayReady = this.gateway.continuity === "resident";
+        if (
+          residentGatewayReady &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready") &&
+          this.gateway.capabilityReady
+        ) {
+          try {
+            residentGatewayReady = await this.gateway.capabilityReady();
+          } catch {
+            residentGatewayReady = false;
+          }
+        }
         const executionCapabilities = this.gateway.continuity === "resident" &&
+          residentGatewayReady &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [PRIME_AGENT_COMMAND_CAPABILITY]
           : [];
@@ -358,20 +445,37 @@ export class HostService {
         try {
           live = await this.gateway.isLive(command.threadId, command.expectedExecutionGenerationId);
         } catch (error) {
-          if (command.command.kind !== "model.select") throw error;
           liveCheckFailure = {
-            code: "MODEL_SELECTION_LIVE_CHECK_FAILED",
+            code: command.command.kind === "model.select"
+              ? "MODEL_SELECTION_LIVE_CHECK_FAILED"
+              : "RESIDENT_SESSION_LIVE_CHECK_FAILED",
             message: "The resident Prime Agent session could not be verified as live",
             retryable: true,
           };
         }
+        const residentCommandUnsupported = this.gateway.continuity === "resident" &&
+          command.command.kind !== "prompt" &&
+          command.command.kind !== "abort" &&
+          command.command.kind !== "model.select"
+          ? {
+              code: "RESIDENT_COMMAND_UNSUPPORTED",
+              message: "This continuity checkpoint supports only a new prompt, Stop, and model selection.",
+              retryable: false,
+            }
+          : undefined;
         const gatewayUnavailable = this.gateway instanceof UnavailablePrimeAgentGateway
           ? {
               code: "GATEWAY_UNAVAILABLE",
               message: "Prime Agent execution is not attached in this build; the command was not queued.",
               retryable: true,
             }
-          : liveCheckFailure;
+          : residentCommandUnsupported ?? liveCheckFailure ?? (!live
+            ? {
+                code: "RESIDENT_SESSION_NOT_ATTACHED",
+                message: "The exact resident Prime Agent session is not attached; the command was not sent.",
+                retryable: true,
+              }
+            : undefined);
         const admission = await this.store.admitCommand(
           command,
           live,
@@ -422,6 +526,79 @@ export class HostService {
               message,
               error: {
                 code: gatewayError?.code ?? "MODEL_SELECTION_OUTCOME_UNKNOWN",
+                message,
+                retryable: uncertain ? false : (gatewayError?.retryable ?? true),
+              },
+            });
+          }
+        }
+
+        if (command.command.kind === "prompt" || command.command.kind === "abort") {
+          let lease: Awaited<ReturnType<HostStore["beginResidentDispatch"]>>;
+          try {
+            lease = await this.store.beginResidentDispatch(command);
+          } catch (error) {
+            const storeError = error instanceof HostStoreError ? error : undefined;
+            return this.store.failResidentDispatchBeforeStart(command, {
+              code: storeError?.code ?? "RESIDENT_DISPATCH_REJECTED",
+              message: (storeError?.message ?? "Resident authority changed before dispatch").slice(0, 2_048),
+              retryable: storeError?.retryable ?? true,
+            });
+          }
+
+          try {
+            const gatewayAdmission = await this.gateway.submit(command, { residentDispatch: lease });
+            if (command.command.kind === "prompt" && gatewayAdmission.disposition === "accepted") {
+              const receipt = await this.store.finalizeResidentDispatch(lease, {
+                status: "running",
+                message: gatewayAdmission.message?.slice(0, 1_024) ??
+                  "Prime Agent owns the prompt; turn completion follows from authoritative runtime state",
+              });
+              try {
+                const reconciliation = await this.store.beginResidentPromptReconciliation(lease);
+                this.gateway.scheduleResidentPromptReconciliation?.(reconciliation);
+              } catch {
+                // The acknowledged-running receipt and prompt lock are already
+                // durable. Readiness discovery can safely reissue the exact
+                // reconciliation lease without replaying this prompt.
+              }
+              return receipt;
+            }
+            if (command.command.kind === "abort" && gatewayAdmission.disposition === "handled") {
+              const receipt = await this.store.finalizeResidentDispatch(lease, {
+                status: "running",
+                message: gatewayAdmission.message?.slice(0, 1_024) ??
+                  "Prime Agent accepted the stop request; waiting for authoritative idle proof",
+              });
+              try {
+                const reconciliation = await this.store.beginResidentAbortReconciliation(lease);
+                this.gateway.scheduleResidentAbortReconciliation?.(reconciliation);
+              } catch {
+                // The acknowledged-running receipt and Stop lock are already
+                // durable. Readiness discovery can safely reissue the exact
+                // read-only lease without replaying this abort.
+              }
+              return receipt;
+            }
+            return this.store.finalizeResidentDispatch(lease, {
+              status: "uncertain",
+              message: "Prime Agent returned an invalid resident command acknowledgement",
+              error: {
+                code: "RESIDENT_DISPATCH_ACK_INVALID",
+                message: "The resident command may have run, but its acknowledgement was invalid",
+                retryable: false,
+              },
+            });
+          } catch (error) {
+            const gatewayError = error instanceof GatewayError ? error : undefined;
+            const uncertain = gatewayError?.uncertain ?? true;
+            const message = (gatewayError?.message ??
+              "Prime Agent may have received the resident command, but its outcome is unknown").slice(0, 1_024);
+            return this.store.finalizeResidentDispatch(lease, {
+              status: uncertain ? "uncertain" : "failed",
+              message,
+              error: {
+                code: gatewayError?.code ?? "RESIDENT_DISPATCH_OUTCOME_UNKNOWN",
                 message,
                 retryable: uncertain ? false : (gatewayError?.retryable ?? true),
               },

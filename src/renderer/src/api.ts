@@ -89,6 +89,12 @@ export interface AttentionItem {
   kind: 'approval' | 'question' | 'failed'
   title: string
   hostName: string
+  diagnostic?: {
+    code: string
+    message: string
+    retryable: boolean
+    diagnosticId?: string
+  }
 }
 
 export interface ChangeSummary {
@@ -195,12 +201,16 @@ export interface WorkbenchSnapshot {
   runtime: RuntimeSummary
   operations: {
     submitCommands: boolean
+    startResidentTurn?: boolean
+    stopResidentTurn?: boolean
     crossHostHandoff: boolean
     modelCatalog?: boolean
   }
   composerReceipt: {
     state: ComposerReceiptState
     message?: string
+    operation?: 'prompt' | 'abort'
+    retryable?: boolean
   }
 }
 
@@ -253,8 +263,6 @@ export type HandoffPhase =
 export interface ComposerRequest {
   threadId: string
   text: string
-  intent: 'follow_up' | 'steer'
-  sendWhenReconnected: boolean
 }
 
 export interface RendererApi {
@@ -270,7 +278,8 @@ export interface RendererApi {
     installHostService: boolean
     installCommandAcknowledged: boolean
   }): Promise<{ host: HostSummary }>
-  sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string }>
+  sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }>
+  abortThread(threadId: string): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }>
   planHandoff(input: {
     threadId: string
     destinationHostId: string
@@ -350,6 +359,8 @@ export const previewSnapshot: WorkbenchSnapshot = {
   selectedThreadId: 'thread-seamless',
   operations: {
     submitCommands: true,
+    startResidentTurn: false,
+    stopResidentTurn: true,
     crossHostHandoff: true,
     modelCatalog: true,
   },
@@ -556,6 +567,135 @@ export const previewSnapshot: WorkbenchSnapshot = {
   composerReceipt: { state: 'waiting_for_connection', message: previewSimulation('waiting for a sample connection') },
 }
 
+export type PreviewVisualState =
+  | 'reconnecting'
+  | 'idle'
+  | 'prompt-admission'
+  | 'prompt-awaiting-idle-proof'
+  | 'stop-awaiting-idle-proof'
+  | 'nonretryable-uncertainty'
+
+const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
+  'reconnecting',
+  'idle',
+  'prompt-admission',
+  'prompt-awaiting-idle-proof',
+  'stop-awaiting-idle-proof',
+  'nonretryable-uncertainty',
+])
+
+function previewVisualStateFromSearch(search: string): PreviewVisualState {
+  const candidate = new URLSearchParams(search).get('visualState')
+  return candidate && PREVIEW_VISUAL_STATES.has(candidate as PreviewVisualState)
+    ? candidate as PreviewVisualState
+    : 'reconnecting'
+}
+
+function previewSnapshotForVisualState(visualState: PreviewVisualState): WorkbenchSnapshot {
+  const snapshot = structuredClone(previewSnapshot)
+  if (visualState === 'reconnecting') return snapshot
+
+  const selectedThread = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
+  const selectedHost = snapshot.hosts.find((host) => host.id === selectedThread?.hostId)
+  const session = snapshot.runtime.session
+  if (!selectedThread || !selectedHost || !session) return snapshot
+
+  selectedHost.connection = 'online'
+  selectedHost.connectionPath = 'SSH'
+  selectedHost.latencyMs = 24
+  delete selectedHost.lastSynchronized
+  session.isStreaming = false
+  session.isCompacting = false
+  session.isBashRunning = false
+  session.queuedActionCount = 0
+  snapshot.runtime.queue = { pendingCount: 0, paused: false }
+  snapshot.operations.submitCommands = true
+  snapshot.operations.startResidentTurn = false
+  snapshot.operations.stopResidentTurn = false
+
+  const previewUpdate = selectedThread.transcript.find((block) => block.id === 'block-5')
+  const setPreviewUpdate = (body: string, detail: string) => {
+    if (!previewUpdate) return
+    previewUpdate.body = previewSimulation(body)
+    previewUpdate.detail = previewSimulation(detail)
+  }
+
+  if (visualState === 'idle') {
+    selectedThread.status = 'idle'
+    snapshot.operations.startResidentTurn = true
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+    setPreviewUpdate(
+      'sample resident session is attached and ready for another prompt',
+      'no prompt was sent to a host',
+    )
+    return snapshot
+  }
+
+  if (visualState === 'prompt-admission') {
+    selectedThread.status = 'idle'
+    // The local draft remains editable while this exact submission is being
+    // admitted; only the submit action is fenced by the sending receipt.
+    snapshot.operations.startResidentTurn = true
+    snapshot.composerReceipt = {
+      state: 'sending',
+      operation: 'prompt',
+      message: 'Host received the prompt · awaiting durable admission',
+    }
+    setPreviewUpdate(
+      'sample prompt crossed the connection and is awaiting durable host admission',
+      'Prime Agent does not own this sample prompt yet',
+    )
+    return snapshot
+  }
+
+  if (visualState === 'prompt-awaiting-idle-proof') {
+    selectedThread.status = 'running'
+    session.isStreaming = true
+    session.queuedActionCount = 1
+    snapshot.runtime.queue = { pendingCount: 1, paused: false }
+    snapshot.operations.stopResidentTurn = true
+    snapshot.composerReceipt = {
+      state: 'sent',
+      operation: 'prompt',
+      message: 'Prime Agent owns this prompt · waiting for authoritative idle proof',
+    }
+    setPreviewUpdate(
+      'sample prompt was acknowledged by Prime Agent',
+      'the preview retains ownership until an exact idle proof',
+    )
+    return snapshot
+  }
+
+  if (visualState === 'stop-awaiting-idle-proof') {
+    // The projection may report idle before the exact Stop receipt completes.
+    // Retained command ownership must keep the Stop surface visible meanwhile.
+    selectedThread.status = 'idle'
+    snapshot.composerReceipt = {
+      state: 'sent',
+      operation: 'abort',
+      message: 'Stop accepted · waiting for authoritative idle proof',
+    }
+    setPreviewUpdate(
+      'sample Stop request was acknowledged at a safe boundary',
+      'the Stop remains nonterminal until exact idle proof',
+    )
+    return snapshot
+  }
+
+  selectedThread.status = 'idle'
+  snapshot.composerReceipt = {
+    state: 'uncertain',
+    operation: 'abort',
+    retryable: false,
+    message: 'Outcome unknown · recovery required; this Stop will not be replayed',
+  }
+  setPreviewUpdate(
+    'sample Stop outcome cannot be proven after the command boundary',
+    'Prime Agent will not replay this Stop without exact recovery evidence',
+  )
+  return snapshot
+}
+
 const discoveredComputers: DiscoveredComputer[] = [
   {
     alias: 'devbox',
@@ -675,9 +815,11 @@ const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCata
 class BrowserPreviewApi implements RendererApi {
   readonly environment = 'preview' as const
 
+  constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {}
+
   async loadWorkbench(): Promise<WorkbenchSnapshot> {
     await delay(120)
-    return structuredClone(previewSnapshot)
+    return previewSnapshotForVisualState(this.visualState)
   }
 
   async selectThread(_threadId: string): Promise<void> {
@@ -732,15 +874,14 @@ class BrowserPreviewApi implements RendererApi {
     }
   }
 
-  async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string }> {
+  async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }> {
     await delay(240)
-    if (request.sendWhenReconnected) {
-      return {
-        state: 'waiting_for_connection',
-        message: previewSimulation('command saved only in the in-memory preview outbox'),
-      }
-    }
-    return { state: 'sent', message: previewSimulation('command not sent to a host') }
+    return { state: 'sent', message: previewSimulation('prompt not sent to a host') }
+  }
+
+  async abortThread(_threadId: string): Promise<{ state: ComposerReceiptState; message: string }> {
+    await delay(180)
+    return { state: 'sent', message: previewSimulation('stop request not sent to a host') }
   }
 
   async planHandoff(input: {
@@ -1008,9 +1149,11 @@ interface NativeProjectionInput {
   connection?: unknown
   outbox?: unknown
   quarantinedOutboxCount?: unknown
+  durableUncertainReceipts?: unknown
   updatedAt?: unknown
   selectedThreadId?: string
   deviceId?: string
+  mutationAuthorityReady?: boolean
 }
 
 interface NativeProjectionCacheEntry {
@@ -1048,6 +1191,10 @@ function snapshotExecutionGenerationId(value: unknown): string | undefined {
   return locationGenerationId && locationGenerationId === cursorGenerationId
     ? locationGenerationId
     : undefined
+}
+
+function snapshotCursorGeneration(value: unknown): string | undefined {
+  return asString(asRecord(asRecord(value)?.latestCursor)?.generation)
 }
 
 function protocolThreadId(thread: ThreadSummary): string {
@@ -1111,6 +1258,7 @@ function snapshotRegresses(previous: unknown, incoming: unknown): boolean {
     snapshotHostId(previous) !== snapshotHostId(incoming) ||
     snapshotExecutionGenerationId(previous) !== snapshotExecutionGenerationId(incoming)
   ) return false
+  if (snapshotCursorGeneration(previous) !== snapshotCursorGeneration(incoming)) return false
   const previousSequence = asNumber(asRecord(asRecord(previous)?.latestCursor)?.sequence)
   const incomingSequence = asNumber(asRecord(asRecord(incoming)?.latestCursor)?.sequence)
   return previousSequence !== undefined && incomingSequence !== undefined && incomingSequence < previousSequence
@@ -1588,31 +1736,182 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       hostName,
     })
   }
+  const durableUncertainAttentionIdentities = new Set<string>()
+  for (const [index, receipt] of records(input.durableUncertainReceipts).slice(-20).entries()) {
+    if (asString(receipt.status) !== 'uncertain') continue
+    const receiptHostId = asString(receipt.hostId)
+    const receiptThreadId = asString(receipt.threadId)
+    const receiptExecutionGenerationId = asString(receipt.executionGenerationId)
+    const matchingThread = threads.find((thread) =>
+      thread.hostId === receiptHostId &&
+      protocolThreadId(thread) === receiptThreadId &&
+      thread.executionGenerationId === receiptExecutionGenerationId,
+    )
+    if (!matchingThread) continue
+    const error = asRecord(receipt.error)
+    const errorCode = asString(error?.code)?.slice(0, 64)
+    const errorMessage = asString(error?.message)?.slice(0, 2_048)
+    const errorRetryable = asBoolean(error?.retryable)
+    const diagnosticId = asString(error?.diagnosticId)?.slice(0, 128)
+    const receiptDeviceId = asString(receipt.deviceId)
+    const receiptCommandId = asString(receipt.commandId)
+    if (receiptHostId && receiptDeviceId && receiptCommandId && receiptThreadId && receiptExecutionGenerationId) {
+      durableUncertainAttentionIdentities.add(JSON.stringify([
+        receiptHostId,
+        receiptDeviceId,
+        receiptCommandId,
+        receiptThreadId,
+        receiptExecutionGenerationId,
+      ]))
+    }
+    attention.push({
+      id: `durable-uncertain-${receiptCommandId ?? index}`,
+      threadId: matchingThread.id,
+      kind: 'failed',
+      title: 'Outcome unknown · Prime Agent did not replay this command',
+      hostName: hosts.find((host) => host.id === matchingThread.hostId)?.name ?? 'Execution host',
+      ...(errorCode && errorMessage && errorRetryable !== undefined
+        ? {
+            diagnostic: {
+              code: errorCode,
+              message: errorMessage,
+              retryable: errorRetryable,
+              ...(diagnosticId ? { diagnosticId } : {}),
+            },
+          }
+        : {}),
+    })
+  }
 
   const outbox = records(input.outbox)
-  const pending = selectedThread
+  for (const [index, entry] of outbox.entries()) {
+    if (asString(entry.state) !== 'uncertain') continue
+    const command = asRecord(entry.command)
+    const entryHostId = asString(entry.hostId)
+    const commandHostId = asString(command?.expectedHostId)
+    const commandThreadId = asString(command?.threadId)
+    const commandGenerationId = asString(command?.expectedExecutionGenerationId)
+    const commandDeviceId = asString(command?.deviceId)
+    const commandId = asString(command?.commandId)
+    const kind = asString(command?.kind)
+    const operation = kind === 'thread.prompt' || kind === 'prompt'
+      ? 'prompt'
+      : kind === 'thread.cancel' || kind === 'thread.abort' || kind === 'abort'
+        ? 'abort'
+        : undefined
+    if (!operation || !entryHostId || entryHostId !== commandHostId) continue
+    const matchingThread = threads.find((thread) =>
+      thread.hostId === entryHostId &&
+      protocolThreadId(thread) === commandThreadId &&
+      thread.executionGenerationId === commandGenerationId
+    )
+    if (!matchingThread) continue
+    if (
+      commandDeviceId && commandId && commandThreadId && commandGenerationId &&
+      durableUncertainAttentionIdentities.has(JSON.stringify([
+        entryHostId,
+        commandDeviceId,
+        commandId,
+        commandThreadId,
+        commandGenerationId,
+      ]))
+    ) continue
+    attention.push({
+      id: `resident-uncertain-${commandId ?? index}`,
+      threadId: matchingThread.id,
+      kind: 'failed',
+      title: operation === 'prompt'
+        ? 'Prompt outcome unknown · reconnect to reconcile this exact command'
+        : 'Outcome unknown · recovery required; this Stop will not be replayed',
+      hostName: hosts.find((host) => host.id === entryHostId)?.name ?? 'Execution host',
+    })
+  }
+  const pendingEntries = selectedThread
     ? selectedThread.executionGenerationId
-      ? outbox.find((entry) => {
+      ? outbox.flatMap((entry, index) => {
         const command = asRecord(entry.command)
+        const issuedAt = asString(command?.issuedAt)
+        const issuedAtEpoch = issuedAt ? Date.parse(issuedAt) : Number.NaN
         return (
           asString(entry.hostId) === selectedThread.hostId &&
           asString(command?.deviceId) === input.deviceId &&
           asString(command?.expectedHostId) === selectedThread.hostId &&
           asString(command?.threadId) === protocolThreadId(selectedThread) &&
           asString(command?.expectedExecutionGenerationId) === selectedThread.executionGenerationId &&
-          Boolean(asString(command?.issuedAt))
+          Number.isFinite(issuedAtEpoch)
         )
-      })
-      : undefined
-    : undefined
+          ? [{ entry, index, issuedAtEpoch }]
+          : []
+      }).sort((left, right) =>
+        right.issuedAtEpoch - left.issuedAtEpoch || right.index - left.index
+      )
+      : []
+    : []
+  const pending = pendingEntries[0]?.entry
   const pendingState = asString(pending?.state)
+  const pendingCommandKind = asString(asRecord(pending?.command)?.kind)
+  const pendingIsPrompt = pendingCommandKind === 'thread.prompt' || pendingCommandKind === 'prompt'
+  const retainedPromptOwned = pendingEntries.some(({ entry }) => {
+    const state = asString(entry.state)
+    const kind = asString(asRecord(entry.command)?.kind)
+    return (kind === 'thread.prompt' || kind === 'prompt') &&
+      (state === 'awaiting_idle_proof' || state === 'uncertain')
+  })
+  const promptDispatchPending = pendingEntries.some(({ entry }) => {
+    const kind = asString(asRecord(entry.command)?.kind)
+    return (kind === 'thread.prompt' || kind === 'prompt') && asString(entry.state) === 'awaiting_reconciliation'
+  })
+  const abortCommandPending = pendingEntries.some(({ entry }) => {
+    const kind = asString(asRecord(entry.command)?.kind)
+    return kind === 'thread.cancel' || kind === 'thread.abort' || kind === 'abort'
+  })
   const composerReceipt: WorkbenchSnapshot['composerReceipt'] = pending
     ? {
-        state: pendingState === 'uncertain' ? 'uncertain' : 'waiting_for_connection',
-        message: pendingState === 'uncertain' ? 'Receipt uncertain · verifying with host' : 'Waiting for connection',
+        state: pendingState === 'uncertain'
+          ? 'uncertain'
+          : pendingState === 'awaiting_idle_proof' || pendingState === 'awaiting_reconciliation'
+            ? 'sent'
+            : pendingState === 'awaiting_abort_idle_proof'
+              ? 'sent'
+            : 'waiting_for_connection',
+        message: pendingState === 'uncertain'
+          ? pendingIsPrompt
+            ? 'Prompt outcome unknown · Prime Agent will not replay it without proof'
+            : 'Outcome unknown · recovery required; this Stop will not be replayed'
+          : pendingState === 'awaiting_idle_proof'
+            ? 'Prime Agent owns this prompt · waiting for authoritative idle proof'
+            : pendingState === 'awaiting_abort_idle_proof'
+              ? 'Stop accepted · waiting for authoritative idle proof'
+            : pendingState === 'awaiting_reconciliation'
+              ? 'Delivery crossed a non-replayable boundary · reconciling the final acknowledgement'
+            : 'Waiting for connection',
+        ...(pendingIsPrompt
+          ? { operation: 'prompt' as const }
+          : asString(asRecord(pending.command)?.kind) === 'thread.cancel' ||
+              asString(asRecord(pending.command)?.kind) === 'thread.abort' ||
+              asString(asRecord(pending.command)?.kind) === 'abort'
+            ? { operation: 'abort' as const }
+            : {}),
       }
     : { state: 'idle', message: hosts.find((host) => host.id === selectedThread?.hostId)?.connection === 'online' ? 'Ready to send' : 'Waiting for connection' }
 
+  const residentSessionReady = Boolean(
+    input.mutationAuthorityReady !== false &&
+    selectedHostHasAuthority &&
+    activePhase === 'online' &&
+    selectedSnapshotIsMaterialized &&
+    advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+    runtime.session?.residency === 'resident' &&
+    runtime.session.activeSessionId &&
+    runtime.session.sessionId,
+  )
+  const residentTurnActive = Boolean(
+    selectedThread?.status === 'running' ||
+    runtime.session?.isStreaming ||
+    runtime.session?.isCompacting ||
+    runtime.session?.isBashRunning ||
+    (runtime.session?.queuedActionCount ?? 0) > 0,
+  )
   return {
     selectedProjectId,
     selectedThreadId,
@@ -1625,10 +1924,16 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     evidence,
     runtime,
     operations: {
-      submitCommands:
-        selectedHostHasAuthority &&
-        selectedSnapshotIsMaterialized &&
-        advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY),
+      submitCommands: residentSessionReady,
+      startResidentTurn:
+        residentSessionReady &&
+        !residentTurnActive &&
+        !retainedPromptOwned &&
+        !promptDispatchPending &&
+        !abortCommandPending &&
+        selectedThread?.status !== 'waiting' &&
+        selectedThread?.status !== 'needs_approval',
+      stopResidentTurn: residentSessionReady && !abortCommandPending && (residentTurnActive || retainedPromptOwned),
       crossHostHandoff:
         selectedHostHasAuthority &&
         activePhase === 'online' &&
@@ -1662,20 +1967,66 @@ function progressCopy(raw: UnknownRecord): { phase?: HandoffPhase; message: stri
   return { message: 'Updating move progress' }
 }
 
-function nativeComposerReceipt(raw: UnknownRecord): { state: ComposerReceiptState; message: string; terminal: boolean } {
+function nativeComposerReceipt(
+  raw: UnknownRecord,
+  operation?: ComposerOperation,
+): { state: ComposerReceiptState; message: string; terminal: boolean; retryable?: boolean } {
   const status = asString(raw.status)
   const detail = asString(raw.detail) ?? asString(raw.message)
   if (status === 'waiting_for_connection') {
     return { state: 'waiting_for_connection', message: detail ?? 'Waiting for connection · saved in this device’s outbox', terminal: false }
   }
   if (status === 'uncertain') {
-    return { state: 'uncertain', message: detail ?? 'Receipt uncertain · verifying with host', terminal: false }
+    const durable = asBoolean(raw.durable) === true
+    const retryable = asBoolean(asRecord(raw.error)?.retryable) ?? false
+    return {
+      state: 'uncertain',
+      message: operation === 'abort'
+        ? 'Outcome unknown · recovery required; this Stop will not be replayed'
+        : detail ?? (durable ? 'Outcome unknown · command was not replayed' : 'Receipt uncertain · verifying with host'),
+      terminal: operation === 'prompt' || operation === 'abort' ? false : durable,
+      retryable,
+    }
   }
   if (status === 'received') return { state: 'sending', message: detail ?? 'Received by host · awaiting durable admission', terminal: false }
+  if (status === 'admitted') {
+    return {
+      state: 'sent',
+      message: detail ?? 'Delivery crossed a non-replayable boundary · reconciling the final acknowledgement',
+      terminal: false,
+    }
+  }
+  if (status === 'running') {
+    return {
+      state: 'sent',
+      message: detail ?? (operation === 'abort'
+        ? 'Stop accepted · waiting for authoritative idle proof'
+        : 'Prime Agent owns this prompt · waiting for authoritative idle proof'),
+      terminal: false,
+    }
+  }
   if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
     return { state: 'rejected', message: detail ?? 'The host rejected this command.', terminal: true }
   }
+  if (status === 'completed' && operation === 'prompt') {
+    return { state: 'idle', message: detail ?? 'Prime Agent is ready for a new prompt', terminal: true }
+  }
+  if (status === 'completed' && operation === 'abort') {
+    return { state: 'idle', message: detail ?? 'Prime Agent stopped safely', terminal: true }
+  }
   return { state: 'sent', message: detail ?? 'Sent · durably admitted by host', terminal: true }
+}
+
+type ComposerOperation = 'prompt' | 'abort'
+
+interface ComposerActionFence {
+  commandId: string
+  expectedHostId: string
+  threadId: string
+  expectedExecutionGenerationId: string
+  operation: ComposerOperation
+  issuedAt: string
+  sequence: number
 }
 
 export class NativeRendererApi implements RendererApi {
@@ -1687,6 +2038,7 @@ export class NativeRendererApi implements RendererApi {
   private connection?: unknown
   private outbox?: unknown
   private quarantinedOutboxCount = 0
+  private durableUncertainReceipts: unknown = []
   private cacheUpdatedAt?: unknown
   private projection?: WorkbenchSnapshot
   private activeProgress?: (phase: HandoffPhase, message: string) => void
@@ -1699,8 +2051,14 @@ export class NativeRendererApi implements RendererApi {
   private readonly composerHosts = new Map<string, string>()
   private readonly composerGenerations = new Map<string, string>()
   private readonly composerFingerprints = new Map<string, string>()
+  private readonly composerOperations = new Map<string, ComposerOperation>()
+  private readonly composerBaselineCursors = new Map<string, string>()
+  private readonly composerActionFences = new Map<string, ComposerActionFence>()
+  private readonly latestComposerActions = new Map<string, ComposerActionFence>()
+  private readonly composerIssuedAtEpochs = new Map<string, number>()
   private readonly composerIdentityConflicts = new Set<string>()
   private readonly retiredExecutionGenerations = new Map<string, Set<string>>()
+  private readonly retiredCursorGenerations = new Map<string, Set<string>>()
   private readonly listeners = new Set<(snapshot: WorkbenchSnapshot) => void>()
   private nativeSubscriptionsStarted = false
   private nativeUnsubscribers: Array<() => void> = []
@@ -1710,14 +2068,21 @@ export class NativeRendererApi implements RendererApi {
   private threadSelectionGeneration = 0
   private connectionGeneration = 0
   private projectionRevision = 0
+  private composerActionSequence = 0
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
+  private mutationAuthorityReadyHostId?: string
+  private mutationAuthorityHydrationGeneration?: number
+  private mutationAuthorityHydrationPromise?: Promise<void>
   private composerOverride?: {
     threadId: string
     expectedHostId: string
     expectedExecutionGenerationId: string
+    operation: ComposerOperation
+    baselineSnapshotCursor: string
     state: ComposerReceiptState
     message: string
+    retryable?: boolean
   }
 
   constructor(private readonly bridge: NativePrimeBridge) {}
@@ -1738,9 +2103,12 @@ export class NativeRendererApi implements RendererApi {
       connection: this.connection,
       outbox: this.outbox,
       quarantinedOutboxCount: this.quarantinedOutboxCount,
+      durableUncertainReceipts: this.durableUncertainReceipts,
       updatedAt: this.cacheUpdatedAt,
       selectedThreadId: this.selectedThreadId,
       deviceId: this.deviceId,
+      mutationAuthorityReady:
+        this.mutationAuthorityReadyHostId === asString(asRecord(this.connection)?.hostId),
     })
     const selectedThread = this.projection.threads.find((thread) => thread.id === this.projection?.selectedThreadId)
     if (
@@ -1749,10 +2117,41 @@ export class NativeRendererApi implements RendererApi {
       selectedThread.hostId === this.composerOverride.expectedHostId &&
       selectedThread.executionGenerationId === this.composerOverride.expectedExecutionGenerationId
     ) {
+      // Resident prompt and Stop ownership are exact receipt identities. Prime
+      // cursor movement—even an idle projection—cannot consume either one;
+      // only its operation-matching completed idle proof may clear it.
+      const pending = this.composerOverride.state === 'sending' ||
+        this.composerOverride.state === 'sent' ||
+        this.composerOverride.state === 'uncertain' ||
+        this.composerOverride.state === 'waiting_for_connection'
+      const blockStart = pending && (
+        this.composerOverride.operation === 'prompt' || this.composerOverride.operation === 'abort'
+      )
+      const blockStop = pending && this.composerOverride.operation === 'abort' && (
+        this.composerOverride.state !== 'uncertain' || this.composerOverride.retryable === false
+      )
+      const promptMayBeOwned = this.composerOverride.operation === 'prompt' &&
+        (this.composerOverride.state === 'sent' || this.composerOverride.state === 'uncertain')
       this.projection = {
         ...this.projection,
-        composerReceipt: { state: this.composerOverride.state, message: this.composerOverride.message },
-      }
+        operations: {
+          ...this.projection.operations,
+          startResidentTurn: blockStart ? false : this.projection.operations.startResidentTurn,
+          stopResidentTurn: blockStop
+            ? false
+            : promptMayBeOwned
+              ? this.projection.operations.submitCommands
+              : this.projection.operations.stopResidentTurn,
+        },
+        composerReceipt: {
+          state: this.composerOverride.state,
+          message: this.composerOverride.message,
+          operation: this.composerOverride.operation,
+          ...(this.composerOverride.retryable !== undefined
+            ? { retryable: this.composerOverride.retryable }
+            : {}),
+          },
+        }
     }
     return this.projection
   }
@@ -1833,6 +2232,23 @@ export class NativeRendererApi implements RendererApi {
     const catalogLineage = catalogGenerationLineages(previous?.catalog, hostId).get(threadId)
     if (catalogLineage?.generationId !== incomingGenerationId) return false
     if (this.retiredExecutionGenerations.get(`${hostId}\u0000${threadId}`)?.has(incomingGenerationId)) return false
+    const cursorGeneration = snapshotCursorGeneration(snapshot)
+    if (!cursorGeneration) return false
+    const cursorLineageKey = `${hostId}\u0000${threadId}\u0000${incomingGenerationId}`
+    if (this.retiredCursorGenerations.get(cursorLineageKey)?.has(cursorGeneration)) return false
+    const previousCursorGeneration = snapshotExecutionGenerationId(previous?.lastSnapshot) === incomingGenerationId
+      ? snapshotCursorGeneration(previous?.lastSnapshot)
+      : undefined
+    if (previousCursorGeneration && previousCursorGeneration !== cursorGeneration) {
+      const previousGeneratedAt = Date.parse(asString(asRecord(previous?.lastSnapshot)?.generatedAt) ?? '')
+      const incomingGeneratedAt = Date.parse(asString(asRecord(snapshot)?.generatedAt) ?? '')
+      if (
+        Number.isFinite(previousGeneratedAt) &&
+        Number.isFinite(incomingGeneratedAt) &&
+        incomingGeneratedAt <= previousGeneratedAt
+      ) return false
+      if (!this.retireRendererCursorGeneration(cursorLineageKey, previousCursorGeneration)) return false
+    }
     if (snapshotRegresses(previous?.lastSnapshot, snapshot)) return false
     const previousGenerationId = snapshotExecutionGenerationId(previous?.lastSnapshot)
     if (
@@ -1871,6 +2287,19 @@ export class NativeRendererApi implements RendererApi {
     return true
   }
 
+  private retireRendererCursorGeneration(lineageKey: string, generationId: string): boolean {
+    let retired = this.retiredCursorGenerations.get(lineageKey)
+    if (!retired) {
+      if (this.retiredCursorGenerations.size >= 512) return false
+      retired = new Set<string>()
+      this.retiredCursorGenerations.set(lineageKey, retired)
+    }
+    if (retired.has(generationId)) return true
+    if (retired.size >= 16) return false
+    retired.add(generationId)
+    return true
+  }
+
   private hydrateRetiredExecutionGenerations(): void {
     this.retiredExecutionGenerations.clear()
     for (const [hostId, entry] of Object.entries(this.projectionEntries)) {
@@ -1904,10 +2333,16 @@ export class NativeRendererApi implements RendererApi {
     this.composerHosts.clear()
     this.composerGenerations.clear()
     this.composerFingerprints.clear()
+    this.composerOperations.clear()
+    this.composerBaselineCursors.clear()
+    this.composerActionFences.clear()
+    this.latestComposerActions.clear()
+    this.composerIssuedAtEpochs.clear()
     this.composerIdentityConflicts.clear()
     this.handoffDestinations.clear()
     this.handoffSources.clear()
     this.activeProgress = undefined
+    this.mutationAuthorityReadyHostId = undefined
     this.threadSelectionGeneration += 1
   }
 
@@ -1943,9 +2378,96 @@ export class NativeRendererApi implements RendererApi {
     }
     this.publish()
 
-    if (this.workbenchLoaded && nextPhase === 'online' && previousPhase !== 'online') {
-      void this.refreshFromAuthoritativeHost().catch(() => undefined)
+    if (this.workbenchLoaded && nextPhase === 'online' && verifiedHostId) {
+      if (this.mutationAuthorityReadyHostId !== verifiedHostId) {
+        void this.rehydrateAuthorityMutationState(verifiedHostId, this.connectionGeneration)
+          .then(async () => await this.refreshFromAuthoritativeHost())
+          .catch(() => undefined)
+      } else if (previousPhase !== 'online') {
+        void this.refreshFromAuthoritativeHost().catch(() => undefined)
+      }
     }
+  }
+
+  private rehydrateAuthorityMutationState(hostId: string, generation: number): Promise<void> {
+    if (
+      this.mutationAuthorityHydrationPromise &&
+      this.mutationAuthorityHydrationGeneration === generation
+    ) return this.mutationAuthorityHydrationPromise
+    const previous = this.mutationAuthorityHydrationPromise
+    const hydration = (async () => {
+      if (previous) await previous.catch(() => undefined)
+      const bootstrap = asRecord(await this.call<unknown>('bootstrap'))
+      const bootstrapHostId = asString(asRecord(bootstrap?.connection)?.hostId)
+      if (
+        generation !== this.connectionGeneration ||
+        asString(asRecord(this.connection)?.phase) !== 'online' ||
+        asString(asRecord(this.connection)?.hostId) !== hostId ||
+        bootstrapHostId !== hostId
+      ) throw new StaleHostAuthorityError()
+      this.outbox = bootstrap?.outbox
+      this.quarantinedOutboxCount = asNumber(bootstrap?.quarantinedOutboxCount) ?? 0
+      this.durableUncertainReceipts = bootstrap?.durableUncertainReceipts
+      this.hydrateComposerCommands(this.outbox)
+      this.mutationAuthorityReadyHostId = hostId
+      this.projectionRevision += 1
+      this.publish()
+    })()
+    this.mutationAuthorityHydrationGeneration = generation
+    this.mutationAuthorityHydrationPromise = hydration
+    void hydration.finally(() => {
+      if (this.mutationAuthorityHydrationPromise === hydration) {
+        this.mutationAuthorityHydrationPromise = undefined
+        this.mutationAuthorityHydrationGeneration = undefined
+      }
+    }).catch(() => undefined)
+    return hydration
+  }
+
+  private composerActionKey(expectedHostId: string, threadId: string): string {
+    return `${expectedHostId}\u0000${threadId}`
+  }
+
+  private nextComposerIssuedAt(expectedHostId: string, threadId: string): string {
+    const key = this.composerActionKey(expectedHostId, threadId)
+    const previous = this.composerIssuedAtEpochs.get(key) ?? 0
+    const epoch = Math.max(Date.now(), previous + 1)
+    this.composerIssuedAtEpochs.set(key, epoch)
+    return new Date(epoch).toISOString()
+  }
+
+  private registerComposerAction(input: Omit<ComposerActionFence, 'sequence'>): ComposerActionFence {
+    const action: ComposerActionFence = {
+      ...input,
+      sequence: ++this.composerActionSequence,
+    }
+    this.composerActionFences.set(action.commandId, action)
+    const key = this.composerActionKey(action.expectedHostId, action.threadId)
+    this.latestComposerActions.set(key, action)
+    const issuedAtEpoch = Date.parse(action.issuedAt)
+    if (Number.isFinite(issuedAtEpoch)) {
+      this.composerIssuedAtEpochs.set(key, Math.max(this.composerIssuedAtEpochs.get(key) ?? 0, issuedAtEpoch))
+    }
+    return action
+  }
+
+  private isLatestComposerAction(
+    commandId: string,
+    expectedHostId: string,
+    threadId: string,
+    expectedExecutionGenerationId: string,
+  ): boolean {
+    const action = this.composerActionFences.get(commandId)
+    const latest = this.latestComposerActions.get(this.composerActionKey(expectedHostId, threadId))
+    return Boolean(
+      action &&
+      latest &&
+      latest.commandId === commandId &&
+      latest.sequence === action.sequence &&
+      action.expectedHostId === expectedHostId &&
+      action.threadId === threadId &&
+      action.expectedExecutionGenerationId === expectedExecutionGenerationId,
+    )
   }
 
   private hydrateComposerCommands(outbox: unknown): void {
@@ -1954,8 +2476,23 @@ export class NativeRendererApi implements RendererApi {
     this.composerHosts.clear()
     this.composerGenerations.clear()
     this.composerFingerprints.clear()
+    this.composerOperations.clear()
+    this.composerBaselineCursors.clear()
+    this.composerActionFences.clear()
+    this.latestComposerActions.clear()
+    this.composerIssuedAtEpochs.clear()
     this.composerIdentityConflicts.clear()
-    for (const entry of records(outbox)) {
+    const orderedEntries = records(outbox)
+      .map((entry, index) => ({ entry, index }))
+      .sort((left, right) => {
+        const leftIssuedAt = Date.parse(asString(asRecord(left.entry.command)?.issuedAt) ?? '')
+        const rightIssuedAt = Date.parse(asString(asRecord(right.entry.command)?.issuedAt) ?? '')
+        if (Number.isFinite(leftIssuedAt) && Number.isFinite(rightIssuedAt) && leftIssuedAt !== rightIssuedAt) {
+          return leftIssuedAt - rightIssuedAt
+        }
+        return left.index - right.index
+      })
+    for (const { entry } of orderedEntries) {
       const command = asRecord(entry.command)
       const commandId = asString(command?.commandId)
       const deviceId = asString(command?.deviceId)
@@ -1964,6 +2501,12 @@ export class NativeRendererApi implements RendererApi {
       const entryHostId = asString(entry.hostId)
       const generationId = asString(command?.expectedExecutionGenerationId)
       const issuedAt = asString(command?.issuedAt)
+      const commandKind = asString(command?.kind)
+      const operation = commandKind === 'thread.prompt' || commandKind === 'prompt'
+        ? 'prompt'
+        : commandKind === 'thread.cancel' || commandKind === 'thread.abort' || commandKind === 'abort'
+          ? 'abort'
+          : undefined
       if (
         commandId &&
         deviceId === this.deviceId &&
@@ -1971,7 +2514,8 @@ export class NativeRendererApi implements RendererApi {
         hostId &&
         hostId === entryHostId &&
         generationId &&
-        issuedAt
+        issuedAt &&
+        operation
       ) {
         const fingerprint = canonicalRendererJson(command)
         const previousFingerprint = this.composerFingerprints.get(commandId)
@@ -1986,6 +2530,19 @@ export class NativeRendererApi implements RendererApi {
         this.composerHosts.set(commandId, hostId)
         this.composerGenerations.set(commandId, generationId)
         this.composerFingerprints.set(commandId, fingerprint)
+        this.composerOperations.set(commandId, operation)
+        this.composerBaselineCursors.set(
+          commandId,
+          canonicalRendererJson(asRecord(asRecord(this.threadSnapshot)?.latestCursor) ?? {}),
+        )
+        this.registerComposerAction({
+          commandId,
+          expectedHostId: hostId,
+          threadId,
+          expectedExecutionGenerationId: generationId,
+          operation,
+          issuedAt,
+        })
       }
     }
   }
@@ -1998,6 +2555,8 @@ export class NativeRendererApi implements RendererApi {
     expectedExecutionGenerationId: string,
     expectedCommandFingerprint: string,
     receipt: { state: ComposerReceiptState; terminal: boolean },
+    operation: ComposerOperation,
+    receiptStatus?: string,
   ): void {
     const entries = records(this.outbox)
     const matches = (entry: UnknownRecord): boolean => {
@@ -2020,6 +2579,12 @@ export class NativeRendererApi implements RendererApi {
     const nextState =
       receipt.state === 'uncertain'
         ? 'uncertain'
+        : receiptStatus === 'running' && operation === 'prompt'
+          ? 'awaiting_idle_proof'
+          : receiptStatus === 'running' && operation === 'abort'
+            ? 'awaiting_abort_idle_proof'
+          : receiptStatus === 'received' || receiptStatus === 'admitted' || receiptStatus === 'running'
+            ? 'awaiting_reconciliation'
         : receipt.state === 'waiting_for_connection'
           ? 'waiting_for_connection'
           : undefined
@@ -2029,12 +2594,31 @@ export class NativeRendererApi implements RendererApi {
     )
   }
 
+  private retireDurableUncertainReceipt(receipt: UnknownRecord): void {
+    const hostId = asString(receipt.hostId)
+    const deviceId = asString(receipt.deviceId)
+    const commandId = asString(receipt.commandId)
+    const threadId = asString(receipt.threadId)
+    const executionGenerationId = asString(receipt.executionGenerationId)
+    if (!hostId || !deviceId || !commandId || !threadId || !executionGenerationId) return
+    this.durableUncertainReceipts = records(this.durableUncertainReceipts).filter((candidate) => !(
+      asString(candidate.hostId) === hostId &&
+      asString(candidate.deviceId) === deviceId &&
+      asString(candidate.commandId) === commandId &&
+      asString(candidate.threadId) === threadId &&
+      asString(candidate.executionGenerationId) === executionGenerationId
+    ))
+  }
+
   private forgetComposerCommand(commandId: string): void {
     this.composerCommands.delete(commandId)
     this.composerDevices.delete(commandId)
     this.composerHosts.delete(commandId)
     this.composerGenerations.delete(commandId)
     this.composerFingerprints.delete(commandId)
+    this.composerOperations.delete(commandId)
+    this.composerBaselineCursors.delete(commandId)
+    this.composerActionFences.delete(commandId)
   }
 
   private startNativeSubscriptions(): void {
@@ -2080,7 +2664,10 @@ export class NativeRendererApi implements RendererApi {
     })
     subscribe('onHostEvent', (event) => {
       const hostEvent = asRecord(event)
-      if (asString(hostEvent?.type) !== 'command.receipt') return
+      const hostEventType = asString(hostEvent?.type)
+      const promptIdleObserved = hostEventType === 'resident.prompt_idle_observed'
+      const abortIdleObserved = hostEventType === 'resident.abort_idle_observed'
+      if (!promptIdleObserved && !abortIdleObserved && hostEventType !== 'command.receipt') return
       const receipt = asRecord(hostEvent?.payload)
       const commandId = asString(receipt?.commandId)
       const storedThreadId = commandId ? this.composerCommands.get(commandId) : undefined
@@ -2088,6 +2675,8 @@ export class NativeRendererApi implements RendererApi {
       const expectedHostId = commandId ? this.composerHosts.get(commandId) : undefined
       const expectedGenerationId = commandId ? this.composerGenerations.get(commandId) : undefined
       const expectedCommandFingerprint = commandId ? this.composerFingerprints.get(commandId) : undefined
+      const operation = commandId ? this.composerOperations.get(commandId) : undefined
+      const baselineSnapshotCursor = commandId ? this.composerBaselineCursors.get(commandId) : undefined
       const threadId = storedThreadId
         ? this.projection?.threads.find(
             (thread) =>
@@ -2105,6 +2694,8 @@ export class NativeRendererApi implements RendererApi {
         !expectedHostId ||
         !expectedGenerationId ||
         !expectedCommandFingerprint ||
+        !operation ||
+        !baselineSnapshotCursor ||
         receiptDeviceId !== expectedDeviceId ||
         receiptThreadId !== storedThreadId ||
         receiptGenerationId !== expectedGenerationId ||
@@ -2120,13 +2711,57 @@ export class NativeRendererApi implements RendererApi {
         ) this.composerOverride = undefined
         return
       }
-      const mapped = nativeComposerReceipt(receipt)
-      this.composerOverride = {
-        threadId,
-        expectedHostId,
-        expectedExecutionGenerationId: expectedGenerationId,
-        state: mapped.state,
-        message: mapped.message,
+      const mapped = nativeComposerReceipt(receipt, operation)
+      const isExactResidentIdleProof = Boolean(
+        asString(receipt.status) === 'completed' &&
+        (operation === 'prompt' || operation === 'abort'),
+      )
+      if (
+        (promptIdleObserved && operation !== 'prompt') ||
+        (abortIdleObserved && operation !== 'abort') ||
+        ((promptIdleObserved || abortIdleObserved) && !isExactResidentIdleProof)
+      ) return
+      if (isExactResidentIdleProof) {
+        this.retireDurableUncertainReceipt(receipt)
+        const actionKey = this.composerActionKey(expectedHostId, storedThreadId)
+        const latest = this.latestComposerActions.get(actionKey)
+        if (
+          latest?.expectedExecutionGenerationId === expectedGenerationId &&
+          latest.operation === operation
+        ) {
+          // A resident proof retires only its own operation. Prompt-idle can
+          // race with a newer accepted Stop, whose ownership remains until the
+          // distinct abort-idle proof arrives.
+          this.latestComposerActions.delete(actionKey)
+        }
+        if (
+          this.composerOverride?.expectedHostId === expectedHostId &&
+          this.composerOverride.expectedExecutionGenerationId === expectedGenerationId &&
+          this.composerOverride.operation === operation &&
+          (this.composerOverride.state === 'sending' ||
+            this.composerOverride.state === 'sent' ||
+            this.composerOverride.state === 'uncertain')
+        ) {
+          this.composerOverride = undefined
+        }
+      } else if (
+        this.isLatestComposerAction(
+          commandId,
+          expectedHostId,
+          storedThreadId,
+          expectedGenerationId,
+        )
+      ) {
+        this.composerOverride = {
+          threadId,
+          expectedHostId,
+          expectedExecutionGenerationId: expectedGenerationId,
+          operation,
+          baselineSnapshotCursor,
+          state: mapped.state,
+          message: mapped.message,
+          ...(mapped.retryable !== undefined ? { retryable: mapped.retryable } : {}),
+        }
       }
       this.updateOutboxFromReceipt(
         commandId,
@@ -2136,6 +2771,8 @@ export class NativeRendererApi implements RendererApi {
         expectedGenerationId,
         expectedCommandFingerprint,
         mapped,
+        operation,
+        asString(receipt.status),
       )
       if (mapped.terminal) {
         this.forgetComposerCommand(commandId)
@@ -2302,7 +2939,12 @@ export class NativeRendererApi implements RendererApi {
       // scoped to that host and must not hydrate the newly verified authority.
       this.workbenchLoaded = true
       const currentProjection = this.updateProjection()
-      queueMicrotask(() => void this.reconcileInBackground())
+      const generation = this.connectionGeneration
+      queueMicrotask(() => {
+        void this.rehydrateAuthorityMutationState(currentVerifiedHostId, generation)
+          .then(async () => await this.reconcileInBackground())
+          .catch(() => undefined)
+      })
       return currentProjection
     }
     const bootstrapEntries = projectionEntriesFromCache(cache)
@@ -2341,7 +2983,9 @@ export class NativeRendererApi implements RendererApi {
     this.threadSnapshot = preferredSnapshot
     this.outbox = bootstrap?.outbox
     this.quarantinedOutboxCount = asNumber(bootstrap?.quarantinedOutboxCount) ?? 0
+    this.durableUncertainReceipts = bootstrap?.durableUncertainReceipts
     this.hydrateComposerCommands(this.outbox)
+    this.mutationAuthorityReadyHostId = connectionHostId
     this.cacheUpdatedAt = connectionHostId
       ? this.projectionEntries[connectionHostId]?.updatedAt
       : asString(cache?.updatedAt)
@@ -2617,11 +3261,11 @@ export class NativeRendererApi implements RendererApi {
     }
   }
 
-  async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string }> {
-    if (!this.projection?.operations.submitCommands) {
+  async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }> {
+    if (!this.projection?.operations.startResidentTurn) {
       return {
         state: 'rejected',
-        message: 'Prime Agent isn’t attached to this host, so commands are unavailable.',
+        message: 'This resident session is not ready for a new prompt. Refresh the thread or reconnect its host.',
       }
     }
     const commandId = createStableId('command')
@@ -2636,15 +3280,15 @@ export class NativeRendererApi implements RendererApi {
     if (asString(asRecord(this.connection)?.hostId) !== expectedHostId) {
       throw new StaleHostAuthorityError()
     }
-    const issuedAt = new Date().toISOString()
+    const issuedAt = this.nextComposerIssuedAt(expectedHostId, remoteThreadId)
     const clientCommand = {
       deviceId: this.deviceId,
       commandId,
       expectedHostId,
       threadId: remoteThreadId,
-      kind: request.intent === 'steer' ? 'thread.steer' : 'thread.follow_up',
+      kind: 'thread.prompt',
       payload: { text: request.text },
-      delivery: request.sendWhenReconnected ? 'send_when_reconnected' : 'live_only',
+      delivery: 'live_only',
       expectedExecutionGenerationId,
       issuedAt,
     }
@@ -2653,6 +3297,27 @@ export class NativeRendererApi implements RendererApi {
     this.composerHosts.set(commandId, expectedHostId)
     this.composerGenerations.set(commandId, expectedExecutionGenerationId)
     this.composerFingerprints.set(commandId, canonicalRendererJson(clientCommand))
+    this.composerOperations.set(commandId, 'prompt')
+    const baselineSnapshotCursor = canonicalRendererJson(asRecord(asRecord(this.threadSnapshot)?.latestCursor) ?? {})
+    this.composerBaselineCursors.set(commandId, baselineSnapshotCursor)
+    this.registerComposerAction({
+      commandId,
+      expectedHostId,
+      threadId: remoteThreadId,
+      expectedExecutionGenerationId,
+      operation: 'prompt',
+      issuedAt,
+    })
+    this.composerOverride = {
+      threadId: request.threadId,
+      expectedHostId,
+      expectedExecutionGenerationId,
+      operation: 'prompt',
+      baselineSnapshotCursor,
+      state: 'sending',
+      message: 'Starting Prime Agent…',
+    }
+    this.publish()
     let receipt: UnknownRecord | undefined
     try {
       receipt = asRecord(await this.call<unknown>('submitCommand', clientCommand))
@@ -2671,33 +3336,212 @@ export class NativeRendererApi implements RendererApi {
         this.forgetComposerCommand(commandId)
         throw new StaleHostAuthorityError()
       }
-      this.composerOverride = {
-        threadId: request.threadId,
-        expectedHostId,
-        expectedExecutionGenerationId,
-        state: 'uncertain',
-        message: error instanceof Error ? `${error.message} Verifying the exact envelope with the host.` : 'Receipt uncertain · verifying with host',
+      if (
+        this.isLatestComposerAction(
+          commandId,
+          expectedHostId,
+          remoteThreadId,
+          expectedExecutionGenerationId,
+        )
+      ) {
+        this.composerOverride = {
+          threadId: request.threadId,
+          expectedHostId,
+          expectedExecutionGenerationId,
+          operation: 'prompt',
+          baselineSnapshotCursor,
+          state: 'uncertain',
+          message: error instanceof Error ? `${error.message} Verifying the exact envelope with the host.` : 'Receipt uncertain · verifying with host',
+        }
+        this.publish()
       }
-      this.publish()
       throw error
     }
     if (!this.hasComposerAuthority(request.threadId, expectedHostId, expectedExecutionGenerationId)) {
       this.forgetComposerCommand(commandId)
       throw new StaleHostAuthorityError()
     }
-    const mapped = nativeComposerReceipt(receipt ?? {})
-    this.composerOverride = {
-      threadId: request.threadId,
+    const mapped = nativeComposerReceipt(receipt ?? {}, 'prompt')
+    const actionIsLatest = this.isLatestComposerAction(
+      commandId,
       expectedHostId,
+      remoteThreadId,
       expectedExecutionGenerationId,
-      state: mapped.state,
-      message: mapped.message,
+    )
+    const completedPromptProof = asString(receipt?.status) === 'completed'
+    if (completedPromptProof) this.retireDurableUncertainReceipt(receipt ?? {})
+    if (actionIsLatest && completedPromptProof) {
+      this.latestComposerActions.delete(this.composerActionKey(expectedHostId, remoteThreadId))
+      if (
+        this.composerOverride?.expectedHostId === expectedHostId &&
+        this.composerOverride.expectedExecutionGenerationId === expectedExecutionGenerationId
+      ) this.composerOverride = undefined
+    } else if (actionIsLatest) {
+      this.composerOverride = {
+        threadId: request.threadId,
+        expectedHostId,
+        expectedExecutionGenerationId,
+        operation: 'prompt',
+        baselineSnapshotCursor,
+        state: mapped.state,
+        message: mapped.message,
+        ...(mapped.retryable !== undefined ? { retryable: mapped.retryable } : {}),
+      }
     }
     if (mapped.terminal) {
       this.forgetComposerCommand(commandId)
     }
+    if (actionIsLatest) this.publish()
+    return {
+      state: mapped.state,
+      message: mapped.message,
+      ...(mapped.retryable !== undefined ? { retryable: mapped.retryable } : {}),
+    }
+  }
+
+  async abortThread(threadId: string): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }> {
+    if (!this.projection?.operations.stopResidentTurn) {
+      return {
+        state: 'rejected',
+        message: 'Prime Agent does not report an active resident turn that can be stopped.',
+      }
+    }
+    const commandId = createStableId('command')
+    const thread = this.projection.threads.find((item) => item.id === threadId)
+    if (!thread?.hostId) throw new Error('Refresh this thread before stopping so its host identity can be verified.')
+    const expectedHostId = thread.hostId
+    const expectedExecutionGenerationId = thread.executionGenerationId
+    if (!expectedExecutionGenerationId) {
+      throw new Error('Refresh this thread before stopping so its exact execution generation can be verified.')
+    }
+    const remoteThreadId = protocolThreadId(thread)
+    if (asString(asRecord(this.connection)?.hostId) !== expectedHostId) {
+      throw new StaleHostAuthorityError()
+    }
+    const issuedAt = this.nextComposerIssuedAt(expectedHostId, remoteThreadId)
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId,
+      threadId: remoteThreadId,
+      kind: 'thread.cancel',
+      delivery: 'live_only',
+      expectedExecutionGenerationId,
+      issuedAt,
+    }
+    this.composerCommands.set(commandId, remoteThreadId)
+    this.composerDevices.set(commandId, this.deviceId)
+    this.composerHosts.set(commandId, expectedHostId)
+    this.composerGenerations.set(commandId, expectedExecutionGenerationId)
+    this.composerFingerprints.set(commandId, canonicalRendererJson(clientCommand))
+    this.composerOperations.set(commandId, 'abort')
+    const baselineSnapshotCursor = canonicalRendererJson(asRecord(asRecord(this.threadSnapshot)?.latestCursor) ?? {})
+    this.composerBaselineCursors.set(commandId, baselineSnapshotCursor)
+    this.registerComposerAction({
+      commandId,
+      expectedHostId,
+      threadId: remoteThreadId,
+      expectedExecutionGenerationId,
+      operation: 'abort',
+      issuedAt,
+    })
+    this.composerOverride = {
+      threadId,
+      expectedHostId,
+      expectedExecutionGenerationId,
+      operation: 'abort',
+      baselineSnapshotCursor,
+      state: 'sending',
+      message: 'Requesting a safe stop…',
+    }
     this.publish()
-    return { state: mapped.state, message: mapped.message }
+    let receipt: UnknownRecord | undefined
+    try {
+      receipt = asRecord(await this.call<unknown>('cancel', {
+        deviceId: this.deviceId,
+        commandId,
+        expectedHostId,
+        expectedExecutionGenerationId,
+        issuedAt,
+        threadId: remoteThreadId,
+      }))
+      if (
+        asString(receipt?.deviceId) !== this.deviceId ||
+        asString(receipt?.commandId) !== commandId ||
+        asString(receipt?.hostId) !== expectedHostId ||
+        asString(receipt?.threadId) !== remoteThreadId ||
+        asString(receipt?.executionGenerationId) !== expectedExecutionGenerationId
+      ) {
+        throw new Error('The host returned a stop receipt for a different command generation. The original outcome remains uncertain.')
+      }
+    } catch (error) {
+      if (error instanceof StaleHostAuthorityError) throw error
+      if (!this.hasComposerAuthority(threadId, expectedHostId, expectedExecutionGenerationId)) {
+        this.forgetComposerCommand(commandId)
+        throw new StaleHostAuthorityError()
+      }
+      if (
+        this.isLatestComposerAction(
+          commandId,
+          expectedHostId,
+          remoteThreadId,
+          expectedExecutionGenerationId,
+        )
+      ) {
+        this.composerOverride = {
+          threadId,
+          expectedHostId,
+          expectedExecutionGenerationId,
+          operation: 'abort',
+          baselineSnapshotCursor,
+          state: 'uncertain',
+          retryable: false,
+          message: error instanceof Error
+            ? `${error.message} Prime Agent will not replay this stop request without proof.`
+            : 'Stop outcome unknown · Prime Agent will not replay this request without proof.',
+        }
+        this.publish()
+      }
+      throw error
+    }
+    if (!this.hasComposerAuthority(threadId, expectedHostId, expectedExecutionGenerationId)) {
+      this.forgetComposerCommand(commandId)
+      throw new StaleHostAuthorityError()
+    }
+    const mapped = nativeComposerReceipt(receipt ?? {}, 'abort')
+    const actionIsLatest = this.isLatestComposerAction(
+      commandId,
+      expectedHostId,
+      remoteThreadId,
+      expectedExecutionGenerationId,
+    )
+    const completedAbortProof = asString(receipt?.status) === 'completed'
+    if (completedAbortProof) this.retireDurableUncertainReceipt(receipt ?? {})
+    if (actionIsLatest && completedAbortProof) {
+      this.latestComposerActions.delete(this.composerActionKey(expectedHostId, remoteThreadId))
+      if (
+        this.composerOverride?.expectedHostId === expectedHostId &&
+        this.composerOverride.expectedExecutionGenerationId === expectedExecutionGenerationId
+      ) this.composerOverride = undefined
+    } else if (actionIsLatest) {
+      this.composerOverride = {
+        threadId,
+        expectedHostId,
+        expectedExecutionGenerationId,
+        operation: 'abort',
+        baselineSnapshotCursor,
+        state: mapped.state,
+        message: mapped.message,
+        ...(mapped.retryable !== undefined ? { retryable: mapped.retryable } : {}),
+      }
+    }
+    if (mapped.terminal) this.forgetComposerCommand(commandId)
+    if (actionIsLatest) this.publish()
+    return {
+      state: mapped.state,
+      message: mapped.message,
+      ...(mapped.retryable !== undefined ? { retryable: mapped.retryable } : {}),
+    }
   }
 
   private hasComposerAuthority(
@@ -2864,11 +3708,11 @@ export function createRendererApi(): RendererApi {
     if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge)
     else if (isNativeBridgeUnavailable(window.navigator.userAgent, false)) {
       throw new Error('The native control bridge did not load. Prime Continuim will not substitute sample data in the desktop app.')
-    } else singletonApi = new BrowserPreviewApi()
+    } else singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
   }
   return singletonApi
 }
 
-export function createPreviewRendererApi(): RendererApi {
-  return new BrowserPreviewApi()
+export function createPreviewRendererApi(visualState: PreviewVisualState = 'reconnecting'): RendererApi {
+  return new BrowserPreviewApi(visualState)
 }

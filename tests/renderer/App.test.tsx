@@ -48,6 +48,38 @@ function withLargeModelCatalog(catalog: RuntimeModelCatalog): RuntimeModelCatalo
   }
 }
 
+function createIdleResidentApi() {
+  const api = createPreviewRendererApi()
+  const loadWorkbench = api.loadWorkbench.bind(api)
+  api.loadWorkbench = async () => {
+    const snapshot = await loadWorkbench()
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-complete')
+    const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+    if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected the resident preview fixture')
+    snapshot.selectedThreadId = thread.id
+    snapshot.selectedProjectId = thread.projectId
+    thread.status = 'idle'
+    host.connection = 'online'
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    snapshot.operations = {
+      ...snapshot.operations,
+      submitCommands: true,
+      startResidentTurn: true,
+      stopResidentTurn: false,
+    }
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+    return snapshot
+  }
+  return api
+}
+
 beforeAll(() => {
   Object.defineProperty(window, 'requestAnimationFrame', {
     configurable: true,
@@ -73,10 +105,98 @@ beforeAll(() => {
 afterEach(() => {
   cleanup()
   window.history.replaceState({}, '', '/')
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1_024 })
+  Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined })
 })
 
 describe('Prime Continuim renderer', () => {
-  it('keeps the durable thread primary while connection and task states remain separate', async () => {
+  it('shows a copyable durable diagnostic with explicit no-retry guidance', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => undefined)
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.attention.unshift({
+        id: 'restart-uncertain',
+        threadId: snapshot.selectedThreadId,
+        kind: 'failed',
+        title: 'Outcome unknown · Prime Agent did not replay this command',
+        hostName: 'devbox',
+        diagnostic: {
+          code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+          message: 'The Prime Agent outcome cannot be proven after the host process identity changed',
+          retryable: false,
+          diagnosticId: 'resident-dispatch-diagnostic-1',
+        },
+      })
+      return snapshot
+    }
+
+    render(<App api={api} />)
+
+    expect(await screen.findByText(/RESIDENT_DISPATCH_RESTART_UNCERTAIN · resident-dispatch-diagnostic-1/)).toBeVisible()
+    expect(screen.getByText('The Prime Agent outcome cannot be proven after the host process identity changed')).toBeVisible()
+    expect(screen.getByText('Do not retry automatically. Inspect the current thread state.')).toBeVisible()
+    expect(screen.queryByText(/try stop again/i)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Copy diagnostic RESIDENT_DISPATCH_RESTART_UNCERTAIN' }))
+    expect(writeText).toHaveBeenCalledWith([
+      'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+      'Diagnostic ID: resident-dispatch-diagnostic-1',
+      'The Prime Agent outcome cannot be proven after the host process identity changed',
+      'Retryable: no',
+    ].join('\n'))
+    expect(screen.getByRole('button', { name: 'Diagnostic copied' })).toBeVisible()
+  })
+
+  it('keeps a non-retryable Stop uncertainty disabled until exact recovery evidence arrives', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+      if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected preview resident authority')
+      thread.status = 'running'
+      host.connection = 'online'
+      snapshot.runtime.session.residency = 'resident'
+      snapshot.runtime.session.activeSessionId = 'active-preview'
+      snapshot.runtime.session.sessionId = 'session-preview'
+      snapshot.operations.startResidentTurn = false
+      snapshot.operations.stopResidentTurn = true
+      snapshot.composerReceipt = {
+        state: 'uncertain',
+        operation: 'abort',
+        retryable: false,
+        message: 'Outcome unknown · recovery required; this Stop will not be replayed',
+      }
+      return snapshot
+    }
+    api.abortThread = vi.fn(async () => ({ state: 'sent', message: 'Stop accepted' }))
+
+    render(<App api={api} />)
+
+    const stop = await screen.findByRole('button', {
+      name: 'Stop outcome unknown; inspect the current thread state',
+    })
+    expect(stop).toHaveTextContent('Outcome unknown')
+    expect(stop).toBeDisabled()
+    expect(screen.getAllByText('Outcome unknown · recovery required; this Stop will not be replayed').some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.queryByText(/try stop again/i)).not.toBeInTheDocument()
+    await user.click(stop)
+    expect(api.abortThread).not.toHaveBeenCalled()
+  })
+
+  it.each([390, 320])(
+    'keeps disconnected cached-running copy explicitly unverified at %ipx',
+    async (width) => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: width })
+    window.dispatchEvent(new Event('resize'))
     const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)
 
@@ -85,9 +205,14 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByText('Last seen running', { selector: '.task-state__label' })).toBeVisible()
     expect(document.querySelector('.task-state')).toHaveClass('task-state--stale')
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
-    expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Send when reconnected' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Send when reconnected' })).toHaveClass('button--empty')
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
+    expect(screen.getByText('Resident status unverified', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.queryByText('Active resident turn', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Prime Agent is working · Stop requests a safe boundary/i)).not.toBeInTheDocument()
+    expect(screen.getAllByText(/Last reported running on devbox · current status unverified/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toHaveTextContent('Reconnect to verify')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
     const continuity = screen.getByRole('region', { name: 'Session status' })
     expect(within(continuity).getByText(/Last reported resident on devbox · current status unverified/i)).toBeVisible()
@@ -99,7 +224,7 @@ describe('Prime Continuim renderer', () => {
     expect(within(receiptDetails as HTMLElement).getByText('preview_simulation_receipt')).toBeVisible()
   })
 
-  it('preserves the composer and cached transcript for an offline thread', async () => {
+  it('preserves the cached transcript without queuing a blind offline mutation', async () => {
     const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
@@ -109,58 +234,47 @@ describe('Prime Continuim renderer', () => {
     expect(await screen.findByRole('heading', { name: 'Benchmark attention kernel' })).toBeVisible()
     expect(screen.getAllByText(/Offline · Last synchronized 18 min ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getAllByText(/cached transcript remains available/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
-    expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled()
-
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Send the benchmark recap when the host returns.')
-    expect(screen.getByRole('button', { name: 'Send when reconnected' })).not.toHaveClass('button--empty')
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
-    expect((await screen.findAllByText(/Preview simulation · command saved only in the in-memory preview outbox/i)).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
+    expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toBeDisabled()
+    expect(screen.queryByText(/send when reconnected/i)).not.toBeInTheDocument()
   })
 
-  it('cannot retain a hidden steer intent after selecting a non-running thread', async () => {
+  it('offers one honest prompt action for an idle resident session', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
-    const loadWorkbench = api.loadWorkbench.bind(api)
-    api.loadWorkbench = async () => {
-      const snapshot = await loadWorkbench()
-      const devbox = snapshot.hosts.find((host) => host.id === 'host-devbox')
-      if (devbox) devbox.connection = 'online'
-      return snapshot
-    }
+    const api = createIdleResidentApi()
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    const steerIntent = screen.getByRole('button', { name: 'Steer next step' })
-    await user.click(steerIntent)
-    expect(steerIntent).toHaveAttribute('aria-pressed', 'true')
-
-    await user.click(screen.getByRole('button', { name: /Frame protocol boundaries/ }))
-    expect(await screen.findByRole('heading', { name: 'Frame protocol boundaries' })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Steer next step' })).not.toBeInTheDocument()
-    expect(screen.getByText('Follow up', { selector: '.composer__intent' })).toBeVisible()
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    expect(screen.queryByRole('button', { name: /steer/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /follow up/i })).not.toBeInTheDocument()
+    expect(screen.getByText('New resident prompt', { selector: '.composer__intent' })).toBeVisible()
 
     await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Summarize the approval boundary.')
-    await user.click(screen.getByRole('button', { name: 'Send follow-up' }))
-    expect(api.sendComposer).toHaveBeenCalledWith(expect.objectContaining({ intent: 'follow_up' }))
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    expect(api.sendComposer).toHaveBeenCalledWith({
+      threadId: 'thread-complete',
+      text: 'Summarize the approval boundary.',
+    })
   })
 
   it('focuses and describes an empty composer submission, then clears the error while typing', async () => {
     const user = userEvent.setup()
-    const previewApi = createPreviewRendererApi()
+    const previewApi = createIdleResidentApi()
     const sendComposer = vi.fn(previewApi.sendComposer.bind(previewApi))
     const api = Object.create(previewApi) as typeof previewApi
     Object.defineProperty(api, 'sendComposer', { configurable: true, value: sendComposer })
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
 
     const composer = screen.getByRole('textbox', { name: 'Message' })
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
 
     await waitFor(() => expect(composer).toHaveFocus())
     expect(composer).toHaveAttribute('aria-invalid', 'true')
     expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-message-error')
-    expect(document.getElementById('composer-message-error')).toHaveTextContent('Write a message before sending.')
+    expect(document.getElementById('composer-message-error')).toHaveTextContent('Write a prompt before running Prime Agent.')
     expect(sendComposer).not.toHaveBeenCalled()
 
     await user.type(composer, 'Continue from the latest checkpoint.')
@@ -171,27 +285,28 @@ describe('Prime Continuim renderer', () => {
 
   it('preserves a draft when the host rejects command admission', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = createIdleResidentApi()
     api.sendComposer = vi.fn(async () => ({
       state: 'rejected',
       message: 'Prime Agent execution is not attached in this build.',
     }))
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const composer = screen.getByRole('textbox', { name: 'Message' })
     const draft = 'Keep this draft until execution is available.'
     await user.type(composer, draft)
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
 
     await screen.findAllByText('Prime Agent execution is not attached in this build.')
     expect(composer).toHaveValue(draft)
+    expect(document.querySelector('.composer__connection')).toHaveClass('composer__connection--rejected')
     expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(draft)).not.toBeInTheDocument()
   })
 
   it('waits for an authoritative host snapshot before rendering an admitted prompt', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = createIdleResidentApi()
     const snapshot = await api.loadWorkbench()
     let publish: ((next: typeof snapshot) => void) | undefined
     api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(snapshot)))
@@ -199,20 +314,31 @@ describe('Prime Continuim renderer', () => {
       publish = listener
       return () => undefined
     })
-    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent · durably admitted by host' }))
+    const admission = deferred<{ state: 'sent'; message: string }>()
+    api.sendComposer = vi.fn(() => admission.promise)
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const transcript = screen.getByRole('region', { name: 'Thread transcript' })
     const composer = screen.getByRole('textbox', { name: 'Message' })
     const prompt = 'Wait for the resident transcript before showing this prompt.'
 
     await user.type(composer, prompt)
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
 
     await waitFor(() => expect(api.sendComposer).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(composer).toHaveValue(''))
+    expect(screen.getByText('Admitting resident prompt', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Prompt is awaiting durable host admission' })).toHaveTextContent('Submitting prompt')
+    expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toHaveAttribute('aria-busy', 'true')
     expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
+
+    await act(async () => {
+      admission.resolve({ state: 'sent', message: 'Sent · durably admitted by host' })
+      await admission.promise
+    })
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument())
+    expect(screen.getByText('Prompt owned by Prime Agent', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
 
     const authoritative = structuredClone(snapshot)
     const selected = authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)
@@ -230,20 +356,248 @@ describe('Prime Continuim renderer', () => {
     expect(await within(transcript).findByText(prompt)).toBeVisible()
   })
 
+  it('turns an owned prompt receipt into an enabled Stop control without inventing transcript state', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    const snapshot = await api.loadWorkbench()
+    let publish: ((next: typeof snapshot) => void) | undefined
+    api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(snapshot)))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
+    api.sendComposer = vi.fn(async () => {
+      const owned = structuredClone(snapshot)
+      owned.operations.startResidentTurn = false
+      owned.operations.stopResidentTurn = true
+      owned.composerReceipt = {
+        state: 'sent',
+        message: 'Prompt accepted · waiting for authoritative resident activity',
+        operation: 'prompt',
+      }
+      publish?.(owned)
+      return { state: 'sent', message: 'Prompt accepted · waiting for authoritative resident activity' }
+    })
+    api.abortThread = vi.fn(async () => ({
+      state: 'sent',
+      message: 'Stop request accepted · waiting for authoritative idle state',
+    }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const prompt = 'Keep the projection honest while starting this turn.'
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), prompt)
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+
+    const stop = await screen.findByRole('button', { name: 'Stop the active Prime Agent turn' })
+    expect(stop).toBeEnabled()
+    expect(stop).toHaveTextContent('Stop')
+    expect(screen.getByText('Prompt owned by Prime Agent')).toBeVisible()
+    expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(prompt)).not.toBeInTheDocument()
+
+    await user.click(stop)
+    expect(api.abortThread).toHaveBeenCalledOnce()
+    expect(api.abortThread).toHaveBeenCalledWith('thread-complete')
+    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })).toBeDisabled()
+  })
+
+  it('keeps an accepted Stop in pending mode across a lagging idle projection until exact proof', async () => {
+    const api = createIdleResidentApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const selected = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
+      if (!selected) throw new Error('Expected selected resident thread')
+      selected.status = 'idle'
+      snapshot.operations.startResidentTurn = false
+      snapshot.operations.stopResidentTurn = false
+      snapshot.composerReceipt = {
+        state: 'sent',
+        operation: 'abort',
+        message: 'Stop accepted · waiting for authoritative idle proof',
+      }
+      return snapshot
+    }
+    api.abortThread = vi.fn(async () => ({ state: 'sent', message: 'Duplicate Stop' }))
+
+    render(<App api={api} />)
+
+    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.queryByText('New resident prompt', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    const pendingStop = screen.getByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })
+    expect(pendingStop).toHaveTextContent('Stop accepted')
+    expect(pendingStop).toBeDisabled()
+    expect(api.abortThread).not.toHaveBeenCalled()
+  })
+
+  it.each(['response', 'error'] as const)(
+    'keeps an accepted Stop authoritative when an older prompt %s arrives late',
+    async (promptOutcome) => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    const snapshot = await api.loadWorkbench()
+    const promptAdmission = deferred<{ state: 'sent'; message: string }>()
+    let publish: ((next: typeof snapshot) => void) | undefined
+    api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(snapshot)))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
+    api.sendComposer = vi.fn(() => promptAdmission.promise)
+    api.abortThread = vi.fn(async () => ({
+      state: 'sent',
+      message: 'Stop request accepted · waiting for authoritative idle state',
+    }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'Start, then stop, this exact resident turn.')
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await waitFor(() => expect(api.sendComposer).toHaveBeenCalledOnce())
+
+    const active = structuredClone(snapshot)
+    const activeThread = active.threads.find((thread) => thread.id === active.selectedThreadId)
+    if (!activeThread || !active.runtime.session) throw new Error('Expected the selected resident thread')
+    activeThread.status = 'running'
+    active.runtime.session = {
+      ...active.runtime.session,
+      isStreaming: true,
+      queuedActionCount: 1,
+    }
+    active.operations.startResidentTurn = false
+    active.operations.stopResidentTurn = true
+    active.composerReceipt = {
+      state: 'sent',
+      message: 'Prompt accepted · resident activity is authoritative',
+      operation: 'prompt',
+    }
+    await act(async () => publish?.(active))
+
+    const stop = await screen.findByRole('button', { name: 'Stop the active Prime Agent turn' })
+    expect(stop).toBeEnabled()
+    await user.click(stop)
+    expect(api.abortThread).toHaveBeenCalledOnce()
+    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(stop).toBeDisabled()
+
+    const delayedPromptEvent = structuredClone(active)
+    delayedPromptEvent.composerReceipt = {
+      state: 'sent',
+      message: 'Delayed prompt running receipt',
+      operation: 'prompt',
+    }
+    await act(async () => publish?.(delayedPromptEvent))
+    expect(screen.getByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(stop).toBeDisabled()
+
+    await act(async () => {
+      if (promptOutcome === 'response') {
+        promptAdmission.resolve({ state: 'sent', message: 'Delayed direct prompt response' })
+      } else {
+        promptAdmission.reject(new Error('Delayed prompt transport failure'))
+      }
+      await promptAdmission.promise.catch(() => undefined)
+    })
+    expect(screen.getByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(stop).toBeDisabled()
+    await user.click(stop)
+    expect(api.abortThread).toHaveBeenCalledOnce()
+
+    const idle = structuredClone(active)
+    const idleThread = idle.threads.find((thread) => thread.id === idle.selectedThreadId)
+    if (!idleThread || !idle.runtime.session) throw new Error('Expected the selected resident thread')
+    idleThread.status = 'idle'
+    idle.runtime.session = {
+      ...idle.runtime.session,
+      isStreaming: false,
+      queuedActionCount: 0,
+    }
+    idle.operations.startResidentTurn = true
+    idle.operations.stopResidentTurn = false
+    idle.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+    await act(async () => publish?.(idle))
+    expect(screen.queryByText('Stop accepted', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
+    if (promptOutcome === 'response') expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('')
+    },
+  )
+
+  it.each(['response', 'error'] as const)(
+    'keeps authoritative idle after both deferred Run and Stop tails settle with a late %s',
+    async (outcome) => {
+      const user = userEvent.setup()
+      const api = createIdleResidentApi()
+      const snapshot = await api.loadWorkbench()
+      const promptTail = deferred<{ state: 'sent'; message: string }>()
+      const stopTail = deferred<{ state: 'sent'; message: string }>()
+      let publish: ((next: typeof snapshot) => void) | undefined
+      api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(snapshot)))
+      api.subscribe = vi.fn((listener) => {
+        publish = listener
+        return () => undefined
+      })
+      api.sendComposer = vi.fn(() => promptTail.promise)
+      api.abortThread = vi.fn(() => stopTail.promise)
+
+      render(<App api={api} />)
+      await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+      await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Fence both late IPC tails.')
+      await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+
+      const active = structuredClone(snapshot)
+      const activeThread = active.threads.find((thread) => thread.id === active.selectedThreadId)
+      if (!activeThread || !active.runtime.session) throw new Error('Expected the selected resident thread')
+      activeThread.status = 'running'
+      active.runtime.session = { ...active.runtime.session, isStreaming: true, queuedActionCount: 1 }
+      active.operations.startResidentTurn = false
+      active.operations.stopResidentTurn = true
+      active.composerReceipt = { state: 'sent', message: 'Prompt owned', operation: 'prompt' }
+      await act(async () => publish?.(active))
+      await user.click(screen.getByRole('button', { name: 'Stop the active Prime Agent turn' }))
+      expect(screen.getByText('Requesting safe stop', { selector: '.composer__intent' })).toBeVisible()
+      expect(screen.getByRole('button', { name: 'Safe Stop request is being sent' })).toHaveTextContent('Requesting stop')
+
+      const idle = structuredClone(active)
+      const idleThread = idle.threads.find((thread) => thread.id === idle.selectedThreadId)
+      if (!idleThread || !idle.runtime.session) throw new Error('Expected the selected resident thread')
+      idleThread.status = 'idle'
+      idle.runtime.session = { ...idle.runtime.session, isStreaming: false, queuedActionCount: 0 }
+      idle.operations.startResidentTurn = true
+      idle.operations.stopResidentTurn = false
+      idle.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+      await act(async () => publish?.(idle))
+      expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
+
+      await act(async () => {
+        if (outcome === 'response') {
+          promptTail.resolve({ state: 'sent', message: 'Late prompt response' })
+          stopTail.resolve({ state: 'sent', message: 'Late Stop response' })
+        } else {
+          promptTail.reject(new Error('Late prompt error'))
+          stopTail.reject(new Error('Late Stop error'))
+        }
+        await Promise.allSettled([promptTail.promise, stopTail.promise])
+      })
+
+      expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
+      expect(screen.queryByText(/Late prompt|Late Stop/)).not.toBeInTheDocument()
+    },
+  )
+
   it('does not let a same-host in-flight receipt clear a newer thread draft', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = createIdleResidentApi()
     const admission = deferred<{ state: 'sent'; message: string }>()
     api.sendComposer = vi.fn(() => admission.promise)
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const firstComposer = screen.getByRole('textbox', { name: 'Message' })
     await user.type(firstComposer, 'First thread submission')
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
+    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
 
-    await user.click(screen.getByRole('button', { name: /Audit SSH discovery/ }))
-    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const secondComposer = screen.getByRole('textbox', { name: 'Message' })
     await user.clear(secondComposer)
     await user.type(secondComposer, 'Newer draft for the second thread')
@@ -258,23 +612,28 @@ describe('Prime Continuim renderer', () => {
   })
 
   it('disables native execution affordances when the host did not negotiate them', async () => {
-    const api = createPreviewRendererApi()
+    const api = createIdleResidentApi()
     const loadWorkbench = api.loadWorkbench.bind(api)
     api.loadWorkbench = async () => {
       const snapshot = await loadWorkbench()
-      snapshot.operations = { submitCommands: false, crossHostHandoff: false }
+      snapshot.operations = {
+        submitCommands: false,
+        startResidentTurn: false,
+        stopResidentTurn: false,
+        crossHostHandoff: false,
+      }
       return snapshot
     }
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
 
     expect(screen.getByRole('textbox', { name: 'Message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Commands unavailable' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeDisabled()
     const location = screen.getByLabelText(/^Run location: devbox\. Moving threads between computers is unavailable$/)
     expect(location).toHaveTextContent('devboxMove unavailable')
-    expect(screen.getAllByText(/Prime Agent isn’t attached to this host/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.getAllByText(/resident session is not ready for a new prompt/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(api.sendComposer).not.toHaveBeenCalled()
   })
 
@@ -1027,7 +1386,7 @@ describe('Prime Continuim renderer', () => {
 
     const threadView = document.querySelector('.thread-view')
     expect(threadView).not.toBeNull()
-    expect(Array.from(threadView?.children ?? []).map((element) => element.className)).toEqual([
+    expect(Array.from(threadView?.children ?? []).map((element) => element.classList[0])).toEqual([
       'thread-notices',
       'transcript',
       'composer-wrap',
@@ -1136,22 +1495,18 @@ describe('Prime Continuim renderer', () => {
 
   it('follows new transcript messages only near the bottom and resets on thread changes', async () => {
     const user = userEvent.setup()
-    const api = createPreviewRendererApi()
+    const api = createIdleResidentApi()
     const initialSnapshot = await api.loadWorkbench()
     let authoritative = structuredClone(initialSnapshot)
     let publish: ((next: typeof initialSnapshot) => void) | undefined
-    const firstSend = deferred<{ state: 'sent'; message: string }>()
-    const secondSend = deferred<{ state: 'sent'; message: string }>()
-    let sendCount = 0
     api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(initialSnapshot)))
     api.subscribe = vi.fn((listener) => {
       publish = listener
       return () => undefined
     })
-    api.sendComposer = vi.fn(() => sendCount++ === 0 ? firstSend.promise : secondSend.promise)
 
     render(<App api={api} />)
-    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const transcript = screen.getByRole('region', { name: 'Thread transcript' })
     let scrollHeight = 1_000
     let scrollTop = 600
@@ -1166,13 +1521,7 @@ describe('Prime Continuim renderer', () => {
     })
 
     fireEvent.scroll(transcript)
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Follow the first response.')
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
     scrollHeight = 1_200
-    await act(async () => {
-      firstSend.resolve({ state: 'sent', message: 'Sent' })
-      await firstSend.promise
-    })
     expect(within(transcript).queryByText('Follow the first response.')).not.toBeInTheDocument()
     authoritative = structuredClone(authoritative)
     authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)?.transcript.push({
@@ -1188,13 +1537,7 @@ describe('Prime Continuim renderer', () => {
 
     scrollTop = 200
     fireEvent.scroll(transcript)
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Do not steal my reading position.')
-    await user.click(screen.getByRole('button', { name: 'Send when reconnected' }))
     scrollHeight = 1_400
-    await act(async () => {
-      secondSend.resolve({ state: 'sent', message: 'Sent' })
-      await secondSend.promise
-    })
     expect(within(transcript).queryByText('Do not steal my reading position.')).not.toBeInTheDocument()
     authoritative = structuredClone(authoritative)
     authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)?.transcript.push({

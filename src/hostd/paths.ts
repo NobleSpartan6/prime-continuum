@@ -17,6 +17,8 @@ export interface HostDataPaths {
   staging: string;
   transactions: string;
   residentProjectionTransactions: string;
+  residentProjectionLineages: string;
+  residentDispatchAttempts: string;
   receipts: string;
   handoffs: string;
   security: string;
@@ -78,6 +80,8 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     staging: join(root, "handoff-staging"),
     transactions: join(root, "transactions"),
     residentProjectionTransactions: join(root, "resident-projection-transactions"),
+    residentProjectionLineages: join(root, "resident-projection-lineages"),
+    residentDispatchAttempts: join(root, "resident-dispatch-attempts"),
     receipts: join(root, "receipts"),
     handoffs: join(root, "handoffs"),
     security,

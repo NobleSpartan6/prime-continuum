@@ -24,6 +24,9 @@ const MAX_WRITE_QUEUE_BYTES = 4 * MAX_FRAME_BYTES
 const ALLOWED_HOST_EVENTS = new Set([
   'catalog.updated',
   'thread.event',
+  'thread.changed',
+  'resident.prompt_idle_observed',
+  'resident.abort_idle_observed',
   'thread.snapshot',
   'snapshot.update',
   'handoff.progress',

@@ -135,7 +135,7 @@ function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][
       followUpMode: 'all',
       messageCount: 1,
       compactionCount: 0,
-      queuedActionCount: 2,
+      queuedActionCount: thread.status === 'running' ? 2 : 0,
       activeToolNames: [],
       context: { usedTokens: 12_000, maxTokens: 100_000 },
     },
@@ -273,11 +273,16 @@ describe('NativeRendererApi', () => {
       expect(published.at(-1)?.selectedThreadId).toBe('thread-seamless')
       expect(published.at(-1)?.threads[0]?.transcript[0]?.body).toBe('Loaded from the authoritative local host.')
     })
-    expect(calls).toEqual(['bootstrap', 'connect', 'hostCatalog', 'requestSnapshot'])
+    expect(calls).toEqual(['bootstrap', 'connect', 'bootstrap', 'hostCatalog', 'requestSnapshot'])
     expect(bridge.connect).toHaveBeenCalledWith({ kind: 'local' })
     expect(published.at(-1)?.runtime.goals).toBeUndefined()
     expect(published.at(-1)?.runtime.schedules).toBeUndefined()
-    expect(published.at(-1)?.operations).toEqual({ submitCommands: false, crossHostHandoff: false })
+    expect(published.at(-1)?.operations).toEqual({
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+    })
     unsubscribe()
   })
 
@@ -532,9 +537,8 @@ describe('NativeRendererApi', () => {
                 commandId: 'command-one',
                 expectedHostId: 'host-local',
                 threadId: 'thread-one',
-                kind: 'thread.follow_up',
-                payload: { text: 'Continue one' },
-                delivery: 'send_when_reconnected',
+                kind: 'thread.cancel',
+                delivery: 'live_only',
                 expectedExecutionGenerationId: 'generation-one',
                 issuedAt: '2026-08-05T20:00:00.000Z',
               },
@@ -548,9 +552,9 @@ describe('NativeRendererApi', () => {
                 commandId: 'command-two',
                 expectedHostId: 'host-local',
                 threadId: 'thread-two',
-                kind: 'thread.follow_up',
+                kind: 'thread.prompt',
                 payload: { text: 'Continue two' },
-                delivery: 'send_when_reconnected',
+                delivery: 'live_only',
                 expectedExecutionGenerationId: 'generation-two',
                 issuedAt: '2026-08-05T20:00:00.000Z',
               },
@@ -612,9 +616,88 @@ describe('NativeRendererApi', () => {
     expect(published.at(-1)?.composerReceipt.state).toBe('uncertain')
 
     await api.selectThread('thread-one')
-    expect(published.at(-1)?.composerReceipt.state).toBe('idle')
+    expect(published.at(-1)?.composerReceipt.state).toBe('sent')
     unsubscribe()
   })
+
+  it.each([
+    ['prompt-first', 'awaiting_abort_idle_proof'],
+    ['abort-first', 'awaiting_abort_idle_proof'],
+    ['prompt-first', 'uncertain'],
+    ['abort-first', 'uncertain'],
+  ] as const)(
+    'derives restart ownership from every exact outbox entry and chooses newer abort state %s/%s',
+    async (order, abortState) => {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = 'idle'
+      const snapshot = recoverySnapshot(catalog.threads[0], 'Retained resident control.')
+      let deviceId = ''
+      const promptEntry = {
+        hostId: 'host-local',
+        command: {
+          deviceId,
+          commandId: 'retained-prompt',
+          expectedHostId: 'host-local',
+          threadId: 'thread-one',
+          kind: 'thread.prompt',
+          payload: { text: 'Retained prompt' },
+          delivery: 'live_only',
+          expectedExecutionGenerationId: 'generation-one',
+          issuedAt: '2026-08-05T20:00:00.000Z',
+        },
+        state: 'awaiting_idle_proof',
+        updatedAt: '2026-08-05T20:00:00.000Z',
+      }
+      const abortEntry = {
+        hostId: 'host-local',
+        command: {
+          deviceId,
+          commandId: 'retained-abort',
+          expectedHostId: 'host-local',
+          threadId: 'thread-one',
+          kind: 'thread.cancel',
+          delivery: 'live_only',
+          expectedExecutionGenerationId: 'generation-one',
+          issuedAt: '2026-08-05T20:00:01.000Z',
+        },
+        state: abortState,
+        updatedAt: '2026-08-05T20:00:01.000Z',
+      }
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: (order === 'prompt-first' ? [promptEntry, abortEntry] : [abortEntry, promptEntry])
+            .map((entry) => ({ ...entry, command: { ...entry.command, deviceId } })),
+          connection: onlineConnection(),
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+        requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHostEvent: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      const api = new NativeRendererApi(bridge)
+      deviceId = (api as unknown as { deviceId: string }).deviceId
+
+      const view = await api.loadWorkbench()
+
+      expect(view.composerReceipt).toMatchObject({
+        state: abortState === 'uncertain' ? 'uncertain' : 'sent',
+        operation: 'abort',
+      })
+      expect(view.composerReceipt.message).toContain(
+        abortState === 'uncertain' ? 'Outcome unknown' : 'Stop accepted',
+      )
+      expect(view.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: false })
+      if (abortState === 'uncertain') {
+        expect(view.attention).toContainEqual(expect.objectContaining({
+          title: expect.stringContaining('recovery required'),
+        }))
+      }
+    },
+  )
 
   it('ignores an A bootstrap payload when a newer B connection event wins the race', async () => {
     const catalogA = recoveryCatalog()
@@ -653,6 +736,90 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('rehydrates the exact durable outbox before restoring mutations when authority switches A to B to A', async () => {
+    const catalogA = singleHostCatalog('host-a', 'Host A', 'thread-a', 'project-a')
+    const catalogB = singleHostCatalog('host-b', 'Host B', 'thread-b', 'project-b')
+    const snapshotA = recoverySnapshot(catalogA.threads[0], 'Owned on A.')
+    const snapshotB = recoverySnapshot(catalogB.threads[0], 'Idle on B.')
+    let connectionListener: ((state: unknown) => void) | undefined
+    let deviceId = ''
+    let currentHost: 'host-a' | 'host-b' = 'host-a'
+    const connectionFor = (hostId: 'host-a' | 'host-b') => ({
+      ...onlineConnection(),
+      hostId,
+      target: { kind: 'local' },
+    })
+    const promptA = {
+      deviceId,
+      commandId: 'owned-a-prompt',
+      expectedHostId: 'host-a',
+      threadId: 'thread-a',
+      kind: 'thread.prompt',
+      payload: { text: 'Owned A work' },
+      delivery: 'live_only',
+      expectedExecutionGenerationId: 'generation-host-a',
+      issuedAt: '2026-08-05T20:00:00.000Z',
+    }
+    const bootstrap = vi.fn(() => ok({
+      cache: {
+        version: 3,
+        activeHostId: currentHost,
+        entries: {
+          'host-a': { hostId: 'host-a', catalog: catalogA, lastSnapshot: snapshotA },
+          'host-b': { hostId: 'host-b', catalog: catalogB, lastSnapshot: snapshotB },
+        },
+      },
+      outbox: currentHost === 'host-a'
+        ? [{
+            hostId: 'host-a',
+            command: { ...promptA, deviceId },
+            state: 'awaiting_idle_proof',
+            updatedAt: '2026-08-05T20:00:00.000Z',
+          }]
+        : [],
+      connection: connectionFor(currentHost),
+      appVersion: '0.1.0',
+    }))
+    const submitCommand = vi.fn()
+    const bridge = {
+      bootstrap,
+      hostCatalog: vi.fn(() => ok(currentHost === 'host-a' ? catalogA : catalogB)),
+      requestSnapshot: vi.fn(() => ok(currentHost === 'host-a' ? snapshotA : snapshotB)),
+      submitCommand,
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    deviceId = (api as unknown as { deviceId: string }).deviceId
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((next) => published.push(next))
+    const initial = await api.loadWorkbench()
+    expect(initial.composerReceipt).toMatchObject({ state: 'sent', operation: 'prompt' })
+    expect(initial.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: true })
+
+    currentHost = 'host-b'
+    connectionListener?.(connectionFor('host-b'))
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: false })
+    await vi.waitFor(() => expect(bootstrap).toHaveBeenCalledTimes(2))
+
+    currentHost = 'host-a'
+    connectionListener?.(connectionFor('host-a'))
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: false })
+    await vi.waitFor(() => {
+      expect(bootstrap).toHaveBeenCalledTimes(3)
+      expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'prompt' })
+      expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: true })
+    })
+    await expect(api.sendComposer({ threadId: 'thread-a', text: 'Must not duplicate A.' }))
+      .resolves.toMatchObject({ state: 'rejected' })
+    expect(submitCommand).not.toHaveBeenCalled()
+  })
+
   it('keeps a same-target A projection as read-only cache when native state verifies Host B', async () => {
     const catalogA = recoveryCatalog()
     const snapshotA = recoverySnapshot(catalogA.threads[0], 'Cached on Host A.')
@@ -689,6 +856,7 @@ describe('NativeRendererApi', () => {
 
   it('scopes composer requests to the visible host and suppresses an A receipt while B is still unverified', async () => {
     const catalogA = recoveryCatalog()
+    catalogA.threads[0].status = 'idle'
     const snapshotA = recoverySnapshot(catalogA.threads[0], 'Cached on Host A.')
     const submission = deferred<unknown>()
     let connectionListener: ((state: unknown) => void) | undefined
@@ -718,8 +886,6 @@ describe('NativeRendererApi', () => {
     const sending = api.sendComposer({
       threadId: 'thread-one',
       text: 'Continue on A',
-      intent: 'follow_up',
-      sendWhenReconnected: false,
     })
     expect(bridge.submitCommand).toHaveBeenCalledWith(expect.objectContaining({
       expectedHostId: 'host-local',
@@ -790,7 +956,12 @@ describe('NativeRendererApi', () => {
     expect(cached.projects.map((project) => project.id).sort()).toEqual(['project-a', 'project-b'])
     expect(cached.threads.map((thread) => thread.id).sort()).toEqual(['thread-a', 'thread-b'])
     expect(cached.selectedThreadId).toBe('thread-b')
-    expect(cached.operations).toEqual({ submitCommands: true, crossHostHandoff: false })
+    expect(cached.operations).toEqual({
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+    })
     expect(cached.threads.find((thread) => thread.id === 'thread-b')?.transcript[0]?.body).toBe('Cached transcript B.')
 
     snapshotListener?.({ ...catalogA, host: { ...catalogA.host, displayName: 'Stale A overwrite' } })
@@ -802,13 +973,16 @@ describe('NativeRendererApi', () => {
     expect(published.at(-1)?.hosts.find((host) => host.id === 'host-a')?.name).toBe('Host A')
 
     await api.selectThread('thread-a')
-    expect(published.at(-1)?.operations).toEqual({ submitCommands: false, crossHostHandoff: false })
+    expect(published.at(-1)?.operations).toEqual({
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+    })
     expect(bridge.requestSnapshot).not.toHaveBeenCalled()
     await expect(api.sendComposer({
       threadId: 'thread-a',
       text: 'Must not cross to B',
-      intent: 'follow_up',
-      sendWhenReconnected: true,
     })).resolves.toMatchObject({ state: 'rejected' })
     expect(bridge.submitCommand).not.toHaveBeenCalled()
     unsubscribe()
@@ -1014,6 +1188,7 @@ describe('NativeRendererApi', () => {
 
   it('captures one stable issue time and exact generation for a composer command', async () => {
     const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
     const snapshot = recoverySnapshot(catalog.threads[0], 'Generation one transcript.')
     let submitted: Record<string, unknown> | undefined
     const bridge = {
@@ -1038,36 +1213,357 @@ describe('NativeRendererApi', () => {
           durable: true,
         })
       }),
+      cancel: vi.fn((input: Record<string, unknown>) => ok({
+        hostId: input.expectedHostId,
+        deviceId: input.deviceId,
+        commandId: input.commandId,
+        threadId: input.threadId,
+        executionGenerationId: input.expectedExecutionGenerationId,
+        status: 'running',
+        durable: true,
+      })),
       onConnectionState: vi.fn(() => () => undefined),
       onSnapshot: vi.fn(() => () => undefined),
       onHostEvent: vi.fn(() => () => undefined),
       onHandoffProgress: vi.fn(() => () => undefined),
     }
     const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((next) => published.push(next))
     await api.loadWorkbench()
 
     await expect(api.sendComposer({
       threadId: 'thread-one',
       text: 'Continue exactly here',
-      intent: 'follow_up',
-      sendWhenReconnected: false,
     })).resolves.toMatchObject({ state: 'sent' })
 
     expect(submitted).toMatchObject({
       expectedHostId: 'host-local',
       threadId: 'thread-one',
       expectedExecutionGenerationId: 'generation-one',
-      kind: 'thread.follow_up',
+      kind: 'thread.prompt',
       payload: { text: 'Continue exactly here' },
     })
     expect(typeof submitted?.issuedAt).toBe('string')
     expect(Number.isFinite(Date.parse(String(submitted?.issuedAt)))).toBe(true)
     expect(bridge.submitCommand).toHaveBeenCalledOnce()
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.status).toBe('idle')
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: true })
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'prompt' })
+
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({
+      state: 'sent',
+      message: 'Stop accepted · waiting for authoritative idle proof',
+    })
+    expect(bridge.cancel).toHaveBeenCalledWith(expect.objectContaining({
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      expectedExecutionGenerationId: 'generation-one',
+    }))
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.status).toBe('idle')
+    expect(published.at(-1)?.operations.stopResidentTurn).toBe(false)
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
   })
+
+  it('treats a direct exact completed prompt response as idle proof even when its parallel event is missed', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Idle before direct proof.')
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      submitCommand: vi.fn((input: Record<string, unknown>) => ok({
+        hostId: input.expectedHostId,
+        deviceId: input.deviceId,
+        commandId: input.commandId,
+        threadId: input.threadId,
+        executionGenerationId: input.expectedExecutionGenerationId,
+        status: 'completed',
+        durable: true,
+      })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((next) => published.push(next))
+    await api.loadWorkbench()
+
+    await expect(api.sendComposer({ threadId: 'thread-one', text: 'Complete before the event.' }))
+      .resolves.toMatchObject({ state: 'idle' })
+
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'idle' })
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
+  })
+
+  it.each(['response', 'error'] as const)(
+    'keeps a newer Stop through prompt idle proof and retires it only after abort proof despite a late %s',
+    async (stopOutcome) => {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = 'idle'
+      const snapshot = recoverySnapshot(catalog.threads[0], 'Owned prompt before Stop.')
+      const stopResponse = deferred<unknown>()
+      let hostEventListener: ((event: unknown) => void) | undefined
+      let deviceId = ''
+      const promptCommand = {
+        deviceId,
+        commandId: 'owned-prompt-before-stop',
+        expectedHostId: 'host-local',
+        threadId: 'thread-one',
+        kind: 'thread.prompt',
+        payload: { text: 'Owned prompt' },
+        delivery: 'live_only',
+        expectedExecutionGenerationId: 'generation-one',
+        issuedAt: '2026-08-05T20:00:00.000Z',
+      }
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [{
+            hostId: 'host-local',
+            command: { ...promptCommand, deviceId },
+            state: 'awaiting_idle_proof',
+            updatedAt: '2026-08-05T20:00:00.000Z',
+          }],
+          connection: onlineConnection(),
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+        requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+        cancel: vi.fn(() => stopResponse.promise),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHostEvent: vi.fn((listener: (event: unknown) => void) => {
+          hostEventListener = listener
+          return () => undefined
+        }),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      const api = new NativeRendererApi(bridge)
+      deviceId = (api as unknown as { deviceId: string }).deviceId
+      const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+      api.subscribe((next) => published.push(next))
+      await api.loadWorkbench()
+
+      const stop = api.abortThread('thread-one')
+      expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sending', operation: 'abort' })
+      hostEventListener?.({
+        type: 'resident.prompt_idle_observed',
+        payload: {
+          hostId: 'host-local',
+          deviceId,
+          commandId: promptCommand.commandId,
+          threadId: promptCommand.threadId,
+          executionGenerationId: promptCommand.expectedExecutionGenerationId,
+          status: 'completed',
+          durable: true,
+        },
+      })
+      expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sending', operation: 'abort' })
+
+      const stopInput = bridge.cancel.mock.calls[0]?.[0] as unknown as Record<string, unknown>
+
+      if (stopOutcome === 'response') {
+        stopResponse.resolve({ ok: true, value: {
+          hostId: stopInput.expectedHostId,
+          deviceId: stopInput.deviceId,
+          commandId: stopInput.commandId,
+          threadId: stopInput.threadId,
+          executionGenerationId: stopInput.expectedExecutionGenerationId,
+          status: 'running',
+          durable: true,
+        } })
+        await expect(stop).resolves.toMatchObject({ state: 'sent' })
+        expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+      } else {
+        stopResponse.reject(new Error('Late Stop transport error'))
+        await expect(stop).rejects.toThrow('Late Stop transport error')
+        expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'uncertain', operation: 'abort' })
+      }
+
+      hostEventListener?.({
+        type: 'resident.abort_idle_observed',
+        payload: {
+          hostId: stopInput.expectedHostId,
+          deviceId: stopInput.deviceId,
+          commandId: stopInput.commandId,
+          threadId: stopInput.threadId,
+          executionGenerationId: stopInput.expectedExecutionGenerationId,
+          status: 'completed',
+          durable: true,
+        },
+      })
+      expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'idle' })
+      expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
+    },
+  )
+
+  it.each(['response', 'error'] as const)(
+    'keeps a newer stop authoritative over a delayed prompt %s and host receipt until idle',
+    async (promptOutcome) => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const initialSnapshot = recoverySnapshot(catalog.threads[0], 'Idle before the prompt.')
+    const promptResponse = deferred<unknown>()
+    let promptCommand: Record<string, unknown> | undefined
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    let hostEventListener: ((event: unknown) => void) | undefined
+    const cancel = vi.fn((input: Record<string, unknown>) => ok({
+      hostId: input.expectedHostId,
+      deviceId: input.deviceId,
+      commandId: input.commandId,
+      threadId: input.threadId,
+      executionGenerationId: input.expectedExecutionGenerationId,
+      status: 'running',
+      durable: true,
+      detail: 'Stop accepted · waiting for authoritative idle proof',
+    }))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: initialSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      submitCommand: vi.fn((input: Record<string, unknown>) => {
+        promptCommand = input
+        return promptResponse.promise
+      }),
+      cancel,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn((listener: (event: unknown) => void) => {
+        hostEventListener = listener
+        return () => undefined
+      }),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((next) => published.push(next))
+    await api.loadWorkbench()
+
+    const prompt = api.sendComposer({ threadId: 'thread-one', text: 'Start the exact resident turn.' })
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sending', operation: 'prompt' })
+
+    const activeSnapshot = structuredClone(initialSnapshot)
+    activeSnapshot.generatedAt = '2026-08-05T20:00:02.000Z'
+    activeSnapshot.thread = {
+      ...activeSnapshot.thread,
+      status: 'running',
+      updatedAt: activeSnapshot.generatedAt,
+    }
+    activeSnapshot.latestCursor = { ...activeSnapshot.latestCursor, sequence: 2 }
+    activeSnapshot.thread.lastKnownCursor = { ...activeSnapshot.latestCursor }
+    activeSnapshot.runtime = {
+      ...activeSnapshot.runtime,
+      isStreaming: true,
+      queuedActionCount: 1,
+    }
+    snapshotListener?.(activeSnapshot)
+    expect(published.at(-1)?.operations.stopResidentTurn).toBe(true)
+
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({
+      state: 'sent',
+      message: 'Stop accepted · waiting for authoritative idle proof',
+    })
+    const stopCommand = cancel.mock.calls[0]?.[0]
+    expect(Date.parse(String(stopCommand?.issuedAt))).toBeGreaterThan(
+      Date.parse(String(promptCommand?.issuedAt)),
+    )
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+    expect(published.at(-1)?.operations.stopResidentTurn).toBe(false)
+
+    hostEventListener?.({
+      type: 'command.receipt',
+      payload: {
+        hostId: promptCommand?.expectedHostId,
+        deviceId: promptCommand?.deviceId,
+        commandId: promptCommand?.commandId,
+        threadId: promptCommand?.threadId,
+        executionGenerationId: promptCommand?.expectedExecutionGenerationId,
+        status: 'running',
+        durable: true,
+        detail: 'Delayed prompt running receipt',
+      },
+    })
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+
+    if (promptOutcome === 'response') {
+      promptResponse.resolve({
+        ok: true,
+        value: {
+          hostId: promptCommand?.expectedHostId,
+          deviceId: promptCommand?.deviceId,
+          commandId: promptCommand?.commandId,
+          threadId: promptCommand?.threadId,
+          executionGenerationId: promptCommand?.expectedExecutionGenerationId,
+          status: 'running',
+          durable: true,
+          detail: 'Delayed direct prompt response',
+        },
+      })
+      await expect(prompt).resolves.toMatchObject({ state: 'sent' })
+    } else {
+      promptResponse.reject(new Error('Delayed prompt transport failure'))
+      await expect(prompt).rejects.toThrow('Delayed prompt transport failure')
+    }
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({ state: 'rejected' })
+    expect(cancel).toHaveBeenCalledOnce()
+
+    const idleSnapshot = structuredClone(activeSnapshot)
+    idleSnapshot.generatedAt = '2026-08-05T20:00:03.000Z'
+    idleSnapshot.thread = {
+      ...idleSnapshot.thread,
+      status: 'idle',
+      updatedAt: idleSnapshot.generatedAt,
+    }
+    idleSnapshot.latestCursor = { ...idleSnapshot.latestCursor, sequence: 3 }
+    idleSnapshot.thread.lastKnownCursor = { ...idleSnapshot.latestCursor }
+    idleSnapshot.runtime = {
+      ...idleSnapshot.runtime,
+      isStreaming: false,
+      queuedActionCount: 0,
+    }
+    snapshotListener?.(idleSnapshot)
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: false })
+    hostEventListener?.({
+      type: 'resident.abort_idle_observed',
+      payload: {
+        hostId: stopCommand?.expectedHostId,
+        deviceId: stopCommand?.deviceId,
+        commandId: stopCommand?.commandId,
+        threadId: stopCommand?.threadId,
+        executionGenerationId: stopCommand?.expectedExecutionGenerationId,
+        status: 'completed',
+        durable: true,
+      },
+    })
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'idle' })
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
+    },
+  )
 
   it('suppresses delayed G1 snapshots and receipts after the same host advances the thread to G2', async () => {
     const catalogG1 = recoveryCatalog()
     const threadG1 = catalogG1.threads[0]
+    threadG1.status = 'idle'
     const snapshotG1 = recoverySnapshot(threadG1, 'Generation one transcript.')
     const threadG2 = {
       ...threadG1,
@@ -1130,8 +1626,6 @@ describe('NativeRendererApi', () => {
     const sending = api.sendComposer({
       threadId: 'thread-one',
       text: 'Continue G1',
-      intent: 'follow_up',
-      sendWhenReconnected: false,
     })
     expect(submitted).toMatchObject({ expectedExecutionGenerationId: 'generation-one' })
 
@@ -1484,6 +1978,64 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('accepts a new resident cursor generation with a reset sequence and rejects the retired cursor', async () => {
+    const catalog = recoveryCatalog()
+    const snapshotA = recoverySnapshot(catalog.threads[0], 'Cursor A at sequence 100.')
+    snapshotA.latestCursor.generation = 'cursor-a'
+    snapshotA.latestCursor.sequence = 100
+    snapshotA.thread.lastKnownCursor = { ...snapshotA.latestCursor }
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshotA },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((view) => published.push(view))
+    await api.loadWorkbench()
+
+    const snapshotB = structuredClone(snapshotA)
+    snapshotB.generatedAt = '2026-08-05T20:00:02.000Z'
+    snapshotB.thread.updatedAt = snapshotB.generatedAt
+    snapshotB.latestCursor = { ...snapshotB.latestCursor, generation: 'cursor-b', sequence: 0 }
+    snapshotB.thread.lastKnownCursor = { ...snapshotB.latestCursor }
+    snapshotB.materializedRecentBlocks[0]!.text = 'Cursor B at sequence 0.'
+    snapshotListener?.(snapshotB)
+    expect(published.at(-1)?.threads[0]?.transcript[0]?.body).toBe('Cursor B at sequence 0.')
+
+    const delayedA = structuredClone(snapshotA)
+    delayedA.generatedAt = '2026-08-05T20:00:03.000Z'
+    delayedA.thread.updatedAt = delayedA.generatedAt
+    delayedA.latestCursor.sequence = 101
+    delayedA.thread.lastKnownCursor = { ...delayedA.latestCursor }
+    delayedA.materializedRecentBlocks[0]!.text = 'Retired cursor A must not return.'
+    snapshotListener?.(delayedA)
+    expect(published.at(-1)?.threads[0]?.transcript[0]?.body).toBe('Cursor B at sequence 0.')
+
+    const snapshotB1 = structuredClone(snapshotB)
+    snapshotB1.generatedAt = '2026-08-05T20:00:04.000Z'
+    snapshotB1.thread.updatedAt = snapshotB1.generatedAt
+    snapshotB1.latestCursor.sequence = 1
+    snapshotB1.thread.lastKnownCursor = { ...snapshotB1.latestCursor }
+    snapshotB1.materializedRecentBlocks[0]!.text = 'Cursor B at sequence 1.'
+    snapshotListener?.(snapshotB1)
+    expect(published.at(-1)?.threads[0]?.transcript[0]?.body).toBe('Cursor B at sequence 1.')
+  })
+
   it('surfaces parseable legacy commands as held instead of composer work', async () => {
     const catalog = recoveryCatalog()
     const snapshot = recoverySnapshot(catalog.threads[0], 'Current transcript.')
@@ -1509,6 +2061,274 @@ describe('NativeRendererApi', () => {
       title: '2 older or invalid commands are held locally and won’t be sent automatically',
     }))
     expect(view.composerReceipt.state).toBe('idle')
+  })
+
+  it('preserves a host-durable uncertainty diagnostic for operator recovery', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Current transcript.')
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [{
+          state: 'uncertain',
+          hostId: 'host-local',
+          command: {
+            kind: 'thread.abort',
+            expectedHostId: 'host-local',
+            deviceId: 'device-local',
+            commandId: 'command-restart-uncertain',
+            threadId: 'thread-one',
+            expectedExecutionGenerationId: 'generation-one',
+            issuedAt: '2026-08-05T20:00:00.000Z',
+          },
+        }],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [{
+          hostId: 'host-local',
+          deviceId: 'device-local',
+          commandId: 'command-restart-uncertain',
+          threadId: 'thread-one',
+          executionGenerationId: 'generation-one',
+          status: 'uncertain',
+          durable: true,
+          error: {
+            code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+            message: 'The Prime Agent outcome cannot be proven after the host process identity changed',
+            retryable: false,
+            diagnosticId: 'resident-dispatch-diagnostic-1',
+          },
+        }],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      }),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+
+    const view = await api.loadWorkbench()
+    const exactCommandAttention = view.attention.filter((item) =>
+      item.id.endsWith('command-restart-uncertain')
+    )
+    expect(exactCommandAttention).toHaveLength(1)
+    expect(exactCommandAttention[0]).toEqual(expect.objectContaining({
+      id: 'durable-uncertain-command-restart-uncertain',
+      diagnostic: {
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        message: 'The Prime Agent outcome cannot be proven after the host process identity changed',
+        retryable: false,
+        diagnosticId: 'resident-dispatch-diagnostic-1',
+      },
+    }))
+  })
+
+  it('retires only the exact durable resident diagnostic when completed Stop proof arrives', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Waiting for exact Stop proof.')
+    snapshot.thread.status = 'idle'
+    let deviceId = ''
+    let hostEventListener: ((event: unknown) => void) | undefined
+    const commandId = 'uncertain-stop-with-diagnostic'
+    const exactIdentity = {
+      hostId: 'host-local',
+      deviceId,
+      commandId,
+      threadId: 'thread-one',
+      executionGenerationId: 'generation-one',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [{
+          state: 'awaiting_abort_idle_proof',
+          hostId: 'host-local',
+          command: {
+            kind: 'thread.cancel',
+            expectedHostId: 'host-local',
+            deviceId,
+            commandId,
+            threadId: 'thread-one',
+            expectedExecutionGenerationId: 'generation-one',
+            issuedAt: '2026-08-05T20:00:00.000Z',
+          },
+        }],
+        durableUncertainReceipts: [{
+          ...exactIdentity,
+          deviceId,
+          status: 'uncertain',
+          durable: true,
+          error: {
+            code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+            message: 'The Stop outcome requires exact reconciliation.',
+            retryable: false,
+            diagnosticId: 'diagnostic-stop-proof',
+          },
+        }],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn((listener: (event: unknown) => void) => {
+        hostEventListener = listener
+        return () => undefined
+      }),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    deviceId = (api as unknown as { deviceId: string }).deviceId
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((view) => published.push(view))
+
+    const retained = await api.loadWorkbench()
+    expect(retained.attention.filter((item) => item.id.endsWith(commandId))).toEqual([
+      expect.objectContaining({
+        id: `durable-uncertain-${commandId}`,
+        diagnostic: expect.objectContaining({ diagnosticId: 'diagnostic-stop-proof' }),
+      }),
+    ])
+    expect(retained.composerReceipt).toMatchObject({ state: 'sent', operation: 'abort' })
+    expect(retained.operations).toMatchObject({ startResidentTurn: false, stopResidentTurn: false })
+
+    hostEventListener?.({
+      type: 'resident.abort_idle_observed',
+      payload: {
+        hostId: 'host-local',
+        deviceId,
+        commandId,
+        threadId: 'thread-one',
+        executionGenerationId: 'generation-one',
+        status: 'completed',
+        durable: true,
+      },
+    })
+
+    expect(published.at(-1)?.attention.some((item) => item.id.endsWith(commandId))).toBe(false)
+    expect(published.at(-1)?.composerReceipt.state).toBe('idle')
+    expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
+  })
+
+  it('surfaces current background-thread uncertainty and rejects a stale generation', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Current transcript.')
+    const durableReceipt = (commandId: string, executionGenerationId: string) => ({
+      hostId: 'host-local',
+      deviceId: 'device-local',
+      commandId,
+      threadId: 'thread-two',
+      executionGenerationId,
+      status: 'uncertain',
+      durable: true,
+      error: {
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        message: 'The Prime Agent outcome cannot be proven after the host process identity changed',
+        retryable: false,
+        diagnosticId: `diagnostic-${commandId}`,
+      },
+    })
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [
+          durableReceipt('background-current', 'generation-two'),
+          durableReceipt('background-stale', 'generation-two-retired'),
+        ],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      }),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+
+    const view = await api.loadWorkbench()
+    expect(view.selectedThreadId).toBe('thread-one')
+    expect(view.attention).toContainEqual(expect.objectContaining({
+      id: 'durable-uncertain-background-current',
+      threadId: 'thread-two',
+      hostName: 'This computer',
+    }))
+    expect(view.attention).not.toContainEqual(expect.objectContaining({
+      id: 'durable-uncertain-background-stale',
+    }))
+  })
+
+  it('keeps a non-retryable Stop uncertainty blocked across generic cursor activity', async () => {
+    const catalog = recoveryCatalog()
+    const initialSnapshot = recoverySnapshot(catalog.threads[0], 'Active resident turn.')
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const cancel = vi.fn((input: Record<string, unknown>) => ok({
+      hostId: input.expectedHostId,
+      deviceId: input.deviceId,
+      commandId: input.commandId,
+      threadId: input.threadId,
+      executionGenerationId: input.expectedExecutionGenerationId,
+      status: 'uncertain',
+      durable: true,
+      detail: 'The Stop outcome is unknown and was not replayed.',
+      error: {
+        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+        message: 'The Stop outcome cannot be proven after restart',
+        retryable: false,
+        diagnosticId: 'abort-attempt-1',
+      },
+    }))
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: initialSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      }),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      cancel,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    api.subscribe((next) => published.push(next))
+    await api.loadWorkbench()
+
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({
+      state: 'uncertain',
+      retryable: false,
+    })
+    expect(published.at(-1)?.operations.stopResidentTurn).toBe(false)
+    expect(published.at(-1)?.composerReceipt).toMatchObject({
+      state: 'uncertain',
+      operation: 'abort',
+      retryable: false,
+    })
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({ state: 'rejected' })
+    expect(cancel).toHaveBeenCalledOnce()
+
+    const advancedActiveSnapshot = structuredClone(initialSnapshot)
+    advancedActiveSnapshot.generatedAt = '2026-08-05T20:00:02.000Z'
+    advancedActiveSnapshot.latestCursor.sequence = 2
+    advancedActiveSnapshot.thread.lastKnownCursor = advancedActiveSnapshot.latestCursor
+    snapshotListener?.(advancedActiveSnapshot)
+    expect(published.at(-1)?.operations.stopResidentTurn).toBe(false)
+    expect(published.at(-1)?.composerReceipt).toMatchObject({ state: 'uncertain', operation: 'abort' })
+    await expect(api.abortThread('thread-one')).resolves.toMatchObject({ state: 'rejected' })
+    expect(cancel).toHaveBeenCalledOnce()
   })
 })
 

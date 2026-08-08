@@ -321,8 +321,10 @@ describe("HostStore resident workspace authority", () => {
 });
 
 describe("HostStore abort admission", () => {
-  it("rejects offline aborts and keeps a live abort admitted until gateway acknowledgement", async () => {
-    const { store } = await fixture();
+  it("rejects offline and idle aborts, then uses the resident lease path for an owned prompt", async () => {
+    const { store, workspaceDirectory } = await fixture();
+    await registerDemoWorkspace(store, workspaceDirectory);
+    await store.persistResidentSessionBinding(binding(workspaceDirectory));
     const host = await store.getHost();
     const before = await store.getThreadSnapshot("demo-thread");
     const offline = abortCommand(host.hostId, "offline-abort");
@@ -336,25 +338,57 @@ describe("HostStore abort admission", () => {
     const live = abortCommand(host.hostId, "live-abort");
     const liveAdmission = await store.admitCommand(live, true);
     expect(liveAdmission.receipt).toMatchObject({
-      status: "admitted",
-      queuePosition: undefined,
-      message: "Abort admitted for live dispatch",
+      status: "rejected",
+      error: { code: "RESIDENT_SESSION_IDLE" },
     });
     expect(await store.getThreadSnapshot("demo-thread")).toEqual(before);
-    expect((await store.reconcileCommands([live])).receipts[0]?.status).toBe("admitted");
+
+    const ownedPrompt: CommandEnvelope = {
+      ...live,
+      commandId: "owned-prompt-before-abort",
+      command: { kind: "prompt", text: "Start one exact resident turn." },
+    };
+    const ownedPromptAdmission = await store.admitCommand(ownedPrompt, true);
+    expect(ownedPromptAdmission.receipt).toMatchObject({ status: "admitted" });
+    const prematureAbort = abortCommand(host.hostId, "premature-owned-live-abort");
+    expect((await store.admitCommand(prematureAbort, true)).receipt).toMatchObject({
+      status: "rejected",
+      error: { code: "RESIDENT_PROMPT_DELIVERY_PENDING", retryable: true },
+    });
+    const promptLease = await store.beginResidentDispatch(ownedPrompt);
+    await store.finalizeResidentDispatch(promptLease, {
+      status: "running",
+      message: "Prime Agent accepted the prompt",
+    });
+    const ownedAbort = abortCommand(host.hostId, "owned-live-abort");
+    expect((await store.admitCommand(ownedAbort, true)).receipt.status).toBe("admitted");
+    const lease = await store.beginResidentDispatch(ownedAbort);
+    const acknowledged = await store.finalizeResidentDispatch(lease, {
+      status: "running",
+      message: "Prime Agent accepted the stop request",
+    });
+    expect(acknowledged.status).toBe("running");
 
     const journalStatuses = (await readFile(store.paths.commandJournal, "utf8"))
       .trim()
       .split("\n")
       .map((line) => (JSON.parse(line) as { status: string }).status);
-    expect(journalStatuses).toEqual(["received", "rejected", "received", "admitted"]);
-
-    const acknowledged = await store.updateCommandReceipt(live, {
-      status: "completed",
-      queuePosition: undefined,
-      message: "Prime Agent handled the command",
-    });
-    expect(acknowledged.status).toBe("completed");
+    expect(journalStatuses).toEqual([
+      "received",
+      "rejected",
+      "received",
+      "rejected",
+      "received",
+      "admitted",
+      "received",
+      "rejected",
+      "admitted",
+      "running",
+      "received",
+      "admitted",
+      "admitted",
+      "running",
+    ]);
   });
 });
 

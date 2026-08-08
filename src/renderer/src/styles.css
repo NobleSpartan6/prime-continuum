@@ -567,6 +567,21 @@ code,
   background: var(--color-accent-hover);
 }
 
+.button--stop {
+  color: var(--color-text);
+  background: var(--color-surface-subtle);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--color-danger) 24%, var(--color-border));
+}
+
+.button--stop svg {
+  color: var(--color-danger);
+}
+
+.button--stop:hover:not(:disabled) {
+  background: var(--color-danger-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--color-danger) 36%, var(--color-border));
+}
+
 .button--secondary {
   color: var(--color-text);
   background: var(--color-surface-raised);
@@ -1034,6 +1049,74 @@ code,
 .attention-list small {
   color: var(--color-text-muted);
   font-size: 0.6875rem;
+}
+
+.attention-diagnostic {
+  display: grid;
+  gap: 0.15rem;
+  margin-block-start: 0.35rem;
+  padding: 0.4rem 3.05rem 0.4rem 0.45rem;
+  color: var(--color-text-secondary);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  user-select: text;
+  background: color-mix(in oklch, var(--color-danger-soft) 58%, var(--color-surface-raised));
+  border: 1px solid color-mix(in oklch, var(--color-danger) 18%, var(--color-border));
+  border-radius: var(--radius-sm);
+}
+
+.attention-diagnostic code {
+  color: var(--color-danger);
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.attention-diagnostic span,
+.attention-diagnostic em {
+  color: var(--color-text-muted);
+  font-size: 0.6875rem;
+  font-style: normal;
+  white-space: normal;
+}
+
+.attention-diagnostic em {
+  color: var(--color-text-secondary);
+}
+
+.attention-list__item--diagnostic,
+.companion-card-list__item--diagnostic {
+  position: relative;
+}
+
+.attention-list button.attention-diagnostic__copy,
+.companion-card-list button.attention-diagnostic__copy {
+  position: absolute;
+  z-index: 1;
+  inset-inline-end: 0.45rem;
+  inset-block-end: 0.45rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  place-items: center;
+  inline-size: 2.5rem;
+  min-inline-size: 2.5rem;
+  block-size: 2.5rem;
+  min-block-size: 2.5rem;
+  padding: 0;
+  color: var(--color-text-muted);
+  background: color-mix(in oklch, var(--color-surface-raised) 92%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.attention-list button.attention-diagnostic__copy:hover,
+.companion-card-list button.attention-diagnostic__copy:hover {
+  color: var(--color-text);
+  background: var(--color-surface-hover);
+}
+
+.companion-card-list__item--diagnostic .attention-diagnostic {
+  margin-inline-end: 0.5rem;
 }
 
 .sidebar__footer {
@@ -1618,6 +1701,41 @@ code,
   box-shadow: var(--shadow-composer);
 }
 
+.composer--compact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.55rem 0.65rem;
+}
+
+.composer--compact .composer__toolbar {
+  display: grid;
+  align-content: center;
+  justify-content: stretch;
+  gap: 0.15rem;
+}
+
+.composer--compact .composer__intent {
+  color: var(--color-text-secondary);
+  font-size: var(--font-meta);
+  font-weight: 620;
+}
+
+.composer--compact .composer__actions {
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+}
+
+.composer--compact .composer__secondary-actions {
+  flex: 0 1 auto;
+}
+
+.composer--compact .composer__hint {
+  display: none;
+}
+
 .composer:focus-within {
   box-shadow:
     0 0 0 2px color-mix(in oklch, var(--color-focus) 78%, transparent),
@@ -1725,6 +1843,17 @@ code,
 
 .composer textarea[aria-invalid="true"] {
   caret-color: var(--color-danger);
+}
+
+.composer textarea:disabled {
+  opacity: 1;
+  color: var(--color-text-muted);
+  cursor: default;
+}
+
+.composer--running textarea {
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
 }
 
 .composer__primary-actions {
@@ -4056,10 +4185,23 @@ dialog.pair-mobile-sheet {
 
 .companion-card-list strong,
 .companion-thread-list strong {
-  overflow: hidden;
   color: var(--color-text);
   font-size: var(--font-ui);
   font-weight: 620;
+}
+
+.companion-card-list strong {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.companion-thread-list strong {
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -4476,7 +4618,7 @@ dialog.pair-mobile-sheet {
 
   .connection-notice--reconnecting .connection-notice__icon,
   .composer__connection--sending svg,
-  .composer__connection--uncertain svg,
+  .composer__connection--uncertain svg.lucide-refresh-cw,
   .inline-loading svg,
   .button svg.lucide-loader-2,
   .evidence-state--running svg,
@@ -4877,6 +5019,54 @@ dialog.pair-mobile-sheet {
     white-space: nowrap;
   }
 
+  .composer-wrap--compact .session-continuity {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.5rem;
+    padding-block: 0.2rem;
+  }
+
+  .composer-wrap--compact .session-continuity__body strong,
+  .composer-wrap--compact .session-continuity__body small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    -webkit-line-clamp: initial;
+    line-clamp: initial;
+  }
+
+  .composer-wrap--compact .session-continuity__queue {
+    grid-column: auto;
+    max-inline-size: 7.5rem;
+  }
+
+  .composer--compact {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.45rem;
+  }
+
+  .composer--compact .composer__connection {
+    display: inline-flex;
+    padding-inline: 0;
+  }
+
+  .composer--compact .composer__connection > span {
+    display: -webkit-box;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  .composer--compact .composer__actions {
+    align-items: center;
+    justify-content: space-between;
+    inline-size: 100%;
+  }
+
   .history-loader {
     align-items: flex-start;
     flex-direction: column;
@@ -5230,6 +5420,10 @@ dialog.pair-mobile-sheet {
     display: none;
   }
 
+  .composer--compact .composer__connection {
+    display: inline-flex;
+  }
+
   .composer__connection--validation {
     display: inline-flex;
   }
@@ -5304,6 +5498,12 @@ dialog.pair-mobile-sheet {
   .thread-row {
     min-block-size: 2.75rem;
   }
+
+  .attention-list button.attention-diagnostic__copy,
+  .companion-card-list button.attention-diagnostic__copy {
+    inline-size: 2.75rem;
+    min-inline-size: 2.75rem;
+  }
 }
 
 @media (prefers-reduced-motion: no-preference) and (max-width: 66rem) {
@@ -5335,6 +5535,7 @@ dialog.pair-mobile-sheet {
   }
 
   .button--primary,
+  .button--stop,
   .task-state,
   .verification-mark,
   .attention-list__icon,

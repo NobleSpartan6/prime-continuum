@@ -11,10 +11,14 @@ import {
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  ResidentAbortIdleObservedSignalSchema,
+  ResidentPromptIdleObservedSignalSchema,
   RuntimeIntegritySnapshotSchema,
   RuntimeModelCatalogSnapshotSchema,
   RuntimeOAuthSessionSnapshotSchema,
+  StructuredErrorSchema,
   ThreadProjectionSnapshotSchema,
+  ThreadChangedEventPayloadSchema,
   type CatalogProjectionSnapshot,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
@@ -67,6 +71,7 @@ interface CachedHostProjection extends IndexedProjectionEntry {
   catalog?: unknown
   lastSnapshot?: unknown
   retiredExecutionGenerations?: Record<string, string[]>
+  retiredCursorGenerations?: Record<string, string[]>
   updatedAt?: string
 }
 
@@ -108,6 +113,11 @@ interface CommandIdentityLedgerEntry {
 interface CommandIdentityLedger {
   version: 1
   entries: CommandIdentityLedgerEntry[]
+}
+
+interface DurableUncertainReceiptHistory {
+  version: 1
+  entries: Array<CommandReceipt & { recordedAt: string }>
 }
 
 interface OutboxClassification {
@@ -157,6 +167,14 @@ interface HealthObservation {
   lineage: HealthLineage
 }
 
+interface ThreadChangeRefresh {
+  readonly authority: CapturedProjectionAuthority
+  readonly threadId: string
+  revision: number
+  committedRevision: number
+  cancelled: boolean
+}
+
 interface ServiceOptions {
   app: App
   sshExecutable?: string
@@ -169,14 +187,18 @@ const OAUTH_DRAIN_TIMEOUT_MS = 15_000
 const HEALTH_POLL_INITIALIZING_MS = 500
 const HEALTH_POLL_STEADY_MS = 15_000
 const HEALTH_POLL_TIMEOUT_MS = 10_000
+const NONTERMINAL_RECONCILIATION_DELAYS_MS = [500, 1_000, 2_000, 5_000, 10_000, 30_000] as const
+const NONTERMINAL_RECONCILIATION_BATCH_LIMIT = 32
+const THREAD_CHANGE_DEBOUNCE_MS = 80
 const OUTBOX_LIMIT = 1_000
+const COMPLETED_PROMPT_PROOF_FENCE_LIMIT = OUTBOX_LIMIT
 const COMMAND_IDENTITY_LEDGER_LIMIT = 10_000
+const DURABLE_UNCERTAIN_RECEIPT_LIMIT = 1_000
 const RETIRED_GENERATIONS_PER_THREAD_LIMIT = 16
+const RETIRED_CURSOR_GENERATIONS_PER_LINEAGE_LIMIT = 16
+const MAX_THREAD_CHANGE_REFRESHES = 1_024
 const TARGET_BINDING_LIMIT = 128
-const TERMINAL_OR_DURABLE = new Set([
-  'received',
-  'admitted',
-  'running',
+const TERMINAL_COMMAND_RECEIPTS = new Set([
   'completed',
   'rejected',
   'cancelled',
@@ -199,9 +221,23 @@ export class DesktopControlService extends EventEmitter {
   private readonly cache: IndexedProjectionCacheStore<CacheEnvelope>
   private readonly outbox: AtomicJsonStore<unknown[]>
   private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
+  private readonly durableUncertainReceipts: AtomicJsonStore<DurableUncertainReceiptHistory>
   private readonly latency = new LatencyRecorder()
   private readonly discoveredAliases = new Set<string>()
   private readonly installPlans = new Map<string, HostInstallPlan>()
+  private readonly threadChangeRefreshes = new Map<string, ThreadChangeRefresh>()
+  /**
+   * Per-identity receipt/proof commits are serialized independently from the
+   * transport request. This lets an idle proof delivered in the same read as a
+   * submit response win without the later submit continuation recreating its
+   * durable outbox entry.
+   */
+  private readonly commandLifecycleTails = new Map<string, Promise<void>>()
+  private readonly completedResidentProofs = new Map<string, CommandReceipt>()
+  private readonly activeCommandSubmissions = new Map<string, number>()
+  private nonterminalReconciliationTimer?: NodeJS.Timeout
+  private nonterminalReconciliationInFlight?: Promise<boolean>
+  private nonterminalReconciliationAttempt = 0
   private connection?: FramedConnection
   private target?: ConnectionTarget
   private authorityHostId?: string
@@ -244,11 +280,18 @@ export class DesktopControlService extends EventEmitter {
       8 * 1024 * 1024,
       { malformedJson: 'error', validateRoot: isCommandIdentityLedger },
     )
+    this.durableUncertainReceipts = new AtomicJsonStore<DurableUncertainReceiptHistory>(
+      path.join(stateDirectory, 'durable-uncertain-receipts.json'),
+      () => ({ version: 1, entries: [] }),
+      4 * 1024 * 1024,
+      { malformedJson: 'error', validateRoot: isDurableUncertainReceiptHistory },
+    )
   }
 
   async bootstrap(): Promise<BootstrapPayload> {
     return await this.latency.measure('cache.bootstrap', async () => {
       await this.commandIdentities.read()
+      const durableUncertainReceipts = await this.durableUncertainReceipts.read()
       const initialCache = await this.readCache()
       if (!this.target && initialCache.lastTarget) {
         this.target = initialCache.lastTarget
@@ -285,6 +328,9 @@ export class DesktopControlService extends EventEmitter {
             cache: visibleCacheForAuthority(cache, activeHostId),
             outbox: actionableOutbox,
             quarantinedOutboxCount: outbox.quarantinedCount,
+            durableUncertainReceipts: durableUncertainReceipts.entries
+              .filter((receipt) => !activeHostId || receipt.hostId === activeHostId)
+              .map(({ recordedAt: _recordedAt, ...receipt }) => receipt),
             connection,
             appVersion: this.app.getVersion()
           }
@@ -435,10 +481,13 @@ export class DesktopControlService extends EventEmitter {
       this.controlIntentGeneration += 1
       this.reconnectGeneration += 1
       this.stopHealthPolling()
+      this.stopNonterminalReconciliation()
       await this.drainActiveRuntimeOAuthSessions()
       const connection = this.connection
+      if (connection) this.cancelThreadChangeRefreshesForConnection(connection)
       this.connection = undefined
       connection?.close()
+      await this.drainNonterminalReconciliation()
       this.setState({
         phase: 'offline',
         target: this.target,
@@ -1060,6 +1109,7 @@ export class DesktopControlService extends EventEmitter {
     // the original command.
     await this.assertOutboxIdentityAvailable(pendingEntry)
     await this.reserveCommandIdentity(command, envelope)
+    const identity = outboxIdentity(hostId, command)
     const connection = this.connection
     if (!connection || connection.isClosed) {
       if (!isExplicitOfflineFollowUp(command)) {
@@ -1090,6 +1140,7 @@ export class DesktopControlService extends EventEmitter {
     }
 
     await this.putOutbox(pendingEntry)
+    this.beginCommandSubmission(identity)
     try {
       if (
         this.authorityHostId !== hostId ||
@@ -1107,18 +1158,55 @@ export class DesktopControlService extends EventEmitter {
       })
       const receipt = { ...normalizeReceipt(command.commandId, result), hostId }
       assertReceiptMatchesCommand(receipt, command)
-      if (receipt.durable || TERMINAL_OR_DURABLE.has(receipt.status)) {
-        await this.removeOutbox([outboxIdentity(hostId, command)])
+      const directResidentOperation = residentCommandOperation(command)
+      if (directResidentOperation && receipt.status === 'completed') {
+        await this.commitCompletedResidentProof(
+          pendingEntry,
+          receipt,
+          this.captureProjectionAuthority(),
+          directResidentOperation,
+        )
+        return receipt
       }
-      return receipt
+      return await this.withCommandLifecycle(identity, async () => {
+        const completedResidentProof = this.completedResidentProofs.get(commandLifecycleKey(identity))
+        if (completedResidentProof) return { ...completedResidentProof }
+        await this.recordDurableUncertainReceipt(receipt, command)
+        const retainedState = commandOutboxStateAfterReceipt(command, receipt.status)
+        if (retainedState) {
+          await this.putOutbox({ ...pendingEntry, state: retainedState, updatedAt: now() })
+          if (retainedState === 'awaiting_reconciliation' || retainedState === 'uncertain') {
+            this.scheduleNonterminalReconciliation()
+          }
+        } else if (shouldRemoveOutboxAfterReceipt(command, receipt)) {
+          await this.removeOutbox([identity])
+        }
+        return receipt
+      })
     } catch (error) {
-      const entry = { hostId, command, state: 'uncertain' as const, updatedAt: now() }
-      if (isDefinitiveCommandIdentityError(error)) {
-        await this.holdOutboxAfterReconciliationFailure(entry, error)
-      } else {
-        await this.putOutbox(entry)
+      const completedResidentProof = await this.withCommandLifecycle(identity, async () => {
+        const proof = this.completedResidentProofs.get(commandLifecycleKey(identity))
+        if (proof) return { ...proof }
+        const entry = { hostId, command, state: 'uncertain' as const, updatedAt: now() }
+        if (isDefinitiveCommandIdentityError(error)) {
+          await this.holdOutboxAfterReconciliationFailure(entry, error)
+        } else {
+          await this.putOutbox(entry)
+          this.scheduleNonterminalReconciliation()
+        }
+        return undefined
+      })
+      if (completedResidentProof) {
+        // The proof event may already have won while its local diagnostic or
+        // outbox cleanup failed. Keep the response proof-dominant, but also
+        // supervise an exact read-only reconcile before the transient fence is
+        // released so retained ownership cannot wait for an unrelated reconnect.
+        this.scheduleNonterminalReconciliation()
+        return completedResidentProof
       }
       throw error
+    } finally {
+      this.endCommandSubmission(identity)
     }
   }
 
@@ -1161,8 +1249,8 @@ export class DesktopControlService extends EventEmitter {
   async reconcileCommands(commandIds: string[]): Promise<CommandReceipt[]> {
     if (commandIds.length === 0) return []
     return await this.latency.measure('command.reconcile', async () => {
-      const hostId = this.requireAuthorityHostId()
-      const connection = this.requireConnection()
+      const authority = this.captureProjectionAuthority()
+      const { hostId, connection } = authority
       const pending = (await this.readOutboxClassification(true)).actionable.filter((entry) => entry.hostId === hostId)
       const entries = commandIds.map((commandId) => {
         const matches = pending.filter((candidate) => candidate.command.commandId === commandId)
@@ -1182,7 +1270,7 @@ export class DesktopControlService extends EventEmitter {
       // One exact envelope per request keeps even a maximum-size multibyte
       // prompt comfortably below the transport's one-megabyte frame ceiling.
       for (const entry of entries) {
-        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
+        if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
           throw new ControlError('connection.superseded', 'The host connection changed during command reconciliation.', {
             retryable: true
           })
@@ -1200,12 +1288,37 @@ export class DesktopControlService extends EventEmitter {
           ...normalizeReconciliation(result, [entry.command]).map((receipt) => ({ ...receipt, hostId }))
         )
       }
-      await this.removeOutbox(
-        receipts
-          .filter((receipt) => TERMINAL_OR_DURABLE.has(receipt.status))
-          .map((receipt) => receiptToOutboxIdentity(hostId, receipt, entries))
-          .filter((identity): identity is OutboxIdentity => Boolean(identity))
-      )
+      const removable: OutboxIdentity[] = []
+      for (const receipt of receipts) {
+        const entry = entries.find((candidate) =>
+          candidate.command.deviceId === receipt.deviceId &&
+          candidate.command.commandId === receipt.commandId &&
+          candidate.command.threadId === receipt.threadId &&
+          candidate.command.expectedExecutionGenerationId === receipt.executionGenerationId
+        )
+        if (!entry) continue
+        const retainedState = commandOutboxStateAfterReceipt(entry.command, receipt.status)
+        if (retainedState) {
+          await this.putOutbox({ ...entry, state: retainedState, updatedAt: now() })
+        } else if (residentCommandOperation(entry.command) && receipt.status === 'completed') {
+          await this.commitCompletedResidentProof(
+            entry,
+            receipt,
+            authority,
+            residentCommandOperation(entry.command)!,
+          )
+        } else if (shouldRemoveOutboxAfterReceipt(entry.command, receipt)) {
+          removable.push(outboxIdentity(hostId, entry.command))
+        }
+      }
+      await this.removeOutbox(removable)
+      for (const receipt of receipts) {
+        const entry = entries.find((candidate) =>
+          candidate.command.deviceId === receipt.deviceId && candidate.command.commandId === receipt.commandId
+        )
+        await this.recordDurableUncertainReceipt(receipt, entry?.command)
+      }
+      this.scheduleNonterminalReconciliation()
       return receipts
     })
   }
@@ -1265,6 +1378,7 @@ export class DesktopControlService extends EventEmitter {
   ): Promise<ConnectionState> {
     this.stopHealthPolling()
     const previous = this.connection
+    if (previous) this.cancelThreadChangeRefreshesForConnection(previous)
     this.connection = undefined
     previous?.close()
     this.attempt += 1
@@ -1324,7 +1438,7 @@ export class DesktopControlService extends EventEmitter {
       this.connection = candidate
       this.attachConnection(candidate, target, hostId, generation)
       try {
-        await this.reconcileOutboxAfterConnect(hostId, candidate)
+        await this.reconcileOutboxAfterConnect({ hostId, connection: candidate, target, generation })
       } catch (error) {
         if (!this.isActiveConnection(candidate, target, hostId, generation)) throw error
         this.setState({
@@ -1356,6 +1470,7 @@ export class DesktopControlService extends EventEmitter {
       this.scheduleHealthPoll(candidate, target, hostId, generation)
       return this.getConnectionState()
     } catch (error) {
+      if (candidate) this.cancelThreadChangeRefreshesForConnection(candidate)
       if (this.connection === candidate) this.connection = undefined
       candidate?.close()
       if (generation === this.reconnectGeneration) {
@@ -1386,6 +1501,64 @@ export class DesktopControlService extends EventEmitter {
         this.authorityHostId !== hostId
       ) return
       if (event.type.startsWith('handoff.')) this.emit('handoff-progress', event.payload)
+      else if (event.type === 'resident.prompt_idle_observed') {
+        const parsed = ResidentPromptIdleObservedSignalSchema.safeParse(event.payload)
+        if (!parsed.success) {
+          connection.terminate(
+            new ControlError('protocol.invalid_prompt_idle_signal', 'The host sent an invalid prompt idle-observed signal.')
+          )
+          return
+        }
+        void this.acceptResidentPromptIdleSignal(
+          parsed.data,
+          { hostId, connection, target, generation },
+        ).catch((error) => {
+          if (!this.isActiveConnection(connection, target, hostId, generation)) return
+          connection.terminate(
+            error instanceof ControlError
+              ? error
+              : new ControlError('protocol.prompt_idle_signal_failed', 'The prompt idle signal could not be reconciled safely.', {
+                  cause: error,
+                }),
+          )
+        })
+      }
+      else if (event.type === 'resident.abort_idle_observed') {
+        const parsed = ResidentAbortIdleObservedSignalSchema.safeParse(event.payload)
+        if (!parsed.success) {
+          connection.terminate(
+            new ControlError('protocol.invalid_abort_idle_signal', 'The host sent an invalid abort idle-observed signal.')
+          )
+          return
+        }
+        void this.acceptResidentAbortIdleSignal(
+          parsed.data,
+          { hostId, connection, target, generation },
+        ).catch((error) => {
+          if (!this.isActiveConnection(connection, target, hostId, generation)) return
+          connection.terminate(
+            error instanceof ControlError
+              ? error
+              : new ControlError('protocol.abort_idle_signal_failed', 'The abort idle signal could not be reconciled safely.', {
+                  cause: error,
+                }),
+          )
+        })
+      }
+      else if (event.type === 'thread.changed') {
+        const parsed = ThreadChangedEventPayloadSchema.safeParse(event.payload)
+        if (!parsed.success) {
+          connection.terminate(
+            new ControlError('protocol.invalid_thread_change', 'The host sent an invalid thread-change signal.')
+          )
+          return
+        }
+        this.scheduleThreadChangeRefresh(
+          { hostId, connection, target, generation },
+          parsed.data.threadId,
+          parsed.data.executionGenerationId,
+        )
+      }
       else if (event.type.startsWith('snapshot.') || event.type === 'thread.snapshot') {
         try {
           const snapshot = snapshotEventForAuthority(event.payload, hostId)
@@ -1421,13 +1594,114 @@ export class DesktopControlService extends EventEmitter {
       else this.emit('host-event', event)
     })
     connection.once('close', (error: unknown) => {
+      this.cancelThreadChangeRefreshesForConnection(connection)
       if (this.connection !== connection) return
       this.stopHealthPolling()
+      this.stopNonterminalReconciliation()
       this.connection = undefined
       this.abandonRuntimeOAuthSessionsForConnection(connection)
       if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
       this.beginAutomaticReconnect(target, error)
     })
+  }
+
+  private scheduleThreadChangeRefresh(
+    authority: CapturedProjectionAuthority,
+    threadId: string,
+    signaledExecutionGenerationId: string,
+  ): void {
+    if (!this.isActiveConnection(authority.connection, authority.target, authority.hostId, authority.generation)) return
+    const key = `${authority.hostId}\u0000${threadId}`
+    const existing = this.threadChangeRefreshes.get(key)
+    if (existing) {
+      if (
+        existing.authority.connection === authority.connection &&
+        existing.authority.generation === authority.generation
+      ) {
+        existing.revision += 1
+        return
+      }
+      existing.cancelled = true
+      this.threadChangeRefreshes.delete(key)
+    }
+    if (this.threadChangeRefreshes.size >= MAX_THREAD_CHANGE_REFRESHES) {
+      authority.connection.terminate(
+        new ControlError(
+          'protocol.thread_change_budget',
+          'The host invalidated more threads than this connection can refresh safely.',
+          { retryable: true, details: { maxThreads: MAX_THREAD_CHANGE_REFRESHES } },
+        )
+      )
+      return
+    }
+    const refresh: ThreadChangeRefresh = {
+      authority,
+      threadId,
+      revision: 1,
+      committedRevision: 0,
+      cancelled: false,
+    }
+    this.threadChangeRefreshes.set(key, refresh)
+    void (async () => {
+      let retryDelayMs = THREAD_CHANGE_DEBOUNCE_MS
+      try {
+        // Collapse token/tool bursts before each bounded authoritative read.
+        while (!refresh.cancelled && refresh.committedRevision < refresh.revision && this.isActiveConnection(
+          authority.connection,
+          authority.target,
+          authority.hostId,
+          authority.generation,
+        )) {
+          const targetRevision = refresh.revision
+          await delay(retryDelayMs)
+          if (refresh.cancelled) return
+          if (!this.isActiveConnection(authority.connection, authority.target, authority.hostId, authority.generation)) return
+          try {
+            const snapshot = ThreadProjectionSnapshotSchema.parse(await authority.connection.request(
+              'thread.snapshot',
+              { threadId },
+              { timeoutMs: 45_000 },
+            ))
+            this.assertProjectionAuthority(authority, 'thread change refresh')
+            if (snapshot.thread.threadId !== threadId || snapshot.thread.currentLocation.hostId !== authority.hostId) {
+              throw new ControlError('protocol.authority_mismatch', 'The refreshed thread snapshot belongs to another authority.')
+            }
+            // The signal generation is advisory. A stale G1 signal may fetch
+            // current G2, but persistence accepts only its monotonic authority.
+            void signaledExecutionGenerationId
+            const accepted = await this.persistThreadSnapshot(snapshot, authority)
+            this.assertProjectionAuthority(authority, 'thread change refresh')
+            if (accepted) this.emit('snapshot', snapshot)
+            refresh.committedRevision = targetRevision
+            retryDelayMs = THREAD_CHANGE_DEBOUNCE_MS
+          } catch (error) {
+            if (!this.isActiveConnection(authority.connection, authority.target, authority.hostId, authority.generation)) return
+            if (!(error instanceof ControlError) || !error.retryable) throw error
+            retryDelayMs = Math.min(Math.max(250, retryDelayMs * 2), 2_000)
+          }
+        }
+      } catch (error) {
+        if (!this.isActiveConnection(authority.connection, authority.target, authority.hostId, authority.generation)) return
+        authority.connection.terminate(
+          error instanceof ControlError
+            ? error
+            : new ControlError('protocol.thread_change_refresh_failed', 'The authoritative thread refresh failed.', {
+                retryable: true,
+                cause: error,
+              })
+        )
+      } finally {
+        if (this.threadChangeRefreshes.get(key) === refresh) this.threadChangeRefreshes.delete(key)
+      }
+    })()
+  }
+
+  private cancelThreadChangeRefreshesForConnection(connection: FramedConnection): void {
+    for (const [key, refresh] of this.threadChangeRefreshes) {
+      if (refresh.authority.connection !== connection) continue
+      refresh.cancelled = true
+      if (this.threadChangeRefreshes.get(key) === refresh) this.threadChangeRefreshes.delete(key)
+    }
   }
 
   private beginAutomaticReconnect(target: ConnectionTarget, cause: unknown): void {
@@ -1509,6 +1783,170 @@ export class DesktopControlService extends EventEmitter {
     this.healthPollTimer = undefined
   }
 
+  private scheduleNonterminalReconciliation(): void {
+    if (
+      this.nonterminalReconciliationTimer ||
+      this.nonterminalReconciliationInFlight ||
+      this.intentionallyOffline ||
+      !this.connection ||
+      this.connection.isClosed ||
+      !this.target ||
+      !this.authorityHostId ||
+      !this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)
+    ) return
+    const delayMs = NONTERMINAL_RECONCILIATION_DELAYS_MS[
+      Math.min(this.nonterminalReconciliationAttempt, NONTERMINAL_RECONCILIATION_DELAYS_MS.length - 1)
+    ] ?? 30_000
+    this.nonterminalReconciliationTimer = setTimeout(() => {
+      this.nonterminalReconciliationTimer = undefined
+      const connection = this.connection
+      const target = this.target
+      const hostId = this.authorityHostId
+      if (!connection || !target || !hostId) return
+      const authority: CapturedProjectionAuthority = {
+        connection,
+        target,
+        hostId,
+        generation: this.reconnectGeneration,
+      }
+      if (!this.isActiveConnection(connection, target, hostId, authority.generation)) return
+      const task = this.pollNonterminalReconciliation(authority)
+      this.nonterminalReconciliationInFlight = task
+      void task.then((madeProgress) => {
+        this.nonterminalReconciliationAttempt = madeProgress
+          ? 0
+          : Math.min(
+              this.nonterminalReconciliationAttempt + 1,
+              NONTERMINAL_RECONCILIATION_DELAYS_MS.length - 1,
+            )
+      }).catch((error) => {
+        if (!this.isActiveConnection(connection, target, hostId, authority.generation)) return
+        connection.terminate(
+          error instanceof ControlError
+            ? error
+            : new ControlError(
+                'protocol.command_reconciliation_failed',
+                'A pending command could not be reconciled safely.',
+                { cause: error, retryable: true },
+              ),
+        )
+      }).finally(() => {
+        if (this.nonterminalReconciliationInFlight === task) {
+          this.nonterminalReconciliationInFlight = undefined
+        }
+        this.scheduleNonterminalReconciliation()
+      })
+    }, delayMs)
+    this.nonterminalReconciliationTimer.unref?.()
+  }
+
+  private stopNonterminalReconciliation(): void {
+    if (this.nonterminalReconciliationTimer) {
+      clearTimeout(this.nonterminalReconciliationTimer)
+      this.nonterminalReconciliationTimer = undefined
+    }
+    this.nonterminalReconciliationAttempt = 0
+  }
+
+  private async drainNonterminalReconciliation(): Promise<void> {
+    const inFlight = this.nonterminalReconciliationInFlight
+    if (!inFlight) return
+    await inFlight.catch(() => undefined)
+  }
+
+  private async pollNonterminalReconciliation(
+    authority: CapturedProjectionAuthority,
+  ): Promise<boolean> {
+    this.assertProjectionAuthority(authority, 'pending command reconciliation')
+    const entries = (await this.readOutboxClassification(true)).actionable
+      .filter((entry) =>
+        entry.hostId === authority.hostId &&
+        (entry.state === 'awaiting_reconciliation' || entry.state === 'uncertain')
+      )
+      .slice(0, NONTERMINAL_RECONCILIATION_BATCH_LIMIT)
+    if (entries.length === 0) {
+      this.nonterminalReconciliationAttempt = 0
+      return false
+    }
+    let madeProgress = false
+    for (const entry of entries) {
+      this.assertProjectionAuthority(authority, 'pending command reconciliation')
+      try {
+        const envelope = adaptCommand(entry.command)
+        await this.reserveCommandIdentity(entry.command, envelope)
+        const result = await authority.connection.request(
+        'command.reconcile',
+        { expectedHostId: authority.hostId, commands: [envelope] },
+        { priority: 'urgent' },
+        )
+        this.assertProjectionAuthority(authority, 'pending command reconciliation')
+        const receipts = normalizeReceipts(result)
+        if (receipts.length > 1) {
+          throw new ControlError(
+            'protocol.command_reconciliation_identity_mismatch',
+            'The host returned more than one receipt for one pending command.',
+          )
+        }
+        const unknown = normalizeUnknownCommandIdentities(result)
+        if (
+          unknown.length > 1 ||
+          unknown.some((identity) =>
+            identity.deviceId !== entry.command.deviceId || identity.commandId !== entry.command.commandId
+          ) ||
+          (receipts.length > 0 && unknown.length > 0)
+        ) {
+          throw new ControlError(
+            'protocol.command_reconciliation_identity_mismatch',
+            'The host reconciliation result did not match the exact pending command identity.',
+          )
+        }
+        const rawReceipt = receipts[0]
+        if (!rawReceipt) continue
+        assertReceiptMatchesCommand(rawReceipt, entry.command)
+        const receipt: CommandReceipt = { ...rawReceipt, hostId: authority.hostId }
+        await this.recordDurableUncertainReceipt(receipt, entry.command)
+        const retainedState = commandOutboxStateAfterReceipt(entry.command, receipt.status)
+        const residentOperation = residentCommandOperation(entry.command)
+        if (residentOperation && receipt.status === 'completed') {
+          await this.commitCompletedResidentProof(entry, receipt, authority, residentOperation)
+          madeProgress = true
+          continue
+        }
+        if (retainedState) {
+          await this.putOutbox({ ...entry, state: retainedState, updatedAt: now() })
+          if (retainedState !== entry.state) {
+            this.emit('host-event', { type: 'command.receipt', payload: receipt })
+            madeProgress = true
+          }
+          continue
+        }
+        if (shouldRemoveOutboxAfterReceipt(entry.command, receipt)) {
+          await this.recordDurableUncertainReceipt(receipt, entry.command)
+          // The exact receipt is delivered before removal for the same crash
+          // ordering as prompt proof. A restart can reconcile a harmless repeat.
+          this.emit('host-event', { type: 'command.receipt', payload: receipt })
+          await this.removeOutbox([outboxIdentity(authority.hostId, entry.command)])
+          madeProgress = true
+        }
+      } catch (error) {
+        if (!this.isActiveConnection(
+          authority.connection,
+          authority.target,
+          authority.hostId,
+          authority.generation,
+        )) throw error
+        if (
+          error instanceof ControlError &&
+          error.code.startsWith('protocol.') &&
+          !isDefinitiveCommandIdentityError(error)
+        ) throw error
+        await this.holdOutboxAfterReconciliationFailure(entry, error)
+        if (isDefinitiveCommandIdentityError(error)) madeProgress = true
+      }
+    }
+    return madeProgress
+  }
+
   private async pollHealth(
     connection: FramedConnection,
     target: ConnectionTarget,
@@ -1531,7 +1969,7 @@ export class DesktopControlService extends EventEmitter {
       const commandsWereAvailable = this.authorityCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)
       this.applyHealthObservation(observation)
       if (!commandsWereAvailable && observation.capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)) {
-        await this.reconcileOutboxAfterConnect(hostId, connection)
+        await this.reconcileOutboxAfterConnect({ hostId, connection, target, generation })
       }
       this.scheduleHealthPoll(connection, target, hostId, generation)
     } catch (error) {
@@ -1757,6 +2195,7 @@ export class DesktopControlService extends EventEmitter {
         hostId: authority.hostId,
         lastSnapshot: snapshot,
         retiredExecutionGenerations: decision.retiredExecutionGenerations,
+        retiredCursorGenerations: decision.retiredCursorGenerations,
         updatedAt: now(),
       })
     })
@@ -1813,7 +2252,21 @@ export class DesktopControlService extends EventEmitter {
       rawOutboxIdentityMatches(candidate, entry.command.deviceId, entry.command.commandId)
     )
     if (matches.length === 0) return
-    if (matches.length === 1 && isExactReplaceableOutboxEntry(matches[0], entry)) return
+    if (matches.length === 1 && isExactReplaceableOutboxEntry(matches[0], entry)) {
+      if (matches[0].state === 'waiting_for_connection') return
+      throw new ControlError(
+        'command.awaiting_reconciliation',
+        'This exact command already crossed a non-replayable boundary and may only be reconciled.',
+        {
+          retryable: false,
+          details: {
+            deviceId: entry.command.deviceId,
+            commandId: entry.command.commandId,
+            state: matches[0].state,
+          },
+        },
+      )
+    }
     throw new ControlError(
       'command.identity_conflict',
       'This device command ID is already held by another or unverifiable local command.',
@@ -1860,9 +2313,81 @@ export class DesktopControlService extends EventEmitter {
     })
   }
 
+  private async withCommandLifecycle<T>(
+    identity: OutboxIdentity,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const key = commandLifecycleKey(identity)
+    const previous = this.commandLifecycleTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.catch(() => undefined).then(async () => await gate)
+    this.commandLifecycleTails.set(key, tail)
+    await previous.catch(() => undefined)
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (this.commandLifecycleTails.get(key) === tail) {
+        this.commandLifecycleTails.delete(key)
+        if (!this.activeCommandSubmissions.has(key)) this.completedResidentProofs.delete(key)
+      }
+    }
+  }
+
+  private beginCommandSubmission(identity: OutboxIdentity): void {
+    const key = commandLifecycleKey(identity)
+    this.activeCommandSubmissions.set(key, (this.activeCommandSubmissions.get(key) ?? 0) + 1)
+  }
+
+  private endCommandSubmission(identity: OutboxIdentity): void {
+    const key = commandLifecycleKey(identity)
+    const remaining = (this.activeCommandSubmissions.get(key) ?? 1) - 1
+    if (remaining > 0) this.activeCommandSubmissions.set(key, remaining)
+    else {
+      this.activeCommandSubmissions.delete(key)
+      this.completedResidentProofs.delete(key)
+    }
+  }
+
+  private rememberCompletedResidentProof(identity: OutboxIdentity, receipt: CommandReceipt): void {
+    const key = commandLifecycleKey(identity)
+    if (!this.completedResidentProofs.has(key) && this.completedResidentProofs.size >= COMPLETED_PROMPT_PROOF_FENCE_LIMIT) {
+      const evictable = [...this.completedResidentProofs.keys()].find(
+        (candidate) => !this.activeCommandSubmissions.has(candidate),
+      )
+      if (!evictable) {
+        throw new ControlError(
+          'command.proof_fence_capacity',
+          'Every resident proof fence is still protecting an in-flight command continuation.',
+          { retryable: true, details: { maxEntries: COMPLETED_PROMPT_PROOF_FENCE_LIMIT } },
+        )
+      }
+      this.completedResidentProofs.delete(evictable)
+    }
+    this.completedResidentProofs.set(key, { ...receipt })
+    while (this.completedResidentProofs.size > COMPLETED_PROMPT_PROOF_FENCE_LIMIT) {
+      const evictable = [...this.completedResidentProofs.keys()].find(
+        (candidate) => candidate !== key && !this.activeCommandSubmissions.has(candidate),
+      )
+      if (!evictable) break
+      this.completedResidentProofs.delete(evictable)
+    }
+  }
+
   private async putOutbox(entry: ScopedOutboxEntry): Promise<void> {
+    const identity = outboxIdentity(entry.hostId, entry.command)
+    const lifecycleKey = commandLifecycleKey(identity)
     await this.outbox.update((current) => {
       const entries = Array.isArray(current) ? current : []
+      // A proof may have been parsed after this write was queued but before its
+      // updater ran. Never let a stale submit/reconcile continuation recreate
+      // prompt ownership after that exact proof has won.
+      if (this.completedResidentProofs.has(lifecycleKey)) {
+        return entries.filter((candidate) => !(
+          isOutboxEntry(candidate) && matchesOutboxIdentity(candidate, identity)
+        ))
+      }
       const sameIdentity = entries.filter((candidate) =>
         rawOutboxIdentityMatches(candidate, entry.command.deviceId, entry.command.commandId)
       )
@@ -1920,7 +2445,12 @@ export class DesktopControlService extends EventEmitter {
         isOutboxEntry(candidate) && matchesOutboxIdentity(candidate, identity)
           ? {
               ...candidate,
-              state: 'uncertain' as const,
+              state:
+                candidate.state === 'awaiting_idle_proof' ||
+                candidate.state === 'awaiting_abort_idle_proof' ||
+                candidate.state === 'awaiting_reconciliation'
+                  ? candidate.state
+                  : 'uncertain' as const,
               updatedAt: now(),
               ...(quarantineReason ? { quarantineReason } : {}),
             }
@@ -1944,8 +2474,9 @@ export class DesktopControlService extends EventEmitter {
     })
   }
 
-  private async reconcileOutboxAfterConnect(hostId: string, connection: FramedConnection): Promise<void> {
-    if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
+  private async reconcileOutboxAfterConnect(authority: CapturedProjectionAuthority): Promise<void> {
+    const { hostId, connection } = authority
+    if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
       throw new ControlError('connection.superseded', 'The host authority changed during command reconciliation.')
     }
     // Reconciliation carries the complete v2 envelope. A legacy v1 host may
@@ -1962,7 +2493,7 @@ export class DesktopControlService extends EventEmitter {
     const explicitlyUnknownWaitingEntries: ScopedOutboxEntry[] = []
 
     for (const entry of pending) {
-      if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
+      if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
         throw new ControlError('connection.superseded', 'The host authority changed during command reconciliation.')
       }
       try {
@@ -1977,7 +2508,18 @@ export class DesktopControlService extends EventEmitter {
         const receivedReceipts = normalizeReceipts(result)
         for (const receipt of receivedReceipts) {
           assertReceiptMatchesCommand(receipt, entry.command)
-          if (TERMINAL_OR_DURABLE.has(receipt.status) || receipt.durable) {
+          const retainedState = commandOutboxStateAfterReceipt(entry.command, receipt.status)
+          if (retainedState) {
+            await this.putOutbox({ ...entry, state: retainedState, updatedAt: now() })
+            durableReceipts.push({ ...receipt, hostId })
+          } else if (residentCommandOperation(entry.command) && receipt.status === 'completed') {
+            await this.commitCompletedResidentProof(
+              entry,
+              { ...receipt, hostId },
+              authority,
+              residentCommandOperation(entry.command)!,
+            )
+          } else if (shouldRemoveOutboxAfterReceipt(entry.command, { ...receipt, hostId })) {
             durableEntries.push(entry)
             durableReceipts.push({ ...receipt, hostId })
           }
@@ -2009,30 +2551,231 @@ export class DesktopControlService extends EventEmitter {
           }
         }
       } catch (error) {
-        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) throw error
+        if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) throw error
         await this.holdOutboxAfterReconciliationFailure(entry, error)
       }
     }
 
-    await this.removeOutbox(durableEntries.map((entry) => outboxIdentity(hostId, entry.command)))
     for (const receipt of durableReceipts) {
+      const entry = pending.find((candidate) =>
+        candidate.command.deviceId === receipt.deviceId && candidate.command.commandId === receipt.commandId
+      )
+      await this.recordDurableUncertainReceipt(receipt, entry?.command)
       this.emit('host-event', { type: 'command.receipt', payload: receipt })
     }
+    await this.removeOutbox(durableEntries.map((entry) => outboxIdentity(hostId, entry.command)))
 
     for (const entry of explicitlyUnknownWaitingEntries) {
       try {
-        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) {
+        if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
           throw new ControlError('connection.superseded', 'The host authority changed before queued delivery.')
         }
         const receipt = await this.submitCommand(entry.command)
         this.emit('host-event', { type: 'command.receipt', payload: receipt })
       } catch (error) {
-        if (this.authorityHostId !== hostId || this.connection !== connection || connection.isClosed) throw error
+        if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) throw error
         // submitCommand has already retained or quarantined this exact envelope.
         // A per-command admission failure must not take down a verified host.
       }
     }
+    this.scheduleNonterminalReconciliation()
   }
+
+  private async recordDurableUncertainReceipt(
+    receipt: CommandReceipt,
+    _command?: ClientCommand,
+  ): Promise<void> {
+    if (!receipt.durable || receipt.status !== 'uncertain') return
+    // Resident uncertainty remains a live, exact mutation barrier in the
+    // outbox, but its structured host diagnostic must survive restart too.
+    // History is informational only and never makes the command replayable.
+    const recorded = { ...receipt, recordedAt: now() }
+    await this.durableUncertainReceipts.update((current) => {
+      const withoutIdentity = current.entries.filter(
+        (entry) => !sameDurableReceiptIdentity(entry, receipt)
+      )
+      return {
+        version: 1,
+        entries: [...withoutIdentity, recorded].slice(-DURABLE_UNCERTAIN_RECEIPT_LIMIT),
+      }
+    })
+  }
+
+  private async retireDurableUncertainReceipt(receipt: CommandReceipt): Promise<void> {
+    await this.durableUncertainReceipts.update((current) => {
+      const entries = current.entries.filter((entry) => !sameDurableReceiptIdentity(entry, receipt))
+      return entries.length === current.entries.length ? current : { version: 1, entries }
+    })
+  }
+
+  private async acceptResidentPromptIdleSignal(
+    signal: ReturnType<typeof ResidentPromptIdleObservedSignalSchema.parse>,
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    this.assertProjectionAuthority(authority, 'resident prompt idle signal')
+    const outbox = await this.readOutboxClassification(true)
+    const baseMatches = outbox.actionable.filter((entry) =>
+      entry.hostId === authority.hostId &&
+      entry.command.deviceId === signal.receipt.deviceId &&
+      entry.command.commandId === signal.receipt.commandId
+    )
+    // A repeated signal after its exact entry was already consumed is harmless.
+    if (baseMatches.length === 0) return
+    if (baseMatches.length !== 1) {
+      throw new ControlError(
+        'protocol.prompt_idle_identity_ambiguous',
+        'The prompt idle signal matched more than one local command identity.',
+      )
+    }
+    const entry = baseMatches[0]!
+    if (
+      entry.command.threadId !== signal.receipt.threadId ||
+      entry.command.expectedExecutionGenerationId !== signal.receipt.executionGenerationId
+    ) {
+      throw new ControlError(
+        'protocol.prompt_idle_receipt_identity_mismatch',
+        'The prompt idle signal changed the immutable thread or execution generation for a local command ID.',
+      )
+    }
+    const envelope = adaptCommand(entry.command)
+    if (
+      envelope.command.kind !== 'prompt' ||
+      signal.attemptId !== residentDispatchAttemptId(entry.command.deviceId, entry.command.commandId)
+    ) {
+      throw new ControlError(
+        'protocol.prompt_idle_state_mismatch',
+        'The prompt idle signal did not match the exact local prompt attempt.',
+      )
+    }
+    const receipt = { ...normalizeReceipt(signal.receipt.commandId, signal.receipt), hostId: authority.hostId }
+    assertReceiptMatchesCommand(receipt, entry.command)
+    if (receipt.status !== 'completed') {
+      throw new ControlError(
+        'protocol.prompt_idle_receipt_invalid',
+        'The prompt idle signal did not carry a completed prompt receipt.',
+      )
+    }
+    await this.commitCompletedResidentProof(entry, receipt, authority, 'prompt')
+  }
+
+  private async acceptResidentAbortIdleSignal(
+    signal: ReturnType<typeof ResidentAbortIdleObservedSignalSchema.parse>,
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    this.assertProjectionAuthority(authority, 'resident abort idle signal')
+    const outbox = await this.readOutboxClassification(true)
+    const baseMatches = outbox.actionable.filter((entry) =>
+      entry.hostId === authority.hostId &&
+      entry.command.deviceId === signal.receipt.deviceId &&
+      entry.command.commandId === signal.receipt.commandId
+    )
+    if (baseMatches.length === 0) return
+    if (baseMatches.length !== 1) {
+      throw new ControlError(
+        'protocol.abort_idle_identity_ambiguous',
+        'The abort idle signal matched more than one local command identity.',
+      )
+    }
+    const entry = baseMatches[0]!
+    if (
+      entry.command.threadId !== signal.receipt.threadId ||
+      entry.command.expectedExecutionGenerationId !== signal.receipt.executionGenerationId
+    ) {
+      throw new ControlError(
+        'protocol.abort_idle_receipt_identity_mismatch',
+        'The abort idle signal changed the immutable thread or execution generation for a local command ID.',
+      )
+    }
+    const envelope = adaptCommand(entry.command)
+    if (
+      envelope.command.kind !== 'abort' ||
+      signal.attemptId !== residentDispatchAttemptId(entry.command.deviceId, entry.command.commandId)
+    ) {
+      throw new ControlError(
+        'protocol.abort_idle_state_mismatch',
+        'The abort idle signal did not match the exact local Stop attempt.',
+      )
+    }
+    const receipt = { ...normalizeReceipt(signal.receipt.commandId, signal.receipt), hostId: authority.hostId }
+    assertReceiptMatchesCommand(receipt, entry.command)
+    if (receipt.status !== 'completed') {
+      throw new ControlError(
+        'protocol.abort_idle_receipt_invalid',
+        'The abort idle signal did not carry a completed Stop receipt.',
+      )
+    }
+    await this.commitCompletedResidentProof(entry, receipt, authority, 'abort')
+  }
+
+  private async commitCompletedResidentProof(
+    expectedEntry: ScopedOutboxEntry,
+    receipt: CommandReceipt,
+    authority: CapturedProjectionAuthority,
+    operation: 'prompt' | 'abort',
+  ): Promise<void> {
+    const identity = outboxIdentity(authority.hostId, expectedEntry.command)
+    await this.withCommandLifecycle(identity, async () => {
+      this.assertProjectionAuthority(authority, 'resident prompt completion')
+      const outbox = await this.readOutboxClassification(true)
+      const matches = outbox.actionable.filter((entry) => matchesOutboxIdentity(entry, identity))
+      const lifecycleKey = commandLifecycleKey(identity)
+      if (matches.length === 0 && this.completedResidentProofs.has(lifecycleKey)) return
+      if (matches.length !== 1) {
+        throw new ControlError(
+          'protocol.prompt_idle_identity_ambiguous',
+          'The completed prompt receipt did not match exactly one durable local command.',
+        )
+      }
+      const entry = matches[0]!
+      const envelope = adaptCommand(entry.command)
+      const expectedEnvelopeKind = operation === 'prompt' ? 'prompt' : 'abort'
+      const expectedProofState = operation === 'prompt' ? 'awaiting_idle_proof' : 'awaiting_abort_idle_proof'
+      if (
+        envelope.command.kind !== expectedEnvelopeKind ||
+        (entry.state !== 'uncertain' &&
+          entry.state !== 'awaiting_reconciliation' &&
+          entry.state !== expectedProofState)
+      ) {
+        throw new ControlError(
+          'protocol.prompt_idle_state_mismatch',
+          'The completed resident receipt did not match its non-replayable local proof state.',
+        )
+      }
+      assertReceiptMatchesCommand(receipt, entry.command)
+      if (receipt.status !== 'completed' || receipt.hostId !== authority.hostId) {
+        throw new ControlError(
+          'protocol.prompt_idle_receipt_invalid',
+          'The prompt completion receipt was not an exact completed host receipt.',
+        )
+      }
+      this.assertProjectionAuthority(authority, 'resident prompt completion')
+      this.rememberCompletedResidentProof(identity, receipt)
+      // Emit synchronously before the durable removal. A crash or write failure
+      // after this point leaves the immutable envelope to reconcile again and
+      // yields only a harmless duplicate; remove-before-emit could lose the
+      // one-shot ownership release forever.
+      this.emit('host-event', {
+        type: operation === 'prompt' ? 'resident.prompt_idle_observed' : 'resident.abort_idle_observed',
+        payload: receipt,
+      })
+      // Keep the immutable outbox barrier until the exact structured
+      // diagnostic has also been retired. A crash before outbox removal then
+      // reconciles the proof again instead of leaving stale Attention forever.
+      await this.retireDurableUncertainReceipt(receipt)
+      await this.removeOutbox([identity])
+    })
+  }
+}
+
+function sameDurableReceiptIdentity(
+  left: Pick<CommandReceipt, 'hostId' | 'deviceId' | 'commandId' | 'threadId' | 'executionGenerationId'>,
+  right: Pick<CommandReceipt, 'hostId' | 'deviceId' | 'commandId' | 'threadId' | 'executionGenerationId'>,
+): boolean {
+  return left.hostId === right.hostId &&
+    left.deviceId === right.deviceId &&
+    left.commandId === right.commandId &&
+    left.threadId === right.threadId &&
+    left.executionGenerationId === right.executionGenerationId
 }
 
 type HostCommandReceipt = Omit<CommandReceipt, 'hostId'>
@@ -2054,8 +2797,27 @@ function normalizeReceipt(commandId: string, value: unknown): HostCommandReceipt
     threadId: receipt.threadId,
     executionGenerationId: receipt.executionGenerationId,
     status,
-    durable: status !== 'uncertain',
-    ...(receipt.message ? { detail: receipt.message.slice(0, 2_048) } : {})
+    // A schema-valid receipt came from hostd's durable receipt journal. An
+    // uncertain *outcome* is terminal and non-replayable; it is not an
+    // uncertain receipt identity. Locally synthesized ambiguity never enters
+    // this normalizer and remains `durable: false` in the outbox.
+    durable: true,
+    ...(receipt.message
+      ? { detail: receipt.message.slice(0, 2_048) }
+      : receipt.error
+        ? { detail: receipt.error.message }
+        : {}),
+    ...(receipt.error
+      ? {
+          error: {
+            code: receipt.error.code,
+            message: receipt.error.message,
+            retryable: receipt.error.retryable,
+            ...(receipt.error.diagnosticId ? { diagnosticId: receipt.error.diagnosticId } : {}),
+            ...(receipt.error.details ? { details: { ...receipt.error.details } } : {}),
+          },
+        }
+      : {}),
   }
 }
 
@@ -2133,6 +2895,13 @@ function commandIdentityKey(deviceId: string, commandId: string): string {
   return `${deviceId}\u0000${commandId}`
 }
 
+function residentDispatchAttemptId(deviceId: string, commandId: string): string {
+  return `resident-dispatch-${createHash('sha256')
+    .update(JSON.stringify([deviceId, commandId]))
+    .digest('hex')
+    .slice(0, 48)}`
+}
+
 function assertReceiptMatchesCommand(
   receipt: HostCommandReceipt | CommandReceipt,
   command: ClientCommand,
@@ -2164,20 +2933,6 @@ function assertReceiptMatchesCommand(
       },
     )
   }
-}
-
-function receiptToOutboxIdentity(
-  hostId: string,
-  receipt: CommandReceipt,
-  entries: ScopedOutboxEntry[],
-): OutboxIdentity | undefined {
-  const entry = entries.find((candidate) =>
-    candidate.command.deviceId === receipt.deviceId &&
-    candidate.command.commandId === receipt.commandId &&
-    candidate.command.threadId === receipt.threadId &&
-    candidate.command.expectedExecutionGenerationId === receipt.executionGenerationId
-  )
-  return entry ? outboxIdentity(hostId, entry.command) : undefined
 }
 
 function adaptCommand(input: ClientCommand): CommandEnvelope {
@@ -2276,8 +3031,49 @@ function isExplicitOfflineFollowUp(command: ClientCommand): boolean {
   )
 }
 
+function commandOutboxStateAfterReceipt(
+  command: ClientCommand,
+  status: CommandReceipt['status'],
+): 'awaiting_idle_proof' | 'awaiting_abort_idle_proof' | 'awaiting_reconciliation' | 'uncertain' | undefined {
+  if (status === 'uncertain') return residentCommandOperation(command) ? 'uncertain' : undefined
+  if (status === 'received' || status === 'admitted') return 'awaiting_reconciliation'
+  if (status === 'running') {
+    if (isPromptClientCommand(command)) return 'awaiting_idle_proof'
+    if (isAbortClientCommand(command)) return 'awaiting_abort_idle_proof'
+    return 'awaiting_reconciliation'
+  }
+  return undefined
+}
+
+function isPromptClientCommand(command: ClientCommand): boolean {
+  return command.kind === 'prompt' || command.kind === 'thread.prompt'
+}
+
+function isAbortClientCommand(command: ClientCommand): boolean {
+  return command.kind === 'abort' || command.kind === 'thread.abort' || command.kind === 'thread.cancel'
+}
+
+function residentCommandOperation(command: ClientCommand): 'prompt' | 'abort' | undefined {
+  if (isPromptClientCommand(command)) return 'prompt'
+  if (isAbortClientCommand(command)) return 'abort'
+  return undefined
+}
+
+function shouldRemoveOutboxAfterReceipt(command: ClientCommand, receipt: CommandReceipt): boolean {
+  return TERMINAL_COMMAND_RECEIPTS.has(receipt.status) || (
+    receipt.status === 'uncertain' && receipt.durable && !residentCommandOperation(command)
+  )
+}
+
 function isOutboxEntry(value: unknown): value is OutboxEntry {
-  if (!isRecord(value) || (value.state !== 'waiting_for_connection' && value.state !== 'uncertain')) return false
+  if (
+    !isRecord(value) ||
+    (value.state !== 'waiting_for_connection' &&
+      value.state !== 'uncertain' &&
+      value.state !== 'awaiting_reconciliation' &&
+      value.state !== 'awaiting_idle_proof' &&
+      value.state !== 'awaiting_abort_idle_proof')
+  ) return false
   if (!isRecord(value.command)) return false
   return (
     (value.hostId === undefined || isHostId(value.hostId)) &&
@@ -2299,8 +3095,11 @@ function isActionableOutboxEntry(entry: OutboxEntry): entry is ScopedOutboxEntry
     typeof entry.command.issuedAt !== 'string'
   ) return false
   try {
-    adaptCommand(entry.command as ClientCommand)
-    return true
+    const envelope = adaptCommand(entry.command as ClientCommand)
+    return (
+      (entry.state !== 'awaiting_idle_proof' || envelope.command.kind === 'prompt') &&
+      (entry.state !== 'awaiting_abort_idle_proof' || envelope.command.kind === 'abort')
+    )
   } catch {
     return false
   }
@@ -2401,6 +3200,10 @@ function outboxIdentity(hostId: string, command: ClientCommand): OutboxIdentity 
   }
 }
 
+function commandLifecycleKey(identity: OutboxIdentity): string {
+  return canonicalJson(identity)
+}
+
 function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalJsonValue(value))
 }
@@ -2430,6 +3233,36 @@ function isCommandIdentityLedger(value: unknown): value is CommandIdentityLedger
       !/^[a-f0-9]{64}$/.test(candidate.envelopeSha256) ||
       typeof candidate.reservedAt !== 'string' ||
       !Number.isFinite(Date.parse(candidate.reservedAt))
+    ) return false
+    const key = commandIdentityKey(candidate.deviceId, candidate.commandId)
+    if (identities.has(key)) return false
+    identities.add(key)
+  }
+  return true
+}
+
+function isDurableUncertainReceiptHistory(value: unknown): value is DurableUncertainReceiptHistory {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.entries)) return false
+  if (value.entries.length > DURABLE_UNCERTAIN_RECEIPT_LIMIT) return false
+  const identities = new Set<string>()
+  for (const candidate of value.entries) {
+    if (
+      !isRecord(candidate) ||
+      !isHostId(candidate.hostId) ||
+      typeof candidate.deviceId !== 'string' || candidate.deviceId.length < 1 || candidate.deviceId.length > 128 ||
+      typeof candidate.commandId !== 'string' || candidate.commandId.length < 1 || candidate.commandId.length > 128 ||
+      typeof candidate.threadId !== 'string' || candidate.threadId.length < 1 || candidate.threadId.length > 128 ||
+      typeof candidate.executionGenerationId !== 'string' || candidate.executionGenerationId.length < 1 || candidate.executionGenerationId.length > 128 ||
+      candidate.status !== 'uncertain' ||
+      candidate.durable !== true ||
+      (candidate.detail !== undefined && (typeof candidate.detail !== 'string' || candidate.detail.length > 2_048)) ||
+      (candidate.error !== undefined && (
+        !isRecord(candidate.error) ||
+        typeof candidate.error.retryable !== 'boolean' ||
+        !StructuredErrorSchema.safeParse(candidate.error).success
+      )) ||
+      typeof candidate.recordedAt !== 'string' ||
+      !Number.isFinite(Date.parse(candidate.recordedAt))
     ) return false
     const key = commandIdentityKey(candidate.deviceId, candidate.commandId)
     if (identities.has(key)) return false
@@ -2660,6 +3493,7 @@ function visibleCacheForAuthority(cache: CacheEnvelope, hostId: string | undefin
 interface ProjectionWriteDecision {
   accept: boolean
   retiredExecutionGenerations: Record<string, string[]>
+  retiredCursorGenerations?: Record<string, string[]>
 }
 
 function catalogProjectionDecision(
@@ -2717,10 +3551,19 @@ function threadSnapshotProjectionDecision(
   incoming: ThreadProjectionSnapshot,
 ): ProjectionWriteDecision {
   const retired = cloneRetiredExecutionGenerations(previous?.retiredExecutionGenerations)
+  const retiredCursors = cloneRetiredCursorGenerations(previous?.retiredCursorGenerations)
   const threadId = incoming.thread.threadId
   const incomingGeneration = incoming.thread.currentLocation.executionGenerationId
+  const cursorRetirementKey = cursorLineageRetirementKey(threadId, incomingGeneration)
+  if (retiredCursors[cursorRetirementKey]?.includes(incoming.latestCursor.generation)) {
+    return {
+      accept: false,
+      retiredExecutionGenerations: retired,
+      retiredCursorGenerations: retiredCursors,
+    }
+  }
   if (retired[threadId]?.includes(incomingGeneration)) {
-    return { accept: false, retiredExecutionGenerations: retired }
+    return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
   }
 
   const parsedCatalog = CatalogProjectionSnapshotSchema.safeParse(previous?.catalog)
@@ -2730,29 +3573,68 @@ function threadSnapshotProjectionDecision(
       catalogThread &&
       catalogThread.currentLocation.executionGenerationId !== incomingGeneration
     ) {
-      return { accept: false, retiredExecutionGenerations: retired }
+      return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
     }
   }
 
   const parsedPrevious = ThreadProjectionSnapshotSchema.safeParse(previous?.lastSnapshot)
   if (!parsedPrevious.success || parsedPrevious.data.thread.threadId !== threadId) {
-    return { accept: true, retiredExecutionGenerations: retired }
+    return { accept: true, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
   }
   const current = parsedPrevious.data
   const currentGeneration = current.thread.currentLocation.executionGenerationId
   if (incomingGeneration === currentGeneration) {
+    const currentCursorGeneration = current.latestCursor.generation
+    if (incoming.latestCursor.generation !== currentCursorGeneration) {
+      if (Date.parse(incoming.thread.updatedAt) <= Date.parse(current.thread.updatedAt)) {
+        return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
+      }
+      if (!retireCursorGeneration(retiredCursors, cursorRetirementKey, currentCursorGeneration)) {
+        return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
+      }
+      return { accept: true, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
+    }
     const regresses =
       incoming.latestCursor.sequence < current.latestCursor.sequence ||
       Date.parse(incoming.thread.updatedAt) < Date.parse(current.thread.updatedAt)
-    return { accept: !regresses, retiredExecutionGenerations: retired }
+    return { accept: !regresses, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
   }
   if (Date.parse(incoming.thread.updatedAt) <= Date.parse(current.thread.updatedAt)) {
-    return { accept: false, retiredExecutionGenerations: retired }
+    return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
   }
   if (!retireExecutionGeneration(retired, threadId, currentGeneration)) {
-    return { accept: false, retiredExecutionGenerations: retired }
+    return { accept: false, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
   }
-  return { accept: true, retiredExecutionGenerations: retired }
+  return { accept: true, retiredExecutionGenerations: retired, retiredCursorGenerations: retiredCursors }
+}
+
+function cloneRetiredCursorGenerations(value: unknown): Record<string, string[]> {
+  if (!isRecord(value)) return {}
+  const result: Record<string, string[]> = {}
+  for (const [lineageKey, generations] of Object.entries(value).slice(0, 10_000)) {
+    if (!/^[a-f0-9]{64}$/.test(lineageKey) || !Array.isArray(generations)) continue
+    const normalized = [...new Set(generations.filter(isBoundedProjectionId))]
+      .slice(-RETIRED_CURSOR_GENERATIONS_PER_LINEAGE_LIMIT)
+    if (normalized.length > 0) result[lineageKey] = normalized
+  }
+  return result
+}
+
+function cursorLineageRetirementKey(threadId: string, executionGenerationId: string): string {
+  return createHash('sha256').update(JSON.stringify([threadId, executionGenerationId])).digest('hex')
+}
+
+function retireCursorGeneration(
+  retired: Record<string, string[]>,
+  lineageKey: string,
+  cursorGeneration: string,
+): boolean {
+  const generations = retired[lineageKey] ?? []
+  if (generations.includes(cursorGeneration)) return true
+  if (generations.length >= RETIRED_CURSOR_GENERATIONS_PER_LINEAGE_LIMIT) return false
+  generations.push(cursorGeneration)
+  retired[lineageKey] = generations
+  return true
 }
 
 function cloneRetiredExecutionGenerations(value: unknown): Record<string, string[]> {
@@ -2811,6 +3693,11 @@ function asCachedHostProjection(value: unknown, hostId: string): CachedHostProje
     ...(
       isRecord(value.retiredExecutionGenerations)
         ? { retiredExecutionGenerations: cloneRetiredExecutionGenerations(value.retiredExecutionGenerations) }
+        : {}
+    ),
+    ...(
+      isRecord(value.retiredCursorGenerations)
+        ? { retiredCursorGenerations: cloneRetiredCursorGenerations(value.retiredCursorGenerations) }
         : {}
     ),
     ...(typeof value.updatedAt === 'string' ? { updatedAt: value.updatedAt } : {}),

@@ -10,13 +10,18 @@ import {
   writeJsonFrame,
 } from "../shared/frame-codec";
 import {
+  HostIpcRequestSchema,
   HostIpcResponseSchema,
   MAX_SNAPSHOT_TRANSFER_BYTES,
   PROTOCOL_VERSION,
+  ResidentAbortIdleObservedSignalSchema,
+  ResidentPromptIdleObservedSignalSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SNAPSHOT_TRANSFER_VERSION,
   type HostIpcResponse,
   type HostIpcSnapshotTransferEnvelope,
+  type ResidentAbortIdleObservedSignal,
+  type ResidentPromptIdleObservedSignal,
 } from "../shared/protocol";
 import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
 import { ensurePrivateDirectory } from "./atomic-files";
@@ -37,6 +42,9 @@ export type { HostOwnershipLease } from "./ownership-lease";
 export const MAX_HOST_CONNECTIONS = 32;
 export const CONNECTION_IDLE_TIMEOUT_MS = 5 * 60_000;
 export const CONNECTION_INITIALIZATION_TIMEOUT_MS = 10_000;
+export const MAX_PENDING_THREAD_CHANGE_SIGNALS = 1_024;
+/** Includes executing requests and requests waiting in either per-session lane. */
+export const MAX_FRAMED_SESSION_IN_FLIGHT_REQUESTS = 8;
 export const UNIX_ENDPOINT_OWNERSHIP_SUFFIX = ".owner";
 export const SSH_BRIDGE_SESSION_PREFACE = Object.freeze({
   primeContinuimSession: 1,
@@ -316,6 +324,246 @@ export async function runFramedSession(
 ): Promise<void> {
   let sessionContext = context;
   let firstFrame = true;
+  let stopped = false;
+  let nextRequestOrdinal = 0;
+  let nextSignalOrdinal = 0;
+  let writeTail = Promise.resolve();
+  let eventPumpPromise: Promise<void> | undefined;
+  let normalRequestTail = Promise.resolve();
+  let urgentRequestTail = Promise.resolve();
+  const inFlightRequests = new Set<Promise<void>>();
+  const inFlightRequestOrdinals = new Set<number>();
+  type PendingSignal<T> = Readonly<{
+    payload: T;
+    barrierOrdinal: number;
+    queuedOrdinal: number;
+  }>;
+  type ThreadChange = { threadId: string; executionGenerationId: string };
+  type WritableSignal =
+    | Readonly<{ kind: "resident.prompt_idle_observed"; key: string; pending: PendingSignal<ResidentPromptIdleObservedSignal> }>
+    | Readonly<{ kind: "resident.abort_idle_observed"; key: string; pending: PendingSignal<ResidentAbortIdleObservedSignal> }>
+    | Readonly<{ kind: "thread.changed"; key: string; pending: PendingSignal<ThreadChange> }>;
+  const pendingThreadChanges = new Map<string, PendingSignal<ThreadChange>>();
+  const pendingPromptIdleSignals = new Map<string, PendingSignal<ResidentPromptIdleObservedSignal>>();
+  const pendingAbortIdleSignals = new Map<string, PendingSignal<ResidentAbortIdleObservedSignal>>();
+  const serializeWrite = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = writeTail.then(work);
+    writeTail = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const terminateSession = (error: Error): void => {
+    if (stopped) return;
+    stopped = true;
+    pendingPromptIdleSignals.clear();
+    pendingAbortIdleSignals.clear();
+    pendingThreadChanges.clear();
+    destroyWritable(writable, error);
+    if (!Object.is(readable, writable) && !readable.destroyed) readable.destroy();
+  };
+  const responseBarrierSatisfied = (barrierOrdinal: number): boolean => {
+    for (const ordinal of inFlightRequestOrdinals) {
+      if (ordinal <= barrierOrdinal) return false;
+    }
+    return true;
+  };
+  const nextWritableSignal = (beforeResponseOrdinal = Number.POSITIVE_INFINITY): WritableSignal | undefined => {
+    const candidates: WritableSignal[] = [];
+    for (const [key, pending] of pendingPromptIdleSignals) {
+      if (pending.barrierOrdinal < beforeResponseOrdinal && responseBarrierSatisfied(pending.barrierOrdinal)) {
+        candidates.push({ kind: "resident.prompt_idle_observed", key, pending });
+      }
+    }
+    for (const [key, pending] of pendingAbortIdleSignals) {
+      if (pending.barrierOrdinal < beforeResponseOrdinal && responseBarrierSatisfied(pending.barrierOrdinal)) {
+        candidates.push({ kind: "resident.abort_idle_observed", key, pending });
+      }
+    }
+    if (candidates.length > 0) {
+      candidates.sort((left, right) => left.pending.queuedOrdinal - right.pending.queuedOrdinal);
+      return candidates[0];
+    }
+    for (const [key, pending] of pendingThreadChanges) {
+      if (pending.barrierOrdinal < beforeResponseOrdinal && responseBarrierSatisfied(pending.barrierOrdinal)) {
+        candidates.push({ kind: "thread.changed", key, pending });
+      }
+    }
+    candidates.sort((left, right) => left.pending.queuedOrdinal - right.pending.queuedOrdinal);
+    return candidates[0];
+  };
+  const writePendingSignal = async (signal: WritableSignal): Promise<void> => {
+    if (signal.kind === "resident.prompt_idle_observed") pendingPromptIdleSignals.delete(signal.key);
+    else if (signal.kind === "resident.abort_idle_observed") pendingAbortIdleSignals.delete(signal.key);
+    else pendingThreadChanges.delete(signal.key);
+    await serializeWrite(() => writeJsonFrame(writable, {
+      protocolVersion: PROTOCOL_VERSION,
+      event: signal.kind,
+      payload: signal.pending.payload,
+    }, DEFAULT_MAX_FRAME_BYTES));
+  };
+  const drainEligibleSignals = async (beforeResponseOrdinal = Number.POSITIVE_INFINITY): Promise<void> => {
+    while (!stopped) {
+      const signal = nextWritableSignal(beforeResponseOrdinal);
+      if (!signal) return;
+      await writePendingSignal(signal);
+    }
+  };
+  const scheduleEventWrite = (): void => {
+    if (stopped || eventPumpPromise || !nextWritableSignal()) return;
+    const pump = Promise.resolve().then(() => drainEligibleSignals());
+    eventPumpPromise = pump;
+    void pump.then(
+      () => {
+        if (eventPumpPromise === pump) eventPumpPromise = undefined;
+        scheduleEventWrite();
+      },
+      (error: unknown) => {
+        if (eventPumpPromise === pump) eventPumpPromise = undefined;
+        terminateSession(error instanceof Error ? error : new Error("Host event write failed"));
+      },
+    );
+  };
+  const flushSignalsBeforeResponse = async (responseOrdinal: number): Promise<void> => {
+    while (!stopped) {
+      const pump = eventPumpPromise;
+      if (pump) {
+        await pump;
+        continue;
+      }
+      const signal = nextWritableSignal(responseOrdinal);
+      if (!signal) return;
+      await writePendingSignal(signal);
+    }
+  };
+  const processRequest = async (
+    request: unknown,
+    requestContext: HostSessionContext,
+    requestOrdinal: number,
+  ): Promise<void> => {
+    if (stopped) return;
+    // There is no await between the completed physical ownership proof and
+    // HostService admission, so shutdown/loss cannot interleave this edge.
+    await assertRequestOwnership?.();
+    const response = await service.handle(request, requestContext);
+    if (stopped) return;
+    // A signal waits only for responses that were already admitted when the
+    // signal was queued. Sustained later traffic cannot starve it, and the
+    // response that causally produced the signal still writes first.
+    await flushSignalsBeforeResponse(requestOrdinal);
+    await serializeWrite(async () => {
+      if (stopped) return;
+      if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
+        await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
+      }
+    });
+  };
+  const admitRequest = (request: unknown): void => {
+    if (inFlightRequests.size >= MAX_FRAMED_SESSION_IN_FLIGHT_REQUESTS) {
+      throw new FrameCodecError(
+        "TOO_MANY_FRAMES",
+        `More than ${MAX_FRAMED_SESSION_IN_FLIGHT_REQUESTS} requests are in flight on one host session`,
+      );
+    }
+    const requestContext = sessionContext;
+    const urgent = isUrgentFramedControlRequest(request);
+    const previous = urgent ? urgentRequestTail : normalRequestTail;
+    const requestOrdinal = ++nextRequestOrdinal;
+    inFlightRequestOrdinals.add(requestOrdinal);
+    const execution = previous.then(() => processRequest(request, requestContext, requestOrdinal));
+    let tracked!: Promise<void>;
+    tracked = execution
+      .catch((error: unknown) => {
+        terminateSession(error instanceof Error ? error : new Error("Host protocol request failed"));
+      })
+      .finally(() => {
+        inFlightRequests.delete(tracked);
+        inFlightRequestOrdinals.delete(requestOrdinal);
+        scheduleEventWrite();
+      });
+    if (urgent) urgentRequestTail = tracked;
+    else normalRequestTail = tracked;
+    inFlightRequests.add(tracked);
+  };
+  const unsubscribeProjectionChanges = service.subscribeProjectionChanges((change) => {
+    if (stopped || sessionContext.transport === "relay") return;
+    // One pending slot per thread is sufficient: consumers fetch the current
+    // authoritative snapshot, so a newer execution generation supersedes an
+    // older unsent hint for that same thread.
+    const key = change.threadId;
+    if (!pendingThreadChanges.has(key) && pendingThreadChanges.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS) {
+      stopped = true;
+      pendingPromptIdleSignals.clear();
+      pendingAbortIdleSignals.clear();
+      pendingThreadChanges.clear();
+      destroyWritable(writable, new FrameCodecError("TOO_MANY_FRAMES", "Too many thread changes are pending"));
+      return;
+    }
+    const existing = pendingThreadChanges.get(key);
+    pendingThreadChanges.set(key, Object.freeze({
+      payload: change,
+      // A coalesced invalidation carries the newest payload, so it must also
+      // preserve the newest causal response barrier. This can delay only that
+      // thread's one bounded slot; proof signals remain independently eligible.
+      barrierOrdinal: Math.max(existing?.barrierOrdinal ?? 0, nextRequestOrdinal),
+      queuedOrdinal: existing?.queuedOrdinal ?? ++nextSignalOrdinal,
+    }));
+    scheduleEventWrite();
+  });
+  const unsubscribePromptIdleObserved = service.subscribeResidentPromptIdleObserved?.((observation) => {
+    if (stopped || sessionContext.transport === "relay") return;
+    const signal = ResidentPromptIdleObservedSignalSchema.parse({
+      eventVersion: 1,
+      attemptId: observation.attemptId,
+      receipt: observation.receipt,
+    });
+    if (
+      !pendingPromptIdleSignals.has(signal.attemptId) &&
+      pendingPromptIdleSignals.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS
+    ) {
+      stopped = true;
+      pendingPromptIdleSignals.clear();
+      pendingAbortIdleSignals.clear();
+      pendingThreadChanges.clear();
+      destroyWritable(writable, new FrameCodecError("TOO_MANY_FRAMES", "Too many prompt idle signals are pending"));
+      return;
+    }
+    if (!pendingPromptIdleSignals.has(signal.attemptId)) {
+      pendingPromptIdleSignals.set(signal.attemptId, Object.freeze({
+        payload: signal,
+        // Exact proof duplicates retain their first causal barrier so a later
+        // duplicate can never extend liveness indefinitely.
+        barrierOrdinal: nextRequestOrdinal,
+        queuedOrdinal: ++nextSignalOrdinal,
+      }));
+    }
+    scheduleEventWrite();
+  }) ?? (() => undefined);
+  const unsubscribeAbortIdleObserved = service.subscribeResidentAbortIdleObserved?.((observation) => {
+    if (stopped || sessionContext.transport === "relay") return;
+    const signal = ResidentAbortIdleObservedSignalSchema.parse({
+      eventVersion: 1,
+      attemptId: observation.attemptId,
+      receipt: observation.receipt,
+    });
+    if (
+      !pendingAbortIdleSignals.has(signal.attemptId) &&
+      pendingAbortIdleSignals.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS
+    ) {
+      stopped = true;
+      pendingPromptIdleSignals.clear();
+      pendingAbortIdleSignals.clear();
+      pendingThreadChanges.clear();
+      destroyWritable(writable, new FrameCodecError("TOO_MANY_FRAMES", "Too many Stop idle signals are pending"));
+      return;
+    }
+    if (!pendingAbortIdleSignals.has(signal.attemptId)) {
+      pendingAbortIdleSignals.set(signal.attemptId, Object.freeze({
+        payload: signal,
+        barrierOrdinal: nextRequestOrdinal,
+        queuedOrdinal: ++nextSignalOrdinal,
+      }));
+    }
+    scheduleEventWrite();
+  }) ?? (() => undefined);
   try {
     for await (const request of readJsonFrames(readable, {
       maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
@@ -330,23 +578,40 @@ export async function runFramedSession(
         continue;
       }
       firstFrame = false;
-      // There is no await between the completed physical ownership proof and
-      // HostService admission, so shutdown/loss cannot interleave this edge.
-      await assertRequestOwnership?.();
-      const response = await service.handle(request, sessionContext);
-      if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
-        await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
-      }
+      admitRequest(request);
     }
+    await Promise.allSettled([...inFlightRequests]);
+    while (eventPumpPromise) await eventPumpPromise.catch(() => undefined);
   } catch (error) {
     if (error instanceof FrameCodecError) {
       // Framing violations are terminal; attempting to answer could desynchronize
       // the stream and amplify attacker-controlled input.
-      destroyWritable(writable, error);
-      return;
+      terminateSession(error);
+    } else {
+      terminateSession(error instanceof Error ? error : new Error("Host protocol session failed"));
     }
-    destroyWritable(writable, error instanceof Error ? error : new Error("Host protocol session failed"));
+    await Promise.allSettled([...inFlightRequests]);
+  } finally {
+    stopped = true;
+    unsubscribeProjectionChanges();
+    unsubscribePromptIdleObserved();
+    unsubscribeAbortIdleObserved();
+    pendingPromptIdleSignals.clear();
+    pendingAbortIdleSignals.clear();
+    pendingThreadChanges.clear();
+    await writeTail.catch(() => undefined);
   }
+}
+
+function isUrgentFramedControlRequest(value: unknown): boolean {
+  const parsed = HostIpcRequestSchema.safeParse(value);
+  if (!parsed.success) return false;
+  const request = parsed.data;
+  if (request.method === "command.submit") return request.payload.command.command.kind === "abort";
+  // Reconciliation is receipt-only. Let an exact Stop identity observe its
+  // durable result without waiting behind a long normal mutation, but never
+  // infer urgency from an unvalidated or partial envelope.
+  return request.method === "command.reconcile" && request.payload.commands[0]?.command.kind === "abort";
 }
 
 async function writeSnapshotResponseIfRequested(

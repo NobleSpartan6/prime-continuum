@@ -14,6 +14,7 @@ import {
   Code2,
   Command,
   Computer,
+  Copy,
   Eye,
   FileCode2,
   FolderGit2,
@@ -36,6 +37,7 @@ import {
   Server,
   ShieldCheck,
   Smartphone,
+  Square,
   Terminal,
   TestTube2,
   Wifi,
@@ -66,8 +68,18 @@ import { FormEvent, KeyboardEvent, ReactNode, RefObject, useCallback, useEffect,
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type WorkbenchSurface = 'desktop' | 'companion'
+type ComposerReceiptView = {
+  state: ComposerReceiptState
+  message: string
+  operation?: 'prompt' | 'abort'
+  retryable?: boolean
+}
+type ComposerLocalAction = {
+  sequence: number
+  operation: 'prompt' | 'abort'
+}
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
-const EMPTY_COMPOSER_ERROR = 'Write a message before sending.'
+const EMPTY_COMPOSER_ERROR = 'Write a prompt before running Prime Agent.'
 const MODEL_REVEAL_INCREMENT = 80
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
@@ -82,6 +94,73 @@ const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
 
 function cx(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
+}
+
+function AttentionDiagnostic({ item }: { item: WorkbenchSnapshot['attention'][number] }) {
+  if (!item.diagnostic) return null
+  return (
+    <span className="attention-diagnostic">
+      <code>{item.diagnostic.code}{item.diagnostic.diagnosticId ? ` · ${item.diagnostic.diagnosticId}` : ''}</code>
+      <span>{item.diagnostic.message}</span>
+      <em>
+        {item.diagnostic.retryable
+          ? 'Reconnect and inspect the current thread state before retrying.'
+          : 'Do not retry automatically. Inspect the current thread state.'}
+      </em>
+    </span>
+  )
+}
+
+function attentionDiagnosticText(item: WorkbenchSnapshot['attention'][number]): string {
+  if (!item.diagnostic) return ''
+  return [
+    item.diagnostic.code,
+    item.diagnostic.diagnosticId ? `Diagnostic ID: ${item.diagnostic.diagnosticId}` : undefined,
+    item.diagnostic.message,
+    item.diagnostic.retryable ? 'Retryable: yes' : 'Retryable: no',
+  ].filter(Boolean).join('\n')
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const field = document.createElement('textarea')
+  field.value = text
+  field.setAttribute('readonly', '')
+  field.style.position = 'fixed'
+  field.style.opacity = '0'
+  document.body.append(field)
+  field.select()
+  const copied = document.execCommand('copy')
+  field.remove()
+  if (!copied) throw new Error('Clipboard copy was rejected')
+}
+
+function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'][number] }) {
+  const [copied, setCopied] = useState(false)
+  if (!item.diagnostic) return null
+  return (
+    <button
+      className="attention-diagnostic__copy"
+      type="button"
+      aria-label={copied ? 'Diagnostic copied' : `Copy diagnostic ${item.diagnostic.code}`}
+      onClick={() => {
+        void writeClipboardText(attentionDiagnosticText(item)).then(() => {
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 1_600)
+        }).catch(() => setCopied(false))
+      }}
+    >
+      <Icon icon={copied ? Check : Copy} size={13} />
+      <span className="sr-only" aria-live="polite">{copied ? 'Diagnostic copied' : 'Copy diagnostic'}</span>
+    </button>
+  )
+}
+
+function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): string {
+  return `${hostId}\u0000${thread.id}\u0000${thread.executionGenerationId ?? ''}`
 }
 
 function Icon({ icon: IconComponent, size = 16, strokeWidth = 1.75 }: { icon: LucideIcon; size?: number; strokeWidth?: number }) {
@@ -290,10 +369,9 @@ export default function App({ api: suppliedApi }: AppProps) {
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [moveDestinationId, setMoveDestinationId] = useState('')
-  const [composerMode, setComposerMode] = useState<'follow_up' | 'steer'>('follow_up')
   const [composerText, setComposerText] = useState('')
   const [composerValidationError, setComposerValidationError] = useState('')
-  const [composerReceipt, setComposerReceipt] = useState<{ state: ComposerReceiptState; message: string }>({
+  const [composerReceipt, setComposerReceipt] = useState<ComposerReceiptView>({
     state: 'idle',
     message: '',
   })
@@ -382,21 +460,45 @@ export default function App({ api: suppliedApi }: AppProps) {
   const activeHostIdRef = useRef<string | undefined>(undefined)
   const activeThreadIdRef = useRef<string | undefined>(undefined)
   const composerAuthorityGenerationRef = useRef(0)
+  const composerActionSequenceRef = useRef(0)
+  const latestComposerActionsRef = useRef(new Map<string, ComposerLocalAction>())
 
   useEffect(() => {
     let cancelled = false
     setLoadError('')
+    const applySnapshot = (nextSnapshot: WorkbenchSnapshot) => {
+      setSnapshot(nextSnapshot)
+      setSelectedProjectId(nextSnapshot.selectedProjectId)
+      setSelectedThreadId(nextSnapshot.selectedThreadId)
+      const nextReceipt: ComposerReceiptView = {
+        state: nextSnapshot.composerReceipt.state,
+        message: nextSnapshot.composerReceipt.message ?? '',
+        ...(nextSnapshot.composerReceipt.operation ? { operation: nextSnapshot.composerReceipt.operation } : {}),
+        ...(nextSnapshot.composerReceipt.retryable !== undefined
+          ? { retryable: nextSnapshot.composerReceipt.retryable }
+          : {}),
+      }
+      const nextThread = nextSnapshot.threads.find((thread) => thread.id === nextSnapshot.selectedThreadId)
+      if (nextThread && nextReceipt.state === 'idle') {
+        // Native proof/reconciliation has reached an authoritative idle state
+        // for this exact host/thread. Retire either local Run or Stop tail so a
+        // deferred IPC resolve/reject cannot reclaim the composer afterward.
+        latestComposerActionsRef.current.delete(composerActionAuthorityKey(nextThread.hostId, nextThread))
+      }
+      const latestAction = nextThread
+        ? latestComposerActionsRef.current.get(composerActionAuthorityKey(nextThread.hostId, nextThread))
+        : undefined
+      setComposerReceipt((current) =>
+        latestAction?.operation === 'abort' && nextReceipt.operation === 'prompt'
+          ? current
+          : nextReceipt,
+      )
+    }
     void api
       .loadWorkbench()
       .then((nextSnapshot) => {
         if (cancelled) return
-        setSnapshot(nextSnapshot)
-        setSelectedProjectId(nextSnapshot.selectedProjectId)
-        setSelectedThreadId(nextSnapshot.selectedThreadId)
-        setComposerReceipt({
-          state: nextSnapshot.composerReceipt.state,
-          message: nextSnapshot.composerReceipt.message ?? '',
-        })
+        applySnapshot(nextSnapshot)
       })
       .catch((error: unknown) => {
         if (!cancelled) setLoadError(error instanceof Error ? error.message : 'Unable to load the workbench.')
@@ -404,13 +506,7 @@ export default function App({ api: suppliedApi }: AppProps) {
 
     const unsubscribe = api.subscribe?.((nextSnapshot) => {
       if (!cancelled) {
-        setSnapshot(nextSnapshot)
-        setSelectedProjectId(nextSnapshot.selectedProjectId)
-        setSelectedThreadId(nextSnapshot.selectedThreadId)
-        setComposerReceipt({
-          state: nextSnapshot.composerReceipt.state,
-          message: nextSnapshot.composerReceipt.message ?? '',
-        })
+        applySnapshot(nextSnapshot)
       }
     })
     return () => {
@@ -427,7 +523,9 @@ export default function App({ api: suppliedApi }: AppProps) {
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
-  const canSubmitCommands = snapshot?.operations.submitCommands ?? false
+  const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
+  const canStartResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.startResidentTurn ?? false)
+  const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   const canLoadModelCatalog = snapshot?.operations.modelCatalog ?? false
   activeHostIdRef.current = selectedHost?.id
@@ -444,10 +542,7 @@ export default function App({ api: suppliedApi }: AppProps) {
         current.state === 'idle' ? { state: 'waiting_for_connection', message: 'Waiting for connection' } : current,
       )
     }
-    if (composerMode === 'steer' && (selectedHost.connection !== 'online' || selectedThread.status !== 'running')) {
-      setComposerMode('follow_up')
-    }
-  }, [composerMode, selectedHost, selectedThread])
+  }, [selectedHost, selectedThread])
 
   const selectThread = (thread: ThreadSummary) => {
     const requestId = ++threadSelectionRequestRef.current
@@ -458,7 +553,7 @@ export default function App({ api: suppliedApi }: AppProps) {
     const host = snapshot?.hosts.find((candidate) => candidate.id === thread.hostId)
     setComposerReceipt(
       host?.connection === 'online'
-        ? { state: 'idle', message: 'Ready to send' }
+        ? { state: 'idle', message: 'Ready for a new prompt' }
         : { state: 'waiting_for_connection', message: 'Waiting for connection' },
     )
     setSidebarOpen(false)
@@ -519,10 +614,13 @@ export default function App({ api: suppliedApi }: AppProps) {
   const submitComposer = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!snapshot || !selectedThread || !selectedHost) return
-    if (!canSubmitCommands) {
+    if (!canStartResidentTurn || selectedHost.connection !== 'online') {
       setComposerReceipt({
         state: 'rejected',
-        message: 'Prime Agent isn’t attached to this host, so commands are unavailable.',
+        operation: 'prompt',
+        message: selectedHost.connection === 'online'
+          ? 'This resident session is not ready for a new prompt. Refresh the thread and try again.'
+          : `Reconnect to ${selectedHost.name} before running a prompt.`,
       })
       return
     }
@@ -536,47 +634,95 @@ export default function App({ api: suppliedApi }: AppProps) {
       return
     }
     setComposerValidationError('')
-    const effectiveComposerMode = selectedThread.status === 'running' ? composerMode : 'follow_up'
-    if (effectiveComposerMode === 'steer' && selectedHost.connection !== 'online') {
-      setComposerReceipt({ state: 'rejected', message: `Reconnect to ${selectedHost.name} before steering this turn.` })
-      return
-    }
-
-    const sendWhenReconnected = selectedHost.connection !== 'online'
     const submissionHostId = selectedHost.id
     const submissionThreadId = selectedThread.id
     const submissionAuthorityGeneration = composerAuthorityGenerationRef.current
     const submittedDraft = composerText
+    const actionKey = composerActionAuthorityKey(submissionHostId, selectedThread)
+    const actionSequence = ++composerActionSequenceRef.current
+    latestComposerActionsRef.current.set(actionKey, { sequence: actionSequence, operation: 'prompt' })
     setComposerReceipt({
-      state: sendWhenReconnected ? 'waiting_for_connection' : 'sending',
-      message: sendWhenReconnected ? 'Saving to this device’s outbox…' : `Sending to ${selectedHost.name}…`,
+      state: 'sending',
+      message: `Starting Prime Agent on ${selectedHost.name}…`,
+      operation: 'prompt',
     })
 
     try {
       const receipt = await api.sendComposer({
         threadId: selectedThread.id,
         text,
-        intent: effectiveComposerMode,
-        sendWhenReconnected,
       })
       if (
         activeHostIdRef.current !== submissionHostId ||
         activeThreadIdRef.current !== submissionThreadId ||
         composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
       ) return
-      setComposerReceipt(receipt)
-      if (receipt.state === 'rejected') return
-      setComposerText((current) => current === submittedDraft ? '' : current)
+      if (receipt.state !== 'rejected') {
+        setComposerText((current) => current === submittedDraft ? '' : current)
+      }
+      if (latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence) return
+      setComposerReceipt({ ...receipt, operation: 'prompt' })
     } catch (error) {
       if (
         isStaleHostAuthorityError(error) ||
         activeHostIdRef.current !== submissionHostId ||
         activeThreadIdRef.current !== submissionThreadId ||
-        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
+        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration ||
+        latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence
       ) return
       setComposerReceipt({
         state: 'uncertain',
-        message: error instanceof Error ? `${error.message} Reconciling by command ID.` : 'Receipt uncertain. Reconciling by command ID.',
+        operation: 'prompt',
+        message: error instanceof Error
+          ? `${error.message} Prime Agent will not replay this prompt without proof.`
+          : 'Prompt outcome unknown · Prime Agent will not replay it without proof.',
+      })
+    }
+  }
+
+  const stopResidentTurn = async () => {
+    if (!snapshot || !selectedThread || !selectedHost) return
+    if (!canStopResidentTurn || selectedHost.connection !== 'online') {
+      setComposerReceipt({
+        state: 'rejected',
+        operation: 'abort',
+        message: selectedHost.connection === 'online'
+          ? 'Prime Agent does not report an active resident turn that can be stopped.'
+          : `Reconnect to ${selectedHost.name} before stopping this turn.`,
+      })
+      return
+    }
+    const submissionHostId = selectedHost.id
+    const submissionThreadId = selectedThread.id
+    const submissionAuthorityGeneration = composerAuthorityGenerationRef.current
+    const actionKey = composerActionAuthorityKey(submissionHostId, selectedThread)
+    const actionSequence = ++composerActionSequenceRef.current
+    latestComposerActionsRef.current.set(actionKey, { sequence: actionSequence, operation: 'abort' })
+    setComposerReceipt({ state: 'sending', message: `Requesting a safe stop on ${selectedHost.name}…`, operation: 'abort' })
+    try {
+      const receipt = await api.abortThread(selectedThread.id)
+      if (
+        activeHostIdRef.current !== submissionHostId ||
+        activeThreadIdRef.current !== submissionThreadId ||
+        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration ||
+        latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence
+      ) return
+      setComposerReceipt({ ...receipt, operation: 'abort' })
+    } catch (error) {
+      if (
+        isStaleHostAuthorityError(error) ||
+        activeHostIdRef.current !== submissionHostId ||
+        activeThreadIdRef.current !== submissionThreadId ||
+        composerAuthorityGenerationRef.current !== submissionAuthorityGeneration ||
+        latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence
+      ) return
+      setComposerReceipt({
+        state: 'uncertain',
+        operation: 'abort',
+        retryable: false,
+        message: error instanceof Error
+          ? `${error.message} Prime Agent will not replay this stop request without proof.`
+          : 'Stop outcome unknown · Prime Agent will not replay this request without proof.',
       })
     }
   }
@@ -615,8 +761,8 @@ export default function App({ api: suppliedApi }: AppProps) {
           <h1>{snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet'}</h1>
           <p>
             {snapshot.projects.length > 0
-              ? 'Start a thread after the host finishes loading this project catalog.'
-              : 'Add an SSH computer, or connect the local host service, to open projects and start durable threads.'}
+              ? 'Thread creation is not available in this build. Open a durable thread already projected by a verified host.'
+              : 'Connect a configured host to inspect its existing projects and durable threads. First-session creation is not available in this build.'}
           </p>
           <button
             ref={addComputerTriggerRef}
@@ -836,8 +982,6 @@ export default function App({ api: suppliedApi }: AppProps) {
           hostName={selectedHost.name}
           taskState={selectedThread.status}
           runtime={selectedRuntime}
-          mode={composerMode}
-          onModeChange={setComposerMode}
           text={composerText}
           onTextChange={(nextText) => {
             setComposerText(nextText)
@@ -845,13 +989,15 @@ export default function App({ api: suppliedApi }: AppProps) {
           }}
           validationError={composerValidationError}
           receipt={composerReceipt}
-          canSubmit={canSubmitCommands}
+          canStartTurn={canStartResidentTurn}
+          canStopTurn={canStopResidentTurn}
           modelCatalogAvailable={canLoadModelCatalog}
           onOpenModelCatalog={(trigger) => {
             modelsDialogTriggerRef.current = trigger
             setModelsOpen(true)
           }}
           onSubmit={submitComposer}
+          onStop={() => void stopResidentTurn()}
         />
       </main>
 
@@ -917,7 +1063,11 @@ export default function App({ api: suppliedApi }: AppProps) {
         }}
         onFocusComposer={() => {
           setCommandPaletteOpen(false)
-          window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('#thread-composer')?.focus())
+          window.requestAnimationFrame(() => {
+            const composer = document.querySelector<HTMLTextAreaElement>('#thread-composer')
+            if (composer && !composer.disabled) composer.focus()
+            else document.querySelector<HTMLButtonElement>('#resident-turn-primary')?.focus()
+          })
         }}
       />
 
@@ -1117,7 +1267,7 @@ function Sidebar({
             {snapshot.attention.map((item) => {
               const thread = snapshot.threads.find((candidate) => candidate.id === item.threadId)
               return (
-                <li key={item.id}>
+                <li key={item.id} className={cx(item.diagnostic && 'attention-list__item--diagnostic')}>
                   <button type="button" onClick={() => thread && onSelectThread(thread)}>
                     <span className="attention-list__icon">
                       <Icon icon={item.kind === 'approval' ? ShieldCheck : item.kind === 'question' ? MessageSquare : AlertCircle} size={15} />
@@ -1125,8 +1275,10 @@ function Sidebar({
                     <span>
                       <strong>{item.title}</strong>
                       <small>{item.hostName}</small>
+                      <AttentionDiagnostic item={item} />
                     </span>
                   </button>
+                  <AttentionDiagnosticCopy item={item} />
                 </li>
               )
             })}
@@ -1382,16 +1534,16 @@ interface ComposerProps {
   hostName: string
   taskState: TaskState
   runtime: RuntimeSummary
-  mode: 'follow_up' | 'steer'
-  onModeChange: (mode: 'follow_up' | 'steer') => void
   text: string
   onTextChange: (value: string) => void
   validationError: string
-  receipt: { state: ComposerReceiptState; message: string }
-  canSubmit: boolean
+  receipt: ComposerReceiptView
+  canStartTurn: boolean
+  canStopTurn: boolean
   modelCatalogAvailable: boolean
   onOpenModelCatalog: (trigger: HTMLElement) => void
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
+  onStop: () => void
 }
 
 function SessionContinuity({
@@ -1458,79 +1610,164 @@ function SessionContinuity({
   )
 }
 
-function Composer({ connection, hostName, taskState, runtime, mode, onModeChange, text, onTextChange, validationError, receipt, canSubmit, modelCatalogAvailable, onOpenModelCatalog, onSubmit }: ComposerProps) {
+function Composer({ connection, hostName, taskState, runtime, text, onTextChange, validationError, receipt, canStartTurn, canStopTurn, modelCatalogAvailable, onOpenModelCatalog, onSubmit, onStop }: ComposerProps) {
   const disconnected = connection !== 'online'
-  const effectiveMode = taskState === 'running' ? mode : 'follow_up'
-  const unavailableCopy = 'Prime Agent isn’t attached to this host, so commands are unavailable.'
-  const submitLabel = !canSubmit
-    ? 'Commands unavailable'
+  const projectionReportsRunning = taskState === 'running'
+  const promptSending = receipt.operation === 'prompt' && receipt.state === 'sending'
+  const promptAwaitingProof = receipt.operation === 'prompt' && receipt.state === 'sent'
+  const promptOutcomeUnknown = receipt.operation === 'prompt' && receipt.state === 'uncertain'
+  const stopSending = receipt.operation === 'abort' && receipt.state === 'sending'
+  const stopAwaitingProof = receipt.operation === 'abort' && receipt.state === 'sent'
+  const abortControlPending = Boolean(
+    receipt.operation === 'abort' &&
+    (receipt.state === 'sending' || receipt.state === 'sent' || receipt.state === 'uncertain'),
+  )
+  const promptControlPending = promptAwaitingProof || promptOutcomeUnknown
+  const residentControlPending = abortControlPending || promptControlPending
+  const running = projectionReportsRunning || canStopTurn || residentControlPending
+  const residentAttached = runtime.session?.residency === 'resident' && Boolean(runtime.session.activeSessionId && runtime.session.sessionId)
+  const canStartNow = canStartTurn && !disconnected
+  const canStopNow = canStopTurn && !disconnected
+  const retryingStop = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable !== false
+  const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
+  const canAct = running ? canStopNow : canStartNow
+  const unavailableCopy = disconnected
+    ? residentControlPending
+      ? `Resident control is retained locally. Reconnect to ${hostName} for authoritative status.`
+      : `Reconnect to ${hostName} to verify this resident turn.`
+    : !residentAttached
+      ? 'Resident control is unavailable until this host reports an existing attached Prime Agent session.'
+      : running
+        ? 'Prime Agent does not report a stoppable active turn.'
+        : 'This resident session is not ready for a new prompt.'
+  const defaultStatus = disconnected
+    ? residentControlPending
+      ? `Resident control retained · reconnect to ${hostName} for authoritative status`
+      : projectionReportsRunning
+        ? `Last reported running on ${hostName} · current status unverified`
+        : unavailableCopy
+    : running
+    ? !projectionReportsRunning && receipt.operation === 'prompt'
+      ? 'Prompt accepted · waiting for authoritative resident activity'
+      : canStopNow
+      ? 'Prime Agent is working · Stop requests a safe boundary'
+      : 'Waiting for authoritative resident activity'
+    : canStartTurn
+      ? 'Ready for a new prompt'
+      : unavailableCopy
+  const receiptStatusCopy = receipt.operation && receipt.state !== 'idle'
+    ? receipt.message || defaultStatus
     : disconnected
-      ? 'Send when reconnected'
-      : effectiveMode === 'steer'
-        ? 'Steer next step'
-        : 'Send follow-up'
-  const receiptStatusCopy = canSubmit ? (receipt.message || (disconnected ? 'Waiting for connection' : 'Ready to send')) : unavailableCopy
+      ? defaultStatus
+      : receipt.message || defaultStatus
   const statusCopy = validationError || receiptStatusCopy
-  const statusState = validationError ? 'rejected' : canSubmit ? receipt.state : 'rejected'
+  const statusState = validationError || receipt.state === 'rejected'
+    ? 'rejected'
+    : receipt.state === 'idle' && !canAct
+      ? 'waiting_for_connection'
+      : receipt.state
+  const primaryLabel = running
+    ? stopOutcomeUnknown
+      ? 'Outcome unknown'
+      : disconnected
+      ? 'Reconnect to verify'
+      : stopSending
+      ? 'Requesting stop'
+      : stopAwaitingProof
+        ? 'Stop accepted'
+      : retryingStop
+        ? 'Try stop again'
+        : 'Stop'
+    : promptSending
+      ? 'Submitting prompt'
+      : disconnected
+      ? 'Reconnect to run'
+      : 'Run prompt'
+  const compactComposer = running
+  const textareaDisabled = !canStartNow
+  const intentCopy = stopOutcomeUnknown
+    ? 'Stop outcome unknown'
+    : retryingStop
+      ? 'Stop outcome uncertain'
+      : stopSending
+        ? 'Requesting safe stop'
+        : stopAwaitingProof
+          ? 'Stop accepted'
+          : promptOutcomeUnknown
+            ? 'Prompt outcome uncertain'
+            : promptSending
+              ? 'Admitting resident prompt'
+              : promptAwaitingProof
+                ? 'Prompt owned by Prime Agent'
+                : running
+                  ? disconnected
+                    ? 'Resident status unverified'
+                    : projectionReportsRunning
+                      ? 'Active resident turn'
+                      : 'Resident turn owned'
+                  : 'New resident prompt'
 
   return (
-    <footer className="composer-wrap">
+    <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
       <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
-      <form className="composer" onSubmit={onSubmit} aria-label="Message composer" aria-disabled={!canSubmit}>
+      <form
+        className={cx('composer', compactComposer && 'composer--compact', running && 'composer--running')}
+        onSubmit={(event) => {
+          if (promptSending) {
+            event.preventDefault()
+            return
+          }
+          onSubmit(event)
+        }}
+        aria-label="Prime Agent prompt"
+        aria-disabled={!canAct || promptSending}
+        aria-busy={promptSending || stopSending ? true : undefined}
+      >
         <div className="composer__toolbar">
-          {taskState === 'running' ? (
-            <div className="mode-control" aria-label="Message intent">
-              <button
-                type="button"
-                aria-pressed={effectiveMode === 'follow_up'}
-                disabled={!canSubmit}
-                onClick={() => onModeChange('follow_up')}
-              >
-                Follow up
-              </button>
-              <button
-                type="button"
-                aria-pressed={effectiveMode === 'steer'}
-                disabled={!canSubmit || disconnected}
-                title={!canSubmit ? unavailableCopy : disconnected ? `Reconnect to ${hostName} to steer the running turn` : 'Deliver after the current tool calls finish'}
-                onClick={() => onModeChange('steer')}
-              >
-                Steer next step
-              </button>
-            </div>
-          ) : <span className="composer__intent">Follow up</span>}
+          <span className="composer__intent">
+            {intentCopy}
+          </span>
           <span className={cx(
             'composer__connection',
             `composer__connection--${statusState}`,
             Boolean(validationError) && 'composer__connection--validation',
           )}>
-            {canSubmit && !validationError && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
-            {canSubmit && !validationError && receipt.state === 'waiting_for_connection' && <Icon icon={Clock3} size={13} />}
-            {canSubmit && !validationError && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
-            {canSubmit && !validationError && receipt.state === 'uncertain' && <Icon icon={RefreshCw} size={13} />}
-            {(!canSubmit || Boolean(validationError) || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
+            {!validationError && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
+            {!validationError && (receipt.state === 'waiting_for_connection' || (receipt.state === 'idle' && !canAct)) && <Icon icon={Clock3} size={13} />}
+            {!validationError && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
+            {!validationError && receipt.state === 'uncertain' && receipt.retryable !== false && <Icon icon={RefreshCw} size={13} />}
+            {!validationError && receipt.state === 'uncertain' && receipt.retryable === false && <Icon icon={AlertCircle} size={13} />}
+            {(Boolean(validationError) || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
             <span id={validationError ? 'composer-message-error' : undefined}>{statusCopy}</span>
           </span>
         </div>
 
-        <label className="sr-only" htmlFor="thread-composer">Message</label>
-        <textarea
-          id="thread-composer"
-          name="message"
-          value={text}
-          rows={2}
-          placeholder={canSubmit ? 'Ask Prime Agent to continue…' : 'Attach Prime Agent to send commands'}
-          disabled={!canSubmit}
-          onChange={(event) => onTextChange(event.target.value)}
-          onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
-            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-              event.preventDefault()
-              event.currentTarget.form?.requestSubmit()
-            }
-          }}
-          aria-invalid={validationError ? 'true' : undefined}
-          aria-describedby={validationError ? 'composer-hint composer-message-error' : 'composer-hint composer-status'}
-        />
+        {!compactComposer && (
+          <>
+            <label className="sr-only" htmlFor="thread-composer">Message</label>
+            <textarea
+              id="thread-composer"
+              name="message"
+              value={text}
+              rows={2}
+              placeholder={disconnected
+                ? 'Reconnect to verify this resident session'
+                : canStartNow
+                  ? 'Ask Prime Agent to build, inspect, or fix…'
+                  : 'Resident prompt unavailable'}
+              disabled={textareaDisabled}
+              onChange={(event) => onTextChange(event.target.value)}
+              onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+                if (!promptSending && (event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                  event.preventDefault()
+                  event.currentTarget.form?.requestSubmit()
+                }
+              }}
+              aria-invalid={validationError ? 'true' : undefined}
+              aria-describedby={validationError ? 'composer-hint composer-message-error' : 'composer-hint composer-status'}
+            />
+          </>
+        )}
 
         <div className="composer__actions">
           <div className="composer__secondary-actions">
@@ -1546,16 +1783,51 @@ function Composer({ connection, hostName, taskState, runtime, mode, onModeChange
                 <Icon icon={ChevronDown} size={13} />
               </button>
             )}
-            <span className="composer__hint" id="composer-hint">{canSubmit ? 'Ctrl or ⌘ + Enter to send' : 'Connect this host to Prime Agent to enable commands'}</span>
+            <span className="composer__hint" id="composer-hint">
+              {running
+                ? disconnected
+                  ? unavailableCopy
+                  : 'Stop asks Prime Agent to end at the next safe boundary'
+                : canStartNow
+                  ? 'Ctrl or ⌘ + Enter to run'
+                  : unavailableCopy}
+            </span>
           </div>
           <div className="composer__primary-actions">
             <button
-              className={cx('button', 'button--primary', !text.trim() && 'button--empty')}
-              type="submit"
-              disabled={!canSubmit || receipt.state === 'sending'}
+              id="resident-turn-primary"
+              className={cx(
+                'button',
+                running ? 'button--stop' : 'button--primary',
+                !running && !text.trim() && 'button--empty',
+              )}
+              type={running ? 'button' : 'submit'}
+              disabled={running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending}
+              aria-label={running
+                ? disconnected
+                  ? 'Reconnect to verify and control this resident turn'
+                  : stopOutcomeUnknown
+                  ? 'Stop outcome unknown; inspect the current thread state'
+                  : stopSending
+                    ? 'Safe Stop request is being sent'
+                    : stopAwaitingProof
+                      ? 'Stop accepted; waiting for authoritative idle proof'
+                  : retryingStop
+                    ? 'Try stopping the active Prime Agent turn again'
+                    : 'Stop the active Prime Agent turn'
+                : promptSending
+                  ? 'Prompt is awaiting durable host admission'
+                  : undefined}
+              onClick={running ? onStop : undefined}
             >
-              {receipt.state === 'sending' ? <Icon icon={Loader2} size={15} /> : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
-              {submitLabel}
+              {stopSending || promptSending
+                ? <Icon icon={Loader2} size={15} />
+                : stopAwaitingProof
+                  ? <Icon icon={Check} size={15} />
+                : running
+                  ? <Icon icon={Square} size={13} strokeWidth={2.25} />
+                  : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
+              {primaryLabel}
             </button>
           </div>
         </div>
@@ -2200,11 +2472,13 @@ function CommandPaletteDialog({
     })),
     ...(snapshot.operations.submitCommands ? [{
       id: 'command:composer',
-      label: 'Focus message composer',
-      detail: 'Write a follow-up or steer the running thread',
+      label: snapshot.operations.stopResidentTurn ? 'Focus active turn controls' : 'Focus prompt composer',
+      detail: snapshot.operations.stopResidentTurn
+        ? 'Review or stop the active resident Prime Agent turn'
+        : 'Write a new prompt for the resident Prime Agent session',
       group: 'Commands' as const,
       icon: Command,
-      keywords: 'message prompt compose send steer follow up',
+      keywords: 'message prompt compose run stop abort resident',
       run: onFocusComposer,
     }] : []),
     {
@@ -2640,14 +2914,19 @@ function CompanionPreview({
                 {actionableAttention.map((item) => {
                   const thread = snapshot.threads.find((candidate) => candidate.id === item.threadId)
                   return (
-                    <li key={item.id}>
+                    <li key={item.id} className={cx(item.diagnostic && 'companion-card-list__item--diagnostic')}>
                       <button type="button" onClick={() => thread && openThread(thread)}>
                         <span className={cx('companion-card-list__icon', `companion-card-list__icon--${item.kind}`)}>
                           <Icon icon={item.kind === 'approval' ? ShieldCheck : item.kind === 'question' ? MessageSquare : AlertCircle} size={17} />
                         </span>
-                        <span><strong>{item.title}</strong><small>{thread?.title ?? 'Unknown thread'} · {item.hostName}</small></span>
+                        <span>
+                          <strong>{item.title}</strong>
+                          <small>{thread?.title ?? 'Unknown thread'} · {item.hostName}</small>
+                          <AttentionDiagnostic item={item} />
+                        </span>
                         <Icon icon={ChevronRight} size={16} />
                       </button>
+                      <AttentionDiagnosticCopy item={item} />
                     </li>
                   )
                 })}
@@ -3074,7 +3353,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                     <span className={cx('provider-rail__icon', provider.configured && 'provider-rail__icon--ready')}>
                       <Icon icon={provider.configured ? CheckCircle2 : LockKeyhole} size={15} />
                     </span>
-                    <span><strong>{provider.displayName}</strong><small>{provider.configured ? 'Configured' : provider.oauthSupported ? 'OAuth available' : 'Setup required'}</small></span>
+                    <span><strong>{provider.displayName}</strong><small>{provider.configured ? 'Configured' : provider.oauthSupported ? 'Supports OAuth' : 'Setup required'}</small></span>
                     <span className="provider-rail__count tabular">{provider.availableModelCount}/{provider.modelCount}</span>
                   </button>
                 ))}
@@ -3103,7 +3382,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                     <p>
                       {isPreview
                         ? <>In the native app, run <code>/login</code> on the connected Prime Agent host. This sample never reads or stores credentials.</>
-                        : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credentials remain on that host; Continuim only reads secret-free status.</>}
+                        : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim's host protocol and renderer.</>}
                     </p>
                   </div>
                 </div>

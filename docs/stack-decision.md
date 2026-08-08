@@ -57,12 +57,6 @@ Screen readers receive summarized lifecycle/attention announcements, never token
 
 ## Release boundary
 
-Keeping the stack does not make the current build production-ready. A Continuim developer preview needs a public-surface resident adapter plus these proofs:
+Keeping the stack does not make the current build production-ready. The existing-binding development checkpoint now uses the pinned public resident surface, survives detach/relaunch and hostd restart in focused tests, fails closed on compatibility drift, and completes acknowledged Prompt/Stop ownership only after operation-specific idle proof. RPC remains a foreground diagnostic path because it owns the session it creates.
 
-1. close the app while a session runs and verify the daemon session continues;
-2. relaunch and reattach to the same active session;
-3. restart hostd without completing the resident session;
-4. fail fast on app/protocol/schema/capability mismatch; and
-5. complete a session only through an explicit end-session action.
-
-Until those pass, RPC is a foreground diagnostic path and the UI must not promise background continuity, phone control, pairing, relay, handoff, or local Windows execution.
+Production still requires crash-safe first-session provisioning, per-binding readiness and quarantine, packaged real-binding prompt/Stop/restart E2E, recovery through verified session rotation for genuinely uncertain mutations, and an explicit end-session lifecycle. Until those pass, the UI must not promise out-of-box background continuity, phone control, pairing, relay, handoff, or production-authorized local Windows execution.

@@ -1,0 +1,87 @@
+import { spawn } from 'node:child_process'
+import { readFile, rm } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import electronPath from 'electron'
+
+const scriptDirectory = dirname(fileURLToPath(import.meta.url))
+const captureScript = join(scriptDirectory, 'capture-renderer-preview.cjs')
+const outputDirectory = join(scriptDirectory, '..', 'out', 'visual-qa')
+const resultPath = join(outputDirectory, 'capture-result.json')
+const errorPath = join(outputDirectory, 'capture-error.txt')
+const environment = { ...process.env }
+const expectedTargets = [
+  ['desktop-idle', 1600, 1000, 'idle', undefined],
+  ['desktop-prompt-admission', 1200, 800, 'prompt-admission', undefined],
+  ['desktop-prompt-proof-390', 390, 844, 'prompt-awaiting-idle-proof', undefined],
+  ['desktop-stop-proof-390', 390, 844, 'stop-awaiting-idle-proof', undefined],
+  ['desktop-uncertain-320', 320, 704, 'nonretryable-uncertainty', undefined],
+  ['companion-attention-390', 390, 844, 'nonretryable-uncertainty', 'companion'],
+  ['companion-attention-320', 320, 704, 'nonretryable-uncertainty', 'companion'],
+]
+const obsoleteCaptures = [
+  'desktop.png',
+  'desktop-390.png',
+  'desktop-320.png',
+  'companion-390.png',
+  'companion-320.png',
+]
+
+// Electron's RunAsNode mode is required by the packaged hostd launcher, but a
+// developer shell can retain it after a runtime smoke. Visual capture must use
+// the real Electron main process regardless of that ambient state.
+delete environment.ELECTRON_RUN_AS_NODE
+
+await Promise.all([
+  rm(resultPath, { force: true }),
+  rm(errorPath, { force: true }),
+  ...obsoleteCaptures.map((name) => rm(join(outputDirectory, name), { force: true })),
+])
+
+const child = spawn(electronPath, [captureScript], {
+  env: environment,
+  stdio: 'inherit',
+  windowsHide: true,
+})
+
+const exitCode = await new Promise((resolve, reject) => {
+  child.once('error', reject)
+  child.once('exit', (code, signal) => {
+    if (signal) reject(new Error(`Renderer visual capture exited from signal ${signal}`))
+    else resolve(code ?? 1)
+  })
+})
+
+let captureError
+try {
+  captureError = await readFile(errorPath, 'utf8')
+} catch {}
+if (captureError) throw new Error(`Renderer visual capture failed:\n${captureError.trim()}`)
+
+let results
+try {
+  results = JSON.parse(await readFile(resultPath, 'utf8'))
+} catch (error) {
+  throw new Error(`Renderer visual capture did not produce a result manifest (Electron exit ${exitCode}): ${error instanceof Error ? error.message : String(error)}`)
+}
+if (!Array.isArray(results) || results.length !== expectedTargets.length) {
+  throw new Error('Renderer visual capture returned an incomplete target set')
+}
+for (const [name, width, height, visualState, surface] of expectedTargets) {
+  const result = results.find((candidate) => candidate?.name === name)
+  if (
+    !result ||
+    result.width !== width ||
+    result.height !== height ||
+    result.visualState !== visualState ||
+    result.surface !== surface ||
+    result.stateEvidence?.expectedTextPresent !== true ||
+    (name.startsWith('desktop-') && name !== 'desktop-idle' && result.stateEvidence?.composerStatusVisible !== true)
+  ) {
+    throw new Error(`Renderer visual capture returned invalid evidence for ${name}`)
+  }
+  process.stdout.write(
+    `${result.name}: ${result.width}x${result.height} · no horizontal overflow · ${result.outputPath}\n`,
+  )
+}
+if (exitCode !== 0) process.exitCode = exitCode

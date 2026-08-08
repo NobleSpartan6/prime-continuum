@@ -51,7 +51,11 @@ describe('renderer style contracts', () => {
     expect(css).toMatch(/\.transcript-jump__button\s*{[^}]*min-inline-size:\s*0;[^}]*max-inline-size:\s*100%;[^}]*white-space:\s*normal;/s)
     expect(minimumLayout).toMatch(/\.topbar__leading \.brand-mark\s*{[^}]*display:\s*none;/s)
     expect(minimumLayout).toMatch(/\.composer__hint\s*{[^}]*display:\s*none;/s)
+    expect(compactMinimumLayout).toMatch(/\.composer--compact \.composer__connection\s*{[^}]*display:\s*inline-flex;/s)
     expect(compactMinimumLayout).toMatch(/\.composer__connection--validation\s*{[^}]*display:\s*inline-flex;/s)
+    expect(css).toMatch(/\.composer--compact\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;/s)
+    expect(css).toMatch(/\.composer-wrap--compact \.session-continuity\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
+    expect(css).toMatch(/\.companion-card-list strong\s*{[^}]*-webkit-line-clamp:\s*2;[^}]*line-clamp:\s*2;/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {
@@ -66,5 +70,7 @@ describe('renderer style contracts', () => {
     expect(motionStyles).toMatch(/dialog\.sheet\[open\]\s*{[^}]*animation:\s*sheet-enter/s)
     expect(motionStyles).toMatch(/\.model-chip:active:not\(:disabled\)\s*{[^}]*scale:\s*0\.96;/s)
     expect(motionStyles).toMatch(/\.models-loading > svg\s*{[^}]*animation:\s*spin/s)
+    expect(motionStyles).toContain('.composer__connection--uncertain svg.lucide-refresh-cw')
+    expect(motionStyles).not.toMatch(/\.composer__connection--uncertain svg,/)
   })
 })
