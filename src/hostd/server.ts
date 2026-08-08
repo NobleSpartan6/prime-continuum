@@ -180,6 +180,11 @@ export async function serveLocalSocket(options: {
     startSession(socket);
   });
   server.maxConnections = MAX_HOST_CONNECTIONS;
+  // Node automatically unlinks the pathname passed to server.listen() when a
+  // Unix-domain server closes. Listen on a private staging name and publish it
+  // by atomic rename so Node never owns cleanup authority for the canonical
+  // pathname; Prime's inode-checked removal below remains the sole remover.
+  const listenEndpoint = process.platform === "win32" ? endpoint : stagedUnixEndpoint(endpoint);
   let ownedSocketIdentity: SocketFileIdentity | undefined;
   let shutdownStarted = false;
   let fatalOwnershipError: Error | undefined;
@@ -249,10 +254,11 @@ export async function serveLocalSocket(options: {
   };
 
   try {
-    await listen(server, endpoint);
+    await listen(server, listenEndpoint);
     if (process.platform !== "win32") {
-      await chmod(endpoint, 0o600);
-      ownedSocketIdentity = await readSocketIdentity(endpoint);
+      await chmod(listenEndpoint, 0o600);
+      ownedSocketIdentity = await readSocketIdentity(listenEndpoint);
+      await rename(listenEndpoint, endpoint);
       await options.beforePostListenOwnershipProof?.();
       await unixOwnership?.assertOwned();
     }
@@ -886,6 +892,10 @@ export function validateLocalEndpoint(endpoint: string, dataDir: string): string
     throw new Error("Unix hostd socket must be contained in the user-owned host data directory");
   }
   return resolved;
+}
+
+function stagedUnixEndpoint(endpoint: string): string {
+  return join(dirname(endpoint), `.p-${randomBytes(4).toString("hex")}`);
 }
 
 async function removeStaleOwnedSocket(endpoint: string): Promise<void> {

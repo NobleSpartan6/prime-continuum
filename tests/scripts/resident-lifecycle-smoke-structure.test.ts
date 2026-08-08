@@ -194,7 +194,7 @@ describe('resident lifecycle smoke structure', () => {
 
   it('detects the missing node:net import that makes readiness time out', () => {
     const regressedPath = resolve(temporaryRoot, 'missing-node-net-import.mjs')
-    const regressedSource = smokeSource.replace('import { createConnection } from "node:net";\n', '')
+    const regressedSource = smokeSource.replace(/import \{ createConnection \} from "node:net";\r?\n/, '')
     expect(regressedSource).not.toBe(smokeSource)
     writeFileSync(regressedPath, regressedSource, { encoding: 'utf8', mode: 0o600 })
 

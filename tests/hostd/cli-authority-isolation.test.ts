@@ -1,5 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { stderr, stdout } from "node:process";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +9,7 @@ import { defaultLocalEndpoint, getHostDataPaths } from "../../src/hostd/paths";
 import { serveLocalSocket } from "../../src/hostd/server";
 import { HostService } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 
 const temporaryDirectories: string[] = [];
@@ -21,7 +21,7 @@ afterEach(async () => {
 
 describe("hostd CLI authority isolation", () => {
   it("keeps probe filesystem-read-only when the host data directory does not exist", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "prime-hostd-cli-read-only-probe-"));
+    const parent = await canonicalTemporaryDirectory("prime-hostd-cli-read-only-probe-");
     temporaryDirectories.push(parent);
     const directory = join(parent, "missing-host-data");
     const output = captureStdout();
@@ -36,7 +36,7 @@ describe("hostd CLI authority isolation", () => {
   });
 
   it("reads a live recent-project catalog without initializing a competing store", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-live-probe-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-cli-live-probe-");
     temporaryDirectories.push(directory);
     const store = new HostStore(directory);
     const service = new HostService(store);
@@ -65,7 +65,7 @@ describe("hostd CLI authority isolation", () => {
   });
 
   it("rejects the removed fixture mode without touching a live service", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-removed-mode-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-cli-removed-mode-");
     temporaryDirectories.push(directory);
     const store = new HostStore(directory);
     const service = new HostService(store);
@@ -93,7 +93,7 @@ describe("hostd CLI authority isolation", () => {
   it.skipIf(process.platform !== "win32")(
     "collapses a junction alias before two serve contenders acquire endpoint ownership",
     async () => {
-      const parent = await mkdtemp(join(tmpdir(), "prime-hostd-cli-junction-contender-"));
+      const parent = await canonicalTemporaryDirectory("prime-hostd-cli-junction-contender-");
       temporaryDirectories.push(parent);
       const physicalDirectory = join(parent, "physical");
       const junctionDirectory = join(parent, "junction");
@@ -144,7 +144,7 @@ describe("hostd CLI authority isolation", () => {
   );
 
   it("does not initialize or cancel live pairing state during probe", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-cli-authority-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-cli-authority-");
     temporaryDirectories.push(directory);
     const stateFile = getHostDataPaths(directory).pairingAuthority;
     const authority = new PairingAuthority(stateFile, { allowTestTicketIds: true });

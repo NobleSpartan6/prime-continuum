@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { canonicalTemporaryDirectory } from '../helpers/canonical-temp'
 import {
   ElectronRuntimeSetupError,
   ensureElectronRuntime,
@@ -26,6 +26,7 @@ describe('Electron development runtime bootstrap', () => {
     const result = await ensureElectronRuntime({
       electronPackageDirectory,
       platform: 'win32',
+      arch: 'x64',
       log: (message) => messages.push(message)
     })
 
@@ -48,6 +49,7 @@ describe('Electron development runtime bootstrap', () => {
     const result = await ensureElectronRuntime({
       electronPackageDirectory,
       platform: 'win32',
+      arch: 'x64',
       log: () => undefined
     })
 
@@ -66,6 +68,7 @@ describe('Electron development runtime bootstrap', () => {
       ensureElectronRuntime({
         electronPackageDirectory,
         platform: 'win32',
+        arch: 'x64',
         log: () => undefined
       })
     ).rejects.toEqual(
@@ -79,6 +82,7 @@ describe('Electron development runtime bootstrap', () => {
       ensureElectronRuntime({
         electronPackageDirectory,
         platform: 'win32',
+        arch: 'x64',
         log: () => undefined
       })
     ).rejects.toThrow('Check network or proxy access to Electron release downloads, then retry `pnpm dev`')
@@ -94,7 +98,7 @@ describe('Electron development runtime bootstrap', () => {
       installerRepairs: false
     })
 
-    const inspection = await inspectElectronRuntime({ electronPackageDirectory, platform: 'win32' })
+    const inspection = await inspectElectronRuntime({ electronPackageDirectory, platform: 'win32', arch: 'x64' })
     expect(inspection.ready).toBe(false)
     expect(inspection.reasons).toContain('path_marker_invalid')
 
@@ -102,6 +106,7 @@ describe('Electron development runtime bootstrap', () => {
       ensureElectronRuntime({
         electronPackageDirectory,
         platform: 'win32',
+        arch: 'x64',
         log: () => undefined
       })
     ).rejects.toThrow('installer exited successfully but left invalid runtime state: path_marker_invalid')
@@ -120,6 +125,7 @@ describe('Electron development runtime bootstrap', () => {
       ensureElectronRuntime({
         electronPackageDirectory,
         platform: 'win32',
+        arch: 'x64',
         installerTimeoutMs: 30,
         log: () => undefined
       })
@@ -263,7 +269,7 @@ async function createElectronFixture({
   executableMachine?: 'x64' | 'ia32' | 'truncated'
   stockInstallerEarlyReturn?: boolean
 }) {
-  const root = await mkdtemp(join(tmpdir(), 'prime-electron-bootstrap-'))
+  const root = await canonicalTemporaryDirectory('prime-electron-bootstrap-')
   fixtureRoots.push(root)
   const electronPackageDirectory = join(root, 'electron')
   await mkdir(electronPackageDirectory, { recursive: true })

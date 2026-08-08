@@ -1,7 +1,6 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
-import { access, mkdir, mkdtemp, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createConnection, createServer as createNetServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AtomicWriteAmbiguousCommitError } from "../../src/hostd/atomic-files";
@@ -16,6 +15,7 @@ import {
 } from "../../src/hostd/server";
 import { HostService } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 const temporaryDirectories: string[] = [];
 
@@ -25,7 +25,7 @@ afterEach(async () => {
 
 describe("hostd local transport", () => {
   it("serves the same framed protocol over a named pipe or Unix socket", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -50,10 +50,14 @@ describe("hostd local transport", () => {
       await server.close();
       await service.close();
     }
+    if (process.platform !== "win32") {
+      await expect(access(endpoint)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(directory)).some((entry) => entry.startsWith(".p-"))).toBe(false);
+    }
   });
 
   it("returns a correlated structured error for invalid request payloads", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -79,7 +83,7 @@ describe("hostd local transport", () => {
   });
 
   it("runs authority recovery only after this process wins endpoint ownership", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -104,7 +108,7 @@ describe("hostd local transport", () => {
   });
 
   it("rejects an alternate endpoint before it can own the same durable store", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-noncanonical-endpoint-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-noncanonical-endpoint-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     const canonicalEndpoint = defaultLocalEndpoint(directory);
@@ -129,7 +133,7 @@ describe("hostd local transport", () => {
   });
 
   it("keeps endpoint ownership until the current service and admitted work are inert", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -159,7 +163,7 @@ describe("hostd local transport", () => {
   });
 
   it("holds a legitimate successor behind an admitted command publication", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-admitted-command-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-admitted-command-test-");
     temporaryDirectories.push(directory);
     const admissionPrepared = deferred<void>();
     const releaseAdmission = deferred<void>();
@@ -260,7 +264,7 @@ describe("hostd local transport", () => {
   });
 
   it("drains an admitted publication before releasing the endpoint to a successor", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-server-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -328,7 +332,7 @@ describe("hostd local transport", () => {
   });
 
   it("upgrades an in-progress clean close when a publication discovers physical loss", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-close-upgrade-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-close-upgrade-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -364,7 +368,7 @@ describe("hostd local transport", () => {
   });
 
   it("fatally closes after post-publication ownership loss and holds successors behind service teardown", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-publication-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-fatal-publication-test-");
     temporaryDirectories.push(directory);
     const store = new HostStore(directory);
     const service = new HostService(store);
@@ -478,7 +482,7 @@ describe("hostd local transport", () => {
   });
 
   it("turns verify-only ownership loss into fatal server shutdown", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-verify-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-fatal-verify-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -505,7 +509,7 @@ describe("hostd local transport", () => {
   it.skipIf(process.platform === "win32")(
     "never unlinks a replacement Unix socket after physical ownership loss",
     async () => {
-      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-fatal-socket-replacement-test-"));
+      const directory = await canonicalTemporaryDirectory("prime-hostd-fatal-socket-replacement-test-");
       temporaryDirectories.push(directory);
       const service = new HostService(new HostStore(directory));
       await service.initialize();
@@ -544,7 +548,7 @@ describe("hostd local transport", () => {
   it.skipIf(process.platform === "win32")(
     "never unlinks a successor Unix socket when ownership is displaced during post-listen startup",
     async () => {
-      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-startup-socket-replacement-test-"));
+      const directory = await canonicalTemporaryDirectory("prime-hostd-startup-socket-replacement-test-");
       temporaryDirectories.push(directory);
       const service = new HostService(new HostStore(directory));
       await service.initialize();
@@ -585,7 +589,7 @@ describe("hostd local transport", () => {
   );
 
   it("fences every request immediately before HostService admission", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-request-fence-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-request-fence-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -612,7 +616,7 @@ describe("hostd local transport", () => {
   });
 
   it("keeps the base service alive after ordinary atomic publication uncertainty", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-runtime-poison-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-runtime-poison-test-");
     temporaryDirectories.push(directory);
     const service = new HostService(new HostStore(directory));
     await service.initialize();
@@ -661,7 +665,7 @@ describe("hostd local transport", () => {
   it.skipIf(process.platform === "win32")(
     "atomically elects one owner when concurrent Unix contenders recover one stale sidecar",
     async () => {
-      const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+      const directory = await canonicalTemporaryDirectory("prime-hostd-owner-test-");
       temporaryDirectories.push(directory);
       const endpoint = join(directory, "hostd.sock");
       const lockPath = unixEndpointOwnershipLockPath(endpoint);
@@ -702,7 +706,7 @@ describe("hostd local transport", () => {
   );
 
   it("never auto-deletes an empty Unix ownership directory, even when it is old", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-owner-test-");
     temporaryDirectories.push(directory);
     const endpoint = join(directory, "hostd.sock");
     const lockPath = unixEndpointOwnershipLockPath(endpoint);
@@ -720,7 +724,7 @@ describe("hostd local transport", () => {
   });
 
   it("publishes only a populated candidate and rejects a delayed publisher after replacement", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-owner-test-");
     temporaryDirectories.push(directory);
     const endpoint = join(directory, "hostd.sock");
     const lockPath = unixEndpointOwnershipLockPath(endpoint);
@@ -748,7 +752,7 @@ describe("hostd local transport", () => {
   });
 
   it("never removes a replacement Unix owner during release", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-owner-test-");
     temporaryDirectories.push(directory);
     const endpoint = join(directory, "hostd.sock");
     const lockPath = unixEndpointOwnershipLockPath(endpoint);
@@ -764,7 +768,7 @@ describe("hostd local transport", () => {
   });
 
   it("treats an indeterminate Unix owner PID as live", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-owner-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-owner-test-");
     temporaryDirectories.push(directory);
     const endpoint = join(directory, "hostd.sock");
     const lockPath = unixEndpointOwnershipLockPath(endpoint);

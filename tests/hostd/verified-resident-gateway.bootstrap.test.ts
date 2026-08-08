@@ -1,6 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway, PrimeAgentProjectionChange } from "../../src/hostd/gateway";
 import type {
@@ -34,6 +33,7 @@ import {
   residentDaemonEndpoint,
   residentDaemonWorkingDirectory,
 } from "../../src/hostd/verified-resident-gateway";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 const temporaryDirectories: string[] = [];
 
@@ -487,7 +487,7 @@ async function gatewayFixture(
     ) => PrimeAgentPublicModuleLoader;
   } = {},
 ) {
-  const root = await mkdtemp(join(tmpdir(), "prime-resident-gateway-bootstrap-test-"));
+  const root = await canonicalTemporaryDirectory("prime-resident-gateway-bootstrap-test-");
   temporaryDirectories.push(root);
   let currentBindings = [...bindings];
   let projectedBindings = [...(fixtureOptions.projectedBindings ?? bindings)];
@@ -617,10 +617,10 @@ function binding(
     lifecycle: "resident",
     threadId,
     executionGenerationId,
-    workspaceDirectory: `C:\\workspaces\\${threadId}`,
+    workspaceDirectory: resolve("test-workspaces", threadId),
     activeSessionId,
     sessionId: `session-${threadId}`,
-    sessionFile: `C:\\sessions\\${threadId}.jsonl`,
+    sessionFile: resolve("test-sessions", `${threadId}.jsonl`),
     boundAt: "2026-08-07T20:00:00.000Z",
     runtime: {
       releaseVersion: PINNED_PRIME_AGENT_RUNTIME.releaseVersion,

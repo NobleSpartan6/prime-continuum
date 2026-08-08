@@ -1,6 +1,5 @@
 import { bootstrapTestWorkspace } from '../hostd/test-workspace-fixture'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { rm } from 'node:fs/promises'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -10,6 +9,7 @@ import { HostService, TRUSTED_USER_SESSION } from '../../src/hostd/service'
 import { runFramedSession } from '../../src/hostd/server'
 import { HostStore } from '../../src/hostd/store'
 import { FramedConnection } from '../../src/main/control/framed-connection'
+import { canonicalTemporaryDirectory } from '../helpers/canonical-temp'
 import { connectLocalHostd } from '../../src/main/control/local-hostd'
 import { LengthPrefixedJsonDecoder, writeJsonFrame } from '../../src/shared/frame-codec'
 import { resolveCanonicalLocalHostTarget } from '../../src/shared/local-host-target'
@@ -25,7 +25,7 @@ afterEach(async () => {
 
 describe('native ↔ hostd framed protocol', () => {
   it('performs health and empty catalog requests over the production framing seam', async () => {
-    const dataDirectory = await mkdtemp(path.join(tmpdir(), 'prime-hostd-integration-'))
+    const dataDirectory = await canonicalTemporaryDirectory('prime-hostd-integration-')
     temporaryDirectories.push(dataDirectory)
     const service = new HostService(new HostStore(dataDirectory))
     await service.initialize()
@@ -59,7 +59,7 @@ describe('native ↔ hostd framed protocol', () => {
   })
 
   it('streams and atomically reassembles a checksummed snapshot larger than one protocol frame', async () => {
-    const dataDirectory = await mkdtemp(path.join(tmpdir(), 'prime-hostd-large-snapshot-'))
+    const dataDirectory = await canonicalTemporaryDirectory('prime-hostd-large-snapshot-')
     temporaryDirectories.push(dataDirectory)
     const store = new HostStore(dataDirectory)
     const service = new HostService(store)
@@ -135,7 +135,7 @@ describe('native ↔ hostd framed protocol', () => {
   })
 
   it('keeps a direct single-frame response for clients that do not opt into snapshot transfers', async () => {
-    const dataDirectory = await mkdtemp(path.join(tmpdir(), 'prime-hostd-direct-snapshot-'))
+    const dataDirectory = await canonicalTemporaryDirectory('prime-hostd-direct-snapshot-')
     temporaryDirectories.push(dataDirectory)
     const service = new HostService(new HostStore(dataDirectory))
     await service.initialize()
@@ -172,7 +172,7 @@ describe('native ↔ hostd framed protocol', () => {
   })
 
   it('starts the bundled CLI on a real named pipe or Unix socket', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'prime-hostd-cli-integration-'))
+    const root = await canonicalTemporaryDirectory('prime-hostd-cli-integration-')
     temporaryDirectories.push(root)
     const target = await resolveCanonicalLocalHostTarget(path.join(root, 'data'), { create: true })
     const dataDirectory = target.dataDirectory

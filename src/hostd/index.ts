@@ -1,4 +1,4 @@
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, posix, resolve, win32 } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
 import { isMainThread } from "node:worker_threads";
 import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
@@ -278,7 +278,12 @@ export function isDirectHostdInvocation(
 ): boolean {
   if (!mainThread) return false;
   if (!script) return false;
-  const name = basename(script).toLowerCase();
+  // Invocation metadata can cross a platform boundary in packaged launchers.
+  // Parse an absolute Windows spelling with Windows rules, but retain native
+  // basename semantics for POSIX paths (where a backslash is a valid byte).
+  const name = (
+    posix.isAbsolute(script) ? posix.basename(script) : win32.isAbsolute(script) ? win32.basename(script) : basename(script)
+  ).toLowerCase();
   return name === "hostd.cjs" || name === "prime-agent-hostd" || name === "prime-agent-hostd.exe";
 }
 

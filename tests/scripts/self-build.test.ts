@@ -1,9 +1,9 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { canonicalTemporaryDirectory } from '../helpers/canonical-temp'
 import {
   assertMaterializedContentEqual,
   captureGitCandidate,
@@ -452,7 +452,7 @@ async function createGitFixture() {
 }
 
 async function temporaryDirectory(prefix: string) {
-  const path = await mkdtemp(join(tmpdir(), prefix))
+  const path = await canonicalTemporaryDirectory(prefix)
   temporaryDirectories.push(path)
   return path
 }

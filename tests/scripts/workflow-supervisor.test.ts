@@ -1,8 +1,8 @@
 import { fork, spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { canonicalTemporaryDirectory } from '../helpers/canonical-temp'
 import {
   createWorkflowChildLease,
   rejectActiveWorkflowChild,
@@ -92,6 +92,9 @@ setInterval(() => undefined, 1000)
     const child = spawn(process.execPath, ['--eval', 'setInterval(() => undefined, 1000)'], {
       stdio: 'ignore',
       windowsHide: true,
+      // The durable lease records a POSIX process-group containment identity.
+      // Mirror the real supervisor launch, where the command is its group leader.
+      detached: process.platform !== 'win32',
     })
     const lease = await createWorkflowChildLease({
       lockPath,
@@ -290,46 +293,88 @@ setInterval(() => undefined, 1000)
     await main.release()
   }, 15_000)
 
-  it('terminates a detached unref descendant before releasing the workflow lease', async () => {
-    const root = await temporaryDirectory()
-    const lockPath = join(root, 'workflow.lock')
-    const pidFile = join(root, 'detached-grandchild.pid')
-    const grandchildScript = join(root, 'detached-grandchild.cjs')
-    const directScript = join(root, 'spawn-detached.cjs')
-    await writeFile(grandchildScript, 'setInterval(() => undefined, 1000)\n', 'utf8')
-    await writeFile(directScript, `const { spawn } = require('node:child_process')
+  it.skipIf(process.platform !== 'win32')(
+    'terminates a detached unref descendant inside the native Windows Job before releasing the workflow lease',
+    async () => {
+      const root = await temporaryDirectory()
+      const lockPath = join(root, 'workflow.lock')
+      const pidFile = join(root, 'detached-grandchild.pid')
+      const grandchildScript = join(root, 'detached-grandchild.cjs')
+      const directScript = join(root, 'spawn-detached.cjs')
+      await writeFile(grandchildScript, 'setInterval(() => undefined, 1000)\n', 'utf8')
+      await writeFile(directScript, `const { spawn } = require('node:child_process')
 const { writeFileSync } = require('node:fs')
 const child = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], { detached: true, stdio: 'ignore' })
 child.unref()
 writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
 `, 'utf8')
-    const main = await acquireWorkflowLock({ workflow: 'dev', projectRoot: root, lockPath })
+      const main = await acquireWorkflowLock({ workflow: 'dev', projectRoot: root, lockPath })
 
-    const result = await runSupervisedWorkflowStep({
-      workflow: 'dev',
-      lock: main,
-      step: {
-        executable: process.execPath,
-        args: [directScript],
-        cwd: root,
-        environment: process.env,
-      },
-      teardownTimeoutMs: 10_000,
-    })
+      const result = await runSupervisedWorkflowStep({
+        workflow: 'dev',
+        lock: main,
+        step: {
+          executable: process.execPath,
+          args: [directScript],
+          cwd: root,
+          environment: process.env,
+        },
+        teardownTimeoutMs: 10_000,
+      })
 
-    expect(result).toMatchObject({ code: 0, supervisorExitedWithoutChildConfirmation: false })
-    const grandchildPid = Number(await waitForFile(pidFile))
-    await waitForProcessesToExit([grandchildPid])
-    await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
-    await main.release()
-    const replacement = await acquireWorkflowLock({ workflow: 'dist', projectRoot: root, lockPath })
-    expect(replacement.owner.workflow).toBe('dist')
-    await replacement.release()
-  }, 20_000)
+      expect(result).toMatchObject({ code: 0, supervisorExitedWithoutChildConfirmation: false })
+      const grandchildPid = Number(await waitForFile(pidFile))
+      await waitForProcessesToExit([grandchildPid])
+      await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
+      await main.release()
+      const replacement = await acquireWorkflowLock({ workflow: 'dist', projectRoot: root, lockPath })
+      expect(replacement.owner.workflow).toBe('dist')
+      await replacement.release()
+    },
+    20_000,
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'terminates an unref descendant retained in the native POSIX process group before releasing the workflow lease',
+    async () => {
+      const root = await temporaryDirectory()
+      const lockPath = join(root, 'workflow.lock')
+      const pidFile = join(root, 'posix-grandchild.pid')
+      const grandchildScript = join(root, 'posix-grandchild.cjs')
+      const directScript = join(root, 'spawn-posix-grandchild.cjs')
+      await writeFile(grandchildScript, 'setInterval(() => undefined, 1000)\n', 'utf8')
+      await writeFile(directScript, `const { spawn } = require('node:child_process')
+const { writeFileSync } = require('node:fs')
+const child = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], { stdio: 'ignore' })
+child.unref()
+writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+`, 'utf8')
+      const main = await acquireWorkflowLock({ workflow: 'dev', projectRoot: root, lockPath })
+
+      const result = await runSupervisedWorkflowStep({
+        workflow: 'dev',
+        lock: main,
+        step: {
+          executable: process.execPath,
+          args: [directScript],
+          cwd: root,
+          environment: process.env,
+        },
+        teardownTimeoutMs: 10_000,
+      })
+
+      expect(result).toMatchObject({ code: 0, supervisorExitedWithoutChildConfirmation: false })
+      const grandchildPid = Number(await waitForFile(pidFile))
+      await waitForProcessesToExit([grandchildPid])
+      await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
+      await main.release()
+    },
+    20_000,
+  )
 })
 
 async function temporaryDirectory() {
-  const path = await mkdtemp(join(tmpdir(), 'prime-workflow-supervisor-'))
+  const path = await canonicalTemporaryDirectory('prime-workflow-supervisor-')
   temporaryDirectories.push(path)
   return path
 }

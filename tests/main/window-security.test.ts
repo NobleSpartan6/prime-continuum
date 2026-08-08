@@ -20,5 +20,6 @@ describe('BrowserWindow security defaults', () => {
   it('loads the ESM preload entry emitted by electron-vite', () => {
     expect(PRELOAD_ENTRY).toBe('../preload/index.cjs')
     expect(resolvePreloadEntry('C:\\app\\out\\main')).toBe('C:\\app\\out\\preload\\index.cjs')
+    expect(resolvePreloadEntry('/opt/prime-continuim/out/main')).toBe('/opt/prime-continuim/out/preload/index.cjs')
   })
 })

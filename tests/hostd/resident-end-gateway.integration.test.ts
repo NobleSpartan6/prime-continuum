@@ -1,8 +1,8 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 import type { PrimeAgentResidentAdapterOptions } from "../../src/hostd/prime-agent-resident-adapter";
 import type { ResidentEndRequest } from "../../src/hostd/resident-lifecycle-coordinator";
 import {
@@ -128,7 +128,7 @@ describe("VerifiedResidentGateway resident end materialization", () => {
 });
 
 async function gatewayFixture(outcome: "success" | "unknown") {
-  const directory = await mkdtemp(join(tmpdir(), "prime-resident-end-gateway-"));
+  const directory = await canonicalTemporaryDirectory("prime-resident-end-gateway-");
   temporaryDirectories.push(directory);
   const dataDirectory = join(directory, "data");
   const workspacePath = join(directory, "workspace");

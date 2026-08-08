@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
   REQUIRED_RESIDENT_DAEMON_CAPABILITIES,
@@ -13,6 +13,9 @@ import {
   validateResidentDaemonHello,
   validateResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
+
+const OWNED_WORKSPACE_DIRECTORY = resolve("test-workspaces", "resident-owned");
+const OWNED_SESSION_PATH = resolve("test-sessions", "resident-owned.jsonl");
 
 function validHello(): Record<string, unknown> {
   return {
@@ -350,16 +353,16 @@ describe("resident launch and create plans", () => {
     const request = buildResidentOwnedDaemonCreateRequest({
       threadId: "thread-owned-1",
       executionGenerationId: "execution-owned-1",
-      workspaceDirectory: "C:\\work\\project",
-      session: { kind: "resume", sessionPath: "C:\\sessions\\thread.jsonl" },
+      workspaceDirectory: OWNED_WORKSPACE_DIRECTORY,
+      session: { kind: "resume", sessionPath: OWNED_SESSION_PATH },
     });
 
     expect(request).toEqual({
       type: "create",
-      config: { cwd: "C:\\work\\project" },
+      config: { cwd: OWNED_WORKSPACE_DIRECTORY },
       lifecycle: "client_owned",
       noSession: false,
-      sessionPath: "C:\\sessions\\thread.jsonl",
+      sessionPath: OWNED_SESSION_PATH,
     });
     expect(request).not.toHaveProperty("continueRecent");
     expect(Object.isFrozen(request)).toBe(true);
@@ -400,7 +403,7 @@ describe("resident launch and create plans", () => {
       () => buildResidentOwnedDaemonCreateRequest({
         threadId: "thread-owned-4",
         executionGenerationId: "execution-owned-4",
-        workspaceDirectory: "C:\\work\\project\\..\\other",
+        workspaceDirectory: `${OWNED_WORKSPACE_DIRECTORY}${sep}..${sep}other`,
         session: { kind: "new" },
       }),
       "PRIME_RUNTIME_ARGUMENT_INVALID",

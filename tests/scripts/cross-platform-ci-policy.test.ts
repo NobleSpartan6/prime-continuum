@@ -3,7 +3,8 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const workflowPath = resolve('.github/workflows/cross-platform-source.yml')
-const workflow = readFileSync(workflowPath, 'utf8')
+const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n?/g, '\n')
+const vitestConfig = readFileSync(resolve('vitest.config.ts'), 'utf8').replace(/\r\n?/g, '\n')
 
 describe('cross-platform source CI policy', () => {
   it('runs the exact source gates on stable Linux, Windows, and macOS hosts', () => {
@@ -34,5 +35,12 @@ describe('cross-platform source CI policy', () => {
       ['actions/setup-node', '249970729cb0ef3589644e2896645e5dc5ba9c38'],
     ])
     expect(actionReferences.every((match) => /^[0-9a-f]{40}$/.test(match[2]!))).toBe(true)
+  })
+
+  it('runs every test with a deterministic hosted-runner concurrency ceiling', () => {
+    expect(workflow).toContain('run: pnpm test')
+    expect(vitestConfig).toContain("include: ['tests/**/*.test.{ts,tsx}']")
+    expect(vitestConfig).toContain('maxWorkers: process.env.CI ? 2 : undefined')
+    expect(vitestConfig).not.toMatch(/\b(?:exclude|shard|passWithNoTests)\s*:/)
   })
 })

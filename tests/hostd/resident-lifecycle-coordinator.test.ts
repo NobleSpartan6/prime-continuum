@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
 import {
   ResidentLifecycleCoordinator,
   type ResidentEndRequest,
@@ -840,7 +841,7 @@ function residentBinding(): ResidentSessionBinding {
     workspaceDirectory: WORKSPACE_DIRECTORY,
     activeSessionId: "active-a",
     sessionId: "session-a",
-    sessionFile: "C:\\sessions\\session-a.jsonl",
+    sessionFile: SESSION_FILE,
     boundAt: "2026-08-08T12:00:01.000Z",
     runtime: {
       releaseVersion: PINNED_PRIME_AGENT_RUNTIME.releaseVersion,
@@ -895,4 +896,5 @@ function deferred<T>() {
 }
 
 const NOW = "2026-08-08T12:00:00.000Z";
-const WORKSPACE_DIRECTORY = "C:\\workspaces\\thread-a";
+const WORKSPACE_DIRECTORY = resolve("test-workspaces", "thread-a");
+const SESSION_FILE = resolve("test-sessions", "session-a.jsonl");

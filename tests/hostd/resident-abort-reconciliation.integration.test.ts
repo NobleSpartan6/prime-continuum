@@ -1,8 +1,8 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 import { UnavailablePrimeAgentGateway } from "../../src/hostd/gateway";
 import type { PrimeAgentResidentAdapterOptions } from "../../src/hostd/prime-agent-resident-adapter";
 import type { ResidentProjectionSnapshot } from "../../src/hostd/resident-projection";
@@ -148,7 +148,7 @@ async function serviceFixture(reconcile: ReconcileHandler) {
 }
 
 async function initializedStore() {
-  const directory = await mkdtemp(join(tmpdir(), "prime-resident-abort-proof-integration-"));
+  const directory = await canonicalTemporaryDirectory("prime-resident-abort-proof-integration-");
   temporaryDirectories.push(directory);
   const workspacePath = join(directory, "workspace");
   await mkdir(workspacePath, { recursive: true });

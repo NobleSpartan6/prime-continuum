@@ -1,8 +1,8 @@
-import { link, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { copyFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 import { HostService, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
 import {
@@ -118,7 +118,7 @@ describe("runtime model catalog", () => {
   });
 
   it("uses the exact verified executable and module URL with a sanitized fixed invocation", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-invocation-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-invocation-");
     try {
       const modulePath = join(directory, "runtime catalog fixture.mjs");
       await writeFile(modulePath, validRuntimeSource(), "utf8");
@@ -152,7 +152,7 @@ describe("runtime model catalog", () => {
   });
 
   it("discovers through a child without changing the host process signal handlers", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-isolation-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-isolation-");
     const beforeSigterm = process.listeners("SIGTERM");
     const beforeSigint = process.listeners("SIGINT");
     try {
@@ -188,7 +188,7 @@ describe("runtime model catalog", () => {
   }, 15_000);
 
   it("terminates a helper that exceeds its deadline", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-timeout-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-timeout-");
     try {
       const modulePath = join(directory, "runtime.mjs");
       await writeFile(
@@ -206,7 +206,7 @@ describe("runtime model catalog", () => {
   });
 
   it("rejects stderr without reflecting potentially secret child output", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-stderr-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-stderr-");
     try {
       const modulePath = join(directory, "runtime.mjs");
       await writeFile(modulePath, validRuntimeSource('process.stderr.write("Bearer must-not-escape\\n");'), "utf8");
@@ -222,7 +222,7 @@ describe("runtime model catalog", () => {
   });
 
   it("rejects malformed and oversized helper stdout", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-output-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-output-");
     try {
       const malformedPath = join(directory, "malformed.mjs");
       await writeFile(
@@ -251,7 +251,7 @@ describe("runtime model catalog", () => {
   }, 20_000);
 
   it("rejects a non-zero helper exit", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-exit-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-exit-");
     try {
       const modulePath = join(directory, "runtime.mjs");
       await writeFile(modulePath, `process.exit(7);\n${validRuntimeSource()}`, "utf8");
@@ -271,7 +271,7 @@ describe("runtime model catalog", () => {
   });
 
   it("advertises and serves the catalog only for the expected host authority", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-model-catalog-service-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-model-catalog-service-");
     try {
       const store = new HostStore(directory);
       await store.initialize();
@@ -430,7 +430,10 @@ export class ModelRegistry {
 async function executableWithSpacedWindowsPath(directory: string): Promise<string> {
   if (process.platform !== "win32") return process.execPath;
   const target = join(directory, "verified runtime host with spaces.exe");
-  await link(process.execPath, target);
+  // GitHub can place the checkout and TEMP on different Windows volumes, where
+  // a hard link is invalid. A byte-for-byte copy preserves the spaced-path
+  // executable behavior this fixture exercises without a same-volume premise.
+  await copyFile(process.execPath, target);
   return target;
 }
 

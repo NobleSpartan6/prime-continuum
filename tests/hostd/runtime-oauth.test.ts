@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
@@ -19,6 +18,23 @@ import {
   terminateRuntimeOAuthHelperProcess,
 } from "../../src/hostd/runtime-oauth";
 import { isPinnedCodexAuthorizationUrl } from "../../src/shared/codex-oauth";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
+
+const VERIFIED_RUNTIME_ROOT = resolve("test-runtime-oauth", "Prime Continuim");
+const VERIFIED_RUNTIME_EXECUTABLE = join(
+  VERIFIED_RUNTIME_ROOT,
+  process.platform === "win32" ? "Prime Continuim.exe" : "prime-continuim",
+);
+const VERIFIED_RUNTIME_MODULE_PATH = join(
+  VERIFIED_RUNTIME_ROOT,
+  "runtime",
+  "node_modules",
+  "prime-agent",
+  "dist",
+  "index.js",
+);
+const VERIFIED_RUNTIME_MODULE_URL = pathToFileURL(VERIFIED_RUNTIME_MODULE_PATH).href;
+const VERIFIED_RUNTIME_CLI = join(dirname(VERIFIED_RUNTIME_MODULE_PATH), "bundle", "cli.js");
 
 const SECRET_CREDENTIALS = Object.freeze({
   access: "private-access-token",
@@ -115,13 +131,13 @@ describe("verified Prime Agent runtime OAuth composition", () => {
 
     for (const invocation of [login, storage]) {
       expect(invocation).toMatchObject({
-        executable: "C:\\Prime Continuim\\Prime Continuim.exe",
-        spawn: { shell: false, windowsHide: true, cwd: "C:\\Prime Continuim\\runtime\\node_modules\\prime-agent\\dist" },
+        executable: VERIFIED_RUNTIME_EXECUTABLE,
+        spawn: { shell: false, windowsHide: true, cwd: dirname(VERIFIED_RUNTIME_MODULE_PATH) },
       });
       expect(invocation.argv.slice(0, 2)).toEqual(["--input-type=module", "--eval"]);
       expect(invocation.argv.slice(-3)).toEqual([
         "--",
-        "file:///C:/Prime%20Continuim/runtime/node_modules/prime-agent/dist/index.js",
+        VERIFIED_RUNTIME_MODULE_URL,
         CODEX_SUBSCRIPTION_PROVIDER_ID,
       ]);
       expect(invocation.spawn.env).toEqual({
@@ -155,7 +171,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
       verifiedHandle({ executable: "relative\\prime.exe" }),
     )).toThrow(RuntimeOAuthHelperError);
     expect(() => buildRuntimeOAuthLoginHelperInvocation(
-      verifiedHandle({ moduleUrl: "file:///C:/Prime/runtime/index.js?replacement=1" }),
+      verifiedHandle({ moduleUrl: `${VERIFIED_RUNTIME_MODULE_URL}?replacement=1` }),
     )).toThrow(RuntimeOAuthHelperError);
   });
 
@@ -167,7 +183,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
   });
 
   it("rejects a verified helper that attempts to publish a different HTTPS authorization host", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-oauth-host-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-oauth-host-");
     try {
       const modulePath = join(directory, "runtime.mjs");
       await writeFile(modulePath, runtimeModuleSource(validAuthorizationUrl("https://attacker.example")), "utf8");
@@ -185,7 +201,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
   });
 
   it("captures credentials through private stdio and terminates the short-lived login helper", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-runtime-oauth-login-"));
+    const directory = await canonicalTemporaryDirectory("prime-runtime-oauth-login-");
     try {
       const modulePath = join(directory, "runtime.mjs");
       await writeFile(modulePath, runtimeModuleSource(validAuthorizationUrl()), "utf8");
@@ -293,14 +309,14 @@ function verifiedHandle(
       runtime: "prime-agent",
       releaseVersion: "0.7.0",
       runtimeBuildId: "oauth-test",
-      platform: "win32",
-      arch: "x64",
+      platform: process.platform,
+      arch: process.arch,
       manifestSha256: "1".repeat(64),
       treeSha256: "2".repeat(64),
       filesSha256: "3".repeat(64),
       hostRuntime: {
-        platform: "win32",
-        arch: "x64",
+        platform: process.platform,
+        arch: process.arch,
         node: "22.12.0",
         electron: "43.3.0",
         executable: "electron",
@@ -309,8 +325,8 @@ function verifiedHandle(
       fileCount: 1,
       totalBytes: 1,
     },
-    executable: overrides.executable ?? "C:\\Prime Continuim\\Prime Continuim.exe",
-    moduleUrl: overrides.moduleUrl ?? "file:///C:/Prime%20Continuim/runtime/node_modules/prime-agent/dist/index.js",
-    cliEntrypoint: "C:\\Prime Continuim\\runtime\\node_modules\\prime-agent\\dist\\bundle\\cli.js",
+    executable: overrides.executable ?? VERIFIED_RUNTIME_EXECUTABLE,
+    moduleUrl: overrides.moduleUrl ?? VERIFIED_RUNTIME_MODULE_URL,
+    cliEntrypoint: VERIFIED_RUNTIME_CLI,
   }) as unknown as VerifiedInstalledRuntimeHandle;
 }

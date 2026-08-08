@@ -1,6 +1,6 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -31,6 +31,7 @@ import {
   type ResidentPromptReconciliationLease,
 } from "../../src/hostd/store";
 import { PROTOCOL_VERSION, type CommandEnvelope } from "../../src/shared/protocol";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 const RUNTIME_NODE = resolve("test-runtime", "node.exe");
 const RUNTIME_CLI = resolve("test-runtime", "prime-agent", "dist", "bundle", "cli.js");
@@ -44,6 +45,11 @@ const DAEMON_ENVIRONMENT = Object.freeze({
   NODE_OPTIONS: "--import=C:\\attacker.mjs",
   PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
 });
+const WORKSPACE_DIRECTORY = resolve("test-workspaces", "resident-adapter");
+const OTHER_WORKSPACE_DIRECTORY = resolve("test-workspaces", "resident-adapter-other");
+const SESSION_DIRECTORY = resolve("test-sessions", "resident-adapter");
+const SESSION_FILE = join(SESSION_DIRECTORY, "session-1.jsonl");
+const OTHER_SESSION_FILE = join(SESSION_DIRECTORY, "other.jsonl");
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -88,9 +94,9 @@ function liveSummary(overrides: Record<string, unknown> = {}): Record<string, un
     isSessionActive: false,
     activeSessionId: "active-1",
     sessionId: "session-1",
-    sessionFile: "C:\\sessions\\session-1.jsonl",
+    sessionFile: SESSION_FILE,
     sessionName: "Prime Continuim",
-    cwd: "C:\\work\\project",
+    cwd: WORKSPACE_DIRECTORY,
     isStreaming: false,
     isCompacting: false,
     attachedClients: 0,
@@ -113,7 +119,7 @@ function validSnapshot(options: {
   return {
     state: {
       activeSessionId: "active-1",
-      cwd: "C:\\work\\project",
+      cwd: WORKSPACE_DIRECTORY,
       model: { provider: "openai", id: "gpt-5" },
       thinkingLevel: "medium",
       serviceTier: "standard",
@@ -124,10 +130,10 @@ function validSnapshot(options: {
       retryAttempt: 0,
       steeringMode: "all",
       followUpMode: "all",
-      sessionFile: "C:\\sessions\\session-1.jsonl",
+      sessionFile: SESSION_FILE,
       sessionId: "session-1",
       sessionName: "Prime Continuim",
-      sessionDir: "C:\\sessions",
+      sessionDir: SESSION_DIRECTORY,
       leafId: null,
       autoCompactionEnabled: true,
       messageCount: messages.length,
@@ -504,7 +510,7 @@ function createInput() {
   return {
     threadId: "thread-1",
     executionGenerationId: "generation-1",
-    workspaceDirectory: "C:\\work\\project",
+    workspaceDirectory: WORKSPACE_DIRECTORY,
     sessionName: "Prime Continuim",
   } as const;
 }
@@ -513,7 +519,7 @@ function ownedInput() {
   return {
     threadId: "thread-owned-1",
     executionGenerationId: "generation-owned-1",
-    workspaceDirectory: "C:\\work\\project",
+    workspaceDirectory: WORKSPACE_DIRECTORY,
     session: { kind: "new" },
     sessionName: "Prime Continuim",
   } as const;
@@ -523,8 +529,8 @@ function ownedResumeInput() {
   return {
     threadId: "thread-owned-1",
     executionGenerationId: "generation-owned-1",
-    workspaceDirectory: "C:\\work\\project",
-    session: { kind: "resume", sessionPath: "C:\\sessions\\session-1.jsonl" },
+    workspaceDirectory: WORKSPACE_DIRECTORY,
+    session: { kind: "resume", sessionPath: SESSION_FILE },
   } as const;
 }
 
@@ -534,10 +540,10 @@ function binding(overrides: Partial<ResidentSessionBinding> = {}): ResidentSessi
     lifecycle: "resident",
     threadId: "thread-1",
     executionGenerationId: "generation-1",
-    workspaceDirectory: "C:\\work\\project",
+    workspaceDirectory: WORKSPACE_DIRECTORY,
     activeSessionId: "active-1",
     sessionId: "session-1",
-    sessionFile: "C:\\sessions\\session-1.jsonl",
+    sessionFile: SESSION_FILE,
     boundAt: "2026-08-06T16:00:00.000Z",
     runtime: validateResidentDaemonHello(validHello()),
     ...overrides,
@@ -548,7 +554,7 @@ async function issueResidentKillLease(
   operationId = "resident-end-adapter",
   bindingOverrides: Partial<ResidentSessionBinding> = {},
 ): Promise<{ store: HostStore; lease: ResidentKillLease; binding: ResidentSessionBinding }> {
-  const directory = await mkdtemp(join(tmpdir(), "prime-adapter-end-"));
+  const directory = await canonicalTemporaryDirectory("prime-adapter-end-");
   temporaryDirectories.push(directory);
   const workspaceDirectory = join(directory, "workspace");
   await mkdir(workspaceDirectory);
@@ -759,7 +765,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
 
     expect(state.requests).toEqual([{
       type: "create",
-      config: { cwd: "C:\\work\\project" },
+      config: { cwd: WORKSPACE_DIRECTORY },
       lifecycle: "client_owned",
       noSession: false,
       name: "Prime Continuim",
@@ -778,10 +784,10 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       candidateVersion: 1,
       threadId: "thread-owned-1",
       executionGenerationId: "generation-owned-1",
-      workspaceDirectory: "C:\\work\\project",
+      workspaceDirectory: WORKSPACE_DIRECTORY,
       activeSessionId: "active-1",
       sessionId: "session-1",
-      sessionFile: "C:\\sessions\\session-1.jsonl",
+      sessionFile: SESSION_FILE,
       boundAt: "2026-08-06T17:00:00.000Z",
       runtime: { runtimeBuildId: "be9e2fa-dirty" },
     });
@@ -901,7 +907,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
         type: "response",
         command: (command as { type?: string }).type ?? "unknown",
         success: true,
-        data: liveSummary({ sessionFile: "C:\\sessions\\other.jsonl" }),
+        data: liveSummary({ sessionFile: OTHER_SESSION_FILE }),
       }),
     });
 
@@ -1029,7 +1035,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       identity: {
         activeSessionId: "active-1",
         sessionId: "session-1",
-        workspaceDirectory: "C:\\work\\project",
+        workspaceDirectory: WORKSPACE_DIRECTORY,
       },
       cursor: { generation: "events-1", sequence: 4 },
     });
@@ -1471,7 +1477,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
 
     expect(state.requests[0]).toEqual({
       type: "create",
-      config: { cwd: "C:\\work\\project" },
+      config: { cwd: WORKSPACE_DIRECTORY },
       lifecycle: "resident",
       noSession: false,
       name: "Prime Continuim",
@@ -1634,7 +1640,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
             type: "response",
             command: "list",
             success: true,
-            data: { sessions: [liveSummary({ cwd: "C:\\other\\project" })] },
+            data: { sessions: [liveSummary({ cwd: OTHER_WORKSPACE_DIRECTORY })] },
           };
         }
         return { type: "response", command: type, success: true };
