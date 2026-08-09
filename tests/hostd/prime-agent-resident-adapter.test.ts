@@ -50,6 +50,7 @@ const OTHER_WORKSPACE_DIRECTORY = resolve("test-workspaces", "resident-adapter-o
 const SESSION_DIRECTORY = resolve("test-sessions", "resident-adapter");
 const SESSION_FILE = join(SESSION_DIRECTORY, "session-1.jsonl");
 const OTHER_SESSION_FILE = join(SESSION_DIRECTORY, "other.jsonl");
+const DURABLE_RESIDENT_AUTHORITY_TEST_TIMEOUT_MS = 15_000;
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -1318,11 +1319,31 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     await adapter.close();
   });
 
-  it("rejects a bare binding and a cross-Store lease without invoking kill", async () => {
-    const owner = await issueResidentKillLease("resident-end-owner");
-    const other = await issueResidentKillLease("resident-end-other");
+  it("rejects a bare binding before Store authorization or daemon reads", async () => {
+    const authorize = vi.fn(async (_lease: ResidentKillLease) => {
+      throw new Error("A bare binding must not reach Store authorization");
+    });
     const { adapter, state } = createHarness({
-      authorizeResidentKillInvocation: (lease) => owner.store.authorizeResidentKillInvocation(lease),
+      authorizeResidentKillInvocation: authorize,
+    });
+
+    await expect(adapter.endResidentSession(binding() as unknown as ResidentKillLease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
+    });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(state.requests).toEqual([]);
+    await adapter.close();
+  });
+
+  it("rejects a cross-Store lease after the read fence without invoking kill", async () => {
+    const [owner, other] = await Promise.all([
+      issueResidentKillLease("resident-end-owner"),
+      issueResidentKillLease("resident-end-other"),
+    ]);
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      owner.store.authorizeResidentKillInvocation(lease));
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
       requestHandler: async (command) => {
         const type = (command as { type?: string }).type ?? "unknown";
         if (type === "list") {
@@ -1337,15 +1358,15 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
       },
     });
 
-    await expect(adapter.endResidentSession(owner.binding as unknown as ResidentKillLease)).rejects.toMatchObject({
-      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
-    });
     await expect(adapter.endResidentSession(other.lease)).rejects.toMatchObject({
       code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
     });
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(authorize).toHaveBeenCalledWith(other.lease);
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
     expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
     await adapter.close();
-  });
+  }, DURABLE_RESIDENT_AUTHORITY_TEST_TIMEOUT_MS);
 
   it("rechecks Store authority after a deferred list and never kills a lease settled meanwhile", async () => {
     const authority = await issueResidentKillLease("resident-end-stale-after-list");
@@ -1374,7 +1395,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     await expect(ending).rejects.toMatchObject({ code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID" });
     expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
     await adapter.close();
-  });
+  }, DURABLE_RESIDENT_AUTHORITY_TEST_TIMEOUT_MS);
 
   it.each([
     ["transport rejection", async () => { throw new Error("kill response transport closed"); }],
