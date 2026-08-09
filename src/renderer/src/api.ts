@@ -1117,7 +1117,7 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '186 GB free',
     gitVersion: 'Git 2.45.2',
     pythonStatus: 'Python 3.12 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.0',
+    agentVersion: 'Prime Agent 0.7.1',
     hostServiceVersion: 'Not installed',
     requiresInstall: true,
     installCommand: 'No signed host-service installer is available in this build.',
@@ -1136,7 +1136,7 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '92 GB free',
     gitVersion: 'Git 2.47.1',
     pythonStatus: 'Python 3.13 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.0',
+    agentVersion: 'Prime Agent 0.7.1',
     hostServiceVersion: 'Host service 0.1.0 · running',
     requiresInstall: false,
     installCommand:
@@ -1149,7 +1149,7 @@ const discoveredComputers: DiscoveredComputer[] = [
 
 const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCatalogSnapshotSchema.parse({
   runtime: 'prime_agent',
-  releaseVersion: '0.7.0',
+  releaseVersion: '0.7.1',
   observedAt: '2026-08-07T12:00:00.000Z',
   providers: [
     {

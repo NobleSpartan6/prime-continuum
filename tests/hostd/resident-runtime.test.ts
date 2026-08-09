@@ -24,9 +24,9 @@ function validHello(): Record<string, unknown> {
     protocol: { name: "prime-agent.daemon", version: 7 },
     schemaId: "protocol-7-schema-13-816309b1cd50",
     schemaRevision: 13,
-    appVersion: "0.7.0",
+    appVersion: "0.7.1",
     runtime: {
-      buildId: "be9e2fa-dirty",
+      buildId: "95afd31-dirty",
       executablePath: "C:\\Prime Agent\\prime-agent.exe",
       entrypointPath: "C:\\Prime Agent\\cli.js",
     },
@@ -49,18 +49,18 @@ function expectContractError(operation: () => unknown, code: string): ResidentRu
 }
 
 describe("resident Prime Agent runtime pin", () => {
-  it("pins the immutable v0.7.0 release asset and verified checksum", () => {
+  it("pins the immutable v0.7.1 release asset and verified checksum", () => {
     expect(PINNED_PRIME_AGENT_RUNTIME).toEqual({
       repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-      releaseTag: "v0.7.0",
-      releaseVersion: "0.7.0",
+      releaseTag: "v0.7.1",
+      releaseVersion: "0.7.1",
       packageName: "prime-agent",
-      assetFileName: "prime-agent-0.7.0.tgz",
+      assetFileName: "prime-agent-0.7.1.tgz",
       assetUrl:
-        "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.0/prime-agent-0.7.0.tgz",
-      sha256: "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
-      expectedAppVersion: "0.7.0",
-      runtimeBuildId: "be9e2fa-dirty",
+        "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+      sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
+      expectedAppVersion: "0.7.1",
+      runtimeBuildId: "95afd31-dirty",
       daemon: {
         protocolName: "prime-agent.daemon",
         protocolVersion: 7,
@@ -86,14 +86,14 @@ describe("resident daemon compatibility", () => {
     const compatibility = validateResidentDaemonHello(validHello());
 
     expect(compatibility).toEqual({
-      releaseVersion: "0.7.0",
-      appVersion: "0.7.0",
+      releaseVersion: "0.7.1",
+      appVersion: "0.7.1",
       protocolName: "prime-agent.daemon",
       protocolVersion: 7,
       schemaRevision: 13,
       schemaId: "protocol-7-schema-13-816309b1cd50",
       capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES, "session_input_admission"],
-      runtimeBuildId: "be9e2fa-dirty",
+      runtimeBuildId: "95afd31-dirty",
       supervisorGeneration: "supervisor-generation-1",
     });
     expect(compatibility).not.toHaveProperty("socketPath");
@@ -105,7 +105,7 @@ describe("resident daemon compatibility", () => {
   it.each([
     ["protocol name", { protocol: { name: "other.daemon", version: 7 } }, "PRIME_RUNTIME_PROTOCOL_NAME_MISMATCH"],
     ["protocol version", { protocol: { name: "prime-agent.daemon", version: 8 } }, "PRIME_RUNTIME_PROTOCOL_VERSION_MISMATCH"],
-    ["app version", { appVersion: "0.7.1" }, "PRIME_RUNTIME_APP_VERSION_MISMATCH"],
+    ["app version", { appVersion: "0.7.2" }, "PRIME_RUNTIME_APP_VERSION_MISMATCH"],
     ["schema revision", { schemaRevision: 14 }, "PRIME_RUNTIME_SCHEMA_REVISION_MISMATCH"],
     ["schema identity", { schemaId: "protocol-7-schema-14-other" }, "PRIME_RUNTIME_SCHEMA_ID_MISMATCH"],
   ])("fails fast on a %s mismatch", (_label, override, code) => {
@@ -143,7 +143,7 @@ describe("resident daemon compatibility", () => {
   it("binds an accepted hello to the exact requested socket path", () => {
     expect(
       validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\prime-agent-daemon" }),
-    ).toMatchObject({ appVersion: "0.7.0" });
+    ).toMatchObject({ appVersion: "0.7.1" });
     expectContractError(
       () => validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\other-daemon" }),
       "PRIME_RUNTIME_SOCKET_MISMATCH",
@@ -156,7 +156,7 @@ describe("resident daemon compatibility", () => {
         expectedExecutablePath: "C:\\Prime Agent\\prime-agent.exe",
         expectedEntrypointPath: "C:\\Prime Agent\\cli.js",
       }),
-    ).toMatchObject({ runtimeBuildId: "be9e2fa-dirty" });
+    ).toMatchObject({ runtimeBuildId: "95afd31-dirty" });
     expectContractError(
       () =>
         validateResidentDaemonHello(validHello(), {
@@ -467,7 +467,7 @@ describe("durable resident bindings", () => {
       () =>
         validateResidentSessionBinding({
           ...value,
-          runtime: { ...value.runtime, appVersion: "0.7.1" },
+          runtime: { ...value.runtime, appVersion: "0.7.2" },
         }),
       "PRIME_RUNTIME_BINDING_INVALID",
     );

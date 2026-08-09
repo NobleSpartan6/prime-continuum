@@ -14,14 +14,14 @@ const PRIME_AGENT_RELEASE_BASE_URL = "https://github.com/PrimeIntellect-ai/prime
  */
 export const PINNED_PRIME_AGENT_RUNTIME = Object.freeze({
   repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-  releaseTag: "v0.7.0",
-  releaseVersion: "0.7.0",
+  releaseTag: "v0.7.1",
+  releaseVersion: "0.7.1",
   packageName: "prime-agent",
-  assetFileName: "prime-agent-0.7.0.tgz",
-  assetUrl: `${PRIME_AGENT_RELEASE_BASE_URL}/v0.7.0/prime-agent-0.7.0.tgz`,
-  sha256: "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
-  expectedAppVersion: "0.7.0",
-  runtimeBuildId: "be9e2fa-dirty",
+  assetFileName: "prime-agent-0.7.1.tgz",
+  assetUrl: `${PRIME_AGENT_RELEASE_BASE_URL}/v0.7.1/prime-agent-0.7.1.tgz`,
+  sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
+  expectedAppVersion: "0.7.1",
+  runtimeBuildId: "95afd31-dirty",
   daemon: Object.freeze({
     protocolName: "prime-agent.daemon",
     protocolVersion: 7,
@@ -41,7 +41,7 @@ export const REQUIRED_RESIDENT_DAEMON_CAPABILITIES = Object.freeze([
 
 /**
  * The published package exposes DaemonClient and DaemonAgentConnection but not
- * its daemon launcher. In v0.7.0 the old `daemon` command is explicitly
+ * its daemon launcher. In v0.7.1 the old `daemon` command is explicitly
  * rejected; the documented `--mode daemon --daemon-socket` CLI mode is the
  * launch boundary. The adapter validates daemon_hello and performs
  * create/attach via DaemonClient. A resident session is never created through
@@ -139,7 +139,7 @@ const DaemonRuntimeIdentitySchema = z
   })
   .strict();
 
-/** Exact daemon_hello shape emitted by the pinned v0.7.0 runtime. */
+/** Exact daemon_hello shape emitted by the pinned v0.7.1 runtime. */
 const PinnedDaemonHelloSchema = z
   .object({
     type: z.literal("daemon_hello"),

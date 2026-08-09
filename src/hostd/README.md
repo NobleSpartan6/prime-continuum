@@ -63,7 +63,7 @@ Prime Agent and commands it runs. Launch Continuim from a deliberately minimized
 environment when project code or model-driven commands are not fully trusted.
 
 The resident adapter must fail closed unless the daemon hello reports Prime
-Agent 0.7.0, protocol 7, schema revision 13, schema ID
+Agent 0.7.1, protocol 7, schema revision 13, schema ID
 `protocol-7-schema-13-816309b1cd50`, and every required snapshot/replay
 capability. Normal disposal detaches. Only an explicit end-session operation may
 complete or kill the session.
@@ -113,7 +113,7 @@ transport result is lost and cancel later work, so it is not eligible for the
 acknowledged-Stop idle proof and returns nonretryable recovery-required admission
 errors. Safe retirement requires a future daemon-level atomic
 `abort_and_quiesce` epoch or verified session rotation; an ordinary
-`abort` followed by `waitForIdle` is not an ordering fence in Prime Agent 0.7.0.
+`abort` followed by `waitForIdle` is not an ordering fence in Prime Agent 0.7.1.
 
 `resident_control_projection_v1` is the polling-only multi-device prerequisite,
 not a mobile-control claim. `thread.control.snapshot` requires the exact expected

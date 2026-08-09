@@ -318,19 +318,19 @@ export interface PrimeDaemonClientPublic {
 /** Narrow structural view of the pinned package's public connection export. */
 export interface PrimeDaemonAgentConnectionPublic {
   getInitialSnapshot(): Promise<unknown>;
-  /** v0.7.0 waits for the action pump, agent, and server-side event queue to become idle. */
+  /** v0.7.1 waits for the action pump, agent, and server-side event queue to become idle. */
   waitForIdle?(): Promise<void>;
   /** Pinned public AgentConnection methods; guarded at the mutation boundary. */
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
-  /** v0.7.0 resolves prompt when the worker accepts/owns it, not at turn completion. */
+  /** v0.7.1 resolves prompt when the worker accepts/owns it, not at turn completion. */
   prompt?(
     message: string,
     options?: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ): Promise<void>;
-  /** v0.7.0 resolves abort when requestAbort() is accepted, not when stopping completes. */
+  /** v0.7.1 resolves abort when requestAbort() is accepted, not when stopping completes. */
   abort?(): Promise<void>;
-  /** v0.7.0 promotes one client-owned worker to ordinary resident lifetime. */
+  /** v0.7.1 promotes one client-owned worker to ordinary resident lifetime. */
   promoteToResident(): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
@@ -372,7 +372,7 @@ export interface PrimeAgentResidentAdapterOptions {
   readonly socketPath: string;
   /** Absolute, verified Node-compatible executable for the pinned runtime. */
   readonly executable: string;
-  /** Absolute, verified v0.7.0 dist/bundle/cli.js entrypoint. */
+  /** Absolute, verified v0.7.1 dist/bundle/cli.js entrypoint. */
   readonly cliEntrypoint: string;
   /** Absolute, writable host-owned directory used instead of ambient cwd. */
   readonly daemonWorkingDirectory: string;

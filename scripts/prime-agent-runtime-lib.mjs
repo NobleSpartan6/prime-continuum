@@ -591,8 +591,14 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   const commandRunner = options.commandRunner ?? runCommand;
   if (typeof commandRunner !== "function") throw buildError("Runtime smoke command runner is invalid.");
   const entrypoints = await resolveVerifiedEntrypoints(runtimeDirectory, options.policy);
+  const daemonSupervisor = await requireContainedRealFile(
+    entrypoints.root,
+    "node_modules/prime-agent/dist/modes/daemon/daemon-supervisor.js",
+    "Prime Agent daemon supervisor",
+  );
   const scratchDirectory = await mkdtemp(join(tmpdir(), "prime-continuim-runtime-smoke-"));
   const probePath = join(scratchDirectory, "runtime-probe.mjs");
+  const retryWorkerProbePath = join(scratchDirectory, "runtime-retry-worker-probe.mjs");
   const daemonClientPath = join(scratchDirectory, "runtime-daemon-client.mjs");
   const probeSource = [
     'import { createRequire } from "node:module";',
@@ -603,6 +609,26 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     'const zeromq = require("zeromq");',
     'if (!zeromq || (typeof zeromq !== "object" && typeof zeromq !== "function")) throw new Error("zeromq did not load");',
     'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
+  ].join("\n");
+  const retryWorkerProbeSource = [
+    'import { resolve } from "node:path";',
+    "const [supervisorModuleUrl, agentDir] = process.argv.slice(2);",
+    'if (!supervisorModuleUrl || !agentDir) throw new Error("missing retry_worker smoke arguments");',
+    "const { DaemonSupervisor } = await import(supervisorModuleUrl);",
+    'if (typeof DaemonSupervisor !== "function") throw new Error("missing DaemonSupervisor export");',
+    'const supervisor = new DaemonSupervisor(resolve(agentDir, "retry-probe.sock"), { defaultSessionConfig: { agentDir } });',
+    "const descriptor = { workerId: \"worker-1\", rootActiveSessionId: \"active-1\", rootSessionId: \"session-1\", lifecycle: \"stopped\", stopRequestedAt: \"2026-08-09T00:00:00.000Z\", archiveOnStop: true, consecutiveFailures: 4 };",
+    "const worker = { descriptor, intentionalStop: true, summaries: new Map() };",
+    "supervisor.workers.set(descriptor.workerId, worker);",
+    "supervisor.assertWorkerAccessibleToClient = () => undefined;",
+    "const events = [];",
+    "supervisor.persistWorker = (candidate) => events.push({ kind: \"persist\", intentionalStop: candidate.intentionalStop, stopRequestedAt: candidate.descriptor.stopRequestedAt, archiveOnStop: candidate.descriptor.archiveOnStop, lifecycle: candidate.descriptor.lifecycle, consecutiveFailures: candidate.descriptor.consecutiveFailures });",
+    "supervisor.recoverWorker = async (candidate) => { events.push({ kind: \"recover\", stopRequestedAt: candidate.descriptor.stopRequestedAt, archiveOnStop: candidate.descriptor.archiveOnStop, lifecycle: candidate.descriptor.lifecycle }); candidate.descriptor.lifecycle = \"ready\"; };",
+    'const response = await supervisor.handleCommand({}, { id: "retry-1", type: "retry_worker", activeSessionId: "active-1" });',
+    'const expected = JSON.stringify([{ kind: "persist", intentionalStop: false, lifecycle: "recovering", consecutiveFailures: 0 }, { kind: "recover", lifecycle: "recovering" }]);',
+    'if (JSON.stringify(events) !== expected) throw new Error(`retry_worker ordering changed: ${JSON.stringify(events)}`);',
+    'if (response?.type !== "response" || response.command !== "retry_worker" || response.success !== true) throw new Error("retry_worker response changed");',
+    'process.stdout.write(JSON.stringify({ retryWorkerOrdering: true }));',
   ].join("\n");
   const daemonClientSource = [
     "const [moduleUrl, socketPath] = process.argv.slice(2);",
@@ -639,6 +665,7 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   try {
     await Promise.all([
       writeFile(probePath, probeSource, { encoding: "utf8", mode: 0o600, flag: "wx" }),
+      writeFile(retryWorkerProbePath, retryWorkerProbeSource, { encoding: "utf8", mode: 0o600, flag: "wx" }),
       writeFile(daemonClientPath, daemonClientSource, { encoding: "utf8", mode: 0o600, flag: "wx" }),
     ]);
     const probe = await commandRunner(
@@ -655,6 +682,25 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
       throw buildError("Runtime smoke process target does not match the build target.");
     }
     assertMinimumNodeVersion(runtimeVersions.node, options.policy.minimumNodeVersion);
+
+    const retryWorkerProbe = await commandRunner(
+      runtimeExecutable,
+      [retryWorkerProbePath, pathToFileURL(daemonSupervisor).href, scratchDirectory],
+      {
+        cwd: runtimeDirectory,
+        env: cleanRuntimeEnvironment(process.env, { electronRunAsNode }),
+        timeoutMs: 30_000,
+      },
+    );
+    let retryWorkerResult;
+    try {
+      retryWorkerResult = JSON.parse(retryWorkerProbe.stdout);
+    } catch (error) {
+      throw buildError("Prime Agent retry_worker smoke helper returned invalid JSON.", error);
+    }
+    if (retryWorkerResult?.retryWorkerOrdering !== true) {
+      throw buildError("Prime Agent retry_worker smoke did not prove tombstone clearing before recovery.");
+    }
 
     const smokeAgentDirectory = join(scratchDirectory, "agent");
     await mkdir(smokeAgentDirectory, { recursive: false });

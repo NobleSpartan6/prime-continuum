@@ -7,7 +7,7 @@ const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_SCOPE = "openid profile email offline_access";
 
 /**
- * Prime Agent v0.7.0 has one fixed Codex authorization construction. Keeping
+ * Prime Agent v0.7.1 has one fixed Codex authorization construction. Keeping
  * this allow-list exact prevents a compromised or incompatible helper from
  * turning the desktop's system-browser privilege into an arbitrary URL opener.
  */

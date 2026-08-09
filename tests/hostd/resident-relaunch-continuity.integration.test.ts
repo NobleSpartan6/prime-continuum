@@ -365,9 +365,9 @@ describe("resident continuity across hostd/store relaunch", () => {
       },
       schemaId: "protocol-7-schema-13-816309b1cd50",
       schemaRevision: 13,
-      appVersion: "0.7.0",
+      appVersion: "0.7.1",
       runtime: {
-        buildId: "be9e2fa-dirty",
+        buildId: "95afd31-dirty",
         executablePath: paths.executable,
         entrypointPath: paths.cliEntrypoint,
       },

@@ -74,9 +74,9 @@ function validHello(overrides: Record<string, unknown> = {}): Record<string, unk
     protocol: { name: "prime-agent.daemon", version: 7 },
     schemaId: "protocol-7-schema-13-816309b1cd50",
     schemaRevision: 13,
-    appVersion: "0.7.0",
+    appVersion: "0.7.1",
     runtime: {
-      buildId: "be9e2fa-dirty",
+      buildId: "95afd31-dirty",
       executablePath: RUNTIME_NODE,
       entrypointPath: RUNTIME_CLI,
     },
@@ -671,7 +671,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     const { adapter, state } = createHarness();
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.0" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
 
     expect(state.spawnCalls).toHaveLength(0);
     expect(state.chronology).toEqual(["connect", "client:close"]);
@@ -711,7 +711,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
   });
 
   it("fails closed on an incompatible live daemon without launching a replacement", async () => {
-    const { adapter, state } = createHarness({ hello: validHello({ appVersion: "0.7.1" }) });
+    const { adapter, state } = createHarness({ hello: validHello({ appVersion: "0.7.2" }) });
     const invocation = buildHarnessInvocation();
 
     await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_APP_VERSION_MISMATCH");
@@ -738,7 +738,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     });
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.0" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
 
     expect(state.spawnCalls).toHaveLength(1);
     expect(adapter.getLifecycle().state).toBe("ready");
@@ -790,7 +790,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       sessionId: "session-1",
       sessionFile: SESSION_FILE,
       boundAt: "2026-08-06T17:00:00.000Z",
-      runtime: { runtimeBuildId: "be9e2fa-dirty" },
+      runtime: { runtimeBuildId: "95afd31-dirty" },
     });
     expect(Object.isFrozen(candidate)).toBe(true);
     expect(Object.isFrozen(candidate.runtime)).toBe(true);

@@ -21,12 +21,13 @@ Prime Agent's local daemon protocol is not a hosted or mobile gateway. Remote co
 
 ## Upstream runtime pin
 
-The first supported integration target is the official Prime Agent v0.7.0 release asset:
+The current supported integration target is the official Prime Agent v0.7.1 release asset:
 
-- release target: `be9e2fa0714e7cd1c6bd9bdb1b554d2cc6550387`
-- asset: `prime-agent-0.7.0.tgz`
-- SHA-256: `88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b`
-- app version: `0.7.0`
+- release target: `95afd319a78ae017a41241d50b013d656a0685ce`
+- asset: `prime-agent-0.7.1.tgz`
+- SHA-256: `d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb`
+- app version: `0.7.1`
+- runtime build ID: `95afd31-dirty`
 - daemon protocol: `prime-agent.daemon` version `7`
 - schema revision: `13`
 - schema ID: `protocol-7-schema-13-816309b1cd50`

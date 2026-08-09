@@ -2,7 +2,8 @@ import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } f
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import * as runtimeLib from "../../scripts/prime-agent-runtime-lib.mjs";
@@ -40,9 +41,40 @@ afterEach(async () => {
 describe("Prime Agent runtime build policy", () => {
   it("accepts the checked-in exact release graph and rejects source drift", async () => {
     const inputs = await loadRuntimeInputs();
+    expect(inputs.sources.release).toEqual({
+      repository: "https://github.com/PrimeIntellect-ai/prime-agent",
+      tag: "v0.7.1",
+      version: "0.7.1",
+      commit: "95afd319a78ae017a41241d50b013d656a0685ce",
+    });
+    expect(inputs.policy).toMatchObject({
+      releaseVersion: "0.7.1",
+      runtimeBuildId: "95afd31-dirty",
+      criticalPackages: {
+        "prime-agent": {
+          version: "0.7.1",
+          integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+        },
+      },
+    });
+    expect(inputs.packageJson).toMatchObject({
+      version: "0.7.1",
+      dependencies: {
+        "prime-agent":
+          "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+      },
+    });
     expect(inputs.sources).not.toHaveProperty("codexAppServer");
     expect(inputs.policy).not.toHaveProperty("codexAppServer");
     expect(inputs.sources.assets).toHaveLength(4);
+    expect(inputs.sources.assets[0]).toEqual({
+      packageName: "prime-agent",
+      fileName: "prime-agent-0.7.1.tgz",
+      url: "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+      size: 9_323_519,
+      sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
+      integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+    });
     expect(inputs.sources.assets.every((asset: { url: string }) => !asset.url.includes("openai/codex"))).toBe(true);
     expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
@@ -291,7 +323,36 @@ describe("Prime Agent runtime tree attestation", () => {
     const primeDirectory = join(root, "node_modules", "prime-agent");
     await writeFile(
       join(primeDirectory, "package.json"),
-      '{"name":"prime-agent","version":"0.7.0","type":"module"}\n',
+      '{"name":"prime-agent","version":"0.7.1","type":"module"}\n',
+    );
+    const daemonSupervisorPath = join(
+      primeDirectory,
+      "dist",
+      "modes",
+      "daemon",
+      "daemon-supervisor.js",
+    );
+    await mkdir(dirname(daemonSupervisorPath), { recursive: true });
+    await writeFile(
+      daemonSupervisorPath,
+      [
+        "export class DaemonSupervisor {",
+        "  workers = new Map();",
+        "  async handleCommand(client, command) {",
+        "    const worker = [...this.workers.values()].find((candidate) => candidate.descriptor.rootActiveSessionId === command.activeSessionId);",
+        "    this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);",
+        "    worker.intentionalStop = false;",
+        "    worker.descriptor.stopRequestedAt = undefined;",
+        "    worker.descriptor.archiveOnStop = undefined;",
+        '    worker.descriptor.lifecycle = "recovering";',
+        "    worker.descriptor.consecutiveFailures = 0;",
+        "    this.persistWorker(worker);",
+        "    await this.recoverWorker(worker);",
+        '    return { id: command.id, type: "response", command: command.type, success: true };',
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
     );
     const entrypoints = await resolveVerifiedEntrypoints(root, inputs.policy);
     const runtimeExecutable = await realpath(process.execPath);
@@ -335,9 +396,9 @@ describe("Prime Agent runtime tree attestation", () => {
       const helperName = basename(args[0] ?? "");
       const helperSource = await readFile(args[0] ?? "", "utf8");
       expect(command).toBe(runtimeExecutable);
-      expect(args[1]).toBe(entrypoints.moduleUrl);
       expect(options.env?.ELECTRON_RUN_AS_NODE).toBe("1");
       if (helperName === "runtime-probe.mjs") {
+        expect(args[1]).toBe(entrypoints.moduleUrl);
         expect(helperSource).toContain("await import(moduleUrl)");
         return {
           stdout: JSON.stringify({
@@ -350,7 +411,21 @@ describe("Prime Agent runtime tree attestation", () => {
           stderr: "",
         };
       }
+      if (helperName === "runtime-retry-worker-probe.mjs") {
+        expect(args[1]).toBe(pathToFileURL(daemonSupervisorPath).href);
+        expect(helperSource).toContain('type: "retry_worker"');
+        expect(helperSource).toContain('stopRequestedAt: candidate.descriptor.stopRequestedAt');
+        const result = await execFileAsync(command, args, {
+          cwd: options.cwd,
+          env: options.env,
+          timeout: options.timeoutMs,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+        });
+        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      }
       expect(helperName).toBe("runtime-daemon-client.mjs");
+      expect(args[1]).toBe(entrypoints.moduleUrl);
       expect(helperSource).toContain("const runtime = await import(moduleUrl)");
       expect(helperSource).toContain('client.request({ type: "shutdown", force: true }, 5_000)');
       const socketPath = args[2];
@@ -376,9 +451,28 @@ describe("Prime Agent runtime tree attestation", () => {
       ).resolves.toMatchObject({ runtimeExecutable });
       expect(calls.map((call) => basename(call.args[0] ?? ""))).toEqual([
         "runtime-probe.mjs",
+        "runtime-retry-worker-probe.mjs",
         "runtime-daemon-client.mjs",
       ]);
       expect(markerGlobal[importMarker]).toBeUndefined();
+
+      const invalidRetryRunner = async (
+        command: string,
+        args: string[],
+        options: SmokeRunnerOptions,
+      ): Promise<{ stdout: string; stderr: string }> => {
+        const result = await commandRunner(command, args, options);
+        if (basename(args[0] ?? "") !== "runtime-retry-worker-probe.mjs") return result;
+        return { ...result, stdout: JSON.stringify({ retryWorkerOrdering: false }) };
+      };
+      await expect(
+        smokeRuntime(root, {
+          runtimeExecutable,
+          electronRunAsNode: true,
+          policy: inputs.policy,
+          commandRunner: invalidRetryRunner,
+        }),
+      ).rejects.toThrow("did not prove tombstone clearing before recovery");
 
       const invalidHelloRunner = async (
         command: string,
@@ -620,7 +714,7 @@ async function makeRuntimeFixture(name: string): Promise<string> {
   await Promise.all([
     writeFile(join(root, "package.json"), '{"name":"fixture"}\n'),
     writeFile(join(root, "package-lock.json"), '{"lockfileVersion":3}\n'),
-    writeFile(join(prime, "package.json"), '{"name":"prime-agent","version":"0.7.0"}\n'),
+    writeFile(join(prime, "package.json"), '{"name":"prime-agent","version":"0.7.1"}\n'),
     writeFile(join(prime, "dist", "index.js"), "export class DaemonClient {}\n"),
     writeFile(join(prime, "dist", "bundle", "cli.js"), "process.exitCode = 0;\n"),
     writeFile(join(root, "node_modules", "zeromq", "build", "fixture", "addon.node"), "native-fixture"),
@@ -636,8 +730,8 @@ async function makeTemporaryDirectory(): Promise<string> {
 
 function fixtureInputs() {
   const policy = {
-    releaseVersion: "0.7.0",
-    runtimeBuildId: "be9e2fa-dirty",
+    releaseVersion: "0.7.1",
+    runtimeBuildId: "95afd31-dirty",
     minimumNodeVersion: "22.8.0",
     npmVersion: "10.9.8",
     install: {
@@ -663,7 +757,12 @@ function fixtureInputs() {
   return {
     policy,
     sources: {
-      release: { repository: "https://github.com/PrimeIntellect-ai/prime-agent", tag: "v0.7.0", version: "0.7.0", commit: "be9e2fa" },
+      release: {
+        repository: "https://github.com/PrimeIntellect-ai/prime-agent",
+        tag: "v0.7.1",
+        version: "0.7.1",
+        commit: "95afd319a78ae017a41241d50b013d656a0685ce",
+      },
       assets: [],
     },
     sourcesSha256: "a".repeat(64),

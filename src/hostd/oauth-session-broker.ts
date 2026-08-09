@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 /**
- * Prime Agent v0.7.0 integration boundary:
+ * Prime Agent v0.7.1 integration boundary:
  *
  * - Public OAuth providers expose one in-process `login(callbacks)` promise,
  *   not a durable or resumable flow.
@@ -214,7 +214,7 @@ class SessionInterruptedError extends Error {}
  * Host-only OAuth coordinator. Credentials enter only the injected storage port
  * and are deliberately absent from every public snapshot and broker error.
  *
- * The concrete Prime Agent adapter is intentionally separate: v0.7.0 exports
+ * The concrete Prime Agent adapter is intentionally separate: v0.7.1 exports
  * provider objects and AuthStorage, but no resumable start/respond/cancel broker.
  */
 export class HostOAuthSessionBroker {

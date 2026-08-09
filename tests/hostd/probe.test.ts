@@ -15,7 +15,7 @@ describe("host runtime probe", () => {
       available: false,
       status: "error",
       version: `Node.js ${version}`,
-      diagnostic: "Prime Agent 0.7.0 requires Node.js 22.8 or newer.",
+      diagnostic: "Prime Agent 0.7.1 requires Node.js 22.8 or newer.",
     });
   });
 

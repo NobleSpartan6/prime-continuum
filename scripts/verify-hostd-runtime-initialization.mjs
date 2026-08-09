@@ -39,9 +39,9 @@ const WARMED_CAPABILITIES = Object.freeze([
   RUNTIME_OAUTH_CAPABILITY,
 ].sort());
 const EXPECTED_MODEL_CATALOG = Object.freeze({
-  releaseVersion: "0.7.0",
+  releaseVersion: "0.7.1",
   providers: 32,
-  models: 1_169,
+  models: 1_173,
   requiredModels: Object.freeze([
     "gpt-5.6-sol",
     "claude-opus-5",
@@ -52,6 +52,9 @@ const EXPECTED_MODEL_CATALOG = Object.freeze({
     "qwen/qwen3.6-35b-a3b",
     "minimax/minimax-m3",
     "openai/gpt-oss-120b",
+  ]),
+  forbiddenModels: Object.freeze([
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
   ]),
 });
 
@@ -394,6 +397,11 @@ function assertRuntimeModelCatalog(catalog, health) {
   if (missing.length > 0) {
     throw new Error(`Runtime model catalog lost required frontier routes: ${missing.join(", ")}`);
   }
+  const retired = EXPECTED_MODEL_CATALOG.forbiddenModels
+    .filter((modelId) => routeKeys.has(modelId));
+  if (retired.length > 0) {
+    throw new Error(`Runtime model catalog regained retired routes: ${retired.join(", ")}`);
+  }
   assertNoSecretBearingCatalogFields(catalog);
   return Object.freeze({
     releaseVersion: catalog.releaseVersion,
@@ -401,6 +409,7 @@ function assertRuntimeModelCatalog(catalog, health) {
     providers: catalog.providers.length,
     models: catalog.models.length,
     requiredModels: EXPECTED_MODEL_CATALOG.requiredModels.length,
+    forbiddenModels: EXPECTED_MODEL_CATALOG.forbiddenModels.length,
     secretBearingPropertiesPresent: false,
   });
 }

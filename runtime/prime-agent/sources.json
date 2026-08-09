@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "release": {
     "repository": "https://github.com/PrimeIntellect-ai/prime-agent",
-    "tag": "v0.7.0",
-    "version": "0.7.0",
-    "commit": "be9e2fa"
+    "tag": "v0.7.1",
+    "version": "0.7.1",
+    "commit": "95afd319a78ae017a41241d50b013d656a0685ce"
   },
   "allowedDownloadHosts": [
     "github.com",
@@ -16,35 +16,35 @@
   "assets": [
     {
       "packageName": "prime-agent",
-      "fileName": "prime-agent-0.7.0.tgz",
-      "url": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.0/prime-agent-0.7.0.tgz",
-      "size": 9323789,
-      "sha256": "88b6578518c72cd51a825bc80f28e0fef9a64c67de4a7d6fd7afd7ca1b34da0b",
-      "integrity": "sha512-pgrjR4QFg4VqgcPg+50VSmttjISuFQgv2a5Bx6L7jD/Mk72/XGd6strBuQPIJ0+KKNekaiEf7cclt7RWvw8s7w=="
+      "fileName": "prime-agent-0.7.1.tgz",
+      "url": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+      "size": 9323519,
+      "sha256": "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
+      "integrity": "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ=="
     },
     {
       "packageName": "@earendil-works/pi-agent-core",
-      "fileName": "prime-agent-core-0.7.0.tgz",
-      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-core-0.7.0.tgz",
+      "fileName": "prime-agent-core-0.7.1.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.1/prime-agent-core-0.7.1.tgz",
       "size": 62815,
-      "sha256": "0313373089831d9a2ce06e874fab8b9c05762c0094ff9fc202908cf7db7f99cd",
-      "integrity": "sha512-lx+juh3pTKb8hVFjtVEKjcVttsNBpKh8anWO15cQ4uuYVeHOFXYs/SjHPEEO7/m1PbmuXHpz1E3qEBxoM6AwaQ=="
+      "sha256": "75bb5a04969208f6d2397d0608c5ee7fbdad3335d6b3ade3e6c88f90f7627678",
+      "integrity": "sha512-j/53bIwcLKEjZEtmXYDYyqx+OL4CXIzu09KOzkXnt4mC2L37i2ieHMYjsAOBevTlfAfaANhR4CGG/mY73MDflA=="
     },
     {
       "packageName": "@earendil-works/pi-ai",
-      "fileName": "prime-agent-ai-0.7.0.tgz",
-      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-ai-0.7.0.tgz",
-      "size": 533591,
-      "sha256": "7cdbb3e835f48dd103325f7a351ce540b27af4d161aeb9c7b9bdcc12fe7909af",
-      "integrity": "sha512-UUYRmIA4SG3wg2v0Dnpj16DxgwZu3GtzZuZhtyEUMeXbdG3Bv7bmHowPCQC/6+GDepd82mwRmV4RVe4IrMlNUg=="
+      "fileName": "prime-agent-ai-0.7.1.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.1/prime-agent-ai-0.7.1.tgz",
+      "size": 534063,
+      "sha256": "8f24accba5cefe8d9a26cf84698110c99ef12d511000afa450503d1f7f2d45a3",
+      "integrity": "sha512-bZeaRGH9GLlesDF6QcrFvKfvE4zF3B0qo9cG2thknn/RFVDvLa4WAqEnoJmn7TmQiOwXCfYrV07ZPtKqSolq9A=="
     },
     {
       "packageName": "@earendil-works/pi-tui",
-      "fileName": "prime-agent-tui-0.7.0.tgz",
-      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.0/prime-agent-tui-0.7.0.tgz",
+      "fileName": "prime-agent-tui-0.7.1.tgz",
+      "url": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.7.1/prime-agent-tui-0.7.1.tgz",
       "size": 444299,
-      "sha256": "3225f7f92e87db80fe2c9005d1f7770735ae625c32935ef2283688fc9bd33951",
-      "integrity": "sha512-mbypMOaUYrrQCBc59YZ34RQHWmsnzJNhd1ISF5E39L9qEKpVU5ZpctTqrA9Dhdo7IGDk0WfSnppNls/uyAcMjw=="
+      "sha256": "22376a2fb3f5931185690cac98cc2e222771a04f9e1ba6ff6ef63224689548e7",
+      "integrity": "sha512-5p4y8kc9OducfCbgqZN47ggM3IrG4zQb1x0epBeSdsP04aQLVxbFwU98IBpb/kdpQacyu21Pqves2bLLRKbSEA=="
     }
   ]
 }

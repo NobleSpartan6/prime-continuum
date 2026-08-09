@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "releaseVersion": "0.7.0",
-  "runtimeBuildId": "be9e2fa-dirty",
+  "releaseVersion": "0.7.1",
+  "runtimeBuildId": "95afd31-dirty",
   "minimumNodeVersion": "22.8.0",
   "npmVersion": "10.9.8",
   "lockfileVersion": 3,
@@ -37,8 +37,8 @@
   },
   "criticalPackages": {
     "prime-agent": {
-      "version": "0.7.0",
-      "integrity": "sha512-pgrjR4QFg4VqgcPg+50VSmttjISuFQgv2a5Bx6L7jD/Mk72/XGd6strBuQPIJ0+KKNekaiEf7cclt7RWvw8s7w=="
+      "version": "0.7.1",
+      "integrity": "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ=="
     },
     "zeromq": {
       "version": "6.5.0",

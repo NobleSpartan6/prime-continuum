@@ -2568,7 +2568,7 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).queryByText(/illustrative|sample catalog|browser preview/i)).not.toBeInTheDocument()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledWith('host-devbox')
     expect(within(dialog).getByText('2 configured')).toBeVisible()
-    expect(within(dialog).getByText(/OAuth-capable providers · Prime Agent 0\.7\.0/)).toBeVisible()
+    expect(within(dialog).getByText(/OAuth-capable providers · Prime Agent 0\.7\.1/)).toBeVisible()
     expect(within(dialog).getByText('GPT-5.6 Sol')).toBeVisible()
     expect(within(dialog).getByText('Kimi K3')).toBeVisible()
     expect(within(dialog).getByText('Current')).toBeVisible()
@@ -2651,7 +2651,7 @@ describe('Prime Continuim renderer', () => {
 
     expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
     expect(within(dialog).getByText(/no authorization URL or credential is exposed to this view/i)).toBeVisible()
-    expect(dialog.querySelector('.provider-setup-note__storage')).toHaveTextContent(/Prime Agent 0\.7\.0.*auth\.json.*operating-system account’s file permissions/i)
+    expect(dialog.querySelector('.provider-setup-note__storage')).toHaveTextContent(/Prime Agent 0\.7\.1.*auth\.json.*operating-system account’s file permissions/i)
     expect(within(dialog).getByText('auth.json is plaintext at rest; it is not a keychain or keyring.')).toBeVisible()
     expect(within(dialog).getByText(/Availability checks reload the account state before model selection/i)).toBeVisible()
     expect(within(dialog).queryByText(/new resident session|restart/i)).not.toBeInTheDocument()
