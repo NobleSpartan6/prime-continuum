@@ -1,5 +1,4 @@
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -8,6 +7,7 @@ import {
   resolvePnpmCli,
   workspaceBuildActivity,
 } from "../../src/hostd/candidate-evaluation";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 const roots: string[] = [];
 
@@ -43,7 +43,7 @@ describe("candidate evaluation passive backend", () => {
   });
 
   it("resolves only an actual JavaScript pnpm/Corepack launcher", async () => {
-    const root = await mkdtemp(join(tmpdir(), "prime-pnpm-launcher-"));
+    const root = await canonicalTemporaryDirectory("prime-pnpm-launcher-");
     roots.push(root);
     const npmCli = join(root, "npm-cli.js");
     const shellShim = join(root, "pnpm");
@@ -57,6 +57,18 @@ describe("candidate evaluation passive backend", () => {
     await expect(resolvePnpmCli({ npm_execpath: npmCli, PATH: "" })).rejects.toThrow(/could not be resolved/);
     await expect(resolvePnpmCli({ npm_execpath: shellShim, PATH: "" })).rejects.toThrow(/could not be resolved/);
     await expect(resolvePnpmCli({ npm_execpath: pnpmCli, PATH: "" })).resolves.toBe(pnpmCli);
+  });
+
+  it("rejects repository Git indirection instead of treating it as a plain root", async () => {
+    const root = await canonicalTemporaryDirectory("prime-candidate-git-indirection-");
+    roots.push(root);
+    await writeFile(join(root, ".git"), "gitdir: ../redirected-git-directory\n");
+
+    await expect(capturePassiveReview(
+      root,
+      join(root, "node_modules", "node", "node.exe"),
+      join(root, "tools", "pnpm.cjs"),
+    )).rejects.toThrow(/plain repository Git directory/);
   });
 
   it("passively rejects live, malformed, and unresolved child workflow leases", async () => {
@@ -94,7 +106,7 @@ describe("candidate evaluation passive backend", () => {
 });
 
 async function fixtureRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "prime-candidate-passive-"));
+  const root = await canonicalTemporaryDirectory("prime-candidate-passive-");
   roots.push(root);
   await Promise.all([
     mkdir(join(root, ".git"), { recursive: true }),
