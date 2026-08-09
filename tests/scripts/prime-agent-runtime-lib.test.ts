@@ -412,7 +412,7 @@ describe("Prime Agent runtime tree attestation", () => {
         };
       }
       if (helperName === "runtime-retry-worker-probe.mjs") {
-        expect(args[1]).toBe(pathToFileURL(daemonSupervisorPath).href);
+        expect(args[1]).toBe(pathToFileURL(await realpath(daemonSupervisorPath)).href);
         expect(helperSource).toContain('type: "retry_worker"');
         expect(helperSource).toContain('stopRequestedAt: candidate.descriptor.stopRequestedAt');
         const result = await execFileAsync(command, args, {
