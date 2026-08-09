@@ -2,6 +2,7 @@ import { resolve } from 'node:path'
 import { defineConfig } from 'vitest/config'
 
 const hostedWindows = Boolean(process.env.CI) && process.platform === 'win32'
+const githubActions = process.env.GITHUB_ACTIONS === 'true'
 
 export default defineConfig({
   resolve: {
@@ -19,7 +20,10 @@ export default defineConfig({
     // explicit in their tests and production code. Other CI hosts retain two.
     maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined,
     testTimeout: hostedWindows ? 20_000 : 5_000,
-    reporters: ['default'],
+    // Keep the readable console report while also publishing exact failing-test
+    // annotations. Public workflow logs are otherwise reduced to a generic
+    // process exit for unauthenticated reviewers.
+    reporters: githubActions ? ['default', 'github-actions'] : ['default'],
     coverage: {
       reporter: ['text', 'html'],
       include: ['src/**/*.{ts,tsx}']
