@@ -94,10 +94,15 @@ function parseDacl(sddl: string): Readonly<{ flags: string; body: string }> | un
 }
 
 function hasExactDaclFlags(flags: string, kind: "protected" | "inherited"): boolean {
+  if (kind === "inherited") {
+    // NTFS can return an inherited file DACL with every ACE marked ID while
+    // omitting the descriptor-level AI control bit. The ACE flags carry the
+    // inheritance proof used below; no other descriptor control is accepted.
+    return flags === "" || flags === "AI";
+  }
   const tokens: string[] = flags.match(/AI|AR|P/g) ?? [];
   if (tokens.join("") !== flags || new Set(tokens).size !== tokens.length) return false;
-  if (kind === "protected") return tokens.includes("P");
-  return !tokens.includes("P") && tokens.includes("AI");
+  return tokens.includes("P");
 }
 
 function hasExactAceFlags(flags: string, required: readonly string[]): boolean {

@@ -23,13 +23,30 @@ describe("neutral Windows security descriptor predicates", () => {
   });
 
   it("allows the exact inherited descendant form but never promotes it to a root proof", () => {
-    const inheritedFile = `D:AI(A;ID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`;
-    expect(isSecureInheritedUserEntryDacl(inheritedFile, USER)).toBe(true);
-    expect(areAllSecureUserEntryDacls(`auth ${inheritedFile}\n`, USER, 1)).toBe(true);
-    expect(isSecureInheritedUserEntryDacl(
-      `D:AI(A;ID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;WD)`,
-      USER,
-    )).toBe(false);
+    const inheritedFile = `(A;ID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`;
+    expect(isSecureInheritedUserEntryDacl(`D:${inheritedFile}`, USER)).toBe(true);
+    expect(isSecureInheritedUserEntryDacl(`D:AI${inheritedFile}`, USER)).toBe(true);
+    expect(areAllSecureUserEntryDacls(`auth D:${inheritedFile}\n`, USER, 1)).toBe(true);
+    expect(isExactProtectedUserDirectoryDacl(`D:${inheritedFile}`, USER)).toBe(false);
+
+    for (const invalid of [
+      `D:P${inheritedFile}`,
+      `D:AR${inheritedFile}`,
+      `D:PAI${inheritedFile}`,
+      `D:X${inheritedFile}`,
+      `D:(A;;FA;;;${USER})(A;;FA;;;SY)(A;;FA;;;BA)`,
+      `D:(A;ID;FA;;;${USER})(A;;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;ID;FA;;;${USER})(A;ID;FA;;;${USER})(A;ID;FA;;;BA)`,
+      `D:${inheritedFile}(A;ID;FA;;;WD)`,
+      `D:(D;ID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;ID;FA;object-guid;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;OIID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;ID;FA;;;${USER})(A;OICIID;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;ID;FR;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`,
+      `D:(A;ID;FA;;;${USER})(A;ID;FA;;;SY)(A;ID;FA;;;WD)`,
+    ]) {
+      expect(isSecureInheritedUserEntryDacl(invalid, USER)).toBe(false);
+    }
   });
 
   it("supports bounded classic and Entra user SID namespaces but excludes well-known identities", () => {

@@ -17,7 +17,7 @@ const USER_SID = "S-1-5-21-100-200-300-1001";
 const AAD_USER_SID = "S-1-12-1-100-200-300-400";
 const SYSTEM_SID = "S-1-5-18";
 const PROTECTED_DACL = `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`;
-const INHERITED_FILE_DACL = `D:AI(A;ID;FA;;;${USER_SID})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`;
+const INHERITED_FILE_DACL = `D:(A;ID;FA;;;${USER_SID})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`;
 const PROGRAM_DATA_SDDL = "O:SYG:SYD:PAI(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)" +
   "(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
 
@@ -138,7 +138,7 @@ describe("host-scoped Prime Agent runtime custody", () => {
     });
   });
 
-  it.runIf(process.platform === "win32")("allows only inherited exact descendant ACLs and proves auth.json ownership", async () => {
+  it.runIf(process.platform === "win32")("accepts an exact inherited auth.json DACL without an AI control bit and proves ownership", async () => {
     const fixture = await windowsFixture({ createAgent: true, createAuth: true });
 
     const proof = await fixture.security.prepareAndVerify(fixture.hostRoot, fixture.agentDirectory);
