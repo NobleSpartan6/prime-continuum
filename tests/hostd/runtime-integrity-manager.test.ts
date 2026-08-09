@@ -808,6 +808,22 @@ describe("runtime file-manifest namespace", () => {
     expect(() => parseRuntimeFileManifest(`${DIGEST}  z.js\n${DIGEST}  a.js\n`, 2)).toThrow("canonical");
     expect(() => parseRuntimeFileManifest(`${DIGEST}  a.js`, 1)).toThrow("canonical");
   });
+
+  it("admits only an exact schema-derived companion executable path", () => {
+    const executable = "companions/codex-app-server/bin/codex-app-server.exe";
+    expect(parseRuntimeFileManifest(
+      `${DIGEST}  ${executable}\n`,
+      1,
+      undefined,
+      new Set([executable]),
+    )).toEqual([{ path: executable, sha256: DIGEST }]);
+    expect(() => parseRuntimeFileManifest(
+      `${DIGEST}  companions/codex-app-server/bin/other.exe\n`,
+      1,
+      undefined,
+      new Set([executable]),
+    )).toThrow("unattested native executable");
+  });
 });
 
 interface Fixture {

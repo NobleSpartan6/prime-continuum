@@ -10,6 +10,12 @@ import {
   CandidateEvaluationSnapshotSchema,
   CandidateEvaluationStatusSchema,
   CatalogProjectionSnapshotSchema,
+  CODEX_SUBSCRIPTION_CAPABILITY,
+  CodexSubscriptionAccountSnapshotSchema,
+  CodexSubscriptionConversationLookupSchema,
+  CodexSubscriptionConversationSnapshotSchema,
+  CodexSubscriptionLoginStartResultSchema,
+  CodexSubscriptionTurnReconciliationSchema,
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
@@ -35,6 +41,19 @@ import {
   type CandidateEvaluationSnapshot,
   type CandidateEvaluationStartRequest,
   type CandidateEvaluationStatus,
+  type CodexSubscriptionAccountSnapshot,
+  type CodexSubscriptionAccountReadRequest,
+  type CodexSubscriptionConversationLookup,
+  type CodexSubscriptionConversationObservation,
+  type CodexSubscriptionConversationSnapshot,
+  type CodexSubscriptionLoginCancelRequest,
+  type CodexSubscriptionLoginStartRequest,
+  type CodexSubscriptionLogoutRequest,
+  type CodexSubscriptionRequestBinding,
+  type CodexSubscriptionTurnInterruptRequest,
+  type CodexSubscriptionTurnReconciliation,
+  type CodexSubscriptionTurnStartRequest,
+  type CodexSubscriptionWorkspaceBinding,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
@@ -44,6 +63,7 @@ import {
   type TaskState,
   type ThreadProjectionSnapshot,
 } from '../../shared/protocol'
+import { isOfficialCodexAppServerLoginUrl } from '../../shared/codex-app-server-auth'
 import {
   CODEX_SUBSCRIPTION_PROVIDER_ID,
   isPinnedCodexAuthorizationUrl
@@ -178,6 +198,47 @@ interface AmbiguousRuntimeOAuthStart {
   readonly providerId: string
 }
 
+interface AmbiguousCodexSubscriptionLoginStart {
+  readonly authority: CapturedProjectionAuthority
+  readonly expectedHostId: string
+  readonly backendIncarnationId: string
+  readonly loginOperationId: string
+}
+
+interface OrphanedCodexSubscriptionLogin {
+  readonly expectedHostId: string
+  readonly backendIncarnationId: string
+  readonly loginOperationId: string
+  readonly loginId?: string
+}
+
+interface PersistedCodexSubscriptionLoginFence extends OrphanedCodexSubscriptionLogin {
+  readonly recordedAt: string
+}
+
+interface PersistedCodexSubscriptionLoginFenceLedger {
+  readonly version: 1
+  readonly entries: PersistedCodexSubscriptionLoginFence[]
+}
+
+interface CodexSubscriptionLoginRegistration {
+  readonly promise: Promise<void>
+  readonly release: () => void
+}
+
+interface ActiveCodexSubscriptionLogin {
+  readonly authority: CapturedProjectionAuthority
+  readonly expectedHostId: string
+  readonly backendIncarnationId: string
+  readonly loginOperationId: string
+  readonly loginId: string
+  readonly authUrl?: string
+  opened: boolean
+  closing: boolean
+  openingPromise?: Promise<void>
+  cancellationPromise?: Promise<CodexSubscriptionAccountSnapshot>
+}
+
 interface HealthLineage {
   hostId: string
   hostdVersion: string
@@ -259,6 +320,8 @@ interface ServiceOptions {
   openExternal?: (url: string) => Promise<void>
   /** Electron's native directory picker, injected so paths never enter preload IPC. */
   selectDirectory?: () => Promise<string | undefined>
+  /** Injectable only for deterministic cross-platform service tests. */
+  platform?: NodeJS.Platform
 }
 
 const RECONNECT_DELAYS_MS = [500, 1_500, 3_500, 8_000, 15_000, 30_000] as const
@@ -305,12 +368,22 @@ export class DesktopControlService extends EventEmitter {
   private readonly sshExecutable: string
   private readonly openExternal: ((url: string) => Promise<void>) | undefined
   private readonly selectDirectory: (() => Promise<string | undefined>) | undefined
+  private readonly platform: NodeJS.Platform
   private readonly oauthAuthorityId = `desktop-oauth-${randomUUID()}`
   private readonly openedOAuthSessions = new Set<string>()
   private readonly activeOAuthSessions = new Map<string, ActiveRuntimeOAuthSession>()
   private readonly openingOAuthSessions = new Map<string, OpeningRuntimeOAuthSession>()
   private readonly oauthStartRegistrations = new Set<Promise<void>>()
   private readonly ambiguousOAuthStarts = new Map<string, AmbiguousRuntimeOAuthStart>()
+  private readonly activeCodexSubscriptionLogins = new Map<string, ActiveCodexSubscriptionLogin>()
+  private readonly codexSubscriptionLoginOperations = new Map<string, ActiveCodexSubscriptionLogin>()
+  private readonly codexSubscriptionLoginRegistrations = new Set<Promise<void>>()
+  private readonly ambiguousCodexSubscriptionLoginStarts = new Map<
+    string,
+    AmbiguousCodexSubscriptionLoginStart
+  >()
+  private readonly orphanedCodexSubscriptionLogins = new Map<string, OrphanedCodexSubscriptionLogin>()
+  private readonly codexSubscriptionAccountMutationTails = new Map<string, Promise<void>>()
   private oauthTransitionBlockCount = 0
   private oauthTransitionGeneration = 0
   private oauthDrainPromise: Promise<void> | undefined
@@ -319,6 +392,8 @@ export class DesktopControlService extends EventEmitter {
   private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
   private readonly durableUncertainReceipts: AtomicJsonStore<DurableUncertainReceiptHistory>
   private readonly residentLifecycleLedger: AtomicJsonStore<PersistedResidentLifecycleLedger>
+  private readonly codexSubscriptionLoginFences: AtomicJsonStore<PersistedCodexSubscriptionLoginFenceLedger>
+  private codexSubscriptionLoginFenceLoad?: Promise<void>
   private readonly latency = new LatencyRecorder()
   private readonly discoveredAliases = new Set<string>()
   private readonly installPlans = new Map<string, HostInstallPlan>()
@@ -365,6 +440,7 @@ export class DesktopControlService extends EventEmitter {
     this.sshExecutable = options.sshExecutable ?? 'ssh'
     this.openExternal = options.openExternal
     this.selectDirectory = options.selectDirectory
+    this.platform = options.platform ?? process.platform
     const stateDirectory = path.join(this.app.getPath('userData'), 'control')
     const emptyCache = (): CacheEnvelope => ({ version: 3, entries: {}, targetHostBindings: [] })
     this.cache = new IndexedProjectionCacheStore(
@@ -397,11 +473,18 @@ export class DesktopControlService extends EventEmitter {
       2 * 1024 * 1024,
       { malformedJson: 'error', validateRoot: isPersistedResidentLifecycleLedger },
     )
+    this.codexSubscriptionLoginFences = new AtomicJsonStore<PersistedCodexSubscriptionLoginFenceLedger>(
+      path.join(stateDirectory, 'codex-subscription-login-fences.json'),
+      () => ({ version: 1, entries: [] }),
+      64 * 1024,
+      { malformedJson: 'error', validateRoot: isPersistedCodexSubscriptionLoginFenceLedger },
+    )
   }
 
   async bootstrap(): Promise<BootstrapPayload> {
     return await this.latency.measure('cache.bootstrap', async () => {
       await this.commandIdentities.read()
+      await this.ensureCodexSubscriptionLoginFencesLoaded()
       const durableUncertainReceipts = await this.durableUncertainReceipts.read()
       const initialCache = await this.readCache()
       if (!this.target && initialCache.lastTarget) {
@@ -537,19 +620,22 @@ export class DesktopControlService extends EventEmitter {
   }
 
   private async connectTarget(target: ConnectionTarget, expectedHostId?: string): Promise<ConnectionState> {
+    await this.ensureCodexSubscriptionLoginFencesLoaded()
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     try {
+      const recoveryHostId = this.codexSubscriptionOrphanRecoveryHostId(target, expectedHostId)
+      const effectiveExpectedHostId = expectedHostId ?? recoveryHostId
       if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
       const intentGeneration = ++this.controlIntentGeneration
       const cache = await this.cache.update((current) => {
         const normalized = normalizeCache(current)
-        if (expectedHostId !== undefined && findBoundHostId(normalized, target) !== expectedHostId) {
+        if (effectiveExpectedHostId !== undefined && findBoundHostId(normalized, target) !== effectiveExpectedHostId) {
           throw new ControlError(
             'ssh.verified_host_binding_required',
             'The previously verified SSH binding changed before this computer could be connected.',
-            { retryable: true, details: { expectedHostId } }
+            { retryable: true, details: { expectedHostId: effectiveExpectedHostId } }
           )
         }
         return {
@@ -565,6 +651,7 @@ export class DesktopControlService extends EventEmitter {
       // The exact old authority must acknowledge cancellation before its
       // transport is replaced. New OAuth admission remains blocked throughout.
       await this.drainActiveRuntimeOAuthSessions()
+      await this.drainActiveCodexSubscriptionLogins(effectiveExpectedHostId)
       if (intentGeneration !== this.controlIntentGeneration) {
         throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
       }
@@ -574,7 +661,8 @@ export class DesktopControlService extends EventEmitter {
       // poll lineage, and renderer authority internally consistent.
       this.intentionallyOffline = false
       const targetChanged = !this.target || !sameTarget(this.target, target)
-      const expectedAuthorityChanged = expectedHostId !== undefined && this.authorityHostId !== expectedHostId
+      const expectedAuthorityChanged = effectiveExpectedHostId !== undefined &&
+        this.authorityHostId !== effectiveExpectedHostId
       if (targetChanged || expectedAuthorityChanged) {
         this.authorityHostId = undefined
         this.authorityCapabilities = []
@@ -593,14 +681,15 @@ export class DesktopControlService extends EventEmitter {
       }
       // A locator is never itself authority. It may restore only a binding that
       // was learned from this target's prior health handshake.
-      this.authorityHostId = expectedHostId ?? findBoundHostId(cache, target)
-      return await this.establish(target, 'connecting', generation, expectedHostId)
+      this.authorityHostId = effectiveExpectedHostId ?? findBoundHostId(cache, target)
+      return await this.establish(target, 'connecting', generation, effectiveExpectedHostId)
     } finally {
       this.endOAuthConnectionTransition()
     }
   }
 
   async reconnect(): Promise<ConnectionState> {
+    await this.ensureCodexSubscriptionLoginFencesLoaded()
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
@@ -609,11 +698,13 @@ export class DesktopControlService extends EventEmitter {
       if (!target) {
         throw new ControlError('connection.no_target', 'There is no previous host to reconnect to.')
       }
-      const expectedHostId = target.kind === 'ssh' ? this.authorityHostId : undefined
+      const recoveryHostId = this.codexSubscriptionOrphanRecoveryHostId(target)
+      const expectedHostId = target.kind === 'ssh' ? this.authorityHostId : recoveryHostId
       this.controlIntentGeneration += 1
       this.intentionallyOffline = false
       const generation = ++this.reconnectGeneration
       await this.drainActiveRuntimeOAuthSessions()
+      await this.drainActiveCodexSubscriptionLogins(expectedHostId)
       if (
         generation !== this.reconnectGeneration ||
         this.intentionallyOffline ||
@@ -629,6 +720,7 @@ export class DesktopControlService extends EventEmitter {
   }
 
   async disconnect(): Promise<void> {
+    await this.ensureCodexSubscriptionLoginFencesLoaded()
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
@@ -639,6 +731,7 @@ export class DesktopControlService extends EventEmitter {
       this.stopHealthPolling()
       this.stopNonterminalReconciliation()
       await this.drainActiveRuntimeOAuthSessions()
+      await this.drainActiveCodexSubscriptionLogins(this.authorityHostId)
       const connection = this.connection
       if (connection) this.cancelThreadChangeRefreshesForConnection(connection)
       this.connection = undefined
@@ -907,6 +1000,350 @@ export class DesktopControlService extends EventEmitter {
       authority.generation,
     )
     return snapshot
+  }
+
+  async codexSubscriptionAccountRead(
+    input: CodexSubscriptionAccountReadRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    return await this.withCodexSubscriptionAccountMutation(input.expectedHostId, async () =>
+      await this.codexSubscriptionAccountReadUnlocked(input))
+  }
+
+  private async codexSubscriptionAccountReadUnlocked(
+    input: CodexSubscriptionAccountReadRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    await this.ensureCodexSubscriptionLoginFencesLoaded()
+    this.assertCodexSubscriptionAdmissionOpen(true)
+    const registration = this.beginCodexSubscriptionLoginRegistration()
+    try {
+      const { expectedHostId } = input
+      const authority = this.captureCodexSubscriptionAuthority(expectedHostId)
+      const transitionGeneration = this.oauthTransitionGeneration
+      const ambiguitiesObservedAtStart = this.codexSubscriptionLoginAmbiguityKeys(authority)
+      const raw = await authority.connection.request(
+        'codex.subscription.account.read',
+        { expectedHostId },
+        { timeoutMs: 15_000 },
+      )
+      const account = this.parseCodexSubscriptionAccount(raw, authority, 'account refresh')
+      await this.persistCodexSubscriptionAccountObservation(authority, account)
+      this.observeCodexSubscriptionAccount(authority, account)
+      this.reconcileCodexSubscriptionLoginAmbiguities(
+        authority,
+        account,
+        ambiguitiesObservedAtStart,
+      )
+      registration.release()
+      if (
+        transitionGeneration !== this.oauthTransitionGeneration ||
+        this.oauthTransitionBlockCount > 0
+      ) {
+        throw new ControlError(
+          'codex.subscription_transition_in_progress',
+          'Codex sign-in state changed while the host connection was changing.',
+          { retryable: true },
+        )
+      }
+      this.assertProjectionAuthority(authority, 'Codex subscription account refresh')
+      return structuredClone(account)
+    } finally {
+      registration.release()
+    }
+  }
+
+  async codexSubscriptionLoginStart(
+    input: CodexSubscriptionLoginStartRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    return await this.withCodexSubscriptionAccountMutation(input.expectedHostId, async () =>
+      await this.codexSubscriptionLoginStartUnlocked(input))
+  }
+
+  private async codexSubscriptionLoginStartUnlocked(
+    input: CodexSubscriptionLoginStartRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    await this.ensureCodexSubscriptionLoginFencesLoaded()
+    this.assertCodexSubscriptionAdmissionOpen()
+    const registration = this.beginCodexSubscriptionLoginRegistration()
+    try {
+      const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+      const transitionGeneration = this.oauthTransitionGeneration
+      const ambiguityKey = this.codexSubscriptionLoginOperationKey(
+        input.expectedHostId,
+        input.expectedBackendIncarnationId,
+        input.operationId,
+      )
+      await this.persistCodexSubscriptionLoginFence({
+        expectedHostId: input.expectedHostId,
+        backendIncarnationId: input.expectedBackendIncarnationId,
+        loginOperationId: input.operationId,
+      })
+      let raw: unknown
+      try {
+        raw = await authority.connection.request(
+          'codex.subscription.login.start',
+          input,
+          { timeoutMs: 30_000 },
+        )
+      } catch (firstError) {
+        try {
+          // Host admission is idempotent for this exact immutable envelope.
+          // Retry only that envelope so a lost response can recover the
+          // original provider login identity without starting another one.
+          raw = await authority.connection.request(
+            'codex.subscription.login.start',
+            input,
+            { timeoutMs: 10_000, priority: 'urgent' },
+          )
+        } catch (reconciliationError) {
+          this.ambiguousCodexSubscriptionLoginStarts.set(ambiguityKey, {
+            authority,
+            expectedHostId: input.expectedHostId,
+            backendIncarnationId: input.expectedBackendIncarnationId,
+            loginOperationId: input.operationId,
+          })
+          throw new ControlError(
+            'codex.subscription_login_start_ambiguous',
+            'The host may have started ChatGPT sign-in, but its exact login identity could not be recovered. Refresh this account on the same computer before changing connections.',
+            { retryable: true, cause: new AggregateError([firstError, reconciliationError]) },
+          )
+        }
+      }
+
+      // From host admission until the exact provider identity is registered,
+      // a connection transition must fail closed rather than miss the login.
+      this.ambiguousCodexSubscriptionLoginStarts.set(ambiguityKey, {
+        authority,
+        expectedHostId: input.expectedHostId,
+        backendIncarnationId: input.expectedBackendIncarnationId,
+        loginOperationId: input.operationId,
+      })
+      const parsed = CodexSubscriptionLoginStartResultSchema.safeParse(raw)
+      if (
+        !parsed.success ||
+        parsed.data.account.backendIncarnationId !== input.expectedBackendIncarnationId ||
+        parsed.data.authorization.operationId !== input.operationId ||
+        !isOfficialCodexAppServerLoginUrl(parsed.data.authorization.authUrl)
+      ) {
+        const error = new ControlError(
+          'protocol.codex_subscription_login_invalid',
+          'The local Codex backend returned an invalid sign-in attempt.',
+        )
+        authority.connection.terminate(error)
+        throw error
+      }
+
+      const { account, authorization } = parsed.data
+      await this.persistCodexSubscriptionLoginFence({
+        expectedHostId: input.expectedHostId,
+        backendIncarnationId: account.backendIncarnationId,
+        loginOperationId: authorization.operationId,
+        loginId: authorization.loginId,
+      })
+      const active = this.registerCodexSubscriptionLogin(authority, {
+        expectedHostId: input.expectedHostId,
+        backendIncarnationId: account.backendIncarnationId,
+        loginOperationId: authorization.operationId,
+        loginId: authorization.loginId,
+        authUrl: authorization.authUrl,
+      })
+      this.ambiguousCodexSubscriptionLoginStarts.delete(ambiguityKey)
+      registration.release()
+      if (
+        transitionGeneration !== this.oauthTransitionGeneration ||
+        this.oauthTransitionBlockCount > 0 ||
+        active.closing
+      ) {
+        throw new ControlError(
+          'codex.subscription_transition_in_progress',
+          'Sign-in was cancelled because the host connection is changing.',
+          { retryable: true },
+        )
+      }
+      this.assertProjectionAuthority(authority, 'Codex subscription sign-in start')
+      try {
+        await this.openCodexSubscriptionLogin(active)
+      } catch (error) {
+        await this.cancelAndRetireCodexSubscriptionLogin(active).catch(() => undefined)
+        throw error
+      }
+      this.assertProjectionAuthority(authority, 'Codex subscription browser launch')
+      const refreshed = await this.codexSubscriptionAccountReadUnlocked({ expectedHostId: input.expectedHostId })
+      this.assertProjectionAuthority(authority, 'Codex subscription post-browser account refresh')
+      if (
+        refreshed.backendIncarnationId !== account.backendIncarnationId ||
+        ((refreshed.phase === 'opening_browser' || refreshed.phase === 'waiting_for_login') &&
+          (refreshed.pendingLoginId !== authorization.loginId ||
+            refreshed.pendingLoginOperationId !== authorization.operationId))
+      ) {
+        this.failCodexSubscriptionProtocol(
+          authority,
+          'The local Codex backend changed the sign-in attempt after the browser opened.',
+        )
+      }
+      return refreshed
+    } finally {
+      registration.release()
+    }
+  }
+
+  async codexSubscriptionLoginCancel(
+    input: CodexSubscriptionLoginCancelRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    return await this.withCodexSubscriptionAccountMutation(input.expectedHostId, async () =>
+      await this.codexSubscriptionLoginCancelUnlocked(input))
+  }
+
+  private async codexSubscriptionLoginCancelUnlocked(
+    input: CodexSubscriptionLoginCancelRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.login.cancel',
+      input,
+      { timeoutMs: 15_000, priority: 'urgent' },
+    )
+    this.assertProjectionAuthority(authority, 'Codex subscription sign-in cancellation')
+    const account = this.parseCodexSubscriptionAccount(raw, authority, 'sign-in cancellation')
+    this.assertCodexSubscriptionAccountIncarnation(account, input.expectedBackendIncarnationId, authority)
+    this.assertCodexSubscriptionLoginClosed(
+      account,
+      input.loginOperationId,
+      input.loginId,
+      authority,
+    )
+    await this.persistCodexSubscriptionAccountObservation(authority, account)
+    this.observeCodexSubscriptionAccount(authority, account)
+    this.retireCodexSubscriptionLoginByIdentity(input)
+    return structuredClone(account)
+  }
+
+  async codexSubscriptionLogout(input: CodexSubscriptionLogoutRequest): Promise<CodexSubscriptionAccountSnapshot> {
+    return await this.withCodexSubscriptionAccountMutation(input.expectedHostId, async () =>
+      await this.codexSubscriptionLogoutUnlocked(input))
+  }
+
+  private async codexSubscriptionLogoutUnlocked(
+    input: CodexSubscriptionLogoutRequest,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    this.assertCodexSubscriptionAdmissionOpen()
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.logout',
+      input,
+      { timeoutMs: 30_000 },
+    )
+    this.assertProjectionAuthority(authority, 'Codex subscription sign-out')
+    const account = this.parseCodexSubscriptionAccount(raw, authority, 'sign-out')
+    this.assertCodexSubscriptionAccountIncarnation(account, input.expectedBackendIncarnationId, authority)
+    await this.persistCodexSubscriptionAccountObservation(authority, account)
+    this.retireCodexSubscriptionLoginsForHost(input.expectedHostId)
+    return structuredClone(account)
+  }
+
+  async codexSubscriptionConversationSnapshot(
+    input: CodexSubscriptionRequestBinding,
+  ): Promise<CodexSubscriptionConversationLookup> {
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.conversation.snapshot',
+      input,
+      { timeoutMs: 30_000 },
+    )
+    this.assertProjectionAuthority(authority, 'Codex conversation refresh')
+    const parsed = CodexSubscriptionConversationLookupSchema.safeParse(raw)
+    if (!parsed.success) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend returned an invalid conversation state.')
+    }
+    if (parsed.data.conversation) {
+      this.assertCodexSubscriptionConversationBinding(parsed.data.conversation, input, authority)
+    }
+    return structuredClone(parsed.data)
+  }
+
+  async codexSubscriptionTurnStart(
+    input: CodexSubscriptionTurnStartRequest,
+  ): Promise<CodexSubscriptionConversationSnapshot> {
+    this.assertCodexSubscriptionAdmissionOpen()
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.turn.start',
+      input,
+      { timeoutMs: 45_000 },
+    )
+    this.assertProjectionAuthority(authority, 'Codex turn start')
+    const conversation = this.parseCodexSubscriptionConversation(raw, authority, 'turn start')
+    this.assertCodexSubscriptionConversationBinding(conversation, input, authority)
+    this.assertCodexSubscriptionConversationIncarnation(
+      conversation,
+      input.expectedBackendIncarnationId,
+      authority,
+    )
+    this.assertCodexSubscriptionConversationObservation(conversation, input.expectedConversation, authority)
+    if (conversation.latestTurn?.operationId !== input.operationId) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend admitted a different turn operation.')
+    }
+    return structuredClone(conversation)
+  }
+
+  async codexSubscriptionTurnInterrupt(
+    input: CodexSubscriptionTurnInterruptRequest,
+  ): Promise<CodexSubscriptionConversationSnapshot> {
+    this.assertCodexSubscriptionAdmissionOpen()
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.turn.interrupt',
+      input,
+      { timeoutMs: 30_000, priority: 'urgent' },
+    )
+    this.assertProjectionAuthority(authority, 'Codex turn interrupt')
+    const conversation = this.parseCodexSubscriptionConversation(raw, authority, 'turn interrupt')
+    this.assertCodexSubscriptionConversationBinding(conversation, input, authority)
+    this.assertCodexSubscriptionConversationIncarnation(
+      conversation,
+      input.expectedBackendIncarnationId,
+      authority,
+    )
+    if (
+      conversation.sessionId !== input.sessionId ||
+      conversation.threadId !== input.codexThreadId ||
+      conversation.latestTurn?.operationId !== input.expectedTurnOperationId ||
+      conversation.latestTurn.turnId !== input.turnId
+    ) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend interrupted a different turn.')
+    }
+    return structuredClone(conversation)
+  }
+
+  async codexSubscriptionTurnReconcile(
+    input: CodexSubscriptionTurnStartRequest,
+  ): Promise<CodexSubscriptionTurnReconciliation> {
+    const authority = this.captureCodexSubscriptionAuthority(input.expectedHostId)
+    const raw = await authority.connection.request(
+      'codex.subscription.turn.reconcile',
+      input,
+      { timeoutMs: 30_000, priority: 'urgent' },
+    )
+    this.assertProjectionAuthority(authority, 'Codex turn reconciliation')
+    const parsed = CodexSubscriptionTurnReconciliationSchema.safeParse(raw)
+    if (!parsed.success || parsed.data.operationId !== input.operationId) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend returned an invalid turn reconciliation.')
+    }
+    if (parsed.data.known) {
+      this.assertCodexSubscriptionConversationBinding(parsed.data.conversation, input, authority)
+      this.assertCodexSubscriptionConversationIncarnation(
+        parsed.data.conversation,
+        input.expectedBackendIncarnationId,
+        authority,
+      )
+      this.assertCodexSubscriptionConversationObservation(
+        parsed.data.conversation,
+        input.expectedConversation,
+        authority,
+      )
+    } else if (!codexSubscriptionBindingMatches(parsed.data.binding, input)) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend reconciled a different workspace.')
+    }
+    return structuredClone(parsed.data)
   }
 
   async startRuntimeOAuth(expectedHostId: string, providerId: string): Promise<RuntimeOAuthSessionView> {
@@ -1331,6 +1768,591 @@ export class DesktopControlService extends EventEmitter {
     return authority
   }
 
+  private captureCodexSubscriptionAuthority(expectedHostId: string): CapturedProjectionAuthority {
+    if (this.platform !== 'win32') {
+      throw new ControlError(
+        'codex.subscription_windows_required',
+        'Codex via ChatGPT subscription is currently available only on Windows.',
+      )
+    }
+    const authority = this.captureProjectionAuthority()
+    if (this.state.phase !== 'online') {
+      throw new ControlError(
+        'codex.subscription_live_connection_required',
+        'Codex via ChatGPT subscription requires a live local workspace connection.',
+        { retryable: true },
+      )
+    }
+    if (authority.hostId !== expectedHostId) {
+      throw new ControlError(
+        'codex.subscription_authority_changed',
+        'The selected workspace belongs to a different host authority. Refresh before continuing.',
+        { retryable: true, details: { expectedHostId, connectedHostId: authority.hostId } },
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'codex.subscription_local_required',
+        'Codex via ChatGPT subscription is available only for a workspace on this computer.',
+      )
+    }
+    if (!this.authorityCapabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY)) {
+      throw new ControlError(
+        'codex.subscription_unavailable',
+        'The connected host does not expose the local Codex subscription backend.',
+        { retryable: true },
+      )
+    }
+    return authority
+  }
+
+  private parseCodexSubscriptionAccount(
+    raw: unknown,
+    authority: CapturedProjectionAuthority,
+    operation: string,
+  ): CodexSubscriptionAccountSnapshot {
+    const parsed = CodexSubscriptionAccountSnapshotSchema.safeParse(raw)
+    if (!parsed.success) {
+      this.failCodexSubscriptionProtocol(
+        authority,
+        `The local Codex backend returned an invalid account state during ${operation}.`,
+      )
+    }
+    return parsed.data
+  }
+
+  private parseCodexSubscriptionConversation(
+    raw: unknown,
+    authority: CapturedProjectionAuthority,
+    operation: string,
+  ): CodexSubscriptionConversationSnapshot {
+    const parsed = CodexSubscriptionConversationSnapshotSchema.safeParse(raw)
+    if (!parsed.success) {
+      this.failCodexSubscriptionProtocol(
+        authority,
+        `The local Codex backend returned an invalid conversation state during ${operation}.`,
+      )
+    }
+    return parsed.data
+  }
+
+  private failCodexSubscriptionProtocol(
+    authority: CapturedProjectionAuthority,
+    message: string,
+  ): never {
+    const error = new ControlError('protocol.codex_subscription_invalid', message)
+    authority.connection.terminate(error)
+    throw error
+  }
+
+  private assertCodexSubscriptionAccountIncarnation(
+    account: CodexSubscriptionAccountSnapshot,
+    expectedBackendIncarnationId: string,
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (account.backendIncarnationId !== expectedBackendIncarnationId) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend changed identity during the account operation.')
+    }
+  }
+
+  private assertCodexSubscriptionLoginClosed(
+    account: CodexSubscriptionAccountSnapshot,
+    loginOperationId: string,
+    loginId: string,
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (account.phase === 'opening_browser' || account.phase === 'waiting_for_login') {
+      this.failCodexSubscriptionProtocol(
+        authority,
+        account.pendingLoginOperationId === loginOperationId && account.pendingLoginId === loginId
+          ? 'The local Codex backend did not close the requested sign-in attempt.'
+          : 'The local Codex backend replaced a sign-in attempt during cancellation.',
+      )
+    }
+  }
+
+  private assertCodexSubscriptionConversationIncarnation(
+    conversation: CodexSubscriptionConversationSnapshot,
+    expectedBackendIncarnationId: string,
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (conversation.backendIncarnationId !== expectedBackendIncarnationId) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend changed identity during the turn operation.')
+    }
+  }
+
+  private assertCodexSubscriptionConversationBinding(
+    conversation: CodexSubscriptionConversationSnapshot,
+    input: CodexSubscriptionRequestBinding,
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (!codexSubscriptionBindingMatches(conversation.binding, input)) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend returned a different workspace conversation.')
+    }
+  }
+
+  private assertCodexSubscriptionConversationObservation(
+    conversation: CodexSubscriptionConversationSnapshot,
+    observation: CodexSubscriptionConversationObservation,
+    authority: CapturedProjectionAuthority,
+  ): void {
+    if (observation.state === 'absent') return
+    if (
+      conversation.sessionId !== observation.sessionId ||
+      conversation.revision < observation.revision ||
+      (observation.threadId !== undefined && conversation.threadId !== observation.threadId)
+    ) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend crossed the reviewed conversation boundary.')
+    }
+  }
+
+  private registerCodexSubscriptionLogin(
+    authority: CapturedProjectionAuthority,
+    input: {
+      expectedHostId: string
+      backendIncarnationId: string
+      loginOperationId: string
+      loginId: string
+      authUrl: string
+    },
+  ): ActiveCodexSubscriptionLogin {
+    const operationKey = this.codexSubscriptionLoginOperationKey(
+      input.expectedHostId,
+      input.backendIncarnationId,
+      input.loginOperationId,
+    )
+    const existing = this.codexSubscriptionLoginOperations.get(operationKey)
+    if (existing) {
+      if (
+        existing.authority.connection !== authority.connection ||
+        existing.authority.generation !== authority.generation ||
+        !sameTarget(existing.authority.target, authority.target) ||
+        existing.loginId !== input.loginId ||
+        existing.authUrl !== input.authUrl
+      ) {
+        this.failCodexSubscriptionProtocol(authority, 'The local Codex backend changed an active sign-in attempt.')
+      }
+      return existing
+    }
+    const active: ActiveCodexSubscriptionLogin = {
+      authority,
+      expectedHostId: input.expectedHostId,
+      backendIncarnationId: input.backendIncarnationId,
+      loginOperationId: input.loginOperationId,
+      loginId: input.loginId,
+      authUrl: input.authUrl,
+      opened: false,
+      closing: false,
+    }
+    this.codexSubscriptionLoginOperations.set(operationKey, active)
+    this.activeCodexSubscriptionLogins.set(this.codexSubscriptionLoginKey(active), active)
+    return active
+  }
+
+  private observeCodexSubscriptionAccount(
+    authority: CapturedProjectionAuthority,
+    account: CodexSubscriptionAccountSnapshot,
+  ): void {
+    // A fresh, schema-valid account/read from the exact reconnected host is the
+    // only main-process proof that an orphaned callback is gone or has a new
+    // current identity. Never clear this fence on elapsed time alone.
+    this.retireOrphanedCodexSubscriptionLoginsForHost(authority.hostId)
+    if (account.phase !== 'opening_browser' && account.phase !== 'waiting_for_login') {
+      this.retireCodexSubscriptionLoginsForHost(authority.hostId)
+      return
+    }
+    const loginOperationId = account.pendingLoginOperationId
+    const loginId = account.pendingLoginId
+    if (!loginOperationId || !loginId) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend omitted the active sign-in identity.')
+    }
+    const operationKey = this.codexSubscriptionLoginOperationKey(
+      authority.hostId,
+      account.backendIncarnationId,
+      loginOperationId,
+    )
+    const existing = this.codexSubscriptionLoginOperations.get(operationKey)
+    if (existing) {
+      if (existing.loginId !== loginId) {
+        this.failCodexSubscriptionProtocol(authority, 'The local Codex backend changed the active sign-in identity.')
+      }
+      return
+    }
+    const active: ActiveCodexSubscriptionLogin = {
+      authority,
+      expectedHostId: authority.hostId,
+      backendIncarnationId: account.backendIncarnationId,
+      loginOperationId,
+      loginId,
+      opened: false,
+      closing: false,
+    }
+    this.codexSubscriptionLoginOperations.set(operationKey, active)
+    this.activeCodexSubscriptionLogins.set(this.codexSubscriptionLoginKey(active), active)
+  }
+
+  private async openCodexSubscriptionLogin(active: ActiveCodexSubscriptionLogin): Promise<void> {
+    if (active.opened) return
+    if (active.openingPromise) return await active.openingPromise
+    if (!active.authUrl) {
+      throw new ControlError(
+        'codex.subscription_browser_destination_unavailable',
+        'This sign-in attempt can only be cancelled and started again.',
+        { retryable: true },
+      )
+    }
+    if (!this.openExternal) {
+      throw new ControlError('codex.subscription_browser_unavailable', 'The system browser is unavailable for sign-in.')
+    }
+    let opening!: Promise<void>
+    opening = (async () => {
+      try {
+        this.assertProjectionAuthority(active.authority, 'Codex subscription browser launch')
+        if (active.closing || this.activeCodexSubscriptionLogins.get(this.codexSubscriptionLoginKey(active)) !== active) {
+          throw new ControlError(
+            'codex.subscription_login_closing',
+            'The sign-in attempt is closing.',
+            { retryable: true },
+          )
+        }
+        try {
+          await this.openExternal?.(active.authUrl as string)
+        } catch {
+          throw new ControlError(
+            'codex.subscription_browser_failed',
+            'The system browser could not open the sign-in page.',
+            { retryable: true },
+          )
+        }
+        this.assertProjectionAuthority(active.authority, 'Codex subscription browser launch')
+        if (active.closing || this.activeCodexSubscriptionLogins.get(this.codexSubscriptionLoginKey(active)) !== active) {
+          throw new ControlError(
+            'codex.subscription_login_closing',
+            'The sign-in attempt closed while its browser opened.',
+            { retryable: true },
+          )
+        }
+        active.opened = true
+      } finally {
+        if (active.openingPromise === opening) active.openingPromise = undefined
+      }
+    })()
+    active.openingPromise = opening
+    await opening
+  }
+
+  private async cancelAndRetireCodexSubscriptionLogin(active: ActiveCodexSubscriptionLogin): Promise<void> {
+    active.closing = true
+    await this.requestCodexSubscriptionLoginCancellation(active)
+    this.retireCodexSubscriptionLogin(active)
+  }
+
+  private async requestCodexSubscriptionLoginCancellation(
+    active: ActiveCodexSubscriptionLogin,
+  ): Promise<CodexSubscriptionAccountSnapshot> {
+    if (!active.cancellationPromise) {
+      const cancellation = (async () => {
+        const raw = await active.authority.connection.request(
+          'codex.subscription.login.cancel',
+          {
+            expectedHostId: active.expectedHostId,
+            expectedBackendIncarnationId: active.backendIncarnationId,
+            loginOperationId: active.loginOperationId,
+            loginId: active.loginId,
+          },
+          { timeoutMs: 10_000, priority: 'urgent' },
+        )
+        const account = this.parseCodexSubscriptionAccount(raw, active.authority, 'sign-in cancellation')
+        this.assertCodexSubscriptionAccountIncarnation(
+          account,
+          active.backendIncarnationId,
+          active.authority,
+        )
+        this.assertCodexSubscriptionLoginClosed(
+          account,
+          active.loginOperationId,
+          active.loginId,
+          active.authority,
+        )
+        await this.persistCodexSubscriptionAccountObservation(active.authority, account)
+        return account
+      })()
+      active.cancellationPromise = cancellation
+      void cancellation.catch(() => {
+        if (active.cancellationPromise === cancellation) active.cancellationPromise = undefined
+      })
+    }
+    return await active.cancellationPromise
+  }
+
+  private retireCodexSubscriptionLoginByIdentity(input: CodexSubscriptionLoginCancelRequest): void {
+    this.ambiguousCodexSubscriptionLoginStarts.delete(
+      this.codexSubscriptionLoginOperationKey(
+        input.expectedHostId,
+        input.expectedBackendIncarnationId,
+        input.loginOperationId,
+      ),
+    )
+    const active = this.activeCodexSubscriptionLogins.get(
+      `${input.expectedHostId}\u0000${input.expectedBackendIncarnationId}\u0000${input.loginOperationId}\u0000${input.loginId}`,
+    )
+    if (active) this.retireCodexSubscriptionLogin(active)
+  }
+
+  private retireCodexSubscriptionLogin(active: ActiveCodexSubscriptionLogin): void {
+    const loginKey = this.codexSubscriptionLoginKey(active)
+    if (this.activeCodexSubscriptionLogins.get(loginKey) === active) {
+      this.activeCodexSubscriptionLogins.delete(loginKey)
+    }
+    const operationKey = this.codexSubscriptionLoginOperationKey(
+      active.expectedHostId,
+      active.backendIncarnationId,
+      active.loginOperationId,
+    )
+    if (this.codexSubscriptionLoginOperations.get(operationKey) === active) {
+      this.codexSubscriptionLoginOperations.delete(operationKey)
+    }
+  }
+
+  private retireCodexSubscriptionLoginsForHost(hostId: string): void {
+    for (const active of [...this.activeCodexSubscriptionLogins.values()]) {
+      if (active.expectedHostId === hostId) this.retireCodexSubscriptionLogin(active)
+    }
+  }
+
+  private retireOrphanedCodexSubscriptionLoginsForHost(hostId: string): void {
+    for (const [operationKey, orphan] of this.orphanedCodexSubscriptionLogins) {
+      if (orphan.expectedHostId === hostId) this.orphanedCodexSubscriptionLogins.delete(operationKey)
+    }
+  }
+
+  private ensureCodexSubscriptionLoginFencesLoaded(): Promise<void> {
+    this.codexSubscriptionLoginFenceLoad ??= (async () => {
+      const ledger = await this.codexSubscriptionLoginFences.read()
+      for (const entry of ledger.entries) {
+        const operationKey = this.codexSubscriptionLoginOperationKey(
+          entry.expectedHostId,
+          entry.backendIncarnationId,
+          entry.loginOperationId,
+        )
+        this.orphanedCodexSubscriptionLogins.set(operationKey, {
+          expectedHostId: entry.expectedHostId,
+          backendIncarnationId: entry.backendIncarnationId,
+          loginOperationId: entry.loginOperationId,
+          ...(entry.loginId ? { loginId: entry.loginId } : {}),
+        })
+      }
+    })()
+    return this.codexSubscriptionLoginFenceLoad
+  }
+
+  private async persistCodexSubscriptionLoginFence(
+    fence: OrphanedCodexSubscriptionLogin,
+  ): Promise<void> {
+    await this.codexSubscriptionLoginFences.update((ledger) => {
+      const operationKey = this.codexSubscriptionLoginOperationKey(
+        fence.expectedHostId,
+        fence.backendIncarnationId,
+        fence.loginOperationId,
+      )
+      const existing = ledger.entries.find((entry) =>
+        this.codexSubscriptionLoginOperationKey(
+          entry.expectedHostId,
+          entry.backendIncarnationId,
+          entry.loginOperationId,
+        ) === operationKey
+      )
+      if (existing?.loginId && fence.loginId && existing.loginId !== fence.loginId) {
+        throw new ControlError(
+          'codex.subscription_login_identity_conflict',
+          'The durable Codex sign-in identity conflicts with the host response.',
+        )
+      }
+      const entries = ledger.entries.filter((entry) =>
+        this.codexSubscriptionLoginOperationKey(
+          entry.expectedHostId,
+          entry.backendIncarnationId,
+          entry.loginOperationId,
+        ) !== operationKey
+      )
+      if (entries.length >= 32) {
+        throw new ControlError(
+          'codex.subscription_login_fence_limit',
+          'Too many unresolved Codex sign-in attempts are retained.',
+        )
+      }
+      entries.push({
+        expectedHostId: fence.expectedHostId,
+        backendIncarnationId: fence.backendIncarnationId,
+        loginOperationId: fence.loginOperationId,
+        ...(fence.loginId ?? existing?.loginId ? { loginId: fence.loginId ?? existing?.loginId } : {}),
+        recordedAt: existing?.recordedAt ?? now(),
+      })
+      return { version: 1, entries }
+    })
+  }
+
+  private async persistCodexSubscriptionAccountObservation(
+    authority: CapturedProjectionAuthority,
+    account: CodexSubscriptionAccountSnapshot,
+  ): Promise<void> {
+    const pending = account.phase === 'opening_browser' || account.phase === 'waiting_for_login'
+      ? {
+          expectedHostId: authority.hostId,
+          backendIncarnationId: account.backendIncarnationId,
+          loginOperationId: account.pendingLoginOperationId,
+          loginId: account.pendingLoginId,
+        }
+      : undefined
+    if (pending && (!pending.loginOperationId || !pending.loginId)) {
+      this.failCodexSubscriptionProtocol(authority, 'The local Codex backend omitted the active sign-in identity.')
+    }
+    await this.codexSubscriptionLoginFences.update((ledger) => {
+      const entries = ledger.entries.filter((entry) => entry.expectedHostId !== authority.hostId)
+      if (pending) {
+        entries.push({
+          expectedHostId: pending.expectedHostId,
+          backendIncarnationId: pending.backendIncarnationId,
+          loginOperationId: pending.loginOperationId as string,
+          loginId: pending.loginId as string,
+          recordedAt: now(),
+        })
+      }
+      return { version: 1, entries }
+    })
+    this.retireOrphanedCodexSubscriptionLoginsForHost(authority.hostId)
+  }
+
+  private codexSubscriptionOrphanRecoveryHostId(
+    target: ConnectionTarget,
+    requestedHostId?: string,
+  ): string | undefined {
+    if (
+      this.orphanedCodexSubscriptionLogins.size === 0 ||
+      !this.target ||
+      !sameTarget(this.target, target) ||
+      !this.authorityHostId ||
+      (requestedHostId !== undefined && requestedHostId !== this.authorityHostId)
+    ) return undefined
+    return [...this.orphanedCodexSubscriptionLogins.values()].every(
+      (orphan) => orphan.expectedHostId === this.authorityHostId,
+    )
+      ? this.authorityHostId
+      : undefined
+  }
+
+  private codexSubscriptionLoginKey(active: ActiveCodexSubscriptionLogin): string {
+    return `${active.expectedHostId}\u0000${active.backendIncarnationId}\u0000${active.loginOperationId}\u0000${active.loginId}`
+  }
+
+  private async withCodexSubscriptionAccountMutation<T>(
+    hostId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.codexSubscriptionAccountMutationTails.get(hostId) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(() => undefined, () => undefined)
+    this.codexSubscriptionAccountMutationTails.set(hostId, tail)
+    try {
+      return await result
+    } finally {
+      if (this.codexSubscriptionAccountMutationTails.get(hostId) === tail) {
+        this.codexSubscriptionAccountMutationTails.delete(hostId)
+      }
+    }
+  }
+
+  private codexSubscriptionLoginOperationKey(
+    hostId: string,
+    backendIncarnationId: string,
+    loginOperationId: string,
+  ): string {
+    return `${hostId}\u0000${backendIncarnationId}\u0000${loginOperationId}`
+  }
+
+  private beginCodexSubscriptionLoginRegistration(): CodexSubscriptionLoginRegistration {
+    let released = false
+    let resolveRegistration!: () => void
+    const promise = new Promise<void>((resolve) => {
+      resolveRegistration = resolve
+    })
+    this.codexSubscriptionLoginRegistrations.add(promise)
+    return {
+      promise,
+      release: () => {
+        if (released) return
+        released = true
+        this.codexSubscriptionLoginRegistrations.delete(promise)
+        resolveRegistration()
+      },
+    }
+  }
+
+  private codexSubscriptionLoginAmbiguityKeys(
+    authority: CapturedProjectionAuthority,
+  ): ReadonlySet<string> {
+    return new Set(
+      [...this.ambiguousCodexSubscriptionLoginStarts.entries()]
+        .filter(([, start]) =>
+          start.authority.connection === authority.connection &&
+          start.authority.generation === authority.generation &&
+          sameTarget(start.authority.target, authority.target)
+        )
+        .map(([key]) => key),
+    )
+  }
+
+  private reconcileCodexSubscriptionLoginAmbiguities(
+    authority: CapturedProjectionAuthority,
+    account: CodexSubscriptionAccountSnapshot,
+    observedAtStart: ReadonlySet<string>,
+  ): void {
+    // A successfully parsed account/read issued after an ambiguous start is
+    // the same authority's provider-level reconciliation point. It proves the
+    // complete current login state because hostd admits at most one login.
+    for (const ambiguityKey of observedAtStart) {
+      const ambiguous = this.ambiguousCodexSubscriptionLoginStarts.get(ambiguityKey)
+      if (
+        ambiguous &&
+        ambiguous.authority.connection === authority.connection &&
+        ambiguous.authority.generation === authority.generation &&
+        sameTarget(ambiguous.authority.target, authority.target)
+      ) {
+        this.ambiguousCodexSubscriptionLoginStarts.delete(ambiguityKey)
+      }
+    }
+
+    if (
+      (account.phase === 'opening_browser' || account.phase === 'waiting_for_login') &&
+      account.pendingLoginOperationId
+    ) {
+      this.ambiguousCodexSubscriptionLoginStarts.delete(
+        this.codexSubscriptionLoginOperationKey(
+          authority.hostId,
+          account.backendIncarnationId,
+          account.pendingLoginOperationId,
+        ),
+      )
+    }
+  }
+
+  private assertCodexSubscriptionAdmissionOpen(allowOrphanReconciliation = false): void {
+    if (this.oauthTransitionBlockCount > 0) {
+      throw new ControlError(
+        'codex.subscription_transition_in_progress',
+        'Codex control is unavailable while the host connection is changing.',
+        { retryable: true },
+      )
+    }
+    if (!allowOrphanReconciliation && this.orphanedCodexSubscriptionLogins.size > 0) {
+      throw new ControlError(
+        'codex.subscription_login_reconciliation_required',
+        'Refresh the Codex account on the reconnected computer before starting another operation.',
+        { retryable: true },
+      )
+    }
+  }
+
   private async presentRuntimeOAuthSnapshot(
     active: ActiveRuntimeOAuthSession,
     snapshot: RuntimeOAuthSessionSnapshot
@@ -1637,6 +2659,72 @@ export class DesktopControlService extends EventEmitter {
     }
   }
 
+  private async drainActiveCodexSubscriptionLogins(allowOrphanedHostId?: string): Promise<void> {
+    const registrations = [...this.codexSubscriptionLoginRegistrations]
+    if (registrations.length > 0) {
+      await withOperationBound(
+        Promise.all(registrations).then(() => undefined),
+        OAUTH_START_REGISTRATION_TIMEOUT_MS,
+        () => new ControlError(
+          'codex.subscription_login_drain_unconfirmed',
+          'An in-flight Codex sign-in operation could not be bound before the host transition.',
+          { retryable: true },
+        ),
+      )
+    }
+
+    if (this.ambiguousCodexSubscriptionLoginStarts.size > 0) {
+      throw new ControlError(
+        'codex.subscription_login_drain_unconfirmed',
+        'A Codex sign-in start has no confirmed provider identity. Refresh that account on the same computer before changing connections.',
+        { retryable: true },
+      )
+    }
+
+    const unresolvedOrphans = [...this.orphanedCodexSubscriptionLogins.values()].filter(
+      (orphan) => orphan.expectedHostId !== allowOrphanedHostId,
+    )
+    if (unresolvedOrphans.length > 0) {
+      throw new ControlError(
+        'codex.subscription_login_drain_unconfirmed',
+        'A Codex sign-in callback may still belong to the disconnected computer. Reconnect to that computer and refresh the account before changing connections.',
+        { retryable: true },
+      )
+    }
+
+    const logins = [...this.activeCodexSubscriptionLogins.values()]
+    if (logins.length === 0) return
+    for (const login of logins) login.closing = true
+
+    const cancellations = await Promise.allSettled(
+      logins.map((login) => this.requestCodexSubscriptionLoginCancellation(login)),
+    )
+    const failures = cancellations.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    )
+    if (failures.length > 0) {
+      throw new ControlError(
+        'codex.subscription_login_drain_unconfirmed',
+        'The host did not confirm every Codex sign-in attempt as closed.',
+        { retryable: true, cause: new AggregateError(failures) },
+      )
+    }
+
+    const openings = logins.flatMap((login) => login.openingPromise ? [login.openingPromise] : [])
+    if (openings.length > 0) {
+      await withOperationBound(
+        Promise.allSettled(openings).then(() => undefined),
+        OAUTH_DRAIN_TIMEOUT_MS,
+        () => new ControlError(
+          'codex.subscription_login_drain_unconfirmed',
+          'The Codex sign-in browser launch did not settle before the host transition.',
+          { retryable: true },
+        ),
+      )
+    }
+    for (const login of logins) this.retireCodexSubscriptionLogin(login)
+  }
+
   private abandonRuntimeOAuthSessionsForConnection(connection: FramedConnection): void {
     // An unexpected transport loss cannot be acknowledged by the host. Forget
     // only main's local handles; hostd retains authority and expires helpers by
@@ -1649,6 +2737,37 @@ export class DesktopControlService extends EventEmitter {
     }
     for (const [ambiguityKey, start] of this.ambiguousOAuthStarts) {
       if (start.authority.connection === connection) this.ambiguousOAuthStarts.delete(ambiguityKey)
+    }
+  }
+
+  private abandonCodexSubscriptionLoginsForConnection(connection: FramedConnection): void {
+    for (const login of [...this.activeCodexSubscriptionLogins.values()]) {
+      if (login.authority.connection !== connection) continue
+      login.closing = true
+      this.orphanedCodexSubscriptionLogins.set(
+        this.codexSubscriptionLoginOperationKey(
+          login.expectedHostId,
+          login.backendIncarnationId,
+          login.loginOperationId,
+        ),
+        {
+          expectedHostId: login.expectedHostId,
+          backendIncarnationId: login.backendIncarnationId,
+          loginOperationId: login.loginOperationId,
+          loginId: login.loginId,
+        },
+      )
+      this.retireCodexSubscriptionLogin(login)
+    }
+    for (const [ambiguityKey, start] of this.ambiguousCodexSubscriptionLoginStarts) {
+      if (start.authority.connection === connection) {
+        this.orphanedCodexSubscriptionLogins.set(ambiguityKey, {
+          expectedHostId: start.expectedHostId,
+          backendIncarnationId: start.backendIncarnationId,
+          loginOperationId: start.loginOperationId,
+        })
+        this.ambiguousCodexSubscriptionLoginStarts.delete(ambiguityKey)
+      }
     }
   }
 
@@ -2048,7 +3167,9 @@ export class DesktopControlService extends EventEmitter {
       if (expectedHostId !== undefined && hostId !== expectedHostId) {
         throw new ControlError(
           'ssh.host_identity_mismatch',
-          'The configured SSH host returned a different immutable host identity.',
+          target.kind === 'ssh'
+            ? 'The configured SSH host returned a different immutable host identity.'
+            : 'The local host returned a different immutable host identity during recovery.',
           { details: { expectedHostId, receivedHostId: hostId } }
         )
       }
@@ -2248,6 +3369,7 @@ export class DesktopControlService extends EventEmitter {
       this.stopNonterminalReconciliation()
       this.connection = undefined
       this.abandonRuntimeOAuthSessionsForConnection(connection)
+      this.abandonCodexSubscriptionLoginsForConnection(connection)
       if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
       this.beginAutomaticReconnect(target, hostId, error)
     })
@@ -2354,7 +3476,10 @@ export class DesktopControlService extends EventEmitter {
 
   private beginAutomaticReconnect(target: ConnectionTarget, connectedHostId: string, cause: unknown): void {
     const generation = ++this.reconnectGeneration
-    const expectedHostId = target.kind === 'ssh' ? connectedHostId : undefined
+    // Unexpected loss must never reconnect an orphaned browser callback to a
+    // different local authority. The immutable health identity fences both
+    // local and SSH automatic recovery.
+    const expectedHostId = connectedHostId
     this.setState({
       phase: 'reconnecting',
       target,
@@ -5322,6 +6447,41 @@ function isCommandIdentityLedger(value: unknown): value is CommandIdentityLedger
   return true
 }
 
+function isPersistedCodexSubscriptionLoginFenceLedger(
+  value: unknown,
+): value is PersistedCodexSubscriptionLoginFenceLedger {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).some((key) => key !== 'version' && key !== 'entries') ||
+    value.version !== 1 ||
+    !Array.isArray(value.entries) ||
+    value.entries.length > 32
+  ) return false
+  const identities = new Set<string>()
+  for (const entry of value.entries) {
+    if (
+      !isRecord(entry) ||
+      Object.keys(entry).some((key) =>
+        key !== 'expectedHostId' &&
+        key !== 'backendIncarnationId' &&
+        key !== 'loginOperationId' &&
+        key !== 'loginId' &&
+        key !== 'recordedAt'
+      ) ||
+      !isHostId(entry.expectedHostId) ||
+      !isHostId(entry.backendIncarnationId) ||
+      !isHostId(entry.loginOperationId) ||
+      (entry.loginId !== undefined && !isHostId(entry.loginId)) ||
+      typeof entry.recordedAt !== 'string' ||
+      !Number.isFinite(Date.parse(entry.recordedAt))
+    ) return false
+    const key = `${entry.expectedHostId}\u0000${entry.backendIncarnationId}\u0000${entry.loginOperationId}`
+    if (identities.has(key)) return false
+    identities.add(key)
+  }
+  return true
+}
+
 function isDurableUncertainReceiptHistory(value: unknown): value is DurableUncertainReceiptHistory {
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.entries)) return false
   if (value.entries.length > DURABLE_UNCERTAIN_RECEIPT_LIMIT) return false
@@ -5844,6 +7004,17 @@ function findBoundSshTarget(
 
 function sameTarget(left: ConnectionTarget, right: ConnectionTarget): boolean {
   return left.kind === right.kind && (left.kind === 'local' || (right.kind === 'ssh' && left.alias === right.alias))
+}
+
+function codexSubscriptionBindingMatches(
+  binding: CodexSubscriptionWorkspaceBinding,
+  input: CodexSubscriptionRequestBinding,
+): boolean {
+  return (
+    binding.hostId === input.expectedHostId &&
+    binding.sourceThreadId === input.threadId &&
+    binding.executionGenerationId === input.expectedExecutionGenerationId
+  )
 }
 
 function sameOptionalTarget(

@@ -1,0 +1,351 @@
+import { access, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  WindowsCodexHomeSecurityProvider,
+  areAllExactProtectedCodexHomeDacls,
+  assertSafeCodexHomeTree,
+  isExactProtectedCodexHomeDacl,
+} from "../../src/hostd/codex-home-security";
+import { CodexSubscriptionStore } from "../../src/hostd/codex-subscription-store";
+import type { VerifiedCodexAppServerLaunchDescriptor } from "../../src/hostd/runtime-integrity-manager";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
+
+const USER_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  await Promise.all(temporaryDirectories.splice(0).map((directory) =>
+    rm(directory, { recursive: true, force: true })));
+});
+
+describe("Codex home security boundary", () => {
+  it("accepts only the exact protected user, SYSTEM, and Administrators DACL", () => {
+    expect(isExactProtectedCodexHomeDacl(
+      `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      USER_SID,
+    )).toBe(true);
+    expect(isExactProtectedCodexHomeDacl(
+      `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-1-0)`,
+      USER_SID,
+    )).toBe(false);
+    const exact = `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`;
+    expect(areAllExactProtectedCodexHomeDacls(`root ${exact}\nchild ${exact}\n`, USER_SID, 2)).toBe(true);
+    expect(areAllExactProtectedCodexHomeDacls(
+      `root ${exact}\nchild D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)` +
+        `(A;OICI;FA;;;BA)(A;OICI;R;;;S-1-1-0)\n`,
+      USER_SID,
+      2,
+    )).toBe(false);
+    expect(isExactProtectedCodexHomeDacl(
+      `D:PAI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      USER_SID,
+    )).toBe(true);
+  });
+
+  it("permits encrypted keyring and bounded session data without permitting plaintext auth", async () => {
+    const home = await temporaryHome();
+    await mkdir(join(home, "secrets"));
+    await writeFile(join(home, "secrets", "codex_auth.age"), "encrypted fixture");
+    await mkdir(join(home, "skills", ".system", "review"), { recursive: true });
+    await writeFile(join(home, "skills", ".system", "review", "helper.py"), "# signed system skill fixture\n");
+    await mkdir(join(home, "sessions", "2026"), { recursive: true });
+    await writeFile(join(home, "sessions", "2026", "rollout.jsonl"), "{}\n");
+    await expect(assertSafeCodexHomeTree(home)).resolves.toBeUndefined();
+
+    await writeFile(join(home, "auth.json"), "{}\n");
+    await expect(assertSafeCodexHomeTree(home)).rejects.toMatchObject({
+      code: "CODEX_HOME_CONTENT_INVALID",
+    });
+  });
+
+  it("rejects executable config and plugin authority anywhere in the dedicated home", async () => {
+    const executableHome = await temporaryHome();
+    await writeFile(join(executableHome, "bootstrap.ps1"), "Write-Output unsafe\n");
+    await expect(assertSafeCodexHomeTree(executableHome)).rejects.toMatchObject({
+      code: "CODEX_HOME_CONTENT_INVALID",
+    });
+
+    const pluginHome = await temporaryHome();
+    await mkdir(join(pluginHome, "plugins"));
+    await expect(assertSafeCodexHomeTree(pluginHome)).rejects.toMatchObject({
+      code: "CODEX_HOME_CONTENT_INVALID",
+    });
+  });
+
+  it("bounds the encrypted credential payload before any account operation", async () => {
+    const home = await temporaryHome();
+    await mkdir(join(home, "secrets"));
+    await writeFile(join(home, "secrets", "codex_auth.age"), Buffer.alloc(1024 * 1024 + 1));
+    await expect(assertSafeCodexHomeTree(home)).rejects.toMatchObject({
+      code: "CODEX_HOME_CONTENT_INVALID",
+    });
+  });
+
+  it("accepts the bounded signed-out 0.147 restart topology", async () => {
+    const home = await temporaryHome();
+    for (const name of [
+      "goals_1.sqlite",
+      "goals_1.sqlite-shm",
+      "goals_1.sqlite-wal",
+      "installation_id",
+      "logs_2.sqlite",
+      "logs_2.sqlite-shm",
+      "logs_2.sqlite-wal",
+      "memories_1.sqlite",
+      "memories_1.sqlite-shm",
+      "memories_1.sqlite-wal",
+      "queue_1.sqlite",
+      "queue_1.sqlite-shm",
+      "queue_1.sqlite-wal",
+      "state_5.sqlite",
+      "state_5.sqlite-shm",
+      "state_5.sqlite-wal",
+    ]) await writeFile(join(home, name), Buffer.alloc(32));
+    await mkdir(join(home, "tmp", "arg0"), { recursive: true });
+    const systemSkills = join(home, "skills", ".system");
+    await mkdir(systemSkills, { recursive: true });
+    await writeFile(join(systemSkills, ".codex-system-skills.marker"), "managed by codex\n");
+    for (const skill of [
+      "imagegen",
+      "openai-docs",
+      "plugin-creator",
+      "review-agent",
+      "skill-creator",
+      "skill-installer",
+    ]) {
+      await mkdir(join(systemSkills, skill, "scripts"), { recursive: true });
+      await writeFile(join(systemSkills, skill, "SKILL.md"), `# ${skill}\n`);
+      await writeFile(join(systemSkills, skill, "scripts", "managed.py"), "# generated\n");
+    }
+    await expect(assertSafeCodexHomeTree(home)).resolves.toBeUndefined();
+  });
+
+  describe("descriptor-bound transient apply-patch shims", () => {
+    it("accepts the exact stable lock plus LF shim tree only with its verified descriptor", async () => {
+      const fixture = await transientShimFixture();
+      const lock = await lstat(join(fixture.shimDirectory, ".lock"));
+      expect(lock.isFile()).toBe(true);
+      expect(lock.isSymbolicLink()).toBe(false);
+      expect(lock.nlink).toBe(1);
+      expect(lock.size).toBe(0);
+
+      await expect(assertSafeCodexHomeTree(fixture.home)).rejects.toMatchObject({
+        code: "CODEX_HOME_CONTENT_INVALID",
+      });
+      await expect(assertSafeCodexHomeTree(fixture.home, fixture.descriptor)).resolves.toBeUndefined();
+    });
+
+    it("rejects shims bound to a different regular executable", async () => {
+      const fixture = await transientShimFixture();
+      const otherExecutable = join(fixture.executableDirectory, "other-codex-app-server.exe");
+      await writeFile(otherExecutable, "other executable fixture\n", "utf8");
+      const canonicalOtherExecutable = await realpath(otherExecutable);
+      const wrongTemplate = applyPatchShimTemplate(canonicalOtherExecutable);
+      await Promise.all(SHIM_FILENAMES.map((name) =>
+        writeFile(join(fixture.shimDirectory, name), wrongTemplate, "utf8")));
+
+      await expect(assertSafeCodexHomeTree(fixture.home, fixture.descriptor)).rejects.toMatchObject({
+        code: "CODEX_HOME_CONTENT_INVALID",
+      });
+    });
+
+    it("rejects any byte drift in the descriptor-bound shim template", async () => {
+      const fixture = await transientShimFixture();
+      await writeFile(
+        join(fixture.shimDirectory, "applypatch.bat"),
+        applyPatchShimTemplate(fixture.descriptor.executable).replaceAll("\n", "\r\n"),
+        "utf8",
+      );
+
+      await expect(assertSafeCodexHomeTree(fixture.home, fixture.descriptor)).rejects.toMatchObject({
+        code: "CODEX_HOME_CONTENT_INVALID",
+      });
+    });
+
+    it("rejects a missing stable lock or a partial wrapper set without retrying", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const missingLock = await transientShimFixture();
+      await rm(join(missingLock.shimDirectory, ".lock"));
+      await expectImmediateContentRejection(
+        assertSafeCodexHomeTree(missingLock.home, missingLock.descriptor),
+      );
+
+      const partial = await transientShimFixture();
+      await rm(join(partial.shimDirectory, "applypatch.bat"));
+      await expectImmediateContentRejection(assertSafeCodexHomeTree(partial.home, partial.descriptor));
+    });
+
+    it("rejects a wrong-type or nonempty stable lock without retrying", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const wrongType = await transientShimFixture();
+      const wrongTypeLock = join(wrongType.shimDirectory, ".lock");
+      await rm(wrongTypeLock);
+      await mkdir(wrongTypeLock);
+      await expectImmediateContentRejection(assertSafeCodexHomeTree(wrongType.home, wrongType.descriptor));
+
+      const nonempty = await transientShimFixture();
+      await writeFile(join(nonempty.shimDirectory, ".lock"), "x", "utf8");
+      await expectImmediateContentRejection(assertSafeCodexHomeTree(nonempty.home, nonempty.descriptor));
+    });
+
+    it("rejects wrong transient directory or shim names", async () => {
+      const wrongDirectory = await transientShimFixture("codex-arg0ABC12_");
+      await expect(assertSafeCodexHomeTree(wrongDirectory.home, wrongDirectory.descriptor)).rejects.toMatchObject({
+        code: "CODEX_HOME_CONTENT_INVALID",
+      });
+
+      const wrongFile = await transientShimFixture();
+      await rename(
+        join(wrongFile.shimDirectory, "applypatch.bat"),
+        join(wrongFile.shimDirectory, "apply-patch.bat"),
+      );
+      await expect(assertSafeCodexHomeTree(wrongFile.home, wrongFile.descriptor)).rejects.toMatchObject({
+        code: "CODEX_HOME_CONTENT_INVALID",
+      });
+    });
+
+    it("rejects any extra entry in an otherwise exact shim directory", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const fixture = await transientShimFixture();
+      await writeFile(join(fixture.shimDirectory, "unexpected.txt"), "extra\n", "utf8");
+
+      await expectImmediateContentRejection(assertSafeCodexHomeTree(fixture.home, fixture.descriptor));
+    });
+  });
+
+  it.runIf(process.platform === "win32")(
+    "keeps the protected boundary valid after the durable subscription store is initialized",
+    async () => {
+      const root = await canonicalTemporaryDirectory("prime-codex-store-acl-");
+      temporaryDirectories.push(root);
+      const privateRoot = join(root, "codex-subscription");
+      const home = join(privateRoot, "home");
+      const privateTemporary = join(privateRoot, "private-temp");
+      const provider = new WindowsCodexHomeSecurityProvider();
+      const proof = await provider.prepareAndVerify(root, home, privateTemporary);
+
+      const store = new CodexSubscriptionStore({ statePath: join(privateRoot, "state.json") });
+      await store.initialize();
+
+      await expect(provider.assertStillSecure(proof)).resolves.toBeUndefined();
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "rejects an existing state root before creating or repairing missing authority children",
+    async () => {
+      const root = await canonicalTemporaryDirectory("prime-codex-existing-root-");
+      temporaryDirectories.push(root);
+      const privateRoot = join(root, "codex-subscription");
+      const statePath = join(privateRoot, "state.json");
+      const home = join(privateRoot, "home");
+      const privateTemporary = join(privateRoot, "private-temp");
+      await mkdir(privateRoot);
+      await writeFile(statePath, "untrusted durable state\n");
+
+      const provider = new WindowsCodexHomeSecurityProvider();
+      await expect(provider.prepareAndVerify(root, home, privateTemporary)).rejects.toMatchObject({
+        code: "CODEX_HOME_PATH_INVALID",
+      });
+      await expect(readFile(statePath, "utf8")).resolves.toBe("untrusted durable state\n");
+      await expect(access(home)).rejects.toBeDefined();
+      await expect(access(privateTemporary)).rejects.toBeDefined();
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "fails closed when an existing encrypted credential child gains Everyone read access",
+    async () => {
+      const root = await canonicalTemporaryDirectory("prime-codex-acl-");
+      temporaryDirectories.push(root);
+      const home = join(root, "codex-subscription", "home");
+      const privateTemporary = join(root, "codex-subscription", "private-temp");
+      const provider = new WindowsCodexHomeSecurityProvider();
+      const proof = await provider.prepareAndVerify(root, home, privateTemporary);
+      await mkdir(join(home, "secrets"));
+      const credential = join(home, "secrets", "codex_auth.age");
+      await writeFile(credential, "encrypted fixture");
+      await expect(provider.assertStillSecure(proof)).resolves.toBeUndefined();
+
+      await runNative(process.env.SystemRoot + "\\System32\\icacls.exe", [
+        credential,
+        "/grant",
+        "*S-1-1-0:(R)",
+      ]);
+      await expect(provider.assertStillSecure(proof)).rejects.toMatchObject({
+        code: "CODEX_HOME_ACL_INVALID",
+      });
+    },
+  );
+
+  it("fails the production capability closed off Windows", async () => {
+    const provider = new WindowsCodexHomeSecurityProvider({ platform: "linux" });
+    await expect(provider.prepareAndVerify(
+      "C:\\host",
+      "C:\\host\\codex-subscription\\home",
+      "C:\\host\\codex-subscription\\private-temp",
+    ))
+      .rejects.toMatchObject({ code: "CODEX_HOME_UNSUPPORTED" });
+  });
+});
+
+async function temporaryHome(): Promise<string> {
+  const directory = await canonicalTemporaryDirectory("prime-codex-home-");
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+const SHIM_FILENAMES = ["apply_patch.bat", "applypatch.bat"] as const;
+
+async function transientShimFixture(directoryName = "codex-arg0A1b2C3") {
+  const home = await temporaryHome();
+  const executableDirectory = await canonicalTemporaryDirectory("prime-codex-app-server-executable-");
+  temporaryDirectories.push(executableDirectory);
+  const executablePath = join(executableDirectory, "codex-app-server.exe");
+  await writeFile(executablePath, "executable fixture\n", "utf8");
+  const executable = await realpath(executablePath);
+  const descriptor = { executable } as VerifiedCodexAppServerLaunchDescriptor;
+  const shimDirectory = join(home, "tmp", "arg0", directoryName);
+  await mkdir(shimDirectory, { recursive: true });
+  await writeFile(join(shimDirectory, ".lock"), Buffer.alloc(0));
+  const template = applyPatchShimTemplate(descriptor.executable);
+  await Promise.all(SHIM_FILENAMES.map((name) => writeFile(join(shimDirectory, name), template, "utf8")));
+  return { home, executableDirectory, descriptor, shimDirectory };
+}
+
+function applyPatchShimTemplate(executable: string): string {
+  return `@echo off\n"${executable}" --codex-run-as-apply-patch %*\n`;
+}
+
+async function expectImmediateContentRejection(promise: Promise<void>): Promise<void> {
+  let outcome: Readonly<{ status: "resolved" }> |
+    Readonly<{ status: "rejected"; reason: unknown }> |
+    undefined;
+  void promise.then(
+    () => { outcome = { status: "resolved" }; },
+    (reason: unknown) => { outcome = { status: "rejected", reason }; },
+  );
+  for (let turn = 0; turn < 100 && !outcome; turn += 1) {
+    expect(vi.getTimerCount()).toBe(0);
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  }
+  expect(outcome).toMatchObject({
+    status: "rejected",
+    reason: { code: "CODEX_HOME_CONTENT_INVALID" },
+  });
+  expect(vi.getTimerCount()).toBe(0);
+}
+
+function runNative(executable: string, args: readonly string[]): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(executable, [...args], { shell: false, windowsHide: true, stdio: "ignore" });
+    child.once("error", rejectPromise);
+    child.once("close", (code, signal) => {
+      if (code === 0 && signal === null) resolvePromise();
+      else rejectPromise(new Error("Native ACL fixture command failed"));
+    });
+  });
+}

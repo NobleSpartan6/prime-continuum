@@ -72,7 +72,11 @@ const STALE_END_ERROR = Object.freeze({
 });
 const RESIDENT_COMMAND_CAPABILITY = "prime_agent_commands_v2";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
+const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
+const CODEX_SUBSCRIPTION_CAPABILITY = "codex_subscription_v1";
 const EXPECTED_BASE_CAPABILITIES = Object.freeze([
+  CANDIDATE_EVALUATION_CAPABILITY,
+  CODEX_SUBSCRIPTION_CAPABILITY,
   "resident_control_projection_v1",
   RESIDENT_LIFECYCLE_CAPABILITY,
   "runtime_integrity_v1",

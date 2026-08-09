@@ -2,6 +2,14 @@ import { createHash } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  CODEX_APP_SERVER_CODEX_HOME_POLICY,
+  CODEX_APP_SERVER_ENVIRONMENT_POLICY,
+  CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG,
+  CODEX_APP_SERVER_FIXED_ARGUMENTS,
+  CODEX_APP_SERVER_INITIALIZE_IDENTITY,
+  CODEX_APP_SERVER_LEGAL_FILES,
+  CODEX_APP_SERVER_THREAD_CONFIG,
+  CODEX_APP_SERVER_THREAD_START_POLICY,
   RUNTIME_TEMPLATE_DIRECTORY,
   cleanRuntimeEnvironment,
   loadRuntimeInputs,
@@ -58,6 +66,9 @@ export async function createRuntimeAttestation(options = {}) {
     tree: verified.manifest.tree,
     entrypoints: verified.manifest.entrypoints,
     daemon: verified.manifest.daemon,
+    ...(verified.manifest.codexAppServer
+      ? { codexAppServer: selectCodexAppServerAttestation(verified.manifest.codexAppServer) }
+      : {}),
     nativeAddons: verified.manifest.nativeAddons,
     hostRuntime,
   };
@@ -159,6 +170,13 @@ export function assertRuntimeAttestationMatches(attestation, context) {
   invariant(sha256(fileManifestBytes) === manifest.tree.filesSha256, "Runtime file-manifest digest is stale.");
   invariant(jsonEqual(attestation.entrypoints, manifest.entrypoints), "Runtime attestation entrypoints drifted.");
   invariant(jsonEqual(attestation.daemon, manifest.daemon), "Runtime attestation daemon contract drifted.");
+  const expectedCodexAppServer = manifest.codexAppServer
+    ? selectCodexAppServerAttestation(manifest.codexAppServer)
+    : undefined;
+  invariant(
+    jsonEqual(attestation.codexAppServer, expectedCodexAppServer),
+    "Runtime Codex app-server companion attestation drifted.",
+  );
   invariant(jsonEqual(attestation.nativeAddons, manifest.nativeAddons), "Runtime native-addon allowlist drifted.");
   invariant(jsonEqual(attestation.hostRuntime, expectedHostRuntime), "Runtime host process identity drifted.");
 }
@@ -189,7 +207,7 @@ export async function readElectronRuntimeIdentity(executablePath) {
 
 function validateRuntimeAttestation(value) {
   assertRecord(value, "runtime attestation");
-  assertExactKeys(value, [
+  const expectedKeys = [
     "schemaVersion",
     "product",
     "assurance",
@@ -201,7 +219,9 @@ function validateRuntimeAttestation(value) {
     "daemon",
     "nativeAddons",
     "hostRuntime",
-  ], "runtime attestation");
+  ];
+  if (value.codexAppServer !== undefined) expectedKeys.push("codexAppServer");
+  assertExactKeys(value, expectedKeys, "runtime attestation");
   invariant(value.schemaVersion === 1, "Unsupported runtime attestation schema.");
   invariant(value.product === "Prime Continuim", "Runtime attestation product is invalid.");
   invariant(value.assurance === "development-integrity", "Runtime attestation assurance is invalid.");
@@ -248,6 +268,8 @@ function validateRuntimeAttestation(value) {
     capabilities.add(capability);
   }
 
+  if (value.codexAppServer !== undefined) validateCodexAppServerAttestation(value.codexAppServer);
+
   invariant(Array.isArray(value.nativeAddons) && value.nativeAddons.length > 0 && value.nativeAddons.length <= 32, "Runtime native-addon allowlist is invalid.");
   const addonPaths = new Set();
   for (const addon of value.nativeAddons) {
@@ -260,6 +282,119 @@ function validateRuntimeAttestation(value) {
     assertSha256(addon.sha256, "nativeAddons[].sha256");
   }
   validateHostRuntime(value.hostRuntime);
+}
+
+function selectCodexAppServerAttestation(value) {
+  return {
+    releaseVersion: value.release.version,
+    platform: value.platform,
+    arch: value.arch,
+    target: value.target,
+    entrypoint: value.entrypoint,
+    fixedArguments: [...value.fixedArguments],
+    legalFiles: value.legalFiles.map((entry) => ({ ...entry })),
+    sessionConfig: structuredClone(value.sessionConfig),
+    threadConfig: { ...value.threadConfig },
+    initializeIdentity: { ...value.initializeIdentity },
+    threadStartPolicy: structuredClone(value.threadStartPolicy),
+    environmentPolicy: {
+      ...value.environmentPolicy,
+      requiredSourceVariables: [...value.environmentPolicy.requiredSourceVariables],
+      constructedVariables: [...value.environmentPolicy.constructedVariables],
+      pathEntries: [...value.environmentPolicy.pathEntries],
+    },
+    codexHomePolicy: {
+      ...value.codexHomePolicy,
+      forbiddenBasenames: [...value.codexHomePolicy.forbiddenBasenames],
+      forbiddenTopLevelDirectories: [...value.codexHomePolicy.forbiddenTopLevelDirectories],
+      forbiddenExecutableExtensions: [...value.codexHomePolicy.forbiddenExecutableExtensions],
+    },
+    assetSha256: value.asset.sha256,
+    publisher: {
+      subject: value.publisher.subject,
+      thumbprint: value.publisher.thumbprint,
+      signedFiles: [...value.publisher.signedFiles],
+      unsignedFiles: [...value.publisher.unsignedFiles],
+    },
+    smoke: { ...value.smoke },
+  };
+}
+
+function validateCodexAppServerAttestation(value) {
+  assertRecord(value, "Codex app-server attestation");
+  assertExactKeys(value, [
+    "releaseVersion",
+    "platform",
+    "arch",
+    "target",
+    "entrypoint",
+    "fixedArguments",
+    "legalFiles",
+    "sessionConfig",
+    "threadConfig",
+    "initializeIdentity",
+    "threadStartPolicy",
+    "environmentPolicy",
+    "codexHomePolicy",
+    "assetSha256",
+    "publisher",
+    "smoke",
+  ], "Codex app-server attestation");
+  invariant(value.releaseVersion === "0.147.0", "Codex app-server attestation release is not pinned.");
+  invariant(value.platform === "win32" && value.arch === "x64", "Codex app-server attestation target is unsupported.");
+  invariant(value.target === "x86_64-pc-windows-msvc", "Codex app-server target triple is invalid.");
+  assertSafeRelativePath(value.entrypoint, "codexAppServer.entrypoint");
+  invariant(
+    value.entrypoint === "companions/codex-app-server/bin/codex-app-server.exe",
+    "Codex app-server attestation entrypoint is invalid.",
+  );
+  invariant(jsonEqual(value.fixedArguments, CODEX_APP_SERVER_FIXED_ARGUMENTS), "Codex app-server fixed arguments drifted.");
+  invariant(jsonEqual(value.legalFiles, CODEX_APP_SERVER_LEGAL_FILES), "Codex app-server legal-resource provenance drifted.");
+  invariant(jsonEqual(value.sessionConfig, CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG), "Codex app-server session config drifted.");
+  invariant(jsonEqual(value.threadConfig, CODEX_APP_SERVER_THREAD_CONFIG), "Codex app-server thread config drifted.");
+  invariant(jsonEqual(value.initializeIdentity, CODEX_APP_SERVER_INITIALIZE_IDENTITY), "Codex app-server initialize identity drifted.");
+  invariant(jsonEqual(value.threadStartPolicy, CODEX_APP_SERVER_THREAD_START_POLICY), "Codex app-server thread/start policy drifted.");
+  invariant(jsonEqual(value.environmentPolicy, CODEX_APP_SERVER_ENVIRONMENT_POLICY), "Codex app-server environment policy drifted.");
+  invariant(jsonEqual(value.codexHomePolicy, CODEX_APP_SERVER_CODEX_HOME_POLICY), "Codex app-server CODEX_HOME policy drifted.");
+  assertSha256(value.assetSha256, "codexAppServer.assetSha256");
+  assertRecord(value.publisher, "Codex app-server publisher attestation");
+  assertExactKeys(value.publisher, ["subject", "thumbprint", "signedFiles", "unsignedFiles"], "Codex app-server publisher attestation");
+  invariant(
+    value.publisher.subject === 'CN="OpenAI OpCo, LLC", O="OpenAI OpCo, LLC", L=San Francisco, S=California, C=US',
+    "Codex app-server publisher subject is invalid.",
+  );
+  invariant(
+    value.publisher.thumbprint === "8B0ADFB840E141DAD3044D2B5AC819873DDE3590",
+    "Codex app-server publisher thumbprint is invalid.",
+  );
+  const signedFiles = [
+    "bin/codex-app-server.exe",
+    "bin/codex-code-mode-host.exe",
+    "codex-resources/codex-command-runner.exe",
+    "codex-resources/codex-windows-sandbox-setup.exe",
+  ];
+  invariant(jsonEqual(value.publisher.signedFiles, signedFiles), "Codex app-server signed file set drifted.");
+  invariant(jsonEqual(value.publisher.unsignedFiles, ["codex-path/rg.exe"]), "Codex app-server unsigned file set drifted.");
+  assertRecord(value.smoke, "Codex app-server smoke attestation");
+  invariant(jsonEqual(value.smoke, {
+    protocol: "jsonl-stdio",
+    initialize: true,
+    initializeIdentity: true,
+    configRead: true,
+    denyVectorEffective: true,
+    windowsSandboxUnelevatedPrivateDesktop: true,
+    mcpServersEmpty: true,
+    hooksEmpty: true,
+    pluginsEmpty: true,
+    appsEmpty: true,
+    threadStartReadOnly: true,
+    threadNetworkAccessDisabled: true,
+    threadDeleted: true,
+    accountReadSignedOut: true,
+    requiresOpenaiAuth: true,
+    forbiddenConfigAbsent: true,
+    authJsonAbsent: true,
+  }), "Codex app-server smoke attestation is invalid.");
 }
 
 function validateHostRuntime(value) {

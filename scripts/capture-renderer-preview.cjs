@@ -142,6 +142,44 @@ const targets = [
     expectShortCandidateEvaluationDialog: true,
   },
   {
+    name: 'codex-signed-out-390',
+    width: 390,
+    height: 844,
+    visualState: 'codex-subscription-signed-out',
+    expectedText: 'Uses your ChatGPT plan; API-key billing is separate. This does not sign Prime Agent in.',
+    openCodexWorkspace: true,
+    expectCodexAction: 'Continue with ChatGPT',
+  },
+  {
+    name: 'codex-signed-out-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'codex-subscription-signed-out',
+    expectedText: 'Uses your ChatGPT plan; API-key billing is separate. This does not sign Prime Agent in.',
+    openCodexWorkspace: true,
+    expectCodexAction: 'Continue with ChatGPT',
+    expectShortCodex: true,
+  },
+  {
+    name: 'codex-ready-390',
+    width: 390,
+    height: 844,
+    visualState: 'codex-subscription-ready',
+    expectedText: 'Read-only execution · approval requests are denied',
+    openCodexWorkspace: true,
+    expectCodexAction: 'Run with Codex',
+  },
+  {
+    name: 'codex-ready-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'codex-subscription-ready',
+    expectedText: 'Read-only execution · approval requests are denied',
+    openCodexWorkspace: true,
+    expectCodexAction: 'Run with Codex',
+    expectShortCodex: true,
+  },
+  {
     name: 'hud-expanded',
     width: 620,
     height: 380,
@@ -344,8 +382,48 @@ async function capture(target, rendererOrigin) {
       }
       await delay(300)
     }
+    if (target.openCodexWorkspace) {
+      // A never-shown Chromium window can advance React state without
+      // compositing the matching frame into capturePage(). Paint this native
+      // surface offscreen so the saved PNG is the exact asserted Codex state.
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = document.querySelector('button[aria-label="Use Codex via ChatGPT subscription"]')
+        if (!(button instanceof HTMLButtonElement) || button.disabled) {
+          throw new Error('The internal Codex visual-QA backend selector was not ready')
+        }
+        button.click()
+      })()`)
+      const codexDeadline = Date.now() + 10_000
+      while (Date.now() < codexDeadline) {
+        const ready = await browserWindow.webContents.executeJavaScript(`(() => {
+          const surface = document.querySelector('.codex-workspace')
+          const action = [...document.querySelectorAll('.codex-workspace button')]
+            .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.expectCodexAction)})
+          return Boolean(
+            surface &&
+            document.body.innerText.includes(${JSON.stringify(target.expectedText)}) &&
+            action instanceof HTMLButtonElement
+          )
+        })()`)
+        if (ready) break
+        await delay(25)
+      }
+      await delay(150)
+      if (target.expectShortCodex) {
+        await browserWindow.webContents.executeJavaScript(`(() => {
+          const surface = document.querySelector('.codex-workspace')
+          if (!(surface instanceof HTMLElement)) throw new Error('The Codex visual-QA surface was not found')
+          surface.scrollTop = surface.scrollHeight
+        })()`)
+        await delay(75)
+      }
+    }
     const selector = target.expectHud
       ? `.hud-${target.expectHud}`
+      : target.openCodexWorkspace
+        ? '.codex-workspace'
       : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
         ? '.empty-workbench'
         : '.app-shell'
@@ -388,6 +466,18 @@ async function capture(target, rendererOrigin) {
       const candidateEvaluationDialogFooterRect = candidateEvaluationDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
       const emptyMain = document.querySelector('.empty-workbench__main')
       const emptyMainStyle = emptyMain ? window.getComputedStyle(emptyMain) : undefined
+      const codexSurface = document.querySelector('.codex-workspace')
+      const codexSurfaceStyle = codexSurface ? window.getComputedStyle(codexSurface) : undefined
+      const codexPrimaryAction = [...document.querySelectorAll('.codex-workspace button')]
+        .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.expectCodexAction)})
+      const codexPrimaryActionRect = codexPrimaryAction?.getBoundingClientRect()
+      const codexPrimaryActionVisible = Boolean(
+        codexPrimaryActionRect &&
+        codexPrimaryActionRect.width > 0 &&
+        codexPrimaryActionRect.height > 0 &&
+        codexPrimaryActionRect.top >= 0 &&
+        codexPrimaryActionRect.bottom <= window.innerHeight
+      )
       const hudSurface = document.querySelector(${JSON.stringify(target.expectHud ? `.hud-${target.expectHud}` : '.hud-never')})
       const bodyStyle = window.getComputedStyle(document.body)
       const rootStyle = window.getComputedStyle(document.documentElement)
@@ -445,6 +535,28 @@ async function capture(target, rendererOrigin) {
         emptyMainClientHeight: emptyMain?.clientHeight,
         emptyMainScrollHeight: emptyMain?.scrollHeight,
         emptyMainOverflowY: emptyMainStyle?.overflowY,
+        codexSurfaceVisible: Boolean(codexSurface && codexSurface.clientWidth > 0 && codexSurface.clientHeight > 0),
+        codexModeSelected: document.querySelector('button[aria-label="Use Codex via ChatGPT subscription"]')?.getAttribute('aria-pressed') === 'true',
+        codexPrimeControlsAbsent: Boolean(
+          codexSurface &&
+          !document.querySelector('#thread-composer') &&
+          !document.querySelector('button[aria-label="Show desktop HUD"]') &&
+          !document.querySelector('.model-chip') &&
+          !document.querySelector('.run-location') &&
+          !document.querySelector('.sidebar__location') &&
+          !document.querySelector('#thread-inspector')
+        ),
+        codexPrimaryActionVisible,
+        codexShortContentReachable: Boolean(
+          codexSurface &&
+          codexSurfaceStyle &&
+          codexPrimaryActionVisible &&
+          (codexSurface.scrollHeight <= codexSurface.clientHeight ||
+            codexSurfaceStyle.overflowY === 'auto' || codexSurfaceStyle.overflowY === 'scroll')
+        ),
+        codexSurfaceClientHeight: codexSurface?.clientHeight,
+        codexSurfaceScrollHeight: codexSurface?.scrollHeight,
+        codexSurfaceOverflowY: codexSurfaceStyle?.overflowY,
         hudSurfaceVisible: Boolean(hudSurface && hudSurface.getBoundingClientRect().width > 0 && hudSurface.getBoundingClientRect().height > 0),
         hudMode: document.querySelector('.hud-buddy') ? 'buddy' : document.querySelector('.hud-expanded') ? 'expanded' : undefined,
         hudStatusVisible: Boolean(document.querySelector('.hud-status')),
@@ -483,6 +595,18 @@ async function capture(target, rendererOrigin) {
       invariant(
         stateEvidence.emptyMainScrollable,
         `${target.name} did not preserve vertical access to resident recovery controls: ${JSON.stringify(stateEvidence)}`,
+      )
+    }
+    if (target.openCodexWorkspace) {
+      invariant(stateEvidence.codexSurfaceVisible, `${target.name} did not paint the Codex workspace`)
+      invariant(stateEvidence.codexModeSelected, `${target.name} did not select the Codex backend`)
+      invariant(stateEvidence.codexPrimeControlsAbsent, `${target.name} exposed Prime-only controls in Codex mode`)
+      invariant(stateEvidence.codexPrimaryActionVisible, `${target.name} hid its primary Codex action`)
+    }
+    if (target.expectShortCodex) {
+      invariant(
+        stateEvidence.codexShortContentReachable,
+        `${target.name} did not preserve vertical access to its Codex action: ${JSON.stringify(stateEvidence)}`,
       )
     }
     if (target.expectHud) {

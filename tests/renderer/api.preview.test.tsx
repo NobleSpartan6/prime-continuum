@@ -214,6 +214,74 @@ describe('browser preview evidence labels', () => {
     })).rejects.toThrow('never invokes candidate code')
   })
 
+  it('keeps both Codex visual-QA states exact-authority and non-executing', async () => {
+    const binding = {
+      expectedHostId: 'host-local',
+      threadId: 'codex-preview-source-thread',
+      expectedExecutionGenerationId: 'codex-preview-execution',
+    }
+
+    for (const visualState of ['codex-subscription-signed-out', 'codex-subscription-ready'] as const) {
+      const api = createPreviewRendererApi(visualState)
+      expect(api.environment).toBe('native')
+      expect(api.codexSubscription).toBeDefined()
+
+      const load = api.loadWorkbench()
+      await vi.advanceTimersByTimeAsync(120)
+      const snapshot = await load
+      expect(snapshot.operations.codexSubscription).toBe(true)
+      expect(snapshot.operations.startResidentTurn).toBe(false)
+      expect(snapshot.operations.stopResidentTurn).toBe(false)
+      expect(snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)).toMatchObject({
+        remoteId: binding.threadId,
+        executionGenerationId: binding.expectedExecutionGenerationId,
+        hostId: binding.expectedHostId,
+      })
+
+      const codex = api.codexSubscription!
+      const account = await codex.accountRead({ expectedHostId: binding.expectedHostId })
+      const conversation = await codex.conversationSnapshot(binding)
+      expect(account.phase).toBe(visualState === 'codex-subscription-ready' ? 'signed_in' : 'signed_out')
+      expect(conversation.conversation === null).toBe(visualState === 'codex-subscription-signed-out')
+
+      const mutationError = 'never invokes login, logout, turn, or interrupt operations'
+      await expect(codex.loginStart({
+        expectedHostId: binding.expectedHostId,
+        expectedBackendIncarnationId: account.backendIncarnationId,
+        operationId: 'codex-preview-login',
+      })).rejects.toThrow(mutationError)
+      await expect(codex.loginCancel({
+        expectedHostId: binding.expectedHostId,
+        expectedBackendIncarnationId: account.backendIncarnationId,
+        loginOperationId: 'codex-preview-login',
+        loginId: 'codex-preview-login-id',
+      })).rejects.toThrow(mutationError)
+      await expect(codex.logout({
+        expectedHostId: binding.expectedHostId,
+        expectedBackendIncarnationId: account.backendIncarnationId,
+        operationId: 'codex-preview-logout',
+      })).rejects.toThrow(mutationError)
+      const startEnvelope = {
+        ...binding,
+        expectedBackendIncarnationId: account.backendIncarnationId,
+        expectedConversation: { state: 'absent' as const },
+        operationId: 'codex-preview-start',
+        prompt: 'This must never run.',
+      }
+      await expect(codex.turnStart(startEnvelope)).rejects.toThrow(mutationError)
+      await expect(codex.turnReconcile(startEnvelope)).rejects.toThrow(mutationError)
+      await expect(codex.turnInterrupt({
+        ...binding,
+        expectedBackendIncarnationId: account.backendIncarnationId,
+        sessionId: 'codex-preview-session',
+        codexThreadId: 'codex-preview-thread',
+        operationId: 'codex-preview-interrupt',
+        expectedTurnOperationId: 'codex-preview-start',
+        turnId: 'codex-preview-turn',
+      })).rejects.toThrow(mutationError)
+    }
+  })
+
   it('labels the handoff plan, progress, checkpoint, and receipt as a simulation', async () => {
     const api = createPreviewRendererApi()
     const planRequest = api.planHandoff({

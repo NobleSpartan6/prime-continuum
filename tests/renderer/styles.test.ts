@@ -110,4 +110,23 @@ describe('renderer style contracts', () => {
     expect(motionStyles).toContain('.composer__connection--uncertain svg.lucide-refresh-cw')
     expect(motionStyles).not.toMatch(/\.composer__connection--uncertain svg,/)
   })
+
+  it('keeps the Codex subscription surface operable at 320 pixels and in forced colors', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const codexNarrowStart = css.lastIndexOf('@media (max-width: 38rem)')
+    const codexNarrow = css.slice(codexNarrowStart, css.indexOf('@media (pointer: coarse)', codexNarrowStart))
+    const codexShortStart = css.lastIndexOf('@media (max-height: 28rem)')
+    const codexShort = css.slice(codexShortStart, css.indexOf('@media (pointer: coarse)', codexShortStart))
+    const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
+
+    expect(codexNarrow).toMatch(/\.codex-account-card\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);[^}]*inline-size:\s*calc\(100% - 1rem\);/s)
+    expect(codexNarrow).toMatch(/\.codex-account-card__actions\s*{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s)
+    expect(codexNarrow).toMatch(/\.codex-composer__footer\s*{[^}]*flex-direction:\s*column;/s)
+    expect(codexNarrow).toMatch(/\.codex-composer__submit\s*{[^}]*inline-size:\s*100%;/s)
+    expect(codexShort).toMatch(/\.codex-workspace\s*{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable;/s)
+    expect(codexShort).toMatch(/\.codex-account-card,\s*\.codex-workspace__center\s*{[^}]*grid-row:\s*auto;/s)
+    expect(forcedColors).toContain('.codex-composer textarea:focus-visible')
+    expect(forcedColors).toContain('.backend-switch')
+    expect(forcedColors).toContain('.codex-account-card')
+  })
 })

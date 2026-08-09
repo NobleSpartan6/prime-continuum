@@ -9,6 +9,7 @@ import { extractFile, listPackage } from '@electron/asar'
 import {
   RUNTIME_TEMPLATE_DIRECTORY,
   loadRuntimeInputs,
+  smokeCodexAppServerCompanion,
   smokeRuntime,
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
@@ -218,6 +219,8 @@ async function main() {
     electronRunAsNode: true,
     policy: inputs.policy,
   })
+  const codexAppServerSmoke = await smokeCodexAppServerCompanion(packagedRuntime.root, { policy: inputs.policy })
+  invariant(codexAppServerSmoke !== undefined, 'The packaged Codex app-server companion smoke was skipped.')
   const applicationSmoke = await smokePackagedApplication(executablePath, packageDirectory)
   assertRuntimeAttestationMatches(attestation, {
     pointer: runtimePointer,
@@ -277,6 +280,15 @@ async function main() {
       electronNode: runtimeSmoke.runtimeVersions.node,
       electronModulesAbi: runtimeSmoke.runtimeVersions.modules,
       electronNapi: runtimeSmoke.runtimeVersions.napi,
+      codexAppServer: {
+        smoke: codexAppServerSmoke,
+        legalFiles: packagedRuntime.manifest.codexAppServer.legalFiles.map(({ path, size, sha256, sourceCommit }) => ({
+          path,
+          size,
+          sha256,
+          sourceCommit,
+        })),
+      },
     },
   }, null, 2))
 }

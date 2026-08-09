@@ -15,7 +15,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { constants as fsConstants, existsSync } from "node:fs";
+import { constants as fsConstants, createReadStream, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   basename,
@@ -25,12 +25,26 @@ import {
   relative,
   resolve,
   sep,
+  extname,
 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
+import { createGunzip } from "node:zlib";
+import {
+  CODEX_APP_SERVER_ENVIRONMENT_POLICY,
+  CODEX_APP_SERVER_LEGAL_FILES,
+  createCodexAppServerEnvironment,
+} from "./codex-app-server-policy-lib.mjs";
+
+export {
+  CODEX_APP_SERVER_ENVIRONMENT_POLICY,
+  CODEX_APP_SERVER_LEGAL_FILES,
+  createCodexAppServerEnvironment,
+} from "./codex-app-server-policy-lib.mjs";
 
 const RUNTIME_METADATA_FILES = new Set(["files.sha256", "runtime.json"]);
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
+const MAX_CODEX_APP_SERVER_ASSET_BYTES = 128 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
@@ -38,6 +52,308 @@ const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNTIME_TEMPLATE_DIRECTORY = join(REPO_ROOT, "runtime", "prime-agent");
+export const CODEX_APP_SERVER_COMPANION_DIRECTORY = "companions/codex-app-server";
+export const CODEX_APP_SERVER_FIXED_ARGUMENTS = Object.freeze([
+  "--strict-config",
+  "-c",
+  'cli_auth_credentials_store="keyring"',
+  "-c",
+  'mcp_oauth_credentials_store="keyring"',
+  "-c",
+  'forced_login_method="chatgpt"',
+  "-c",
+  'web_search="disabled"',
+  "-c",
+  "check_for_update_on_startup=false",
+  "-c",
+  'shell_environment_policy.inherit="none"',
+  "-c",
+  "shell_environment_policy.experimental_use_profile=false",
+  "-c",
+  "allow_login_shell=false",
+  "-c",
+  'windows.sandbox="unelevated"',
+  "-c",
+  "windows.sandbox_private_desktop=true",
+  "-c",
+  "include_apps_instructions=false",
+  "-c",
+  "skills.include_instructions=false",
+  "-c",
+  "orchestrator.skills.enabled=false",
+  "-c",
+  "orchestrator.mcp.enabled=false",
+  "-c",
+  "features.plugins=false",
+  "-c",
+  "features.apps=false",
+  "-c",
+  "features.remote_plugin=false",
+  "-c",
+  "features.plugin_sharing=false",
+  "-c",
+  "features.recommended_plugins=false",
+  "-c",
+  "features.skill_mcp_dependency_install=false",
+  "-c",
+  "features.skill_search=false",
+  "-c",
+  "features.plugin_hooks=false",
+  "-c",
+  "features.hooks=false",
+  "-c",
+  "features.browser_use=false",
+  "-c",
+  "features.browser_use_full_cdp_access=false",
+  "-c",
+  "features.browser_use_external=false",
+  "-c",
+  "features.computer_use=false",
+  "-c",
+  "features.in_app_browser=false",
+  "-c",
+  "features.in_app_updates=false",
+  "-c",
+  "features.image_generation=false",
+  "-c",
+  "features.tool_suggest=false",
+  "-c",
+  "features.multi_agent=false",
+  "-c",
+  "features.multi_agent_v2=false",
+  "-c",
+  "features.code_mode=false",
+  "-c",
+  "features.code_mode_buffered_exec=false",
+  "-c",
+  "features.code_mode_host=false",
+  "-c",
+  "features.code_mode_only=false",
+  "-c",
+  "features.enable_mcp_apps=false",
+  "-c",
+  "features.mcp_2026_07_28=false",
+  "-c",
+  "features.non_prefixed_mcp_tool_names=false",
+  "-c",
+  "features.deferred_tool_world_state=false",
+  "-c",
+  "features.tool_call_mcp_elicitation=false",
+  "-c",
+  "features.auth_elicitation=false",
+  "-c",
+  "features.standalone_web_search=false",
+  "-c",
+  "features.executor_capability_discovery=false",
+  "-c",
+  "features.workspace_dependencies=false",
+  "-c",
+  "features.memories=false",
+  "-c",
+  "features.elevated_windows_sandbox=false",
+  "--listen",
+  "stdio://",
+]);
+export const CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG = Object.freeze({
+  cli_auth_credentials_store: "keyring",
+  mcp_oauth_credentials_store: "keyring",
+  forced_login_method: "chatgpt",
+  web_search: "disabled",
+  check_for_update_on_startup: false,
+  shell_environment_policy: Object.freeze({
+    inherit: "none",
+    experimental_use_profile: false,
+  }),
+  allow_login_shell: false,
+  windows: Object.freeze({
+    sandbox: "unelevated",
+    sandbox_private_desktop: true,
+  }),
+  include_apps_instructions: false,
+  skills: Object.freeze({ include_instructions: false }),
+  orchestrator: Object.freeze({
+    skills: Object.freeze({ enabled: false }),
+    mcp: Object.freeze({ enabled: false }),
+  }),
+  features: Object.freeze({
+    plugins: false,
+    apps: false,
+    remote_plugin: false,
+    plugin_sharing: false,
+    recommended_plugins: false,
+    skill_mcp_dependency_install: false,
+    skill_search: false,
+    plugin_hooks: false,
+    hooks: false,
+    browser_use: false,
+    browser_use_full_cdp_access: false,
+    browser_use_external: false,
+    computer_use: false,
+    in_app_browser: false,
+    in_app_updates: false,
+    image_generation: false,
+    tool_suggest: false,
+    multi_agent: false,
+    multi_agent_v2: false,
+    code_mode: false,
+    code_mode_buffered_exec: false,
+    code_mode_host: false,
+    code_mode_only: false,
+    enable_mcp_apps: false,
+    mcp_2026_07_28: false,
+    non_prefixed_mcp_tool_names: false,
+    deferred_tool_world_state: false,
+    tool_call_mcp_elicitation: false,
+    auth_elicitation: false,
+    standalone_web_search: false,
+    executor_capability_discovery: false,
+    workspace_dependencies: false,
+    memories: false,
+    elevated_windows_sandbox: false,
+  }),
+});
+export const CODEX_APP_SERVER_THREAD_CONFIG = Object.freeze(Object.fromEntries(
+  flattenConfigLeafPaths(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG).map((path) => [
+    path,
+    readConfigPath(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG, path),
+  ]),
+));
+export const CODEX_APP_SERVER_INITIALIZE_IDENTITY = Object.freeze({
+  clientInfoName: "prime_continuim",
+  clientInfoTitle: "Prime Continuim",
+  capabilities: Object.freeze({ experimentalApi: true }),
+  userAgentTemplate: "prime_continuim/0.147.0 (Windows <major>.<minor>.<build>; x86_64) unknown (prime_continuim; <clientVersion>)",
+  platformFamily: "windows",
+  platformOs: "windows",
+});
+export const CODEX_APP_SERVER_THREAD_START_POLICY = Object.freeze({
+  requiredCapability: "experimentalApi",
+  requestKeys: Object.freeze([
+    "modelProvider",
+    "cwd",
+    "runtimeWorkspaceRoots",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "sandbox",
+    "config",
+    "ephemeral",
+    "environments",
+    "dynamicTools",
+    "selectedCapabilityRoots",
+    "experimentalRawEvents",
+  ]),
+  modelProvider: "openai",
+  cwd: "absolute-workspace",
+  runtimeWorkspaceRoots: "exact-cwd-only",
+  approvalPolicy: "never",
+  approvalsReviewer: "user",
+  sandbox: "read-only",
+  config: "attested-thread-config",
+  ephemeral: false,
+  environments: Object.freeze([]),
+  dynamicTools: Object.freeze([]),
+  selectedCapabilityRoots: Object.freeze([]),
+  experimentalRawEvents: false,
+  deleteAfterSmoke: true,
+  expectedSecurityResponse: Object.freeze({
+    model: "gpt-5.6-sol",
+    modelProvider: "openai",
+    runtimeWorkspaceRoots: Object.freeze([]),
+    instructionSources: Object.freeze([]),
+    approvalPolicy: "never",
+    approvalsReviewer: "user",
+    sandbox: Object.freeze({ type: "readOnly", networkAccess: false }),
+    activePermissionProfile: null,
+    multiAgentMode: "explicitRequestOnly",
+  }),
+});
+export const CODEX_APP_SERVER_CODEX_HOME_POLICY = Object.freeze({
+  requireEmptyAtLaunch: true,
+  allowedGeneratedSystemSkillsRoot: "skills/.system",
+  forbiddenBasenames: Object.freeze([
+    ".credentials.json",
+    ".env",
+    "AGENTS.md",
+    "auth.json",
+    "config.toml",
+    "hooks.json",
+    "managed_config.toml",
+    "requirements.toml",
+  ]),
+  forbiddenTopLevelDirectories: Object.freeze([
+    ".agents",
+    ".codex",
+    "agents",
+    "commands",
+    "marketplaces",
+    "plugins",
+    "prompts",
+    "rules",
+  ]),
+  forbiddenExecutableExtensions: Object.freeze([
+    ".bat",
+    ".cmd",
+    ".com",
+    ".cjs",
+    ".dll",
+    ".exe",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".sh",
+    ".ts",
+    ".tsx",
+  ]),
+});
+
+const CODEX_APP_SERVER_RELEASE = Object.freeze({
+  repository: "https://github.com/openai/codex",
+  tag: "rust-v0.147.0",
+  version: "0.147.0",
+  tagObject: "3ed6f04f6bf8b7c46299d1cb1ff99c74ce21a51d",
+  commit: "be6e8eac029b183056b7e4402879f15d2c85f61b",
+});
+const CODEX_APP_SERVER_ASSET = Object.freeze({
+  fileName: "codex-app-server-package-x86_64-pc-windows-msvc.tar.gz",
+  url: "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-app-server-package-x86_64-pc-windows-msvc.tar.gz",
+  size: 110_054_928,
+  expandedSize: 319_488_000,
+  sha256: "c8908d687cf7caa3074921479726db32f96a295372c3544f1e96919a7254951f",
+});
+const CODEX_APP_SERVER_PACKAGE_METADATA = Object.freeze({
+  layoutVersion: 1,
+  version: "0.147.0",
+  target: "x86_64-pc-windows-msvc",
+  variant: "codex-app-server",
+  entrypoint: "bin/codex-app-server.exe",
+  resourcesDir: "codex-resources",
+  pathDir: "codex-path",
+});
+const CODEX_APP_SERVER_ARCHIVE_MEMBERS = Object.freeze([
+  Object.freeze({ path: "bin/", type: "directory", size: 0 }),
+  Object.freeze({ path: "bin/codex-app-server.exe", type: "file", size: 247_694_640, sha256: "5f9fcc5c8cb2358908534d42ed00dff72e0295a8b76bdc69e01a8bca75e29662" }),
+  Object.freeze({ path: "bin/codex-code-mode-host.exe", type: "file", size: 57_450_288, sha256: "37c23a542037e1bcfd0fa7eb4a150c697229d7ff31bf675c519d5bff7226b191" }),
+  Object.freeze({ path: "codex-package.json", type: "file", size: 237, sha256: "90f75ac3f356281935567105ce486bd42fc23f25812d1629f2a048255a1b6496" }),
+  Object.freeze({ path: "codex-path/", type: "directory", size: 0 }),
+  Object.freeze({ path: "codex-path/rg.exe", type: "file", size: 4_218_880, sha256: "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680" }),
+  Object.freeze({ path: "codex-resources/", type: "directory", size: 0 }),
+  Object.freeze({ path: "codex-resources/codex-command-runner.exe", type: "file", size: 1_300_272, sha256: "3a70491d8d588afa459a42816f05b8c2fdd6bddb0ef318f3dfccc963a30b420a" }),
+  Object.freeze({ path: "codex-resources/codex-windows-sandbox-setup.exe", type: "file", size: 8_804_144, sha256: "a4df86996dfbb218d96d73a80606d89b742dfa4ddd3470614e90dde89e3250a3" }),
+]);
+const CODEX_APP_SERVER_AUTHENTICODE = Object.freeze({
+  publisherSubject: 'CN="OpenAI OpCo, LLC", O="OpenAI OpCo, LLC", L=San Francisco, S=California, C=US',
+  issuer: "CN=Microsoft ID Verified CS EOC CA 04, O=Microsoft Corporation, C=US",
+  signerThumbprint: "8B0ADFB840E141DAD3044D2B5AC819873DDE3590",
+  signedFiles: Object.freeze([
+    "bin/codex-app-server.exe",
+    "bin/codex-code-mode-host.exe",
+    "codex-resources/codex-command-runner.exe",
+    "codex-resources/codex-windows-sandbox-setup.exe",
+  ]),
+  unsignedFiles: Object.freeze(["codex-path/rg.exe"]),
+});
 
 export class PrimeAgentRuntimeBuildError extends Error {
   constructor(message, options = {}) {
@@ -185,6 +501,72 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   for (const entrypoint of Object.values(policy.entrypoints ?? {})) {
     assertSafeRelativePath(entrypoint, "runtime entrypoint");
   }
+  validateCodexAppServerInputs(sources, policy, allowedHosts);
+}
+
+function validateCodexAppServerInputs(sources, policy, allowedHosts) {
+  const source = sources.codexAppServer;
+  const companion = policy.codexAppServer;
+  assertRecord(source, "Codex app-server source");
+  assertRecord(companion, "Codex app-server policy");
+  if (!jsonEqual(source.release, CODEX_APP_SERVER_RELEASE)) {
+    throw buildError("Codex app-server release identity changed without review.");
+  }
+  if (!jsonEqual(source.asset, CODEX_APP_SERVER_ASSET)) {
+    throw buildError("Codex app-server release asset changed without review.");
+  }
+  if (!jsonEqual(source.legalFiles, CODEX_APP_SERVER_LEGAL_FILES)) {
+    throw buildError("Codex app-server legal-resource provenance changed without review.");
+  }
+  for (const legalFile of source.legalFiles) {
+    parseAllowedHttpsUrl(legalFile.url, allowedHosts);
+    assertSafeRelativePath(legalFile.path, "Codex app-server legal resource");
+    if (!legalFile.path.startsWith("legal/") || legalFile.size > 64 * 1024) {
+      throw buildError("Codex app-server legal resource bounds are invalid.");
+    }
+  }
+  parseAllowedHttpsUrl(source.asset.url, allowedHosts);
+  if (
+    source.asset.size > MAX_CODEX_APP_SERVER_ASSET_BYTES ||
+    !Number.isSafeInteger(source.asset.expandedSize) ||
+    source.asset.expandedSize <= source.asset.size
+  ) {
+    throw buildError("Codex app-server release asset bounds are invalid.");
+  }
+  if (!jsonEqual(source.archiveMembers, CODEX_APP_SERVER_ARCHIVE_MEMBERS)) {
+    throw buildError("Codex app-server archive member allowlist changed without review.");
+  }
+  if (!jsonEqual(source.packageMetadata, CODEX_APP_SERVER_PACKAGE_METADATA)) {
+    throw buildError("Codex app-server package metadata changed without review.");
+  }
+  if (!jsonEqual(source.authenticode, CODEX_APP_SERVER_AUTHENTICODE)) {
+    throw buildError("Codex app-server publisher policy changed without review.");
+  }
+  const expectedPolicy = {
+    platform: "win32",
+    arch: "x64",
+    target: CODEX_APP_SERVER_PACKAGE_METADATA.target,
+    directory: CODEX_APP_SERVER_COMPANION_DIRECTORY,
+    entrypoint: `${CODEX_APP_SERVER_COMPANION_DIRECTORY}/${CODEX_APP_SERVER_PACKAGE_METADATA.entrypoint}`,
+    packageMetadata: `${CODEX_APP_SERVER_COMPANION_DIRECTORY}/codex-package.json`,
+    fixedArguments: CODEX_APP_SERVER_FIXED_ARGUMENTS,
+    sessionConfig: CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG,
+    threadConfig: CODEX_APP_SERVER_THREAD_CONFIG,
+    initializeIdentity: CODEX_APP_SERVER_INITIALIZE_IDENTITY,
+    threadStartPolicy: CODEX_APP_SERVER_THREAD_START_POLICY,
+    environmentPolicy: CODEX_APP_SERVER_ENVIRONMENT_POLICY,
+    codexHomePolicy: CODEX_APP_SERVER_CODEX_HOME_POLICY,
+    protocol: "jsonl-stdio",
+    credentialStore: "keyring",
+    mcpCredentialStore: "keyring",
+    forcedLoginMethod: "chatgpt",
+  };
+  if (!jsonEqual(companion, expectedPolicy)) {
+    throw buildError("Codex app-server launch policy changed without review.");
+  }
+  assertSafeRelativePath(companion.directory, "Codex app-server directory");
+  assertSafeRelativePath(companion.entrypoint, "Codex app-server entrypoint");
+  assertSafeRelativePath(companion.packageMetadata, "Codex app-server package metadata path");
 }
 
 export async function verifyReleaseAssets(inputs, cacheDirectory, options = {}) {
@@ -198,10 +580,41 @@ export async function verifyReleaseAssets(inputs, cacheDirectory, options = {}) 
       continue;
     }
     await rm(destination, { force: true });
-    await downloadVerifiedAsset(asset, destination, allowedHosts, options);
+    await downloadVerifiedAsset(asset, destination, allowedHosts, { ...options, maximumBytes: MAX_ASSET_BYTES });
     verified.push(destination);
   }
+  if (codexAppServerSupportedForTarget(inputs.policy, options.platform, options.arch)) {
+    const asset = inputs.sources.codexAppServer.asset;
+    const destination = join(cacheDirectory, `${asset.sha256}-${asset.fileName}`);
+    if (!(await fileMatches(destination, asset))) {
+      await rm(destination, { force: true });
+      await downloadVerifiedAsset(asset, destination, allowedHosts, {
+        ...options,
+        maximumBytes: MAX_CODEX_APP_SERVER_ASSET_BYTES,
+      });
+    }
+    verified.push(destination);
+    for (const legalFile of inputs.sources.codexAppServer.legalFiles) {
+      const legalDestination = join(cacheDirectory, `${legalFile.sha256}-${legalFile.fileName}`);
+      if (!(await fileMatches(legalDestination, legalFile))) {
+        await rm(legalDestination, { force: true });
+        await downloadVerifiedAsset(legalFile, legalDestination, allowedHosts, {
+          ...options,
+          maximumBytes: 64 * 1024,
+        });
+      }
+      verified.push(legalDestination);
+    }
+  }
   return Object.freeze(verified);
+}
+
+export function codexAppServerSupportedForTarget(
+  policy,
+  platform = process.platform,
+  arch = process.arch,
+) {
+  return platform === policy?.codexAppServer?.platform && arch === policy?.codexAppServer?.arch;
 }
 
 async function downloadVerifiedAsset(asset, destination, allowedHosts, options) {
@@ -234,7 +647,7 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts, options) 
       const chunk = result.value;
       const buffer = Buffer.from(chunk);
       bytes += buffer.byteLength;
-      if (bytes > asset.size || bytes > MAX_ASSET_BYTES) {
+      if (bytes > asset.size || bytes > options.maximumBytes) {
         throw buildError(`Download exceeded the pinned size for ${asset.fileName}.`);
       }
       digest.update(buffer);
@@ -374,6 +787,429 @@ export async function installLockedRuntime({ inputs, stagingDirectory, npmCli })
   }
   await rm(join(stagingDirectory, "node_modules", ".bin"), { recursive: true, force: true });
   return npmVersion;
+}
+
+export async function installCodexAppServerCompanion({
+  inputs,
+  runtimeDirectory,
+  verifiedAssets,
+  platform = process.platform,
+  arch = process.arch,
+  authenticodeInspector,
+}) {
+  if (!codexAppServerSupportedForTarget(inputs.policy, platform, arch)) return undefined;
+  if (!Array.isArray(verifiedAssets)) throw buildError("Verified runtime asset paths are required.");
+  const asset = inputs.sources.codexAppServer.asset;
+  const expectedBasename = `${asset.sha256}-${asset.fileName}`;
+  const matches = verifiedAssets.filter((candidate) => basename(candidate) === expectedBasename);
+  if (matches.length !== 1 || !(await fileMatches(matches[0], asset))) {
+    throw buildError("The pinned Codex app-server asset was not verified exactly once.");
+  }
+  const legalAssets = [];
+  for (const legalFile of inputs.sources.codexAppServer.legalFiles) {
+    const legalBasename = `${legalFile.sha256}-${legalFile.fileName}`;
+    const legalMatches = verifiedAssets.filter((candidate) => basename(candidate) === legalBasename);
+    if (legalMatches.length !== 1 || !(await fileMatches(legalMatches[0], legalFile))) {
+      throw buildError(`The pinned Codex app-server ${legalFile.path} was not verified exactly once.`);
+    }
+    legalAssets.push({ source: legalMatches[0], record: legalFile });
+  }
+  const runtimeRoot = await realpath(runtimeDirectory);
+  const companionsDirectory = join(runtimeRoot, "companions");
+  const companionDirectory = join(runtimeRoot, ...inputs.policy.codexAppServer.directory.split("/"));
+  if (companionDirectory !== join(companionsDirectory, "codex-app-server")) {
+    throw buildError("Codex app-server companion directory escaped its reviewed namespace.");
+  }
+  await mkdir(companionsDirectory, { recursive: false });
+  await mkdir(companionDirectory, { recursive: false });
+  await extractCodexAppServerArchive({
+    assetPath: matches[0],
+    destinationDirectory: companionDirectory,
+    source: inputs.sources.codexAppServer,
+  });
+  const legalDirectory = join(companionDirectory, "legal");
+  await mkdir(legalDirectory, { recursive: false });
+  for (const legalFile of legalAssets) {
+    const destination = join(companionDirectory, ...legalFile.record.path.split("/"));
+    assertContainedPath(legalDirectory, destination, "Codex app-server legal resource");
+    await copyFile(legalFile.source, destination, fsConstants.COPYFILE_EXCL);
+    if (!(await fileMatches(destination, legalFile.record))) {
+      throw buildError(`Installed Codex app-server ${legalFile.record.path} bytes drifted.`);
+    }
+  }
+  return await verifyCodexAppServerCompanion(runtimeRoot, {
+    inputs,
+    policy: inputs.policy,
+    platform,
+    arch,
+    authenticodeInspector,
+  });
+}
+
+export async function extractCodexAppServerArchive({ assetPath, destinationDirectory, source }) {
+  const assetDetails = await lstat(assetPath);
+  if (
+    !assetDetails.isFile() ||
+    assetDetails.isSymbolicLink() ||
+    assetDetails.size !== source?.asset?.size ||
+    (await sha256File(assetPath)) !== source.asset.sha256
+  ) {
+    throw buildError("Codex app-server archive bytes do not match the pinned asset.");
+  }
+  const destinationDetails = await lstat(destinationDirectory);
+  if (!destinationDetails.isDirectory() || destinationDetails.isSymbolicLink()) {
+    throw buildError("Codex app-server extraction root must be a plain directory.");
+  }
+  const initialEntries = await readdir(destinationDirectory);
+  if (initialEntries.length !== 0) throw buildError("Codex app-server extraction root must be empty.");
+  const expectedMembers = source.archiveMembers;
+  let logicalMemberIndex = 0;
+  let totalExpandedBytes = 0;
+  let state = "header";
+  let headerBuffer = Buffer.alloc(0);
+  let pendingPax = false;
+  let current;
+  let currentHandle;
+  let currentDigest;
+  let remaining = 0;
+  let padding = 0;
+  let paxChunks = [];
+  let zeroBlocks = 0;
+  const stream = createReadStream(assetPath).pipe(createGunzip());
+
+  const closeCurrent = async () => {
+    if (!currentHandle) return;
+    await currentHandle.sync();
+    await currentHandle.close();
+    currentHandle = undefined;
+  };
+
+  const finishMember = async () => {
+    if (current.kind === "pax") {
+      const pax = Buffer.concat(paxChunks);
+      validateCodexPaxHeader(pax);
+      pendingPax = true;
+      paxChunks = [];
+    } else if (current.expected.type === "file") {
+      await closeCurrent();
+      const digest = currentDigest.digest("hex");
+      if (digest !== current.expected.sha256) {
+        throw buildError(`Codex app-server archive member digest mismatch: ${current.expected.path}.`);
+      }
+      logicalMemberIndex += 1;
+    } else {
+      logicalMemberIndex += 1;
+    }
+    current = undefined;
+    currentDigest = undefined;
+    state = padding === 0 ? "header" : "padding";
+  };
+
+  try {
+    for await (const rawChunk of stream) {
+      const chunk = Buffer.from(rawChunk);
+      totalExpandedBytes += chunk.byteLength;
+      if (totalExpandedBytes > source.asset.expandedSize) {
+        throw buildError("Codex app-server archive expanded beyond its pinned bound.");
+      }
+      let offset = 0;
+      while (offset < chunk.byteLength) {
+        if (state === "end") {
+          if (chunk.subarray(offset).some((byte) => byte !== 0)) {
+            throw buildError("Codex app-server archive contains bytes after its end marker.");
+          }
+          offset = chunk.byteLength;
+          continue;
+        }
+        if (state === "header") {
+          const take = Math.min(512 - headerBuffer.byteLength, chunk.byteLength - offset);
+          headerBuffer = Buffer.concat([headerBuffer, chunk.subarray(offset, offset + take)]);
+          offset += take;
+          if (headerBuffer.byteLength < 512) continue;
+          const header = headerBuffer;
+          headerBuffer = Buffer.alloc(0);
+          if (header.every((byte) => byte === 0)) {
+            if (logicalMemberIndex !== expectedMembers.length || pendingPax) {
+              throw buildError("Codex app-server archive ended before its exact member set.");
+            }
+            zeroBlocks += 1;
+            if (zeroBlocks >= 2) state = "end";
+            continue;
+          }
+          if (zeroBlocks !== 0) throw buildError("Codex app-server archive resumed after an end marker.");
+          const parsed = parseTarHeader(header);
+          if (parsed.type === "pax") {
+            if (pendingPax || parsed.path !== "././@PaxHeader" || parsed.size < 1 || parsed.size > 128) {
+              throw buildError("Codex app-server archive has an unexpected PAX header.");
+            }
+            current = { kind: "pax" };
+            remaining = parsed.size;
+            padding = tarPadding(parsed.size);
+            paxChunks = [];
+            state = "data";
+            continue;
+          }
+          const expected = expectedMembers[logicalMemberIndex];
+          if (
+            !expected ||
+            !pendingPax ||
+            parsed.path !== expected.path ||
+            parsed.type !== expected.type ||
+            parsed.size !== expected.size
+          ) {
+            throw buildError(`Codex app-server archive member ${parsed.path} is not the next pinned member.`);
+          }
+          pendingPax = false;
+          current = { kind: "logical", expected };
+          remaining = parsed.size;
+          padding = tarPadding(parsed.size);
+          const destination = join(destinationDirectory, ...expected.path.replace(/\/$/, "").split("/"));
+          assertContainedPath(destinationDirectory, destination, "Codex app-server archive member");
+          if (expected.type === "directory") {
+            await mkdir(destination, { recursive: false });
+            await finishMember();
+          } else {
+            currentDigest = createHash("sha256");
+            currentHandle = await open(destination, "wx", expected.path.endsWith(".exe") ? 0o700 : 0o600);
+            state = "data";
+            if (remaining === 0) await finishMember();
+          }
+          continue;
+        }
+        if (state === "data") {
+          const take = Math.min(remaining, chunk.byteLength - offset);
+          const bytes = chunk.subarray(offset, offset + take);
+          offset += take;
+          remaining -= take;
+          if (current.kind === "pax") {
+            paxChunks.push(bytes);
+          } else {
+            currentDigest.update(bytes);
+            await currentHandle.write(bytes);
+          }
+          if (remaining === 0) await finishMember();
+          continue;
+        }
+        if (state === "padding") {
+          const take = Math.min(padding, chunk.byteLength - offset);
+          if (chunk.subarray(offset, offset + take).some((byte) => byte !== 0)) {
+            throw buildError("Codex app-server archive member padding is non-zero.");
+          }
+          offset += take;
+          padding -= take;
+          if (padding === 0) state = "header";
+        }
+      }
+    }
+    if (
+      totalExpandedBytes !== source.asset.expandedSize ||
+      state !== "end" ||
+      zeroBlocks < 2 ||
+      logicalMemberIndex !== expectedMembers.length ||
+      pendingPax ||
+      headerBuffer.byteLength !== 0 ||
+      currentHandle
+    ) {
+      throw buildError("Codex app-server archive did not match its exact bounded layout.");
+    }
+  } catch (error) {
+    await currentHandle?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function verifyCodexAppServerCompanion(runtimeDirectory, options = {}) {
+  const policy = options.policy;
+  if (!codexAppServerSupportedForTarget(policy, options.platform, options.arch)) return undefined;
+  const root = await realpath(runtimeDirectory);
+  const companionDirectory = join(root, ...policy.codexAppServer.directory.split("/"));
+  assertContainedPath(root, companionDirectory, "Codex app-server companion directory");
+  const canonicalCompanion = await realpath(companionDirectory);
+  if (canonicalCompanion !== companionDirectory) {
+    throw buildError("Codex app-server companion directory is not physically canonical.");
+  }
+  const expectedFiles = options.inputs.sources.codexAppServer.archiveMembers
+    .filter((member) => member.type === "file")
+    .map(({ path, size, sha256 }) => ({ path, size, sha256 }))
+    .concat(options.inputs.sources.codexAppServer.legalFiles.map(({ path, size, sha256 }) => ({
+      path,
+      size,
+      sha256,
+    })));
+  const actualFiles = await collectRuntimeFiles(canonicalCompanion, { rejectEmptyDirectories: true });
+  if (!jsonEqual(actualFiles, expectedFiles)) {
+    throw buildError("Codex app-server companion files do not match the pinned release package.");
+  }
+  const packageMetadataPath = await requireContainedRealFile(
+    root,
+    policy.codexAppServer.packageMetadata,
+    "Codex app-server package metadata",
+  );
+  const packageMetadata = await readJson(packageMetadataPath);
+  if (!jsonEqual(packageMetadata, options.inputs.sources.codexAppServer.packageMetadata)) {
+    throw buildError("Codex app-server package metadata does not match the pinned layout.");
+  }
+  const executablePath = await requireContainedRealFile(
+    root,
+    policy.codexAppServer.entrypoint,
+    "Codex app-server entrypoint",
+  );
+  const publisher = await (options.authenticodeInspector ?? inspectCodexAppServerAuthenticode)(
+    canonicalCompanion,
+    options.inputs.sources.codexAppServer.authenticode,
+  );
+  return Object.freeze({
+    release: options.inputs.sources.codexAppServer.release,
+    asset: options.inputs.sources.codexAppServer.asset,
+    legalFiles: options.inputs.sources.codexAppServer.legalFiles.map((value) => ({ ...value })),
+    platform: policy.codexAppServer.platform,
+    arch: policy.codexAppServer.arch,
+    target: policy.codexAppServer.target,
+    directory: policy.codexAppServer.directory,
+    entrypoint: policy.codexAppServer.entrypoint,
+    packageMetadata: {
+      path: policy.codexAppServer.packageMetadata,
+      sha256: expectedFiles.find((file) => file.path === "codex-package.json")?.sha256,
+      ...packageMetadata,
+    },
+    fixedArguments: [...policy.codexAppServer.fixedArguments],
+    sessionConfig: structuredClone(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG),
+    threadConfig: { ...CODEX_APP_SERVER_THREAD_CONFIG },
+    initializeIdentity: { ...policy.codexAppServer.initializeIdentity },
+    threadStartPolicy: structuredClone(policy.codexAppServer.threadStartPolicy),
+    environmentPolicy: {
+      ...policy.codexAppServer.environmentPolicy,
+      requiredSourceVariables: [...policy.codexAppServer.environmentPolicy.requiredSourceVariables],
+      constructedVariables: [...policy.codexAppServer.environmentPolicy.constructedVariables],
+      pathEntries: [...policy.codexAppServer.environmentPolicy.pathEntries],
+    },
+    codexHomePolicy: {
+      ...policy.codexAppServer.codexHomePolicy,
+      forbiddenBasenames: [...policy.codexAppServer.codexHomePolicy.forbiddenBasenames],
+      forbiddenTopLevelDirectories: [...policy.codexAppServer.codexHomePolicy.forbiddenTopLevelDirectories],
+      forbiddenExecutableExtensions: [...policy.codexAppServer.codexHomePolicy.forbiddenExecutableExtensions],
+    },
+    publisher,
+    executablePath,
+  });
+}
+
+export async function inspectCodexAppServerAuthenticode(companionDirectory, policy) {
+  if (process.platform !== "win32") throw buildError("Codex app-server publisher verification requires Windows.");
+  const systemRoot = process.env.SystemRoot;
+  if (typeof systemRoot !== "string" || !isAbsolute(systemRoot) || /[\0\r\n]/.test(systemRoot)) {
+    throw buildError("SystemRoot is required for Codex app-server publisher verification.");
+  }
+  const powershell = await requireAbsoluteRealFile(
+    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    "Windows PowerShell",
+  );
+  const securityModule = await requireAbsoluteRealFile(
+    join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules", "Microsoft.PowerShell.Security", "Microsoft.PowerShell.Security.psd1"),
+    "Windows PowerShell security module",
+  );
+  const inspectedPaths = [...policy.signedFiles, ...policy.unsignedFiles];
+  const absolutePaths = [];
+  for (const relativePath of inspectedPaths) {
+    absolutePaths.push(await requireContainedRealFile(companionDirectory, relativePath, "Codex Authenticode input"));
+  }
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    "Import-Module -Name $env:PRIME_CONTINUIM_CODEX_SECURITY_MODULE -Force",
+    "$paths = ConvertFrom-Json -InputObject $env:PRIME_CONTINUIM_CODEX_SIGNATURE_PATHS",
+    "$values = foreach ($path in $paths) {",
+    "  $signature = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop",
+    "  [ordered]@{ Path = [string]$path; Status = [string]$signature.Status; Subject = if ($null -eq $signature.SignerCertificate) { '' } else { [string]$signature.SignerCertificate.Subject }; Issuer = if ($null -eq $signature.SignerCertificate) { '' } else { [string]$signature.SignerCertificate.Issuer }; Thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { [string]$signature.SignerCertificate.Thumbprint } }",
+    "}",
+    "@($values) | ConvertTo-Json -Compress",
+  ].join("; ");
+  const environment = createAuthenticodeEnvironment(process.env, {
+    systemRoot,
+    securityModule,
+    paths: absolutePaths,
+  });
+  const result = await runCommand(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+    env: environment,
+    timeoutMs: 30_000,
+  });
+  let values;
+  try {
+    values = JSON.parse(result.stdout);
+  } catch (error) {
+    throw buildError("Codex app-server Authenticode verifier returned invalid JSON.", error);
+  }
+  if (!Array.isArray(values) || values.length !== inspectedPaths.length) {
+    throw buildError("Codex app-server Authenticode verifier returned an incomplete result.");
+  }
+  const signed = [];
+  const unsigned = [];
+  for (let index = 0; index < inspectedPaths.length; index += 1) {
+    const relativePath = inspectedPaths[index];
+    const value = values[index];
+    if (value?.Path !== absolutePaths[index]) throw buildError("Codex Authenticode result path changed in transit.");
+    if (index < policy.signedFiles.length) {
+      if (
+        value.Status !== "Valid" ||
+        value.Subject !== policy.publisherSubject ||
+        value.Issuer !== policy.issuer ||
+        String(value.Thumbprint).toUpperCase() !== policy.signerThumbprint
+      ) {
+        throw buildError(`Codex app-server publisher verification failed for ${relativePath}.`);
+      }
+      signed.push(relativePath);
+    } else {
+      if (value.Status !== "NotSigned" || value.Subject !== "" || value.Issuer !== "" || value.Thumbprint !== "") {
+        throw buildError(`Codex app-server unsigned-tool policy failed for ${relativePath}.`);
+      }
+      unsigned.push(relativePath);
+    }
+  }
+  return Object.freeze({
+    status: "valid",
+    subject: policy.publisherSubject,
+    issuer: policy.issuer,
+    thumbprint: policy.signerThumbprint,
+    signedFiles: Object.freeze(signed),
+    unsignedFiles: Object.freeze(unsigned),
+  });
+}
+
+export async function smokeCodexAppServerCompanion(runtimeDirectory, options = {}) {
+  if (!codexAppServerSupportedForTarget(options.policy, options.platform, options.arch)) return undefined;
+  const root = await realpath(runtimeDirectory);
+  const executablePath = await requireContainedRealFile(
+    root,
+    options.policy.codexAppServer.entrypoint,
+    "Codex app-server smoke entrypoint",
+  );
+  const scratchDirectory = await mkdtemp(join(tmpdir(), "prime-continuim-codex-app-server-smoke-"));
+  const codexHome = join(scratchDirectory, "codex-home");
+  const temporaryDirectory = join(scratchDirectory, "codex-temp");
+  await mkdir(codexHome, { recursive: false });
+  await mkdir(temporaryDirectory, { recursive: false });
+  try {
+    const canonicalCodexHome = await realpath(codexHome);
+    const canonicalTemporaryDirectory = await realpath(temporaryDirectory);
+    await assertCodexHomePolicy(canonicalCodexHome, { requireEmpty: true });
+    const environment = createCodexAppServerEnvironment(options.environment ?? process.env, {
+      codexHome,
+      companionDirectory: dirname(dirname(executablePath)),
+      temporaryDirectory: canonicalTemporaryDirectory,
+    });
+    const smoke = await runCodexAppServerProtocolSmoke({
+      executablePath,
+      args: options.policy.codexAppServer.fixedArguments,
+      codexHome: canonicalCodexHome,
+      environment,
+      spawnImpl: options.spawnImpl ?? spawn,
+      timeoutMs: options.timeoutMs ?? 30_000,
+      teardownTimeoutMs: options.teardownTimeoutMs ?? 5_000,
+    });
+    await assertCodexHomePolicy(canonicalCodexHome);
+    return Object.freeze(smoke);
+  } finally {
+    await rm(scratchDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
 }
 
 export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
@@ -700,7 +1536,11 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   }
 }
 
-export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersion, smoke }) {
+export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersion, smoke, codexAppServer }) {
+  const companionExpected = codexAppServerSupportedForTarget(inputs.policy);
+  if (companionExpected !== Boolean(codexAppServer)) {
+    throw buildError("Codex app-server companion presence does not match the build target.");
+  }
   const entries = await collectRuntimeFiles(runtimeDirectory);
   const fileManifest = entries.map((entry) => `${entry.sha256}  ${entry.path}\n`).join("");
   const treeSource = entries.map((entry) => `${entry.sha256} ${entry.size} ${entry.path}\n`).join("");
@@ -730,6 +1570,9 @@ export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersi
     installPolicy: inputs.policy.install,
     entrypoints: inputs.policy.entrypoints,
     daemon: inputs.policy.daemon,
+    ...(codexAppServer
+      ? { codexAppServer: codexAppServerManifestRecord(codexAppServer.verification, codexAppServer.smoke) }
+      : {}),
     sources: inputs.sources.assets.map(({ packageName, fileName, url, size, sha256, integrity }) => ({
       packageName,
       fileName,
@@ -817,8 +1660,62 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
       throw buildError("Runtime manifest does not match the checked-in source policy and lock.");
     }
   }
+  const companionExpected = options.inputs
+    ? codexAppServerSupportedForTarget(options.inputs.policy, options.platform, options.arch)
+    : manifest.codexAppServer !== undefined;
+  if (companionExpected !== (manifest.codexAppServer !== undefined)) {
+    throw buildError("Runtime Codex app-server companion presence does not match the pinned target.");
+  }
+  if (manifest.codexAppServer !== undefined) {
+    if (!options.inputs) throw buildError("Codex app-server companion verification requires checked-in inputs.");
+    validateCodexAppServerSmoke(manifest.codexAppServer.smoke);
+    const companion = await verifyCodexAppServerCompanion(root, {
+      inputs: options.inputs,
+      policy: options.policy,
+      platform: options.platform,
+      arch: options.arch,
+      authenticodeInspector: options.authenticodeInspector,
+    });
+    const expectedCompanion = codexAppServerManifestRecord(companion, manifest.codexAppServer.smoke);
+    if (!jsonEqual(manifest.codexAppServer, expectedCompanion)) {
+      throw buildError("Runtime Codex app-server companion attestation does not match the verified files.");
+    }
+  }
   await resolveVerifiedEntrypoints(root, options.policy);
   return Object.freeze({ root, manifest });
+}
+
+function codexAppServerManifestRecord(verification, smoke) {
+  validateCodexAppServerSmoke(smoke);
+  const { executablePath: _privateExecutablePath, ...publicVerification } = verification;
+  return {
+    ...publicVerification,
+    smoke: { ...smoke },
+  };
+}
+
+function validateCodexAppServerSmoke(value) {
+  if (!jsonEqual(value, {
+    protocol: "jsonl-stdio",
+    initialize: true,
+    initializeIdentity: true,
+    configRead: true,
+    denyVectorEffective: true,
+    windowsSandboxUnelevatedPrivateDesktop: true,
+    mcpServersEmpty: true,
+    hooksEmpty: true,
+    pluginsEmpty: true,
+    appsEmpty: true,
+    threadStartReadOnly: true,
+    threadNetworkAccessDisabled: true,
+    threadDeleted: true,
+    accountReadSignedOut: true,
+    requiresOpenaiAuth: true,
+    forbiddenConfigAbsent: true,
+    authJsonAbsent: true,
+  })) {
+    throw buildError("Codex app-server signed-out smoke attestation is invalid.");
+  }
 }
 
 function runtimeVersionRecordIsValid(value, { expectedNpm }) {
@@ -1041,6 +1938,792 @@ export function cleanRuntimeEnvironment(source, { electronRunAsNode }) {
   }
   if (electronRunAsNode) environment.ELECTRON_RUN_AS_NODE = "1";
   return environment;
+}
+
+function parseTarHeader(header) {
+  if (!Buffer.isBuffer(header) || header.byteLength !== 512) {
+    throw buildError("Codex app-server archive header is not one tar block.");
+  }
+  const recordedChecksum = parseTarOctal(header.subarray(148, 156), "tar checksum");
+  let calculatedChecksum = 0;
+  for (let index = 0; index < header.byteLength; index += 1) {
+    calculatedChecksum += index >= 148 && index < 156 ? 0x20 : header[index];
+  }
+  if (recordedChecksum !== calculatedChecksum) {
+    throw buildError("Codex app-server archive header checksum is invalid.");
+  }
+  if (
+    !header.subarray(257, 263).equals(Buffer.from([0x75, 0x73, 0x74, 0x61, 0x72, 0x00])) ||
+    header.subarray(263, 265).toString("ascii") !== "00"
+  ) {
+    throw buildError("Codex app-server archive must use the reviewed POSIX tar format.");
+  }
+  const name = readTarText(header.subarray(0, 100), "tar member name");
+  const prefix = readTarText(header.subarray(345, 500), "tar member prefix");
+  const path = prefix ? `${prefix}/${name}` : name;
+  if (!path || path.length > 4_096 || /[\\\0\r\n]/.test(path) || path.normalize("NFC") !== path) {
+    throw buildError("Codex app-server archive contains an unsafe member path.");
+  }
+  const typeFlag = header[156];
+  const type = typeFlag === 0 || typeFlag === 0x30
+    ? "file"
+    : typeFlag === 0x35
+      ? "directory"
+      : typeFlag === 0x78
+        ? "pax"
+        : undefined;
+  if (!type) throw buildError(`Codex app-server archive contains unsupported tar type ${typeFlag}.`);
+  const size = parseTarOctal(header.subarray(124, 136), "tar member size");
+  if (!Number.isSafeInteger(size) || size < 0 || size > CODEX_APP_SERVER_ASSET.expandedSize) {
+    throw buildError("Codex app-server archive member size is outside its bound.");
+  }
+  if ((type === "directory") !== path.endsWith("/") || (type === "directory" && size !== 0)) {
+    throw buildError("Codex app-server archive directory entry is malformed.");
+  }
+  return { path, type, size };
+}
+
+function readTarText(bytes, label) {
+  const terminator = bytes.indexOf(0);
+  const end = terminator < 0 ? bytes.byteLength : terminator;
+  if (terminator >= 0 && bytes.subarray(terminator).some((byte) => byte !== 0)) {
+    throw buildError(`Codex app-server ${label} has non-zero bytes after its terminator.`);
+  }
+  const valueBytes = bytes.subarray(0, end);
+  if (valueBytes.some((byte) => byte < 0x20 || byte > 0x7e)) {
+    throw buildError(`Codex app-server ${label} is not printable ASCII.`);
+  }
+  return valueBytes.toString("ascii");
+}
+
+function parseTarOctal(bytes, label) {
+  if (bytes[0] !== undefined && (bytes[0] & 0x80) !== 0) {
+    throw buildError(`Codex app-server ${label} uses an unsupported base-256 value.`);
+  }
+  const text = bytes.toString("ascii");
+  if (!/^[ 0-7]*\0?[ ]*$/.test(text)) throw buildError(`Codex app-server ${label} is not canonical octal.`);
+  const digits = text.replace(/[\0 ]/g, "");
+  if (!digits) return 0;
+  const value = Number.parseInt(digits, 8);
+  if (!Number.isSafeInteger(value)) throw buildError(`Codex app-server ${label} exceeds integer bounds.`);
+  return value;
+}
+
+function validateCodexPaxHeader(bytes) {
+  const text = bytes.toString("ascii");
+  const match = /^(\d+) mtime=(\d+\.\d+)\n$/.exec(text);
+  if (!match || Number(match[1]) !== bytes.byteLength || !Number.isFinite(Number(match[2]))) {
+    throw buildError("Codex app-server archive PAX metadata is not the reviewed mtime-only record.");
+  }
+}
+
+function tarPadding(size) {
+  return (512 - (size % 512)) % 512;
+}
+
+function assertContainedPath(root, candidate, label) {
+  const relation = relative(resolve(root), resolve(candidate));
+  if (!relation || relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+    throw buildError(`${label} escapes or aliases its reviewed root.`);
+  }
+}
+
+function createAuthenticodeEnvironment(source, { systemRoot, securityModule, paths }) {
+  const environment = {
+    SystemRoot: systemRoot,
+    WINDIR: systemRoot,
+    ComSpec: join(systemRoot, "System32", "cmd.exe"),
+    PATH: [
+      join(systemRoot, "System32"),
+      join(systemRoot, "System32", "WindowsPowerShell", "v1.0"),
+    ].join(";"),
+    PATHEXT: ".COM;.EXE;.BAT;.CMD",
+    PRIME_CONTINUIM_CODEX_SECURITY_MODULE: securityModule,
+    PRIME_CONTINUIM_CODEX_SIGNATURE_PATHS: JSON.stringify(paths),
+  };
+  for (const key of ["TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA"]) {
+    if (typeof source[key] === "string" && !/[\0\r\n]/.test(source[key])) environment[key] = source[key];
+  }
+  return environment;
+}
+
+async function runCodexAppServerProtocolSmoke({
+  executablePath,
+  args,
+  codexHome,
+  environment,
+  spawnImpl,
+  timeoutMs,
+  teardownTimeoutMs,
+}) {
+  const maximumOutputBytes = 512 * 1024;
+  return await new Promise((resolveSmoke, rejectSmoke) => {
+    const child = spawnImpl(executablePath, [...args], {
+      cwd: codexHome,
+      env: environment,
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdoutBuffer = Buffer.alloc(0);
+    let stderr = "";
+    let outputBytes = 0;
+    const completedResponses = new Set();
+    let terminalError;
+    let settled = false;
+    let inputClosed = false;
+    let handshakeState = "starting";
+    let activeThreadId;
+    let threadStartedNotificationId;
+    let threadNotLoaded = false;
+    let threadDeletedNotification = false;
+    let threadDeleteTimer;
+    let teardownTimer;
+    const timer = setTimeout(() => fail(buildError("Codex app-server signed-out smoke timed out.")), timeoutMs);
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(teardownTimer);
+      clearTimeout(threadDeleteTimer);
+      if (error) rejectSmoke(error);
+      else resolveSmoke(value);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      terminalError ??= error;
+      if (!inputClosed) {
+        inputClosed = true;
+        child.stdin?.destroy();
+      }
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (!teardownTimer) {
+        teardownTimer = setTimeout(
+          () => settle(buildError("Codex app-server smoke process teardown was not confirmed.", terminalError)),
+          teardownTimeoutMs,
+        );
+      }
+    };
+    const beginGracefulShutdown = () => {
+      if (!inputClosed) {
+        inputClosed = true;
+        child.stdin.end();
+      }
+      if (!teardownTimer) {
+        teardownTimer = setTimeout(
+          () => {
+            teardownTimer = undefined;
+            fail(buildError("Codex app-server did not exit after its stdio transport closed."));
+          },
+          teardownTimeoutMs,
+        );
+      }
+    };
+    const send = (message) => {
+      if (settled || terminalError || inputClosed) return;
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+    const validateInitialize = async (result) => {
+      if (
+        !isPlainObject(result) ||
+        !hasExactObjectKeys(result, ["userAgent", "codexHome", "platformFamily", "platformOs"]) ||
+        typeof result.codexHome !== "string" ||
+        !isAbsolute(result.codexHome) ||
+        /[\0\r\n]/.test(result.codexHome) ||
+        result.platformFamily !== CODEX_APP_SERVER_INITIALIZE_IDENTITY.platformFamily ||
+        result.platformOs !== CODEX_APP_SERVER_INITIALIZE_IDENTITY.platformOs ||
+        typeof result.userAgent !== "string" ||
+        !/^prime_continuim\/0\.147\.0 \(Windows [0-9]+\.[0-9]+\.[0-9]+; x86_64\) unknown \(prime_continuim; 0\.1\.0\)$/.test(result.userAgent)
+      ) {
+        throw buildError("Codex app-server initialize returned an incompatible identity.");
+      }
+      const returnedHome = await realpath(result.codexHome).catch((error) => {
+        throw buildError("Codex app-server initialize returned an unavailable CODEX_HOME.", error);
+      });
+      if (returnedHome !== codexHome) {
+        throw buildError("Codex app-server initialize returned a different physical CODEX_HOME.");
+      }
+    };
+    const sendRequest = (id, method, params, state) => {
+      handshakeState = state;
+      send({ method, id, params });
+    };
+    const scheduleThreadDelete = () => {
+      if (
+        threadDeleteTimer ||
+        activeThreadId === undefined ||
+        threadStartedNotificationId !== activeThreadId
+      ) return;
+      handshakeState = "thread_delete_settling";
+      threadDeleteTimer = setTimeout(() => {
+        threadDeleteTimer = undefined;
+        sendRequest(7, "thread/delete", { threadId: activeThreadId }, "delete_sent");
+      }, 200);
+    };
+    const completeResponse = (id, state, label, result, validate, next) => {
+      if (handshakeState !== state || completedResponses.has(id)) {
+        fail(buildError(`Codex app-server ${label} response is invalid, duplicated, or out of order.`));
+        return;
+      }
+      try {
+        validate(result);
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      completedResponses.add(id);
+      next();
+    };
+    const consumeFrame = (line) => {
+      let frame;
+      try {
+        frame = JSON.parse(line);
+      } catch (error) {
+        fail(buildError("Codex app-server smoke emitted invalid JSONL.", error));
+        return;
+      }
+      if (!isPlainObject(frame)) {
+        fail(buildError("Codex app-server smoke emitted a non-object frame."));
+        return;
+      }
+      if (Object.hasOwn(frame, "id")) {
+        if (!hasExactObjectKeys(frame, ["id", "result"]) || frame.error !== undefined) {
+          fail(buildError("Codex app-server smoke received an invalid response or server request."));
+          return;
+        }
+        if (frame.id === 0) {
+          if (handshakeState !== "initialize_sent" || completedResponses.has(0)) {
+            fail(buildError("Codex app-server initialize response is invalid or duplicated."));
+            return;
+          }
+          handshakeState = "initialize_validating";
+          void validateInitialize(frame.result).then(() => {
+            if (terminalError || settled) return;
+            completedResponses.add(0);
+            send({ method: "initialized", params: {} });
+            sendRequest(1, "config/read", { cwd: codexHome, includeLayers: true }, "config_sent");
+          }).catch((error) => fail(error));
+          return;
+        }
+        if (frame.id === 1) {
+          completeResponse(1, "config_sent", "config/read", frame.result,
+            (result) => validateCodexAppServerConfigRead(result, codexHome),
+            () => sendRequest(2, "mcpServerStatus/list", { limit: 100, detail: "full" }, "mcp_sent"));
+          return;
+        }
+        if (frame.id === 2) {
+          completeResponse(2, "mcp_sent", "mcpServerStatus/list", frame.result,
+            (result) => assertExactProtocolValue(result, { data: [], nextCursor: null }, "MCP server list"),
+            () => sendRequest(3, "hooks/list", { cwds: [codexHome] }, "hooks_sent"));
+          return;
+        }
+        if (frame.id === 3) {
+          completeResponse(3, "hooks_sent", "hooks/list", frame.result,
+            (result) => assertExactProtocolValue(result, {
+              data: [{ cwd: codexHome, hooks: [], warnings: [], errors: [] }],
+            }, "hook list"),
+            () => sendRequest(4, "plugin/list", {
+              cwds: [codexHome],
+              marketplaceKinds: ["local"],
+              forceRefetch: false,
+            }, "plugins_sent"));
+          return;
+        }
+        if (frame.id === 4) {
+          completeResponse(4, "plugins_sent", "plugin/list", frame.result,
+            (result) => assertExactProtocolValue(result, {
+              marketplaces: [],
+              marketplaceLoadErrors: [],
+              featuredPluginIds: [],
+            }, "plugin list"),
+            () => sendRequest(5, "app/list", { limit: 100, forceRefetch: false }, "apps_sent"));
+          return;
+        }
+        if (frame.id === 5) {
+          completeResponse(5, "apps_sent", "app/list", frame.result,
+            (result) => assertExactProtocolValue(result, { data: [], nextCursor: null }, "app list"),
+            () => sendRequest(6, "thread/start", codexAppServerThreadStartParams(codexHome), "thread_sent"));
+          return;
+        }
+        if (frame.id === 6) {
+          completeResponse(6, "thread_sent", "thread/start", frame.result,
+            (result) => {
+              activeThreadId = validateCodexAppServerThreadStart(result, codexHome);
+              if (threadStartedNotificationId !== undefined && threadStartedNotificationId !== activeThreadId) {
+                throw buildError("Codex app-server thread/start notification did not bind the response thread.");
+              }
+            },
+            () => {
+              if (threadStartedNotificationId === activeThreadId) {
+                scheduleThreadDelete();
+              } else {
+                handshakeState = "thread_waiting_notification";
+              }
+            });
+          return;
+        }
+        if (frame.id === 7) {
+          completeResponse(7, "delete_sent", "thread/delete", frame.result,
+            (result) => assertExactProtocolValue(result, {}, "thread deletion"),
+            () => sendRequest(8, "account/read", { refreshToken: false }, "account_sent"));
+          return;
+        }
+        if (frame.id === 8) {
+          completeResponse(8, "account_sent", "account/read", frame.result,
+            (result) => assertExactProtocolValue(result, {
+              account: null,
+              requiresOpenaiAuth: true,
+            }, "signed-out account state"),
+            () => {
+              handshakeState = "complete";
+              beginGracefulShutdown();
+            });
+          return;
+        }
+        fail(buildError("Codex app-server smoke received an unknown response or server request id."));
+        return;
+      }
+      if (!hasExactObjectKeys(frame, ["method", "params", "emittedAtMs"]) ||
+        !Number.isSafeInteger(frame.emittedAtMs) || frame.emittedAtMs <= 0) {
+        fail(buildError("Codex app-server smoke received an unexpected notification or frame."));
+        return;
+      }
+      if (frame.method === "remoteControl/status/changed") {
+        if (
+          !isPlainObject(frame.params) ||
+          !hasExactObjectKeys(frame.params, ["status", "serverName", "installationId", "environmentId"]) ||
+          frame.params.status !== "disabled" ||
+          frame.params.serverName !== "DEV" ||
+          typeof frame.params.installationId !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(frame.params.installationId) ||
+          frame.params.environmentId !== null
+        ) fail(buildError("Codex app-server smoke received an invalid remote-control notification."));
+        return;
+      }
+      if (frame.method === "thread/started" && isPlainObject(frame.params) && hasExactObjectKeys(frame.params, ["thread"])) {
+        if (threadStartedNotificationId !== undefined) {
+          fail(buildError("Codex app-server smoke received a duplicate thread/started notification."));
+          return;
+        }
+        try {
+          threadStartedNotificationId = validateCodexAppServerThread(frame.params.thread, codexHome);
+          if (activeThreadId !== undefined && threadStartedNotificationId !== activeThreadId) {
+            throw buildError("Codex app-server thread/started notification did not bind the response thread.");
+          }
+          if (handshakeState === "thread_waiting_notification" && activeThreadId === threadStartedNotificationId) {
+            scheduleThreadDelete();
+          }
+        } catch (error) {
+          fail(error);
+        }
+        return;
+      }
+      if (
+        frame.method === "thread/status/changed" &&
+        isPlainObject(frame.params) &&
+        hasExactObjectKeys(frame.params, ["threadId", "status"]) &&
+        frame.params.threadId === activeThreadId &&
+        jsonEqual(frame.params.status, { type: "notLoaded" }) &&
+        !threadNotLoaded
+      ) {
+        threadNotLoaded = true;
+        return;
+      }
+      if (
+        frame.method === "thread/deleted" &&
+        isPlainObject(frame.params) &&
+        hasExactObjectKeys(frame.params, ["threadId"]) &&
+        frame.params.threadId === activeThreadId &&
+        threadNotLoaded &&
+        !threadDeletedNotification
+      ) {
+        threadDeletedNotification = true;
+        return;
+      }
+      fail(buildError("Codex app-server smoke received an unexpected notification or frame."));
+    };
+    child.stdout.on("data", (chunk) => {
+      outputBytes += chunk.byteLength;
+      if (outputBytes > maximumOutputBytes) {
+        fail(buildError("Codex app-server smoke output exceeded its bound."));
+        return;
+      }
+      stdoutBuffer = Buffer.concat([stdoutBuffer, Buffer.from(chunk)]);
+      while (true) {
+        const newline = stdoutBuffer.indexOf(0x0a);
+        if (newline < 0) break;
+        const lineBytes = stdoutBuffer.subarray(0, newline);
+        stdoutBuffer = stdoutBuffer.subarray(newline + 1);
+        const line = lineBytes.toString("utf8").replace(/\r$/, "");
+        if (line) consumeFrame(line);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      outputBytes += chunk.byteLength;
+      if (outputBytes > maximumOutputBytes) {
+        fail(buildError("Codex app-server smoke output exceeded its bound."));
+        return;
+      }
+      stderr += Buffer.from(chunk).toString("utf8");
+    });
+    child.stdin.on("error", (error) => fail(buildError("Codex app-server smoke stdin failed.", error)));
+    child.once("error", (error) => fail(buildError("Codex app-server smoke process could not start.", error)));
+    child.once("close", (code, signal) => {
+      if (terminalError) {
+        settle(terminalError);
+        return;
+      }
+      if (
+        code !== 0 ||
+        signal !== null ||
+        stdoutBuffer.byteLength !== 0 ||
+        completedResponses.size !== 9 ||
+        activeThreadId === undefined ||
+        threadStartedNotificationId !== activeThreadId ||
+        !threadNotLoaded ||
+        !threadDeletedNotification
+      ) {
+        settle(buildError(`Codex app-server smoke exited incompletely (${code ?? signal ?? "unknown"}): ${stderr.trim().slice(-1_024)}`));
+        return;
+      }
+      if (handshakeState !== "complete") {
+        settle(buildError("Codex app-server signed-out smoke returned an incompatible identity or account state."));
+        return;
+      }
+      settle(undefined, Object.freeze({
+        protocol: "jsonl-stdio",
+        initialize: true,
+        initializeIdentity: true,
+        configRead: true,
+        denyVectorEffective: true,
+        windowsSandboxUnelevatedPrivateDesktop: true,
+        mcpServersEmpty: true,
+        hooksEmpty: true,
+        pluginsEmpty: true,
+        appsEmpty: true,
+        threadStartReadOnly: true,
+        threadNetworkAccessDisabled: true,
+        threadDeleted: true,
+        accountReadSignedOut: true,
+        requiresOpenaiAuth: true,
+        forbiddenConfigAbsent: true,
+        authJsonAbsent: true,
+      }));
+    });
+    child.once("spawn", () => {
+      handshakeState = "initialize_sent";
+      send({
+        method: "initialize",
+        id: 0,
+        params: {
+          clientInfo: {
+            name: CODEX_APP_SERVER_INITIALIZE_IDENTITY.clientInfoName,
+            title: CODEX_APP_SERVER_INITIALIZE_IDENTITY.clientInfoTitle,
+            version: "0.1.0",
+          },
+          capabilities: { ...CODEX_APP_SERVER_INITIALIZE_IDENTITY.capabilities },
+        },
+      });
+    });
+  });
+}
+
+function validateCodexAppServerConfigRead(result, codexHome) {
+  if (!isPlainObject(result) || !hasExactObjectKeys(result, ["config", "origins", "layers"])) {
+    throw buildError("Codex app-server config/read returned an incompatible result shape.");
+  }
+  if (!isPlainObject(result.config) || !isPlainObject(result.origins) || !Array.isArray(result.layers)) {
+    throw buildError("Codex app-server config/read returned invalid config provenance.");
+  }
+  if (result.layers.length !== 3) {
+    throw buildError("Codex app-server config/read returned an unexpected configuration layer.");
+  }
+  const [sessionLayer, userLayer, systemLayer] = result.layers;
+  if (
+    !isPlainObject(sessionLayer) ||
+    !hasExactObjectKeys(sessionLayer, ["name", "version", "config"]) ||
+    !jsonEqual(sessionLayer.name, { type: "sessionFlags" }) ||
+    typeof sessionLayer.version !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(sessionLayer.version) ||
+    !jsonEqual(sessionLayer.config, CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG)
+  ) {
+    throw buildError("Codex app-server config/read did not preserve the exact fixed session flags.");
+  }
+  if (
+    !isPlainObject(userLayer) ||
+    !hasExactObjectKeys(userLayer, ["name", "version", "config"]) ||
+    !jsonEqual(userLayer.name, { type: "user", file: join(codexHome, "config.toml"), profile: null }) ||
+    !/^sha256:[0-9a-f]{64}$/.test(userLayer.version) ||
+    !jsonEqual(userLayer.config, {})
+  ) {
+    throw buildError("Codex app-server private user configuration layer was not empty.");
+  }
+  if (
+    !isPlainObject(systemLayer) ||
+    !hasExactObjectKeys(systemLayer, ["name", "version", "config"]) ||
+    !isPlainObject(systemLayer.name) ||
+    !hasExactObjectKeys(systemLayer.name, ["type", "file"]) ||
+    systemLayer.name.type !== "system" ||
+    typeof systemLayer.name.file !== "string" ||
+    !isAbsolute(systemLayer.name.file) ||
+    /[\0\r\n]/.test(systemLayer.name.file) ||
+    !/^sha256:[0-9a-f]{64}$/.test(systemLayer.version) ||
+    !jsonEqual(systemLayer.config, {})
+  ) {
+    throw buildError("Codex app-server system configuration layer was not empty.");
+  }
+  const expectedOriginPaths = flattenConfigLeafPaths(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG)
+    .map((path) => path === "features.multi_agent_v2" ? "features.multi_agent_v2.enabled" : path)
+    .sort();
+  if (!jsonEqual(Object.keys(result.origins).sort(), expectedOriginPaths)) {
+    throw buildError("Codex app-server config/read origin set drifted from the fixed session flags.");
+  }
+  for (const origin of Object.values(result.origins)) {
+    if (
+      !isPlainObject(origin) ||
+      !hasExactObjectKeys(origin, ["name", "version"]) ||
+      !jsonEqual(origin.name, { type: "sessionFlags" }) ||
+      origin.version !== sessionLayer.version
+    ) {
+      throw buildError("Codex app-server config/read origin was not the fixed session-flag layer.");
+    }
+  }
+  for (const path of flattenConfigLeafPaths(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG)) {
+    const expected = readConfigPath(CODEX_APP_SERVER_EXPECTED_SESSION_CONFIG, path);
+    const actual = readConfigPath(result.config, path);
+    if (!jsonEqual(actual, expected)) {
+      throw buildError(`Codex app-server effective configuration drifted at ${path}.`);
+    }
+  }
+  for (const [path, expected] of [
+    ["mcp_servers", {}],
+    ["plugins", {}],
+    ["marketplaces", {}],
+    ["hooks", null],
+    ["apps", null],
+    ["tools", null],
+    ["agents", null],
+    ["features.network_proxy", null],
+    ["features.remote_control", false],
+  ]) {
+    if (!jsonEqual(readConfigPath(result.config, path), expected)) {
+      throw buildError(`Codex app-server effective executable surface was not empty at ${path}.`);
+    }
+  }
+}
+
+function codexAppServerThreadStartParams(cwd) {
+  return {
+    modelProvider: CODEX_APP_SERVER_THREAD_START_POLICY.modelProvider,
+    cwd,
+    runtimeWorkspaceRoots: [cwd],
+    approvalPolicy: CODEX_APP_SERVER_THREAD_START_POLICY.approvalPolicy,
+    approvalsReviewer: CODEX_APP_SERVER_THREAD_START_POLICY.approvalsReviewer,
+    sandbox: CODEX_APP_SERVER_THREAD_START_POLICY.sandbox,
+    config: { ...CODEX_APP_SERVER_THREAD_CONFIG },
+    ephemeral: CODEX_APP_SERVER_THREAD_START_POLICY.ephemeral,
+    environments: [],
+    dynamicTools: [],
+    selectedCapabilityRoots: [],
+    experimentalRawEvents: CODEX_APP_SERVER_THREAD_START_POLICY.experimentalRawEvents,
+  };
+}
+
+function validateCodexAppServerThreadStart(result, codexHome) {
+  if (!isPlainObject(result) || !hasExactObjectKeys(result, [
+    "thread",
+    "model",
+    "modelProvider",
+    "serviceTier",
+    "cwd",
+    "runtimeWorkspaceRoots",
+    "instructionSources",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "sandbox",
+    "activePermissionProfile",
+    "reasoningEffort",
+    "multiAgentMode",
+  ])) {
+    throw buildError("Codex app-server thread/start returned an incompatible result shape.");
+  }
+  const expected = CODEX_APP_SERVER_THREAD_START_POLICY.expectedSecurityResponse;
+  if (
+    result.model !== expected.model ||
+    result.modelProvider !== expected.modelProvider ||
+    result.serviceTier !== null ||
+    result.cwd !== codexHome ||
+    !jsonEqual(result.runtimeWorkspaceRoots, expected.runtimeWorkspaceRoots) ||
+    !jsonEqual(result.instructionSources, expected.instructionSources) ||
+    result.approvalPolicy !== expected.approvalPolicy ||
+    result.approvalsReviewer !== expected.approvalsReviewer ||
+    !jsonEqual(result.sandbox, expected.sandbox) ||
+    result.activePermissionProfile !== expected.activePermissionProfile ||
+    result.reasoningEffort !== null ||
+    result.multiAgentMode !== expected.multiAgentMode
+  ) {
+    throw buildError("Codex app-server thread/start did not preserve the reviewed read-only security policy.");
+  }
+  return validateCodexAppServerThread(result.thread, codexHome);
+}
+
+function validateCodexAppServerThread(thread, codexHome) {
+  if (!isPlainObject(thread) || !hasExactObjectKeys(thread, [
+    "id",
+    "extra",
+    "sessionId",
+    "forkedFromId",
+    "parentThreadId",
+    "preview",
+    "ephemeral",
+    "section",
+    "sectionEnteredAt",
+    "historyMode",
+    "modelProvider",
+    "createdAt",
+    "updatedAt",
+    "recencyAt",
+    "status",
+    "path",
+    "cwd",
+    "cliVersion",
+    "source",
+    "canAcceptDirectInput",
+    "threadSource",
+    "agentNickname",
+    "agentRole",
+    "gitInfo",
+    "name",
+    "turns",
+  ])) {
+    throw buildError("Codex app-server thread/start returned an incompatible thread shape.");
+  }
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const pathRelation = typeof thread.path === "string"
+    ? relative(codexHome, resolve(thread.path)).replaceAll("\\", "/")
+    : "";
+  if (
+    typeof thread.id !== "string" || !uuid.test(thread.id) ||
+    typeof thread.sessionId !== "string" || !uuid.test(thread.sessionId) ||
+    thread.extra !== null ||
+    thread.forkedFromId !== null ||
+    thread.parentThreadId !== null ||
+    thread.preview !== "" ||
+    thread.ephemeral !== false ||
+    thread.section !== null ||
+    thread.sectionEnteredAt !== null ||
+    thread.historyMode !== "legacy" ||
+    thread.modelProvider !== "openai" ||
+    !Number.isSafeInteger(thread.createdAt) || thread.createdAt <= 0 ||
+    !Number.isSafeInteger(thread.updatedAt) || thread.updatedAt <= 0 ||
+    !Number.isSafeInteger(thread.recencyAt) || thread.recencyAt <= 0 ||
+    !jsonEqual(thread.status, { type: "idle" }) ||
+    !/^sessions\/[0-9]{4}\/[0-9]{2}\/[0-9]{2}\/rollout-[^/]+-[0-9a-f-]{36}\.jsonl$/.test(pathRelation) ||
+    thread.cwd !== codexHome ||
+    thread.cliVersion !== "0.147.0" ||
+    thread.source !== "vscode" ||
+    thread.canAcceptDirectInput !== true ||
+    thread.threadSource !== null ||
+    thread.agentNickname !== null ||
+    thread.agentRole !== null ||
+    thread.gitInfo !== null ||
+    thread.name !== null ||
+    !jsonEqual(thread.turns, [])
+  ) {
+    throw buildError("Codex app-server thread/start returned an incompatible no-turn thread.");
+  }
+  return thread.id;
+}
+
+function flattenConfigLeafPaths(value, prefix = "", result = []) {
+  for (const [key, child] of Object.entries(value)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (isPlainObject(child)) flattenConfigLeafPaths(child, path, result);
+    else result.push(path);
+  }
+  return result;
+}
+
+function readConfigPath(value, path) {
+  return path.split(".").reduce((current, key) => isPlainObject(current) ? current[key] : undefined, value);
+}
+
+function assertExactProtocolValue(actual, expected, label) {
+  if (!jsonEqual(actual, expected)) throw buildError(`Codex app-server ${label} response was not the reviewed empty result.`);
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactObjectKeys(value, expected) {
+  return jsonEqual(Object.keys(value).sort(), [...expected].sort());
+}
+
+async function assertCodexHomePolicy(root, options = {}) {
+  const maximumEntries = 50_000;
+  const maximumDepth = 32;
+  const forbiddenBasenames = new Set(
+    CODEX_APP_SERVER_CODEX_HOME_POLICY.forbiddenBasenames.map((value) => value.toLowerCase()),
+  );
+  const forbiddenTopLevelDirectories = new Set(
+    CODEX_APP_SERVER_CODEX_HOME_POLICY.forbiddenTopLevelDirectories.map((value) => value.toLowerCase()),
+  );
+  const forbiddenExecutableExtensions = new Set(
+    CODEX_APP_SERVER_CODEX_HOME_POLICY.forbiddenExecutableExtensions.map((value) => value.toLowerCase()),
+  );
+  const rootDetails = await lstat(root);
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw buildError("Codex app-server private home must be one plain directory.");
+  }
+  if (options.requireEmpty === true && (await readdir(root)).length !== 0) {
+    throw buildError("Codex app-server private home must be empty before launch.");
+  }
+  let visited = 0;
+  async function visit(directory, depth, prefix) {
+    if (depth > maximumDepth) throw buildError("Codex app-server smoke home exceeded its directory-depth bound.");
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      visited += 1;
+      if (visited > maximumEntries) throw buildError("Codex app-server smoke home exceeded its entry-count bound.");
+      const entryPath = join(directory, entry.name);
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const normalizedName = entry.name.toLowerCase();
+      const topLevel = relativePath.split("/", 1)[0].toLowerCase();
+      const isGeneratedSystemSkill = relativePath === "skills" ||
+        relativePath === CODEX_APP_SERVER_CODEX_HOME_POLICY.allowedGeneratedSystemSkillsRoot ||
+        relativePath.startsWith(`${CODEX_APP_SERVER_CODEX_HOME_POLICY.allowedGeneratedSystemSkillsRoot}/`);
+      const details = await lstat(entryPath);
+      if (/[^\S ]|[\0\r\n]/.test(entry.name) || entry.name.normalize("NFC") !== entry.name) {
+        throw buildError("Codex app-server smoke home contains an unsafe entry name.");
+      }
+      if (entry.isSymbolicLink() || details.isSymbolicLink()) {
+        throw buildError("Codex app-server smoke home contains a reparse link.");
+      }
+      if (forbiddenBasenames.has(normalizedName)) {
+        throw buildError(`Codex app-server smoke home contains forbidden ${entry.name}.`);
+      }
+      if (depth === 0 && details.isDirectory() && forbiddenTopLevelDirectories.has(topLevel)) {
+        throw buildError(`Codex app-server smoke home contains forbidden executable config directory ${entry.name}.`);
+      }
+      if (topLevel === "skills" && !isGeneratedSystemSkill) {
+        throw buildError("Codex app-server smoke home contains a non-system skill.");
+      }
+      if (
+        details.isFile() &&
+        !isGeneratedSystemSkill &&
+        forbiddenExecutableExtensions.has(extname(entry.name).toLowerCase())
+      ) {
+        throw buildError("Codex app-server smoke home contains an executable user-config file.");
+      }
+      if (details.isDirectory()) {
+        await visit(entryPath, depth + 1, relativePath);
+      } else if (!details.isFile()) {
+        throw buildError("Codex app-server smoke home contains a non-regular entry.");
+      }
+    }
+  }
+  await visit(root, 0, "");
 }
 
 async function collectRuntimeFiles(root, options = {}) {

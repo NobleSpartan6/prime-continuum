@@ -77,6 +77,7 @@ import type {
 } from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
+import { CodexSubscriptionWorkspace } from './CodexSubscriptionWorkspace'
 import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
@@ -97,6 +98,7 @@ type HostActivationView = {
   message: string
 }
 type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
+type WorkbenchBackend = 'prime' | 'codex_subscription'
 type ResidentLifecycleRecoveryReference = {
   operationId: string
   expectedHostId: string
@@ -219,6 +221,15 @@ function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'
 
 function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): string {
   return `${hostId}\u0000${thread.id}\u0000${thread.executionGenerationId ?? ''}`
+}
+
+function codexSubscriptionAuthorityKey(snapshot: WorkbenchSnapshot): string {
+  if (!snapshot.operations.codexSubscription) return ''
+  const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+  if (!thread?.executionGenerationId) return ''
+  const host = snapshot.hosts.find((candidate) => candidate.id === thread.hostId)
+  if (host?.kind !== 'local' || host.connection !== 'online') return ''
+  return [host.id, thread.remoteId ?? thread.id, thread.executionGenerationId].join('\u0000')
 }
 
 function threadMatchesHudTarget(thread: ThreadSummary, target: HudTarget): boolean {
@@ -794,6 +805,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [moveDestinationId, setMoveDestinationId] = useState('')
   const [composerText, setComposerText] = useState('')
   const [composerValidationError, setComposerValidationError] = useState('')
+  const [workbenchBackend, setWorkbenchBackend] = useState<WorkbenchBackend>('prime')
   const [composerReceipt, setComposerReceipt] = useState<ComposerReceiptView>({
     state: 'idle',
     message: '',
@@ -813,6 +825,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
+  const codexBackendAuthorityRef = useRef('')
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
@@ -829,7 +842,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [inspectorIsOverlay, sidebarIsOverlay])
 
   useEffect(() => {
-    if (surface === 'hud') return
+    if (surface === 'hud' || workbenchBackend !== 'prime') return
     const openPalette = (event: globalThis.KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -840,7 +853,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     }
     window.addEventListener('keydown', openPalette)
     return () => window.removeEventListener('keydown', openPalette)
-  }, [openCommandPalette, surface])
+  }, [openCommandPalette, surface, workbenchBackend])
 
   useResponsiveDrawerFocus({
     open: sidebarOpen,
@@ -871,6 +884,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     setSnapshot(nextSnapshot)
     setSelectedProjectId(nextSnapshot.selectedProjectId)
     setSelectedThreadId(nextSnapshot.selectedThreadId)
+    const selectedCodexAuthority = codexBackendAuthorityRef.current
+    if (selectedCodexAuthority && codexSubscriptionAuthorityKey(nextSnapshot) !== selectedCodexAuthority) {
+      // Consume capability/tuple loss at the subscription boundary itself. A
+      // same-tick recovery must not make React silently re-enter Codex mode.
+      codexBackendAuthorityRef.current = ''
+      setWorkbenchBackend('prime')
+    }
     const nextReceipt: ComposerReceiptView = {
       state: nextSnapshot.composerReceipt.state,
       message: nextSnapshot.composerReceipt.message ?? '',
@@ -1025,6 +1045,30 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const canLoadModelCatalog = api.environment === 'native' && (snapshot?.operations.modelCatalog ?? false)
   const canManageComputers = api.environment === 'native'
   const canProvisionResident = snapshot?.operations.provisionResident ?? false
+  const canUseCodexSubscription = Boolean(
+    surface === 'workbench' &&
+    api.environment === 'native' &&
+    api.codexSubscription &&
+    selectedThreadIsMaterialized &&
+    selectedHost?.kind === 'local' &&
+    selectedHost.connection === 'online' &&
+    selectedThread?.executionGenerationId &&
+    snapshot?.operations.codexSubscription,
+  )
+  const activeWorkbenchBackend: WorkbenchBackend =
+    workbenchBackend === 'codex_subscription' && canUseCodexSubscription
+      ? 'codex_subscription'
+      : 'prime'
+  const codexBackendAuthorityKey = canUseCodexSubscription && snapshot
+    ? codexSubscriptionAuthorityKey(snapshot)
+    : ''
+
+  useLayoutEffect(() => {
+    if (workbenchBackend !== 'codex_subscription') return
+    if (codexBackendAuthorityKey && codexBackendAuthorityRef.current === codexBackendAuthorityKey) return
+    codexBackendAuthorityRef.current = ''
+    setWorkbenchBackend('prime')
+  }, [codexBackendAuthorityKey, workbenchBackend])
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
     : []
@@ -1074,6 +1118,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [exactHudThread?.title, surface])
   const canOpenHud = Boolean(
     surface === 'workbench' &&
+    activeWorkbenchBackend === 'prime' &&
     api.environment === 'native' &&
     selectedThreadIsMaterialized &&
     selectedHost &&
@@ -2259,45 +2304,87 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         </div>
 
         <div className="topbar__controls">
-          <div
-            className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
-            aria-hidden="true"
-            title={`Task state: ${visibleTaskState}`}
-          >
-            <Icon icon={taskIcon(selectedThread.status)} size={14} />
-            <span className="task-state__label">{visibleTaskState}</span>
-          </div>
-          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-            Task state: {visibleTaskState}
-          </span>
-
-          {canOpenHud && (
-            <button
-              className="icon-button topbar__hud-control"
-              type="button"
-              aria-label="Show desktop HUD"
-              title="Show desktop HUD"
-              onClick={() => void showDesktopHud()}
-            >
-              <Icon icon={MessageSquare} size={17} />
-            </button>
+          {canUseCodexSubscription && (
+            <div className="backend-switch" role="group" aria-label="Conversation backend">
+              <button
+                type="button"
+                aria-pressed={activeWorkbenchBackend === 'prime'}
+                onClick={() => {
+                  codexBackendAuthorityRef.current = ''
+                  setWorkbenchBackend('prime')
+                  window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#thread-heading')?.focus())
+                }}
+              >
+                Prime Agent
+              </button>
+              <button
+                type="button"
+                aria-label="Use Codex via ChatGPT subscription"
+                aria-pressed={activeWorkbenchBackend === 'codex_subscription'}
+                onClick={() => {
+                  codexBackendAuthorityRef.current = codexBackendAuthorityKey
+                  setInspectorOpen(false)
+                  setCommandPaletteOpen(false)
+                  setModelsOpen(false)
+                  setMoveThreadOpen(false)
+                  setWorkbenchBackend('codex_subscription')
+                  window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#codex-workspace-heading')?.focus())
+                }}
+              >
+                Codex
+              </button>
+            </div>
+          )}
+          {activeWorkbenchBackend === 'prime' ? (
+            <>
+              <div
+                className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
+                aria-hidden="true"
+                title={`Task state: ${visibleTaskState}`}
+              >
+                <Icon icon={taskIcon(selectedThread.status)} size={14} />
+                <span className="task-state__label">{visibleTaskState}</span>
+              </div>
+              <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+                Task state: {visibleTaskState}
+              </span>
+            </>
+          ) : (
+            <span className="task-state task-state--codex" aria-label="Codex backend selected">
+              <Icon icon={Bot} size={14} />
+              <span className="task-state__label">Codex</span>
+            </span>
           )}
 
-          <button
-            ref={commandPaletteTriggerRef}
-            className="command-trigger"
-            type="button"
-            aria-label="Search projects, threads, and commands"
-            aria-haspopup="dialog"
-            title="Search projects, threads, and commands"
-            onClick={openCommandPalette}
-          >
-            <Icon icon={Search} size={15} />
-            <span>Search or run…</span>
-            <kbd>{commandShortcutLabel()}</kbd>
-          </button>
+          {activeWorkbenchBackend === 'prime' && (
+            <>
+              {canOpenHud && (
+                <button
+                  className="icon-button topbar__hud-control"
+                  type="button"
+                  aria-label="Show desktop HUD"
+                  title="Show desktop HUD"
+                  onClick={() => void showDesktopHud()}
+                >
+                  <Icon icon={MessageSquare} size={17} />
+                </button>
+              )}
 
-          <div className="run-location">
+              <button
+                ref={commandPaletteTriggerRef}
+                className="command-trigger"
+                type="button"
+                aria-label="Search projects, threads, and commands"
+                aria-haspopup="dialog"
+                title="Search projects, threads, and commands"
+                onClick={openCommandPalette}
+              >
+                <Icon icon={Search} size={15} />
+                <span>Search or run…</span>
+                <kbd>{commandShortcutLabel()}</kbd>
+              </button>
+
+              <div className="run-location">
             <span className="run-location__label">Run location</span>
             <span className={cx('connection-dot', `connection-dot--${selectedHost.connection}`)} aria-hidden="true" />
             {canMoveThreads ? (
@@ -2323,23 +2410,25 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 <small>Move unavailable</small>
               </span>
             )}
-          </div>
+              </div>
 
-          <button
-            ref={inspectorToggleRef}
-            className="icon-button topbar__inspector-control"
-            type="button"
-            aria-label={inspectorOpen ? 'Close inspector' : 'Open inspector'}
-            title={inspectorOpen ? 'Close inspector' : 'Open inspector'}
-            aria-expanded={inspectorOpen}
-            aria-controls="thread-inspector"
-            onClick={() => {
-              setSidebarOpen(false)
-              setInspectorOpen((value) => !value)
-            }}
-          >
-            <Icon icon={inspectorOpen ? PanelRightClose : ListChecks} size={18} />
-          </button>
+              <button
+                ref={inspectorToggleRef}
+                className="icon-button topbar__inspector-control"
+                type="button"
+                aria-label={inspectorOpen ? 'Close inspector' : 'Open inspector'}
+                title={inspectorOpen ? 'Close inspector' : 'Open inspector'}
+                aria-expanded={inspectorOpen}
+                aria-controls="thread-inspector"
+                onClick={() => {
+                  setSidebarOpen(false)
+                  setInspectorOpen((value) => !value)
+                }}
+              >
+                <Icon icon={inspectorOpen ? PanelRightClose : ListChecks} size={18} />
+              </button>
+            </>
+          )}
         </div>
       </header>
 
@@ -2350,6 +2439,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         onSelectProject={selectProject}
         onSelectThread={selectThread}
         onSearch={openCommandPalette}
+        primeControlsVisible={activeWorkbenchBackend === 'prime'}
         onClose={closeSidebar}
         onAddComputer={(trigger) => {
           addComputerReturnTargetRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
@@ -2381,11 +2471,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           setModelsOpen(true)
         }}
         onMoveThread={openMoveThread}
-        canMoveThread={canMoveThreads}
-        canLoadModelCatalog={canLoadModelCatalog}
+        canMoveThread={activeWorkbenchBackend === 'prime' && canMoveThreads}
+        canLoadModelCatalog={activeWorkbenchBackend === 'prime' && canLoadModelCatalog}
         canManageComputers={canManageComputers}
-        canProvisionResident={canProvisionResident}
-        residentLifecycleOperations={residentLifecycleOperations}
+        canProvisionResident={activeWorkbenchBackend === 'prime' && canProvisionResident}
+        residentLifecycleOperations={activeWorkbenchBackend === 'prime' ? residentLifecycleOperations : []}
         residentRecoveryReference={residentRecoveryReference}
         residentLifecycleBusy={residentWorkspacePicking || residentStatusChecking}
         addComputerTriggerRef={addComputerTriggerRef}
@@ -2453,50 +2543,70 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           )}
         </div>
 
-        <Transcript thread={selectedThread} />
+        {activeWorkbenchBackend === 'codex_subscription' && api.codexSubscription && selectedThread.executionGenerationId ? (
+          <CodexSubscriptionWorkspace
+            key={[
+              selectedHost.id,
+              selectedThread.remoteId ?? selectedThread.id,
+              selectedThread.executionGenerationId,
+            ].join('\u0000')}
+            api={api.codexSubscription}
+            binding={{
+              expectedHostId: selectedHost.id,
+              threadId: selectedThread.remoteId ?? selectedThread.id,
+              expectedExecutionGenerationId: selectedThread.executionGenerationId,
+            }}
+          />
+        ) : (
+          <>
+            <Transcript thread={selectedThread} />
 
-        <Composer
-          connection={selectedHost.connection}
-          hostName={selectedHost.name}
-          taskState={selectedThread.status}
-          runtime={selectedRuntime}
-          text={composerText}
-          onTextChange={(nextText) => {
-            setComposerText(nextText)
-            if (composerValidationError) setComposerValidationError('')
-          }}
-          validationError={composerValidationError}
-          receipt={composerReceipt}
-          canStartTurn={canStartResidentTurn}
-          canStopTurn={canStopResidentTurn}
-          modelCatalogAvailable={canLoadModelCatalog}
-          onOpenModelCatalog={(trigger) => {
-            modelsDialogTriggerRef.current = trigger
-            setModelsOpen(true)
-          }}
-          onSubmit={submitComposer}
-          onStop={() => void stopResidentTurn()}
-        />
+            <Composer
+              connection={selectedHost.connection}
+              hostName={selectedHost.name}
+              taskState={selectedThread.status}
+              runtime={selectedRuntime}
+              text={composerText}
+              onTextChange={(nextText) => {
+                setComposerText(nextText)
+                if (composerValidationError) setComposerValidationError('')
+              }}
+              validationError={composerValidationError}
+              receipt={composerReceipt}
+              canStartTurn={canStartResidentTurn}
+              canStopTurn={canStopResidentTurn}
+              modelCatalogAvailable={canLoadModelCatalog}
+              onOpenModelCatalog={(trigger) => {
+                modelsDialogTriggerRef.current = trigger
+                setModelsOpen(true)
+              }}
+              onSubmit={submitComposer}
+              onStop={() => void stopResidentTurn()}
+            />
+          </>
+        )}
       </main>
 
-      <Inspector
-        api={api}
-        snapshot={snapshot}
-        selectedThread={selectedThread}
-        selectedProject={selectedProject}
-        selectedHost={selectedHost}
-        runtime={selectedRuntime}
-        activeTab={inspectorTab}
-        onTabChange={setInspectorTab}
-        onClose={closeInspector}
-        containerRef={inspectorPanelRef}
-        modal={inspectorIsModal}
-        inert={sidebarIsModal}
-        canEndResident={canEndResident}
-        residentEndPreparing={residentEndPreparing}
-        residentEndError={residentEndError}
-        onEndResident={(trigger) => void reviewResidentEnd(trigger)}
-      />
+      {activeWorkbenchBackend === 'prime' && (
+        <Inspector
+          api={api}
+          snapshot={snapshot}
+          selectedThread={selectedThread}
+          selectedProject={selectedProject}
+          selectedHost={selectedHost}
+          runtime={selectedRuntime}
+          activeTab={inspectorTab}
+          onTabChange={setInspectorTab}
+          onClose={closeInspector}
+          containerRef={inspectorPanelRef}
+          modal={inspectorIsModal}
+          inert={sidebarIsModal}
+          canEndResident={canEndResident}
+          residentEndPreparing={residentEndPreparing}
+          residentEndError={residentEndError}
+          onEndResident={(trigger) => void reviewResidentEnd(trigger)}
+        />
+      )}
 
       {(sidebarOpen || inspectorOpen) && (
         <button
@@ -2546,7 +2656,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         }}
       />
 
-      <CommandPaletteDialog
+      {activeWorkbenchBackend === 'prime' && <CommandPaletteDialog
         open={commandPaletteOpen}
         snapshot={snapshot}
         selectedThreadId={selectedThread.id}
@@ -2584,18 +2694,18 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           setCommandPaletteOpen(false)
           if (trigger) void reviewResidentEnd(trigger)
         }}
-      />
+      />}
 
-      <ModelsDialog
+      {activeWorkbenchBackend === 'prime' && <ModelsDialog
         api={api}
         open={modelsOpen}
         host={selectedHost}
         currentModel={selectedRuntime.session?.model}
         triggerRef={modelsDialogTriggerRef}
         onClose={() => setModelsOpen(false)}
-      />
+      />}
 
-      <MoveThreadDialog
+      {activeWorkbenchBackend === 'prime' && <MoveThreadDialog
         api={api}
         open={moveThreadOpen}
         thread={selectedThread}
@@ -2604,7 +2714,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         triggerRef={moveThreadTriggerRef}
         onClose={() => setMoveThreadOpen(false)}
         onMoved={finishMove}
-      />
+      />}
     </div>
   )
 }
@@ -2616,6 +2726,7 @@ interface SidebarProps {
   onSelectProject: (projectId: string) => void
   onSelectThread: (thread: ThreadSummary) => void
   onSearch: () => void
+  primeControlsVisible: boolean
   onClose: () => void
   onAddComputer: (trigger: HTMLElement) => void
   onProvisionResident: (trigger: HTMLElement) => void
@@ -2645,6 +2756,7 @@ function Sidebar({
   onSelectProject,
   onSelectThread,
   onSearch,
+  primeControlsVisible,
   onClose,
   onAddComputer,
   onProvisionResident,
@@ -2726,18 +2838,20 @@ function Sidebar({
             onCheck={onCheckResident}
           />
         )}
-        <div className="sidebar__new-row">
-          <button
-            className="button button--quiet button--full sidebar__search"
-            type="button"
-            aria-label="Search projects and threads"
-            title="Search projects, threads, and commands"
-            onClick={onSearch}
-          >
-            <Icon icon={Search} size={17} />
-            <span>Search</span>
-          </button>
-        </div>
+        {primeControlsVisible && (
+          <div className="sidebar__new-row">
+            <button
+              className="button button--quiet button--full sidebar__search"
+              type="button"
+              aria-label="Search projects and threads"
+              title="Search projects, threads, and commands"
+              onClick={onSearch}
+            >
+              <Icon icon={Search} size={17} />
+              <span>Search</span>
+            </button>
+          </div>
+        )}
 
         <nav className="nav-section" aria-labelledby="projects-heading">
           <div className="nav-section__heading">
@@ -2838,7 +2952,7 @@ function Sidebar({
       </div>
 
       <div className="sidebar__footer">
-        {selectedHost && compatibleHosts.length > 0 && (
+        {primeControlsVisible && selectedHost && compatibleHosts.length > 0 && (
           <div className="sidebar__location">
             <span>Run location</span>
             <span className={cx('connection-dot', `connection-dot--${selectedHost.connection}`)} aria-hidden="true" />

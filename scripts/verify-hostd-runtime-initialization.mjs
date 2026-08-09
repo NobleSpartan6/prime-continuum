@@ -19,6 +19,7 @@ const FIRST_HEALTH_DEADLINE_MS = 10_000;
 const HEALTH_REQUEST_DEADLINE_MS = 3_000;
 const MODEL_CATALOG_REQUEST_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 180_000;
+const CODEX_CAPABILITY_DEADLINE_MS = 60_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const BASE_HEALTH_CAPABILITIES = Object.freeze([
@@ -28,6 +29,8 @@ const BASE_HEALTH_CAPABILITIES = Object.freeze([
 ].sort());
 const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
+const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
+const CODEX_SUBSCRIPTION_CAPABILITY = "codex_subscription_v1";
 const EXPECTED_MODEL_CATALOG = Object.freeze({
   releaseVersion: "0.7.0",
   providers: 32,
@@ -173,7 +176,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     const runtime = response.health.runtimeIntegrity;
     if (runtime?.status === "failed" || runtime?.status === "unavailable") {
       throw new Error(
-        `Runtime initialization failed with ${runtime.code} after phases ${[...phases].join(", ") || "none"}`,
+        `Runtime initialization failed with ${runtime.code} after phases ${[...phases].join(", ") || "none"}; ${stderrTail.toString("utf8")}`,
       );
     }
     if (runtime?.status === "initializing") phases.add(runtime.phase);
@@ -183,8 +186,28 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
       break;
     }
   }
-  if (!readyHealth) throw new Error("Runtime initialization did not reach ready within the smoke deadline");
+  if (!readyHealth) {
+    throw new Error(
+      `Runtime initialization did not reach ready within the smoke deadline after phases ${[...phases].join(", ") || "none"}; ${stderrTail.toString("utf8")}`,
+    );
+  }
   const readyMs = Date.now() - launchStartedAt;
+  const codexDeadline = Date.now() + CODEX_CAPABILITY_DEADLINE_MS;
+  while (!readyHealth.capabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY) && Date.now() < codexDeadline) {
+    assertChildAlive(child, stderrTail);
+    await delay(POLL_INTERVAL_MS);
+    const response = await requestHealth(endpoint, HEALTH_REQUEST_DEADLINE_MS);
+    assertRuntimeHealth(response.health, "ready");
+    readyHealth = response.health;
+    latencies.push(response.latencyMs);
+  }
+  if (!readyHealth.capabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY)) {
+    throw new Error(
+      `Release hostd did not advertise the attested Codex subscription capability after its bounded background preflight; ${stderrTail.toString("utf8")}`,
+    );
+  }
+  assertRuntimeHealth(readyHealth, "ready", true);
+  const codexReadyMs = Date.now() - launchStartedAt;
   const identity = readyHealth.runtimeIntegrity;
   const modelCatalog = await requestHost(
     endpoint,
@@ -219,6 +242,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     firstRuntimeStatus,
     firstHealthMs,
     readyMs,
+    codexReadyMs,
     maxHealthLatencyMs: Math.max(...latencies),
     samples: latencies.length,
     phases: [...phases],
@@ -227,7 +251,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
   };
 }
 
-function assertRuntimeHealth(health, expectedStatus) {
+function assertRuntimeHealth(health, expectedStatus, requireCodexCapability = false) {
   if (!health || health.protocolVersion !== 1) throw new Error("Health response has an invalid protocol identity");
   const runtime = health.runtimeIntegrity;
   if (!runtime || runtime.contractVersion !== 1 || runtime.status !== expectedStatus) {
@@ -237,9 +261,17 @@ function assertRuntimeHealth(health, expectedStatus) {
     throw new Error("Runtime health capabilities are invalid");
   }
   const expectedCapabilities = expectedStatus === "ready"
-    ? [...BASE_HEALTH_CAPABILITIES, MODEL_CATALOG_CAPABILITY, RESIDENT_LIFECYCLE_CAPABILITY].sort()
+    ? [
+        ...BASE_HEALTH_CAPABILITIES,
+        MODEL_CATALOG_CAPABILITY,
+        RESIDENT_LIFECYCLE_CAPABILITY,
+        CANDIDATE_EVALUATION_CAPABILITY,
+        ...(requireCodexCapability ? [CODEX_SUBSCRIPTION_CAPABILITY] : []),
+      ].sort()
     : BASE_HEALTH_CAPABILITIES;
-  const actualCapabilities = [...health.capabilities].sort();
+  const actualCapabilities = health.capabilities
+    .filter((capability) => requireCodexCapability || capability !== CODEX_SUBSCRIPTION_CAPABILITY)
+    .sort();
   if (JSON.stringify(actualCapabilities) !== JSON.stringify(expectedCapabilities)) {
     throw new Error(
       `Runtime health capabilities differ from the exact release contract: ${actualCapabilities.join(", ")}`,
@@ -452,6 +484,7 @@ function cleanRunAsNodeEnvironment(environment) {
     }
   }
   result.ELECTRON_RUN_AS_NODE = "1";
+  result.PRIME_CONTINUIM_PACKAGE_SMOKE = "1";
   return result;
 }
 

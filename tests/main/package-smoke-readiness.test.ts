@@ -7,6 +7,7 @@ const DIGEST_B = `sha256:${'b'.repeat(64)}`
 const DIGEST_C = `sha256:${'c'.repeat(64)}`
 
 const electronApp = {
+  requestSingleInstanceLock: vi.fn(() => true),
   whenReady: vi.fn(() => new Promise<void>(() => undefined)),
   on: vi.fn(),
   once: vi.fn(),

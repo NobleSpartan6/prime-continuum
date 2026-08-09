@@ -2,7 +2,7 @@ import { basename, isAbsolute, posix, resolve, win32 } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
 import { isMainThread } from "node:worker_threads";
 import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
-import { resolveHostDataDir } from "./paths";
+import { HOSTD_VERSION, resolveHostDataDir } from "./paths";
 import { collectHostProbe } from "./probe";
 import { PairingAuthority, type ChannelCloseFailureDiagnostic } from "./pairing/authority";
 import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
@@ -15,10 +15,16 @@ import { HostService } from "./service";
 import { HostStore } from "./store";
 import { CandidateEvaluationCoordinator } from "./candidate-evaluation";
 import { CandidateEvaluationStore } from "./candidate-evaluation-store";
+import { CodexSubscriptionBackend } from "./codex-subscription-backend";
 
 export * from "./gateway";
 export * from "./candidate-evaluation";
 export * from "./candidate-evaluation-store";
+export * from "./codex-app-server-client";
+export * from "./codex-app-server-process";
+export * from "./codex-home-security";
+export * from "./codex-subscription-backend";
+export * from "./codex-subscription-store";
 export * from "./oauth-session-broker";
 export * from "./paths";
 export * from "./probe";
@@ -109,6 +115,14 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
           environment: process.env,
         })
       : undefined;
+    const codexSubscriptionBackend = runtimeInitialization
+      ? new CodexSubscriptionBackend({
+          paths: store.paths,
+          authorityStore: store,
+          runtimeHandles: runtimeInitialization,
+          clientVersion: HOSTD_VERSION,
+        })
+      : undefined;
     const service = new HostService(
       store,
       residentGateway,
@@ -120,6 +134,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         runtimeModelCatalogProvider: runtimeModelCatalog,
         runtimeOAuthComposition,
         candidateEvaluationCoordinator: candidateEvaluation,
+        codexSubscriptionBackend,
       },
     );
     const endpoint = options.socket ?? target.endpoint;

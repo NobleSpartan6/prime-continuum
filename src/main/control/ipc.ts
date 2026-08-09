@@ -3,6 +3,13 @@ import { z } from 'zod'
 import {
   CandidateEvaluationPreflightRequestSchema,
   CandidateEvaluationStartRequestSchema,
+  CodexSubscriptionAccountReadRequestSchema,
+  CodexSubscriptionLoginCancelRequestSchema,
+  CodexSubscriptionLoginStartRequestSchema,
+  CodexSubscriptionLogoutRequestSchema,
+  CodexSubscriptionRequestBindingSchema,
+  CodexSubscriptionTurnInterruptRequestSchema,
+  CodexSubscriptionTurnStartRequestSchema,
   RuntimeIntegrityTargetSchema,
 } from '../../shared/protocol'
 import { IPC, type Result, type RuntimeIntegrityRepairInput } from './contracts'
@@ -75,12 +82,13 @@ const residentEnd = z
     consent: z.literal(true),
   })
   .strict()
-
 export interface ControlIpcOptions {
   ipcMain: IpcMain
   service: DesktopControlService
   getWindows: () => readonly BrowserWindow[]
   isTrustedSender: (event: IpcMainInvokeEvent) => boolean
+  /** Codex subscription control is intentionally unavailable to the HUD. */
+  isTrustedWorkbenchSender?: (event: IpcMainInvokeEvent) => boolean
 }
 
 export function isTrustedRendererSender(
@@ -99,17 +107,19 @@ export function isTrustedRendererSender(
 
 export function registerControlIpc(options: ControlIpcOptions): () => void {
   const { ipcMain, service, getWindows, isTrustedSender } = options
+  const isTrustedWorkbenchSender = options.isTrustedWorkbenchSender ?? (() => false)
   const channels: string[] = []
 
   const handle = <T>(
     channel: string,
     schema: z.ZodType,
-    operation: (input: never) => Promise<T> | T
+    operation: (input: never) => Promise<T> | T,
+    trustSender: (event: IpcMainInvokeEvent) => boolean = isTrustedSender,
   ): void => {
     channels.push(channel)
     ipcMain.handle(channel, async (event, rawInput): Promise<Result<T>> => {
       try {
-        if (!isTrustedSender(event)) {
+        if (!trustSender(event)) {
           throw new ControlError('ipc.untrusted_sender', 'The native request did not come from the app UI.')
         }
         assertBoundedIpcInput(rawInput)
@@ -207,6 +217,62 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     CandidateEvaluationPreflightRequestSchema,
     (input: Parameters<DesktopControlService['candidateEvaluationSnapshot']>[0]) =>
       service.candidateEvaluationSnapshot(input)
+  )
+  handle(
+    IPC.codexSubscriptionAccountRead,
+    CodexSubscriptionAccountReadRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionAccountRead']>[0]) =>
+      service.codexSubscriptionAccountRead(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionLoginStart,
+    CodexSubscriptionLoginStartRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionLoginStart']>[0]) =>
+      service.codexSubscriptionLoginStart(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionLoginCancel,
+    CodexSubscriptionLoginCancelRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionLoginCancel']>[0]) =>
+      service.codexSubscriptionLoginCancel(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionLogout,
+    CodexSubscriptionLogoutRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionLogout']>[0]) =>
+      service.codexSubscriptionLogout(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionConversationSnapshot,
+    CodexSubscriptionRequestBindingSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionConversationSnapshot']>[0]) =>
+      service.codexSubscriptionConversationSnapshot(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionTurnStart,
+    CodexSubscriptionTurnStartRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionTurnStart']>[0]) =>
+      service.codexSubscriptionTurnStart(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionTurnInterrupt,
+    CodexSubscriptionTurnInterruptRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionTurnInterrupt']>[0]) =>
+      service.codexSubscriptionTurnInterrupt(input),
+    isTrustedWorkbenchSender,
+  )
+  handle(
+    IPC.codexSubscriptionTurnReconcile,
+    CodexSubscriptionTurnStartRequestSchema,
+    (input: Parameters<DesktopControlService['codexSubscriptionTurnReconcile']>[0]) =>
+      service.codexSubscriptionTurnReconcile(input),
+    isTrustedWorkbenchSender,
   )
   handle(
     IPC.selectResidentWorkspace,

@@ -3,6 +3,13 @@ import {
   CandidateEvaluationPreflightSchema,
   CandidateEvaluationSnapshotSchema,
   CandidateEvaluationStatusSchema,
+  CODEX_SUBSCRIPTION_BACKEND_ID,
+  CODEX_SUBSCRIPTION_BACKEND_LABEL,
+  CODEX_SUBSCRIPTION_CAPABILITY,
+  CodexSubscriptionAccountSnapshotSchema,
+  CodexSubscriptionConversationLookupSchema,
+  CodexSubscriptionConversationSnapshotSchema,
+  CodexSubscriptionTurnReconciliationSchema,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
@@ -22,6 +29,17 @@ import {
   type CandidateEvaluationSnapshot,
   type CandidateEvaluationStartRequest,
   type CandidateEvaluationStatus,
+  type CodexSubscriptionAccountReadRequest,
+  type CodexSubscriptionAccountSnapshot,
+  type CodexSubscriptionConversationLookup,
+  type CodexSubscriptionConversationSnapshot,
+  type CodexSubscriptionLoginCancelRequest,
+  type CodexSubscriptionLoginStartRequest,
+  type CodexSubscriptionLogoutRequest,
+  type CodexSubscriptionRequestBinding,
+  type CodexSubscriptionTurnInterruptRequest,
+  type CodexSubscriptionTurnReconciliation,
+  type CodexSubscriptionTurnStartRequest,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
@@ -262,6 +280,8 @@ export interface WorkbenchSnapshot {
     modelCatalog?: boolean
     /** Capability-derived probe availability only; never an action authorization. */
     candidateEvaluationProbe?: boolean
+    /** Eligibility only; every Codex action revalidates exact native authority. */
+    codexSubscription?: boolean
   }
   composerReceipt: {
     state: ComposerReceiptState
@@ -382,6 +402,7 @@ export interface ComposerRequest {
 
 export interface RendererApi {
   environment: 'native' | 'preview'
+  codexSubscription?: CodexSubscriptionRendererApi
   loadWorkbench(): Promise<WorkbenchSnapshot>
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
   hudOpen(target: HudTarget): Promise<HudState>
@@ -440,6 +461,17 @@ export interface RendererApi {
     },
     onProgress: (phase: HandoffPhase, message: string) => void,
   ): Promise<{ destinationHostId: string; receiptId: string }>
+}
+
+export interface CodexSubscriptionRendererApi {
+  accountRead(input: CodexSubscriptionAccountReadRequest): Promise<CodexSubscriptionAccountSnapshot>
+  loginStart(input: CodexSubscriptionLoginStartRequest): Promise<CodexSubscriptionAccountSnapshot>
+  loginCancel(input: CodexSubscriptionLoginCancelRequest): Promise<CodexSubscriptionAccountSnapshot>
+  logout(input: CodexSubscriptionLogoutRequest): Promise<CodexSubscriptionAccountSnapshot>
+  conversationSnapshot(input: CodexSubscriptionRequestBinding): Promise<CodexSubscriptionConversationLookup>
+  turnStart(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionConversationSnapshot>
+  turnInterrupt(input: CodexSubscriptionTurnInterruptRequest): Promise<CodexSubscriptionConversationSnapshot>
+  turnReconcile(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionTurnReconciliation>
 }
 
 export class StaleHostAuthorityError extends Error {
@@ -728,6 +760,8 @@ export type PreviewVisualState =
   | 'resident-end-review'
   | 'resident-end-pending'
   | 'candidate-evaluation-review'
+  | 'codex-subscription-signed-out'
+  | 'codex-subscription-ready'
   | 'hud-expanded'
   | 'hud-buddy'
 
@@ -743,6 +777,8 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'resident-end-review',
   'resident-end-pending',
   'candidate-evaluation-review',
+  'codex-subscription-signed-out',
+  'codex-subscription-ready',
   'hud-expanded',
   'hud-buddy',
 ])
@@ -757,6 +793,33 @@ function previewVisualStateFromSearch(search: string): PreviewVisualState {
 function previewSnapshotForVisualState(visualState: PreviewVisualState): WorkbenchSnapshot {
   const snapshot = structuredClone(previewSnapshot)
   if (visualState === 'reconnecting') return snapshot
+
+  if (visualState === 'codex-subscription-signed-out' || visualState === 'codex-subscription-ready') {
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
+    if (!thread || !host) return snapshot
+    snapshot.selectedProjectId = thread.projectId
+    snapshot.selectedThreadId = thread.id
+    thread.remoteId = PREVIEW_CODEX_BINDING.threadId
+    thread.executionGenerationId = PREVIEW_CODEX_BINDING.expectedExecutionGenerationId
+    thread.status = 'idle'
+    host.kind = 'local'
+    host.connection = 'online'
+    host.connectionPath = 'Local socket'
+    host.latencyMs = 2
+    delete host.lastSynchronized
+    snapshot.attention = []
+    snapshot.runtime = {}
+    snapshot.operations = {
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+      codexSubscription: true,
+    }
+    snapshot.composerReceipt = { state: 'idle', message: previewSimulation('Codex visual fixture; no command can run') }
+    return snapshot
+  }
 
   if (visualState === 'resident-start' || visualState === 'resident-recovery') {
     const host = snapshot.hosts[0]
@@ -1194,13 +1257,147 @@ const previewCandidateEvaluationSnapshot = CandidateEvaluationSnapshotSchema.par
   evaluations: [],
 })
 
+const PREVIEW_CODEX_BINDING = Object.freeze({
+  expectedHostId: 'host-local',
+  threadId: 'codex-preview-source-thread',
+  expectedExecutionGenerationId: 'codex-preview-execution',
+})
+
+const PREVIEW_CODEX_EXECUTION_POLICY = Object.freeze({
+  filesystem: 'read_only_user_scope' as const,
+  workspaceReadConfinement: false as const,
+  toolNetworkAccess: false as const,
+  approvalPolicy: 'never' as const,
+  disclosure: 'Codex tools cannot write files or open network connections. They may read other files available to your Windows account; this is not a workspace-only sandbox. Prompts and content Codex reads—including workspace instructions and tool-read files—are sent to OpenAI for the turn.' as const,
+})
+
+const PREVIEW_CODEX_BACKEND = Object.freeze({
+  id: CODEX_SUBSCRIPTION_BACKEND_ID,
+  kind: 'codex_subscription' as const,
+  label: CODEX_SUBSCRIPTION_BACKEND_LABEL,
+})
+
+function previewCodexAccount(visualState: PreviewVisualState): CodexSubscriptionAccountSnapshot {
+  const account = visualState === 'codex-subscription-ready'
+    ? {
+        backend: PREVIEW_CODEX_BACKEND,
+        backendIncarnationId: 'codex-preview-backend',
+        phase: 'signed_in' as const,
+        accountType: 'chatgpt' as const,
+        requiresOpenaiAuth: true as const,
+        planType: 'plus' as const,
+        executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
+        turnReadiness: { state: 'ready' as const, verifiedAt: '2026-08-09T12:03:00.000Z' },
+        updatedAt: '2026-08-09T12:03:00.000Z',
+      }
+    : {
+        backend: PREVIEW_CODEX_BACKEND,
+        backendIncarnationId: 'codex-preview-backend',
+        phase: 'signed_out' as const,
+        executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
+        turnReadiness: { state: 'unavailable' as const, reason: 'account_required' as const },
+        updatedAt: '2026-08-09T12:00:00.000Z',
+      }
+  return CodexSubscriptionAccountSnapshotSchema.parse(account)
+}
+
+function previewCodexConversation(visualState: PreviewVisualState): CodexSubscriptionConversationSnapshot | null {
+  if (visualState !== 'codex-subscription-ready') return null
+  return CodexSubscriptionConversationSnapshotSchema.parse({
+    backend: PREVIEW_CODEX_BACKEND,
+    backendIncarnationId: 'codex-preview-backend',
+    binding: {
+      hostId: PREVIEW_CODEX_BINDING.expectedHostId,
+      sourceThreadId: PREVIEW_CODEX_BINDING.threadId,
+      executionGenerationId: PREVIEW_CODEX_BINDING.expectedExecutionGenerationId,
+    },
+    sessionId: 'codex-preview-session',
+    threadId: 'codex-preview-thread',
+    revision: 4,
+    state: 'terminal',
+    executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
+    latestTurn: {
+      operationId: 'codex-preview-turn-operation',
+      turnId: 'codex-preview-turn',
+      state: 'completed',
+      terminal: true,
+      startedAt: '2026-08-09T12:01:00.000Z',
+      completedAt: '2026-08-09T12:02:00.000Z',
+    },
+    transcript: [
+      {
+        itemId: 'codex-preview-user-item',
+        turnOperationId: 'codex-preview-turn-operation',
+        turnId: 'codex-preview-turn',
+        sequence: 0,
+        role: 'user',
+        state: 'completed',
+        text: 'Summarize the execution boundary for this preview.',
+        createdAt: '2026-08-09T12:01:00.000Z',
+        updatedAt: '2026-08-09T12:01:00.000Z',
+      },
+      {
+        itemId: 'codex-preview-assistant-item',
+        turnOperationId: 'codex-preview-turn-operation',
+        turnId: 'codex-preview-turn',
+        sequence: 1,
+        role: 'assistant',
+        state: 'completed',
+        text: 'This is a non-executing visual fixture. Codex tools cannot write files or open network connections, but reads are not confined to this workspace.',
+        createdAt: '2026-08-09T12:01:01.000Z',
+        updatedAt: '2026-08-09T12:02:00.000Z',
+      },
+    ],
+    transcriptTruncated: false,
+    updatedAt: '2026-08-09T12:02:00.000Z',
+  })
+}
+
+function previewCodexBindingMatches(input: CodexSubscriptionRequestBinding): boolean {
+  return input.expectedHostId === PREVIEW_CODEX_BINDING.expectedHostId &&
+    input.threadId === PREVIEW_CODEX_BINDING.threadId &&
+    input.expectedExecutionGenerationId === PREVIEW_CODEX_BINDING.expectedExecutionGenerationId
+}
+
+function createPreviewCodexSubscriptionApi(visualState: PreviewVisualState): CodexSubscriptionRendererApi {
+  const account = previewCodexAccount(visualState)
+  const conversation = previewCodexConversation(visualState)
+  const rejectMutation = async (_input: unknown): Promise<never> => {
+    throw new Error('The internal Codex visual-QA fixture never invokes login, logout, turn, or interrupt operations.')
+  }
+  return Object.freeze({
+    accountRead: async (input: CodexSubscriptionAccountReadRequest) => {
+      if (input.expectedHostId !== PREVIEW_CODEX_BINDING.expectedHostId) {
+        throw new Error('The internal Codex visual-QA account authority changed.')
+      }
+      return structuredClone(account)
+    },
+    loginStart: rejectMutation,
+    loginCancel: rejectMutation,
+    logout: rejectMutation,
+    conversationSnapshot: async (input: CodexSubscriptionRequestBinding) => {
+      if (!previewCodexBindingMatches(input)) {
+        throw new Error('The internal Codex visual-QA conversation authority changed.')
+      }
+      return { conversation: structuredClone(conversation) }
+    },
+    turnStart: rejectMutation,
+    turnInterrupt: rejectMutation,
+    turnReconcile: rejectMutation,
+  })
+}
+
 class BrowserPreviewApi implements RendererApi {
   readonly environment: 'native' | 'preview'
+  readonly codexSubscription?: CodexSubscriptionRendererApi
   private previewHudState: HudState = { state: 'closed' }
   private readonly hudListeners = new Set<(state: HudState) => void>()
 
   constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
-    this.environment = visualState === 'candidate-evaluation-review' ? 'native' : 'preview'
+    const codexVisualState = visualState === 'codex-subscription-signed-out' ||
+      visualState === 'codex-subscription-ready'
+    this.environment = visualState === 'candidate-evaluation-review' || codexVisualState ? 'native' : 'preview'
+    if (codexVisualState) this.codexSubscription = createPreviewCodexSubscriptionApi(visualState)
     if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
       this.previewHudState = {
         state: visualState === 'hud-buddy' ? 'buddy' : 'expanded',
@@ -3021,6 +3218,14 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       advertisedCapabilities.includes(CANDIDATE_EVALUATION_PROBE_CAPABILITY)
         ? { candidateEvaluationProbe: true }
         : {}),
+      ...(selectedHostHasAuthority &&
+      selectedSnapshotIsMaterialized &&
+      activePhase === 'online' &&
+      asString(activeTarget?.kind) === 'local' &&
+      asString(rawConnection?.path) === 'local_socket' &&
+      advertisedCapabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY)
+        ? { codexSubscription: true }
+        : {}),
     },
     composerReceipt: selectedResidentEnd
       ? {
@@ -3121,8 +3326,185 @@ interface ComposerActionFence {
   sequence: number
 }
 
+function codexSubscriptionBindingKey(input: CodexSubscriptionRequestBinding): string {
+  return `${input.expectedHostId}\u0000${input.threadId}\u0000${input.expectedExecutionGenerationId}`
+}
+
+function codexSubscriptionBindingMatches(
+  binding: { hostId: string; sourceThreadId: string; executionGenerationId: string },
+  input: CodexSubscriptionRequestBinding,
+): boolean {
+  return (
+    binding.hostId === input.expectedHostId &&
+    binding.sourceThreadId === input.threadId &&
+    binding.executionGenerationId === input.expectedExecutionGenerationId
+  )
+}
+
+class NativeCodexSubscriptionRendererApi implements CodexSubscriptionRendererApi {
+  private readonly acceptedAccounts = new Map<
+    string,
+    { snapshot: CodexSubscriptionAccountSnapshot; fingerprint: string }
+  >()
+  private readonly acceptedConversations = new Map<
+    string,
+    { snapshot: CodexSubscriptionConversationSnapshot; fingerprint: string }
+  >()
+
+  constructor(private readonly bridge: object) {}
+
+  private async call<T>(method: string, payload: unknown): Promise<T> {
+    const candidate = (this.bridge as Record<string, unknown>)[method]
+    if (typeof candidate !== 'function') {
+      throw new Error(`The native Codex subscription bridge does not expose ${method}.`)
+    }
+    const raw = await (candidate as (input: unknown) => Promise<unknown>).call(this.bridge, payload)
+    return unwrapResult<T>(raw)
+  }
+
+  async accountRead(input: CodexSubscriptionAccountReadRequest): Promise<CodexSubscriptionAccountSnapshot> {
+    return this.acceptAccount(input.expectedHostId, CodexSubscriptionAccountSnapshotSchema.parse(
+      await this.call<unknown>('accountRead', input),
+    ))
+  }
+
+  async loginStart(input: CodexSubscriptionLoginStartRequest): Promise<CodexSubscriptionAccountSnapshot> {
+    const account = CodexSubscriptionAccountSnapshotSchema.parse(
+      await this.call<unknown>('loginStart', input),
+    )
+    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.acceptAccount(input.expectedHostId, account)
+  }
+
+  async loginCancel(input: CodexSubscriptionLoginCancelRequest): Promise<CodexSubscriptionAccountSnapshot> {
+    const account = CodexSubscriptionAccountSnapshotSchema.parse(
+      await this.call<unknown>('loginCancel', input),
+    )
+    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.acceptAccount(input.expectedHostId, account)
+  }
+
+  async logout(input: CodexSubscriptionLogoutRequest): Promise<CodexSubscriptionAccountSnapshot> {
+    const account = CodexSubscriptionAccountSnapshotSchema.parse(
+      await this.call<unknown>('logout', input),
+    )
+    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.acceptAccount(input.expectedHostId, account)
+  }
+
+  async conversationSnapshot(input: CodexSubscriptionRequestBinding): Promise<CodexSubscriptionConversationLookup> {
+    const lookup = CodexSubscriptionConversationLookupSchema.parse(
+      await this.call<unknown>('conversationSnapshot', input),
+    )
+    if (!lookup.conversation) {
+      const accepted = this.acceptedConversations.get(codexSubscriptionBindingKey(input))
+      if (accepted) return { conversation: structuredClone(accepted.snapshot) }
+      return { conversation: null }
+    }
+    return { conversation: this.acceptConversation(input, lookup.conversation) }
+  }
+
+  async turnStart(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionConversationSnapshot> {
+    const conversation = CodexSubscriptionConversationSnapshotSchema.parse(
+      await this.call<unknown>('turnStart', input),
+    )
+    if (
+      conversation.backendIncarnationId !== input.expectedBackendIncarnationId ||
+      conversation.latestTurn?.operationId !== input.operationId
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.acceptConversation(input, conversation)
+  }
+
+  async turnInterrupt(input: CodexSubscriptionTurnInterruptRequest): Promise<CodexSubscriptionConversationSnapshot> {
+    const conversation = CodexSubscriptionConversationSnapshotSchema.parse(
+      await this.call<unknown>('turnInterrupt', input),
+    )
+    if (
+      conversation.backendIncarnationId !== input.expectedBackendIncarnationId ||
+      conversation.sessionId !== input.sessionId ||
+      conversation.threadId !== input.codexThreadId ||
+      conversation.latestTurn?.operationId !== input.expectedTurnOperationId ||
+      conversation.latestTurn.turnId !== input.turnId
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.acceptConversation(input, conversation)
+  }
+
+  async turnReconcile(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionTurnReconciliation> {
+    const result = CodexSubscriptionTurnReconciliationSchema.parse(
+      await this.call<unknown>('turnReconcile', input),
+    )
+    if (result.operationId !== input.operationId) throw new StaleHostAuthorityError()
+    if (result.known) {
+      if (result.conversation.backendIncarnationId !== input.expectedBackendIncarnationId) {
+        throw new StaleHostAuthorityError()
+      }
+      return {
+        ...result,
+        conversation: this.acceptConversation(input, result.conversation),
+      }
+    }
+    if (!codexSubscriptionBindingMatches(result.binding, input)) throw new StaleHostAuthorityError()
+    return structuredClone(result)
+  }
+
+  private acceptAccount(
+    expectedHostId: string,
+    candidate: CodexSubscriptionAccountSnapshot,
+  ): CodexSubscriptionAccountSnapshot {
+    const fingerprint = JSON.stringify(candidate)
+    const accepted = this.acceptedAccounts.get(expectedHostId)
+    if (accepted && accepted.snapshot.backendIncarnationId === candidate.backendIncarnationId) {
+      const acceptedTime = Date.parse(accepted.snapshot.updatedAt)
+      const candidateTime = Date.parse(candidate.updatedAt)
+      if (candidateTime < acceptedTime) return structuredClone(accepted.snapshot)
+      if (candidateTime === acceptedTime) {
+        if (fingerprint !== accepted.fingerprint) {
+          throw new Error('The local Codex backend changed an account snapshot without advancing its timestamp.')
+        }
+        return structuredClone(accepted.snapshot)
+      }
+    }
+    const retained = structuredClone(candidate)
+    this.acceptedAccounts.set(expectedHostId, { snapshot: retained, fingerprint })
+    return structuredClone(retained)
+  }
+
+  private acceptConversation(
+    input: CodexSubscriptionRequestBinding,
+    candidate: CodexSubscriptionConversationSnapshot,
+  ): CodexSubscriptionConversationSnapshot {
+    if (!codexSubscriptionBindingMatches(candidate.binding, input)) throw new StaleHostAuthorityError()
+    const key = codexSubscriptionBindingKey(input)
+    const fingerprint = JSON.stringify(candidate)
+    const accepted = this.acceptedConversations.get(key)
+    if (accepted && accepted.snapshot.backendIncarnationId === candidate.backendIncarnationId) {
+      if (candidate.revision < accepted.snapshot.revision) return structuredClone(accepted.snapshot)
+      if (candidate.revision === accepted.snapshot.revision) {
+        if (fingerprint !== accepted.fingerprint) {
+          throw new Error('The local Codex backend changed a conversation without advancing its revision.')
+        }
+        return structuredClone(accepted.snapshot)
+      }
+    }
+    const retained = structuredClone(candidate)
+    this.acceptedConversations.set(key, { snapshot: retained, fingerprint })
+    return structuredClone(retained)
+  }
+}
+
 export class NativeRendererApi implements RendererApi {
   readonly environment = 'native' as const
+  readonly codexSubscription?: CodexSubscriptionRendererApi
   private readonly deviceId = getDeviceId()
   private projectionEntries: Record<string, NativeProjectionCacheEntry> = {}
   private catalog?: unknown
@@ -3195,7 +3577,10 @@ export class NativeRendererApi implements RendererApi {
   constructor(
     private readonly bridge: NativePrimeBridge,
     private readonly options: { allowConnectionInitiation?: boolean } = {},
-  ) {}
+  ) {
+    const candidate = asRecord((bridge as Record<string, unknown>).codexSubscription)
+    if (candidate) this.codexSubscription = new NativeCodexSubscriptionRendererApi(candidate)
+  }
 
   private async call<T>(method: string, payload?: unknown): Promise<T> {
     const candidate = (this.bridge as Record<string, unknown>)[method]

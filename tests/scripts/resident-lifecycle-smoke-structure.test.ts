@@ -51,6 +51,15 @@ function unresolvedNameDiagnostics(path: string): string[] {
   return `${result.stdout}${result.stderr}`.match(unresolvedNamePattern) ?? []
 }
 
+function materializeExpectedBaseCapabilities(): string[] {
+  const declarationStart = smokeSource.indexOf('const RESIDENT_COMMAND_CAPABILITY')
+  const declarationEnd = smokeSource.indexOf('const require = createRequire', declarationStart)
+  expect(declarationStart).toBeGreaterThanOrEqual(0)
+  expect(declarationEnd).toBeGreaterThan(declarationStart)
+  const declaration = smokeSource.slice(declarationStart, declarationEnd)
+  return new Function(`${declaration}; return [...EXPECTED_BASE_CAPABILITIES];`)() as string[]
+}
+
 function materializeDaemonAuditSource(): string {
   const declarationStart = smokeSource.indexOf('function daemonAuditSource()')
   expect(declarationStart).toBeGreaterThanOrEqual(0)
@@ -184,6 +193,18 @@ function materializeDurableProjectionAssertions(): {
 }
 
 describe('resident lifecycle smoke structure', () => {
+  it('requires every packaged local capability in the exact ready-health contract', () => {
+    expect(materializeExpectedBaseCapabilities()).toEqual([
+      'candidate_evaluation_probe_v1',
+      'codex_subscription_v1',
+      'resident_control_projection_v1',
+      'resident_lifecycle_v1',
+      'runtime_integrity_v1',
+      'runtime_model_catalog_v1',
+      'snapshot_chunks_v1',
+    ])
+  })
+
   it('resolves every outer smoke and generated daemon-audit global', () => {
     const daemonAuditPath = resolve(temporaryRoot, 'daemon-audit.mjs')
     writeFileSync(daemonAuditPath, materializeDaemonAuditSource(), { encoding: 'utf8', mode: 0o600 })

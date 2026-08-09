@@ -285,7 +285,26 @@ async function waitForPackageSmokeConnection(window: BrowserWindow): Promise<voi
   throw new Error('The packaged renderer did not establish a verified local host connection within its deadline.')
 }
 
-void app.whenReady().then(async () => {
+const ownsSingleInstance = app.requestSingleInstanceLock()
+
+if (!ownsSingleInstance) {
+  // A second Electron main must never open the same durable control ledgers.
+  // The primary instance receives `second-instance` and restores its workbench.
+  app.quit()
+} else {
+  initializePrimaryInstance()
+}
+
+function initializePrimaryInstance(): void {
+  app.on('second-instance', () => {
+    // `whenReady()` also covers the narrow startup interval before the first
+    // workbench exists. `showMainWindow` intentionally never targets the HUD.
+    void app.whenReady().then(() => {
+      showMainWindow()
+    })
+  })
+
+  void app.whenReady().then(async () => {
   app.setAppUserModelId('ai.primeintellect.continuim')
   const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
   const service = new DesktopControlService({
@@ -359,6 +378,8 @@ void app.whenReady().then(async () => {
     getWindows: trustedRendererWindows,
     isTrustedSender: (event) =>
       isTrustedRendererSender(event, trustedRendererWindows(), rendererUrlIsTrusted),
+    isTrustedWorkbenchSender: (event) =>
+      isTrustedRendererSender(event, mainWindow ? [mainWindow] : [], rendererUrlIsTrusted),
   })
   unregisterHudIpc = registerHudIpc({
     ipcMain,
@@ -384,13 +405,14 @@ void app.whenReady().then(async () => {
   app.on('activate', () => {
     showMainWindow()
   })
-})
+  })
 
-app.on('web-contents-created', (_event, contents) => {
-  contents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  contents.on('will-attach-webview', (event) => event.preventDefault())
-})
+  app.on('web-contents-created', (_event, contents) => {
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    contents.on('will-attach-webview', (event) => event.preventDefault())
+  })
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
-})
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit()
+  })
+}
