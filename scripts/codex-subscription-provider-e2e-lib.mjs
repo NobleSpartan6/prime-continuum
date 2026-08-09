@@ -11,6 +11,8 @@ export const CHECKPOINT_ASSERTION = "DISPOSABLE_WINDOWS_CHECKPOINT_READY";
 export const CONFIRMATION_PHRASE = "I AUTHORIZE LIVE CODEX USER-SCOPE TURNS, SIGN-OUT, FIXTURE RETENTION, AND DISPOSABLE VM DESTRUCTION";
 export const MAX_CDP_MESSAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_RECEIPT_BYTES = 12 * 1024;
+export const RENDERER_TERMINAL_POLL_INTERVAL_MS = 4_000;
+export const MIN_POST_RESTART_CONVERSATION_OBSERVATIONS = 3;
 
 export const FAILURE_STAGES = Object.freeze([
   "admission",
@@ -67,6 +69,9 @@ const NONCLAIMS = Object.freeze([
   "not_signing_evidence",
   "not_hostd_restart_evidence",
   "not_provider_rpc_count_evidence",
+  "not_release_readiness_evidence",
+  "not_native_picker_evidence",
+  "not_cleanup_completion_evidence",
   "system_browser_session_state_not_observed",
 ]);
 
@@ -434,27 +439,71 @@ export function validateInterruptedTurn(active, terminal) {
   return Object.freeze({ operationId: activeTurn.operationId, turnId: activeTurn.turnId });
 }
 
-export function validateElectronRestartRecovery(before, after, operationIds) {
-  if (!before || !after || before.backendIncarnationId !== after.backendIncarnationId) {
+export function validateElectronRestartRecovery(before, observations, operationIds) {
+  if (
+    !Array.isArray(operationIds) ||
+    operationIds.length !== 2 ||
+    operationIds.some((operationId) => !boundedId(operationId)) ||
+    operationIds[0] === operationIds[1]
+  ) {
     fail("desktop_restart", "RECOVERY_NOT_PROVEN");
   }
-  if (!Number.isSafeInteger(before.revision) || !Number.isSafeInteger(after.revision) || after.revision < before.revision) {
+  if (
+    !before ||
+    !Array.isArray(observations) ||
+    observations.length < MIN_POST_RESTART_CONVERSATION_OBSERVATIONS ||
+    observations.length > 128
+  ) {
     fail("desktop_restart", "RECOVERY_NOT_PROVEN");
   }
-  if (!causallyMonotonic(before.updatedAt, after.updatedAt)) fail("desktop_restart", "RECOVERY_NOT_PROVEN");
-  const beforeDurable = omitCurrentObservation(before);
-  const afterDurable = omitCurrentObservation(after);
-  if (!isDeepStrictEqual(beforeDurable, afterDurable)) fail("desktop_restart", "RECOVERY_NOT_PROVEN");
-  if (!Array.isArray(operationIds) || operationIds.length !== 2 || operationIds[0] === operationIds[1]) {
-    fail("desktop_restart", "RECOVERY_NOT_PROVEN");
+  assertExactOperationAdmissions(before, operationIds);
+  const durableBeforeRestart = omitObservationMetadata(before);
+  let previousSnapshot = before;
+  let previousObservedAtMonotonicMs;
+  let minimumPostRestartObservationSeparationMs = Number.MAX_SAFE_INTEGER;
+  for (const observation of observations) {
+    const snapshot = observation?.snapshot;
+    const observedAtMonotonicMs = observation?.observedAtMonotonicMs;
+    const observationSeparationMs = previousObservedAtMonotonicMs === undefined ||
+      !Number.isSafeInteger(observedAtMonotonicMs)
+      ? undefined
+      : observedAtMonotonicMs - previousObservedAtMonotonicMs;
+    if (
+      !snapshot ||
+      !Number.isSafeInteger(observedAtMonotonicMs) ||
+      observedAtMonotonicMs < 0 ||
+      (
+        observationSeparationMs !== undefined &&
+        observationSeparationMs < RENDERER_TERMINAL_POLL_INTERVAL_MS
+      ) ||
+      snapshot.backendIncarnationId !== before.backendIncarnationId ||
+      !Number.isSafeInteger(previousSnapshot.revision) ||
+      !Number.isSafeInteger(snapshot.revision) ||
+      snapshot.revision < previousSnapshot.revision ||
+      !causallyMonotonic(previousSnapshot.updatedAt, snapshot.updatedAt) ||
+      !isDeepStrictEqual(durableBeforeRestart, omitObservationMetadata(snapshot)) ||
+      (snapshot.revision === previousSnapshot.revision && !isDeepStrictEqual(previousSnapshot, snapshot))
+    ) {
+      fail("desktop_restart", "RECOVERY_NOT_PROVEN");
+    }
+    if (observationSeparationMs !== undefined) {
+      minimumPostRestartObservationSeparationMs = Math.min(
+        minimumPostRestartObservationSeparationMs,
+        observationSeparationMs,
+      );
+    }
+    assertExactOperationAdmissions(snapshot, operationIds);
+    previousSnapshot = snapshot;
+    previousObservedAtMonotonicMs = observedAtMonotonicMs;
   }
-  const expectedOperations = [...operationIds].sort();
-  const recoveredUsers = after.transcript.filter((item) => item.role === "user");
-  const recoveredOperations = recoveredUsers.map((item) => item.turnOperationId).sort();
-  if (recoveredUsers.length !== 2 || !isDeepStrictEqual(recoveredOperations, expectedOperations)) {
-    fail("desktop_restart", "RECOVERY_NOT_PROVEN");
-  }
-  return Object.freeze({ recovered: true, noReplay: true });
+  return Object.freeze({
+    recovered: true,
+    noAdditionalDurableAdmissionObserved: true,
+    postRestartConversationObservationCount: observations.length,
+    minimumPostRestartObservationSeparationMs,
+    rendererTerminalPollIntervalMs: RENDERER_TERMINAL_POLL_INTERVAL_MS,
+    rendererTerminalPollIntervalSizedObservationGapCount: observations.length - 1,
+  });
 }
 
 export class NullDelimitedCdpDecoder {
@@ -516,15 +565,26 @@ export function createFunctionalReceipt(input) {
     "interruptedTurnRenderedUserItem",
     "interruptedTurnExactIdentity",
     "desktopRestartRecovered",
-    "noReplay",
+    "noAdditionalDurableAdmissionObserved",
     "restartSignedIn",
     "loggedOut",
     "authJsonAbsent",
   ]) {
     if (input[key] !== true) fail("receipt", "RECEIPT_INVALID");
   }
+  if (
+    !Number.isSafeInteger(input.postRestartConversationObservationCount) ||
+    input.postRestartConversationObservationCount < MIN_POST_RESTART_CONVERSATION_OBSERVATIONS ||
+    input.postRestartConversationObservationCount > 128 ||
+    !Number.isSafeInteger(input.minimumPostRestartObservationSeparationMs) ||
+    input.minimumPostRestartObservationSeparationMs < RENDERER_TERMINAL_POLL_INTERVAL_MS ||
+    input.minimumPostRestartObservationSeparationMs > 24 * 60 * 60 * 1_000 ||
+    input.rendererTerminalPollIntervalMs !== RENDERER_TERMINAL_POLL_INTERVAL_MS ||
+    input.rendererTerminalPollIntervalSizedObservationGapCount !==
+      input.postRestartConversationObservationCount - 1
+  ) fail("receipt", "RECEIPT_INVALID");
   const receipt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: EVIDENCE_KIND,
     evidenceClass: EVIDENCE_CLASS,
     outcome: "functional_passed_cleanup_required",
@@ -572,7 +632,13 @@ export function createFunctionalReceipt(input) {
       hostdRestarted: false,
       backendIncarnationPreserved: true,
       exactConversationRecovered: true,
-      noReplay: true,
+      exactDurableConversationStable: true,
+      noAdditionalDurableAdmissionObserved: true,
+      postRestartConversationObservationCount: input.postRestartConversationObservationCount,
+      minimumPostRestartObservationSeparationMs: input.minimumPostRestartObservationSeparationMs,
+      rendererTerminalPollIntervalMs: RENDERER_TERMINAL_POLL_INTERVAL_MS,
+      rendererTerminalPollIntervalSizedObservationGapCount:
+        input.rendererTerminalPollIntervalSizedObservationGapCount,
     },
     security: {
       codexHomeAuthJsonAbsent: true,
@@ -598,7 +664,7 @@ export function createFailureReceipt(stage, code, cleanup = {}) {
     code = "RECEIPT_INVALID";
   }
   return validateReceipt({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: EVIDENCE_KIND,
     evidenceClass: EVIDENCE_CLASS,
     outcome: "failed",
@@ -674,7 +740,22 @@ function assertTurnTranscriptIdentity(snapshot, operationId, turnId, stage) {
   ) fail(stage, "TURN_IDENTITY_INVALID");
 }
 
-function omitCurrentObservation(snapshot) {
+function assertExactOperationAdmissions(snapshot, operationIds) {
+  if (!Array.isArray(snapshot?.transcript) || snapshot.transcriptTruncated !== false) {
+    fail("desktop_restart", "RECOVERY_NOT_PROVEN");
+  }
+  const expectedOperations = [...operationIds].sort();
+  const admittedUsers = snapshot.transcript.filter((item) => item.role === "user");
+  const admittedOperations = admittedUsers.map((item) => item.turnOperationId).sort();
+  const transcriptOperations = [...new Set(snapshot.transcript.map((item) => item.turnOperationId))].sort();
+  if (
+    admittedUsers.length !== 2 ||
+    !isDeepStrictEqual(admittedOperations, expectedOperations) ||
+    !isDeepStrictEqual(transcriptOperations, expectedOperations)
+  ) fail("desktop_restart", "RECOVERY_NOT_PROVEN");
+}
+
+function omitObservationMetadata(snapshot) {
   const { backendIncarnationId: _backendIncarnationId, revision: _revision, updatedAt: _updatedAt, ...durable } = snapshot;
   return durable;
 }

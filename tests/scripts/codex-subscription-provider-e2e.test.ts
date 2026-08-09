@@ -5,9 +5,11 @@ import {
   CHECKPOINT_ASSERTION,
   CONFIRMATION_PHRASE,
   DISPOSABLE_CHECKPOINT_FLAG,
+  MIN_POST_RESTART_CONVERSATION_OBSERVATIONS,
   NullDelimitedCdpDecoder,
   OPT_IN_FLAG,
   ProviderE2eContractError,
+  RENDERER_TERMINAL_POLL_INTERVAL_MS,
   assertInteractiveAdmission,
   assertTypedConfirmation,
   createFailureReceipt,
@@ -156,24 +158,59 @@ describe('authenticated Codex provider E2E contract', () => {
     )).toThrowError(expect.objectContaining({ code: 'INTERRUPT_NOT_PROVEN' }))
   })
 
-  it('proves Electron-only recovery on the same hostd incarnation without replay', () => {
+  it('proves stable durable admissions over two renderer-interval-sized post-restart gaps', () => {
     const first = terminalTwoTurnConversation()
     const restarted = structuredClone(first)
     restarted.revision += 1
     restarted.updatedAt = '2026-08-09T12:00:10.000Z'
-    expect(validateElectronRestartRecovery(first, restarted, ['turn-one', 'turn-two'])).toEqual({
+    const observations = restartObservations(restarted)
+    expect(RENDERER_TERMINAL_POLL_INTERVAL_MS).toBe(4_000)
+    expect(MIN_POST_RESTART_CONVERSATION_OBSERVATIONS).toBe(3)
+    expect(validateElectronRestartRecovery(first, observations, ['turn-one', 'turn-two'])).toEqual({
       recovered: true,
-      noReplay: true,
+      noAdditionalDurableAdmissionObserved: true,
+      postRestartConversationObservationCount: 3,
+      minimumPostRestartObservationSeparationMs: 4_000,
+      rendererTerminalPollIntervalMs: 4_000,
+      rendererTerminalPollIntervalSizedObservationGapCount: 2,
     })
 
-    const differentBackend = structuredClone(restarted)
-    differentBackend.backendIncarnationId = 'new-hostd-incarnation'
+    expect(() => validateElectronRestartRecovery(first, observations.slice(0, 2), ['turn-one', 'turn-two']))
+      .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
+
+    expect(() => validateElectronRestartRecovery(
+      first,
+      Array.from({ length: 129 }, (_, index) => ({
+        snapshot: structuredClone(restarted),
+        observedAtMonotonicMs: 10_000 + index * RENDERER_TERMINAL_POLL_INTERVAL_MS,
+      })),
+      ['turn-one', 'turn-two'],
+    )).toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
+
+    const tooSoon = structuredClone(observations)
+    tooSoon[2]!.observedAtMonotonicMs -= 1
+    expect(() => validateElectronRestartRecovery(first, tooSoon, ['turn-one', 'turn-two']))
+      .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
+
+    const differentBackend = structuredClone(observations)
+    differentBackend[1]!.snapshot.backendIncarnationId = 'new-hostd-incarnation'
     expect(() => validateElectronRestartRecovery(first, differentBackend, ['turn-one', 'turn-two']))
       .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
 
-    const replayed = structuredClone(restarted)
-    replayed.transcript.push({ ...replayed.transcript[0]!, itemId: 'duplicate-user', sequence: 4 })
-    expect(() => validateElectronRestartRecovery(first, replayed, ['turn-one', 'turn-two']))
+    const additionalAdmission = structuredClone(observations)
+    additionalAdmission[2]!.snapshot.transcript.push({
+      ...additionalAdmission[2]!.snapshot.transcript[0]!,
+      itemId: 'third-user',
+      turnOperationId: 'turn-three',
+      turnId: 'provider-turn-three',
+      sequence: 4,
+    })
+    expect(() => validateElectronRestartRecovery(first, additionalAdmission, ['turn-one', 'turn-two']))
+      .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
+
+    const regressed = structuredClone(observations)
+    regressed[2]!.snapshot.revision = first.revision
+    expect(() => validateElectronRestartRecovery(first, regressed, ['turn-one', 'turn-two']))
       .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
 
     const beforeWithUnrelated = structuredClone(first)
@@ -183,10 +220,7 @@ describe('authenticated Codex provider E2E contract', () => {
       turnOperationId: 'unexpected-operation',
       sequence: 4,
     })
-    const afterWithUnrelated = structuredClone(beforeWithUnrelated)
-    afterWithUnrelated.revision += 1
-    afterWithUnrelated.updatedAt = '2026-08-09T12:00:10.000Z'
-    expect(() => validateElectronRestartRecovery(beforeWithUnrelated, afterWithUnrelated, ['turn-one', 'turn-two']))
+    expect(() => validateElectronRestartRecovery(beforeWithUnrelated, observations, ['turn-one', 'turn-two']))
       .toThrowError(expect.objectContaining({ code: 'RECOVERY_NOT_PROVEN' }))
   })
 
@@ -211,12 +245,17 @@ describe('authenticated Codex provider E2E contract', () => {
       interruptedTurnRenderedUserItem: true,
       interruptedTurnExactIdentity: true,
       desktopRestartRecovered: true,
-      noReplay: true,
+      noAdditionalDurableAdmissionObserved: true,
+      postRestartConversationObservationCount: 3,
+      minimumPostRestartObservationSeparationMs: 4_250,
+      rendererTerminalPollIntervalMs: 4_000,
+      rendererTerminalPollIntervalSizedObservationGapCount: 2,
       restartSignedIn: true,
       loggedOut: true,
       authJsonAbsent: true,
     })
     expect(receipt).toMatchObject({
+      schemaVersion: 2,
       evidenceClass: 'opt_in_functional_e2e',
       outcome: 'functional_passed_cleanup_required',
       privilegedDebugAuthority: true,
@@ -228,6 +267,14 @@ describe('authenticated Codex provider E2E contract', () => {
       },
       completedTurn: { renderedStreamingAssistantObserved: true },
       boundary: { desktopLifecycleDrive: 'exact_process_uia_titlebar_close_button' },
+      recovery: {
+        exactDurableConversationStable: true,
+        noAdditionalDurableAdmissionObserved: true,
+        postRestartConversationObservationCount: 3,
+        minimumPostRestartObservationSeparationMs: 4_250,
+        rendererTerminalPollIntervalMs: 4_000,
+        rendererTerminalPollIntervalSizedObservationGapCount: 2,
+      },
       security: { codexHomeAuthJsonAbsent: true },
     })
     expect(receipt.nonclaims).toEqual([
@@ -237,6 +284,9 @@ describe('authenticated Codex provider E2E contract', () => {
       'not_signing_evidence',
       'not_hostd_restart_evidence',
       'not_provider_rpc_count_evidence',
+      'not_release_readiness_evidence',
+      'not_native_picker_evidence',
+      'not_cleanup_completion_evidence',
       'system_browser_session_state_not_observed',
     ])
     const serialized = serializeReceipt(receipt)
@@ -253,6 +303,7 @@ describe('authenticated Codex provider E2E contract', () => {
       desktopStarted: true,
     })
     expect(failureReceipt).toMatchObject({
+      schemaVersion: 2,
       outcome: 'failed',
       stage: 'login',
       code: 'LOGIN_NOT_COMPLETED',
@@ -271,10 +322,11 @@ describe('authenticated Codex provider E2E contract', () => {
   })
 
   it('keeps the executable harness on the pipe, UI-input, read-only-bridge boundary', async () => {
-    const [source, packageSource, workflowSource] = await Promise.all([
+    const [source, packageSource, workflowSource, rendererWorkspaceSource] = await Promise.all([
       readFile(resolve('scripts/verify-codex-subscription-provider-e2e.mjs'), 'utf8'),
       readFile(resolve('package.json'), 'utf8'),
       readFile(resolve('scripts/run-workflow.mjs'), 'utf8'),
+      readFile(resolve('src/renderer/src/CodexSubscriptionWorkspace.tsx'), 'utf8'),
     ])
     const packageManifest = JSON.parse(packageSource) as { scripts?: Record<string, string> }
     expect(source).toContain('--remote-debugging-pipe')
@@ -339,6 +391,12 @@ describe('authenticated Codex provider E2E contract', () => {
     expect(source).toContain('area <= 0')
     expect(source).toContain('requireViewport &&')
     expect(source).toContain('STREAMING_ASSISTANT_SELECTOR')
+    expect(source).toContain('observePostRestartConversationStability')
+    expect(source).toContain('const POST_RESTART_OBSERVATION_DELAY_MS = RENDERER_TERMINAL_POLL_INTERVAL_MS + 250')
+    expect(source).toContain('await delay(POST_RESTART_OBSERVATION_DELAY_MS)')
+    expect(source).toContain('while (observations.length < MIN_POST_RESTART_CONVERSATION_OBSERVATIONS)')
+    expect(source).not.toContain('noReplay')
+    expect(rendererWorkspaceSource).toContain('const ACCOUNT_POLL_MS = 4_000')
     expect(source).toContain('assertAuthJsonAbsent(await canonicalCodexHome(fixture.dataDirectory))')
     expect(source).toContain('resolve(dataDirectory, "codex-subscription", "home")')
     expect(source).not.toContain('assertAuthJsonAbsent(fixture.dataDirectory)')
@@ -374,6 +432,31 @@ describe('authenticated Codex provider E2E contract', () => {
     expect(packageManifest.scripts?.['verify:codex-subscription-provider:e2e'])
       .toBe('node scripts/verify-codex-subscription-provider-e2e.mjs')
     expect(workflowSource).not.toContain('verify:codex-subscription-provider:e2e')
+  })
+
+  it('documents every destructive prerequisite and the intentional nonzero cleanup-required result', async () => {
+    const [readme, implementationStatus] = await Promise.all([
+      readFile(resolve('README.md'), 'utf8'),
+      readFile(resolve('docs/implementation-status.md'), 'utf8'),
+    ])
+    for (const prerequisite of [
+      'exact clean checkout',
+      'Windows PowerShell and Windows UI Automation',
+      'working system browser and provider network',
+      'must initially report signed out',
+      'functional_passed_cleanup_required',
+      'exits with status 2',
+      'roll back or destroy the disposable environment',
+    ]) expect(readme).toContain(prerequisite)
+    for (const nonclaim of [
+      'establish a provider RPC count',
+      'not native-picker evidence',
+      'not cleanup-completion',
+      'not release-readiness',
+    ]) expect(readme).toContain(nonclaim)
+    expect(implementationStatus).toContain('exact clean `pnpm dist` candidate')
+    expect(implementationStatus).toContain('initially signed-out app-server account')
+    expect(implementationStatus).toContain('Functional success intentionally emits `cleanup_required`, exits 2')
   })
 
 })
@@ -531,4 +614,11 @@ function terminalTwoTurnConversation() {
   ]
   second.revision = 8
   return second
+}
+
+function restartObservations(snapshot: ReturnType<typeof terminalTwoTurnConversation>) {
+  return [0, 1, 2].map((index) => ({
+    snapshot: structuredClone(snapshot),
+    observedAtMonotonicMs: 10_000 + index * RENDERER_TERMINAL_POLL_INTERVAL_MS,
+  }))
 }

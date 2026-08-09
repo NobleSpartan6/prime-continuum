@@ -8,6 +8,8 @@ export const CHECKPOINT_ASSERTION: string
 export const CONFIRMATION_PHRASE: string
 export const MAX_CDP_MESSAGE_BYTES: number
 export const MAX_RECEIPT_BYTES: number
+export const RENDERER_TERMINAL_POLL_INTERVAL_MS: number
+export const MIN_POST_RESTART_CONVERSATION_OBSERVATIONS: number
 export const FAILURE_STAGES: readonly string[]
 export const FAILURE_CODES: readonly string[]
 
@@ -44,9 +46,19 @@ export function validateCompletedTurn(observations: unknown[]): Readonly<{ opera
 export function validateInterruptedTurn(active: unknown, terminal: unknown): Readonly<{ operationId: string; turnId: string }>
 export function validateElectronRestartRecovery(
   before: unknown,
-  after: unknown,
+  observations: Array<{
+    snapshot: unknown
+    observedAtMonotonicMs: number
+  }>,
   operationIds: string[],
-): Readonly<{ recovered: true; noReplay: true }>
+): Readonly<{
+  recovered: true
+  noAdditionalDurableAdmissionObserved: true
+  postRestartConversationObservationCount: number
+  minimumPostRestartObservationSeparationMs: number
+  rendererTerminalPollIntervalMs: number
+  rendererTerminalPollIntervalSizedObservationGapCount: number
+}>
 
 export class NullDelimitedCdpDecoder {
   constructor(maxMessageBytes?: number)

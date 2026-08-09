@@ -15,6 +15,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { stdin, stderr, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -22,8 +23,10 @@ import { extractFile, statFile, uncache } from "@electron/asar";
 import {
   CHECKPOINT_ASSERTION,
   CONFIRMATION_PHRASE,
+  MIN_POST_RESTART_CONVERSATION_OBSERVATIONS,
   NullDelimitedCdpDecoder,
   ProviderE2eContractError,
+  RENDERER_TERMINAL_POLL_INTERVAL_MS,
   assertAccountPhase,
   assertInitiallySignedOut,
   assertInteractiveAdmission,
@@ -62,6 +65,7 @@ const RENDERER_READY_TIMEOUT_MS = 180_000;
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
 const RESTART_TIMEOUT_MS = 180_000;
+const POST_RESTART_OBSERVATION_DELAY_MS = RENDERER_TERMINAL_POLL_INTERVAL_MS + 250;
 const MAX_AUTH_SCAN_ENTRIES = 20_000;
 const UIA_CLOSE_HELPER_SOURCE = String.raw`
 using System;
@@ -332,9 +336,14 @@ try {
     (conversation) => conversation?.latestTurn?.terminal === true,
     RESTART_TIMEOUT_MS,
   );
-  validateElectronRestartRecovery(
-    interruptedConversation,
+  const postRestartConversationObservations = await observePostRestartConversationStability(
+    controller,
+    fixture.binding,
     restartedConversation,
+  );
+  const restartRecovery = validateElectronRestartRecovery(
+    interruptedConversation,
+    postRestartConversationObservations,
     [completedIdentity.operationId, interruptedIdentity.operationId],
   );
   await controller.waitForExactVisibleCount(USER_MESSAGE_SELECTOR, 2, 30_000);
@@ -379,8 +388,13 @@ try {
     completedTurnExactIdentity: true,
     interruptedTurnRenderedUserItem: true,
     interruptedTurnExactIdentity: true,
-    desktopRestartRecovered: true,
-    noReplay: true,
+    desktopRestartRecovered: restartRecovery.recovered,
+    noAdditionalDurableAdmissionObserved: restartRecovery.noAdditionalDurableAdmissionObserved,
+    postRestartConversationObservationCount: restartRecovery.postRestartConversationObservationCount,
+    minimumPostRestartObservationSeparationMs: restartRecovery.minimumPostRestartObservationSeparationMs,
+    rendererTerminalPollIntervalMs: restartRecovery.rendererTerminalPollIntervalMs,
+    rendererTerminalPollIntervalSizedObservationGapCount:
+      restartRecovery.rendererTerminalPollIntervalSizedObservationGapCount,
     restartSignedIn: true,
     loggedOut: true,
     authJsonAbsent: true,
@@ -1198,6 +1212,22 @@ async function waitForConversation(controller, binding, predicate, timeoutMs) {
     await delay(75);
   }
   fail(currentStage, currentStage === "interrupted_turn" ? "INTERRUPT_NOT_PROVEN" : "RECOVERY_NOT_PROVEN");
+}
+
+async function observePostRestartConversationStability(controller, binding, initialSnapshot) {
+  const observations = [{
+    snapshot: initialSnapshot,
+    observedAtMonotonicMs: Math.floor(performance.now()),
+  }];
+  while (observations.length < MIN_POST_RESTART_CONVERSATION_OBSERVATIONS) {
+    await delay(POST_RESTART_OBSERVATION_DELAY_MS);
+    const snapshot = await controller.conversationSnapshot(binding);
+    observations.push({
+      snapshot,
+      observedAtMonotonicMs: Math.floor(performance.now()),
+    });
+  }
+  return observations;
 }
 
 async function observeCompletedTurn(controller, binding) {
