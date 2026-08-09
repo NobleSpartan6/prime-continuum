@@ -15,6 +15,7 @@ const rendererEntry = join(rendererRoot, 'index.html')
 const outputDirectory = join(repositoryRoot, 'out', 'visual-qa')
 const resultPath = join(outputDirectory, 'capture-result.json')
 const errorPath = join(outputDirectory, 'capture-error.txt')
+const visualQaUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1'
 const targets = [
   {
     name: 'desktop-idle',
@@ -244,9 +245,7 @@ async function capture(target, rendererOrigin) {
   })
   try {
     browserWindow.setContentSize(target.width, target.height, false)
-    browserWindow.webContents.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1',
-    )
+    browserWindow.webContents.setUserAgent(visualQaUserAgent)
     const rendererUrl = new URL('/', rendererOrigin)
     if (target.visualState) rendererUrl.searchParams.set('visualState', target.visualState)
     if (target.surface) rendererUrl.searchParams.set('surface', target.surface)

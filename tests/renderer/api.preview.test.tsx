@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createPreviewRendererApi } from '../../src/renderer/src/api'
+import {
+  createPreviewRendererApi,
+  INTERNAL_VISUAL_QA_USER_AGENT,
+  isInternalVisualQaRequest,
+} from '../../src/renderer/src/api'
 import {
   CandidateEvaluationPreflightSchema,
   CandidateEvaluationSnapshotSchema,
@@ -16,6 +20,20 @@ describe('browser preview evidence labels', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('admits the internal visual fixture only for the exact loopback request and user agent', () => {
+    const exact = {
+      protocol: 'http:',
+      hostname: '127.0.0.1',
+      userAgent: INTERNAL_VISUAL_QA_USER_AGENT,
+      search: '?visualState=candidate-evaluation-review',
+    }
+    expect(isInternalVisualQaRequest(exact)).toBe(true)
+    expect(isInternalVisualQaRequest({ ...exact, userAgent: `${INTERNAL_VISUAL_QA_USER_AGENT} suffix` })).toBe(false)
+    expect(isInternalVisualQaRequest({ ...exact, userAgent: `prefix ${INTERNAL_VISUAL_QA_USER_AGENT}` })).toBe(false)
+    expect(isInternalVisualQaRequest({ ...exact, hostname: 'localhost' })).toBe(false)
+    expect(isInternalVisualQaRequest({ ...exact, search: '' })).toBe(false)
   })
 
   it('labels checkpoint fixtures and every simulated command receipt as preview-only', async () => {

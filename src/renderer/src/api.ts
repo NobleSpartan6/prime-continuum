@@ -5751,14 +5751,29 @@ export class NativeRendererApi implements RendererApi {
 
 let singletonApi: RendererApi | undefined
 
+export const INTERNAL_VISUAL_QA_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1'
+
+export function isInternalVisualQaRequest(input: {
+  protocol: string
+  hostname: string
+  userAgent: string
+  search: string
+}): boolean {
+  return input.protocol === 'http:' &&
+    input.hostname === '127.0.0.1' &&
+    input.userAgent === INTERNAL_VISUAL_QA_USER_AGENT &&
+    new URLSearchParams(input.search).has('visualState')
+}
+
 export function createRendererApi(options: { allowConnectionInitiation?: boolean } = {}): RendererApi {
   if (!singletonApi) {
     const nativeBridge = Reflect.get(window, 'prime') as NativePrimeBridge | undefined
-    const search = new URLSearchParams(window.location.search)
-    const internalVisualQa = window.location.protocol === 'http:' &&
-      window.location.hostname === '127.0.0.1' &&
-      window.navigator.userAgent.includes('PrimeContinuimVisualQA/1') &&
-      search.has('visualState')
+    const internalVisualQa = isInternalVisualQaRequest({
+      protocol: window.location.protocol,
+      hostname: window.location.hostname,
+      userAgent: window.navigator.userAgent,
+      search: window.location.search,
+    })
     if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge, options)
     else if (internalVisualQa) singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
     else throw new Error('Prime Continuim requires its desktop control bridge. Close this window and reopen the installed desktop app.')

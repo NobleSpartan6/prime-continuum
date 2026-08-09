@@ -786,8 +786,10 @@ export function describeToolchainSentinelMetadata(metadata) {
   return {
     ...identity,
     size: metadata.size,
+    // Cloud hydration and antivirus scans can advance NTFS change-time while
+    // preserving the exact file. Size/mtime/inode catch replacement during a
+    // step; the final toolchain inspection independently rehashes all bytes.
     mtimeMs: Math.trunc(metadata.mtimeMs),
-    ctimeMs: Math.trunc(metadata.ctimeMs),
   }
 }
 

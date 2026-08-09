@@ -62,7 +62,11 @@ describe('Prime Continuim self-build evidence', () => {
       .not.toEqual(describeToolchainSentinelMetadata(directory))
 
     const file = { ...directory, isDirectory: () => false, isFile: () => true }
+    expect(describeToolchainSentinelMetadata({ ...file, ctimeMs: 600 }))
+      .toEqual(describeToolchainSentinelMetadata(file))
     expect(describeToolchainSentinelMetadata({ ...file, mtimeMs: 500 }))
+      .not.toEqual(describeToolchainSentinelMetadata(file))
+    expect(describeToolchainSentinelMetadata({ ...file, ino: 5 }))
       .not.toEqual(describeToolchainSentinelMetadata(file))
   })
 
