@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import {
   CODEX_SUBSCRIPTION_BACKEND_ID,
   CODEX_SUBSCRIPTION_BACKEND_LABEL,
@@ -1895,7 +1895,7 @@ function validateEffectiveConfig(
     !sameJson(Object.keys(system.name).sort(), ["file", "type"]) ||
     system.name.type !== "system" ||
     typeof system.name.file !== "string" ||
-    !isAbsolute(system.name.file) ||
+    !win32.isAbsolute(system.name.file) ||
     /[\0\r\n]/.test(system.name.file) ||
     typeof system.version !== "string" ||
     !/^sha256:[a-f0-9]{64}$/.test(system.version) ||

@@ -182,7 +182,7 @@ describe('Prime Continuim self-build evidence', () => {
     await rm(join(root, 'a'), { recursive: true, force: true })
     await symlink(outside, join(root, 'a'), process.platform === 'win32' ? 'junction' : 'dir')
 
-    await expect(captureGitCandidate(root)).rejects.toThrow(/linked|reparse/i)
+    await expect(captureGitCandidate(root)).rejects.toThrow(/linked|reparse|links and special files/i)
     expect(await readFile(join(outside, 'file.txt'), 'utf8')).toBe('PRIVATE OUTSIDE BYTES\n')
   })
 

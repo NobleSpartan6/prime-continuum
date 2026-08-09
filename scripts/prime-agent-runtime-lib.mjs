@@ -26,6 +26,7 @@ import {
   resolve,
   sep,
   extname,
+  win32,
 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
@@ -1192,7 +1193,7 @@ export async function smokeCodexAppServerCompanion(runtimeDirectory, options = {
     const canonicalTemporaryDirectory = await realpath(temporaryDirectory);
     await assertCodexHomePolicy(canonicalCodexHome, { requireEmpty: true });
     const environment = createCodexAppServerEnvironment(options.environment ?? process.env, {
-      codexHome,
+      codexHome: canonicalCodexHome,
       companionDirectory: dirname(dirname(executablePath)),
       temporaryDirectory: canonicalTemporaryDirectory,
     });
@@ -2465,7 +2466,7 @@ function validateCodexAppServerConfigRead(result, codexHome) {
     !hasExactObjectKeys(systemLayer.name, ["type", "file"]) ||
     systemLayer.name.type !== "system" ||
     typeof systemLayer.name.file !== "string" ||
-    !isAbsolute(systemLayer.name.file) ||
+    !win32.isAbsolute(systemLayer.name.file) ||
     /[\0\r\n]/.test(systemLayer.name.file) ||
     !/^sha256:[0-9a-f]{64}$/.test(systemLayer.version) ||
     !jsonEqual(systemLayer.config, {})

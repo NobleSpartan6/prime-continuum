@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { realpathSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import {
   mkdir,
@@ -216,6 +217,34 @@ describe("Codex app-server signed-out protocol smoke", () => {
     });
   });
 
+  it.runIf(process.platform !== "win32")(
+    "passes the canonical private home to the app-server environment through a temporary-directory alias",
+    async () => {
+      const root = await companionFixture();
+      const aliasedRoot = await temporaryDirectory("prime-codex-smoke-aliased-temp-");
+      const physicalTemporary = join(aliasedRoot, "physical");
+      const aliasedTemporary = join(aliasedRoot, "alias");
+      await mkdir(physicalTemporary);
+      await symlink(physicalTemporary, aliasedTemporary, "dir");
+      const spawn = scriptedSpawn();
+      const spawnImpl: ReturnType<typeof scriptedSpawn> = (executable, args, options) => {
+        const launchedCodexHome = options.env.CODEX_HOME;
+        if (!launchedCodexHome) throw new Error("Codex smoke fixture launched without CODEX_HOME");
+        expect(launchedCodexHome).toBe(realpathSync(launchedCodexHome));
+        return spawn(executable, args, options);
+      };
+      const previousTemporary = process.env.TMPDIR;
+      process.env.TMPDIR = aliasedTemporary;
+      try {
+        await expect(smokeCodexAppServerCompanion(root, smokeOptions(spawnImpl)))
+          .resolves.toMatchObject({ initialize: true, accountReadSignedOut: true });
+      } finally {
+        if (previousTemporary === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previousTemporary;
+      }
+    },
+  );
+
   it("rejects unknown response ids and confirms failed-process teardown", async () => {
     const root = await companionFixture();
     const spawnImpl = scriptedSpawn({
@@ -375,6 +404,7 @@ async function companionFixture(): Promise<string> {
 }
 
 function smokeOptions(spawnImpl: ReturnType<typeof scriptedSpawn>) {
+  const systemRoot = resolve("fixture-system-root");
   return {
     policy: {
       codexAppServer: {
@@ -386,6 +416,10 @@ function smokeOptions(spawnImpl: ReturnType<typeof scriptedSpawn>) {
     },
     platform: "win32",
     arch: "x64",
+    environment: {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+    },
     spawnImpl,
     timeoutMs: 500,
     teardownTimeoutMs: 50,

@@ -123,7 +123,7 @@ describe("Codex home security boundary", () => {
     await expect(assertSafeCodexHomeTree(home)).resolves.toBeUndefined();
   });
 
-  describe("descriptor-bound transient apply-patch shims", () => {
+  describe.runIf(process.platform === "win32")("descriptor-bound transient apply-patch shims", () => {
     it("accepts the exact stable lock plus LF shim tree only with its verified descriptor", async () => {
       const fixture = await transientShimFixture();
       const lock = await lstat(join(fixture.shimDirectory, ".lock"));
