@@ -121,6 +121,10 @@ interface CommandResult {
   readonly stderr: Uint8Array;
 }
 
+interface VerifiedTrusteeAliases {
+  readonly localAdministratorSid: string;
+}
+
 export interface CodexHomeSecurityCommandRunner {
   run(executable: string, args: readonly string[], stdin?: Uint8Array): Promise<CommandResult>;
 }
@@ -198,7 +202,7 @@ export class WindowsCodexHomeSecurityProvider implements CodexHomeSecurityProvid
       // Never silently repair an existing credential tree. A weak ACL means
       // encrypted credentials may already have been disclosed, so capability
       // admission must fail before reading content or changing permissions.
-      await this.verifyDacl(cacls, canonicalPrivateRoot, currentUserSid);
+      await this.verifyDacl(icacls, cacls, canonicalPrivateRoot, currentUserSid);
     } else {
       if (
         JSON.stringify((await readdir(canonicalPrivateRoot)).sort()) !== JSON.stringify(["home", "private-temp"]) ||
@@ -243,6 +247,7 @@ export class WindowsCodexHomeSecurityProvider implements CodexHomeSecurityProvid
     // Post-operation checks are observation-only. Permission drift is a
     // terminal credential-custody failure, not something to heal after use.
     await this.verifyDacl(
+      this.systemTool("icacls.exe"),
       this.systemTool("cacls.exe"),
       resolve(paths.canonicalHostDataRoot, "codex-subscription"),
       parsed.currentUserSid,
@@ -304,10 +309,11 @@ export class WindowsCodexHomeSecurityProvider implements CodexHomeSecurityProvid
       [directory, "/t", `/s:${protectedDacl(currentUserSid)}`],
       Buffer.from("Y\r\n", "ascii"),
     );
-    await this.verifyDacl(cacls, directory, currentUserSid);
+    await this.verifyDacl(icacls, cacls, directory, currentUserSid);
   }
 
   private async verifyDacl(
+    icacls: string,
     cacls: string,
     directory: string,
     currentUserSid: string,
@@ -317,15 +323,41 @@ export class WindowsCodexHomeSecurityProvider implements CodexHomeSecurityProvid
     const rootOutput = Buffer.from(rootResult.stdout).toString("ascii");
     const result = await this.runRequired(cacls, [directory, "/t", "/s"]);
     const output = Buffer.from(result.stdout).toString("ascii");
+    const aliases = await this.verifyRootTrusteeAliases(
+      icacls,
+      directory,
+      currentUserSid,
+      rootOutput,
+    );
     if (
-      !containsOneExactProtectedCodexHomeDacl(rootOutput, currentUserSid) ||
-      !areAllSecureCodexHomeDacls(output, currentUserSid, expectedEntryCount)
+      !containsOneExactProtectedCodexHomeDacl(rootOutput, currentUserSid, aliases) ||
+      !areAllSecureCodexHomeDaclsWithAliases(output, currentUserSid, expectedEntryCount, aliases)
     ) {
       throw new CodexHomeSecurityError(
         "CODEX_HOME_ACL_INVALID",
         "CODEX_HOME entries do not have the required protected Windows DACL",
       );
     }
+  }
+
+  private async verifyRootTrusteeAliases(
+    icacls: string,
+    directory: string,
+    currentUserSid: string,
+    rootOutput: string,
+  ): Promise<VerifiedTrusteeAliases | undefined> {
+    if (!containsTrusteeAlias(rootOutput, "LA") || !isLocalAdministratorRid(currentUserSid)) {
+      return undefined;
+    }
+    const result = await this.runRequired(
+      icacls,
+      [directory, "/findsid", `*${currentUserSid}`, "/Q"],
+    );
+    // `LA` is relative to the local machine account domain. A RID-500 suffix
+    // alone cannot prove that the current account is this machine's local
+    // Administrator, so an exact binary-DACL match on this root is required.
+    if (!containsExactFindSidRootMatch(result.stdout, directory)) return undefined;
+    return Object.freeze({ localAdministratorSid: currentUserSid });
   }
 
   private async runRequired(
@@ -626,6 +658,14 @@ export async function assertPlainPrivateTree(root: string): Promise<void> {
 }
 
 export function isExactProtectedCodexHomeDacl(sddl: string, currentUserSid: string): boolean {
+  return isExactProtectedCodexHomeDaclWithAliases(sddl, currentUserSid);
+}
+
+function isExactProtectedCodexHomeDaclWithAliases(
+  sddl: string,
+  currentUserSid: string,
+  aliases?: VerifiedTrusteeAliases,
+): boolean {
   if (!isUserSid(currentUserSid)) return false;
   const parsed = parseDacl(sddl);
   if (!parsed || !hasExactDaclFlags(parsed.flags, "protected")) return false;
@@ -642,7 +682,7 @@ export function isExactProtectedCodexHomeDacl(sddl: string, currentUserSid: stri
     ) {
       return false;
     }
-    const trustee = canonicalTrustee(fields[5]!);
+    const trustee = canonicalTrustee(fields[5]!, aliases);
     trustees.add(trustee);
   }
   return trustees.size === 3 && trustees.has(currentUserSid) && trustees.has(SYSTEM_SID) &&
@@ -659,7 +699,7 @@ export function areAllExactProtectedCodexHomeDacls(
   }
   const dacls = extractDacls(output);
   return dacls.length === expectedEntryCount &&
-    dacls.every((dacl) => isExactProtectedCodexHomeDacl(dacl, currentUserSid));
+    dacls.every((dacl) => isExactProtectedCodexHomeDaclWithAliases(dacl, currentUserSid));
 }
 
 /**
@@ -668,6 +708,14 @@ export function areAllExactProtectedCodexHomeDacls(
  * partial access, inherit-only ACE, or explicit broad grant is accepted.
  */
 export function isSecureInheritedCodexHomeDacl(sddl: string, currentUserSid: string): boolean {
+  return isSecureInheritedCodexHomeDaclWithAliases(sddl, currentUserSid);
+}
+
+function isSecureInheritedCodexHomeDaclWithAliases(
+  sddl: string,
+  currentUserSid: string,
+  aliases?: VerifiedTrusteeAliases,
+): boolean {
   if (!isUserSid(currentUserSid)) return false;
   const parsed = parseDacl(sddl);
   if (!parsed || !hasExactDaclFlags(parsed.flags, "inherited")) return false;
@@ -690,7 +738,7 @@ export function isSecureInheritedCodexHomeDacl(sddl: string, currentUserSid: str
     if (!observedInheritanceKind) return false;
     if (inheritanceKind && inheritanceKind !== observedInheritanceKind) return false;
     inheritanceKind = observedInheritanceKind;
-    const trustee = canonicalTrustee(fields[5]!);
+    const trustee = canonicalTrustee(fields[5]!, aliases);
     trustees.add(trustee);
   }
   return trustees.size === 3 && trustees.has(currentUserSid) && trustees.has(SYSTEM_SID) &&
@@ -702,18 +750,32 @@ export function areAllSecureCodexHomeDacls(
   currentUserSid: string,
   expectedEntryCount: number,
 ): boolean {
+  return areAllSecureCodexHomeDaclsWithAliases(output, currentUserSid, expectedEntryCount);
+}
+
+function areAllSecureCodexHomeDaclsWithAliases(
+  output: string,
+  currentUserSid: string,
+  expectedEntryCount: number,
+  aliases?: VerifiedTrusteeAliases,
+): boolean {
   if (!Number.isSafeInteger(expectedEntryCount) || expectedEntryCount < 1 || expectedEntryCount > MAX_HOME_ENTRIES + 1) {
     return false;
   }
   const dacls = extractDacls(output);
   return dacls.length === expectedEntryCount && dacls.every((dacl) =>
-    isExactProtectedCodexHomeDacl(dacl, currentUserSid) ||
-    isSecureInheritedCodexHomeDacl(dacl, currentUserSid));
+    isExactProtectedCodexHomeDaclWithAliases(dacl, currentUserSid, aliases) ||
+    isSecureInheritedCodexHomeDaclWithAliases(dacl, currentUserSid, aliases));
 }
 
-function containsOneExactProtectedCodexHomeDacl(output: string, currentUserSid: string): boolean {
+function containsOneExactProtectedCodexHomeDacl(
+  output: string,
+  currentUserSid: string,
+  aliases?: VerifiedTrusteeAliases,
+): boolean {
   const dacls = extractDacls(output);
-  return dacls.length === 1 && isExactProtectedCodexHomeDacl(dacls[0]!, currentUserSid);
+  return dacls.length === 1 &&
+    isExactProtectedCodexHomeDaclWithAliases(dacls[0]!, currentUserSid, aliases);
 }
 
 function parseDacl(sddl: string): Readonly<{ flags: string; body: string }> | undefined {
@@ -746,10 +808,28 @@ function isFileFullControl(rights: string): boolean {
   return Number.parseInt(rights.slice(2), 16) === 0x001f01ff;
 }
 
-function canonicalTrustee(value: string): string {
+function canonicalTrustee(value: string, aliases?: VerifiedTrusteeAliases): string {
   if (value === "SY") return SYSTEM_SID;
   if (value === "BA") return ADMINISTRATORS_SID;
+  if (value === "LA" && aliases) return aliases.localAdministratorSid;
   return value;
+}
+
+function containsTrusteeAlias(output: string, alias: string): boolean {
+  return extractDacls(output).some((dacl) => {
+    const aces = dacl.match(/\([^()]+\)/g) ?? [];
+    return aces.some((ace) => {
+      const fields = ace.slice(1, -1).split(";");
+      return fields.length === 6 && fields[5] === alias;
+    });
+  });
+}
+
+function containsExactFindSidRootMatch(stdout: Uint8Array, directory: string): boolean {
+  const expectedLine = `SID Found: ${directory.replaceAll("/", "\\")}.`;
+  const lines = Buffer.from(stdout).toString("ascii").split(/\r?\n/);
+  const matchLines = lines.filter((line) => line.startsWith("SID Found: "));
+  return matchLines.length === 1 && matchLines[0] === expectedLine;
 }
 
 function extractDacls(output: string): string[] {
@@ -836,6 +916,10 @@ function isSafeName(value: string): boolean {
 
 function isUserSid(value: string): boolean {
   return /^S-1-5-21(?:-\d+){4}$/.test(value);
+}
+
+function isLocalAdministratorRid(value: string): boolean {
+  return isUserSid(value) && value.endsWith("-500");
 }
 
 async function pathExists(path: string): Promise<boolean> {

@@ -10,11 +10,13 @@ import {
   isExactProtectedCodexHomeDacl,
   isSecureInheritedCodexHomeDacl,
 } from "../../src/hostd/codex-home-security";
+import type { CodexHomeSecurityCommandRunner } from "../../src/hostd/codex-home-security";
 import { CodexSubscriptionStore } from "../../src/hostd/codex-subscription-store";
 import type { VerifiedCodexAppServerLaunchDescriptor } from "../../src/hostd/runtime-integrity-manager";
 import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 const USER_SID = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+const LOCAL_ADMIN_SID = "S-1-5-21-1111111111-2222222222-3333333333-500";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -72,6 +74,18 @@ describe("Codex home security boundary", () => {
       `D:P(D;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
       `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)`,
     ]) expect(isExactProtectedCodexHomeDacl(nearMiss, USER_SID)).toBe(false);
+    expect(isExactProtectedCodexHomeDacl(
+      "D:PAI(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+      LOCAL_ADMIN_SID,
+    )).toBe(false);
+    expect(isExactProtectedCodexHomeDacl(
+      "D:PAI(A;OICI;FA;;;LG)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+      "S-1-5-21-1111111111-2222222222-3333333333-501",
+    )).toBe(false);
+    expect(isSecureInheritedCodexHomeDacl(
+      "D:AI(A;OICIID;FA;;;LA)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)",
+      LOCAL_ADMIN_SID,
+    )).toBe(false);
     expect(isSecureInheritedCodexHomeDacl(
       `D:AI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
       USER_SID,
@@ -261,6 +275,83 @@ describe("Codex home security boundary", () => {
     });
   });
 
+  describe.runIf(process.platform === "win32")("local Administrator SDDL alias proof", () => {
+    it("accepts LA only after a pinned exact-SID lookup succeeds on the same root", async () => {
+      const fixture = await mockedAclBoundary(LOCAL_ADMIN_SID, "LA", "match");
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).resolves.toMatchObject({ currentUserSid: LOCAL_ADMIN_SID });
+
+      expect(fixture.findSidCalls()).toEqual([{
+        executable: join(process.env.SystemRoot!, "System32", "icacls.exe"),
+        args: [fixture.privateRoot, "/findsid", `*${LOCAL_ADMIN_SID}`, "/Q"],
+      }]);
+    });
+
+    it("fails closed when the exact RID-500 lookup command exits unsuccessfully", async () => {
+      const fixture = await mockedAclBoundary(LOCAL_ADMIN_SID, "LA", "exit_failure");
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).rejects.toMatchObject({ code: "CODEX_HOME_SECURITY_TOOL_FAILED" });
+      expect(fixture.findSidCalls()).toHaveLength(1);
+    });
+
+    it.each([
+      ["empty success", "empty_success"],
+      ["success without a match", "no_match_success"],
+      ["success naming a different root", "wrong_root"],
+      ["success naming both the exact and a different root", "ambiguous_match"],
+    ] as const)("rejects LA after %s output", async (_label, findSidResult) => {
+      const fixture = await mockedAclBoundary(LOCAL_ADMIN_SID, "LA", findSidResult);
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).rejects.toMatchObject({ code: "CODEX_HOME_ACL_INVALID" });
+      expect(fixture.findSidCalls()).toHaveLength(1);
+    });
+
+    it("never looks up or accepts LA for an ordinary user SID", async () => {
+      const fixture = await mockedAclBoundary(USER_SID, "LA", "match");
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).rejects.toMatchObject({ code: "CODEX_HOME_ACL_INVALID" });
+      expect(fixture.findSidCalls()).toEqual([]);
+    });
+
+    it("keeps the numeric ordinary-user path independent of alias lookup", async () => {
+      const fixture = await mockedAclBoundary(USER_SID, USER_SID, "exit_failure");
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).resolves.toMatchObject({ currentUserSid: USER_SID });
+      expect(fixture.findSidCalls()).toEqual([]);
+    });
+
+    it("does not invoke alias lookup for a numeric RID-500 trustee", async () => {
+      const fixture = await mockedAclBoundary(LOCAL_ADMIN_SID, LOCAL_ADMIN_SID, "exit_failure");
+
+      await expect(fixture.provider.prepareAndVerify(
+        fixture.root,
+        fixture.home,
+        fixture.privateTemporary,
+      )).resolves.toMatchObject({ currentUserSid: LOCAL_ADMIN_SID });
+      expect(fixture.findSidCalls()).toEqual([]);
+    });
+  });
+
   it.runIf(process.platform === "win32")(
     "keeps the protected boundary valid after the durable subscription store is initialized",
     async () => {
@@ -336,6 +427,73 @@ describe("Codex home security boundary", () => {
       .rejects.toMatchObject({ code: "CODEX_HOME_UNSUPPORTED" });
   });
 });
+
+async function mockedAclBoundary(
+  currentUserSid: string,
+  observedUserTrustee: string,
+  findSidResult: "match" | "exit_failure" | "empty_success" | "no_match_success" | "wrong_root" |
+    "ambiguous_match",
+) {
+  const root = await canonicalTemporaryDirectory("prime-codex-mocked-acl-");
+  temporaryDirectories.push(root);
+  const privateRoot = join(root, "codex-subscription");
+  const home = join(privateRoot, "home");
+  const privateTemporary = join(privateRoot, "private-temp");
+  const dacl = `D:PAI(A;OICI;FA;;;${observedUserTrustee})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`;
+  const inheritedDacl = `D:AI(A;OICIID;FA;;;${observedUserTrustee})` +
+    "(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)";
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  const commandRunner: CodexHomeSecurityCommandRunner = {
+    async run(executable, args) {
+      calls.push({ executable, args: [...args] });
+      const normalizedExecutable = executable.replaceAll("/", "\\").toLowerCase();
+      if (normalizedExecutable.endsWith("\\whoami.exe")) {
+        return commandResult(`"HOST\\fixture","${currentUserSid}"\r\n`);
+      }
+      if (normalizedExecutable.endsWith("\\cacls.exe")) {
+        if (args.length === 2 && args[1] === "/s") return commandResult(`root ${dacl}\r\n`);
+        if (args.length === 3 && args[1] === "/t" && args[2] === "/s") {
+          return commandResult(`root ${dacl}\r\nhome ${inheritedDacl}\r\ntemp ${inheritedDacl}\r\n`);
+        }
+      }
+      if (args[1] === "/findsid") {
+        if (findSidResult === "exit_failure") {
+          throw new Error("Exact SID lookup exited unsuccessfully");
+        }
+        if (findSidResult === "match") {
+          return commandResult(`SID Found: ${args[0]}.\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n`);
+        }
+        if (findSidResult === "no_match_success") {
+          return commandResult(
+            "No files with a matching SID was found\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n",
+          );
+        }
+        if (findSidResult === "wrong_root") {
+          return commandResult("SID Found: C:\\unrelated\\codex-subscription.\r\n");
+        }
+        if (findSidResult === "ambiguous_match") {
+          return commandResult(
+            `SID Found: ${args[0]}.\r\nSID Found: C:\\unrelated\\codex-subscription.\r\n`,
+          );
+        }
+        return commandResult("");
+      }
+      return commandResult("");
+    },
+  };
+  return Object.freeze({
+    root,
+    privateRoot,
+    home,
+    privateTemporary,
+    provider: new WindowsCodexHomeSecurityProvider({ commandRunner }),
+    findSidCalls: () => calls.filter(({ args }) => args[1] === "/findsid"),
+  });
+}
+
+function commandResult(stdout: string) {
+  return Object.freeze({ stdout: Buffer.from(stdout, "ascii"), stderr: Buffer.alloc(0) });
+}
 
 async function temporaryHome(): Promise<string> {
   const directory = await canonicalTemporaryDirectory("prime-codex-home-");
