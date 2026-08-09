@@ -28,6 +28,7 @@ const bridge: PrimeBridge = {
   planHostInstall: (input) => invoke(IPC.planHostInstall, input),
   installHost: (input) => invoke(IPC.installHost, input),
   connect: (input) => invoke(IPC.connect, input),
+  activateVerifiedSshHost: (input) => invoke(IPC.activateVerifiedSshHost, input),
   reconnect: () => invoke(IPC.reconnect),
   disconnect: () => invoke(IPC.disconnect),
   hostCatalog: () => invoke(IPC.hostCatalog),

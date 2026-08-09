@@ -1785,6 +1785,477 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('explicitly activates only the selected cached SSH host and preserves its exact thread generation', async () => {
+    const cachedCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:00:00.000Z')
+    const authoritativeCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:01:00.000Z')
+    const cachedSnapshot = recoverySnapshot(cachedCatalog.threads[0], 'Cached first thread.')
+    const authoritativeSnapshot = recoverySnapshot(authoritativeCatalog.threads[1], 'Fresh selected thread.')
+    const authoritativeSnapshotReply = deferred<unknown>()
+    const offlineConnection = {
+      phase: 'offline',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['prime_agent_commands_v2'],
+    }
+    const onlineConnection = {
+      ...offlineConnection,
+      phase: 'online',
+      since: '2026-08-05T20:01:00.000Z',
+      attempt: 2,
+    }
+    const cache = {
+      version: 3,
+      activeHostId: 'host-b',
+      entries: {
+        'host-b': {
+          hostId: 'host-b',
+          catalog: cachedCatalog,
+          lastSnapshot: cachedSnapshot,
+          updatedAt: '2026-08-05T20:00:01.000Z',
+        },
+      },
+    }
+    const bridge = {
+      bootstrap: vi.fn()
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: offlineConnection, appVersion: '0.1.0' }))
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: onlineConnection, appVersion: '0.1.0' })),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => ok(onlineConnection)),
+      hostCatalog: vi.fn(() => ok(authoritativeCatalog)),
+      requestSnapshot: vi.fn(() => authoritativeSnapshotReply.promise),
+      submitCommand: vi.fn(() => ok({ status: 'admitted', durable: true })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const cached = await api.loadWorkbench()
+    expect(cached.selectedThreadId).toBe('thread-one')
+    await Promise.resolve()
+    expect(bridge.connect).not.toHaveBeenCalled()
+
+    await api.selectThread('thread-two')
+    const activation = api.activateComputer('host-b')
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'thread-two' }))
+    expect(published.at(-1)?.operations.startResidentTurn).toBe(false)
+    authoritativeSnapshotReply.resolve(ok(authoritativeSnapshot))
+    const activated = await activation
+
+    expect(bridge.activateVerifiedSshHost).toHaveBeenCalledWith({ expectedHostId: 'host-b' })
+    expect(bridge.connect).not.toHaveBeenCalled()
+    expect(bridge.submitCommand).not.toHaveBeenCalled()
+    expect(activated.selectedThreadId).toBe('thread-two')
+    expect(activated.threads.find((thread) => thread.id === 'thread-two')).toMatchObject({
+      hostId: 'host-b',
+      executionGenerationId: 'generation-stable-thread-two',
+      transcript: [expect.objectContaining({ body: 'Fresh selected thread.' })],
+    })
+    expect(activated.operations.startResidentTurn).toBe(true)
+    unsubscribe()
+  })
+
+  it('rejects a cached SSH activation identity mismatch before refresh and keeps cached mutations read-only', async () => {
+    const cachedCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:00:00.000Z')
+    const cachedSnapshot = recoverySnapshot(cachedCatalog.threads[0], 'Cached transcript remains.')
+    const offlineConnection = {
+      phase: 'offline',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: {
+          version: 3,
+          activeHostId: 'host-b',
+          entries: {
+            'host-b': { hostId: 'host-b', catalog: cachedCatalog, lastSnapshot: cachedSnapshot },
+          },
+        },
+        outbox: [],
+        connection: offlineConnection,
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => ok({
+        phase: 'online',
+        target: { kind: 'ssh', alias: 'different-private-name' },
+        hostId: 'host-c',
+        path: 'ssh',
+        since: '2026-08-05T20:01:00.000Z',
+        attempt: 2,
+      })),
+      hostCatalog: vi.fn(),
+      requestSnapshot: vi.fn(),
+      submitCommand: vi.fn(),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const cached = await api.loadWorkbench()
+
+    await expect(api.activateComputer('host-b')).rejects.toBeInstanceOf(StaleHostAuthorityError)
+
+    expect(bridge.activateVerifiedSshHost).toHaveBeenCalledWith({ expectedHostId: 'host-b' })
+    expect(bridge.hostCatalog).not.toHaveBeenCalled()
+    expect(bridge.requestSnapshot).not.toHaveBeenCalled()
+    expect(bridge.submitCommand).not.toHaveBeenCalled()
+    expect(published.at(-1) ?? cached).toMatchObject({
+      selectedThreadId: 'thread-one',
+      operations: { submitCommands: false, startResidentTurn: false },
+    })
+    expect((published.at(-1) ?? cached).threads[0]?.transcript[0]?.body).toBe('Cached transcript remains.')
+    unsubscribe()
+  })
+
+  it('fails closed when the selected cached execution generation advanced before activation refresh', async () => {
+    const cachedCatalog = sshActivationCatalog('generation-cached', '2026-08-05T20:00:00.000Z')
+    const authoritativeCatalog = sshActivationCatalog('generation-advanced', '2026-08-05T20:01:00.000Z')
+    const cachedSnapshot = recoverySnapshot(cachedCatalog.threads[1], 'Cached selected generation.')
+    const advancedSnapshot = recoverySnapshot(authoritativeCatalog.threads[1], 'Advanced generation.')
+    const offlineConnection = {
+      phase: 'offline',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['prime_agent_commands_v2'],
+    }
+    const onlineConnection = { ...offlineConnection, phase: 'online', attempt: 2 }
+    const cache = {
+      version: 3,
+      activeHostId: 'host-b',
+      entries: {
+        'host-b': { hostId: 'host-b', catalog: cachedCatalog, lastSnapshot: cachedSnapshot },
+      },
+    }
+    const advancedCache = {
+      version: 3,
+      activeHostId: 'host-b',
+      entries: {
+        'host-b': {
+          hostId: 'host-b',
+          catalog: authoritativeCatalog,
+          lastSnapshot: advancedSnapshot,
+          updatedAt: '2026-08-05T20:01:01.000Z',
+        },
+      },
+    }
+    const bridge = {
+      bootstrap: vi.fn()
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: offlineConnection, appVersion: '0.1.0' }))
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: onlineConnection, appVersion: '0.1.0' }))
+        .mockImplementationOnce(() => ok({ cache: advancedCache, outbox: [], connection: onlineConnection, appVersion: '0.1.0' })),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => ok(onlineConnection)),
+      hostCatalog: vi.fn(() => ok(authoritativeCatalog)),
+      requestSnapshot: vi.fn(() => ok(advancedSnapshot)),
+      submitCommand: vi.fn(),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+
+    await expect(api.activateComputer('host-b')).rejects.toBeInstanceOf(StaleHostAuthorityError)
+
+    expect(bridge.requestSnapshot).toHaveBeenCalledWith({ threadId: 'thread-two' })
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-two')?.executionGenerationId)
+      .toBe('generation-advanced-thread-two')
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-b')?.activationRequired).toBe(true)
+    expect(published.at(-1)?.operations).toMatchObject({ submitCommands: false, startResidentTurn: false })
+    await expect(api.sendComposer({ threadId: 'thread-two', text: 'Do not replay this draft' }))
+      .resolves.toMatchObject({ state: 'rejected' })
+    expect(bridge.submitCommand).not.toHaveBeenCalled()
+
+    const retried = await api.activateComputer('host-b')
+    expect(bridge.activateVerifiedSshHost).toHaveBeenCalledTimes(2)
+    expect(retried.hosts.find((host) => host.id === 'host-b')?.activationRequired).toBeUndefined()
+    expect(retried.threads.find((thread) => thread.id === 'thread-two')?.executionGenerationId)
+      .toBe('generation-advanced-thread-two')
+    expect(retried.operations.startResidentTurn).toBe(true)
+    unsubscribe()
+  })
+
+  it('lets a newer native connection observation supersede a delayed cached-host activation reply', async () => {
+    const cachedCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:00:00.000Z')
+    const cachedSnapshot = recoverySnapshot(cachedCatalog.threads[0], 'Cached transcript remains.')
+    const activationReply = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: {
+          version: 3,
+          activeHostId: 'host-b',
+          entries: {
+            'host-b': { hostId: 'host-b', catalog: cachedCatalog, lastSnapshot: cachedSnapshot },
+          },
+        },
+        outbox: [],
+        connection: {
+          phase: 'offline',
+          target: { kind: 'ssh', alias: 'private-config-name' },
+          hostId: 'host-b',
+          path: 'ssh',
+          since: '2026-08-05T20:00:00.000Z',
+          attempt: 1,
+        },
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => activationReply.promise),
+      hostCatalog: vi.fn(),
+      requestSnapshot: vi.fn(),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+    const activating = api.activateComputer('host-b')
+    await vi.waitFor(() => expect(bridge.activateVerifiedSshHost).toHaveBeenCalledOnce())
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'local' },
+      since: '2026-08-05T20:01:00.000Z',
+      attempt: 2,
+    })
+    activationReply.resolve(ok({
+      phase: 'online',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:00:30.000Z',
+      attempt: 2,
+    }))
+
+    await expect(activating).rejects.toBeInstanceOf(StaleHostAuthorityError)
+    expect(bridge.hostCatalog).not.toHaveBeenCalled()
+    expect(bridge.requestSnapshot).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('restores the unchanged prior online authority when activation fails before observing a replacement', async () => {
+    const fixture = twoHostActivationCache()
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        connection: fixture.connectionA,
+        appVersion: '0.1.0',
+      })),
+      activateVerifiedSshHost: vi.fn(() => Promise.resolve({
+        ok: false as const,
+        error: {
+          code: 'ssh.verified_host_binding_required',
+          message: 'This computer has no previously verified configured SSH binding. Add it again before connecting.',
+        },
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalogA)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshotA)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalled())
+    await api.selectThread('thread-b')
+
+    await expect(api.activateComputer('host-b')).rejects.toThrow(/Add it again before connecting/)
+    await api.selectThread('thread-a')
+
+    expect(published.at(-1)?.selectedThreadId).toBe('thread-a')
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-a')?.connection).toBe('online')
+    expect(published.at(-1)?.operations.submitCommands).toBe(true)
+    expect(published.at(-1)?.hosts.some((host) => host.activationRequired)).toBe(false)
+    unsubscribe()
+  })
+
+  it('observes an exact activation reply but never overwrites a newer user thread selection', async () => {
+    const fixture = twoHostActivationCache()
+    const activationReply = deferred<unknown>()
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        connection: fixture.connectionA,
+        appVersion: '0.1.0',
+      })),
+      activateVerifiedSshHost: vi.fn(() => activationReply.promise),
+      hostCatalog: vi.fn(() => ok(fixture.catalogA)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshotA)),
+      submitCommand: vi.fn(),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    await vi.waitFor(() => expect(bridge.requestSnapshot).toHaveBeenCalled())
+    await api.selectThread('thread-b')
+    const activating = api.activateComputer('host-b')
+    await vi.waitFor(() => expect(bridge.activateVerifiedSshHost).toHaveBeenCalledOnce())
+
+    await api.selectThread('thread-a')
+    activationReply.resolve(ok(fixture.connectionB))
+    await expect(activating).rejects.toBeInstanceOf(StaleHostAuthorityError)
+
+    expect(published.at(-1)?.selectedThreadId).toBe('thread-a')
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-a')?.transcript[0]?.body)
+      .toBe('Authoritative A transcript.')
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-b')).toMatchObject({
+      connection: 'online',
+      activationRequired: true,
+    })
+    expect(published.at(-1)?.operations).toMatchObject({ submitCommands: false, startResidentTurn: false })
+    expect(bridge.submitCommand).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('does not let delayed activation bootstrap replace a thread selected after the exact reply', async () => {
+    const catalog = sshActivationCatalog('generation-stable', '2026-08-05T20:00:00.000Z')
+    const firstSnapshot = recoverySnapshot(catalog.threads[0], 'Cached first thread.')
+    const secondSnapshot = recoverySnapshot(catalog.threads[1], 'Selected second thread.')
+    const offlineConnection = {
+      phase: 'offline',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['prime_agent_commands_v2'],
+    }
+    const onlineConnection = { ...offlineConnection, phase: 'online', attempt: 2 }
+    const cache = {
+      version: 3,
+      activeHostId: 'host-b',
+      entries: {
+        'host-b': { hostId: 'host-b', catalog, lastSnapshot: firstSnapshot },
+      },
+    }
+    const delayedBootstrap = deferred<unknown>()
+    const bridge = {
+      bootstrap: vi.fn()
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: offlineConnection, appVersion: '0.1.0' }))
+        .mockImplementationOnce(() => delayedBootstrap.promise),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => ok(onlineConnection)),
+      hostCatalog: vi.fn(),
+      requestSnapshot: vi.fn((input: { threadId: string }) =>
+        input.threadId === 'thread-two' ? ok(secondSnapshot) : ok(firstSnapshot),
+      ),
+      submitCommand: vi.fn(),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+    const activating = api.activateComputer('host-b')
+    await vi.waitFor(() => expect(bridge.bootstrap).toHaveBeenCalledTimes(2))
+
+    await api.selectThread('thread-two')
+    expect(published.at(-1)?.selectedThreadId).toBe('thread-two')
+    const afterSelection = published.length
+    delayedBootstrap.resolve(ok({ cache, outbox: [], connection: onlineConnection, appVersion: '0.1.0' }))
+    await expect(activating).rejects.toBeInstanceOf(StaleHostAuthorityError)
+
+    expect(published.slice(afterSelection).every((snapshot) => snapshot.selectedThreadId === 'thread-two')).toBe(true)
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-two')?.transcript[0]?.body)
+      .toBe('Selected second thread.')
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-b')?.activationRequired).toBe(true)
+    expect(published.at(-1)?.operations).toMatchObject({ submitCommands: false, startResidentTurn: false })
+    expect(bridge.hostCatalog).not.toHaveBeenCalled()
+    await expect(api.sendComposer({ threadId: 'thread-two', text: 'Never replay this draft' }))
+      .resolves.toMatchObject({ state: 'rejected' })
+    expect(bridge.submitCommand).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('does not treat a rejected regressed catalog as fresh activation proof', async () => {
+    const cachedCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:02:00.000Z')
+    const regressedCatalog = sshActivationCatalog('generation-stable', '2026-08-05T20:01:00.000Z')
+    const cachedSnapshot = recoverySnapshot(cachedCatalog.threads[0], 'Cached transcript only.')
+    const onlineConnection = {
+      phase: 'online',
+      target: { kind: 'ssh', alias: 'private-config-name' },
+      hostId: 'host-b',
+      path: 'ssh',
+      since: '2026-08-05T20:03:00.000Z',
+      attempt: 2,
+      capabilities: ['prime_agent_commands_v2'],
+    }
+    const cache = {
+      version: 3,
+      activeHostId: 'host-b',
+      entries: {
+        'host-b': { hostId: 'host-b', catalog: cachedCatalog, lastSnapshot: cachedSnapshot },
+      },
+    }
+    const bridge = {
+      bootstrap: vi.fn()
+        .mockImplementationOnce(() => ok({
+          cache,
+          outbox: [],
+          connection: { ...onlineConnection, phase: 'offline', attempt: 1 },
+          appVersion: '0.1.0',
+        }))
+        .mockImplementationOnce(() => ok({ cache, outbox: [], connection: onlineConnection, appVersion: '0.1.0' })),
+      connect: vi.fn(),
+      activateVerifiedSshHost: vi.fn(() => ok(onlineConnection)),
+      hostCatalog: vi.fn(() => ok(regressedCatalog)),
+      requestSnapshot: vi.fn(() => ok(cachedSnapshot)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+
+    await expect(api.activateComputer('host-b')).rejects.toBeInstanceOf(StaleHostAuthorityError)
+
+    expect(bridge.hostCatalog).toHaveBeenCalledOnce()
+    expect(bridge.requestSnapshot).not.toHaveBeenCalled()
+    expect(published.at(-1)?.hosts.find((host) => host.id === 'host-b')?.activationRequired).toBe(true)
+    expect(published.at(-1)?.operations).toMatchObject({ submitCommands: false, startResidentTurn: false })
+    unsubscribe()
+  })
+
   it('projects fresh local setup only from exact live runtime and local lifecycle authority', async () => {
     const readyRuntime = (hostId = 'host-local') => ({
       kind: 'reported',
@@ -3776,4 +4247,82 @@ function singleHostCatalog(hostId: string, displayName: string, threadId: string
     },
   }
   return { ...base, hosts: undefined, host, projects: [project], threads: [thread] }
+}
+
+function sshActivationCatalog(generationPrefix: string, generatedAt: string) {
+  const base = recoveryCatalog()
+  const host = {
+    ...base.hosts[1],
+    hostId: 'host-b',
+    displayName: 'Build computer',
+    kind: 'ssh',
+    reachability: 'online',
+    connectionPaths: [{ kind: 'ssh', priority: 0, state: 'available', latencyMs: 18 }],
+  }
+  const project = {
+    ...base.projects[0],
+    projectId: 'project-b',
+    hostId: 'host-b',
+    workspaceId: 'workspace-b',
+  }
+  const threads = base.threads.map((thread) => ({
+    ...thread,
+    projectIdentity: 'project-b',
+    updatedAt: generatedAt,
+    currentLocation: {
+      hostId: 'host-b',
+      projectId: 'project-b',
+      workspaceId: 'workspace-b',
+      executionGenerationId: `${generationPrefix}-${thread.threadId}`,
+    },
+  }))
+  return {
+    snapshotVersion: 1,
+    generatedAt,
+    host,
+    projects: [project],
+    threads,
+  }
+}
+
+function twoHostActivationCache() {
+  const catalogA = singleHostCatalog('host-a', 'Host A', 'thread-a', 'project-a')
+  const baseB = singleHostCatalog('host-b', 'Host B', 'thread-b', 'project-b')
+  const catalogB = {
+    ...baseB,
+    host: {
+      ...baseB.host,
+      kind: 'ssh',
+      connectionPaths: [{ kind: 'ssh', priority: 0, state: 'available', latencyMs: 20 }],
+    },
+  }
+  const snapshotA = recoverySnapshot(catalogA.threads[0], 'Authoritative A transcript.')
+  const snapshotB = recoverySnapshot(catalogB.threads[0], 'Cached B transcript.')
+  const connectionA = {
+    phase: 'online',
+    target: { kind: 'local' },
+    hostId: 'host-a',
+    path: 'local_socket',
+    since: '2026-08-05T20:00:00.000Z',
+    attempt: 1,
+    capabilities: ['prime_agent_commands_v2'],
+  }
+  const connectionB = {
+    phase: 'online',
+    target: { kind: 'ssh', alias: 'private-config-name' },
+    hostId: 'host-b',
+    path: 'ssh',
+    since: '2026-08-05T20:01:00.000Z',
+    attempt: 2,
+    capabilities: ['prime_agent_commands_v2'],
+  }
+  const cache = {
+    version: 3,
+    activeHostId: 'host-a',
+    entries: {
+      'host-a': { hostId: 'host-a', catalog: catalogA, lastSnapshot: snapshotA },
+      'host-b': { hostId: 'host-b', catalog: catalogB, lastSnapshot: snapshotB },
+    },
+  }
+  return { catalogA, catalogB, snapshotA, snapshotB, connectionA, connectionB, cache }
 }

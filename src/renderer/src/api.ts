@@ -77,6 +77,8 @@ export interface HostSummary {
   compatibility: 'compatible' | 'update_available' | 'upgrade_required'
   /** Integrity readiness is projected only for the currently verified host authority. */
   runtimeReadiness?: HostRuntimeReadiness
+  /** Exact SSH authority is online but remains mutation-gated until explicit verification finishes. */
+  activationRequired?: boolean
 }
 
 export interface TranscriptBlock {
@@ -379,6 +381,7 @@ export interface RendererApi {
   retryLocalSetup(): Promise<void>
   repairLocalRuntime(): Promise<void>
   selectThread(threadId: string): Promise<void>
+  activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
   provisionResident(input: {
@@ -1164,6 +1167,10 @@ class BrowserPreviewApi implements RendererApi {
     // adapter overrides this boundary with an authoritative host request.
   }
 
+  async activateComputer(_expectedHostId: string): Promise<WorkbenchSnapshot> {
+    throw new Error('Connecting a saved computer is available only in the native desktop app.')
+  }
+
   async loadRuntimeModelCatalog(_hostId: string): Promise<RuntimeModelCatalogSnapshot> {
     await delay(180)
     return structuredClone(previewRuntimeModelCatalog)
@@ -1858,6 +1865,7 @@ interface NativeProjectionInput {
   selectedThreadId?: string
   deviceId?: string
   mutationAuthorityReady?: boolean
+  activationRequiredHostId?: string
 }
 
 const RESIDENT_LIFECYCLE_OPERATION_STATES = new Set<ResidentLifecycleOperationState>([
@@ -2244,12 +2252,13 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     // data. Only the currently verified connection may render as online.
     const state = connectionFromNative(isActive && activePhase ? activePhase : 'offline')
     const rawKind = asString(host.kind)
+    const projectedKind = rawKind === 'local' || rawKind === 'paired' ? rawKind : 'ssh'
     const synchronizedAt = asString(host.cacheUpdatedAt) ?? asString(host.lastSeenAt) ?? (isActive ? updatedAt : undefined)
     const runtimeReadiness = isActive ? exactActiveRuntimeReadiness : undefined
     return {
       id: hostId,
       name: hostName,
-      kind: rawKind === 'local' || rawKind === 'paired' ? rawKind : 'ssh',
+      kind: projectedKind,
       connection: state,
       connectionPath: pathKind === 'local_socket' ? 'Local socket' : pathKind === 'relay' ? 'Relay' : 'SSH',
       lastSynchronized: state === 'online' ? undefined : displayTime(synchronizedAt) || 'not yet',
@@ -2259,6 +2268,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
           ? host.compatibility
           : 'compatible',
       ...(runtimeReadiness ? { runtimeReadiness } : {}),
+      ...(projectedKind === 'ssh' && isActive && state === 'online' && input.activationRequiredHostId === hostId
+        ? { activationRequired: true }
+        : {}),
     }
   })
 
@@ -2954,6 +2966,7 @@ export class NativeRendererApi implements RendererApi {
   private workbenchLoaded = false
   private selectedThreadId?: string
   private threadSelectionGeneration = 0
+  private userThreadSelectionRevision = 0
   private connectionGeneration = 0
   private connectionObservationRevision = 0
   private projectionRevision = 0
@@ -2963,6 +2976,15 @@ export class NativeRendererApi implements RendererApi {
   private mutationAuthorityReadyHostId?: string
   private mutationAuthorityHydrationGeneration?: number
   private mutationAuthorityHydrationPromise?: Promise<void>
+  private explicitHostActivationExpectedHostId?: string
+  private explicitHostActivationSelectionRevision?: number
+  private readonly activationRetryRequiredHostIds = new Set<string>()
+  private latestAuthoritativeMaterialization?: {
+    connectionGeneration: number
+    hostId: string
+    threadId: string
+    executionGenerationId: string
+  }
   private composerOverride?: {
     threadId: string
     expectedHostId: string
@@ -3033,6 +3055,11 @@ export class NativeRendererApi implements RendererApi {
       deviceId: this.deviceId,
       mutationAuthorityReady:
         this.mutationAuthorityReadyHostId === asString(asRecord(this.connection)?.hostId),
+      activationRequiredHostId: this.activationRetryRequiredHostIds.has(
+        asString(asRecord(this.connection)?.hostId) ?? '',
+      )
+        ? asString(asRecord(this.connection)?.hostId)
+        : undefined,
     })
     const selectedThread = this.projection.threads.find((thread) => thread.id === this.projection?.selectedThreadId)
     if (
@@ -3152,6 +3179,62 @@ export class NativeRendererApi implements RendererApi {
       fence.observedTargetKey === this.connectionTargetKey(this.connection) &&
       fence.requestedTargetKey === this.connectionTargetKey(state)
     )
+  }
+
+  private beginHostActivationReplyFence(): { revision: number; observedConnectionKey: string } {
+    return {
+      // An activation request carries only the immutable host identity. The
+      // configured SSH locator stays in the main process and is never accepted
+      // from renderer input.
+      revision: ++this.connectionObservationRevision,
+      observedConnectionKey: this.connectionKey(this.connection),
+    }
+  }
+
+  private hostActivationReplyIsCurrent(
+    fence: { revision: number; observedConnectionKey: string },
+  ): boolean {
+    return (
+      fence.revision === this.connectionObservationRevision &&
+      fence.observedConnectionKey === this.connectionKey(this.connection)
+    )
+  }
+
+  private isExactSshAuthority(state: unknown, expectedHostId: string): boolean {
+    const connection = asRecord(state)
+    const target = asRecord(connection?.target)
+    return (
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.path) === 'ssh' &&
+      asString(connection?.hostId) === expectedHostId &&
+      asString(target?.kind) === 'ssh'
+    )
+  }
+
+  private restoreSelectedHostThread(
+    expectedHostId: string,
+    remoteThreadId: string,
+    expectedExecutionGenerationId: string,
+  ): void {
+    const selectedThread = this.updateProjection().threads.find(
+      (thread) =>
+        thread.hostId === expectedHostId &&
+        protocolThreadId(thread) === remoteThreadId &&
+        thread.executionGenerationId === expectedExecutionGenerationId,
+    )
+    if (!selectedThread) return
+    if (this.selectedThreadId !== selectedThread.id) this.threadSelectionGeneration += 1
+    this.selectedThreadId = selectedThread.id
+    this.threadSnapshot = this.cachedSnapshotForThread(
+      remoteThreadId,
+      expectedHostId,
+      selectedThread.executionGenerationId,
+    )
+    this.publish()
+  }
+
+  private authoritativeMaterializationProof(): typeof this.latestAuthoritativeMaterialization {
+    return this.latestAuthoritativeMaterialization
   }
 
   private rebuildCatalog(): void {
@@ -3333,6 +3416,12 @@ export class NativeRendererApi implements RendererApi {
     const verifiedHostId = asString(asRecord(state)?.hostId)
     const targetChanged = Boolean(previousTarget && nextTarget && previousTarget !== nextTarget)
     const authorityChanged = Boolean(verifiedHostId && previousHostId && verifiedHostId !== previousHostId)
+    const preserveNewerExplicitSelection = Boolean(
+      verifiedHostId &&
+      this.explicitHostActivationExpectedHostId === verifiedHostId &&
+      this.explicitHostActivationSelectionRevision !== undefined &&
+      this.userThreadSelectionRevision !== this.explicitHostActivationSelectionRevision,
+    )
     if (targetChanged || authorityChanged) this.clearAuthorityMutationState()
     const connectionChanged = this.connectionKey(this.connection) !== this.connectionKey(state)
     const observationChanged = this.connectionObservationKey(this.connection) !== this.connectionObservationKey(state)
@@ -3346,13 +3435,13 @@ export class NativeRendererApi implements RendererApi {
       // invalidating exact host-bound mutations.
       this.projectionRevision += 1
     }
-    if (authorityChanged && verifiedHostId) {
+    if (authorityChanged && verifiedHostId && !preserveNewerExplicitSelection) {
       const cached = this.projectionEntries[verifiedHostId]?.lastSnapshot
       this.threadSnapshot = cached
       this.selectedThreadId = undefined
     }
     this.rebuildCatalog()
-    if (authorityChanged && verifiedHostId) {
+    if (authorityChanged && verifiedHostId && !preserveNewerExplicitSelection) {
       const cachedThreadId = snapshotThreadId(this.threadSnapshot)
       if (cachedThreadId) {
         this.selectedThreadId = this.updateProjection().threads.find(
@@ -3362,7 +3451,13 @@ export class NativeRendererApi implements RendererApi {
     }
     this.publish()
 
-    if (this.workbenchLoaded && nextPhase === 'online' && verifiedHostId) {
+    if (
+      this.workbenchLoaded &&
+      nextPhase === 'online' &&
+      verifiedHostId &&
+      this.explicitHostActivationExpectedHostId !== verifiedHostId &&
+      !this.activationRetryRequiredHostIds.has(verifiedHostId)
+    ) {
       if (this.mutationAuthorityReadyHostId !== verifiedHostId) {
         void this.rehydrateAuthorityMutationState(verifiedHostId, this.connectionGeneration)
           .then(async () => await this.refreshFromAuthoritativeHost())
@@ -3389,6 +3484,11 @@ export class NativeRendererApi implements RendererApi {
         asString(asRecord(this.connection)?.hostId) !== hostId ||
         bootstrapHostId !== hostId
       ) throw new StaleHostAuthorityError()
+      if (
+        this.explicitHostActivationExpectedHostId === hostId &&
+        this.explicitHostActivationSelectionRevision !== undefined &&
+        this.userThreadSelectionRevision !== this.explicitHostActivationSelectionRevision
+      ) throw new StaleHostAuthorityError()
       const bootstrapEntry = projectionEntriesFromCache(asRecord(bootstrap?.cache))[hostId]
       if (bootstrapEntry) {
         for (const [threadId, generations] of Object.entries(bootstrapEntry.retiredExecutionGenerations ?? {})) {
@@ -3413,7 +3513,12 @@ export class NativeRendererApi implements RendererApi {
       this.residentLifecycleOperations = bootstrap?.residentLifecycleOperations
       this.applyPendingResidentMaterializations()
       this.hydrateComposerCommands(this.outbox)
-      this.mutationAuthorityReadyHostId = hostId
+      // An explicit cached-host activation keeps every mutation gated until
+      // that exact selected thread generation has also survived the fresh
+      // authoritative catalog and snapshot refresh.
+      const explicitActivationDefersMutations = this.explicitHostActivationExpectedHostId === hostId
+      this.mutationAuthorityReadyHostId = explicitActivationDefersMutations ? undefined : hostId
+      if (!explicitActivationDefersMutations) this.activationRetryRequiredHostIds.delete(hostId)
       this.projectionRevision += 1
       const hydratedThreadId = snapshotThreadId(this.threadSnapshot)
       const hydratedGenerationId = snapshotExecutionGenerationId(this.threadSnapshot)
@@ -3820,7 +3925,7 @@ export class NativeRendererApi implements RendererApi {
       return
     }
 
-    this.replaceCatalogEntry(authorityHostId, catalog)
+    if (!this.replaceCatalogEntry(authorityHostId, catalog)) return
     const catalogProjection = this.publish()
     if (!this.selectedThreadId || !catalogProjection.threads.some((thread) => thread.id === this.selectedThreadId)) {
       this.selectedThreadId = catalogProjection.selectedThreadId || catalogProjection.threads[0]?.id
@@ -3867,6 +3972,12 @@ export class NativeRendererApi implements RendererApi {
     ) return
     if (!this.replaceSnapshotEntry(authorityHostId, snapshot)) return
     this.threadSnapshot = snapshot
+    this.latestAuthoritativeMaterialization = {
+      connectionGeneration,
+      hostId: authorityHostId,
+      threadId: remoteThreadId,
+      executionGenerationId: currentSelectedThread.executionGenerationId,
+    }
     this.publish()
   }
 
@@ -4075,10 +4186,11 @@ export class NativeRendererApi implements RendererApi {
       const existingTarget = asRecord(connection?.target)
       if (phase !== 'online') {
         if (this.options.allowConnectionInitiation === false) return
-        const target =
-          existingTarget?.kind === 'ssh' && asString(existingTarget.alias)
-            ? { kind: 'ssh', alias: asString(existingTarget.alias) }
-            : { kind: 'local' }
+        // A cached SSH locator can only be activated by an explicit user
+        // action carrying its previously verified immutable host ID. Generic
+        // alias-bearing connect remains limited to first-time Add Computer.
+        if (existingTarget?.kind === 'ssh') return
+        const target = { kind: 'local' }
         const fence = this.beginConnectionReplyFence(target)
         const state = await this.call<unknown>('connect', target)
         if (!this.connectionReplyIsCurrent(fence, state)) return
@@ -4596,6 +4708,7 @@ export class NativeRendererApi implements RendererApi {
 
   async selectThread(threadId: string): Promise<void> {
     if (!threadId) throw new Error('Choose a thread before requesting its snapshot.')
+    this.userThreadSelectionRevision += 1
     const previousThreadId = this.selectedThreadId
     const previousSnapshot = this.threadSnapshot
     const selectionConnectionGeneration = this.connectionGeneration
@@ -4668,6 +4781,122 @@ export class NativeRendererApi implements RendererApi {
       this.threadSnapshot = previousSnapshot
       this.publish()
       throw error
+    }
+  }
+
+  async activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot> {
+    if (this.options.allowConnectionInitiation === false) {
+      throw new Error('Connecting a saved computer is unavailable from this surface.')
+    }
+    const cachedHost = this.projection?.hosts.find((host) => host.id === expectedHostId)
+    if (!cachedHost || cachedHost.kind !== 'ssh') {
+      throw new Error('Choose a saved SSH computer before connecting.')
+    }
+    if (cachedHost.connection !== 'offline' && cachedHost.activationRequired !== true) {
+      throw new Error('Only an offline saved computer can be connected from this action.')
+    }
+    if (this.explicitHostActivationExpectedHostId) {
+      throw new Error('Another saved computer is already being connected.')
+    }
+
+    const selectedBeforeActivation = this.projection?.threads.find(
+      (thread) => thread.id === this.selectedThreadId && thread.hostId === expectedHostId,
+    )
+    const selectedRemoteThreadId = selectedBeforeActivation
+      ? protocolThreadId(selectedBeforeActivation)
+      : undefined
+    const selectedExecutionGenerationId = selectedBeforeActivation?.executionGenerationId
+    if (!selectedRemoteThreadId || !selectedExecutionGenerationId) {
+      throw new Error('Choose a saved thread with a verified execution generation before connecting.')
+    }
+    const activationSelectionRevision = this.userThreadSelectionRevision
+    const previousConnectionGeneration = this.connectionGeneration
+    const previousMutationAuthorityReadyHostId = this.mutationAuthorityReadyHostId
+    const fence = this.beginHostActivationReplyFence()
+    this.explicitHostActivationExpectedHostId = expectedHostId
+    this.explicitHostActivationSelectionRevision = activationSelectionRevision
+    try {
+      // The cached bootstrap is read-only until a fresh exact-host bootstrap
+      // completes under the newly verified online authority.
+      this.mutationAuthorityReadyHostId = undefined
+      this.latestAuthoritativeMaterialization = undefined
+      const reply = await this.call<unknown>('activateVerifiedSshHost', { expectedHostId })
+      if (!this.isExactSshAuthority(reply, expectedHostId)) throw new StaleHostAuthorityError()
+
+      if (this.hostActivationReplyIsCurrent(fence)) {
+        this.applyConnectionState(reply)
+      } else if (!this.isExactSshAuthority(this.connection, expectedHostId)) {
+        // A later native observation outranks the bridge reply. Only an exact
+        // already-online observation for this immutable host corroborates it.
+        throw new StaleHostAuthorityError()
+      }
+      if (this.userThreadSelectionRevision !== activationSelectionRevision) throw new StaleHostAuthorityError()
+
+      if (!this.isExactSshAuthority(this.connection, expectedHostId)) throw new StaleHostAuthorityError()
+      const generation = this.connectionGeneration
+      this.restoreSelectedHostThread(expectedHostId, selectedRemoteThreadId, selectedExecutionGenerationId)
+      await this.rehydrateAuthorityMutationState(expectedHostId, generation)
+      if (
+        generation !== this.connectionGeneration ||
+        !this.isExactSshAuthority(this.connection, expectedHostId) ||
+        this.userThreadSelectionRevision !== activationSelectionRevision
+      ) throw new StaleHostAuthorityError()
+
+      // Bootstrap may prefer that host's last materialized thread. Restore the
+      // user's exact cached selection before asking for authoritative state.
+      this.restoreSelectedHostThread(expectedHostId, selectedRemoteThreadId, selectedExecutionGenerationId)
+      await this.refreshFromAuthoritativeHost()
+      const current = this.projection
+      const host = current?.hosts.find((candidate) => candidate.id === expectedHostId)
+      const selected = current?.threads.find((thread) => thread.id === current.selectedThreadId)
+      const materialization = this.authoritativeMaterializationProof()
+      if (
+        generation !== this.connectionGeneration ||
+        !this.isExactSshAuthority(this.connection, expectedHostId) ||
+        this.userThreadSelectionRevision !== activationSelectionRevision ||
+        !current ||
+        !host ||
+        host.kind !== 'ssh' ||
+        host.connection !== 'online' ||
+        host.connectionPath !== 'SSH' ||
+        selected?.hostId !== expectedHostId ||
+        protocolThreadId(selected) !== selectedRemoteThreadId ||
+        selected.executionGenerationId !== selectedExecutionGenerationId ||
+        !materialization ||
+        materialization.connectionGeneration !== generation ||
+        materialization.hostId !== expectedHostId ||
+        materialization.threadId !== selectedRemoteThreadId ||
+        materialization.executionGenerationId !== selectedExecutionGenerationId
+      ) throw new StaleHostAuthorityError()
+      this.mutationAuthorityReadyHostId = expectedHostId
+      this.activationRetryRequiredHostIds.delete(expectedHostId)
+      this.projectionRevision += 1
+      return this.publish()
+    } catch (error) {
+      const current = asRecord(this.connection)
+      if (
+        previousMutationAuthorityReadyHostId &&
+        previousConnectionGeneration === this.connectionGeneration &&
+        asString(current?.phase) === 'online' &&
+        asString(current?.hostId) === previousMutationAuthorityReadyHostId
+      ) {
+        this.mutationAuthorityReadyHostId = previousMutationAuthorityReadyHostId
+        this.projectionRevision += 1
+        this.publish()
+      } else if (
+        this.isExactSshAuthority(this.connection, expectedHostId) &&
+        this.mutationAuthorityReadyHostId !== expectedHostId
+      ) {
+        this.activationRetryRequiredHostIds.add(expectedHostId)
+        this.projectionRevision += 1
+        this.publish()
+      }
+      throw error
+    } finally {
+      if (this.explicitHostActivationExpectedHostId === expectedHostId) {
+        this.explicitHostActivationExpectedHostId = undefined
+        this.explicitHostActivationSelectionRevision = undefined
+      }
     }
   }
 

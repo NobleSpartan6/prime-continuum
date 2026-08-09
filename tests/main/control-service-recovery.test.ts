@@ -431,6 +431,233 @@ describe('DesktopControlService recovery', () => {
     expect((await service.bootstrap()).outbox).toEqual([])
   })
 
+  it('activates the newest private SSH binding using only its immutable host identity', async () => {
+    const directory = await createUserData({
+      cache: verifiedSshCache('host-a', 'current-devbox', ['retired-devbox'])
+    })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`Unexpected activation request: ${method}`)
+    })
+    connectSshHost.mockReturnValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    authorizeSshAlias(service, 'current-devbox')
+
+    await expect(service.activateVerifiedSshHost('host-a')).resolves.toMatchObject({
+      phase: 'online',
+      hostId: 'host-a',
+      target: { kind: 'ssh', alias: 'current-devbox' },
+      path: 'ssh',
+    })
+
+    expect(connectSshHost).toHaveBeenCalledWith('current-devbox', 'ssh')
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+  })
+
+  it('requires an existing verified SSH binding before activation and never accepts a local binding as a substitute', async () => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await expect(service.activateVerifiedSshHost('host-a')).rejects.toMatchObject({
+      code: 'ssh.verified_host_binding_required',
+      details: { expectedHostId: 'host-a' },
+    })
+    expect(connectSshHost).not.toHaveBeenCalled()
+  })
+
+  it('closes an SSH candidate whose health identity differs without rebinding or reconciling it', async () => {
+    const directory = await createUserData({ cache: verifiedSshCache('host-a', 'devbox') })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-b')
+      throw new Error(`A mismatched host must not receive ${method}`)
+    })
+    const reconnectCandidate = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-b')
+      throw new Error(`A mismatched reconnect must not receive ${method}`)
+    })
+    connectSshHost.mockReturnValueOnce(connection).mockReturnValueOnce(reconnectCandidate)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    authorizeSshAlias(service, 'devbox')
+
+    await expect(service.activateVerifiedSshHost('host-a')).rejects.toMatchObject({
+      code: 'ssh.host_identity_mismatch',
+      details: { expectedHostId: 'host-a', receivedHostId: 'host-b' },
+    })
+
+    expect(connection.isClosed).toBe(true)
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get'])
+    expect(service.getConnectionState()).toMatchObject({ phase: 'offline', hostId: 'host-a' })
+    await expect(service.reconnect()).rejects.toMatchObject({
+      code: 'ssh.host_identity_mismatch',
+      details: { expectedHostId: 'host-a', receivedHostId: 'host-b' },
+    })
+    expect(reconnectCandidate.isClosed).toBe(true)
+    expect(reconnectCandidate.requests.map(({ method }) => method)).toEqual(['health.get'])
+    const bootstrap = await service.bootstrap()
+    expect(bootstrap.cache).toMatchObject({
+      projectionHostId: 'host-a',
+      targetHostBindings: [expect.objectContaining({ hostId: 'host-a' })],
+    })
+    expect(JSON.stringify(bootstrap.cache)).not.toContain('host-b')
+  })
+
+  it('keeps the immutable SSH identity fence across automatic reconnect', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    try {
+      const directory = await createUserData({ cache: verifiedSshCache('host-a', 'devbox') })
+      const initial = new TestConnection((method) => {
+        if (method === 'health.get') return health('host-a')
+        throw new Error(`Unexpected initial request: ${method}`)
+      })
+      const replacement = new TestConnection((method) => {
+        if (method === 'health.get') return health('host-b')
+        throw new Error(`A mismatched automatic reconnect must not receive ${method}`)
+      })
+      connectSshHost.mockReturnValueOnce(initial).mockReturnValueOnce(replacement)
+      const service = new DesktopControlService({ app: testApp(directory) })
+      authorizeSshAlias(service, 'devbox')
+      await service.activateVerifiedSshHost('host-a')
+
+      initial.isClosed = true
+      initial.emit('close', new ControlError('transport.closed', 'The SSH transport closed.', { retryable: true }))
+      expect(service.getConnectionState()).toMatchObject({ phase: 'reconnecting', hostId: 'host-a' })
+      await vi.advanceTimersByTimeAsync(500)
+
+      expect(replacement.isClosed).toBe(true)
+      expect(replacement.requests.map(({ method }) => method)).toEqual(['health.get'])
+      expect(service.getConnectionState()).toMatchObject({
+        phase: 'offline',
+        hostId: 'host-a',
+        error: { code: 'ssh.host_identity_mismatch' },
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(connectSshHost).toHaveBeenCalledTimes(2)
+      expect(JSON.stringify((await service.bootstrap()).cache)).not.toContain('host-b')
+      await service.disconnect()
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let a superseded stale handshake poison the winning SSH binding across restart', async () => {
+    const queuedForA = followUp('device-a', 'stale-bind-must-not-reconcile', 'host-a')
+    const directory = await createUserData({ outbox: [waiting(queuedForA)] })
+    const staleA = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`The superseded Host A handshake must not receive ${method}`)
+    })
+    const winnerB = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-b')
+      throw new Error(`The winning Host B connection must not receive Host A ${method}`)
+    })
+    const restartedB = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-b')
+      throw new Error(`Restarted Host B must not receive Host A ${method}`)
+    })
+    connectSshHost
+      .mockReturnValueOnce(staleA)
+      .mockReturnValueOnce(winnerB)
+      .mockReturnValueOnce(restartedB)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    authorizeSshAlias(service, 'devbox')
+    const cacheStore = (service as unknown as {
+      cache: { update: (updater: (current: unknown) => unknown) => Promise<unknown> }
+    }).cache
+    const originalUpdate = cacheStore.update.bind(cacheStore)
+    const staleBindRelease = deferred<void>()
+    let updateCount = 0
+    let staleBindStarted!: () => void
+    const staleBindWaiting = new Promise<void>((resolve) => { staleBindStarted = resolve })
+    cacheStore.update = async (updater) => {
+      updateCount += 1
+      if (updateCount === 2) {
+        staleBindStarted()
+        await staleBindRelease.promise
+      }
+      return await originalUpdate(updater)
+    }
+
+    const staleConnect = service.connect({ kind: 'ssh', alias: 'devbox' })
+    await staleBindWaiting
+    await expect(service.connect({ kind: 'ssh', alias: 'devbox' })).resolves.toMatchObject({
+      phase: 'online',
+      hostId: 'host-b',
+    })
+    staleBindRelease.resolve()
+    await expect(staleConnect).rejects.toMatchObject({ code: 'connection.superseded' })
+
+    expect(staleA.requests.map(({ method }) => method)).toEqual(['health.get'])
+    expect(winnerB.requests.map(({ method }) => method)).toEqual(['health.get'])
+    expect(service.getConnectionState()).toMatchObject({ phase: 'online', hostId: 'host-b' })
+    const winningCache = await service.bootstrap()
+    expect(winningCache.cache).toMatchObject({
+      projectionHostId: 'host-b',
+      targetHostBindings: [expect.objectContaining({
+        target: { kind: 'ssh', alias: 'devbox' },
+        hostId: 'host-b',
+      })],
+    })
+    expect(JSON.stringify(winningCache.cache)).not.toContain('host-a')
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ hostId: 'host-a', command: expect.objectContaining({ commandId: queuedForA.commandId }) }),
+    ])
+    await service.disconnect()
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    await expect(restarted.bootstrap()).resolves.toMatchObject({
+      connection: { phase: 'offline', hostId: 'host-b', target: { kind: 'ssh', alias: 'devbox' } },
+      outbox: [],
+    })
+    await expect(restarted.reconnect()).resolves.toMatchObject({ phase: 'online', hostId: 'host-b' })
+    expect(restartedB.requests.map(({ method }) => method)).toEqual(['health.get'])
+    expect(await readStoredOutbox(directory)).toEqual([
+      expect.objectContaining({ hostId: 'host-a', command: expect.objectContaining({ commandId: queuedForA.commandId }) }),
+    ])
+    await restarted.disconnect()
+  })
+
+  it('reconciles an uncertain live-only remote prompt after activation without replaying the mutation', async () => {
+    const uncertainPrompt = prompt('device-a', 'dropped-remote-prompt', 'host-a')
+    const directory = await createUserData({
+      cache: verifiedSshCache('host-a', 'devbox'),
+      outbox: [{ hostId: 'host-a', command: uncertainPrompt, state: 'uncertain', updatedAt: timestamp }],
+    })
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health('host-a')
+      if (method === 'command.reconcile') {
+        expect(params).toMatchObject({
+          expectedHostId: 'host-a',
+          commands: [expect.objectContaining({
+            deviceId: uncertainPrompt.deviceId,
+            commandId: uncertainPrompt.commandId,
+            expectedExecutionGenerationId: uncertainPrompt.expectedExecutionGenerationId,
+          })],
+        })
+        return {
+          receipts: [],
+          unknown: [{ deviceId: uncertainPrompt.deviceId, commandId: uncertainPrompt.commandId }],
+        }
+      }
+      throw new Error(`An uncertain live-only prompt must not invoke ${method}`)
+    })
+    connectSshHost.mockReturnValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    authorizeSshAlias(service, 'devbox')
+
+    await expect(service.activateVerifiedSshHost('host-a')).resolves.toMatchObject({ phase: 'online', hostId: 'host-a' })
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get', 'command.reconcile'])
+    expect(connection.requests.some(({ method }) => method === 'command.submit')).toBe(false)
+    await service.disconnect()
+    expect((await service.bootstrap()).outbox).toEqual([
+      expect.objectContaining({
+        state: 'uncertain',
+        command: expect.objectContaining({ commandId: uncertainPrompt.commandId }),
+      }),
+    ])
+  })
+
   it('replays by immutable host identity when the SSH alias has changed', async () => {
     const queued = followUp('device-a', 'renamed-alias-follow-up', 'host-a')
     const directory = await createUserData({
@@ -2509,6 +2736,29 @@ function verifiedCache(hostId: string) {
     catalog: catalog(hostId),
     targetHostBindings: [{ target: { kind: 'local' }, hostId, verifiedAt: timestamp }]
   }
+}
+
+function verifiedSshCache(hostId: string, alias: string, olderAliases: string[] = []) {
+  return {
+    version: 2,
+    lastTarget: { kind: 'ssh', alias },
+    lastTargetUpdatedAt: timestamp,
+    projectionHostId: hostId,
+    catalog: catalog(hostId),
+    targetHostBindings: [
+      ...olderAliases.map((olderAlias) => ({
+        target: { kind: 'ssh', alias: olderAlias },
+        hostId,
+        verifiedAt: timestamp,
+      })),
+      { target: { kind: 'ssh', alias }, hostId, verifiedAt: timestamp },
+    ],
+  }
+}
+
+function authorizeSshAlias(service: DesktopControlService, alias: string): void {
+  const internals = service as unknown as { discoveredAliases: Set<string> }
+  internals.discoveredAliases.add(alias)
 }
 
 function deferred<T>() {

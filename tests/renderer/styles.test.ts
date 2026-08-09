@@ -62,6 +62,23 @@ describe('renderer style contracts', () => {
     expect(css).not.toMatch(/\.companion-|\.pair-mobile-/)
   })
 
+  it('keeps the explicit cached-computer action visible without adding motion at narrow widths', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const adaptiveLayout = css.slice(
+      css.indexOf('@media (max-width: 50rem)'),
+      css.indexOf('@media (max-width: 38rem)'),
+    )
+    const compactLayout = css.slice(
+      css.indexOf('@media (max-width: 24rem) and (max-height: 44rem)'),
+      css.indexOf('@media (min-width: 38.001rem)'),
+    )
+
+    expect(css).toMatch(/\.connection-notice__action\s*{[^}]*flex:\s*0 0 auto;[^}]*margin-inline-start:\s*0\.25rem;/s)
+    expect(adaptiveLayout).toMatch(/\.connection-notice__action\s*{[^}]*order:\s*2;[^}]*margin-inline-start:\s*auto;/s)
+    expect(compactLayout).toMatch(/\.connection-notice__detail\s*{[^}]*display:\s*none;/s)
+    expect(css).not.toMatch(/\.connection-notice__action\s*{[^}]*animation:/s)
+  })
+
   it('keeps resident setup controls reachable in a short zoomed viewport', async () => {
     const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
     const shortLayout = css.slice(

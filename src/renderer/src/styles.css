@@ -1238,6 +1238,11 @@ code,
   color: var(--color-text-muted);
 }
 
+.connection-notice__action {
+  flex: 0 0 auto;
+  margin-inline-start: 0.25rem;
+}
+
 .transcript {
   position: relative;
   min-block-size: 0;
@@ -5228,8 +5233,14 @@ body[data-surface="hud"] {
   }
 
   .connection-notice__detail {
+    order: 3;
     flex-basis: 100%;
     margin-inline-start: 1.4rem;
+  }
+
+  .connection-notice__action {
+    order: 2;
+    margin-inline-start: auto;
   }
 
   .manual-fields {

@@ -46,6 +46,73 @@ function createNativeUiFixture(): RendererApi {
   return api
 }
 
+function createHostActivationHarness() {
+  const api = asNativeFixture(createPreviewRendererApi())
+  const base = structuredClone(previewSnapshot)
+  const activationReply = deferred<WorkbenchSnapshot>()
+  const listeners = new Set<(next: WorkbenchSnapshot) => void>()
+  const snapshotFor = (
+    connection: WorkbenchSnapshot['hosts'][number]['connection'],
+    activationRequired = false,
+  ): WorkbenchSnapshot => {
+    const snapshot = structuredClone(base)
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-seamless')
+    const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+    if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected the SSH resident fixture')
+    snapshot.selectedThreadId = thread.id
+    snapshot.selectedProjectId = thread.projectId
+    thread.status = 'idle'
+    thread.executionGenerationId = 'generation-activation-one'
+    thread.workspaceId = 'workspace-activation-one'
+    host.name = 'Build computer'
+    host.kind = 'ssh'
+    host.connection = connection
+    host.connectionPath = 'SSH'
+    host.activationRequired = activationRequired || undefined
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      residency: 'resident',
+      activeSessionId: 'active-activation-one',
+      sessionId: 'session-activation-one',
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    const writable = connection === 'online' && !activationRequired
+    snapshot.operations = {
+      submitCommands: writable,
+      startResidentTurn: writable,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+    }
+    snapshot.composerReceipt = writable
+      ? { state: 'idle', message: 'Ready for a new prompt' }
+      : { state: 'waiting_for_connection', message: 'Waiting for connection' }
+    return snapshot
+  }
+  let current = snapshotFor('online')
+  api.loadWorkbench = vi.fn(async () => structuredClone(current))
+  api.subscribe = vi.fn((listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  })
+  api.activateComputer = vi.fn(() => activationReply.promise)
+  api.selectThread = vi.fn(async () => undefined)
+  api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+  const publish = (next: WorkbenchSnapshot) => {
+    current = structuredClone(next)
+    listeners.forEach((listener) => listener(structuredClone(current)))
+  }
+  return {
+    api: api as RendererApi,
+    activationReply,
+    snapshotFor,
+    publish,
+  }
+}
+
 function withLargeModelCatalog(catalog: RuntimeModelCatalog): RuntimeModelCatalog {
   const providers = catalog.providers.slice(0, 2).map((provider) => ({
     ...provider,
@@ -428,7 +495,7 @@ describe('Prime Continuim renderer', () => {
 
     const heading = await screen.findByRole('heading', { name: 'Seamless remote experience' })
     expect(heading).toBeVisible()
-    expect(document.title).toBe('Prime Continuim HUD — Seamless remote experience')
+    await waitFor(() => expect(document.title).toBe('Prime Continuim HUD — Seamless remote experience'))
     expect(screen.getByLabelText('Thread transcript')).toBeVisible()
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Repair runtime' })).not.toBeInTheDocument()
@@ -1499,6 +1566,139 @@ describe('Prime Continuim renderer', () => {
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toBeDisabled()
     expect(screen.queryByText(/send when reconnected/i)).not.toBeInTheDocument()
+  })
+
+  it('connects a cached SSH computer by keyboard, stays busy once, and preserves the draft at narrow width', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    window.dispatchEvent(new Event('resize'))
+    const user = userEvent.setup()
+    const harness = createHostActivationHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Keep this exact draft')
+    await act(async () => harness.publish(harness.snapshotFor('offline')))
+
+    const connect = screen.getByRole('button', { name: 'Connect to this computer' })
+    expect(connect).toBeVisible()
+    connect.focus()
+    await user.keyboard('{Enter}')
+
+    expect(harness.api.activateComputer).toHaveBeenCalledWith('host-devbox')
+    expect(harness.api.activateComputer).toHaveBeenCalledTimes(1)
+    expect(connect).toBeDisabled()
+    expect(connect).toHaveAttribute('aria-busy', 'true')
+    expect(connect).toHaveTextContent('Connect to this computer')
+    expect(document.querySelector('#connection-status')).toHaveTextContent('Connecting to this computer.')
+    expect(screen.getByText(/aligning the renderer around one durable thread/i)).toBeVisible()
+    expect(harness.api.sendComposer).not.toHaveBeenCalled()
+    await user.keyboard('{Enter}')
+    expect(harness.api.activateComputer).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      harness.activationReply.resolve(harness.snapshotFor('online'))
+      await harness.activationReply.promise
+    })
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Connect to this computer' })).not.toBeInTheDocument())
+    expect(document.querySelector('#connection-status')).toHaveTextContent('Connected to this computer.')
+    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep this exact draft')
+    expect(harness.api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('keeps controlled activation errors path-free, read-only, and explicitly retryable when authority is online', async () => {
+    const user = userEvent.setup()
+    const harness = createHostActivationHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Preserve after failure')
+    await act(async () => harness.publish(harness.snapshotFor('offline')))
+    await user.click(screen.getByRole('button', { name: 'Connect to this computer' }))
+
+    const privateLocator = 'secret-build-alias'
+    await act(async () => {
+      harness.activationReply.reject(Object.assign(
+        new Error(`OpenSSH could not reach ${privateLocator}.`),
+        { code: 'ssh.unreachable' },
+      ))
+      await harness.activationReply.promise.catch(() => undefined)
+    })
+
+    const retry = await screen.findByRole('button', { name: 'Connect to this computer' })
+    expect(retry).toBeEnabled()
+    expect(document.querySelector('#connection-status')).toHaveTextContent(
+      'Unable to connect to this computer. The connection could not be verified. Check this computer, then try again. No command was sent.',
+    )
+    expect(document.body).not.toHaveTextContent(privateLocator)
+    expect(harness.api.sendComposer).not.toHaveBeenCalled()
+
+    await act(async () => harness.publish(harness.snapshotFor('online', true)))
+    expect(screen.getByRole('button', { name: 'Connect to this computer' })).toBeEnabled()
+    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Preserve after failure')
+    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeDisabled()
+    expect(harness.api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('directs a missing verified binding back through Add computer without exposing native details', async () => {
+    const user = userEvent.setup()
+    const harness = createHostActivationHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await act(async () => harness.publish(harness.snapshotFor('offline')))
+    await user.click(screen.getByRole('button', { name: 'Connect to this computer' }))
+
+    await act(async () => {
+      harness.activationReply.reject(Object.assign(
+        new Error('private-user@private-host could not be opened'),
+        { code: 'ssh.verified_host_binding_required' },
+      ))
+      await harness.activationReply.promise.catch(() => undefined)
+    })
+
+    expect(document.querySelector('#connection-status')).toHaveTextContent(/Add the computer again before connecting\. No command was sent\./)
+    expect(document.body).not.toHaveTextContent('private-user@private-host')
+  })
+
+  it('ignores a late activation result after the user selects another host and never sends the preserved draft', async () => {
+    const user = userEvent.setup()
+    const harness = createHostActivationHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Draft stays with my current view')
+    await act(async () => harness.publish(harness.snapshotFor('offline')))
+    await user.click(screen.getByRole('button', { name: 'Connect to this computer' }))
+
+    await user.click(screen.getByRole('button', { name: /Frame protocol boundaries/ }))
+    expect(await screen.findByRole('heading', { name: 'Frame protocol boundaries' })).toBeVisible()
+    await act(async () => {
+      harness.activationReply.resolve(harness.snapshotFor('online'))
+      await harness.activationReply.promise
+    })
+
+    expect(screen.getByRole('heading', { name: 'Frame protocol boundaries' })).toBeVisible()
+    expect(document.querySelector('#connection-status')).not.toHaveTextContent('Connected to this computer.')
+    expect(harness.api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('does not expose cached-host activation in preview or while native SSH is already reconnecting', async () => {
+    const previewApi = createPreviewRendererApi()
+    const previewLoad = previewApi.loadWorkbench.bind(previewApi)
+    previewApi.loadWorkbench = async () => {
+      const snapshot = await previewLoad()
+      const host = snapshot.hosts.find((candidate) => candidate.id === 'host-devbox')
+      if (!host) throw new Error('Expected preview SSH host')
+      host.connection = 'offline'
+      return snapshot
+    }
+    render(<App api={previewApi} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(screen.queryByRole('button', { name: 'Connect to this computer' })).not.toBeInTheDocument()
+    cleanup()
+
+    const nativeHarness = createHostActivationHarness()
+    nativeHarness.publish(nativeHarness.snapshotFor('reconnecting'))
+    render(<App api={nativeHarness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(screen.queryByRole('button', { name: 'Connect to this computer' })).not.toBeInTheDocument()
   })
 
   it('offers one honest prompt action for an idle resident session', async () => {

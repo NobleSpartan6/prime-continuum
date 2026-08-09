@@ -505,17 +505,50 @@ export class DesktopControlService extends EventEmitter {
   }
 
   async connect(target: ConnectionTarget): Promise<ConnectionState> {
+    return await this.connectTarget(target)
+  }
+
+  async activateVerifiedSshHost(expectedHostId: string): Promise<ConnectionState> {
+    if (!isHostId(expectedHostId)) {
+      throw new ControlError(
+        'ssh.verified_host_identity_invalid',
+        'Choose a previously verified computer before connecting.'
+      )
+    }
+    const cache = await this.readCache()
+    const target = findBoundSshTarget(cache, expectedHostId)
+    if (!target) {
+      throw new ControlError(
+        'ssh.verified_host_binding_required',
+        'This computer has no previously verified configured SSH binding. Add it again before connecting.',
+        { details: { expectedHostId } }
+      )
+    }
+    return await this.connectTarget(target, expectedHostId)
+  }
+
+  private async connectTarget(target: ConnectionTarget, expectedHostId?: string): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     try {
       if (target.kind === 'ssh') await this.requireDiscoveredAlias(target.alias)
       const intentGeneration = ++this.controlIntentGeneration
-      const cache = await this.cache.update((current) => ({
-        ...normalizeCache(current),
-        lastAttemptedTarget: target,
-        lastAttemptedAt: now()
-      }))
+      const cache = await this.cache.update((current) => {
+        const normalized = normalizeCache(current)
+        if (expectedHostId !== undefined && findBoundHostId(normalized, target) !== expectedHostId) {
+          throw new ControlError(
+            'ssh.verified_host_binding_required',
+            'The previously verified SSH binding changed before this computer could be connected.',
+            { retryable: true, details: { expectedHostId } }
+          )
+        }
+        return {
+          ...normalized,
+          lastAttemptedTarget: target,
+          lastAttemptedAt: now()
+        }
+      })
       if (intentGeneration !== this.controlIntentGeneration) {
         throw new ControlError('connection.superseded', 'The connection attempt was superseded.', { retryable: true })
       }
@@ -532,7 +565,8 @@ export class DesktopControlService extends EventEmitter {
       // poll lineage, and renderer authority internally consistent.
       this.intentionallyOffline = false
       const targetChanged = !this.target || !sameTarget(this.target, target)
-      if (targetChanged) {
+      const expectedAuthorityChanged = expectedHostId !== undefined && this.authorityHostId !== expectedHostId
+      if (targetChanged || expectedAuthorityChanged) {
         this.authorityHostId = undefined
         this.authorityCapabilities = []
         this.authorityRuntimeReadiness = undefined
@@ -550,8 +584,8 @@ export class DesktopControlService extends EventEmitter {
       }
       // A locator is never itself authority. It may restore only a binding that
       // was learned from this target's prior health handshake.
-      this.authorityHostId = findBoundHostId(cache, target)
-      return await this.establish(target, 'connecting', generation)
+      this.authorityHostId = expectedHostId ?? findBoundHostId(cache, target)
+      return await this.establish(target, 'connecting', generation, expectedHostId)
     } finally {
       this.endOAuthConnectionTransition()
     }
@@ -566,6 +600,7 @@ export class DesktopControlService extends EventEmitter {
       if (!target) {
         throw new ControlError('connection.no_target', 'There is no previous host to reconnect to.')
       }
+      const expectedHostId = target.kind === 'ssh' ? this.authorityHostId : undefined
       this.controlIntentGeneration += 1
       this.intentionallyOffline = false
       const generation = ++this.reconnectGeneration
@@ -578,7 +613,7 @@ export class DesktopControlService extends EventEmitter {
       ) {
         throw new ControlError('connection.superseded', 'The reconnection attempt was superseded.', { retryable: true })
       }
-      return await this.establish(target, 'reconnecting', generation)
+      return await this.establish(target, 'reconnecting', generation, expectedHostId)
     } finally {
       this.endOAuthConnectionTransition()
     }
@@ -1902,7 +1937,8 @@ export class DesktopControlService extends EventEmitter {
   private async establish(
     target: ConnectionTarget,
     phase: 'connecting' | 'reconnecting',
-    generation: number
+    generation: number,
+    expectedHostId?: string
   ): Promise<ConnectionState> {
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
@@ -1943,6 +1979,13 @@ export class DesktopControlService extends EventEmitter {
       }
       const observation = observationFromHealth(health)
       const hostId = observation.hostId
+      if (expectedHostId !== undefined && hostId !== expectedHostId) {
+        throw new ControlError(
+          'ssh.host_identity_mismatch',
+          'The configured SSH host returned a different immutable host identity.',
+          { details: { expectedHostId, receivedHostId: hostId } }
+        )
+      }
       const projectionInvalidated = await this.bindAuthority(target, hostId, generation)
       this.authorityCapabilities = observation.capabilities
       this.authorityRuntimeReadiness = observation.runtimeReadiness
@@ -2140,7 +2183,7 @@ export class DesktopControlService extends EventEmitter {
       this.connection = undefined
       this.abandonRuntimeOAuthSessionsForConnection(connection)
       if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
-      this.beginAutomaticReconnect(target, error)
+      this.beginAutomaticReconnect(target, hostId, error)
     })
   }
 
@@ -2243,8 +2286,9 @@ export class DesktopControlService extends EventEmitter {
     }
   }
 
-  private beginAutomaticReconnect(target: ConnectionTarget, cause: unknown): void {
+  private beginAutomaticReconnect(target: ConnectionTarget, connectedHostId: string, cause: unknown): void {
     const generation = ++this.reconnectGeneration
+    const expectedHostId = target.kind === 'ssh' ? connectedHostId : undefined
     this.setState({
       phase: 'reconnecting',
       target,
@@ -2262,10 +2306,24 @@ export class DesktopControlService extends EventEmitter {
         await delay(withJitter(baseDelay))
         if (this.intentionallyOffline || generation !== this.reconnectGeneration) return
         try {
-          await this.establish(target, 'reconnecting', generation)
+          await this.establish(target, 'reconnecting', generation, expectedHostId)
           return
         } catch (error) {
           lastError = error
+          if (error instanceof ControlError && error.code === 'ssh.host_identity_mismatch') {
+            if (!this.intentionallyOffline && generation === this.reconnectGeneration) {
+              this.setState({
+                phase: 'offline',
+                target,
+                ...(expectedHostId ? { hostId: expectedHostId } : {}),
+                ...this.authorityObservationState(),
+                since: now(),
+                attempt: this.attempt,
+                error: toStructuredError(error),
+              })
+            }
+            return
+          }
           retryIndex += 1
           if (!this.intentionallyOffline && generation === this.reconnectGeneration) {
             this.setState({
@@ -4004,15 +4062,15 @@ export class DesktopControlService extends EventEmitter {
     let projectionInvalidated = false
     await this.cache.update((current) => {
       const cache = normalizeCache(current)
-      const targetHostBindings = cache.targetHostBindings
-        .filter((binding) => !sameTarget(binding.target, target))
-        .slice(-(TARGET_BINDING_LIMIT - 1))
-      targetHostBindings.push({ target, hostId, verifiedAt })
       const remainsCurrent =
         generation === this.reconnectGeneration &&
         !this.intentionallyOffline &&
         Boolean(this.target && sameTarget(this.target, target))
-      if (!remainsCurrent) return { ...cache, targetHostBindings }
+      if (!remainsCurrent) return cache
+      const targetHostBindings = cache.targetHostBindings
+        .filter((binding) => !sameTarget(binding.target, target))
+        .slice(-(TARGET_BINDING_LIMIT - 1))
+      targetHostBindings.push({ target, hostId, verifiedAt })
       projectionInvalidated = Boolean(cache.activeHostId && cache.activeHostId !== hostId)
       return {
         ...cache,
@@ -5654,6 +5712,16 @@ function asCachedHostProjection(value: unknown, hostId: string): CachedHostProje
 
 function findBoundHostId(cache: CacheEnvelope, target: ConnectionTarget): string | undefined {
   return [...cache.targetHostBindings].reverse().find((binding) => sameTarget(binding.target, target))?.hostId
+}
+
+function findBoundSshTarget(
+  cache: CacheEnvelope,
+  hostId: string,
+): Extract<ConnectionTarget, { kind: 'ssh' }> | undefined {
+  const binding = [...cache.targetHostBindings]
+    .reverse()
+    .find((candidate) => candidate.hostId === hostId && candidate.target.kind === 'ssh')
+  return binding?.target.kind === 'ssh' ? { kind: 'ssh', alias: binding.target.alias } : undefined
 }
 
 function sameTarget(left: ConnectionTarget, right: ConnectionTarget): boolean {

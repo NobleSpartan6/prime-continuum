@@ -131,6 +131,11 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     (input: { planId: string; consent: true }) => service.installHost(input.planId, input.consent)
   )
   handle(IPC.connect, connectionTarget, (input: z.infer<typeof connectionTarget>) => service.connect(input))
+  handle(
+    IPC.activateVerifiedSshHost,
+    z.object({ expectedHostId: id }).strict(),
+    (input: { expectedHostId: string }) => service.activateVerifiedSshHost(input.expectedHostId)
+  )
   handle(IPC.reconnect, z.undefined(), () => service.reconnect())
   handle(IPC.disconnect, z.undefined(), () => service.disconnect())
   handle(IPC.hostCatalog, z.undefined(), () => service.hostCatalog())

@@ -22,6 +22,7 @@ export const IPC = {
   planHostInstall: 'prime:ssh:install-plan',
   installHost: 'prime:ssh:install',
   connect: 'prime:connection:connect',
+  activateVerifiedSshHost: 'prime:connection:activate-verified-ssh-host',
   reconnect: 'prime:connection:reconnect',
   disconnect: 'prime:connection:disconnect',
   hostCatalog: 'prime:catalog:hosts',
@@ -411,6 +412,7 @@ export interface PrimeBridge {
   planHostInstall(input: { alias: string }): Promise<Result<HostInstallPlan>>
   installHost(input: { planId: string; consent: true }): Promise<Result<never>>
   connect(input: ConnectionTarget): Promise<Result<ConnectionState>>
+  activateVerifiedSshHost(input: { expectedHostId: string }): Promise<Result<ConnectionState>>
   reconnect(): Promise<Result<ConnectionState>>
   disconnect(): Promise<Result<void>>
   hostCatalog(): Promise<Result<unknown>>

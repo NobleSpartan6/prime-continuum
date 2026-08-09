@@ -82,6 +82,11 @@ type ComposerLocalAction = {
   sequence: number
   operation: 'prompt' | 'abort'
 }
+type HostActivationView = {
+  hostId: string
+  phase: 'connecting' | 'error' | 'connected'
+  message: string
+}
 type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
 type ResidentLifecycleRecoveryReference = {
   operationId: string
@@ -293,6 +298,22 @@ function residentLifecycleAnnouncement(status: ResidentLifecycleStatusResult | n
 
 function Icon({ icon: IconComponent, size = 16, strokeWidth = 1.75 }: { icon: LucideIcon; size?: number; strokeWidth?: number }) {
   return <IconComponent aria-hidden="true" focusable="false" size={size} strokeWidth={strokeWidth} />
+}
+
+function hostActivationFailureMessage(error: unknown): string {
+  if (isStaleHostAuthorityError(error)) {
+    return 'Unable to connect to this computer. This saved thread changed while the computer connected. Review the refreshed thread, then try again. No command was sent.'
+  }
+  const code = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : ''
+  if (code === 'ssh.verified_host_binding_required' || code === 'ssh.verified_host_identity_invalid') {
+    return 'Unable to connect to this computer. Its saved SSH verification is missing or changed. Add the computer again before connecting. No command was sent.'
+  }
+  if (code === 'ssh.host_identity_mismatch') {
+    return 'Unable to connect to this computer. Its identity did not match the saved verification. Add the computer again to verify it before connecting. No command was sent.'
+  }
+  return 'Unable to connect to this computer. The connection could not be verified. Check this computer, then try again. No command was sent.'
 }
 
 type LocalSetupStepState = 'pending' | 'current' | 'complete' | 'error' | 'action'
@@ -733,6 +754,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [hudBoundaryError, setHudBoundaryError] = useState('')
   const [hudActionError, setHudActionError] = useState('')
   const [threadSelectionError, setThreadSelectionError] = useState('')
+  const [hostActivation, setHostActivation] = useState<HostActivationView | null>(null)
   const [selectedProjectId, setSelectedProjectId] = useState('')
   const [selectedThreadId, setSelectedThreadId] = useState(initialThreadId)
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Changes')
@@ -824,6 +846,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     onClose: closeInspector,
   })
   const threadSelectionRequestRef = useRef(0)
+  const hostActivationRequestRef = useRef(0)
   const activeHostIdRef = useRef<string | undefined>(undefined)
   const activeThreadIdRef = useRef<string | undefined>(undefined)
   const composerAuthorityGenerationRef = useRef(0)
@@ -832,6 +855,35 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const hudSelectionRequestRef = useRef('')
   const previousHudTargetKeyRef = useRef('')
   const hudFocusKeyRef = useRef('')
+
+  const applySnapshot = useCallback((nextSnapshot: WorkbenchSnapshot) => {
+    setSnapshot(nextSnapshot)
+    setSelectedProjectId(nextSnapshot.selectedProjectId)
+    setSelectedThreadId(nextSnapshot.selectedThreadId)
+    const nextReceipt: ComposerReceiptView = {
+      state: nextSnapshot.composerReceipt.state,
+      message: nextSnapshot.composerReceipt.message ?? '',
+      ...(nextSnapshot.composerReceipt.operation ? { operation: nextSnapshot.composerReceipt.operation } : {}),
+      ...(nextSnapshot.composerReceipt.retryable !== undefined
+        ? { retryable: nextSnapshot.composerReceipt.retryable }
+        : {}),
+    }
+    const nextThread = nextSnapshot.threads.find((thread) => thread.id === nextSnapshot.selectedThreadId)
+    if (nextThread && nextReceipt.state === 'idle') {
+      // Native proof/reconciliation has reached an authoritative idle state
+      // for this exact host/thread. Retire either local Run or Stop tail so a
+      // deferred IPC resolve/reject cannot reclaim the composer afterward.
+      latestComposerActionsRef.current.delete(composerActionAuthorityKey(nextThread.hostId, nextThread))
+    }
+    const latestAction = nextThread
+      ? latestComposerActionsRef.current.get(composerActionAuthorityKey(nextThread.hostId, nextThread))
+      : undefined
+    setComposerReceipt((current) =>
+      latestAction?.operation === 'abort' && nextReceipt.operation === 'prompt'
+        ? current
+        : nextReceipt,
+    )
+  }, [])
 
   useEffect(() => {
     if (surface !== 'hud') return
@@ -877,34 +929,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   useEffect(() => {
     let cancelled = false
     setLoadError('')
-    const applySnapshot = (nextSnapshot: WorkbenchSnapshot) => {
-      setSnapshot(nextSnapshot)
-      setSelectedProjectId(nextSnapshot.selectedProjectId)
-      setSelectedThreadId(nextSnapshot.selectedThreadId)
-      const nextReceipt: ComposerReceiptView = {
-        state: nextSnapshot.composerReceipt.state,
-        message: nextSnapshot.composerReceipt.message ?? '',
-        ...(nextSnapshot.composerReceipt.operation ? { operation: nextSnapshot.composerReceipt.operation } : {}),
-        ...(nextSnapshot.composerReceipt.retryable !== undefined
-          ? { retryable: nextSnapshot.composerReceipt.retryable }
-          : {}),
-      }
-      const nextThread = nextSnapshot.threads.find((thread) => thread.id === nextSnapshot.selectedThreadId)
-      if (nextThread && nextReceipt.state === 'idle') {
-        // Native proof/reconciliation has reached an authoritative idle state
-        // for this exact host/thread. Retire either local Run or Stop tail so a
-        // deferred IPC resolve/reject cannot reclaim the composer afterward.
-        latestComposerActionsRef.current.delete(composerActionAuthorityKey(nextThread.hostId, nextThread))
-      }
-      const latestAction = nextThread
-        ? latestComposerActionsRef.current.get(composerActionAuthorityKey(nextThread.hostId, nextThread))
-        : undefined
-      setComposerReceipt((current) =>
-        latestAction?.operation === 'abort' && nextReceipt.operation === 'prompt'
-          ? current
-          : nextReceipt,
-      )
-    }
     void api
       .loadWorkbench()
       .then((nextSnapshot) => {
@@ -924,7 +948,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       cancelled = true
       unsubscribe?.()
     }
-  }, [api])
+  }, [api, applySnapshot])
 
   useEffect(() => {
     const stage = snapshot?.localSetup?.stage
@@ -972,6 +996,14 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     snapshot?.projects.find((project) => project.id === selectedProjectId) ??
     snapshot?.projects[0]
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
+  const selectedHostActivation = hostActivation?.hostId === selectedHost?.id ? hostActivation : null
+  const hostActivationPending = selectedHostActivation?.phase === 'connecting'
+  const canActivateSelectedHost = Boolean(
+    surface === 'workbench' &&
+    api.environment === 'native' &&
+    selectedHost?.kind === 'ssh' &&
+    (selectedHost.connection === 'offline' || selectedHost.activationRequired === true),
+  )
   const activeLocalHostId = snapshot?.hosts.find((host) => host.kind === 'local' && host.connection === 'online')?.id
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
@@ -1223,25 +1255,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [selectedThread?.id])
 
   useEffect(() => {
+    if (!hostActivation || hostActivation.hostId === selectedHost?.id) return
+    hostActivationRequestRef.current += 1
+    setHostActivation(null)
+  }, [hostActivation, selectedHost?.id])
+
+  useEffect(() => {
     if (!selectedHost || !selectedThread) return
-    if (selectedHost.connection !== 'online') {
+    if (selectedHost.connection !== 'online' || selectedHost.activationRequired) {
       setComposerReceipt((current) =>
-        current.state === 'idle' ? { state: 'waiting_for_connection', message: 'Waiting for connection' } : current,
+        current.state === 'idle'
+          ? {
+              state: 'waiting_for_connection',
+              message: selectedHost.activationRequired ? 'Waiting for connection verification' : 'Waiting for connection',
+            }
+          : current,
       )
     }
   }, [selectedHost, selectedThread])
 
   const selectThread = (thread: ThreadSummary) => {
     const requestId = ++threadSelectionRequestRef.current
+    hostActivationRequestRef.current += 1
+    setHostActivation(null)
     composerAuthorityGenerationRef.current += 1
     setThreadSelectionError('')
     setSelectedThreadId(thread.id)
     setSelectedProjectId(thread.projectId)
     const host = snapshot?.hosts.find((candidate) => candidate.id === thread.hostId)
     setComposerReceipt(
-      host?.connection === 'online'
+      host?.connection === 'online' && !host.activationRequired
         ? { state: 'idle', message: 'Ready for a new prompt' }
-        : { state: 'waiting_for_connection', message: 'Waiting for connection' },
+        : {
+            state: 'waiting_for_connection',
+            message: host?.activationRequired ? 'Waiting for connection verification' : 'Waiting for connection',
+          },
     )
     setSidebarOpen(false)
     window.requestAnimationFrame(() => {
@@ -1252,6 +1300,40 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       const detail = error instanceof Error ? error.message : 'The host did not return an authoritative snapshot.'
       setThreadSelectionError(`Couldn’t refresh ${thread.title}. ${detail}`)
     })
+  }
+
+  const activateSelectedComputer = async () => {
+    if (!selectedHost || !canActivateSelectedHost || hostActivationPending) return
+    const expectedHostId = selectedHost.id
+    const requestId = ++hostActivationRequestRef.current
+    setHostActivation({
+      hostId: expectedHostId,
+      phase: 'connecting',
+      message: 'Connecting to this computer.',
+    })
+    try {
+      const activatedSnapshot = await api.activateComputer(expectedHostId)
+      if (
+        hostActivationRequestRef.current !== requestId ||
+        activeHostIdRef.current !== expectedHostId
+      ) return
+      applySnapshot(activatedSnapshot)
+      setHostActivation({
+        hostId: expectedHostId,
+        phase: 'connected',
+        message: 'Connected to this computer.',
+      })
+    } catch (error: unknown) {
+      if (
+        hostActivationRequestRef.current !== requestId ||
+        activeHostIdRef.current !== expectedHostId
+      ) return
+      setHostActivation({
+        hostId: expectedHostId,
+        phase: 'error',
+        message: hostActivationFailureMessage(error),
+      })
+    }
   }
 
   const selectProject = (projectId: string) => {
@@ -2092,6 +2174,35 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
 
   const compatibleHosts = snapshot.hosts.filter((host) => selectedProject.hostIds.includes(host.id))
   const isDisconnected = selectedHost.connection !== 'online'
+  const showConnectionNotice = Boolean(
+    isDisconnected ||
+    selectedHost.activationRequired === true ||
+    selectedHostActivation?.phase === 'connecting' ||
+    selectedHostActivation?.phase === 'error',
+  )
+  const connectionNoticeHeading = selectedHostActivation?.phase === 'error'
+    ? 'Unable to connect to this computer'
+    : selectedHostActivation?.phase === 'connecting'
+      ? 'Connecting to this computer'
+      : selectedHost.activationRequired
+        ? 'Connection verification required'
+      : connectionCopy(selectedHost.connection, selectedHost)
+  const connectionNoticeDetail = selectedHostActivation?.phase === 'error'
+    ? selectedHostActivation.message.replace(/^Unable to connect to this computer\.\s*/, '')
+    : selectedHostActivation?.phase === 'connecting'
+      ? 'Cached transcript remains available while Prime Agent verifies this computer.'
+      : selectedHost.activationRequired
+        ? 'Review this saved thread, then connect again before sending a command.'
+      : selectedHost.connection === 'offline'
+        ? 'Cached transcript remains available.'
+        : 'The task may still be running.'
+  const connectionStatusAnnouncement = selectedHostActivation?.message || (
+    selectedHost.activationRequired
+      ? 'Connection verification required. Review this saved thread, then connect again before sending a command.'
+      : isDisconnected
+        ? connectionCopy(selectedHost.connection, selectedHost)
+        : ''
+  )
   const taskStateIsStale = isDisconnected && !['complete', 'failed'].includes(selectedThread.status)
   const visibleTaskState = taskStateIsStale
     ? `Last seen ${taskLabel(selectedThread.status).toLowerCase()}`
@@ -2100,8 +2211,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   return (
     <div className="app-shell" data-sidebar-open={sidebarOpen} data-inspector-open={inspectorOpen}>
       <a className="skip-link" href="#main">Skip to thread</a>
-      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {isDisconnected ? connectionCopy(selectedHost.connection, selectedHost) : ''}
+      <div id="connection-status" className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {connectionStatusAnnouncement}
       </div>
       <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {residentLifecycleFeedback}
@@ -2274,15 +2385,35 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
 
       <main className="thread-view" id="main" tabIndex={-1} inert={sidebarIsModal || inspectorIsModal ? true : undefined}>
         <div className="thread-notices">
-          {isDisconnected && (
+          {showConnectionNotice && (
             <div className={cx('connection-notice', `connection-notice--${selectedHost.connection}`)}>
               <span className="connection-notice__icon">
-                <Icon icon={selectedHost.connection === 'offline' ? WifiOff : RefreshCw} size={14} />
+                <Icon
+                  icon={selectedHostActivation?.phase === 'error'
+                    ? AlertCircle
+                    : selectedHost.connection === 'offline'
+                      ? WifiOff
+                      : RefreshCw}
+                  size={14}
+                />
               </span>
-              <span>{connectionCopy(selectedHost.connection, selectedHost)}</span>
+              <span>{connectionNoticeHeading}</span>
               <span className="connection-notice__detail">
-                {selectedHost.connection === 'offline' ? 'Cached transcript remains available.' : 'The task may still be running.'}
+                {connectionNoticeDetail}
               </span>
+              {(canActivateSelectedHost || hostActivationPending) && (
+                <button
+                  className="button button--secondary button--small connection-notice__action"
+                  type="button"
+                  disabled={hostActivationPending}
+                  aria-busy={hostActivationPending}
+                  aria-describedby="connection-status"
+                  onClick={() => void activateSelectedComputer()}
+                >
+                  <Icon icon={Network} size={14} />
+                  <span>Connect to this computer</span>
+                </button>
+              )}
             </div>
           )}
 
