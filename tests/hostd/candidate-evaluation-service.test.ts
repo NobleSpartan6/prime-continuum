@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CandidateEvaluationStore } from "../../src/hostd/candidate-evaluation-store";
 import {
   CandidateEvaluationCoordinator,
@@ -22,6 +22,99 @@ afterEach(async () => {
 });
 
 describe("HostService candidate evaluation containment", () => {
+  it("serves core health while optional candidate recovery warms, then advertises it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "prime-candidate-service-"));
+    roots.push(root);
+    const store = new HostStore(root);
+    const coordinator = new CandidateEvaluationCoordinator({
+      authorityStore: store,
+      persistence: new CandidateEvaluationStore(store.paths),
+      backend: unavailableBackend(),
+    });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const finished = deferred<void>();
+    let candidateReady = false;
+    vi.spyOn(coordinator, "initialize").mockImplementation(async () => {
+      started.resolve();
+      await release.promise;
+      candidateReady = true;
+      finished.resolve();
+    });
+    vi.spyOn(coordinator, "capabilityReady").mockImplementation(() => candidateReady);
+    const service = new HostService(store, undefined, undefined, {
+      candidateEvaluationCoordinator: coordinator,
+      runtimeIntegrityProvider: { snapshot: readyRuntime },
+    });
+
+    const initialization = service.initialize();
+    await started.promise;
+    let coreReady = false;
+    void initialization.then(() => { coreReady = true; });
+    try {
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      expect(coreReady).toBe(true);
+      const warmingHealth = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "health-during-candidate-recovery",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      expect(warmingHealth).toMatchObject({ ok: true, result: { serviceState: "ready" } });
+      if (!warmingHealth.ok || warmingHealth.method !== "health.get") throw new Error("health failed");
+      expect(warmingHealth.result.capabilities).not.toContain("candidate_evaluation_probe_v1");
+
+      release.resolve();
+      await finished.promise;
+      const readyHealth = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "health-after-candidate-recovery",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      if (!readyHealth.ok || readyHealth.method !== "health.get") throw new Error("health failed");
+      expect(readyHealth.result.capabilities).toContain("candidate_evaluation_probe_v1");
+    } finally {
+      release.resolve();
+      await initialization;
+      await service.close();
+    }
+  });
+
+  it("joins optional candidate recovery before closing its coordinator", async () => {
+    const root = await mkdtemp(join(tmpdir(), "prime-candidate-service-"));
+    roots.push(root);
+    const store = new HostStore(root);
+    const coordinator = new CandidateEvaluationCoordinator({
+      authorityStore: store,
+      persistence: new CandidateEvaluationStore(store.paths),
+      backend: unavailableBackend(),
+    });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    vi.spyOn(coordinator, "initialize").mockImplementation(async () => {
+      started.resolve();
+      await release.promise;
+    });
+    const coordinatorClose = vi.spyOn(coordinator, "close").mockResolvedValue();
+    const service = new HostService(store, undefined, undefined, {
+      candidateEvaluationCoordinator: coordinator,
+      runtimeIntegrityProvider: { snapshot: readyRuntime },
+    });
+
+    await service.initialize();
+    await started.promise;
+    const closing = service.close();
+    try {
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      expect(coordinatorClose).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await closing;
+    }
+    expect(coordinatorClose).toHaveBeenCalledOnce();
+  });
+
   it("keeps health, catalog, and thread reads available when optional evaluator state is malformed", async () => {
     const root = await mkdtemp(join(tmpdir(), "prime-candidate-service-"));
     roots.push(root);
@@ -79,6 +172,14 @@ describe("HostService candidate evaluation containment", () => {
     await service.close();
   });
 });
+
+function deferred<T>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return Object.freeze({ promise, resolve: resolvePromise });
+}
 
 function unavailableBackend(): CandidateEvaluationBackend {
   return {

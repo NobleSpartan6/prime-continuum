@@ -44,9 +44,24 @@ describe('Electron single-instance lifecycle', () => {
     expect(fixture.hudWindow.show).not.toHaveBeenCalled()
     expect(fixture.hudWindow.focus).not.toHaveBeenCalled()
   })
+
+  it('starts loading the workbench without waiting for HUD preferences to settle', async () => {
+    const hudInitialization = deferred<void>()
+    const fixture = installIndexMocks(true, hudInitialization.promise)
+
+    await import('../../src/main/index')
+    await flushMicrotasks()
+
+    expect(fixture.hudInitialize).toHaveBeenCalledOnce()
+    expect(fixture.browserWindows).toHaveLength(1)
+    expect(fixture.browserWindows[0]?.loadFile).toHaveBeenCalledOnce()
+
+    hudInitialization.resolve()
+    await hudInitialization.promise
+  })
 })
 
-function installIndexMocks(ownsLock: boolean) {
+function installIndexMocks(ownsLock: boolean, hudInitialization: Promise<void> = Promise.resolve()) {
   const ready = Promise.resolve()
   const app = {
     requestSingleInstanceLock: vi.fn(() => ownsLock),
@@ -73,8 +88,9 @@ function installIndexMocks(ownsLock: boolean) {
     show: vi.fn(),
     focus: vi.fn(),
   }
+  const hudInitialize = vi.fn(async () => await hudInitialization)
   class HudWindowController {
-    initialize = vi.fn(async () => undefined)
+    initialize = hudInitialize
     dispose = vi.fn(async () => undefined)
     window = vi.fn(() => hudWindow)
   }
@@ -111,7 +127,7 @@ function installIndexMocks(ownsLock: boolean) {
   vi.doMock('../../src/main/window-paths', () => ({ resolvePreloadEntry: vi.fn(() => 'preload.cjs') }))
   vi.doMock('../../src/main/window-security', () => ({ secureWebPreferences: vi.fn(() => ({})) }))
 
-  return { app, browserWindows, controlService, hudWindow }
+  return { app, browserWindows, controlService, hudWindow, hudInitialize }
 }
 
 class FakeBrowserWindow {
@@ -142,4 +158,12 @@ async function flushMicrotasks(): Promise<void> {
   await Promise.resolve()
   await Promise.resolve()
   await Promise.resolve()
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
 }

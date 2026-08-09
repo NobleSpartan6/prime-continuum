@@ -23,6 +23,7 @@ function fixture() {
     service,
     getWindows: () => [],
     isTrustedSender: () => true,
+    isTrustedWorkbenchSender: () => true,
   })
   return { handlers, service, dispose }
 }

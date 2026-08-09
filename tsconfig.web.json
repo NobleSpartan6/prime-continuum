@@ -24,7 +24,6 @@
     "src/renderer/src/**/*.ts",
     "src/renderer/src/**/*.tsx",
     "src/shared/protocol.ts",
-    "src/shared/codex-app-server-auth.ts",
     "src/shared/codex-oauth.ts",
     "src/shared/window-control.ts"
   ]

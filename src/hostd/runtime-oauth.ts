@@ -35,6 +35,11 @@ export interface RuntimeOAuthStorageSession {
 export interface VerifiedRuntimeOAuthCompositionOptions {
   readonly runtimeHandles: VerifiedRuntimeHandleProvider;
   readonly environment?: Readonly<NodeJS.ProcessEnv>;
+  readonly credentialSecurity?: Readonly<{
+    prepareAndVerify(): Promise<void>;
+    assertStillSecure(options?: { readonly force?: boolean }): Promise<void>;
+    capabilityAvailable?(): boolean;
+  }>;
   /** Test seam. Production always launches the exact verified runtime helper. */
   readonly runLogin?: (
     handle: VerifiedInstalledRuntimeHandle,
@@ -61,6 +66,9 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
   private readonly runLogin: NonNullable<VerifiedRuntimeOAuthCompositionOptions["runLogin"]>;
   private readonly openStorage: NonNullable<VerifiedRuntimeOAuthCompositionOptions["openStorage"]>;
   private readonly provider: HostOAuthProvider;
+  private readonly credentialSecurity: VerifiedRuntimeOAuthCompositionOptions["credentialSecurity"];
+  private initializationPromise: Promise<void> | undefined;
+  private securityReady: boolean;
   private activeStorage: RuntimeOAuthStorageSession | undefined;
   private terminalHelperFailure: RuntimeOAuthHelperTerminationError | undefined;
   private closed = false;
@@ -70,6 +78,8 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
     this.environment = sanitizeRuntimeOAuthHelperEnvironment(options.environment ?? process.env);
     this.runLogin = options.runLogin ?? runRuntimeOAuthLoginHelper;
     this.openStorage = options.openStorage ?? openRuntimeOAuthStorageHelper;
+    this.credentialSecurity = options.credentialSecurity;
+    this.securityReady = !this.credentialSecurity;
     this.provider = Object.freeze({
       id: CODEX_SUBSCRIPTION_PROVIDER_ID,
       name: CODEX_SUBSCRIPTION_PROVIDER_NAME,
@@ -79,8 +89,22 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
   }
 
   getProvider(providerId: string): HostOAuthProvider | undefined {
-    if (this.closed || providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID) return undefined;
+    if (
+      this.closed ||
+      !this.securityReady ||
+      this.credentialSecurity?.capabilityAvailable?.() === false ||
+      providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID
+    ) return undefined;
     return this.provider;
+  }
+
+  async initialize(): Promise<void> {
+    this.assertOpen(false);
+    if (this.securityReady) return;
+    this.initializationPromise ??= this.credentialSecurity!.prepareAndVerify().then(() => {
+      this.securityReady = true;
+    });
+    await this.initializationPromise;
   }
 
   async set(
@@ -91,6 +115,7 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
     if (providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID || this.activeStorage) {
       throw new RuntimeOAuthHelperError("Prime Agent OAuth storage is unavailable");
     }
+    await this.assertCredentialSecurity(true);
     const handle = await this.runtimeHandles.acquireVerifiedRuntimeHandle();
     let storage: RuntimeOAuthStorageSession;
     try {
@@ -101,23 +126,32 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
     }
     this.activeStorage = storage;
     await storage.set(providerId, auth);
+    await this.assertCredentialSecurity(true);
   }
 
   async drainErrors(): Promise<readonly unknown[]> {
-    return this.requireStorage().drainErrors();
+    await this.assertCredentialSecurity(true);
+    const errors = await this.requireStorage().drainErrors();
+    await this.assertCredentialSecurity(true);
+    return errors;
   }
 
   async reload(): Promise<void> {
+    await this.assertCredentialSecurity(true);
     await this.requireStorage().reload();
+    await this.assertCredentialSecurity(true);
   }
 
   async getAuthStatus(providerId: string): Promise<{ readonly configured: unknown }> {
     const storage = this.requireStorage();
     try {
+      await this.assertCredentialSecurity(true);
       if (providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID) {
         throw new RuntimeOAuthHelperError("Prime Agent OAuth storage is unavailable");
       }
-      return await storage.getAuthStatus(providerId);
+      const status = await storage.getAuthStatus(providerId);
+      await this.assertCredentialSecurity(true);
+      return status;
     } finally {
       try {
         await storage.close();
@@ -146,10 +180,13 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
 
   private async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
     this.assertOpen();
+    await this.assertCredentialSecurity(true);
     const handle = await this.runtimeHandles.acquireVerifiedRuntimeHandle();
     this.assertOpen();
     try {
-      return await this.runLogin(handle, CODEX_SUBSCRIPTION_PROVIDER_ID, callbacks, this.environment);
+      const credentials = await this.runLogin(handle, CODEX_SUBSCRIPTION_PROVIDER_ID, callbacks, this.environment);
+      await this.assertCredentialSecurity(true);
+      return credentials;
     } catch (error) {
       this.rememberTerminalHelperFailure(error);
       throw error;
@@ -162,8 +199,24 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
     return this.activeStorage;
   }
 
-  private assertOpen(): void {
+  private assertOpen(requireSecurity = true): void {
     if (this.closed) throw new RuntimeOAuthHelperError("Prime Agent OAuth composition is closed");
+    if (requireSecurity && !this.securityReady) {
+      throw new RuntimeOAuthHelperError("Prime Agent OAuth credential storage is unavailable");
+    }
+  }
+
+  private async assertCredentialSecurity(force = false): Promise<void> {
+    this.assertOpen();
+    try {
+      await this.credentialSecurity?.assertStillSecure(force ? { force: true } : undefined);
+    } catch (error) {
+      // Permission or path drift revokes the provider for the rest of this
+      // composition. A later health projection must not keep advertising a
+      // login capability after custody can no longer be proven.
+      this.securityReady = false;
+      throw error;
+    }
   }
 
   private rememberTerminalHelperFailure(error: unknown): void {

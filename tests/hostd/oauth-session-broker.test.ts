@@ -194,6 +194,7 @@ describe("host OAuth session broker", () => {
       expectedHostId: "stale-host",
       authorityId: AUTHORITY_ID,
       providerId: provider.provider.id,
+      operationId: "oauth-operation-stale-host",
     })).toThrowError(expect.objectContaining({ code: "HOST_AUTHORITY_MISMATCH" }));
     expect(resolver).not.toHaveBeenCalled();
 
@@ -237,14 +238,37 @@ describe("host OAuth session broker", () => {
       expect.objectContaining({ code: "OAUTH_PROVIDER_BUSY" }),
     );
     await expect(broker.cancel(binding({ sessionId: started.sessionId }))).resolves.toMatchObject({ phase: "cancelled" });
-    expect(() => broker.start(binding({ providerId: provider.provider.id }))).toThrowError(
+    expect(() => broker.start(binding({
+      providerId: provider.provider.id,
+      operationId: "oauth-operation-while-provider-drains",
+    }))).toThrowError(
       expect.objectContaining({ code: "OAUTH_PROVIDER_BUSY" }),
     );
 
     provider.credentials.resolve(SECRET_CREDENTIALS);
     await flushMicrotasks();
-    const restarted = broker.start(binding({ providerId: provider.provider.id }));
+    const restarted = broker.start(binding({
+      providerId: provider.provider.id,
+      operationId: "oauth-operation-restart",
+    }));
     await waitFor(() => broker.status(binding({ sessionId: restarted.sessionId })).phase === "completed");
+  });
+
+  it("returns the exact terminal tombstone for a retried start operation", async () => {
+    const provider: HostOAuthProvider = {
+      id: "openai-codex",
+      name: "ChatGPT Plus/Pro",
+      login: vi.fn(async () => SECRET_CREDENTIALS),
+    };
+    const broker = brokerFor(provider, storagePort());
+    const request = binding({ providerId: provider.id, operationId: "oauth-operation-lost-response" });
+
+    const started = broker.start(request);
+    await waitFor(() => broker.status(binding({ sessionId: started.sessionId })).phase === "completed");
+    const completed = broker.status(binding({ sessionId: started.sessionId }));
+
+    expect(broker.start(request)).toEqual(completed);
+    expect(provider.login).toHaveBeenCalledOnce();
   });
 
   it("does not acknowledge cancellation after credential commit has linearized", async () => {
@@ -463,8 +487,14 @@ function brokerFor(provider: HostOAuthProvider, storage: HostOAuthStorage & { ca
 function binding<T extends Record<string, unknown>>(request: T): T & {
   expectedHostId: string;
   authorityId: string;
+  operationId: string;
 } {
-  return { expectedHostId: HOST_ID, authorityId: AUTHORITY_ID, ...request };
+  return {
+    expectedHostId: HOST_ID,
+    authorityId: AUTHORITY_ID,
+    operationId: "oauth-operation-default",
+    ...request,
+  };
 }
 
 function storagePort(overrides: Partial<HostOAuthStorage> = {}) {

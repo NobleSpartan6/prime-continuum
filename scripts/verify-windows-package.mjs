@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify, isDeepStrictEqual } from 'node:util'
@@ -9,7 +10,6 @@ import { extractFile, listPackage } from '@electron/asar'
 import {
   RUNTIME_TEMPLATE_DIRECTORY,
   loadRuntimeInputs,
-  smokeCodexAppServerCompanion,
   smokeRuntime,
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
@@ -19,11 +19,13 @@ import {
   extractEmbeddedRuntimeAttestation,
   parseRuntimeAttestation,
 } from './runtime-attestation-lib.mjs'
+import { createPrimeAgentSmokeCustody } from './prime-agent-smoke-custody-lib.mjs'
 
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'ascii')
 const FUSE_ENABLED = '1'.charCodeAt(0)
 const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 
 function invariant(condition, message) {
   if (!condition) {
@@ -219,9 +221,7 @@ async function main() {
     electronRunAsNode: true,
     policy: inputs.policy,
   })
-  const codexAppServerSmoke = await smokeCodexAppServerCompanion(packagedRuntime.root, { policy: inputs.policy })
-  invariant(codexAppServerSmoke !== undefined, 'The packaged Codex app-server companion smoke was skipped.')
-  const applicationSmoke = await smokePackagedApplication(executablePath, packageDirectory)
+  const applicationSmoke = await smokePackagedApplication(executablePath, packageDirectory, packagedHostdPath)
   assertRuntimeAttestationMatches(attestation, {
     pointer: runtimePointer,
     manifest: packagedRuntime.manifest,
@@ -280,15 +280,6 @@ async function main() {
       electronNode: runtimeSmoke.runtimeVersions.node,
       electronModulesAbi: runtimeSmoke.runtimeVersions.modules,
       electronNapi: runtimeSmoke.runtimeVersions.napi,
-      codexAppServer: {
-        smoke: codexAppServerSmoke,
-        legalFiles: packagedRuntime.manifest.codexAppServer.legalFiles.map(({ path, size, sha256, sourceCommit }) => ({
-          path,
-          size,
-          sha256,
-          sourceCommit,
-        })),
-      },
     },
   }, null, 2))
 }
@@ -476,12 +467,22 @@ function verifyWindowsVersionInfo(value, projectPackage) {
   invariant(value.OriginalFilename === `${productName}.exe`, 'Windows OriginalFilename does not match this release.')
 }
 
-async function smokePackagedApplication(executablePath, packageDirectory) {
+async function smokePackagedApplication(executablePath, packageDirectory, packagedHostdPath) {
   const scratch = await mkdtemp(join(tmpdir(), 'prime-continuim-package-smoke-'))
+  const hostDataRoot = join(scratch, 'hostd')
+  await mkdir(hostDataRoot, { mode: 0o700 })
+  const primeAgentCustody = await createPrimeAgentSmokeCustody({
+    hostDataRoot,
+    hostdModule: require(packagedHostdPath),
+  })
+  await primeAgentCustody.assertInitiallyAbsent()
   const environment = { ...process.env }
   for (const name of ['ELECTRON_RUN_AS_NODE', 'ELECTRON_RENDERER_URL', 'NODE_OPTIONS', 'NODE_PATH']) delete environment[name]
   environment.PRIME_CONTINUIM_PACKAGE_SMOKE = '1'
-  environment.PRIME_AGENT_DATA_DIR = join(scratch, 'hostd')
+  environment.PRIME_AGENT_DATA_DIR = hostDataRoot
+  let primaryFailure
+  let applicationSmoke
+  let cleanShutdownConfirmed = false
   try {
     const { stdout } = await execFileAsync(executablePath, [`--user-data-dir=${join(scratch, 'user-data')}`, '--disable-gpu'], {
       cwd: packageDirectory,
@@ -492,10 +493,48 @@ async function smokePackagedApplication(executablePath, packageDirectory) {
     })
     const markers = stdout.split(/\r?\n/).filter((line) => line === PACKAGE_SMOKE_MARKER)
     invariant(markers.length === 1, 'The packaged application did not complete its main/preload/renderer bridge smoke exactly once.')
-    return { mainLoaded: true, preloadBridgeInstalled: true, rendererLoaded: true }
-  } finally {
-    await rm(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    cleanShutdownConfirmed = true
+    applicationSmoke = { mainLoaded: true, preloadBridgeInstalled: true, rendererLoaded: true }
+  } catch (error) {
+    primaryFailure = error
   }
+
+  const cleanupFailures = []
+  let custodyCleanupConfirmed = false
+  if (cleanShutdownConfirmed) {
+    try {
+      await primeAgentCustody.captureExisting()
+      await primeAgentCustody.removeAfterConfirmedShutdown({ confirmedCleanShutdown: true })
+      custodyCleanupConfirmed = true
+    } catch (error) {
+      cleanupFailures.push(new Error('Packaged application Prime Agent custody cleanup failed', { cause: error }))
+    }
+  } else {
+    cleanupFailures.push(new Error(
+      'Packaged application Prime Agent custody was retained because clean app and host shutdown was not confirmed',
+    ))
+  }
+  if (custodyCleanupConfirmed) {
+    try {
+      await rm(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    } catch (error) {
+      cleanupFailures.push(new Error('Packaged application smoke temporary-root cleanup failed', { cause: error }))
+    }
+  }
+  if (primaryFailure) {
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [primaryFailure, ...cleanupFailures],
+        'Packaged application smoke failed and cleanup was incomplete',
+      )
+    }
+    throw primaryFailure
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'Packaged application smoke cleanup was incomplete')
+  }
+  invariant(applicationSmoke, 'Packaged application smoke completed without an assurance result.')
+  return applicationSmoke
 }
 
 function validateRuntimePointer(pointer, inputs, label) {

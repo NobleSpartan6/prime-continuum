@@ -108,6 +108,47 @@ describe("runtime model catalog", () => {
     });
   });
 
+  it("invalidates cached provider status after Prime Agent OAuth completes", async () => {
+    const runHelper = vi.fn(async () => helperPayload());
+    const provider = new VerifiedRuntimeModelCatalog({
+      runtimeHandles: { acquireVerifiedRuntimeHandle: async () => verifiedHandle() },
+      runHelper,
+      cacheTtlMs: 60_000,
+      now: () => new Date("2026-08-09T12:00:00.000Z"),
+    });
+
+    const first = await provider.read();
+    expect(await provider.read()).toBe(first);
+    provider.invalidate();
+    expect(await provider.read()).not.toBe(first);
+    expect(runHelper).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks shared custody before serving a cached catalog and withdraws readiness on drift", async () => {
+    let secure = true;
+    const credentialSecurity = {
+      prepareAndVerify: vi.fn(async () => undefined),
+      assertStillSecure: vi.fn(async () => {
+        if (!secure) throw new Error("simulated custody drift");
+      }),
+    };
+    const runHelper = vi.fn(async () => helperPayload());
+    const provider = new VerifiedRuntimeModelCatalog({
+      runtimeHandles: { acquireVerifiedRuntimeHandle: async () => verifiedHandle() },
+      runHelper,
+      credentialSecurity,
+      cacheTtlMs: 60_000,
+      now: () => new Date("2026-08-09T12:00:00.000Z"),
+    });
+
+    await expect(provider.read()).resolves.toMatchObject({ runtime: "prime_agent" });
+    expect(runHelper).toHaveBeenCalledOnce();
+    secure = false;
+    await expect(provider.read()).rejects.toThrow("simulated custody drift");
+    await expect(provider.capabilityReady()).resolves.toBe(false);
+    expect(runHelper).toHaveBeenCalledOnce();
+  });
+
   it("fails closed when the isolated helper violates the private discovery contract", async () => {
     const provider = new VerifiedRuntimeModelCatalog({
       runtimeHandles: { acquireVerifiedRuntimeHandle: async () => verifiedHandle() },
@@ -283,8 +324,12 @@ describe("runtime model catalog", () => {
         "2026-08-07T12:00:00.000Z",
       );
       const read = vi.fn(async () => catalog);
+      let capabilityReady = true;
       const service = new HostService(store, undefined, undefined, {
-        runtimeModelCatalogProvider: { read },
+        runtimeModelCatalogProvider: {
+          read,
+          capabilityReady: vi.fn(async () => capabilityReady),
+        },
       });
 
       const health = await service.handle({
@@ -312,6 +357,19 @@ describe("runtime model catalog", () => {
       }, TRUSTED_USER_SESSION);
       expect(staleAuthority).toMatchObject({ ok: false, error: { code: "HOST_AUTHORITY_MISMATCH" } });
       expect(read).toHaveBeenCalledOnce();
+
+      capabilityReady = false;
+      const driftedHealth = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "model-catalog-health-drifted",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      expect(driftedHealth).toMatchObject({ ok: true });
+      if (!driftedHealth.ok || driftedHealth.method !== "health.get") {
+        throw new Error("Expected a health response after simulated catalog custody drift");
+      }
+      expect(driftedHealth.result.capabilities).not.toContain(RUNTIME_MODEL_CATALOG_CAPABILITY);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

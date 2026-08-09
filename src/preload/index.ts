@@ -1,7 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import {
   IPC,
-  type CodexSubscriptionBridge,
   type ClientCommand,
   type ConnectionTarget,
   type HandoffCommitRequest,
@@ -22,20 +21,7 @@ function subscribe<T>(channel: string, listener: (payload: T) => void): () => vo
   return () => ipcRenderer.removeListener(channel, handler)
 }
 
-const codexSubscription: CodexSubscriptionBridge = {
-  accountRead: (input) => invoke(IPC.codexSubscriptionAccountRead, input),
-  loginStart: (input) => invoke(IPC.codexSubscriptionLoginStart, input),
-  loginCancel: (input) => invoke(IPC.codexSubscriptionLoginCancel, input),
-  logout: (input) => invoke(IPC.codexSubscriptionLogout, input),
-  conversationSnapshot: (input) => invoke(IPC.codexSubscriptionConversationSnapshot, input),
-  turnStart: (input) => invoke(IPC.codexSubscriptionTurnStart, input),
-  turnInterrupt: (input) => invoke(IPC.codexSubscriptionTurnInterrupt, input),
-  turnReconcile: (input) => invoke(IPC.codexSubscriptionTurnReconcile, input),
-}
-Object.freeze(codexSubscription)
-
 const bridge: PrimeBridge = {
-  codexSubscription,
   bootstrap: () => invoke(IPC.bootstrap),
   discoverSshHosts: () => invoke(IPC.discoverSshHosts),
   probeSshHost: (input) => invoke(IPC.probeSshHost, input),

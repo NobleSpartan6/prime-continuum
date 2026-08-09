@@ -809,19 +809,10 @@ describe("runtime file-manifest namespace", () => {
     expect(() => parseRuntimeFileManifest(`${DIGEST}  a.js`, 1)).toThrow("canonical");
   });
 
-  it("admits only an exact schema-derived companion executable path", () => {
-    const executable = "companions/codex-app-server/bin/codex-app-server.exe";
-    expect(parseRuntimeFileManifest(
-      `${DIGEST}  ${executable}\n`,
-      1,
-      undefined,
-      new Set([executable]),
-    )).toEqual([{ path: executable, sha256: DIGEST }]);
+  it("rejects native executable payloads now that the runtime has no companion allowlist", () => {
     expect(() => parseRuntimeFileManifest(
-      `${DIGEST}  companions/codex-app-server/bin/other.exe\n`,
+      `${DIGEST}  companions/legacy/bin/backend.exe\n`,
       1,
-      undefined,
-      new Set([executable]),
     )).toThrow("unattested native executable");
   });
 });

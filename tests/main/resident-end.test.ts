@@ -496,6 +496,7 @@ describe('DesktopControlService resident end boundary', () => {
       service,
       getWindows: () => [],
       isTrustedSender: () => true,
+      isTrustedWorkbenchSender: () => true,
     })
     const event = {} as IpcMainInvokeEvent
 

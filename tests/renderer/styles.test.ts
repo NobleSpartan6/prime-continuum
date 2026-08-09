@@ -24,7 +24,6 @@ describe('renderer style contracts', () => {
     expect(darkTheme).toContain('--color-accent: oklch(0.64 0.19 292)')
     expect(css).toMatch(/\.app-shell\s*{[^}]*grid-template-columns:\s*16rem minmax\(25rem, 1fr\);/s)
     expect(css).toMatch(/\.nav-row,\s*\.thread-row\s*{[^}]*border-radius:\s*0\.1875rem;/s)
-    expect(css).toMatch(/\.backend-switch\s*{[^}]*background:\s*var\(--color-canvas\);[^}]*border:\s*1px solid var\(--color-border\);/s)
     expect(css).toMatch(/\.empty-workbench::before\s*{[^}]*background-size:\s*3rem 3rem, 3rem 3rem, 100% 100%;[^}]*pointer-events:\s*none;/s)
     expect(forcedColors).toMatch(/\.empty-workbench::before\s*{[^}]*display:\s*none;/s)
   })
@@ -54,6 +53,8 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.provider-rail\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*max-block-size:\s*10\.5rem;/s)
     expect(narrowLayout).toMatch(/\.provider-rail__summary\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);[^}]*border-inline-end:\s*0;/s)
     expect(narrowLayout).toMatch(/\.model-catalog\s*{[^}]*overflow-y:\s*auto;/s)
+    expect(narrowLayout).toMatch(/\.runtime-oauth-feedback\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s)
+    expect(narrowLayout).toMatch(/\.runtime-oauth-feedback > \.button\s*{[^}]*grid-column:\s*1;[^}]*grid-row:\s*auto;/s)
     expect(narrowLayout).toMatch(/\.model-list\s*{[^}]*flex:\s*none;[^}]*overflow-y:\s*visible;/s)
     expect(narrowLayout).toMatch(/\.resident-recovery\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
     expect(narrowLayout).toMatch(/\.resident-recovery > \.button\s*{[^}]*grid-column:\s*1 \/ -1;[^}]*inline-size:\s*100%;/s)
@@ -62,6 +63,7 @@ describe('renderer style contracts', () => {
     expect(narrowLayout).toMatch(/\.model-search input,\s*\.command-palette__input input\s*{[^}]*font-size:\s*1rem;/s)
     expect(css).toMatch(/body:has\(dialog\[open\]\) :is\(\.sidebar__scroll, \.transcript__scroller, \.inspector__panel\)\s*{[^}]*overflow-y:\s*hidden;/s)
     expect(css).toMatch(/\.task-state--stale\s*{[^}]*color:\s*var\(--color-text-muted\);/s)
+    expect(css).toMatch(/\.runtime-oauth-feedback\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*align-items:\s*center;/s)
     expect(css).toMatch(/\.message__receipt summary\s*{[^}]*min-block-size:\s*2rem;[^}]*cursor:\s*pointer;/s)
   })
 
@@ -85,7 +87,31 @@ describe('renderer style contracts', () => {
     expect(compactMinimumLayout).toMatch(/\.composer__connection--validation\s*{[^}]*display:\s*inline-flex;/s)
     expect(css).toMatch(/\.composer--compact\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;/s)
     expect(css).toMatch(/\.composer-wrap--compact \.session-continuity\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)
+    expect(css).toMatch(/\.session-continuity__summary\s*{[^}]*display:\s*flex;[^}]*min-inline-size:\s*0;/s)
     expect(css).not.toMatch(/\.companion-|\.pair-mobile-/)
+  })
+
+  it('collapses only nonessential composer context when a 320px workbench is extremely short', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const shortMinimumStart = css.indexOf('@media (max-width: 24rem) and (max-height: 28rem)')
+    const shortMinimumLayout = css.slice(
+      shortMinimumStart,
+      css.indexOf('@media (max-height: 28rem)', shortMinimumStart),
+    )
+
+    expect(shortMinimumStart).toBeGreaterThan(-1)
+    expect(css).toMatch(/\.thread-view\s*{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\) auto;/s)
+    expect(shortMinimumLayout).toMatch(/\.session-continuity,\s*\.composer__intent\s*{[^}]*display:\s*none;/s)
+    expect(shortMinimumLayout).not.toMatch(/\.composer__toolbar\s*{[^}]*display:\s*none;/s)
+    expect(shortMinimumLayout).not.toMatch(/\.composer__connection(?:--[\w-]+)?\s*{[^}]*display:\s*none;/s)
+    expect(shortMinimumLayout).not.toMatch(/\.composer__actions|\.model-chip|\.composer__primary-actions/)
+    expect(css).toMatch(/\.model-chip\s*{[^}]*min-block-size:\s*2\.5rem;/s)
+    expect(shortMinimumLayout).toMatch(/dialog\.sheet\.models-sheet,\s*\.models-sheet__surface\s*{[^}]*block-size:\s*calc\(100dvh - 0\.5rem\);[^}]*max-block-size:\s*calc\(100dvh - 0\.5rem\);/s)
+    expect(shortMinimumLayout).toMatch(/\.models-sheet__header\s*{[^}]*min-block-size:\s*3\.25rem;[^}]*padding:\s*0\.5rem 0\.75rem;/s)
+    expect(shortMinimumLayout).toMatch(/\.provider-rail\s*{[^}]*display:\s*block;[^}]*max-block-size:\s*3\.25rem;[^}]*overflow-y:\s*hidden;/s)
+    expect(shortMinimumLayout).toMatch(/\.provider-rail__summary\s*{[^}]*display:\s*none;/s)
+    expect(shortMinimumLayout).toMatch(/\.provider-rail nav button\s*{[^}]*min-block-size:\s*2\.75rem;/s)
+    expect(shortMinimumLayout).toMatch(/\.model-catalog\s*{[^}]*min-block-size:\s*2\.75rem;[^}]*overflow-y:\s*auto;/s)
   })
 
   it('keeps the explicit cached-computer action visible without adding motion at narrow widths', async () => {
@@ -137,22 +163,4 @@ describe('renderer style contracts', () => {
     expect(motionStyles).not.toMatch(/\.composer__connection--uncertain svg,/)
   })
 
-  it('keeps the Codex subscription surface operable at 320 pixels and in forced colors', async () => {
-    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
-    const codexNarrowStart = css.lastIndexOf('@media (max-width: 38rem)')
-    const codexNarrow = css.slice(codexNarrowStart, css.indexOf('@media (pointer: coarse)', codexNarrowStart))
-    const codexShortStart = css.lastIndexOf('@media (max-height: 28rem)')
-    const codexShort = css.slice(codexShortStart, css.indexOf('@media (pointer: coarse)', codexShortStart))
-    const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
-
-    expect(codexNarrow).toMatch(/\.codex-account-card\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);[^}]*inline-size:\s*calc\(100% - 1rem\);/s)
-    expect(codexNarrow).toMatch(/\.codex-account-card__actions\s*{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s)
-    expect(codexNarrow).toMatch(/\.codex-composer__footer\s*{[^}]*flex-direction:\s*column;/s)
-    expect(codexNarrow).toMatch(/\.codex-composer__submit\s*{[^}]*inline-size:\s*100%;/s)
-    expect(codexShort).toMatch(/\.codex-workspace\s*{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable;/s)
-    expect(codexShort).toMatch(/\.codex-account-card,\s*\.codex-workspace__center\s*{[^}]*grid-row:\s*auto;/s)
-    expect(forcedColors).toContain('.codex-composer textarea:focus-visible')
-    expect(forcedColors).toContain('.backend-switch')
-    expect(forcedColors).toContain('.codex-account-card')
-  })
 })

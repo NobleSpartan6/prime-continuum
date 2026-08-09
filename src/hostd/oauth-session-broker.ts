@@ -72,6 +72,7 @@ export interface HostOAuthStorage {
 
 /** Concrete host compositions may own helper processes in addition to both ports. */
 export interface HostOAuthComposition extends HostOAuthProviderPort, HostOAuthStorage {
+  initialize?(): Promise<void>;
   close?(): Promise<void>;
 }
 
@@ -167,6 +168,8 @@ interface AuthorityBinding {
 
 export interface StartOAuthSessionRequest extends AuthorityBinding {
   readonly providerId: string;
+  /** Stable across transport retries of one admitted start. */
+  readonly operationId: string;
 }
 
 export interface ReadOAuthSessionRequest extends AuthorityBinding {
@@ -187,6 +190,7 @@ interface OAuthSession {
   readonly sessionId: string;
   readonly providerId: string;
   readonly authorityId: string;
+  readonly startOperationKey: string;
   readonly expiresAtMs: number;
   readonly abortController: AbortController;
   readonly issuedChallengeIds: Set<string>;
@@ -224,6 +228,7 @@ export class HostOAuthSessionBroker {
   private readonly idFactory: () => string;
   private readonly sessions = new Map<string, OAuthSession>();
   private readonly providerRuns = new Map<string, string>();
+  private readonly startOperations = new Map<string, string>();
   private persistenceTail: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -253,6 +258,14 @@ export class HostOAuthSessionBroker {
     const nowMs = this.prepare(request);
     const providerId = boundedIdentifier(request.providerId, "OAuth provider identifier");
     const authorityId = boundedIdentifier(request.authorityId, "OAuth authority identifier");
+    const operationId = boundedIdentifier(request.operationId, "OAuth start operation identifier");
+    const startOperationKey = `${authorityId}\u0000${providerId}\u0000${operationId}`;
+    const retainedSessionId = this.startOperations.get(startOperationKey);
+    if (retainedSessionId) {
+      const retained = this.sessions.get(retainedSessionId);
+      if (retained) return snapshotOf(retained);
+      this.startOperations.delete(startOperationKey);
+    }
     const activeSessionId = this.providerRuns.get(providerId);
     if (activeSessionId) {
       const activeSession = this.sessions.get(activeSessionId);
@@ -284,12 +297,14 @@ export class HostOAuthSessionBroker {
       sessionId,
       providerId,
       authorityId,
+      startOperationKey,
       expiresAtMs: safeTimestamp(nowMs, this.activeTtlMs),
       abortController: new AbortController(),
       issuedChallengeIds: new Set(),
       phase: "starting",
     };
     this.sessions.set(sessionId, session);
+    this.startOperations.set(startOperationKey, sessionId);
     this.providerRuns.set(providerId, sessionId);
     session.expirationTimer = setTimeout(() => this.expireSession(sessionId), this.activeTtlMs);
     session.expirationTimer.unref?.();
@@ -593,6 +608,9 @@ export class HostOAuthSessionBroker {
         nowMs >= session.tombstoneExpiresAtMs
       ) {
         this.sessions.delete(sessionId);
+        if (this.startOperations.get(session.startOperationKey) === sessionId) {
+          this.startOperations.delete(session.startOperationKey);
+        }
       }
     }
   }

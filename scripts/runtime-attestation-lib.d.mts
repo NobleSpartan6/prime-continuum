@@ -1,9 +1,3 @@
-import type { CodexAppServerThreadStartPolicy } from "./prime-agent-runtime-lib.mjs";
-
-export type RuntimeCodexAppServerAttestation = Readonly<Record<string, unknown>> & Readonly<{
-  threadStartPolicy: Readonly<CodexAppServerThreadStartPolicy>;
-}>;
-
 export interface RuntimeAttestation {
   readonly schemaVersion: 1;
   readonly product: "Prime Continuim";
@@ -14,7 +8,6 @@ export interface RuntimeAttestation {
   readonly tree: Readonly<Record<string, unknown>>;
   readonly entrypoints: Readonly<Record<string, unknown>>;
   readonly daemon: Readonly<Record<string, unknown>>;
-  readonly codexAppServer?: RuntimeCodexAppServerAttestation;
   readonly nativeAddons: readonly Readonly<Record<string, unknown>>[];
   readonly hostRuntime: Readonly<Record<string, unknown>>;
 }

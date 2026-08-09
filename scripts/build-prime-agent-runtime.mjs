@@ -5,10 +5,8 @@ import {
   REPO_ROOT,
   RUNTIME_TEMPLATE_DIRECTORY,
   acquireBuildLock,
-  codexAppServerSupportedForTarget,
   createRuntimeManifest,
   discoverNpmCli,
-  installCodexAppServerCompanion,
   installLockedRuntime,
   loadRuntimeInputs,
   pruneEmptyRuntimeDirectories,
@@ -17,7 +15,6 @@ import {
   removeLegacyRuntimeAssetCache,
   removeObsoleteRuntimeInstalls,
   smokeRuntime,
-  smokeCodexAppServerCompanion,
   sha256File,
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
@@ -45,15 +42,8 @@ const stagingDirectory = join(
 
 try {
   const npmCli = await discoverNpmCli(argumentsValue.npmCli);
-  const verifiedAssets = await verifyReleaseAssets(inputs, assetCacheDirectory);
+  await verifyReleaseAssets(inputs, assetCacheDirectory);
   const reviewedAssetNames = inputs.sources.assets.map((asset) => `${asset.sha256}-${asset.fileName}`);
-  if (codexAppServerSupportedForTarget(inputs.policy)) {
-    const asset = inputs.sources.codexAppServer.asset;
-    reviewedAssetNames.push(`${asset.sha256}-${asset.fileName}`);
-    for (const legalFile of inputs.sources.codexAppServer.legalFiles) {
-      reviewedAssetNames.push(`${legalFile.sha256}-${legalFile.fileName}`);
-    }
-  }
   await removeLegacyRuntimeAssetCache(
     outputRoot,
     reviewedAssetNames,
@@ -62,25 +52,16 @@ try {
   await pruneRuntimePackagingNoise(stagingDirectory, inputs.policy);
   await pruneRuntimeForTarget(stagingDirectory);
   await pruneEmptyRuntimeDirectories(stagingDirectory);
-  const companionVerification = await installCodexAppServerCompanion({
-    inputs,
-    runtimeDirectory: stagingDirectory,
-    verifiedAssets,
-  });
   const smoke = await smokeRuntime(stagingDirectory, {
     runtimeExecutable,
     electronRunAsNode: argumentsValue.electronRunAsNode,
     policy: inputs.policy,
   });
-  const companionSmoke = await smokeCodexAppServerCompanion(stagingDirectory, { policy: inputs.policy });
   const manifest = await createRuntimeManifest({
     runtimeDirectory: stagingDirectory,
     inputs,
     npmVersion,
     smoke,
-    ...(companionVerification && companionSmoke
-      ? { codexAppServer: { verification: companionVerification, smoke: companionSmoke } }
-      : {}),
   });
   await verifyBuiltRuntime(stagingDirectory, { inputs, policy: inputs.policy });
   const manifestSha256 = await sha256File(join(stagingDirectory, "runtime.json"));

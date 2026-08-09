@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import runtimePolicy from "../../runtime/prime-agent/runtime-policy.json";
-import { CODEX_APP_SERVER_LEGAL_FILES } from "../../scripts/codex-app-server-policy-lib.mjs";
 
 declare const __PRIME_CONTINUIM_RUNTIME_ATTESTATION_RECORD__: string | undefined;
 
@@ -8,117 +6,6 @@ export const RUNTIME_ATTESTATION_RECORD_PREFIX = "PRIME_CONTINUIM_RUNTIME_ATTEST
 export const MAX_RUNTIME_ATTESTATION_BYTES = 256 * 1024;
 
 export type RuntimeAssurance = "development-integrity" | "production-authenticated";
-
-export interface EmbeddedCodexAppServerThreadStartPolicy {
-  readonly requiredCapability: "experimentalApi";
-  readonly requestKeys: readonly [
-    "modelProvider",
-    "cwd",
-    "runtimeWorkspaceRoots",
-    "approvalPolicy",
-    "approvalsReviewer",
-    "sandbox",
-    "config",
-    "ephemeral",
-    "environments",
-    "dynamicTools",
-    "selectedCapabilityRoots",
-    "experimentalRawEvents",
-  ];
-  readonly modelProvider: "openai";
-  readonly cwd: "absolute-workspace";
-  readonly runtimeWorkspaceRoots: "exact-cwd-only";
-  readonly approvalPolicy: "never";
-  readonly approvalsReviewer: "user";
-  readonly sandbox: "read-only";
-  readonly config: "attested-thread-config";
-  readonly ephemeral: false;
-  readonly environments: readonly [];
-  readonly dynamicTools: readonly [];
-  readonly selectedCapabilityRoots: readonly [];
-  readonly experimentalRawEvents: false;
-  readonly deleteAfterSmoke: true;
-  readonly expectedSecurityResponse: Readonly<{
-    model: "gpt-5.6-sol";
-    modelProvider: "openai";
-    runtimeWorkspaceRoots: readonly [];
-    instructionSources: readonly [];
-    approvalPolicy: "never";
-    approvalsReviewer: "user";
-    sandbox: Readonly<{ type: "readOnly"; networkAccess: false }>;
-    activePermissionProfile: null;
-    multiAgentMode: "explicitRequestOnly";
-  }>;
-}
-
-export interface EmbeddedCodexAppServerAttestation {
-  readonly releaseVersion: "0.147.0";
-  readonly platform: "win32";
-  readonly arch: "x64";
-  readonly target: "x86_64-pc-windows-msvc";
-  readonly entrypoint: "companions/codex-app-server/bin/codex-app-server.exe";
-  readonly fixedArguments: readonly string[];
-  readonly legalFiles: readonly Readonly<{
-    fileName: string;
-    path: "legal/LICENSE" | "legal/NOTICE";
-    url: string;
-    sourceCommit: string;
-    size: number;
-    sha256: string;
-  }>[];
-  readonly sessionConfig: Readonly<Record<string, unknown>>;
-  readonly threadConfig: Readonly<Record<string, boolean | string>>;
-  readonly initializeIdentity: Readonly<{
-    clientInfoName: "prime_continuim";
-    clientInfoTitle: "Prime Continuim";
-    capabilities: Readonly<{ experimentalApi: true }>;
-    userAgentTemplate: "prime_continuim/0.147.0 (Windows <major>.<minor>.<build>; x86_64) unknown (prime_continuim; <clientVersion>)";
-    platformFamily: "windows";
-    platformOs: "windows";
-  }>;
-  readonly threadStartPolicy: Readonly<EmbeddedCodexAppServerThreadStartPolicy>;
-  readonly environmentPolicy: Readonly<{
-    inherit: "none";
-    requiredSourceVariables: readonly ["SystemRoot", "WINDIR"];
-    constructedVariables: readonly ["ComSpec", "TEMP", "TMP", "PATH", "PATHEXT", "CODEX_HOME"];
-    privateTemporaryDirectoryRequired: true;
-    pathEntries: readonly ["codex-path", "System32", "WindowsPowerShell/v1.0"];
-    pathExt: ".COM;.EXE;.BAT;.CMD";
-  }>;
-  readonly codexHomePolicy: Readonly<{
-    requireEmptyAtLaunch: true;
-    allowedGeneratedSystemSkillsRoot: "skills/.system";
-    forbiddenBasenames: readonly string[];
-    forbiddenTopLevelDirectories: readonly string[];
-    forbiddenExecutableExtensions: readonly string[];
-  }>;
-  readonly assetSha256: string;
-  readonly publisher: Readonly<{
-    subject: string;
-    thumbprint: string;
-    signedFiles: readonly string[];
-    unsignedFiles: readonly string[];
-  }>;
-  readonly smoke: Readonly<{
-    protocol: "jsonl-stdio";
-    initialize: true;
-    initializeIdentity: true;
-    configRead: true;
-    denyVectorEffective: true;
-    windowsSandboxUnelevatedPrivateDesktop: true;
-    mcpServersEmpty: true;
-    hooksEmpty: true;
-    pluginsEmpty: true;
-    appsEmpty: true;
-    threadStartReadOnly: true;
-    threadNetworkAccessDisabled: true;
-    threadDeleted: true;
-    accountReadSignedOut: true;
-    requiresOpenaiAuth: true;
-    forbiddenConfigAbsent: true;
-    authJsonAbsent: true;
-  }>;
-}
 
 export interface EmbeddedRuntimeAttestation {
   readonly schemaVersion: 1;
@@ -154,7 +41,6 @@ export interface EmbeddedRuntimeAttestation {
     schemaId: string;
     requiredCapabilities: readonly string[];
   }>;
-  readonly codexAppServer?: EmbeddedCodexAppServerAttestation;
   readonly nativeAddons: readonly Readonly<{ path: string; size: number; sha256: string }>[];
   readonly hostRuntime: Readonly<{
     kind: "electron-run-as-node";
@@ -238,6 +124,19 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
   const daemon = value.daemon;
   const hostRuntime = value.hostRuntime;
   return (
+    jsonEqual(Object.keys(value).sort(), [
+      "schemaVersion",
+      "product",
+      "assurance",
+      "runtimePolicySchemaVersion",
+      "runtime",
+      "manifest",
+      "tree",
+      "entrypoints",
+      "daemon",
+      "nativeAddons",
+      "hostRuntime",
+    ].sort()) &&
     value.schemaVersion === 1 &&
     value.product === "Prime Continuim" &&
     (value.assurance === "development-integrity" || value.assurance === "production-authenticated") &&
@@ -275,7 +174,6 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
     daemon.requiredCapabilities.length <= 32 &&
     daemon.requiredCapabilities.every(isBoundedString) &&
     new Set(daemon.requiredCapabilities).size === daemon.requiredCapabilities.length &&
-    (value.codexAppServer === undefined || isCodexAppServerAttestation(value.codexAppServer)) &&
     Array.isArray(value.nativeAddons) &&
     value.nativeAddons.length > 0 &&
     value.nativeAddons.length <= 32 &&
@@ -289,64 +187,6 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
     isBoundedString(hostRuntime.platform) &&
     isBoundedString(hostRuntime.arch) &&
     hostRuntime.runAsNode === true
-  );
-}
-
-function isCodexAppServerAttestation(value: unknown): value is EmbeddedCodexAppServerAttestation {
-  if (
-    !isRecord(value) ||
-    !isRecord(value.publisher) ||
-    !isRecord(value.smoke) ||
-    !isRecord(value.sessionConfig) ||
-    !isRecord(value.threadConfig) ||
-    !isRecord(value.initializeIdentity) ||
-    !isRecord(value.threadStartPolicy) ||
-    !isRecord(value.environmentPolicy) ||
-    !isRecord(value.codexHomePolicy)
-  ) return false;
-  const contract = runtimePolicy.codexAppServer;
-  const signedFiles = [
-    "bin/codex-app-server.exe",
-    "bin/codex-code-mode-host.exe",
-    "codex-resources/codex-command-runner.exe",
-    "codex-resources/codex-windows-sandbox-setup.exe",
-  ];
-  return (
-    value.releaseVersion === "0.147.0" &&
-    value.platform === "win32" &&
-    value.arch === "x64" &&
-    value.target === "x86_64-pc-windows-msvc" &&
-    value.entrypoint === "companions/codex-app-server/bin/codex-app-server.exe" &&
-    jsonEqual(value.fixedArguments, contract.fixedArguments) &&
-    jsonEqual(value.legalFiles, CODEX_APP_SERVER_LEGAL_FILES) &&
-    jsonEqual(value.sessionConfig, contract.sessionConfig) &&
-    jsonEqual(value.threadConfig, contract.threadConfig) &&
-    jsonEqual(value.initializeIdentity, contract.initializeIdentity) &&
-    jsonEqual(value.threadStartPolicy, contract.threadStartPolicy) &&
-    jsonEqual(value.environmentPolicy, contract.environmentPolicy) &&
-    jsonEqual(value.codexHomePolicy, contract.codexHomePolicy) &&
-    isSha256(value.assetSha256) &&
-    value.publisher.subject === 'CN="OpenAI OpCo, LLC", O="OpenAI OpCo, LLC", L=San Francisco, S=California, C=US' &&
-    value.publisher.thumbprint === "8B0ADFB840E141DAD3044D2B5AC819873DDE3590" &&
-    jsonEqual(value.publisher.signedFiles, signedFiles) &&
-    jsonEqual(value.publisher.unsignedFiles, ["codex-path/rg.exe"]) &&
-    value.smoke.protocol === "jsonl-stdio" &&
-    value.smoke.initialize === true &&
-    value.smoke.initializeIdentity === true &&
-    value.smoke.configRead === true &&
-    value.smoke.denyVectorEffective === true &&
-    value.smoke.windowsSandboxUnelevatedPrivateDesktop === true &&
-    value.smoke.mcpServersEmpty === true &&
-    value.smoke.hooksEmpty === true &&
-    value.smoke.pluginsEmpty === true &&
-    value.smoke.appsEmpty === true &&
-    value.smoke.threadStartReadOnly === true &&
-    value.smoke.threadNetworkAccessDisabled === true &&
-    value.smoke.threadDeleted === true &&
-    value.smoke.accountReadSignedOut === true &&
-    value.smoke.requiresOpenaiAuth === true &&
-    value.smoke.forbiddenConfigAbsent === true &&
-    value.smoke.authJsonAbsent === true
   );
 }
 

@@ -6,10 +6,9 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
-using System.Text.RegularExpressions;
 public static class PrimeContinuimJobRunner {
  const uint CREATE_SUSPENDED=4, EXTENDED_STARTUPINFO_PRESENT=0x80000, STARTF_USESTDHANDLES=0x100, KILL_ON_CLOSE=0x2000, INFINITE=0xffffffff, WAIT_OBJECT_0=0;
- const int ExtendedLimits=9, BasicAccounting=1, ERROR_ALREADY_EXISTS=183;
+ const int ExtendedLimits=9, BasicAccounting=1;
  static readonly UIntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST=(UIntPtr)0x0002000D;
  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct STARTUPINFO { public int cb; public string a,b,c; public uint x,y,xs,ys,xc,yc,fill,flags; public short show,reserved; public IntPtr reserved2,input,output,error; }
  [StructLayout(LayoutKind.Sequential)] struct STARTUPINFOEX { public STARTUPINFO startup; public IntPtr attributes; }
@@ -34,42 +33,10 @@ public static class PrimeContinuimJobRunner {
  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int n);
  static void Check(bool ok,string operation) { if(!ok) throw new Win32Exception(Marshal.GetLastWin32Error(),operation); }
  static Exception First(Exception current,Exception next) { return current??next; }
- static Mutex AcquireOwnership(string name) {
-  if(String.IsNullOrEmpty(name))return null;
-  if(!Regex.IsMatch(name,@"^Global\\PrimeContinuim\.CodexAppServer\.[0-9a-f]{64}$",RegexOptions.CultureInvariant))throw new ArgumentException("Job ownership name is invalid.");
-  bool created=false,acquired=false; Mutex mutex=null;
+ public static int Run(string executable,string commandLine,string cwd) {
+  IntPtr job=IntPtr.Zero,process=IntPtr.Zero,thread=IntPtr.Zero,attributes=IntPtr.Zero,jobValue=IntPtr.Zero; bool resumed=false;
   try {
-   mutex=new Mutex(true,name,out created); acquired=created;
-   if(!acquired){try{acquired=mutex.WaitOne(0);}catch(AbandonedMutexException){acquired=true;}}
-   if(!acquired)throw new InvalidOperationException("A Codex app-server Job already owns this protected home.");
-   return mutex;
-  } catch { if(mutex!=null){if(acquired)try{mutex.ReleaseMutex();}catch{} mutex.Dispose();} throw; }
- }
- static bool JobIsEmpty(IntPtr job) {
-  int size=Marshal.SizeOf(typeof(ACCOUNTING)); IntPtr accounting=Marshal.AllocHGlobal(size);
-  try { uint returned; Check(QueryInformationJobObject(job,BasicAccounting,accounting,(uint)size,out returned),"QueryInformationJobObject failed"); return ((ACCOUNTING)Marshal.PtrToStructure(accounting,typeof(ACCOUNTING))).active==0; }
-  finally { Marshal.FreeHGlobal(accounting); }
- }
- static void HoldOwnershipUntilJobIsEmpty(IntPtr job) {
-  for(;;){try{if(JobIsEmpty(job))return;}catch{} Thread.Sleep(50);}
- }
- static IntPtr CreateExclusiveJob(string ownershipJobName) {
-  if(String.IsNullOrEmpty(ownershipJobName)){IntPtr unnamed=CreateJobObject(IntPtr.Zero,null);Check(unnamed!=IntPtr.Zero,"CreateJobObject failed");return unnamed;}
-  if(!Regex.IsMatch(ownershipJobName,@"^Global\\PrimeContinuim\.CodexAppServer\.Job\.[0-9a-f]{64}$",RegexOptions.CultureInvariant))throw new ArgumentException("Job ownership object name is invalid.");
-  for(;;){
-   IntPtr candidate=CreateJobObject(IntPtr.Zero,ownershipJobName); int createError=Marshal.GetLastWin32Error(); Check(candidate!=IntPtr.Zero,"CreateJobObject failed");
-   if(createError!=ERROR_ALREADY_EXISTS)return candidate;
-   try { TerminateJobObject(candidate,1); HoldOwnershipUntilJobIsEmpty(candidate); }
-   finally { if(!CloseHandle(candidate)){for(;;)Thread.Sleep(1000);} }
-   Thread.Sleep(50);
-  }
- }
- public static int Run(string executable,string commandLine,string cwd,string ownershipMutexName,string ownershipJobName) {
-  IntPtr job=IntPtr.Zero,process=IntPtr.Zero,thread=IntPtr.Zero,attributes=IntPtr.Zero,jobValue=IntPtr.Zero; bool resumed=false; Mutex ownership=null;
-  try {
-   if(String.IsNullOrEmpty(ownershipMutexName)!=String.IsNullOrEmpty(ownershipJobName))throw new ArgumentException("Job ownership payload is incomplete.");
-   ownership=AcquireOwnership(ownershipMutexName);
-   job=CreateExclusiveJob(ownershipJobName);
+   job=CreateJobObject(IntPtr.Zero,null); Check(job!=IntPtr.Zero,"CreateJobObject failed");
    var limits=new EXTENDED_LIMITS(); limits.basic.flags=KILL_ON_CLOSE; int ls=Marshal.SizeOf(typeof(EXTENDED_LIMITS)); IntPtr lp=Marshal.AllocHGlobal(ls);
    try { Marshal.StructureToPtr(limits,lp,false); Check(SetInformationJobObject(job,ExtendedLimits,lp,(uint)ls),"SetInformationJobObject failed"); } finally { Marshal.FreeHGlobal(lp); }
    IntPtr attributeSize=IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref attributeSize); if(attributeSize==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error(),"Attribute-list sizing failed");
@@ -80,14 +47,14 @@ public static class PrimeContinuimJobRunner {
    if(ResumeThread(thread)==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread failed"); resumed=true;
     Check(WaitForSingleObject(process,INFINITE)==WAIT_OBJECT_0,"Process wait failed"); uint exitCode; Check(GetExitCodeProcess(process,out exitCode),"GetExitCodeProcess failed");
     Check(TerminateJobObject(job,exitCode),"TerminateJobObject failed"); int size=Marshal.SizeOf(typeof(ACCOUNTING)); IntPtr ap=Marshal.AllocHGlobal(size);
-     try { for(int n=0;n<100;n++){ uint returned; Check(QueryInformationJobObject(job,BasicAccounting,ap,(uint)size,out returned),"QueryInformationJobObject failed"); var a=(ACCOUNTING)Marshal.PtrToStructure(ap,typeof(ACCOUNTING)); if(a.active==0)return unchecked((int)exitCode); Thread.Sleep(50); } if(ownership!=null){HoldOwnershipUntilJobIsEmpty(job);return unchecked((int)exitCode);} throw new TimeoutException("Windows job descendants did not terminate within 5 seconds."); }
+     try { for(int n=0;n<100;n++){ uint returned; Check(QueryInformationJobObject(job,BasicAccounting,ap,(uint)size,out returned),"QueryInformationJobObject failed"); var a=(ACCOUNTING)Marshal.PtrToStructure(ap,typeof(ACCOUNTING)); if(a.active==0)return unchecked((int)exitCode); Thread.Sleep(50); } throw new TimeoutException("Windows job descendants did not terminate within 5 seconds."); }
     finally { Marshal.FreeHGlobal(ap); }
-  } finally { Exception cleanup=null; if(process!=IntPtr.Zero&&!resumed&&!TerminateProcess(process,1))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"TerminateProcess failed during suspended-child cleanup")); if(job!=IntPtr.Zero&&ownership!=null){try{TerminateJobObject(job,1);HoldOwnershipUntilJobIsEmpty(job);}catch{HoldOwnershipUntilJobIsEmpty(job);}} if(thread!=IntPtr.Zero&&!CloseHandle(thread))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Thread-handle close failed")); if(job!=IntPtr.Zero&&!CloseHandle(job))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Job-handle close failed")); if(process!=IntPtr.Zero&&!resumed&&WaitForSingleObject(process,5000)!=WAIT_OBJECT_0)cleanup=First(cleanup,new TimeoutException("Suspended in-job child termination was not confirmed.")); if(process!=IntPtr.Zero&&!CloseHandle(process))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Process-handle close failed")); if(attributes!=IntPtr.Zero){DeleteProcThreadAttributeList(attributes);Marshal.FreeHGlobal(attributes);} if(jobValue!=IntPtr.Zero)Marshal.FreeHGlobal(jobValue); if(ownership!=null){try{ownership.ReleaseMutex();}catch(Exception e){cleanup=First(cleanup,e);} ownership.Dispose();} if(cleanup!=null)throw cleanup; }
+  } finally { Exception cleanup=null; if(process!=IntPtr.Zero&&!resumed&&!TerminateProcess(process,1))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"TerminateProcess failed during suspended-child cleanup")); if(thread!=IntPtr.Zero&&!CloseHandle(thread))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Thread-handle close failed")); if(job!=IntPtr.Zero&&!CloseHandle(job))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Job-handle close failed")); if(process!=IntPtr.Zero&&!resumed&&WaitForSingleObject(process,5000)!=WAIT_OBJECT_0)cleanup=First(cleanup,new TimeoutException("Suspended in-job child termination was not confirmed.")); if(process!=IntPtr.Zero&&!CloseHandle(process))cleanup=First(cleanup,new Win32Exception(Marshal.GetLastWin32Error(),"Process-handle close failed")); if(attributes!=IntPtr.Zero){DeleteProcThreadAttributeList(attributes);Marshal.FreeHGlobal(attributes);} if(jobValue!=IntPtr.Zero)Marshal.FreeHGlobal(jobValue); if(cleanup!=null)throw cleanup; }
   }
 }
 '@
 try {
  $configuration=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Payload))|ConvertFrom-Json
- $code=[PrimeContinuimJobRunner]::Run([string]$configuration.executable,[string]$configuration.commandLine,[string]$configuration.cwd,[string]$configuration.ownershipMutexName,[string]$configuration.ownershipJobName)
+ $code=[PrimeContinuimJobRunner]::Run([string]$configuration.executable,[string]$configuration.commandLine,[string]$configuration.cwd)
  [Environment]::Exit($code)
 } catch { [Console]::Error.WriteLine("Prime Continuim Windows job supervisor failed: $($_.Exception.Message)"); [Environment]::Exit(1) }

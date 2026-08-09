@@ -15,16 +15,15 @@ import { HostService } from "./service";
 import { HostStore } from "./store";
 import { CandidateEvaluationCoordinator } from "./candidate-evaluation";
 import { CandidateEvaluationStore } from "./candidate-evaluation-store";
-import { CodexSubscriptionBackend } from "./codex-subscription-backend";
+import {
+  HostScopedPrimeAgentAuthSecurity,
+  SharedPrimeAgentRuntimeSecurityGuard,
+  resolvePrimeAgentRuntimeDirectory,
+} from "./prime-agent-auth-security";
 
 export * from "./gateway";
 export * from "./candidate-evaluation";
 export * from "./candidate-evaluation-store";
-export * from "./codex-app-server-client";
-export * from "./codex-app-server-process";
-export * from "./codex-home-security";
-export * from "./codex-subscription-backend";
-export * from "./codex-subscription-store";
 export * from "./oauth-session-broker";
 export * from "./paths";
 export * from "./probe";
@@ -32,6 +31,7 @@ export * from "./prime-agent-resident-adapter";
 export * from "./prime-agent-resident-worker-entry";
 export * from "./prime-agent-resident-worker-protocol";
 export * from "./prime-agent-resident-worker-proxy";
+export * from "./prime-agent-auth-security";
 export * from "./resident-runtime";
 export * from "./runtime-attestation";
 export * from "./runtime-initialization-coordinator";
@@ -39,6 +39,7 @@ export * from "./runtime-integrity-manager";
 export * from "./runtime-model-catalog";
 export * from "./runtime-oauth";
 export * from "./verified-resident-gateway";
+export * from "./windows-security-descriptor";
 export * from "./server";
 export * from "./service";
 export * from "./store";
@@ -86,6 +87,11 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
   try {
     const target = await resolveCanonicalLocalHostTarget(options.dataDir, { create: true });
     const store = new HostStore(target.dataDirectory);
+    const primeAgentDirectory = resolvePrimeAgentRuntimeDirectory(target.dataDirectory);
+    const primeAgentEnvironment = Object.freeze({
+      ...process.env,
+      PRIME_AGENT_CODING_AGENT_DIR: primeAgentDirectory,
+    });
     const runtimeAttestation = readEmbeddedRuntimeAttestationEnvelope();
     const runtimeInitialization = runtimeAttestation
         ? new RuntimeInitializationCoordinator({
@@ -96,8 +102,19 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
               : {}),
           })
       : undefined;
+    const primeAgentRuntimeSecurity = runtimeInitialization
+      ? new SharedPrimeAgentRuntimeSecurityGuard({
+          security: new HostScopedPrimeAgentAuthSecurity(),
+          hostDataRoot: target.dataDirectory,
+          agentDirectory: primeAgentDirectory,
+        })
+      : undefined;
     const runtimeModelCatalog = runtimeInitialization
-      ? new VerifiedRuntimeModelCatalog({ runtimeHandles: runtimeInitialization })
+      ? new VerifiedRuntimeModelCatalog({
+          runtimeHandles: runtimeInitialization,
+          helperEnvironment: primeAgentEnvironment,
+          credentialSecurity: primeAgentRuntimeSecurity,
+        })
       : undefined;
     const candidateEvaluation = runtimeInitialization
       ? new CandidateEvaluationCoordinator({
@@ -105,22 +122,19 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
           persistence: new CandidateEvaluationStore(store.paths),
         })
       : undefined;
-    const runtimeOAuthComposition = runtimeInitialization && plaintextRuntimeOAuthDevelopmentEnabled(process.env)
-      ? new VerifiedRuntimeOAuthComposition({ runtimeHandles: runtimeInitialization })
+    const runtimeOAuthComposition = runtimeInitialization
+      ? new VerifiedRuntimeOAuthComposition({
+          runtimeHandles: runtimeInitialization,
+          environment: primeAgentEnvironment,
+          credentialSecurity: primeAgentRuntimeSecurity,
+        })
       : undefined;
     const residentGateway = runtimeInitialization
       ? new VerifiedResidentGateway({
           store,
           runtimeHandles: runtimeInitialization,
-          environment: process.env,
-        })
-      : undefined;
-    const codexSubscriptionBackend = runtimeInitialization
-      ? new CodexSubscriptionBackend({
-          paths: store.paths,
-          authorityStore: store,
-          runtimeHandles: runtimeInitialization,
-          clientVersion: HOSTD_VERSION,
+          environment: primeAgentEnvironment,
+          credentialSecurity: primeAgentRuntimeSecurity,
         })
       : undefined;
     const service = new HostService(
@@ -134,7 +148,6 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         runtimeModelCatalogProvider: runtimeModelCatalog,
         runtimeOAuthComposition,
         candidateEvaluationCoordinator: candidateEvaluation,
-        codexSubscriptionBackend,
       },
     );
     const endpoint = options.socket ?? target.endpoint;
@@ -164,17 +177,6 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
     // Remove the otherwise-live signal listeners so that failure can exit.
     termination.cancel();
   }
-}
-
-/**
- * Prime Agent v0.7.0 stores OAuth credentials in plaintext auth.json. Keep the
- * checkpoint unreachable in normal production startup until keyring custody
- * and durable restart receipts exist.
- */
-export function plaintextRuntimeOAuthDevelopmentEnabled(
-  environment: Readonly<NodeJS.ProcessEnv>,
-): boolean {
-  return environment.PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV === "1";
 }
 
 function reportChannelCloseFailure(diagnostic: ChannelCloseFailureDiagnostic): void {

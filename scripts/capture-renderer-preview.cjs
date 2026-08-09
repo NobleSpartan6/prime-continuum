@@ -25,6 +25,46 @@ const targets = [
     expectedText: 'Ready for a new prompt',
   },
   {
+    name: 'model-selection-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'model-selection',
+    expectedText: 'Choose a model for this thread’s next prompt. This changes the resident session only; it does not send a prompt. “Available” means Prime Agent reports provider access, not that an inference smoke test passed.',
+    expectModelAction: 'Use model GPT-5.6 Terra',
+    openModelsDialog: true,
+  },
+  {
+    name: 'model-selection-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'model-selection',
+    expectedText: 'Choose a model for this thread’s next prompt. This changes the resident session only; it does not send a prompt. “Available” means Prime Agent reports provider access, not that an inference smoke test passed.',
+    expectModelAction: 'Use model GPT-5.6 Terra',
+    openModelsDialog: true,
+    expectShortModelsDialog: true,
+  },
+  {
+    name: 'prime-oauth-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'prime-oauth',
+    expectedText: 'Prime Agent 0.7.0 stores OAuth credentials in its host-only auth.json, protected by this operating-system account’s file permissions.',
+    expectOAuthAction: 'Connect ChatGPT',
+    selectProviderId: 'openai-codex',
+    openModelsDialog: true,
+  },
+  {
+    name: 'prime-oauth-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'prime-oauth',
+    expectedText: 'Prime Agent 0.7.0 stores OAuth credentials in its host-only auth.json, protected by this operating-system account’s file permissions.',
+    expectOAuthAction: 'Connect ChatGPT',
+    selectProviderId: 'openai-codex',
+    openModelsDialog: true,
+    expectShortModelsDialog: true,
+  },
+  {
     name: 'desktop-prompt-admission',
     width: 1200,
     height: 800,
@@ -142,44 +182,6 @@ const targets = [
     expectShortCandidateEvaluationDialog: true,
   },
   {
-    name: 'codex-signed-out-390',
-    width: 390,
-    height: 844,
-    visualState: 'codex-subscription-signed-out',
-    expectedText: 'Uses your ChatGPT plan; API-key billing is separate. This does not sign Prime Agent in.',
-    openCodexWorkspace: true,
-    expectCodexAction: 'Continue with ChatGPT',
-  },
-  {
-    name: 'codex-signed-out-short-320',
-    width: 320,
-    height: 256,
-    visualState: 'codex-subscription-signed-out',
-    expectedText: 'Uses your ChatGPT plan; API-key billing is separate. This does not sign Prime Agent in.',
-    openCodexWorkspace: true,
-    expectCodexAction: 'Continue with ChatGPT',
-    expectShortCodex: true,
-  },
-  {
-    name: 'codex-ready-390',
-    width: 390,
-    height: 844,
-    visualState: 'codex-subscription-ready',
-    expectedText: 'Read-only execution · approval requests are denied',
-    openCodexWorkspace: true,
-    expectCodexAction: 'Run with Codex',
-  },
-  {
-    name: 'codex-ready-short-320',
-    width: 320,
-    height: 256,
-    visualState: 'codex-subscription-ready',
-    expectedText: 'Read-only execution · approval requests are denied',
-    openCodexWorkspace: true,
-    expectCodexAction: 'Run with Codex',
-    expectShortCodex: true,
-  },
-  {
     name: 'hud-expanded',
     width: 620,
     height: 380,
@@ -289,6 +291,95 @@ async function capture(target, rendererOrigin) {
     if (target.surface) rendererUrl.searchParams.set('surface', target.surface)
     await browserWindow.loadURL(rendererUrl.href)
     await waitForSurface(browserWindow, target)
+    if (target.openModelsDialog) {
+      // Paint the real native surface offscreen, then use the visible composer
+      // action that a person would use. The model actions themselves remain
+      // untouched: this target is evidence for discoverability and reachability,
+      // never an execution fixture.
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+      const modelTriggerEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = document.querySelector('button.model-chip')
+        const rect = button?.getBoundingClientRect()
+        const style = button ? window.getComputedStyle(button) : undefined
+        const visible = Boolean(
+          button instanceof HTMLButtonElement &&
+          !button.disabled &&
+          style &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.left >= 0 &&
+          rect.right <= window.innerWidth &&
+          rect.top >= 0 &&
+          rect.bottom <= window.innerHeight
+        )
+        if (button instanceof HTMLButtonElement && visible) button.click()
+        return {
+          found: button instanceof HTMLButtonElement,
+          enabled: button instanceof HTMLButtonElement && !button.disabled,
+          visible,
+          rect: rect ? { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom } : undefined,
+        }
+      })()`)
+      invariant(
+        modelTriggerEvidence.visible,
+        `${target.name} did not expose the visible Models & accounts composer action: ${JSON.stringify(modelTriggerEvidence)}`,
+      )
+      if (target.selectProviderId) {
+        const providerDeadline = Date.now() + 10_000
+        while (Date.now() < providerDeadline) {
+          const selected = await browserWindow.webContents.executeJavaScript(`(() => {
+            const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
+            const button = dialog?.querySelector('button[data-provider-id=${JSON.stringify(target.selectProviderId)}]')
+            if (!(button instanceof HTMLButtonElement)) return false
+            button.click()
+            return true
+          })()`)
+          if (selected) break
+          await delay(25)
+        }
+      }
+      const dialogDeadline = Date.now() + 10_000
+      while (Date.now() < dialogDeadline) {
+        const ready = await browserWindow.webContents.executeJavaScript(`(() => {
+          const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
+          const action = [...(dialog?.querySelectorAll('button') ?? [])]
+            .find((candidate) => ${target.expectModelAction
+              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
+          return Boolean(dialog && action instanceof HTMLButtonElement && !action.disabled)
+        })()`)
+        if (ready) break
+        await delay(25)
+      }
+      await delay(300)
+      if (target.expectShortModelsDialog) {
+        const shortModelScrollEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
+          const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
+          const catalog = dialog?.querySelector('.model-catalog')
+          const action = [...(dialog?.querySelectorAll('button') ?? [])]
+            .find((candidate) => ${target.expectModelAction
+              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
+          if (!(catalog instanceof HTMLElement) || !(action instanceof HTMLButtonElement) || action.disabled) {
+            return { ready: false }
+          }
+          const catalogRect = catalog.getBoundingClientRect()
+          const actionRect = action.getBoundingClientRect()
+          if (actionRect.top < catalogRect.top || actionRect.bottom > catalogRect.bottom) {
+            const centeredOffset = actionRect.top - catalogRect.top - Math.max(0, (catalog.clientHeight - actionRect.height) / 2)
+            const maximumScrollTop = Math.max(0, catalog.scrollHeight - catalog.clientHeight)
+            catalog.scrollTop = Math.min(maximumScrollTop, Math.max(0, catalog.scrollTop + centeredOffset))
+          }
+          return { ready: true }
+        })()`)
+        invariant(shortModelScrollEvidence.ready, `${target.name} did not expose an enabled model action to its catalog scroller`)
+        await delay(75)
+      }
+    }
     if (target.openResidentDialog) {
       // Chromium does not composite top-layer dialogs into capturePage() for
       // a never-shown window. Show it inactive and far outside every normal
@@ -382,48 +473,10 @@ async function capture(target, rendererOrigin) {
       }
       await delay(300)
     }
-    if (target.openCodexWorkspace) {
-      // A never-shown Chromium window can advance React state without
-      // compositing the matching frame into capturePage(). Paint this native
-      // surface offscreen so the saved PNG is the exact asserted Codex state.
-      browserWindow.setPosition(-10_000, -10_000, false)
-      browserWindow.showInactive()
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const button = document.querySelector('button[aria-label="Use Codex via ChatGPT subscription"]')
-        if (!(button instanceof HTMLButtonElement) || button.disabled) {
-          throw new Error('The internal Codex visual-QA backend selector was not ready')
-        }
-        button.click()
-      })()`)
-      const codexDeadline = Date.now() + 10_000
-      while (Date.now() < codexDeadline) {
-        const ready = await browserWindow.webContents.executeJavaScript(`(() => {
-          const surface = document.querySelector('.codex-workspace')
-          const action = [...document.querySelectorAll('.codex-workspace button')]
-            .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.expectCodexAction)})
-          return Boolean(
-            surface &&
-            document.body.innerText.includes(${JSON.stringify(target.expectedText)}) &&
-            action instanceof HTMLButtonElement
-          )
-        })()`)
-        if (ready) break
-        await delay(25)
-      }
-      await delay(150)
-      if (target.expectShortCodex) {
-        await browserWindow.webContents.executeJavaScript(`(() => {
-          const surface = document.querySelector('.codex-workspace')
-          if (!(surface instanceof HTMLElement)) throw new Error('The Codex visual-QA surface was not found')
-          surface.scrollTop = surface.scrollHeight
-        })()`)
-        await delay(75)
-      }
-    }
     const selector = target.expectHud
       ? `.hud-${target.expectHud}`
-      : target.openCodexWorkspace
-        ? '.codex-workspace'
+      : target.openModelsDialog
+        ? 'dialog[open][aria-labelledby="models-title"] .models-sheet__surface'
       : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
         ? '.empty-workbench'
         : '.app-shell'
@@ -464,20 +517,28 @@ async function capture(target, rendererOrigin) {
       const candidateEvaluationDialogScroll = candidateEvaluationDialog?.querySelector('.sheet__scroll')
       const candidateEvaluationDialogScrollStyle = candidateEvaluationDialogScroll ? window.getComputedStyle(candidateEvaluationDialogScroll) : undefined
       const candidateEvaluationDialogFooterRect = candidateEvaluationDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
+      const modelsDialog = document.querySelector('dialog[aria-labelledby="models-title"]')
+      const modelsSurface = modelsDialog?.querySelector('.models-sheet__surface')
+      const modelCatalog = modelsDialog?.querySelector('.model-catalog')
+      const modelCatalogStyle = modelCatalog ? window.getComputedStyle(modelCatalog) : undefined
+      const modelCatalogRect = modelCatalog?.getBoundingClientRect()
+      const modelAction = [...(modelsDialog?.querySelectorAll('button') ?? [])]
+        .find((candidate) => ${target.expectModelAction
+          ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+          : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
+      const modelActionRect = modelAction?.getBoundingClientRect()
+      const modelActionVisible = Boolean(
+        modelActionRect &&
+        modelCatalogRect &&
+        modelActionRect.width > 0 &&
+        modelActionRect.height > 0 &&
+        modelActionRect.left >= Math.max(0, modelCatalogRect.left) &&
+        modelActionRect.right <= Math.min(window.innerWidth, modelCatalogRect.right) &&
+        modelActionRect.top >= Math.max(0, modelCatalogRect.top) &&
+        modelActionRect.bottom <= Math.min(window.innerHeight, modelCatalogRect.bottom)
+      )
       const emptyMain = document.querySelector('.empty-workbench__main')
       const emptyMainStyle = emptyMain ? window.getComputedStyle(emptyMain) : undefined
-      const codexSurface = document.querySelector('.codex-workspace')
-      const codexSurfaceStyle = codexSurface ? window.getComputedStyle(codexSurface) : undefined
-      const codexPrimaryAction = [...document.querySelectorAll('.codex-workspace button')]
-        .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.expectCodexAction)})
-      const codexPrimaryActionRect = codexPrimaryAction?.getBoundingClientRect()
-      const codexPrimaryActionVisible = Boolean(
-        codexPrimaryActionRect &&
-        codexPrimaryActionRect.width > 0 &&
-        codexPrimaryActionRect.height > 0 &&
-        codexPrimaryActionRect.top >= 0 &&
-        codexPrimaryActionRect.bottom <= window.innerHeight
-      )
       const hudSurface = document.querySelector(${JSON.stringify(target.expectHud ? `.hud-${target.expectHud}` : '.hud-never')})
       const bodyStyle = window.getComputedStyle(document.body)
       const rootStyle = window.getComputedStyle(document.documentElement)
@@ -525,6 +586,26 @@ async function capture(target, rendererOrigin) {
           candidateEvaluationDialogFooterRect.height > 0 &&
           candidateEvaluationDialogFooterRect.bottom <= window.innerHeight
         ),
+        modelsDialogOpen: Boolean(modelsDialog?.matches('[open]:modal')),
+        modelSelectionActionEnabled: Boolean(modelAction instanceof HTMLButtonElement && !modelAction.disabled),
+        modelSelectionActionVisible: modelActionVisible,
+        modelSelectionUnchanged: Boolean(
+          modelAction instanceof HTMLButtonElement &&
+          !modelAction.disabled &&
+          !modelsDialog?.querySelector('.model-selection-feedback__message:not(.sr-only)')
+        ),
+        modelCatalogScrollable: Boolean(
+          modelCatalog &&
+          modelCatalogStyle &&
+          (modelCatalogStyle.overflowY === 'auto' || modelCatalogStyle.overflowY === 'scroll') &&
+          modelCatalog.clientHeight > 0 &&
+          modelCatalog.scrollHeight > modelCatalog.clientHeight
+        ),
+        modelCatalogClientHeight: modelCatalog?.clientHeight,
+        modelCatalogScrollHeight: modelCatalog?.scrollHeight,
+        modelCatalogScrollTop: modelCatalog?.scrollTop,
+        modelsDialogScrollTop: modelsDialog?.scrollTop,
+        modelsSurfaceScrollTop: modelsSurface?.scrollTop,
         residentPickerBusy: document.querySelector('.empty-workbench__actions .button--primary')?.getAttribute('aria-busy'),
         emptyMainScrollable: Boolean(
           emptyMain &&
@@ -535,28 +616,6 @@ async function capture(target, rendererOrigin) {
         emptyMainClientHeight: emptyMain?.clientHeight,
         emptyMainScrollHeight: emptyMain?.scrollHeight,
         emptyMainOverflowY: emptyMainStyle?.overflowY,
-        codexSurfaceVisible: Boolean(codexSurface && codexSurface.clientWidth > 0 && codexSurface.clientHeight > 0),
-        codexModeSelected: document.querySelector('button[aria-label="Use Codex via ChatGPT subscription"]')?.getAttribute('aria-pressed') === 'true',
-        codexPrimeControlsAbsent: Boolean(
-          codexSurface &&
-          !document.querySelector('#thread-composer') &&
-          !document.querySelector('button[aria-label="Show desktop HUD"]') &&
-          !document.querySelector('.model-chip') &&
-          !document.querySelector('.run-location') &&
-          !document.querySelector('.sidebar__location') &&
-          !document.querySelector('#thread-inspector')
-        ),
-        codexPrimaryActionVisible,
-        codexShortContentReachable: Boolean(
-          codexSurface &&
-          codexSurfaceStyle &&
-          codexPrimaryActionVisible &&
-          (codexSurface.scrollHeight <= codexSurface.clientHeight ||
-            codexSurfaceStyle.overflowY === 'auto' || codexSurfaceStyle.overflowY === 'scroll')
-        ),
-        codexSurfaceClientHeight: codexSurface?.clientHeight,
-        codexSurfaceScrollHeight: codexSurface?.scrollHeight,
-        codexSurfaceOverflowY: codexSurfaceStyle?.overflowY,
         hudSurfaceVisible: Boolean(hudSurface && hudSurface.getBoundingClientRect().width > 0 && hudSurface.getBoundingClientRect().height > 0),
         hudMode: document.querySelector('.hud-buddy') ? 'buddy' : document.querySelector('.hud-expanded') ? 'expanded' : undefined,
         hudStatusVisible: Boolean(document.querySelector('.hud-status')),
@@ -591,22 +650,26 @@ async function capture(target, rendererOrigin) {
     if (target.expectShortCandidateEvaluationDialog) {
       invariant(stateEvidence.candidateEvaluationDialogContentReachable, `${target.name} did not keep the candidate evaluation review and actions reachable`)
     }
+    if (target.openModelsDialog) {
+      invariant(stateEvidence.modelsDialogOpen, `${target.name} did not open Models & accounts as a modal dialog`)
+      invariant(stateEvidence.modelSelectionActionEnabled, `${target.name} did not expose its expected enabled action`)
+      invariant(stateEvidence.modelSelectionActionVisible, `${target.name} hid its expected action: ${JSON.stringify(stateEvidence)}`)
+      invariant(stateEvidence.modelSelectionUnchanged, `${target.name} invoked or locked its non-executing action`)
+    }
+    if (target.expectShortModelsDialog) {
+      invariant(
+        stateEvidence.modelCatalogScrollable,
+        `${target.name} did not preserve a real model-catalog scroll container: ${JSON.stringify(stateEvidence)}`,
+      )
+      invariant(
+        stateEvidence.modelsDialogScrollTop === 0 && stateEvidence.modelsSurfaceScrollTop === 0,
+        `${target.name} scrolled outside the model catalog: ${JSON.stringify(stateEvidence)}`,
+      )
+    }
     if (target.expectScrollableEmpty) {
       invariant(
         stateEvidence.emptyMainScrollable,
         `${target.name} did not preserve vertical access to resident recovery controls: ${JSON.stringify(stateEvidence)}`,
-      )
-    }
-    if (target.openCodexWorkspace) {
-      invariant(stateEvidence.codexSurfaceVisible, `${target.name} did not paint the Codex workspace`)
-      invariant(stateEvidence.codexModeSelected, `${target.name} did not select the Codex backend`)
-      invariant(stateEvidence.codexPrimeControlsAbsent, `${target.name} exposed Prime-only controls in Codex mode`)
-      invariant(stateEvidence.codexPrimaryActionVisible, `${target.name} hid its primary Codex action`)
-    }
-    if (target.expectShortCodex) {
-      invariant(
-        stateEvidence.codexShortContentReachable,
-        `${target.name} did not preserve vertical access to its Codex action: ${JSON.stringify(stateEvidence)}`,
       )
     }
     if (target.expectHud) {

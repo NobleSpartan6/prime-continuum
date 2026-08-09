@@ -20,6 +20,7 @@ import {
   extractEmbeddedRuntimeAttestation,
   parseRuntimeAttestation,
 } from "./runtime-attestation-lib.mjs";
+import { createPrimeAgentSmokeCustody } from "./prime-agent-smoke-custody-lib.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOSTD_PATH = resolve(REPO_ROOT, "out", "hostd", "hostd.cjs");
@@ -72,16 +73,18 @@ const STALE_END_ERROR = Object.freeze({
 });
 const RESIDENT_COMMAND_CAPABILITY = "prime_agent_commands_v2";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
+const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
-const CODEX_SUBSCRIPTION_CAPABILITY = "codex_subscription_v1";
 const EXPECTED_BASE_CAPABILITIES = Object.freeze([
-  CANDIDATE_EVALUATION_CAPABILITY,
-  CODEX_SUBSCRIPTION_CAPABILITY,
   "resident_control_projection_v1",
   RESIDENT_LIFECYCLE_CAPABILITY,
   "runtime_integrity_v1",
   "runtime_model_catalog_v1",
+  RUNTIME_OAUTH_CAPABILITY,
   "snapshot_chunks_v1",
+].sort());
+const EXPECTED_WARMED_CAPABILITIES = Object.freeze([
+  CANDIDATE_EVALUATION_CAPABILITY,
 ].sort());
 
 const require = createRequire(import.meta.url);
@@ -92,25 +95,15 @@ const daemonAuditPath = join(temporaryRoot, "daemon-audit.mjs");
 const fauxLedgerPath = join(temporaryRoot, "faux-provider-ledger.jsonl");
 const requestedDataDirectory = join(temporaryRoot, "host-data");
 const requestedWorkspaceDirectory = join(temporaryRoot, "workspace");
-const agentDirectory = join(temporaryRoot, "prime-agent-home");
-const extensionDirectory = join(agentDirectory, "extensions");
-const fauxExtensionPath = join(extensionDirectory, "continuim-smoke-faux.ts");
 
 await Promise.all([
   mkdir(requestedDataDirectory, { recursive: true, mode: 0o700 }),
   mkdir(requestedWorkspaceDirectory, { recursive: true, mode: 0o700 }),
-  mkdir(agentDirectory, { recursive: true, mode: 0o700 }),
-  mkdir(extensionDirectory, { recursive: true, mode: 0o700 }),
 ]);
 const dataDirectory = await realpath(requestedDataDirectory);
 const workspaceDirectory = await realpath(requestedWorkspaceDirectory);
 const hostEndpoint = localHostEndpoint(dataDirectory);
 const residentEndpoint = residentDaemonEndpoint(dataDirectory);
-await Promise.all([
-  writeFile(hostdWrapperPath, hostdSmokeWrapperSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
-  writeFile(daemonAuditPath, daemonAuditSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
-  writeFile(fauxExtensionPath, fauxProviderExtensionSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
-]);
 
 const attestationBytes = await readFile(ATTESTATION_PATH);
 const attestation = parseRuntimeAttestation(attestationBytes);
@@ -123,8 +116,21 @@ if (attestation.runtime.platform !== process.platform || attestation.runtime.arc
 }
 await assertExactSeedRoot(RUNTIME_SEED_ROOT);
 await stat(electronExecutable);
+const hostdModule = require(HOSTD_PATH);
+const primeAgentCustody = await createPrimeAgentSmokeCustody({
+  hostDataRoot: dataDirectory,
+  hostdModule,
+});
+await primeAgentCustody.assertInitiallyAbsent();
+const agentDirectory = primeAgentCustody.agentDirectory;
+const extensionDirectory = join(agentDirectory, "extensions");
+const fauxExtensionPath = join(extensionDirectory, "continuim-smoke-faux.ts");
+await Promise.all([
+  writeFile(hostdWrapperPath, hostdSmokeWrapperSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
+  writeFile(daemonAuditPath, daemonAuditSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
+]);
 
-const credentialFree = credentialFreeRunAsNodeEnvironment(process.env, agentDirectory);
+const credentialFree = credentialFreeRunAsNodeEnvironment(process.env);
 const createdAt = new Date().toISOString();
 let hostdChild;
 let runtimeRoot;
@@ -178,6 +184,13 @@ try {
 
   runtimeRoot = await resolveInstalledRuntimeRoot(zeroBinding.health.runtimeIntegrity);
   credentialFileState = await assertCredentialStoreEmpty();
+  await primeAgentCustody.captureExisting();
+  await mkdir(extensionDirectory, { mode: 0o700 });
+  await writeFile(fauxExtensionPath, fauxProviderExtensionSource(), {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
 
   // Provision may start the private daemon before returning. Arm cleanup at
   // the mutation boundary so even a failed/unknown response cannot leak it.
@@ -973,15 +986,17 @@ try {
 }
 
 const cleanupFailures = [];
+let cleanHostShutdownConfirmed = hostdChild === undefined;
 if (hostdChild) {
   try {
     await stopHostd(hostdChild);
+    hostdChild = undefined;
+    cleanHostShutdownConfirmed = true;
   } catch (error) {
     cleanupFailures.push(new Error("Release hostd cleanup failed", { cause: error }));
-  } finally {
-    hostdChild = undefined;
   }
 }
+let residentDaemonShutdownConfirmed = !daemonObserved;
 if (daemonObserved && runtimeRoot) {
   try {
     const cleanupAudit = await inspectResidentDaemon(
@@ -991,21 +1006,38 @@ if (daemonObserved && runtimeRoot) {
     );
     assertDaemonTermination(cleanupAudit);
     daemonObserved = false;
+    residentDaemonShutdownConfirmed = true;
   } catch (error) {
     cleanupFailures.push(new Error("Resident daemon cleanup failed", { cause: error }));
   }
 }
-try {
-  await rm(temporaryRoot, {
-    recursive: true,
-    force: true,
-    maxRetries: 10,
-    retryDelay: 100,
-  });
-} catch (error) {
-  cleanupFailures.push(new Error("Resident lifecycle smoke temporary-root cleanup failed", {
-    cause: error,
-  }));
+let custodyCleanupConfirmed = false;
+if (cleanHostShutdownConfirmed && residentDaemonShutdownConfirmed) {
+  try {
+    await primeAgentCustody.captureExisting();
+    await primeAgentCustody.removeAfterConfirmedShutdown({ confirmedCleanShutdown: true });
+    custodyCleanupConfirmed = true;
+  } catch (error) {
+    cleanupFailures.push(new Error("Prime Agent resident-smoke custody cleanup failed", { cause: error }));
+  }
+} else {
+  cleanupFailures.push(new Error(
+    "Prime Agent resident-smoke custody was retained because every runtime owner did not confirm clean shutdown",
+  ));
+}
+if (custodyCleanupConfirmed) {
+  try {
+    await rm(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
+  } catch (error) {
+    cleanupFailures.push(new Error("Resident lifecycle smoke temporary-root cleanup failed", {
+      cause: error,
+    }));
+  }
 }
 
 if (primaryFailure) {
@@ -1075,6 +1107,8 @@ async function waitForResidentReadiness(child, expectCommandCapability) {
       if (
         runtime?.status === "ready" &&
         lastHealth.capabilities?.includes(RESIDENT_LIFECYCLE_CAPABILITY) &&
+        lastHealth.capabilities.includes(RUNTIME_OAUTH_CAPABILITY) &&
+        lastHealth.capabilities.includes(CANDIDATE_EVALUATION_CAPABILITY) &&
         lastHealth.capabilities.includes(RESIDENT_COMMAND_CAPABILITY) === expectCommandCapability
       ) {
         assertReadyRuntimeHealth(lastHealth, expectCommandCapability);
@@ -1126,7 +1160,16 @@ function assertReadyRuntimeHealth(health, expectCommandCapability) {
   if (hasCommands !== expectCommandCapability) {
     throw new Error("Ready health resident command capability differs from exact binding state");
   }
-  const base = health.capabilities.filter((capability) => capability !== RESIDENT_COMMAND_CAPABILITY).sort();
+  const missingWarmed = EXPECTED_WARMED_CAPABILITIES.filter((capability) => !health.capabilities.includes(capability));
+  if (missingWarmed.length > 0) {
+    throw new Error(`Ready health is missing warmed optional capabilities: ${missingWarmed.join(", ")}`);
+  }
+  const base = health.capabilities
+    .filter((capability) =>
+      capability !== RESIDENT_COMMAND_CAPABILITY &&
+      !EXPECTED_WARMED_CAPABILITIES.includes(capability)
+    )
+    .sort();
   if (JSON.stringify(base) !== JSON.stringify(EXPECTED_BASE_CAPABILITIES)) {
     throw new Error(`Ready health capabilities changed: ${health.capabilities.join(", ")}`);
   }
@@ -2717,7 +2760,7 @@ function assertChildAlive(processHandle) {
   throw new Error(`Release hostd exited before readiness: ${processHandle.stderrTail.toString("utf8")}`);
 }
 
-function credentialFreeRunAsNodeEnvironment(source, isolatedAgentDirectory) {
+function credentialFreeRunAsNodeEnvironment(source) {
   const environment = {};
   let strippedCredentialVariableCount = 0;
   for (const [name, value] of Object.entries(source)) {
@@ -2727,6 +2770,7 @@ function credentialFreeRunAsNodeEnvironment(source, isolatedAgentDirectory) {
       normalized === "NODE_OPTIONS" ||
       normalized === "NODE_PATH" ||
       normalized === "ELECTRON_RUN_AS_NODE" ||
+      normalized === "PRIME_AGENT_CODING_AGENT_DIR" ||
       normalized === "PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV" ||
       normalized.startsWith("PRIME_AGENT_INTERNAL_") ||
       normalized === "PRIME_AGENT_BUILD_ID" ||
@@ -2741,7 +2785,6 @@ function credentialFreeRunAsNodeEnvironment(source, isolatedAgentDirectory) {
     environment[name] = value;
   }
   environment.ELECTRON_RUN_AS_NODE = "1";
-  environment.PRIME_AGENT_CODING_AGENT_DIR = isolatedAgentDirectory;
   environment.PRIME_CONTINUIM_PACKAGE_SMOKE = "1";
   return Object.freeze({
     environment: Object.freeze(environment),

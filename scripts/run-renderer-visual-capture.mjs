@@ -12,6 +12,10 @@ const errorPath = join(outputDirectory, 'capture-error.txt')
 const environment = { ...process.env }
 const expectedTargets = [
   ['desktop-idle', 1600, 1000, 'idle', undefined],
+  ['model-selection-dialog-390', 390, 844, 'model-selection', undefined],
+  ['model-selection-dialog-short-320', 320, 256, 'model-selection', undefined],
+  ['prime-oauth-dialog-390', 390, 844, 'prime-oauth', undefined],
+  ['prime-oauth-dialog-short-320', 320, 256, 'prime-oauth', undefined],
   ['desktop-prompt-admission', 1200, 800, 'prompt-admission', undefined],
   ['desktop-prompt-proof-390', 390, 844, 'prompt-awaiting-idle-proof', undefined],
   ['desktop-stop-proof-390', 390, 844, 'stop-awaiting-idle-proof', undefined],
@@ -26,10 +30,6 @@ const expectedTargets = [
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
   ['candidate-evaluation-dialog-390', 390, 844, 'candidate-evaluation-review', undefined],
   ['candidate-evaluation-dialog-short-320', 320, 256, 'candidate-evaluation-review', undefined],
-  ['codex-signed-out-390', 390, 844, 'codex-subscription-signed-out', undefined],
-  ['codex-signed-out-short-320', 320, 256, 'codex-subscription-signed-out', undefined],
-  ['codex-ready-390', 390, 844, 'codex-subscription-ready', undefined],
-  ['codex-ready-short-320', 320, 256, 'codex-subscription-ready', undefined],
   ['hud-expanded', 620, 380, 'hud-expanded', 'hud'],
   ['hud-buddy', 184, 64, 'hud-buddy', 'hud'],
 ]
@@ -41,6 +41,10 @@ const obsoleteCaptures = [
   'companion-320.png',
   'companion-attention-390.png',
   'companion-attention-320.png',
+  'codex-signed-out-390.png',
+  'codex-signed-out-short-320.png',
+  'codex-ready-390.png',
+  'codex-ready-short-320.png',
 ]
 
 // Electron's RunAsNode mode is required by the packaged hostd launcher, but a
@@ -99,13 +103,17 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
     ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||
     (name === 'candidate-evaluation-dialog-short-320' && result.stateEvidence?.candidateEvaluationDialogContentReachable !== true) ||
-    (name.startsWith('codex-') && (
-      result.stateEvidence?.codexSurfaceVisible !== true ||
-      result.stateEvidence?.codexModeSelected !== true ||
-      result.stateEvidence?.codexPrimeControlsAbsent !== true ||
-      result.stateEvidence?.codexPrimaryActionVisible !== true
+    ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-')) && (
+      result.stateEvidence?.modelsDialogOpen !== true ||
+      result.stateEvidence?.modelSelectionActionEnabled !== true ||
+      result.stateEvidence?.modelSelectionActionVisible !== true ||
+      result.stateEvidence?.modelSelectionUnchanged !== true
     )) ||
-    (name.includes('-short-320') && name.startsWith('codex-') && result.stateEvidence?.codexShortContentReachable !== true) ||
+    ((name === 'model-selection-dialog-short-320' || name === 'prime-oauth-dialog-short-320') && (
+      result.stateEvidence?.modelCatalogScrollable !== true ||
+      result.stateEvidence?.modelsDialogScrollTop !== 0 ||
+      result.stateEvidence?.modelsSurfaceScrollTop !== 0
+    )) ||
     (name === 'resident-recovery-short-320' && result.stateEvidence?.emptyMainScrollable !== true)
     || (name.startsWith('hud-') && (
       result.stateEvidence?.hudSurfaceVisible !== true ||

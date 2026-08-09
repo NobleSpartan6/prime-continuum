@@ -51,13 +51,15 @@ function unresolvedNameDiagnostics(path: string): string[] {
   return `${result.stdout}${result.stderr}`.match(unresolvedNamePattern) ?? []
 }
 
-function materializeExpectedBaseCapabilities(): string[] {
+function materializeExpectedCapabilitySets(): { base: string[]; warmed: string[] } {
   const declarationStart = smokeSource.indexOf('const RESIDENT_COMMAND_CAPABILITY')
   const declarationEnd = smokeSource.indexOf('const require = createRequire', declarationStart)
   expect(declarationStart).toBeGreaterThanOrEqual(0)
   expect(declarationEnd).toBeGreaterThan(declarationStart)
   const declaration = smokeSource.slice(declarationStart, declarationEnd)
-  return new Function(`${declaration}; return [...EXPECTED_BASE_CAPABILITIES];`)() as string[]
+  return new Function(
+    `${declaration}; return { base: [...EXPECTED_BASE_CAPABILITIES], warmed: [...EXPECTED_WARMED_CAPABILITIES] };`,
+  )() as { base: string[]; warmed: string[] }
 }
 
 function materializeDaemonAuditSource(): string {
@@ -193,16 +195,17 @@ function materializeDurableProjectionAssertions(): {
 }
 
 describe('resident lifecycle smoke structure', () => {
-  it('requires every packaged local capability in the exact ready-health contract', () => {
-    expect(materializeExpectedBaseCapabilities()).toEqual([
-      'candidate_evaluation_probe_v1',
-      'codex_subscription_v1',
+  it('separates core ready health from optional candidate-evaluation warmup', () => {
+    const capabilities = materializeExpectedCapabilitySets()
+    expect(capabilities.base).toEqual([
       'resident_control_projection_v1',
       'resident_lifecycle_v1',
       'runtime_integrity_v1',
       'runtime_model_catalog_v1',
+      'runtime_oauth_v1',
       'snapshot_chunks_v1',
     ])
+    expect(capabilities.warmed).toEqual(['candidate_evaluation_probe_v1'])
   })
 
   it('resolves every outer smoke and generated daemon-audit global', () => {

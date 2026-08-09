@@ -57,13 +57,6 @@ jobs:
       - name: Typecheck Node and renderer boundaries
         run: pnpm typecheck
 
-      - name: Compile the exact Windows UI Automation helper
-        if: runner.os == 'Windows'
-        timeout-minutes: 3
-        env:
-          PRIME_CONTINUIM_WINDOWS_UIA_COMPILE: "true"
-        run: pnpm exec vitest run tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts
-
       - name: Run the complete source test suite
         run: pnpm test
 

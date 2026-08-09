@@ -391,6 +391,7 @@ describe('NativeRendererApi', () => {
       }),
     }
     const api = new NativeRendererApi(bridge)
+    expect(api).not.toHaveProperty('codexSubscription')
     const observed = vi.fn()
     const unsubscribe = api.onHudState(observed)
 
@@ -3073,6 +3074,826 @@ describe('NativeRendererApi', () => {
     expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
     await expect(api.loadRuntimeModelCatalog('host-remote')).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
     expect(runtimeModelCatalog).toHaveBeenCalledOnce()
+  })
+
+  it('runs one sequential Prime OAuth poll chain on the exact local resident authority and refreshes the catalog', async () => {
+    vi.useFakeTimers()
+    try {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = 'idle'
+      const snapshot = recoverySnapshot(catalog.threads[0], 'Prime OAuth authority.')
+      const unavailableCatalog = {
+        runtime: 'prime_agent',
+        releaseVersion: '0.7.0',
+        observedAt: '2026-08-07T12:00:00.000Z',
+        providers: [{
+          providerId: 'openai-codex',
+          displayName: 'ChatGPT Plus/Pro (Codex Subscription)',
+          oauthSupported: true,
+          oauthUsesCallbackServer: true,
+          configured: false,
+          authSource: 'none',
+          modelCount: 1,
+          availableModelCount: 0,
+        }],
+        models: [{
+          providerId: 'openai-codex',
+          modelId: 'gpt-5.3-codex',
+          name: 'GPT-5.3 Codex',
+          api: 'openai-codex-responses',
+          reasoning: true,
+          input: ['text'],
+          contextWindow: 400_000,
+          maxOutputTokens: 128_000,
+          available: false,
+          usingOAuth: false,
+        }],
+      }
+      const refreshedCatalog = structuredClone(unavailableCatalog)
+      refreshedCatalog.observedAt = '2026-08-07T12:01:00.000Z'
+      refreshedCatalog.providers[0]!.configured = true
+      refreshedCatalog.providers[0]!.authSource = 'stored'
+      refreshedCatalog.providers[0]!.availableModelCount = 1
+      refreshedCatalog.models[0]!.available = true
+      refreshedCatalog.models[0]!.usingOAuth = true
+      const expiresAt = '2099-08-07T12:10:00.000Z'
+      const startRuntimeOAuth = vi.fn(() => ok({
+        sessionId: 'oauth-session-one',
+        providerId: 'openai-codex',
+        phase: 'awaiting_user',
+        expiresAt,
+        interaction: { kind: 'browser', state: 'opened' },
+      }))
+      const statuses = [
+        {
+          sessionId: 'oauth-session-one',
+          providerId: 'openai-codex',
+          phase: 'committing',
+          expiresAt,
+        },
+        {
+          sessionId: 'oauth-session-one',
+          providerId: 'openai-codex',
+          phase: 'completed',
+          expiresAt,
+          configured: true,
+        },
+      ]
+      let concurrentStatuses = 0
+      let maxConcurrentStatuses = 0
+      const runtimeOAuthStatus = vi.fn(async () => {
+        concurrentStatuses += 1
+        maxConcurrentStatuses = Math.max(maxConcurrentStatuses, concurrentStatuses)
+        await Promise.resolve()
+        concurrentStatuses -= 1
+        return { ok: true as const, value: statuses.shift() }
+      })
+      const runtimeModelCatalog = vi.fn(() => ok(refreshedCatalog))
+      const api = new NativeRendererApi({
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          connection: {
+            ...onlineConnection(),
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          },
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+        requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+        runtimeModelCatalog,
+        startRuntimeOAuth,
+        runtimeOAuthStatus,
+        cancelRuntimeOAuth: vi.fn(),
+      })
+
+      const projection = await api.loadWorkbench()
+      expect(projection.operations.runtimeOAuth).toBe(true)
+      const progress: string[] = []
+      const pending = api.startRuntimeOAuth({
+        hostId: 'host-local',
+        providerId: 'openai-codex',
+      }, (update) => progress.push(`${update.phase}:${update.message}`))
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      await expect(pending).resolves.toEqual({
+        state: 'completed',
+        message: 'ChatGPT is connected to Prime Agent and the model catalog is refreshed.',
+        catalog: refreshedCatalog,
+      })
+      expect(startRuntimeOAuth).toHaveBeenCalledOnce()
+      expect(startRuntimeOAuth).toHaveBeenCalledWith({
+        expectedHostId: 'host-local',
+        providerId: 'openai-codex',
+      })
+      expect(runtimeOAuthStatus).toHaveBeenCalledTimes(2)
+      expect(runtimeOAuthStatus).toHaveBeenNthCalledWith(1, {
+        expectedHostId: 'host-local',
+        sessionId: 'oauth-session-one',
+      })
+      expect(maxConcurrentStatuses).toBe(1)
+      expect(runtimeModelCatalog).toHaveBeenCalledOnce()
+      expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
+      expect(progress.join(' ')).toMatch(/awaiting_user:Finish signing in in your browser/)
+      expect(progress.join(' ')).toMatch(/committing:Saving the Prime Agent account/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('admits host-scoped Prime OAuth before any resident thread exists', async () => {
+    const catalog = recoveryCatalog()
+    catalog.projects = []
+    catalog.threads = []
+    const expiresAt = '2099-08-07T12:10:00.000Z'
+    const refreshedCatalog = {
+      runtime: 'prime_agent',
+      releaseVersion: '0.7.0',
+      observedAt: '2026-08-07T12:01:00.000Z',
+      providers: [],
+      models: [],
+    }
+    const startRuntimeOAuth = vi.fn(() => ok({
+      sessionId: 'oauth-first-run',
+      providerId: 'openai-codex',
+      phase: 'completed',
+      expiresAt,
+      configured: true,
+    }))
+    const runtimeModelCatalog = vi.fn(() => ok(refreshedCatalog))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('No resident thread exists yet.'))),
+      runtimeModelCatalog,
+      startRuntimeOAuth,
+      runtimeOAuthStatus: vi.fn(),
+      cancelRuntimeOAuth: vi.fn(),
+    })
+
+    const projection = await api.loadWorkbench()
+    expect(projection.projects).toEqual([])
+    expect(projection.threads).toEqual([])
+    expect(projection.operations.modelCatalog).toBe(true)
+    expect(projection.operations.runtimeOAuth).toBe(true)
+
+    await expect(api.startRuntimeOAuth({
+      hostId: 'host-local',
+      providerId: 'openai-codex',
+    }, () => undefined)).resolves.toEqual({
+      state: 'completed',
+      message: 'ChatGPT is connected to Prime Agent and the model catalog is refreshed.',
+      catalog: refreshedCatalog,
+    })
+    expect(startRuntimeOAuth).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      providerId: 'openai-codex',
+    })
+    expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
+  })
+
+  it('keeps a host-scoped Prime OAuth session owned while the selected resident thread changes', async () => {
+    vi.useFakeTimers()
+    try {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = 'idle'
+      const firstSnapshot = recoverySnapshot(catalog.threads[0], 'Prime OAuth starts here.')
+      const secondSnapshot = recoverySnapshot(catalog.threads[1], 'Another resident thread is selected.')
+      const expiresAt = '2099-08-07T12:10:00.000Z'
+      const startRuntimeOAuth = vi.fn(() => ok({
+        sessionId: 'oauth-host-scoped',
+        providerId: 'openai-codex',
+        phase: 'awaiting_user',
+        expiresAt,
+        interaction: { kind: 'browser', state: 'opened' },
+      }))
+      const runtimeOAuthStatus = vi.fn(() => ok({
+        sessionId: 'oauth-host-scoped',
+        providerId: 'openai-codex',
+        phase: 'completed',
+        expiresAt,
+        configured: true,
+      }))
+      const api = new NativeRendererApi({
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: firstSnapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          connection: {
+            ...onlineConnection(),
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          },
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+        requestSnapshot: vi.fn((input: { threadId?: string }) =>
+          ok(input.threadId === 'thread-two' ? secondSnapshot : firstSnapshot)),
+        runtimeModelCatalog: vi.fn(() => ok({
+          runtime: 'prime_agent',
+          releaseVersion: '0.7.0',
+          observedAt: '2026-08-07T12:01:00.000Z',
+          providers: [],
+          models: [],
+        })),
+        startRuntimeOAuth,
+        runtimeOAuthStatus,
+        cancelRuntimeOAuth: vi.fn(),
+      })
+      await api.loadWorkbench()
+
+      const pending = api.startRuntimeOAuth({
+        hostId: 'host-local',
+        providerId: 'openai-codex',
+      }, () => undefined)
+      await Promise.resolve()
+      await api.selectThread('thread-two')
+      await vi.advanceTimersByTimeAsync(500)
+
+      await expect(pending).resolves.toMatchObject({ state: 'completed' })
+      expect(runtimeOAuthStatus).toHaveBeenCalledOnce()
+      expect(startRuntimeOAuth).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels the one admitted Prime OAuth session without polling or issuing another start', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Prime OAuth cancellation authority.')
+    const expiresAt = '2099-08-07T12:10:00.000Z'
+    const startRuntimeOAuth = vi.fn(() => ok({
+      sessionId: 'oauth-session-cancel',
+      providerId: 'openai-codex',
+      phase: 'awaiting_user',
+      expiresAt,
+      interaction: { kind: 'browser', state: 'opened' },
+    }))
+    const runtimeOAuthStatus = vi.fn()
+    const cancelRuntimeOAuth = vi.fn(() => ok({
+      sessionId: 'oauth-session-cancel',
+      providerId: 'openai-codex',
+      phase: 'cancelled',
+      expiresAt,
+    }))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      startRuntimeOAuth,
+      runtimeOAuthStatus,
+      cancelRuntimeOAuth,
+    })
+    await api.loadWorkbench()
+
+    const request = { hostId: 'host-local', providerId: 'openai-codex' }
+    const pending = api.startRuntimeOAuth(request, () => undefined)
+    await Promise.resolve()
+    const cancellation = api.cancelRuntimeOAuth(request)
+
+    await expect(Promise.all([pending, cancellation])).resolves.toEqual([
+      { state: 'cancelled', message: 'ChatGPT sign-in was cancelled.' },
+      { state: 'cancelled', message: 'ChatGPT sign-in was cancelled.' },
+    ])
+    expect(startRuntimeOAuth).toHaveBeenCalledOnce()
+    expect(runtimeOAuthStatus).not.toHaveBeenCalled()
+    expect(cancelRuntimeOAuth).toHaveBeenCalledOnce()
+    expect(cancelRuntimeOAuth).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      sessionId: 'oauth-session-cancel',
+    })
+  })
+
+  it('sanitizes an ambiguous Prime OAuth start and never retries it inside the operation', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Ambiguous Prime OAuth start.')
+    const startRuntimeOAuth = vi.fn(() => Promise.reject(new Error('https://secret.example/callback?token=do-not-render')))
+    const runtimeOAuthStatus = vi.fn()
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      startRuntimeOAuth,
+      runtimeOAuthStatus,
+      cancelRuntimeOAuth: vi.fn(),
+    })
+    await api.loadWorkbench()
+
+    const result = await api.startRuntimeOAuth({
+      hostId: 'host-local',
+      providerId: 'openai-codex',
+    }, () => undefined)
+    expect(result).toEqual({
+      state: 'uncertain',
+      retryable: false,
+      message: 'Prime Agent may have started sign-in, but its session could not be verified. Prime Continuim will not start it again automatically.',
+    })
+    expect(JSON.stringify(result)).not.toMatch(/secret\.example|token=|do-not-render/)
+    expect(startRuntimeOAuth).toHaveBeenCalledOnce()
+    expect(runtimeOAuthStatus).not.toHaveBeenCalled()
+  })
+
+  it('withholds Prime OAuth from a non-local connection even when that host advertises the capability', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Non-local OAuth authority.')
+    const startRuntimeOAuth = vi.fn()
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          target: { kind: 'ssh', alias: 'host-local-over-ssh' },
+          path: 'ssh',
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      startRuntimeOAuth,
+    })
+
+    const projection = await api.loadWorkbench()
+    expect(projection.operations.runtimeOAuth).toBeUndefined()
+    expect(() => api.startRuntimeOAuth({
+      hostId: 'host-local',
+      providerId: 'openai-codex',
+    }, () => undefined)).toThrow(StaleHostAuthorityError)
+    expect(startRuntimeOAuth).not.toHaveBeenCalled()
+  })
+
+  it('offers resident model selection only for the exact authoritative idle turn while preserving Stop', async () => {
+    const modelConnection = {
+      ...onlineConnection(),
+      capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+    }
+    const idleCatalog = recoveryCatalog()
+    idleCatalog.threads[0].status = 'idle'
+    const idleSnapshot = recoverySnapshot(idleCatalog.threads[0], 'Idle model-selection authority.')
+    const idleApi = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog: idleCatalog, lastSnapshot: idleSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: modelConnection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+    })
+
+    await expect(idleApi.loadWorkbench()).resolves.toMatchObject({
+      operations: {
+        startResidentTurn: true,
+        stopResidentTurn: false,
+        modelCatalog: true,
+        selectResidentModel: true,
+      },
+    })
+
+    const runningCatalog = recoveryCatalog()
+    const runningSnapshot = recoverySnapshot(runningCatalog.threads[0], 'Running model-selection authority.')
+    const runningApi = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog: runningCatalog, lastSnapshot: runningSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: modelConnection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+    })
+    const runningProjection = await runningApi.loadWorkbench()
+
+    expect(runningProjection.operations).toMatchObject({
+      startResidentTurn: false,
+      stopResidentTurn: true,
+      modelCatalog: true,
+    })
+    expect(runningProjection.operations.selectResidentModel).toBeUndefined()
+    expect(() => runningApi.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    })).toThrow(StaleHostAuthorityError)
+  })
+
+  it('submits one exact live-only model command and completes only after the refreshed model projects', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const initialSnapshot = recoverySnapshot(catalog.threads[0], 'Before model selection.')
+    const selectedSnapshot = structuredClone(initialSnapshot)
+    selectedSnapshot.generatedAt = '2026-08-05T20:00:02.000Z'
+    selectedSnapshot.latestCursor.sequence = 2
+    selectedSnapshot.thread.lastKnownCursor = selectedSnapshot.latestCursor
+    selectedSnapshot.runtime.model = 'openai-codex/gpt-5.3-codex'
+    const submittedReceipt = deferred<unknown>()
+    const submitCommand = vi.fn(() => submittedReceipt.promise)
+    const requestSnapshot = vi.fn(() => ok(selectedSnapshot))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: initialSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await api.loadWorkbench()
+
+    const request = {
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    }
+    const first = api.selectResidentModel(request)
+    const duplicate = api.selectResidentModel(request)
+    const conflicting = api.selectResidentModel({ ...request, modelId: 'gpt-5.2-codex' })
+    expect(duplicate).toBe(first)
+    await expect(conflicting).resolves.toEqual({
+      state: 'rejected',
+      retryable: true,
+      message: 'Another resident model change is already being verified. Try again after it finishes.',
+    })
+    expect(submitCommand).toHaveBeenCalledOnce()
+    const command = submitCommand.mock.calls[0]![0] as Record<string, unknown>
+    expect(command).toMatchObject({
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      expectedExecutionGenerationId: 'generation-one',
+      kind: 'model.select',
+      payload: { providerId: 'openai-codex', modelId: 'gpt-5.3-codex' },
+      delivery: 'live_only',
+    })
+    expect(typeof command.commandId).toBe('string')
+    expect(typeof command.issuedAt).toBe('string')
+    submittedReceipt.resolve(ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+      message: 'Selected GPT-5.3 Codex.',
+    }))
+
+    await expect(Promise.all([first, duplicate])).resolves.toEqual([
+      { state: 'completed', projected: true, message: 'Selected GPT-5.3 Codex.' },
+      { state: 'completed', projected: true, message: 'Selected GPT-5.3 Codex.' },
+    ])
+    expect(requestSnapshot).toHaveBeenCalledOnce()
+    expect(requestSnapshot).toHaveBeenCalledWith({ threadId: 'thread-one' })
+    expect(published.at(-1)?.runtime.session?.model).toBe('openai-codex/gpt-5.3-codex')
+    unsubscribe()
+  })
+
+  it('does not share an old-generation model promise with the same visible thread and target', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Original model-selection generation.')
+    const submittedReceipt = deferred<unknown>()
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const submitCommand = vi.fn(() => submittedReceipt.promise)
+    const requestSnapshot = vi.fn(() => ok(snapshot))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (next: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((projection) => published.push(projection))
+    await api.loadWorkbench()
+
+    const request = {
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    }
+    const original = api.selectResidentModel(request)
+    const command = submitCommand.mock.calls[0]![0] as Record<string, unknown>
+    const nextCatalog = structuredClone(catalog)
+    nextCatalog.generatedAt = '2026-08-05T20:00:03.000Z'
+    nextCatalog.threads[0].updatedAt = nextCatalog.generatedAt
+    nextCatalog.threads[0].currentLocation.executionGenerationId = 'generation-one-next'
+    snapshotListener?.(nextCatalog)
+    expect(published.at(-1)?.threads.find((thread) => thread.id === 'thread-one')?.executionGenerationId)
+      .toBe('generation-one-next')
+
+    const reopened = api.selectResidentModel(request)
+    expect(reopened).not.toBe(original)
+    await expect(reopened).resolves.toMatchObject({ state: 'rejected', retryable: true })
+    expect(submitCommand).toHaveBeenCalledOnce()
+
+    submittedReceipt.resolve(ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+    }))
+    await expect(original).resolves.toMatchObject({ state: 'completed', projected: false })
+    expect(requestSnapshot).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('keeps exact completed model proof dominant when the post-receipt refresh is unavailable', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Completed model proof.')
+    const requestSnapshot = vi.fn(() => Promise.reject(new Error('Snapshot refresh unavailable.')))
+    const submitCommand = vi.fn((command: Record<string, unknown>) => ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+      message: 'Model selected on the resident runtime.',
+    }))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+    })
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    })).resolves.toEqual({
+      state: 'completed',
+      projected: false,
+      message: 'Prime Agent completed this model change, but the current thread display has not refreshed yet.',
+    })
+    expect(submitCommand).toHaveBeenCalledOnce()
+    expect(requestSnapshot).toHaveBeenCalledOnce()
+  })
+
+  it('does not replay an ambiguous model receipt and never projects it', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Ambiguous model receipt.')
+    const requestSnapshot = vi.fn(() => ok(snapshot))
+    const submitCommand = vi.fn((command: Record<string, unknown>) => ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: 'another-command',
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+    }))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+    })
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    })).resolves.toEqual({
+      state: 'uncertain',
+      retryable: false,
+      message: 'The host returned a receipt for another command authority. Prime Continuim will not replay this model change.',
+    })
+    expect(submitCommand).toHaveBeenCalledOnce()
+    expect(requestSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('preserves post-dispatch uncertainty and exact terminal rejection across authority replacement', async () => {
+    const startAuthorityRace = async () => {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = 'idle'
+      const snapshot = recoverySnapshot(catalog.threads[0], 'Authority changes after dispatch.')
+      const submittedReceipt = deferred<unknown>()
+      let connectionListener: ((state: unknown) => void) | undefined
+      const requestSnapshot = vi.fn(() => ok(snapshot))
+      const submitCommand = vi.fn(() => submittedReceipt.promise)
+      const api = new NativeRendererApi({
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          connection: {
+            ...onlineConnection(),
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+          },
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+        requestSnapshot,
+        submitCommand,
+        onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+          connectionListener = listener
+          return () => undefined
+        }),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHostEvent: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      })
+      const unsubscribe = api.subscribe(() => undefined)
+      await api.loadWorkbench()
+      const pending = api.selectResidentModel({
+        threadId: 'thread-one',
+        providerId: 'openai-codex',
+        modelId: 'gpt-5.3-codex',
+      })
+      const command = submitCommand.mock.calls[0]![0] as Record<string, unknown>
+      connectionListener?.({
+        phase: 'connecting',
+        target: { kind: 'ssh', alias: 'replacement-host' },
+        since: '2026-08-05T20:00:02.000Z',
+        attempt: 2,
+      })
+      return { api, command, pending, requestSnapshot, submitCommand, submittedReceipt, unsubscribe }
+    }
+
+    const ambiguous = await startAuthorityRace()
+    await expect(ambiguous.api.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.2-codex',
+    })).resolves.toMatchObject({ state: 'rejected', retryable: true })
+    ambiguous.submittedReceipt.reject(new Error('Connection changed after dispatch.'))
+    await expect(ambiguous.pending).resolves.toEqual({
+      state: 'uncertain',
+      retryable: false,
+      message: 'Connection changed after dispatch. Prime Continuim will not replay this model change without terminal proof.',
+    })
+    expect(ambiguous.submitCommand).toHaveBeenCalledOnce()
+    expect(ambiguous.requestSnapshot).not.toHaveBeenCalled()
+    ambiguous.unsubscribe()
+
+    const rejected = await startAuthorityRace()
+    rejected.submittedReceipt.resolve(ok({
+      hostId: rejected.command.expectedHostId,
+      deviceId: rejected.command.deviceId,
+      commandId: rejected.command.commandId,
+      threadId: rejected.command.threadId,
+      executionGenerationId: rejected.command.expectedExecutionGenerationId,
+      status: 'rejected',
+      durable: true,
+      error: { retryable: true, message: 'The selected model is no longer available.' },
+    }))
+    await expect(rejected.pending).resolves.toEqual({
+      state: 'rejected',
+      retryable: true,
+      message: 'The selected model is no longer available.',
+    })
+    expect(rejected.submitCommand).toHaveBeenCalledOnce()
+    expect(rejected.requestSnapshot).not.toHaveBeenCalled()
+    rejected.unsubscribe()
+  })
+
+  it('returns completed refresh-pending proof without mutating a replacement authority', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Authority changes after selection.')
+    const submittedReceipt = deferred<unknown>()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const requestSnapshot = vi.fn(() => ok(snapshot))
+    const submitCommand = vi.fn(() => submittedReceipt.promise)
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+
+    const pending = api.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    })
+    const command = submitCommand.mock.calls[0]![0] as Record<string, unknown>
+    connectionListener?.({
+      phase: 'connecting',
+      target: { kind: 'ssh', alias: 'replacement-host' },
+      since: '2026-08-05T20:00:02.000Z',
+      attempt: 2,
+    })
+    submittedReceipt.resolve(ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+    }))
+
+    await expect(pending).resolves.toMatchObject({ state: 'completed', projected: false })
+    expect(submitCommand).toHaveBeenCalledOnce()
+    expect(requestSnapshot).not.toHaveBeenCalled()
+    unsubscribe()
   })
 
   it('captures one stable issue time and exact generation for a composer command', async () => {

@@ -343,6 +343,118 @@ function createIdleResidentApi() {
   return api
 }
 
+function createContinuityApi(options: {
+  taskState: WorkbenchSnapshot['threads'][number]['status']
+  connection?: WorkbenchSnapshot['hosts'][number]['connection']
+  residency?: NonNullable<WorkbenchSnapshot['runtime']['session']>['residency']
+}) {
+  const api = createIdleResidentApi()
+  const loadWorkbench = api.loadWorkbench.bind(api)
+  api.loadWorkbench = async () => {
+    const snapshot = await loadWorkbench()
+    const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+    const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+    if (!thread || !host || !snapshot.runtime.session) throw new Error('Expected the continuity fixture')
+    thread.status = options.taskState
+    host.name = 'Resident workstation'
+    host.connection = options.connection ?? 'online'
+    const residency = options.residency ?? 'resident'
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      residency,
+      activeSessionId: residency === 'resident' ? 'active-continuity-one' : undefined,
+      sessionId: residency === 'resident' ? 'session-continuity-one' : undefined,
+      isStreaming: options.taskState === 'running',
+    }
+    snapshot.operations.startResidentTurn = options.taskState === 'idle' && host.connection === 'online'
+    snapshot.operations.stopResidentTurn = options.taskState === 'running' && host.connection === 'online'
+    return snapshot
+  }
+  return api
+}
+
+function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  const loadRuntimeModelCatalog = api.loadRuntimeModelCatalog.bind(api)
+  const listeners = new Set<(next: WorkbenchSnapshot) => void>()
+  let current = structuredClone(previewSnapshot)
+  const selectedThread = current.threads.find((thread) => thread.id === 'thread-seamless')
+  const selectedHost = current.hosts.find((host) => host.id === selectedThread?.hostId)
+  if (!selectedThread || !selectedHost || !current.runtime.session) throw new Error('Expected the resident model-selection fixture')
+  selectedThread.status = 'idle'
+  selectedThread.executionGenerationId = 'generation-model-selection-one'
+  selectedThread.workspaceId = 'workspace-model-selection-one'
+  selectedHost.connection = 'online'
+  if (options.runtimeOAuth) {
+    selectedHost.kind = 'local'
+    selectedHost.connectionPath = 'Local socket'
+  }
+  current.runtime.session = {
+    ...current.runtime.session,
+    model: 'openai-codex/gpt-5.6-sol',
+    isStreaming: false,
+    isCompacting: false,
+    isBashRunning: false,
+    queuedActionCount: 0,
+  }
+  current.runtime.queue = { pendingCount: 0, paused: false }
+  current.operations = {
+    ...current.operations,
+    submitCommands: true,
+    startResidentTurn: true,
+    stopResidentTurn: false,
+    modelCatalog: true,
+    selectResidentModel: true,
+    ...(options.runtimeOAuth ? { runtimeOAuth: true } : {}),
+  }
+  current.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+  api.loadWorkbench = vi.fn(async () => structuredClone(current))
+  api.subscribe = vi.fn((listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  })
+  api.loadRuntimeModelCatalog = vi.fn(async (hostId) => {
+    const catalog = await loadRuntimeModelCatalog(hostId)
+    if (!options.runtimeOAuth) return catalog
+    const nextCatalog = structuredClone(catalog)
+    const provider = nextCatalog.providers.find((candidate) => candidate.providerId === 'openai-codex')
+    if (provider) {
+      provider.configured = false
+      provider.authSource = 'none'
+      provider.availableModelCount = 0
+    }
+    nextCatalog.models.forEach((model) => {
+      if (model.providerId !== 'openai-codex') return
+      model.available = false
+      model.usingOAuth = false
+    })
+    return nextCatalog
+  })
+  api.selectResidentModel = vi.fn(async () => ({
+    state: 'completed' as const,
+    projected: true,
+    message: 'Prime Agent selected and verified this model.',
+  }))
+
+  const publish = (mutate: (snapshot: WorkbenchSnapshot) => void) => {
+    const next = structuredClone(current)
+    mutate(next)
+    current = next
+    listeners.forEach((listener) => listener(structuredClone(current)))
+  }
+
+  return {
+    api,
+    publish,
+    publishCurrentModel(model: string) {
+      publish((snapshot) => {
+        if (!snapshot.runtime.session) throw new Error('Expected the resident model-selection session')
+        snapshot.runtime.session.model = model
+      })
+    },
+  }
+}
+
 function createHudHarness(options: {
   taskState?: WorkbenchSnapshot['threads'][number]['status']
   connection?: WorkbenchSnapshot['hosts'][number]['connection']
@@ -656,6 +768,7 @@ afterEach(() => {
   cleanup()
   window.history.replaceState({}, '', '/')
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1_024 })
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined })
 })
 
@@ -672,10 +785,10 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Repair runtime' })).not.toBeInTheDocument()
 
-    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
     await user.type(composer, 'Build the HUD from this resident thread')
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
     expect(harness.api.sendComposer).toHaveBeenCalledWith({
       threadId: harness.target.threadId,
       text: 'Build the HUD from this resident thread',
@@ -684,7 +797,7 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
     const buddy = await screen.findByRole('button', { name: /Working: Seamless remote experience\. Open conversation/ })
     await waitFor(() => expect(buddy).toHaveFocus())
-    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     await user.click(buddy)
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
     await user.keyboard('{Escape}')
@@ -698,7 +811,7 @@ describe('Prime Continuim renderer', () => {
 
     expect(await screen.findByRole('heading', { name: 'Desktop HUD unavailable' })).toBeVisible()
     expect(screen.getByText(/host, thread, and execution generation are not present/i)).toBeVisible()
-    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(harness.api.selectThread).not.toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Return to workbench' }))
     expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
@@ -706,25 +819,33 @@ describe('Prime Continuim renderer', () => {
     expect(harness.api.repairLocalRuntime).not.toHaveBeenCalled()
   })
 
-  it('clears a draft when the native HUD is retargeted and preserves it across modes for one target', async () => {
+  it('isolates and restores drafts by exact HUD authority and clears only the submitted authority', async () => {
     const user = userEvent.setup()
     const harness = createHudHarness()
     render(<App api={harness.api} surface="hud" />)
 
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    const firstComposer = screen.getByRole('textbox', { name: 'Message' })
+    const firstComposer = screen.getByRole('textbox', { name: 'Task brief' })
     await user.type(firstComposer, 'This draft belongs only to the first thread')
 
     const nextSnapshot = structuredClone(harness.snapshot)
     const sourceThread = nextSnapshot.threads.find((thread) => thread.id === harness.target.threadId)!
+    const sourceHost = nextSnapshot.hosts.find((host) => host.id === sourceThread.hostId)!
+    const nextHost = {
+      ...sourceHost,
+      id: 'host-hud-two',
+      name: 'Second resident workstation',
+    }
     const nextThread = {
       ...structuredClone(sourceThread),
       id: 'thread-hud-two',
       remoteId: 'thread-hud-two',
+      hostId: nextHost.id,
       title: 'Second HUD resident thread',
       executionGenerationId: 'generation-hud-two',
       transcript: [],
     }
+    nextSnapshot.hosts.push(nextHost)
     nextSnapshot.threads.push(nextThread)
     nextSnapshot.selectedThreadId = nextThread.id
     nextSnapshot.selectedProjectId = nextThread.projectId
@@ -740,20 +861,49 @@ describe('Prime Continuim renderer', () => {
     })
 
     expect(await screen.findByRole('heading', { name: 'Second HUD resident thread' })).toBeVisible()
-    const secondComposer = screen.getByRole('textbox', { name: 'Message' })
+    const secondComposer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(secondComposer).toHaveValue(''))
     expect(secondComposer).not.toHaveValue('This draft belongs only to the first thread')
 
     await user.type(secondComposer, 'Keep this draft while changing HUD modes')
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: harness.target, ignoresMouseEvents: false })
+      harness.publishSnapshot(structuredClone(harness.snapshot))
+    })
+    expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('This draft belongs only to the first thread')
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: nextTarget, ignoresMouseEvents: false })
+      harness.publishSnapshot(nextSnapshot)
+    })
+    expect(await screen.findByRole('heading', { name: 'Second HUD resident thread' })).toBeVisible()
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Keep this draft while changing HUD modes')
+
     await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
     await user.click(await screen.findByRole('button', { name: /Open conversation/ }))
-    expect(await screen.findByRole('textbox', { name: 'Message' })).toHaveValue('Keep this draft while changing HUD modes')
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Keep this draft while changing HUD modes')
 
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
     expect(harness.api.sendComposer).toHaveBeenLastCalledWith({
       threadId: nextThread.id,
       text: 'Keep this draft while changing HUD modes',
     })
+    act(() => harness.publishSnapshot(nextSnapshot))
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveValue(''))
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: harness.target, ignoresMouseEvents: false })
+      harness.publishSnapshot(structuredClone(harness.snapshot))
+    })
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('This draft belongs only to the first thread')
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: nextTarget, ignoresMouseEvents: false })
+      harness.publishSnapshot(nextSnapshot)
+    })
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('')
   })
 
   it('uses the resident Stop authority and explicit close path from the expanded HUD', async () => {
@@ -770,13 +920,13 @@ describe('Prime Continuim renderer', () => {
     expect(harness.api.hudClose).toHaveBeenCalledOnce()
   })
 
-  it('clears the draft before paint when the same HUD thread advances to a new execution generation', async () => {
+  it('isolates and restores drafts when the same HUD thread changes execution generation', async () => {
     const user = userEvent.setup()
     const harness = createHudHarness()
     render(<App api={harness.api} surface="hud" />)
 
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Draft from the retired execution')
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Draft from the first execution')
 
     const nextSnapshot = structuredClone(harness.snapshot)
     const thread = nextSnapshot.threads.find((candidate) => candidate.id === harness.target.threadId)!
@@ -790,9 +940,22 @@ describe('Prime Continuim renderer', () => {
       harness.publishSnapshot(nextSnapshot)
     })
 
-    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const composer = await screen.findByRole('textbox', { name: 'Task brief' })
     expect(composer).toHaveValue('')
-    expect(composer).not.toHaveValue('Draft from the retired execution')
+    expect(composer).not.toHaveValue('Draft from the first execution')
+    await user.type(composer, 'Draft from the second execution')
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: harness.target, ignoresMouseEvents: false })
+      harness.publishSnapshot(structuredClone(harness.snapshot))
+    })
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Draft from the first execution')
+
+    act(() => {
+      harness.publishHudState({ state: 'expanded', target: nextTarget, ignoresMouseEvents: false })
+      harness.publishSnapshot(nextSnapshot)
+    })
+    expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Draft from the second execution')
   })
 
   it('keeps passive HUD and transcript updates from stealing focus', async () => {
@@ -848,7 +1011,7 @@ describe('Prime Continuim renderer', () => {
     const harness = createHudHarness({ taskState: 'needs_approval' })
     render(<App api={harness.api} surface="hud" />)
 
-    expect(await screen.findByText('Needs you')).toBeVisible()
+    expect(await screen.findByText('Needs you', { selector: '.hud-status > span' })).toBeVisible()
     expect(screen.getByText(/approval needs review in the full workbench/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Review in workbench' }))
@@ -943,7 +1106,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     expect(await screen.findByText('Ending resident session', { selector: '.composer__intent' })).toBeVisible()
-    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resident session end is durably pending' })).toBeDisabled()
     expect(api.endResident).not.toHaveBeenCalled()
 
@@ -1143,6 +1306,53 @@ describe('Prime Continuim renderer', () => {
     expect(within(main).getByRole('status')).toHaveTextContent('bundled Prime Agent runtime is verified')
     const chooseWorkspace = screen.getByRole('button', { name: 'Choose workspace folder' })
     await waitFor(() => expect(chooseWorkspace).toHaveFocus())
+  })
+
+  it('opens Prime Agent accounts and starts host-scoped OAuth before a resident thread exists', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const loadWorkbench = harness.api.loadWorkbench.bind(harness.api)
+    harness.api.loadWorkbench = vi.fn(async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.selectedProjectId = ''
+      snapshot.selectedThreadId = ''
+      snapshot.projects = []
+      snapshot.threads = []
+      snapshot.runtime = {}
+      snapshot.operations = {
+        ...snapshot.operations,
+        submitCommands: false,
+        startResidentTurn: false,
+        stopResidentTurn: false,
+        provisionResident: true,
+        modelCatalog: true,
+        selectResidentModel: undefined,
+        runtimeOAuth: true,
+      }
+      return snapshot
+    })
+    harness.api.startRuntimeOAuth = vi.fn(async () => ({
+      state: 'completed',
+      message: 'ChatGPT is connected to Prime Agent.',
+    }))
+    harness.api.cancelRuntimeOAuth = vi.fn(async () => null)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Start a resident thread' })
+    const models = screen.getByRole('button', { name: 'Models & accounts' })
+    expect(screen.queryByRole('heading', { name: 'Seamless remote experience' })).not.toBeInTheDocument()
+    await user.click(models)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+
+    expect(harness.api.startRuntimeOAuth).toHaveBeenCalledWith({
+      hostId: 'host-local',
+      providerId: 'openai-codex',
+    }, expect.any(Function))
+    expect(within(dialog).getByText('ChatGPT is connected to Prime Agent.')).toHaveAttribute('role', 'status')
+    expect(within(dialog).queryByRole('button', { name: /Use model/i })).not.toBeInTheDocument()
   })
 
   it('announces and focuses a terminal local-service failure, then retries only the local connection', async () => {
@@ -1654,6 +1864,9 @@ describe('Prime Continuim renderer', () => {
   })
 
   it('keeps a non-retryable Stop uncertainty disabled until exact recovery evidence arrives', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 256 })
+    window.dispatchEvent(new Event('resize'))
     const user = userEvent.setup()
     const api = createPreviewRendererApi()
     const loadWorkbench = api.loadWorkbench.bind(api)
@@ -1686,7 +1899,12 @@ describe('Prime Continuim renderer', () => {
     })
     expect(stop).toHaveTextContent('Outcome unknown')
     expect(stop).toBeDisabled()
+    expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
+    expect(document.querySelector('.composer__connection')).toHaveClass('composer__connection--uncertain')
     expect(screen.getAllByText('Outcome unknown · recovery required; this Stop will not be replayed').some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByText('Needs you')).toBeVisible()
+    expect(within(continuity).getByText(/last Stop outcome.*is unknown/i)).toBeVisible()
     expect(screen.queryByText(/try stop again/i)).not.toBeInTheDocument()
     await user.click(stop)
     expect(api.abortThread).not.toHaveBeenCalled()
@@ -1705,7 +1923,7 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByText('Last seen running', { selector: '.task-state__label' })).toBeVisible()
     expect(document.querySelector('.task-state')).toHaveClass('task-state--stale')
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
-    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
     expect(screen.getByText('Resident status unverified', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByText('Active resident turn', { selector: '.composer__intent' })).not.toBeInTheDocument()
@@ -1715,8 +1933,9 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toHaveTextContent('Reconnect to verify')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
     const continuity = screen.getByRole('region', { name: 'Session status' })
-    expect(within(continuity).getByText(/Last reported resident on devbox · current status unverified/i)).toBeVisible()
-    expect(within(continuity).queryByText(/Continues on devbox when this window closes/i)).not.toBeInTheDocument()
+    expect(within(continuity).getByRole('status')).toHaveTextContent('Reconnecting')
+    expect(within(continuity).getByText('Reconnecting to devbox. Saved activity is available; current status is unverified.')).toBeVisible()
+    expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
     const receiptDetails = screen.getByText('Receipt details').closest('details')
     expect(receiptDetails).not.toHaveAttribute('open')
     await user.click(screen.getByText('Receipt details'))
@@ -1734,7 +1953,7 @@ describe('Prime Continuim renderer', () => {
     expect(await screen.findByRole('heading', { name: 'Benchmark attention kernel' })).toBeVisible()
     expect(screen.getAllByText(/Offline · Last synchronized 18 min ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getAllByText(/cached transcript remains available/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
-    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toBeDisabled()
     expect(screen.queryByText(/send when reconnected/i)).not.toBeInTheDocument()
@@ -1747,7 +1966,7 @@ describe('Prime Continuim renderer', () => {
     const harness = createHostActivationHarness()
     render(<App api={harness.api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Keep this exact draft')
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Keep this exact draft')
     await act(async () => harness.publish(harness.snapshotFor('offline')))
 
     const connect = screen.getByRole('button', { name: 'Connect to this computer' })
@@ -1773,7 +1992,7 @@ describe('Prime Continuim renderer', () => {
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Connect to this computer' })).not.toBeInTheDocument())
     expect(document.querySelector('#connection-status')).toHaveTextContent('Connected to this computer.')
-    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep this exact draft')
+    expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveValue('Keep this exact draft')
     expect(harness.api.sendComposer).not.toHaveBeenCalled()
   })
 
@@ -1782,7 +2001,7 @@ describe('Prime Continuim renderer', () => {
     const harness = createHostActivationHarness()
     render(<App api={harness.api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Preserve after failure')
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Preserve after failure')
     await act(async () => harness.publish(harness.snapshotFor('offline')))
     await user.click(screen.getByRole('button', { name: 'Connect to this computer' }))
 
@@ -1805,8 +2024,8 @@ describe('Prime Continuim renderer', () => {
 
     await act(async () => harness.publish(harness.snapshotFor('online', true)))
     expect(screen.getByRole('button', { name: 'Connect to this computer' })).toBeEnabled()
-    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Preserve after failure')
-    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeDisabled()
+    expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveValue('Preserve after failure')
+    expect(screen.getByRole('button', { name: 'Delegate task' })).toBeDisabled()
     expect(harness.api.sendComposer).not.toHaveBeenCalled()
   })
 
@@ -1835,7 +2054,7 @@ describe('Prime Continuim renderer', () => {
     const harness = createHostActivationHarness()
     render(<App api={harness.api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Draft stays with my current view')
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Draft stays with my current view')
     await act(async () => harness.publish(harness.snapshotFor('offline')))
     await user.click(screen.getByRole('button', { name: 'Connect to this computer' }))
 
@@ -1873,7 +2092,7 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('button', { name: 'Connect to this computer' })).not.toBeInTheDocument()
   })
 
-  it('offers one honest prompt action for an idle resident session', async () => {
+  it('offers one accessible, task-oriented delegation action for an idle resident session', async () => {
     const user = userEvent.setup()
     const api = createIdleResidentApi()
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
@@ -1882,17 +2101,61 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     expect(screen.queryByRole('button', { name: /steer/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /follow up/i })).not.toBeInTheDocument()
-    expect(screen.getByText('New resident prompt', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Delegate a task', { selector: '.composer__intent' })).toBeVisible()
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    expect(composer).toHaveAttribute('placeholder', 'Describe the outcome, constraints, and done criteria…')
+    expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-status')
+    expect(document.getElementById('composer-hint')).toHaveTextContent('Include the outcome, constraints, and done criteria')
+    expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toContainElement(composer)
 
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Summarize the approval boundary.')
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.type(composer, 'Summarize the approval boundary.')
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
     expect(api.sendComposer).toHaveBeenCalledWith({
       threadId: 'thread-complete',
       text: 'Summarize the approval boundary.',
     })
   })
 
+  it.each([
+    { taskState: 'idle' as const, expectedStatus: 'Ready', expectedDetail: 'Resident workstation is ready for another delegated task.' },
+    { taskState: 'waiting' as const, expectedStatus: 'Needs you', expectedDetail: 'Prime Agent needs your input on Resident workstation before it can continue.' },
+    { taskState: 'running' as const, connection: 'reconnecting' as const, expectedStatus: 'Reconnecting', expectedDetail: 'Reconnecting to Resident workstation. Saved activity is available; current status is unverified.' },
+  ])('announces $expectedStatus continuity without moving focus', async ({ taskState, connection, expectedStatus, expectedDetail }) => {
+    render(<App api={createContinuityApi({ taskState, ...(connection ? { connection } : {}) })} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+
+    expect(within(continuity).getByRole('status')).toHaveTextContent(expectedStatus)
+    expect(within(continuity).getByText(expectedDetail)).toBeVisible()
+    expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    {
+      residency: 'resident' as const,
+      expected: 'Prime Agent keeps working on Resident workstation after this window closes.',
+      promisesOffload: true,
+    },
+    {
+      residency: 'client_owned' as const,
+      expected: 'Prime Agent is working on Resident workstation while this client remains attached.',
+      promisesOffload: false,
+    },
+  ])('describes working $residency authority without overstating offload', async ({ residency, expected, promisesOffload }) => {
+    render(<App api={createContinuityApi({ taskState: 'running', residency })} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+
+    expect(within(continuity).getByRole('status')).toHaveTextContent('Working')
+    expect(within(continuity).getByText(expected)).toBeVisible()
+    expect(continuity).toHaveTextContent(promisesOffload ? 'after this window closes' : 'while this client remains attached')
+    if (!promisesOffload) expect(continuity).not.toHaveTextContent('after this window closes')
+  })
+
   it('focuses and describes an empty composer submission, then clears the error while typing', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 256 })
+    window.dispatchEvent(new Event('resize'))
     const user = userEvent.setup()
     const previewApi = createIdleResidentApi()
     const sendComposer = vi.fn(previewApi.sendComposer.bind(previewApi))
@@ -1901,13 +2164,15 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
 
-    const composer = screen.getByRole('textbox', { name: 'Message' })
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     await waitFor(() => expect(composer).toHaveFocus())
     expect(composer).toHaveAttribute('aria-invalid', 'true')
     expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-message-error')
-    expect(document.getElementById('composer-message-error')).toHaveTextContent('Write a prompt before running Prime Agent.')
+    expect(document.querySelector('.composer__connection')).toHaveClass('composer__connection--validation')
+    expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
+    expect(document.getElementById('composer-message-error')).toHaveTextContent('Describe the task before delegating to Prime Agent.')
     expect(sendComposer).not.toHaveBeenCalled()
 
     await user.type(composer, 'Continue from the latest checkpoint.')
@@ -1926,10 +2191,10 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
-    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
     const draft = 'Keep this draft until execution is available.'
     await user.type(composer, draft)
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     await screen.findAllByText('Prime Agent execution is not attached in this build.')
     expect(composer).toHaveValue(draft)
@@ -1953,25 +2218,30 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const transcript = screen.getByRole('region', { name: 'Thread transcript' })
-    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
     const prompt = 'Wait for the resident transcript before showing this prompt.'
 
     await user.type(composer, prompt)
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     await waitFor(() => expect(api.sendComposer).toHaveBeenCalledTimes(1))
     expect(screen.getByText('Admitting resident prompt', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Prompt is awaiting durable host admission' })).toHaveTextContent('Submitting prompt')
     expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toHaveAttribute('aria-busy', 'true')
     expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).getByText(/Delegating this task to Prime Agent/)).toBeVisible()
 
     await act(async () => {
       admission.resolve({ state: 'sent', message: 'Sent · durably admitted by host' })
       await admission.promise
     })
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument())
     expect(screen.getByText('Prompt owned by Prime Agent', { selector: '.composer__intent' })).toBeVisible()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
+    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).getByText(/Prime Agent owns this task.*waiting for authoritative activity/)).toBeVisible()
 
     const authoritative = structuredClone(snapshot)
     const selected = authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)
@@ -2019,8 +2289,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const prompt = 'Keep the projection honest while starting this turn.'
-    await user.type(screen.getByRole('textbox', { name: 'Message' }), prompt)
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), prompt)
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     const stop = await screen.findByRole('button', { name: 'Stop the active Prime Agent turn' })
     expect(stop).toBeEnabled()
@@ -2057,7 +2327,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
-    expect(screen.queryByText('New resident prompt', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Delegate a task', { selector: '.composer__intent' })).not.toBeInTheDocument()
     const pendingStop = screen.getByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })
     expect(pendingStop).toHaveTextContent('Stop accepted')
     expect(pendingStop).toBeDisabled()
@@ -2085,9 +2355,9 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
-    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await user.type(composer, 'Start, then stop, this exact resident turn.')
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
     await waitFor(() => expect(api.sendComposer).toHaveBeenCalledOnce())
 
     const active = structuredClone(snapshot)
@@ -2152,8 +2422,8 @@ describe('Prime Continuim renderer', () => {
     idle.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     await act(async () => publish?.(idle))
     expect(screen.queryByText('Stop accepted', { selector: '.composer__intent' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
-    if (promptOutcome === 'response') expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
+    if (promptOutcome === 'response') expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveValue('')
     },
   )
 
@@ -2176,8 +2446,8 @@ describe('Prime Continuim renderer', () => {
 
       render(<App api={api} />)
       await screen.findByRole('heading', { name: 'Audit SSH discovery' })
-      await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Fence both late IPC tails.')
-      await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+      await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Fence both late IPC tails.')
+      await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
       const active = structuredClone(snapshot)
       const activeThread = active.threads.find((thread) => thread.id === active.selectedThreadId)
@@ -2201,7 +2471,7 @@ describe('Prime Continuim renderer', () => {
       idle.operations.stopResidentTurn = false
       idle.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
       await act(async () => publish?.(idle))
-      expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
 
       await act(async () => {
         if (outcome === 'response') {
@@ -2214,7 +2484,7 @@ describe('Prime Continuim renderer', () => {
         await Promise.allSettled([promptTail.promise, stopTail.promise])
       })
 
-      expect(screen.getByRole('button', { name: 'Run prompt' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
       expect(screen.queryByText(/Late prompt|Late Stop/)).not.toBeInTheDocument()
     },
   )
@@ -2227,11 +2497,11 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
-    const firstComposer = screen.getByRole('textbox', { name: 'Message' })
+    const firstComposer = screen.getByRole('textbox', { name: 'Task brief' })
     await user.type(firstComposer, 'First thread submission')
-    await user.click(screen.getByRole('button', { name: 'Run prompt' }))
+    await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
-    const secondComposer = screen.getByRole('textbox', { name: 'Message' })
+    const secondComposer = screen.getByRole('textbox', { name: 'Task brief' })
     await user.clear(secondComposer)
     await user.type(secondComposer, 'Newer draft for the second thread')
 
@@ -2262,8 +2532,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
 
-    expect(screen.getByRole('textbox', { name: 'Message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Run prompt' })).toBeDisabled()
+    expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delegate task' })).toBeDisabled()
     const location = screen.getByLabelText(/^Run location: devbox\. Moving threads between computers is unavailable$/)
     expect(location).toHaveTextContent('devboxMove unavailable')
     expect(screen.getAllByText(/resident session is not ready for a new prompt/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
@@ -2282,7 +2552,7 @@ describe('Prime Continuim renderer', () => {
     expect(selectThread).toHaveBeenCalledWith('thread-gpu')
   })
 
-  it('shows only the native runtime-backed model registry and preserves its read-only metadata controls', async () => {
+  it('shows only the native runtime-backed model registry and keeps active-turn rows nonactionable', async () => {
     const user = userEvent.setup()
     const api = asNativeFixture(createPreviewRendererApi())
     const loadRuntimeModelCatalog = vi.spyOn(api, 'loadRuntimeModelCatalog')
@@ -2303,8 +2573,8 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText('Kimi K3')).toBeVisible()
     expect(within(dialog).getByText('Current')).toBeVisible()
     expect(within(dialog).queryByText('Claude Opus 5')).not.toBeInTheDocument()
-    expect(within(dialog).queryByRole('button', { name: /connect|select/i })).not.toBeInTheDocument()
-    expect(within(dialog).getByText(/This registry view is read-only/)).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: /Use model/i })).not.toBeInTheDocument()
+    expect(within(dialog).getByText(/Model selection is available only while this exact resident session is idle/)).toBeVisible()
 
     const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
     const allProviders = within(providerToolbar).getByRole('button', { name: /All providers/ })
@@ -2334,10 +2604,362 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText('Claude Opus 5')).toBeVisible()
     expect(within(dialog).getAllByText('Setup required').length).toBeGreaterThan(0)
     expect(dialog.querySelector('.model-list')).not.toHaveAttribute('aria-live')
-    expect(within(dialog).getByRole('status')).toHaveAttribute('aria-atomic', 'true')
+    const modelResultsStatus = within(dialog).getByText('Showing 2 of 2 models')
+    expect(modelResultsStatus).toHaveAttribute('role', 'status')
+    expect(modelResultsStatus).toHaveTextContent('Showing 2 of 2 models')
+    expect(modelResultsStatus).toHaveAttribute('aria-atomic', 'true')
+    expect(modelResultsStatus).not.toHaveAttribute('aria-label')
 
     await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
     await waitFor(() => expect(trigger).toHaveFocus())
+  })
+
+  it('connects ChatGPT to the selected Prime Agent runtime and replaces the catalog only after completion proof', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const initialCatalog = await harness.api.loadRuntimeModelCatalog('host-devbox')
+    const refreshedCatalog = structuredClone(initialCatalog)
+    refreshedCatalog.observedAt = '2026-08-07T12:03:00.000Z'
+    const refreshedProvider = refreshedCatalog.providers.find((provider) => provider.providerId === 'openai-codex')!
+    refreshedProvider.configured = true
+    refreshedProvider.authSource = 'stored'
+    refreshedProvider.availableModelCount = refreshedProvider.modelCount
+    refreshedCatalog.models.forEach((model) => {
+      if (model.providerId !== 'openai-codex') return
+      model.available = true
+      model.usingOAuth = true
+    })
+    const completion = deferred<{
+      state: 'completed'
+      message: string
+      catalog: RuntimeModelCatalog
+    }>()
+    let reportProgress: ((progress: { phase: 'awaiting_user'; message: string }) => void) | undefined
+    harness.api.startRuntimeOAuth = vi.fn((_request, onProgress) => {
+      reportProgress = onProgress as typeof reportProgress
+      return completion.promise
+    })
+    harness.api.cancelRuntimeOAuth = vi.fn(async () => null)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    expect(within(dialog).queryByRole('button', { name: /Connect/ })).not.toBeInTheDocument()
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+
+    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
+    expect(within(dialog).getByText(/no authorization URL or credential is exposed to this view/i)).toBeVisible()
+    expect(dialog.querySelector('.provider-setup-note__storage')).toHaveTextContent(/Prime Agent 0\.7\.0.*auth\.json.*operating-system account’s file permissions/i)
+    expect(within(dialog).getByText('auth.json is plaintext at rest; it is not a keychain or keyring.')).toBeVisible()
+    expect(within(dialog).getByText(/Availability checks reload the account state before model selection/i)).toBeVisible()
+    expect(within(dialog).queryByText(/new resident session|restart/i)).not.toBeInTheDocument()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    expect(harness.api.startRuntimeOAuth).toHaveBeenCalledWith({
+      hostId: 'host-devbox',
+      providerId: 'openai-codex',
+    }, expect.any(Function))
+    expect(within(dialog).getByText(/Opening the verified ChatGPT sign-in page/)).toHaveAttribute('role', 'status')
+    expect(within(dialog).getByRole('button', { name: 'Cancel sign-in' })).toBeEnabled()
+
+    act(() => reportProgress?.({
+      phase: 'awaiting_user',
+      message: 'Finish signing in in your browser. This window will update automatically.',
+    }))
+    expect(within(dialog).getByText(/Finish signing in in your browser/)).toHaveAttribute('role', 'status')
+
+    await act(async () => {
+      completion.resolve({
+        state: 'completed',
+        message: 'ChatGPT is connected to Prime Agent and the model catalog is refreshed.',
+        catalog: refreshedCatalog,
+      })
+      await completion.promise
+    })
+    expect(within(dialog).getByText(/connected to Prime Agent.*catalog is refreshed/i)).toHaveAttribute('role', 'status')
+    expect(within(dialog).queryByRole('button', { name: 'Connect ChatGPT' })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /ChatGPT Plus\/Pro/ })).toHaveTextContent('Configured')
+  })
+
+  it('keeps a host-scoped Prime Agent sign-in visible and cancellable when the selected resident thread changes', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const completion = deferred<{ state: 'cancelled'; message: string }>()
+    harness.api.startRuntimeOAuth = vi.fn(() => completion.promise)
+    harness.api.cancelRuntimeOAuth = vi.fn((_request) => {
+      completion.resolve({ state: 'cancelled', message: 'ChatGPT sign-in was cancelled.' })
+      return completion.promise
+    })
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+
+    expect(within(dialog).getByText(/Opening the verified ChatGPT sign-in page/)).toHaveAttribute('role', 'status')
+    expect(within(dialog).getByRole('button', { name: 'Cancel sign-in' })).toBeEnabled()
+
+    await act(async () => {
+      harness.publish((snapshot) => {
+        const nextThread = snapshot.threads.find((thread) => thread.id === 'thread-complete')
+        if (!nextThread) throw new Error('Expected the second resident thread fixture')
+        snapshot.selectedThreadId = nextThread.id
+        snapshot.selectedProjectId = nextThread.projectId
+      })
+    })
+
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    expect(within(dialog).getByText(/Opening the verified ChatGPT sign-in page/)).toHaveAttribute('role', 'status')
+    expect(within(dialog).getByRole('button', { name: 'Cancel sign-in' })).toBeEnabled()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel sign-in' }))
+    await waitFor(() => expect(within(dialog).getByText('ChatGPT sign-in was cancelled.')).toHaveAttribute('role', 'status'))
+    expect(harness.api.startRuntimeOAuth).toHaveBeenCalledTimes(1)
+    expect(harness.api.cancelRuntimeOAuth).toHaveBeenCalledWith({
+      hostId: 'host-devbox',
+      providerId: 'openai-codex',
+    })
+  })
+
+  it('uses the exact OAuth cancellation for both Cancel sign-in and closing Models & accounts', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const first = deferred<{ state: 'cancelled'; message: string }>()
+    const second = deferred<{ state: 'cancelled'; message: string }>()
+    harness.api.startRuntimeOAuth = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    let cancellationCount = 0
+    harness.api.cancelRuntimeOAuth = vi.fn((_request) => {
+      cancellationCount += 1
+      const target = cancellationCount === 1 ? first : second
+      target.resolve({ state: 'cancelled', message: 'ChatGPT sign-in was cancelled.' })
+      return target.promise
+    })
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+    let dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel sign-in' }))
+
+    await waitFor(() => expect(within(dialog).getByText('ChatGPT sign-in was cancelled.')).toHaveAttribute('role', 'status'))
+    expect(harness.api.cancelRuntimeOAuth).toHaveBeenNthCalledWith(1, {
+      hostId: 'host-devbox',
+      providerId: 'openai-codex',
+    })
+    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(harness.api.cancelRuntimeOAuth).toHaveBeenNthCalledWith(2, {
+      hostId: 'host-devbox',
+      providerId: 'openai-codex',
+    })
+    expect(harness.api.startRuntimeOAuth).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('dialog', { name: 'Models & accounts' })).not.toBeInTheDocument()
+
+    await user.click(trigger)
+    dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
+    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
+    expect(dialog.querySelector('.runtime-oauth-feedback__message--error')).toHaveTextContent('')
+  })
+
+  it('selects only available non-current models and waits for the authoritative current-model projection', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    const completion = deferred<{
+      state: 'completed'
+      projected: false
+      message: string
+    }>()
+    harness.api.selectResidentModel = vi.fn(() => completion.promise)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await within(dialog).findByText('GPT-5.6 Terra')
+    const feedback = dialog.querySelector<HTMLElement>('.model-selection-feedback')
+    expect(feedback).not.toBeNull()
+
+    const currentRow = within(dialog).getByText('GPT-5.6 Sol').closest('article')
+    const targetRow = within(dialog).getByText('GPT-5.6 Terra').closest('article')
+    expect(currentRow).not.toBeNull()
+    expect(targetRow).not.toBeNull()
+    expect(within(currentRow as HTMLElement).getByText('Current')).toBeVisible()
+    expect(within(currentRow as HTMLElement).queryByRole('button', { name: /Use model/ })).not.toBeInTheDocument()
+
+    await user.click(within(dialog).getByRole('button', { name: 'All models' }))
+    const unavailableRow = within(dialog).getByText('Claude Opus 5').closest('article')
+    expect(unavailableRow).not.toBeNull()
+    expect(within(unavailableRow as HTMLElement).getByText('Setup required')).toBeVisible()
+    expect(within(unavailableRow as HTMLElement).queryByRole('button', { name: /Use model/ })).not.toBeInTheDocument()
+
+    const useTerra = within(targetRow as HTMLElement).getByRole('button', { name: 'Use model GPT-5.6 Terra' })
+    await user.click(useTerra)
+    expect(harness.api.selectResidentModel).toHaveBeenCalledWith({
+      threadId: 'thread-seamless',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.6-terra',
+    })
+    expect(within(feedback as HTMLElement).getByRole('status')).toHaveTextContent(
+      /Selecting GPT-5\.6 Terra for this thread's next prompt/,
+    )
+    within(dialog).getAllByRole('button', { name: /model (GPT|Kimi|DeepSeek|Qwen|GLM|MiniMax)/i })
+      .forEach((button) => expect(button).toBeDisabled())
+
+    await act(async () => {
+      completion.resolve({
+        state: 'completed',
+        projected: false,
+        message: 'Prime Agent completed this model change, but the current thread display has not refreshed yet.',
+      })
+      await completion.promise
+    })
+    expect(within(feedback as HTMLElement).getByRole('status')).toHaveTextContent(
+      /Selected on host · refreshing current model.*will not resend/i,
+    )
+    expect(within(targetRow as HTMLElement).queryByText('Current')).not.toBeInTheDocument()
+    expect(within(targetRow as HTMLElement).getByRole('button', { name: 'Refreshing GPT-5.6 Terra' })).toBeDisabled()
+
+    act(() => harness.publishCurrentModel('openai-codex/gpt-5.6-terra'))
+    await waitFor(() => expect(within(targetRow as HTMLElement).getByText('Current')).toBeVisible())
+    expect(within(feedback as HTMLElement).getByRole('status')).toHaveTextContent(
+      /GPT-5\.6 Terra is now shown as current for this thread/,
+    )
+    expect(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Luna' })).toBeEnabled()
+    expect(within(dialog).getByText(/changes the resident session only; it does not send a prompt/i)).toBeVisible()
+  })
+
+  it('surfaces definitive rejection and permits only an explicitly retryable selection', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    harness.api.selectResidentModel = vi.fn()
+      .mockResolvedValueOnce({ state: 'rejected', retryable: true, message: 'Prime Agent rejected this model change.' })
+      .mockResolvedValueOnce({ state: 'rejected', retryable: false, message: 'This model is no longer selectable.' })
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const useTerra = await within(dialog).findByRole('button', { name: 'Use model GPT-5.6 Terra' })
+    const feedback = dialog.querySelector<HTMLElement>('.model-selection-feedback')
+    expect(feedback).not.toBeNull()
+
+    await user.click(useTerra)
+    expect(within(feedback as HTMLElement).getByRole('alert')).toHaveTextContent(
+      /No model change was applied.*You can choose a model again/,
+    )
+    expect(useTerra).toBeEnabled()
+
+    await user.click(useTerra)
+    expect(within(feedback as HTMLElement).getByRole('alert')).toHaveTextContent(
+      /No model change was applied.*cannot be retried/,
+    )
+    expect(useTerra).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Luna' })).toBeEnabled()
+    expect(harness.api.selectResidentModel).toHaveBeenCalledTimes(2)
+  })
+
+  it('locks uncertain model changes without replaying them', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    const outcome = deferred<{
+      state: 'uncertain'
+      retryable: false
+      message: string
+    }>()
+    harness.api.selectResidentModel = vi.fn(() => outcome.promise)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const useTerra = await within(dialog).findByRole('button', { name: 'Use model GPT-5.6 Terra' })
+    const feedback = dialog.querySelector<HTMLElement>('.model-selection-feedback')
+    expect(feedback).not.toBeNull()
+    await user.click(useTerra)
+    expect(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Luna' })).toBeDisabled()
+
+    await act(async () => {
+      outcome.resolve({
+        state: 'uncertain',
+        retryable: false,
+        message: 'The host response ended before terminal proof arrived.',
+      })
+      await outcome.promise
+    })
+    expect(within(feedback as HTMLElement).getByRole('alert')).toHaveTextContent(
+      /outcome is unknown.*will not send this model change again automatically.*Do not retry it from this dialog/i,
+    )
+    within(dialog).getAllByRole('button', { name: /Use model/ }).forEach((button) => expect(button).toBeDisabled())
+    await user.click(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Luna' }))
+    expect(harness.api.selectResidentModel).toHaveBeenCalledOnce()
+  })
+
+  it('discards late model-selection results after authority changes or dialog closure', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    const staleAuthorityOutcome = deferred<{
+      state: 'rejected'
+      retryable: true
+      message: string
+    }>()
+    const closedDialogOutcome = deferred<{
+      state: 'uncertain'
+      retryable: false
+      message: string
+    }>()
+    harness.api.selectResidentModel = vi.fn()
+      .mockReturnValueOnce(staleAuthorityOutcome.promise)
+      .mockReturnValueOnce(closedDialogOutcome.promise)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+    let dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const firstUseTerra = await within(dialog).findByRole('button', { name: 'Use model GPT-5.6 Terra' })
+    let feedback = dialog.querySelector<HTMLElement>('.model-selection-feedback')
+    expect(feedback).not.toBeNull()
+    await user.click(firstUseTerra)
+
+    act(() => harness.publish((snapshot) => {
+      const selectedThread = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
+      if (!selectedThread) throw new Error('Expected the selected model-selection thread')
+      selectedThread.executionGenerationId = 'generation-model-selection-two'
+    }))
+    await act(async () => {
+      staleAuthorityOutcome.resolve({ state: 'rejected', retryable: true, message: 'This late result must not render.' })
+      await staleAuthorityOutcome.promise
+    })
+    expect(within(feedback as HTMLElement).getByRole('alert')).toHaveTextContent('')
+    expect(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Terra' })).toBeEnabled()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Terra' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
+    await act(async () => {
+      closedDialogOutcome.resolve({ state: 'uncertain', retryable: false, message: 'This closed result must not render.' })
+      await closedDialogOutcome.promise
+    })
+    await user.click(trigger)
+    dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const reopenedUseTerra = await within(dialog).findByRole('button', { name: 'Use model GPT-5.6 Terra' })
+    feedback = dialog.querySelector<HTMLElement>('.model-selection-feedback')
+    expect(feedback).not.toBeNull()
+    expect(reopenedUseTerra).toBeEnabled()
+    expect(within(feedback as HTMLElement).getByRole('alert')).toHaveTextContent('')
+    expect(harness.api.selectResidentModel).toHaveBeenCalledTimes(2)
   })
 
   it('reveals every matching model in explicit batches and resets the batch when filters or the dialog change', async () => {
@@ -3458,7 +4080,7 @@ describe('Prime Continuim renderer', () => {
       time: 'Now',
       body: 'Do not steal my reading position.',
     })
-    const composer = screen.getByRole('textbox', { name: 'Message' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
     composer.focus()
     await act(async () => publish?.(authoritative))
     await screen.findByText('Do not steal my reading position.')

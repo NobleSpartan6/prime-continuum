@@ -60,6 +60,62 @@ afterEach(async () => {
 })
 
 describe('DesktopControlService recovery', () => {
+  it('loads independent bootstrap ledgers concurrently without weakening the authority snapshot', async () => {
+    const directory = await createUserData({})
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const stores = service as unknown as {
+      commandIdentities: { read: () => Promise<unknown> }
+      durableUncertainReceipts: { read: () => Promise<unknown> }
+      cache: { read: () => Promise<unknown> }
+      outbox: { read: () => Promise<unknown> }
+      residentLifecycleLedger: { read: () => Promise<unknown> }
+    }
+    const initialRelease = deferred<void>()
+    const initialStarts: string[] = []
+    const holdInitial = async <T>(name: string, value: T): Promise<T> => {
+      initialStarts.push(name)
+      await initialRelease.promise
+      return value
+    }
+
+    stores.commandIdentities.read = vi.fn(async () =>
+      await holdInitial('command-identities', { version: 1, entries: [] })
+    )
+    stores.durableUncertainReceipts.read = vi.fn(async () =>
+      await holdInitial('uncertain-receipts', { version: 1, entries: [] })
+    )
+    stores.cache.read = vi.fn(async () =>
+      await holdInitial('projection-cache', { version: 3, entries: {}, targetHostBindings: [] })
+    )
+    stores.outbox.read = vi.fn(async () =>
+      await holdInitial('outbox', [])
+    )
+    stores.residentLifecycleLedger.read = vi.fn(async () =>
+      await holdInitial('resident-lifecycle', { version: 1, entries: [] })
+    )
+
+    const bootstrapPromise = service.bootstrap()
+    await Promise.resolve()
+    const initialSnapshot = [...initialStarts]
+    initialRelease.resolve()
+
+    await expect(bootstrapPromise).resolves.toMatchObject({
+      cache: { version: 3, entries: {}, targetHostBindings: [] },
+      outbox: [],
+      durableUncertainReceipts: [],
+      residentLifecycleOperations: [],
+      connection: { phase: 'offline' },
+    })
+    expect(new Set(initialSnapshot)).toEqual(new Set([
+      'command-identities',
+      'uncertain-receipts',
+      'projection-cache',
+      'outbox',
+      'resident-lifecycle',
+    ]))
+    expect(stores.commandIdentities.read).toHaveBeenCalledTimes(1)
+  })
+
   it('restores the persisted last target during bootstrap and can reconnect to it', async () => {
     const directory = await createUserData({
       cache: {
@@ -930,7 +986,10 @@ describe('DesktopControlService recovery', () => {
     await service.connect({ kind: 'local' })
 
     const cacheStore = (service as unknown as {
-      cache: { update: (updater: (current: unknown) => unknown) => Promise<unknown> }
+      cache: {
+        update: (updater: (current: unknown) => unknown) => Promise<unknown>
+        readHydrated: () => Promise<{ entries: Record<string, unknown> }>
+      }
     }).cache
     const originalUpdate = cacheStore.update.bind(cacheStore)
     const releaseSnapshotWrite = deferred<void>()
@@ -954,9 +1013,21 @@ describe('DesktopControlService recovery', () => {
     await expect(staleSnapshot).rejects.toMatchObject({ code: 'connection.superseded' })
     expect(snapshots).toEqual([])
     const bootstrap = await service.bootstrap()
+    const bootstrapCache = bootstrap.cache as { entries: Record<string, unknown> }
     expect(bootstrap.connection).toMatchObject({ phase: 'online', hostId: 'host-b' })
     expect(bootstrap.cache).not.toMatchObject({ catalog: { host: { hostId: 'host-a' } } })
-    expect(bootstrap.cache).toMatchObject({
+    expect(bootstrapCache.entries['host-a']).toBeUndefined()
+    const hostAProjectionPath = path.join(
+      directory,
+      'control',
+      'projections',
+      `${createHash('sha256').update('host-a').digest('hex')}.json`,
+    )
+    expect(JSON.parse(await readFile(hostAProjectionPath, 'utf8'))).toMatchObject({
+      hostId: 'host-a',
+      catalog: { host: { hostId: 'host-a', displayName: 'Test host' } },
+    })
+    expect(await cacheStore.readHydrated()).toMatchObject({
       entries: { 'host-a': { catalog: { host: { hostId: 'host-a', displayName: 'Test host' } } } }
     })
   })
@@ -1136,23 +1207,37 @@ describe('DesktopControlService recovery', () => {
 
     const restarted = new DesktopControlService({ app: testApp(directory) })
     const bootstrap = await restarted.bootstrap()
+    const bootstrapCache = bootstrap.cache as { entries: Record<string, unknown> }
     expect(bootstrap.connection).toMatchObject({ phase: 'offline', hostId: 'host-b' })
     expect(bootstrap.cache).toMatchObject({
       version: 3,
       activeHostId: 'host-b',
       projectionHostId: 'host-b',
       entries: {
-        'host-a': {
-          catalog: { host: { hostId: 'host-a', displayName: 'Test host' } },
-          lastSnapshot: { thread: { threadId: 'thread-a' } }
-        },
         'host-b': {
           catalog: { host: { hostId: 'host-b', displayName: 'Host B replaced' } },
           lastSnapshot: { thread: { threadId: 'thread-b' } }
         }
       }
     })
+    expect(bootstrapCache.entries['host-a']).toBeUndefined()
     expect(await readdir(path.join(directory, 'control', 'projections'))).toHaveLength(2)
+
+    const restartedCache = (restarted as unknown as {
+      cache: { readHydrated: () => Promise<{ entries: Record<string, unknown> }> }
+    }).cache
+    expect(await restartedCache.readHydrated()).toMatchObject({
+      entries: {
+        'host-a': {
+          catalog: { host: { hostId: 'host-a', displayName: 'Test host' } },
+          lastSnapshot: { thread: { threadId: 'thread-a' } },
+        },
+        'host-b': {
+          catalog: { host: { hostId: 'host-b', displayName: 'Host B replaced' } },
+          lastSnapshot: { thread: { threadId: 'thread-b' } },
+        },
+      },
+    })
   })
 
   it('fences the sanitized runtime model catalog to the verified host authority', async () => {

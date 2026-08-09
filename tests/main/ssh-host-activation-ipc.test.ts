@@ -32,6 +32,7 @@ describe('verified SSH host activation IPC', () => {
       } as unknown as DesktopControlService,
       getWindows: () => [],
       isTrustedSender: (event) => event === trustedEvent,
+      isTrustedWorkbenchSender: (event) => event === trustedEvent,
     })
     const invoke = handlers.get(IPC.activateVerifiedSshHost)
 

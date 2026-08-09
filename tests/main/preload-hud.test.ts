@@ -21,6 +21,7 @@ describe('preload HUD bridge', () => {
     expect(exposeInMainWorld.mock.calls[0]?.[0]).toBe('prime')
     const exposed = exposeInMainWorld.mock.calls[0]?.[1] as HudBridge
     expect(Object.isFrozen(exposed)).toBe(true)
+    expect(exposed).not.toHaveProperty('codexSubscription')
     const target: HudTarget = {
       expectedHostId: 'host-local',
       threadId: 'thread-prime',

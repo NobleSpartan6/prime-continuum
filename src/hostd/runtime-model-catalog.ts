@@ -9,6 +9,7 @@ import {
   type RuntimeModelProvider,
 } from "../shared/protocol";
 import type { VerifiedInstalledRuntimeHandle } from "./runtime-integrity-manager";
+import type { PrimeAgentRuntimeSecurityGate } from "./prime-agent-auth-security";
 
 const MAX_RUNTIME_CATALOG_BYTES = 2 * 1024 * 1024;
 const MAX_HELPER_STDERR_BYTES = 64 * 1024;
@@ -102,6 +103,8 @@ export interface VerifiedRuntimeHandleProvider {
 
 export interface RuntimeModelCatalogProvider {
   read(): Promise<RuntimeModelCatalogSnapshot>;
+  capabilityReady?(): Promise<boolean>;
+  invalidate?(): void;
 }
 
 export interface RuntimeModelCatalogHelperRunOptions {
@@ -120,6 +123,8 @@ export interface VerifiedRuntimeModelCatalogOptions {
   readonly helperTimeoutMs?: number;
   readonly now?: () => Date;
   readonly cacheTtlMs?: number;
+  /** Shared production custody proof; tests that exercise pure catalog logic may omit it. */
+  readonly credentialSecurity?: PrimeAgentRuntimeSecurityGate;
 }
 
 export interface RuntimeModelCatalogHelperInvocation {
@@ -157,6 +162,7 @@ export class VerifiedRuntimeModelCatalog implements RuntimeModelCatalogProvider 
   private readonly helperTimeoutMs: number;
   private readonly now: () => Date;
   private readonly cacheTtlMs: number;
+  private readonly credentialSecurity: PrimeAgentRuntimeSecurityGate | undefined;
   private cached: { readonly value: RuntimeModelCatalogSnapshot; readonly loadedAtMs: number } | undefined;
   private activeRead: Promise<RuntimeModelCatalogSnapshot> | undefined;
 
@@ -167,13 +173,37 @@ export class VerifiedRuntimeModelCatalog implements RuntimeModelCatalogProvider 
     this.helperTimeoutMs = options.helperTimeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS;
     this.now = options.now ?? (() => new Date());
     this.cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    this.credentialSecurity = options.credentialSecurity;
     if (!Number.isSafeInteger(this.cacheTtlMs) || this.cacheTtlMs < 0 || this.cacheTtlMs > 60_000) {
       throw new TypeError("Runtime model catalog cache TTL must be an integer from 0 to 60000 milliseconds");
     }
     assertHelperTimeout(this.helperTimeoutMs);
   }
 
-  read(): Promise<RuntimeModelCatalogSnapshot> {
+  invalidate(): void {
+    this.cached = undefined;
+  }
+
+  async capabilityReady(): Promise<boolean> {
+    if (this.credentialSecurity?.capabilityAvailable?.() === false) {
+      void this.credentialSecurity.prepareAndVerify().catch(() => undefined);
+      return false;
+    }
+    try {
+      await this.credentialSecurity?.assertStillSecure();
+      return true;
+    } catch {
+      this.cached = undefined;
+      return false;
+    }
+  }
+
+  async read(): Promise<RuntimeModelCatalogSnapshot> {
+    await this.credentialSecurity?.assertStillSecure();
+    return this.readSecured();
+  }
+
+  private readSecured(): Promise<RuntimeModelCatalogSnapshot> {
     const now = this.now();
     const nowMs = now.getTime();
     if (!Number.isFinite(nowMs)) {
@@ -205,6 +235,9 @@ export class VerifiedRuntimeModelCatalog implements RuntimeModelCatalogProvider 
       handle.identity.releaseVersion,
       observedAt.toISOString(),
     );
+    // A helper can race a path/permission change. Never publish or cache its
+    // result unless the same shared custody proof still holds afterwards.
+    await this.credentialSecurity?.assertStillSecure({ force: true });
     this.cached = { value: snapshot, loadedAtMs };
     return snapshot;
   }

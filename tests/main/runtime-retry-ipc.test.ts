@@ -40,6 +40,7 @@ describe('runtime integrity retry IPC', () => {
       service: { retryRuntimeIntegrity, on, off } as unknown as DesktopControlService,
       getWindows: () => [],
       isTrustedSender: (event) => event === trustedEvent,
+      isTrustedWorkbenchSender: (event) => event === trustedEvent,
     })
     const invoke = handlers.get(IPC.retryRuntimeIntegrity)
     expect(invoke).toBeTypeOf('function')
@@ -105,6 +106,7 @@ describe('runtime integrity retry IPC', () => {
       service: { repairRuntimeIntegrity, on: vi.fn(), off: vi.fn() } as unknown as DesktopControlService,
       getWindows: () => [],
       isTrustedSender: (event) => event === trustedEvent,
+      isTrustedWorkbenchSender: (event) => event === trustedEvent,
     })
     const invoke = handlers.get(IPC.repairRuntimeIntegrity)
 

@@ -371,7 +371,6 @@ function initializePrimaryInstance(): void {
       )
     },
   })
-  await hudWindowController.initialize()
   unregisterIpc = registerControlIpc({
     ipcMain,
     service,
@@ -400,7 +399,15 @@ function initializePrimaryInstance(): void {
     }
     return
   }
-  void loadRenderer(mainWindow)
+  void loadRenderer(mainWindow).catch(() => {
+    // Keep first paint off the HUD-preference critical path without turning a
+    // navigation failure into an unhandled rejection or leaking its URL.
+    process.stderr.write('Prime Continuim could not load the workbench renderer.\n')
+  })
+  // HUD preferences are not needed to paint the workbench. Start their bounded
+  // read after renderer navigation; every HUD operation that needs them still
+  // awaits the controller's shared, idempotent initialization promise.
+  void hudWindowController.initialize()
 
   app.on('activate', () => {
     showMainWindow()

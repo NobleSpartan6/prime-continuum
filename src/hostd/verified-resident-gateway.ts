@@ -49,6 +49,7 @@ import {
   type ResidentPromptReconciliationLease,
 } from "./store";
 import type { CommandEnvelope } from "../shared/protocol";
+import type { PrimeAgentRuntimeSecurityGate } from "./prime-agent-auth-security";
 
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
 
@@ -90,6 +91,8 @@ export interface VerifiedResidentGatewayOptions {
   readonly runtimeHandles: VerifiedRuntimeHandleProvider;
   readonly environment?: Readonly<NodeJS.ProcessEnv>;
   readonly platform?: NodeJS.Platform;
+  /** The exact shared custody proof also used by OAuth and model discovery. */
+  readonly credentialSecurity?: PrimeAgentRuntimeSecurityGate;
   /** Test seam. Production constructs the pinned resident adapter exactly once. */
   readonly adapterFactory?: (options: PrimeAgentResidentAdapterOptions) => ResidentGatewayAdapter;
   /** Test seam for the verified deep-module loader. */
@@ -107,6 +110,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   private readonly runtimeHandles: VerifiedRuntimeHandleProvider;
   private readonly environment: Readonly<NodeJS.ProcessEnv>;
   private readonly platform: NodeJS.Platform;
+  private readonly credentialSecurity: PrimeAgentRuntimeSecurityGate | undefined;
   private readonly adapterFactory: NonNullable<VerifiedResidentGatewayOptions["adapterFactory"]>;
   private readonly moduleLoaderFactory: NonNullable<VerifiedResidentGatewayOptions["moduleLoaderFactory"]>;
   private readonly lifecycleCoordinator: ResidentLifecycleCoordinator;
@@ -124,6 +128,9 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   private readonly bindingPublicationRevisions = new Map<string, number>();
   private adapter: ResidentGatewayAdapter | undefined;
   private adapterPromise: Promise<ResidentGatewayAdapter> | undefined;
+  private residentLifecycleCapabilityVerified = false;
+  private residentLifecycleCapabilityAttempt: Promise<void> | undefined;
+  private residentLifecycleCapabilityRetryAfterMs = 0;
   private runtimeModuleLoader: PrimeAgentResidentWorkerModuleLoader | undefined;
   private promptReconciliationDiscovery: Promise<void> | undefined;
   private abortReconciliationDiscovery: Promise<void> | undefined;
@@ -135,6 +142,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     this.runtimeHandles = options.runtimeHandles;
     this.environment = Object.freeze({ ...(options.environment ?? process.env) });
     this.platform = options.platform ?? process.platform;
+    this.credentialSecurity = options.credentialSecurity;
     this.adapterFactory = options.adapterFactory ?? ((adapterOptions) => new PrimeAgentResidentAdapter(adapterOptions));
     this.moduleLoaderFactory = options.moduleLoaderFactory ?? createVerifiedResidentModuleLoader;
     this.lifecycleCoordinator = new ResidentLifecycleCoordinator({
@@ -148,6 +156,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
 
   async isLive(threadId: string, executionGenerationId: string): Promise<boolean> {
     if (this.closed) return false;
+    if (!(await this.credentialSecurityReady())) return false;
     const binding = await this.store.getResidentSessionBinding(threadId, executionGenerationId);
     const slot = residentBindingSlotKey(threadId, executionGenerationId);
     if (!binding) {
@@ -166,6 +175,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
 
   async isResidentBindingLive(bindingValue: ResidentSessionBinding): Promise<boolean> {
     if (this.closed) return false;
+    if (!(await this.credentialSecurityReady())) return false;
     const binding = validateResidentSessionBinding(bindingValue);
     const slot = residentBindingSlotKeyFor(binding);
     const fingerprint = residentDispatchAuthorityFingerprint(binding);
@@ -181,6 +191,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (prepared !== attached) return false;
     try {
       const live = await this.adapter.isLive(binding.threadId, binding.executionGenerationId);
+      await this.assertCredentialSecurity(true);
       const stillPrepared = !this.closed &&
         live &&
         this.preparedBindings.get(slot) === attached &&
@@ -202,6 +213,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
    */
   async capabilityReady(): Promise<boolean> {
     if (this.closed) return false;
+    if (!this.beginCredentialSecurityWarmup()) return false;
+    if (!(await this.credentialSecurityReady())) return false;
     const bindings = await this.store.listResidentSessionBindings();
     this.synchronizeDesiredBindings(bindings);
     for (const desired of this.desiredBindings.values()) {
@@ -224,12 +237,11 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
    */
   async residentLifecycleCapabilityReady(): Promise<boolean> {
     if (this.closed) return false;
-    try {
-      await this.ensureProvisioningAdapter();
-      return !this.closed;
-    } catch {
-      return false;
-    }
+    if (!this.beginCredentialSecurityWarmup()) return false;
+    if (!(await this.credentialSecurityReady())) return false;
+    if (this.residentLifecycleCapabilityVerified) return true;
+    this.scheduleResidentLifecycleCapabilityWarmup();
+    return false;
   }
 
   /** Durable client-owned escrow provisioning for one Store-authorized thread. */
@@ -237,7 +249,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (this.closed) {
       return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
     }
-    return this.lifecycleCoordinator.provision(request);
+    return this.assertCredentialSecurity(true).then(() => this.lifecycleCoordinator.provision(request));
   }
 
   /** Durable explicit end for one exact Store-authorized resident thread. */
@@ -245,7 +257,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (this.closed) {
       return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
     }
-    return this.lifecycleCoordinator.end(request);
+    return this.assertCredentialSecurity(true).then(() => this.lifecycleCoordinator.end(request));
   }
 
   subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
@@ -316,6 +328,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (this.closed) {
       throw new GatewayError("GATEWAY_CLOSED", "The resident Prime Agent gateway is closed", false);
     }
+    await this.assertCredentialSecurity();
     const adapter = this.adapter;
     const binding = dispatchBindingFor(command, context, this.preparedBindings);
     if (!adapter || !binding || !this.isPreparedBinding(binding)) {
@@ -333,6 +346,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
         true,
       );
     }
+    await this.assertCredentialSecurity(true);
     return adapter.submit(command, context);
   }
 
@@ -370,7 +384,12 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     return this.closePromise;
   }
 
-  private ensureAdapter(): Promise<ResidentGatewayAdapter> {
+  private async ensureAdapter(): Promise<ResidentGatewayAdapter> {
+    await this.assertCredentialSecurity();
+    return this.ensureSecuredAdapter();
+  }
+
+  private ensureSecuredAdapter(): Promise<ResidentGatewayAdapter> {
     if (this.closed) return Promise.reject(new GatewayError("GATEWAY_CLOSED", "The resident gateway is closed"));
     if (this.adapter) return Promise.resolve(this.adapter);
     if (this.adapterPromise) return this.adapterPromise;
@@ -388,6 +407,68 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     return attempt;
   }
 
+  private async credentialSecurityReady(): Promise<boolean> {
+    try {
+      await this.assertCredentialSecurity();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private beginCredentialSecurityWarmup(): boolean {
+    if (!this.credentialSecurity || this.credentialSecurity.capabilityAvailable?.() !== false) return true;
+    void this.credentialSecurity.prepareAndVerify().catch(() => {
+      this.withdrawCredentialRuntime();
+    });
+    return false;
+  }
+
+  private async assertCredentialSecurity(force = false): Promise<void> {
+    try {
+      await this.credentialSecurity?.assertStillSecure(force ? { force: true } : undefined);
+    } catch {
+      this.withdrawCredentialRuntime();
+      throw new GatewayError(
+        "PRIME_AGENT_RUNTIME_CUSTODY_UNAVAILABLE",
+        "The resident Prime Agent runtime custody boundary is unavailable",
+        true,
+      );
+    }
+  }
+
+  private withdrawCredentialRuntime(): void {
+    this.residentLifecycleCapabilityVerified = false;
+    this.residentLifecycleCapabilityRetryAfterMs = Number.POSITIVE_INFINITY;
+    this.preparedBindings.clear();
+    for (const [slot, attached] of this.attachedBindings) {
+      this.retireAttachedBinding(slot, attached);
+    }
+  }
+
+  private scheduleResidentLifecycleCapabilityWarmup(): void {
+    if (
+      this.closed ||
+      this.residentLifecycleCapabilityVerified ||
+      this.residentLifecycleCapabilityAttempt ||
+      Date.now() < this.residentLifecycleCapabilityRetryAfterMs
+    ) return;
+    let attempt!: Promise<void>;
+    attempt = this.ensureProvisioningAdapter()
+      .then(() => {
+        if (!this.closed) this.residentLifecycleCapabilityVerified = true;
+      })
+      .catch(() => {
+        this.residentLifecycleCapabilityRetryAfterMs = Date.now() + 5_000;
+      })
+      .finally(() => {
+        if (this.residentLifecycleCapabilityAttempt === attempt) {
+          this.residentLifecycleCapabilityAttempt = undefined;
+        }
+      });
+    this.residentLifecycleCapabilityAttempt = attempt;
+  }
+
   private async ensureProvisioningAdapter(): Promise<ResidentProvisioningAdapter> {
     const adapter = await this.ensureAdapter();
     if (
@@ -401,11 +482,20 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       );
     }
     return Object.freeze({
-      createOwnedCandidate: (input: ResidentOwnedSessionCreateInput) => adapter.createOwnedCandidate!(input),
-      readStableResidentProjection: (binding: ResidentSessionBinding) =>
-        adapter.readStableResidentProjection!(binding),
-      endResidentSession: (lease: Parameters<NonNullable<ResidentProvisioningAdapter["endResidentSession"]>>[0]) =>
-        adapter.endResidentSession!(lease),
+      createOwnedCandidate: async (input: ResidentOwnedSessionCreateInput) => {
+        await this.assertCredentialSecurity(true);
+        return adapter.createOwnedCandidate!(input);
+      },
+      readStableResidentProjection: async (binding: ResidentSessionBinding) => {
+        await this.assertCredentialSecurity(true);
+        return adapter.readStableResidentProjection!(binding);
+      },
+      endResidentSession: async (
+        lease: Parameters<NonNullable<ResidentProvisioningAdapter["endResidentSession"]>>[0],
+      ) => {
+        await this.assertCredentialSecurity(true);
+        return adapter.endResidentSession!(lease);
+      },
     });
   }
 
@@ -508,6 +598,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       // inside attach and a later async refresh can cross this exact baseline.
       const publicationBaseline = this.bindingPublicationRevisions.get(slot) ?? 0;
       connection = await adapter.attachResident(desired.binding);
+      await this.assertCredentialSecurity(true);
       if (
         this.closed ||
         !this.isDesiredBinding(slot, desired.fingerprint) ||
@@ -689,11 +780,13 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   }
 
   private async reconcileResidentPrompt(lease: ResidentPromptReconciliationLease): Promise<void> {
+    if (!(await this.credentialSecurityReady())) return;
     const adapter = this.adapter;
     if (this.closed || !adapter || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) {
       return;
     }
     const evidence = await adapter.reconcileAcknowledgedPromptIdle(lease);
+    await this.assertCredentialSecurity(true);
     if (this.closed || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) return;
     const observation = await this.store.completeResidentPromptReconciliation(lease, evidence);
     if (this.closed) return;
@@ -721,11 +814,13 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   }
 
   private async reconcileResidentAbort(lease: ResidentAbortReconciliationLease): Promise<void> {
+    if (!(await this.credentialSecurityReady())) return;
     const adapter = this.adapter;
     if (this.closed || !adapter || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) {
       return;
     }
     const evidence = await adapter.reconcileAcknowledgedAbortIdle(lease);
+    await this.assertCredentialSecurity(true);
     if (this.closed || !this.isPreparedBinding(lease.binding) || !(await this.isCurrentBinding(lease.binding))) return;
     // Store alone may replace a lagging active view at the same upstream
     // cursor, and only under this exact branded acknowledged-Stop lease.
@@ -755,6 +850,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
   }
 
   private async createAdapter(): Promise<ResidentGatewayAdapter> {
+    await this.assertCredentialSecurity();
     const handle = await this.runtimeHandles.acquireVerifiedRuntimeHandle();
     const daemonWorkingDirectory = residentDaemonWorkingDirectory(this.store.paths.root);
     const socketPath = residentDaemonEndpoint(this.store.paths.root, this.platform);
@@ -772,6 +868,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       // retains this exact loader, whose Worker promise is cached, so later
       // operations cannot observe a different module load outcome.
       await moduleLoader();
+      await this.assertCredentialSecurity(true);
       if (this.closed) {
         throw new GatewayError(
           "GATEWAY_CLOSED",
@@ -785,15 +882,23 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
         daemonWorkingDirectory,
         environment: this.environment,
         loadRuntimeModule: moduleLoader,
-        persistBinding: (binding) => this.store.persistResidentSessionBinding(binding),
-        authorizeResidentKillInvocation: (lease) => this.store.authorizeResidentKillInvocation(lease),
+        persistBinding: async (binding) => {
+          await this.assertCredentialSecurity(true);
+          await this.store.persistResidentSessionBinding(binding);
+        },
+        authorizeResidentKillInvocation: async (lease) => {
+          await this.assertCredentialSecurity(true);
+          return this.store.authorizeResidentKillInvocation(lease);
+        },
         publishProjection: async (binding, projection) => {
+          await this.assertCredentialSecurity();
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
           await this.store.publishResidentProjectionSnapshot(binding, projection);
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
           this.publishProjectionChange(binding);
         },
         publishModelSelectionProjection: async (command, binding, projection) => {
+          await this.assertCredentialSecurity(true);
           if (this.closed || !(await this.isCurrentBinding(binding))) {
             throw new GatewayError(
               "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",

@@ -40,6 +40,11 @@ afterEach(async () => {
 describe("Prime Agent runtime build policy", () => {
   it("accepts the checked-in exact release graph and rejects source drift", async () => {
     const inputs = await loadRuntimeInputs();
+    expect(inputs.sources).not.toHaveProperty("codexAppServer");
+    expect(inputs.policy).not.toHaveProperty("codexAppServer");
+    expect(inputs.sources.assets).toHaveLength(4);
+    expect(inputs.sources.assets.every((asset: { url: string }) => !asset.url.includes("openai/codex"))).toBe(true);
+    expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
     expect(Object.keys(inputs.lockfile.packages)).toHaveLength(202);
     const zeromq = inputs.lockfile.packages["node_modules/zeromq"];
@@ -56,6 +61,18 @@ describe("Prime Agent runtime build policy", () => {
         policy: inputs.policy,
       }),
     ).toThrow(PrimeAgentRuntimeBuildError);
+
+    for (const side of ["sources", "policy"] as const) {
+      const legacySources = structuredClone(inputs.sources) as Record<string, unknown>;
+      const legacyPolicy = structuredClone(inputs.policy) as Record<string, unknown>;
+      (side === "sources" ? legacySources : legacyPolicy).codexAppServer = {};
+      expect(() => validateRuntimeInputs({
+        packageJson: inputs.packageJson,
+        lockfile: inputs.lockfile,
+        sources: legacySources,
+        policy: legacyPolicy,
+      })).toThrow("must not declare a companion backend");
+    }
   });
 
   it("removes inherited execution roles and Node preload injection", () => {
@@ -181,10 +198,34 @@ describe("Prime Agent runtime tree attestation", () => {
     );
     await writeFile(manifestPath, manifestText);
 
+    const legacyManifest = JSON.parse(manifestText) as Record<string, unknown>;
+    legacyManifest.codexAppServer = { releaseVersion: "0.147.0" };
+    await writeFile(manifestPath, `${JSON.stringify(legacyManifest, null, 2)}\n`);
+    await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).rejects.toThrow(
+      "does not match the pinned policy",
+    );
+    await writeFile(manifestPath, manifestText);
+
     await writeFile(join(root, "node_modules", "prime-agent", "dist", "index.js"), "export const changed = true;\n");
     await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).rejects.toThrow(
       "Runtime tree does not match runtime.json",
     );
+  });
+
+  it("refuses to attest any legacy companion namespace", async () => {
+    const root = await makeRuntimeFixture("runtime-with-legacy-companion");
+    const companion = join(root, "companions", "legacy");
+    await mkdir(companion, { recursive: true });
+    await writeFile(join(companion, "backend.exe"), "legacy backend");
+
+    await expect(createRuntimeManifest({
+      runtimeDirectory: root,
+      inputs: fixtureInputs(),
+      npmVersion: "10.9.8",
+      smoke: {
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+      },
+    })).rejects.toThrow("must not contain a companion backend");
   });
 
   it("rejects an entrypoint traversal before touching the filesystem", async () => {

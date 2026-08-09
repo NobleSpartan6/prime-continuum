@@ -48,6 +48,11 @@ interface StoredProjectionIndex {
   [key: string]: unknown
 }
 
+export interface IndexedProjectionCacheStoreOptions {
+  /** Injectable only for deterministic cache-read scheduling tests. */
+  readProjection?: (hostId: string, read: () => Promise<unknown>) => Promise<unknown>
+}
+
 /**
  * A small atomic index plus one bounded atomic file per immutable host.
  *
@@ -58,6 +63,15 @@ interface StoredProjectionIndex {
 export class IndexedProjectionCacheStore<T extends IndexedProjectionEnvelope> {
   private readonly index: AtomicJsonStore<unknown>
   private tail: Promise<void> = Promise.resolve()
+  private snapshot: T | undefined
+  private initialRead: Promise<T> | undefined
+  private backgroundHydration: Promise<void> | undefined
+  private backgroundHydrationFailure: { error: unknown } | undefined
+  /**
+   * Every mutation advances this epoch before touching disk. A background read
+   * may finish after that point, but it can no longer publish its older view.
+   */
+  private hydrationEpoch = 0
 
   constructor(
     indexPath: string,
@@ -65,39 +79,147 @@ export class IndexedProjectionCacheStore<T extends IndexedProjectionEnvelope> {
     private readonly normalize: (value: unknown) => T,
     private readonly fallback: () => T,
     private readonly limits: ProjectionCacheLimits = DEFAULT_LIMITS,
+    private readonly options: IndexedProjectionCacheStoreOptions = {},
   ) {
     this.index = new AtomicJsonStore(indexPath, fallback, INDEX_MAX_BYTES)
   }
 
   async read(): Promise<T> {
     await this.tail
-    return await this.readUnlocked()
+    if (this.backgroundHydrationFailure) throw this.backgroundHydrationFailure.error
+    if (this.snapshot) return this.snapshot
+
+    const existing = this.initialRead
+    if (existing) return await existing
+
+    const epoch = this.hydrationEpoch
+    const operation = this.readCacheFirstUnlocked(epoch)
+    this.initialRead = operation
+    try {
+      return await operation
+    } finally {
+      if (this.initialRead === operation) this.initialRead = undefined
+    }
+  }
+
+  /** Explicit full-cache barrier for maintenance paths that need inactive hosts. */
+  async readHydrated(): Promise<T> {
+    await this.read()
+    const hydration = this.backgroundHydration
+    if (hydration) await hydration
+    return await this.read()
   }
 
   async update(update: (current: T) => T | Promise<T>): Promise<T> {
     let result: T | undefined
     const operation = this.tail.then(async () => {
-      const current = await this.readUnlocked()
+      const epoch = ++this.hydrationEpoch
+      this.snapshot = undefined
+      this.initialRead = undefined
+      this.backgroundHydrationFailure = undefined
+      const current = await this.readAllUnlocked()
       const requested = this.normalize(await update(current))
-      result = await this.persistUnlocked(current, requested)
+      const persisted = await this.persistUnlocked(current, requested)
+      if (epoch === this.hydrationEpoch) this.snapshot = persisted
+      result = persisted
     })
     this.tail = operation.catch(() => undefined)
     await operation
     return result as T
   }
 
-  private async readUnlocked(): Promise<T> {
+  /**
+   * Initial paint needs only the selected authority. Inactive projections are
+   * independently stored cache material, so they can hydrate after the first result
+   * without delaying renderer readiness.
+   */
+  private async readCacheFirstUnlocked(epoch: number): Promise<T> {
+    const raw = await this.index.read()
+    if (!isStoredProjectionIndex(raw)) {
+      const normalized = this.normalize(raw)
+      if (epoch === this.hydrationEpoch) this.snapshot = normalized
+      return normalized
+    }
+
+    const descriptors = this.validDescriptors(raw)
+    const preferredHostId = preferredProjectionHostId(raw, descriptors)
+    const entries: Record<string, IndexedProjectionEntry> = {}
+    if (preferredHostId) {
+      const projection = await this.readProjection(preferredHostId)
+      if (isRecord(projection)) entries[preferredHostId] = projection as IndexedProjectionEntry
+    }
+    const initial = this.normalize({ ...raw, entries })
+    if (epoch !== this.hydrationEpoch) return initial
+
+    this.snapshot = initial
+    const inactive = descriptors.filter(([hostId]) => hostId !== preferredHostId)
+    if (inactive.length > 0) this.startBackgroundHydration(raw, inactive, entries, epoch)
+    return initial
+  }
+
+  private async readAllUnlocked(): Promise<T> {
     const raw = await this.index.read()
     if (!isStoredProjectionIndex(raw)) return this.normalize(raw)
 
     const entries: Record<string, IndexedProjectionEntry> = {}
-    for (const [hostId, descriptor] of sortedOwnEntries(raw.entries)) {
-      if (!isStoredProjectionDescriptor(descriptor, hostId)) continue
-      if (descriptor.fileName !== projectionFileName(hostId)) continue
-      const projection = await this.projectionStore(hostId).read()
+    for (const [hostId] of this.validDescriptors(raw)) {
+      const projection = await this.readProjection(hostId)
       if (isRecord(projection)) entries[hostId] = projection as IndexedProjectionEntry
     }
     return this.normalize({ ...raw, entries })
+  }
+
+  private startBackgroundHydration(
+    raw: StoredProjectionIndex,
+    descriptors: Array<[string, StoredProjectionDescriptor]>,
+    initialEntries: Record<string, IndexedProjectionEntry>,
+    epoch: number,
+  ): void {
+    const operation = this.hydrateInactive(raw, descriptors, initialEntries, epoch)
+    this.backgroundHydration = operation
+    void operation
+      .catch((error: unknown) => {
+        // Preserve the existing fail-closed read behavior once asynchronous
+        // hydration has discovered a bounded-file or filesystem failure.
+        if (epoch === this.hydrationEpoch) this.backgroundHydrationFailure = { error }
+      })
+      .finally(() => {
+        if (this.backgroundHydration === operation) this.backgroundHydration = undefined
+      })
+  }
+
+  private async hydrateInactive(
+    raw: StoredProjectionIndex,
+    descriptors: Array<[string, StoredProjectionDescriptor]>,
+    initialEntries: Record<string, IndexedProjectionEntry>,
+    epoch: number,
+  ): Promise<void> {
+    const entries = { ...initialEntries }
+    for (const [hostId] of descriptors) {
+      if (epoch !== this.hydrationEpoch) return
+      const projection = await this.readProjection(hostId)
+      if (epoch !== this.hydrationEpoch) return
+      if (isRecord(projection)) entries[hostId] = projection as IndexedProjectionEntry
+    }
+    const hydrated = this.normalize({ ...raw, entries })
+    if (epoch === this.hydrationEpoch) this.snapshot = hydrated
+  }
+
+  private validDescriptors(raw: StoredProjectionIndex): Array<[string, StoredProjectionDescriptor]> {
+    return sortedOwnEntries(raw.entries).filter(
+      (entry): entry is [string, StoredProjectionDescriptor] => {
+        const [hostId, descriptor] = entry
+        return (
+          isStoredProjectionDescriptor(descriptor, hostId, this.limits.fileMaxBytes) &&
+          descriptor.fileName === projectionFileName(hostId)
+        )
+      },
+    )
+  }
+
+  private async readProjection(hostId: string): Promise<unknown> {
+    const read = async (): Promise<unknown> => await this.projectionStore(hostId).read()
+    return this.options.readProjection ? await this.options.readProjection(hostId, read) : await read()
   }
 
   private async persistUnlocked(current: T, requested: T): Promise<T> {
@@ -233,15 +355,53 @@ function isStoredProjectionIndex(value: unknown): value is StoredProjectionIndex
   return Object.values(value.entries).every((entry) => isRecord(entry) && typeof entry.fileName === 'string')
 }
 
-function isStoredProjectionDescriptor(value: unknown, hostId: string): value is StoredProjectionDescriptor {
+function isStoredProjectionDescriptor(
+  value: unknown,
+  hostId: string,
+  fileMaxBytes = PROJECTION_FILE_MAX_BYTES,
+): value is StoredProjectionDescriptor {
   return (
     isRecord(value) &&
     value.hostId === hostId &&
     typeof value.fileName === 'string' &&
     Number.isInteger(value.byteLength) &&
     Number(value.byteLength) >= 0 &&
-    Number(value.byteLength) <= PROJECTION_FILE_MAX_BYTES &&
+    Number(value.byteLength) <= fileMaxBytes &&
     (value.updatedAt === undefined || typeof value.updatedAt === 'string')
+  )
+}
+
+function preferredProjectionHostId(
+  index: StoredProjectionIndex,
+  descriptors: Array<[string, StoredProjectionDescriptor]>,
+): string | undefined {
+  const available = new Set(descriptors.map(([hostId]) => hostId))
+  // The last target's immutable host binding is the bootstrap authority used
+  // by DesktopControlService. Prefer that exact selection over advisory cache
+  // metadata if a recovered index ever contains a mismatch.
+  if (index.lastTarget !== undefined && Array.isArray(index.targetHostBindings)) {
+    for (let offset = index.targetHostBindings.length - 1; offset >= 0; offset -= 1) {
+      const binding = index.targetHostBindings[offset]
+      if (!isRecord(binding) || typeof binding.hostId !== 'string') continue
+      if (available.has(binding.hostId) && sameStoredTarget(binding.target, index.lastTarget)) {
+        return binding.hostId
+      }
+    }
+  }
+
+  for (const candidate of [index.activeHostId, index.selectedHostId, index.projectionHostId]) {
+    if (typeof candidate === 'string' && available.has(candidate)) return candidate
+  }
+  return undefined
+}
+
+function sameStoredTarget(left: unknown, right: unknown): boolean {
+  if (!isRecord(left) || !isRecord(right) || left.kind !== right.kind) return false
+  return left.kind === 'local' || (
+    left.kind === 'ssh' &&
+    typeof left.alias === 'string' &&
+    typeof right.alias === 'string' &&
+    left.alias === right.alias
   )
 }
 

@@ -10,16 +10,17 @@ import {
   extractEmbeddedRuntimeAttestation,
   parseRuntimeAttestation,
 } from "./runtime-attestation-lib.mjs";
+import { createPrimeAgentSmokeCustody } from "./prime-agent-smoke-custody-lib.mjs";
+import { LOCAL_HOSTD_SMOKE_FIRST_HEALTH_DEADLINE_MS } from "../src/shared/local-host-startup-policy.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOSTD_PATH = resolve(REPO_ROOT, "out", "hostd", "hostd.cjs");
 const SEED_ROOT = resolve(process.env.PRIME_CONTINUIM_RUNTIME_SEED_ROOT ?? resolve(REPO_ROOT, "out", "runtime"));
 const ATTESTATION_PATH = resolve(REPO_ROOT, "out", "main", "runtime-attestation.json");
-const FIRST_HEALTH_DEADLINE_MS = 10_000;
 const HEALTH_REQUEST_DEADLINE_MS = 3_000;
 const MODEL_CATALOG_REQUEST_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 180_000;
-const CODEX_CAPABILITY_DEADLINE_MS = 60_000;
+const OPTIONAL_CAPABILITIES_DEADLINE_MS = 60_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const BASE_HEALTH_CAPABILITIES = Object.freeze([
@@ -29,8 +30,14 @@ const BASE_HEALTH_CAPABILITIES = Object.freeze([
 ].sort());
 const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
+const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
-const CODEX_SUBSCRIPTION_CAPABILITY = "codex_subscription_v1";
+const WARMED_CAPABILITIES = Object.freeze([
+  CANDIDATE_EVALUATION_CAPABILITY,
+  MODEL_CATALOG_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+].sort());
 const EXPECTED_MODEL_CATALOG = Object.freeze({
   releaseVersion: "0.7.0",
   providers: 32,
@@ -68,31 +75,88 @@ if (attestation.runtime.platform !== process.platform || attestation.runtime.arc
 }
 await assertExactSeedRoot(SEED_ROOT);
 await stat(electronExecutable);
+const hostdModule = require(HOSTD_PATH);
+const primeAgentCustody = await createPrimeAgentSmokeCustody({
+  hostDataRoot: dataDirectory,
+  hostdModule,
+});
+await primeAgentCustody.assertInitiallyAbsent();
 
 let child;
+let primaryFailure;
+let successReport;
 try {
   const cleanInstall = await runHostdReadinessPass({ expectCleanInstall: true });
   const restart = await runHostdReadinessPass({ expectCleanInstall: false });
   if (identityKey(cleanInstall.identity) !== identityKey(restart.identity)) {
     throw new Error("Clean-install and restart readiness returned different runtime identities");
   }
-  process.stdout.write(`${JSON.stringify({
+  successReport = {
     schemaVersion: 1,
     electronExecutable,
     hostdPath: HOSTD_PATH,
     seedRoot: SEED_ROOT,
     cleanInstall,
     restart,
-  }, null, 2)}\n`);
-} finally {
-  await stopChild(child).catch(() => undefined);
-  await rm(temporaryRoot, {
-    recursive: true,
-    force: true,
-    maxRetries: 5,
-    retryDelay: 100,
-  }).catch(() => undefined);
+  };
+} catch (error) {
+  primaryFailure = error;
 }
+
+const cleanupFailures = [];
+let cleanShutdownConfirmed = child === undefined;
+if (child) {
+  try {
+    await stopChild(child);
+    child = undefined;
+    cleanShutdownConfirmed = true;
+  } catch (error) {
+    cleanupFailures.push(new Error("Release hostd cleanup failed", { cause: error }));
+  }
+}
+let custodyCleanupConfirmed = false;
+if (cleanShutdownConfirmed) {
+  try {
+    await primeAgentCustody.captureExisting();
+    await primeAgentCustody.removeAfterConfirmedShutdown({ confirmedCleanShutdown: true });
+    custodyCleanupConfirmed = true;
+  } catch (error) {
+    cleanupFailures.push(new Error("Prime Agent package-smoke custody cleanup failed", { cause: error }));
+  }
+} else {
+  cleanupFailures.push(new Error(
+    "Prime Agent package-smoke custody was retained because clean host shutdown was not confirmed",
+  ));
+}
+if (custodyCleanupConfirmed) {
+  try {
+    await rm(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
+  } catch (error) {
+    cleanupFailures.push(new Error("Runtime initialization smoke temporary-root cleanup failed", { cause: error }));
+  }
+}
+
+if (primaryFailure) {
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(
+      [primaryFailure, ...cleanupFailures],
+      "Runtime initialization smoke failed and cleanup was incomplete",
+    );
+  }
+  throw primaryFailure;
+}
+if (cleanupFailures.length > 0) {
+  throw new AggregateError(cleanupFailures, "Runtime initialization smoke cleanup was incomplete");
+}
+if (!successReport) {
+  throw new Error("Runtime initialization smoke completed without an assurance report");
+}
+process.stdout.write(`${JSON.stringify(successReport, null, 2)}\n`);
 
 async function runHostdReadinessPass({ expectCleanInstall }) {
   const launchStartedAt = Date.now();
@@ -126,7 +190,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
 
   let first;
   let lastError;
-  const firstDeadline = Date.now() + FIRST_HEALTH_DEADLINE_MS;
+  const firstDeadline = Date.now() + LOCAL_HOSTD_SMOKE_FIRST_HEALTH_DEADLINE_MS;
   while (Date.now() < firstDeadline) {
     assertChildAlive(child, stderrTail);
     try {
@@ -149,7 +213,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     throw new Error(`Initial runtime health has an invalid status: ${firstRuntimeStatus ?? "missing"}`);
   }
   assertRuntimeHealth(first.health, firstRuntimeStatus);
-  if (firstHealthMs >= FIRST_HEALTH_DEADLINE_MS) {
+  if (firstHealthMs >= LOCAL_HOSTD_SMOKE_FIRST_HEALTH_DEADLINE_MS) {
     throw new Error("Initial runtime health exceeded the bounded core-startup deadline");
   }
 
@@ -192,8 +256,8 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     );
   }
   const readyMs = Date.now() - launchStartedAt;
-  const codexDeadline = Date.now() + CODEX_CAPABILITY_DEADLINE_MS;
-  while (!readyHealth.capabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY) && Date.now() < codexDeadline) {
+  const optionalCapabilitiesDeadline = Date.now() + OPTIONAL_CAPABILITIES_DEADLINE_MS;
+  while (!hasEveryCapability(readyHealth, WARMED_CAPABILITIES) && Date.now() < optionalCapabilitiesDeadline) {
     assertChildAlive(child, stderrTail);
     await delay(POLL_INTERVAL_MS);
     const response = await requestHealth(endpoint, HEALTH_REQUEST_DEADLINE_MS);
@@ -201,13 +265,14 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     readyHealth = response.health;
     latencies.push(response.latencyMs);
   }
-  if (!readyHealth.capabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY)) {
+  if (!hasEveryCapability(readyHealth, WARMED_CAPABILITIES)) {
+    const missing = WARMED_CAPABILITIES.filter((capability) => !readyHealth.capabilities.includes(capability));
     throw new Error(
-      `Release hostd did not advertise the attested Codex subscription capability after its bounded background preflight; ${stderrTail.toString("utf8")}`,
+      `Release hostd did not advertise its optional Prime Agent capabilities after bounded background initialization: ${missing.join(", ")}; ${stderrTail.toString("utf8")}`,
     );
   }
   assertRuntimeHealth(readyHealth, "ready", true);
-  const codexReadyMs = Date.now() - launchStartedAt;
+  const optionalCapabilitiesReadyMs = Date.now() - launchStartedAt;
   const identity = readyHealth.runtimeIntegrity;
   const modelCatalog = await requestHost(
     endpoint,
@@ -216,6 +281,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     MODEL_CATALOG_REQUEST_DEADLINE_MS,
   );
   const catalogSummary = assertRuntimeModelCatalog(modelCatalog.result, readyHealth);
+  await primeAgentCustody.captureExisting();
   const installedPointer = JSON.parse(await readFile(join(dataDirectory, "runtime", "current.json"), "utf8"));
   for (const key of [
     "releaseVersion",
@@ -242,7 +308,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     firstRuntimeStatus,
     firstHealthMs,
     readyMs,
-    codexReadyMs,
+    optionalCapabilitiesReadyMs,
     maxHealthLatencyMs: Math.max(...latencies),
     samples: latencies.length,
     phases: [...phases],
@@ -251,7 +317,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
   };
 }
 
-function assertRuntimeHealth(health, expectedStatus, requireCodexCapability = false) {
+function assertRuntimeHealth(health, expectedStatus, requireWarmedCapabilities = false) {
   if (!health || health.protocolVersion !== 1) throw new Error("Health response has an invalid protocol identity");
   const runtime = health.runtimeIntegrity;
   if (!runtime || runtime.contractVersion !== 1 || runtime.status !== expectedStatus) {
@@ -263,14 +329,11 @@ function assertRuntimeHealth(health, expectedStatus, requireCodexCapability = fa
   const expectedCapabilities = expectedStatus === "ready"
     ? [
         ...BASE_HEALTH_CAPABILITIES,
-        MODEL_CATALOG_CAPABILITY,
-        RESIDENT_LIFECYCLE_CAPABILITY,
-        CANDIDATE_EVALUATION_CAPABILITY,
-        ...(requireCodexCapability ? [CODEX_SUBSCRIPTION_CAPABILITY] : []),
+        ...(requireWarmedCapabilities ? WARMED_CAPABILITIES : []),
       ].sort()
     : BASE_HEALTH_CAPABILITIES;
   const actualCapabilities = health.capabilities
-    .filter((capability) => requireCodexCapability || capability !== CODEX_SUBSCRIPTION_CAPABILITY)
+    .filter((capability) => requireWarmedCapabilities || !WARMED_CAPABILITIES.includes(capability))
     .sort();
   if (JSON.stringify(actualCapabilities) !== JSON.stringify(expectedCapabilities)) {
     throw new Error(
@@ -303,6 +366,10 @@ function assertRuntimeHealth(health, expectedStatus, requireCodexCapability = fa
       throw new Error("Runtime health exposed a filesystem path");
     }
   }
+}
+
+function hasEveryCapability(health, capabilities) {
+  return capabilities.every((capability) => health.capabilities.includes(capability));
 }
 
 function assertRuntimeModelCatalog(catalog, health) {

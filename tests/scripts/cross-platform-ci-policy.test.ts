@@ -5,14 +5,6 @@ import { describe, expect, it } from 'vitest'
 const workflowPath = resolve('.github/workflows/cross-platform-source.yml')
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n?/g, '\n')
 const vitestConfig = readFileSync(resolve('vitest.config.ts'), 'utf8').replace(/\r\n?/g, '\n')
-const providerContractTest = readFileSync(
-  resolve('tests/scripts/codex-subscription-provider-e2e.test.ts'),
-  'utf8',
-).replace(/\r\n?/g, '\n')
-const windowsUiaCompileTest = readFileSync(
-  resolve('tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts'),
-  'utf8',
-).replace(/\r\n?/g, '\n')
 
 describe('cross-platform source CI policy', () => {
   it('runs the exact source gates on stable Linux, Windows, and macOS hosts', () => {
@@ -60,20 +52,4 @@ describe('cross-platform source CI policy', () => {
     expect(vitestConfig).not.toMatch(/\b(?:shard|passWithNoTests)\s*:/)
   })
 
-  it('isolates only the real Windows UI Automation compiler in one bounded Windows step', () => {
-    const testPath = 'tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts'
-    expect(workflow).toContain("if: runner.os == 'Windows'\n        timeout-minutes: 3")
-    expect(workflow).toContain('PRIME_CONTINUIM_WINDOWS_UIA_COMPILE: "true"')
-    expect(workflow).toContain(`run: pnpm exec vitest run ${testPath}`)
-    expect(vitestConfig).toContain(`const windowsUiaCompileTest = '${testPath}'`)
-    expect(vitestConfig).toContain(
-      '...(hostedWindows && !runWindowsUiaCompileTest ? { exclude: [windowsUiaCompileTest] } : {}),',
-    )
-    expect([...vitestConfig.matchAll(/\bexclude\s*:/g)]).toHaveLength(1)
-    expect(providerContractTest).not.toContain('Add-Type -TypeDefinition $source -ReferencedAssemblies $references')
-    expect(windowsUiaCompileTest).toContain('Add-Type -TypeDefinition $source -ReferencedAssemblies $references')
-    expect(windowsUiaCompileTest).toContain('timeout: 90_000')
-    expect(windowsUiaCompileTest).toContain('}, 120_000)')
-    expect([...windowsUiaCompileTest.matchAll(/\bit(?:\.runIf\([^\n]+\))?\(/g)]).toHaveLength(1)
-  })
 })

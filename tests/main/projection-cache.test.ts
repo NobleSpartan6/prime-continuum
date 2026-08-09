@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -10,6 +10,7 @@ import {
   PROJECTION_FILE_MAX_BYTES,
   type IndexedProjectionEntry,
   type IndexedProjectionEnvelope,
+  type IndexedProjectionCacheStoreOptions,
 } from '../../src/main/control/projection-cache'
 
 interface TestEnvelope extends IndexedProjectionEnvelope {
@@ -86,17 +87,175 @@ describe('IndexedProjectionCacheStore', () => {
     }))
 
     expect(Object.keys(persisted.entries).sort()).toEqual(['host-active', 'host-newer', 'host-newest'])
-    expect(Object.keys((await createStore(directory).read()).entries).sort()).toEqual([
+    expect(Object.keys((await createStore(directory).readHydrated()).entries).sort()).toEqual([
       'host-active',
       'host-newer',
       'host-newest',
     ])
+  })
+
+  it('returns the active projection before a slow inactive projection finishes hydrating', async () => {
+    const directory = await temporaryDirectory()
+    const seeded = createStore(directory)
+    await seeded.update((cache) => ({
+      ...cache,
+      activeHostId: 'host-active',
+      entries: {
+        'host-active': { hostId: 'host-active', payload: 'ready' },
+        'host-inactive': { hostId: 'host-inactive', payload: 'later' },
+      },
+    }))
+
+    const inactiveReadStarted = deferred<void>()
+    const releaseInactiveRead = deferred<void>()
+    let inactiveReadFinished = false
+    const restarted = createStore(directory, undefined, {
+      readProjection: async (hostId, read) => {
+        if (hostId === 'host-inactive') {
+          inactiveReadStarted.resolve()
+          await releaseInactiveRead.promise
+          inactiveReadFinished = true
+        }
+        return await read()
+      },
+    })
+
+    const initial = await restarted.read()
+    expect(initial.entries['host-active']).toMatchObject({ payload: 'ready' })
+    expect(initial.entries['host-inactive']).toBeUndefined()
+    await inactiveReadStarted.promise
+    expect(inactiveReadFinished).toBe(false)
+
+    releaseInactiveRead.resolve()
+    expect((await restarted.readHydrated()).entries['host-inactive']).toMatchObject({ payload: 'later' })
+  })
+
+  it('loads the host selected by the last verified target before other projections', async () => {
+    const directory = await temporaryDirectory()
+    const seeded = createStore(directory)
+    const selectedTarget = { kind: 'local', recoveredMetadata: true }
+    await seeded.update((cache) => ({
+      ...cache,
+      activeHostId: 'host-other',
+      lastTarget: selectedTarget,
+      targetHostBindings: [{ target: { kind: 'local' }, hostId: 'host-selected' }],
+      entries: {
+        'host-other': { hostId: 'host-other', payload: 'later' },
+        'host-selected': { hostId: 'host-selected', payload: 'ready' },
+      },
+    }))
+
+    const releaseOtherRead = deferred<void>()
+    const otherReadStarted = deferred<void>()
+    const restarted = createStore(directory, undefined, {
+      readProjection: async (hostId, read) => {
+        if (hostId === 'host-other') {
+          otherReadStarted.resolve()
+          await releaseOtherRead.promise
+        }
+        return await read()
+      },
+    })
+
+    const initial = await restarted.read()
+    expect(initial.entries['host-selected']).toMatchObject({ payload: 'ready' })
+    expect(initial.entries['host-other']).toBeUndefined()
+    await otherReadStarted.promise
+    releaseOtherRead.resolve()
+  })
+
+  it('surfaces a bounded-file failure after allowing the valid active projection to paint', async () => {
+    const directory = await temporaryDirectory()
+    const limits = { fileMaxBytes: 256, totalMaxBytes: 1024, hostLimit: 3 }
+    const seeded = createStore(directory, limits)
+    await seeded.update((cache) => ({
+      ...cache,
+      activeHostId: 'host-active',
+      entries: {
+        'host-active': { hostId: 'host-active', payload: 'ready' },
+        'host-inactive': { hostId: 'host-inactive', payload: 'initially-valid' },
+      },
+    }))
+    const inactiveFile = `${createHash('sha256').update('host-inactive').digest('hex')}.json`
+    await writeFile(
+      path.join(directory, 'projections', inactiveFile),
+      JSON.stringify({ hostId: 'host-inactive', payload: 'x'.repeat(512) }),
+    )
+
+    const inactiveReadStarted = deferred<void>()
+    const releaseInactiveRead = deferred<void>()
+    const restarted = createStore(directory, limits, {
+      readProjection: async (hostId, read) => {
+        if (hostId === 'host-inactive') {
+          inactiveReadStarted.resolve()
+          await releaseInactiveRead.promise
+        }
+        return await read()
+      },
+    })
+
+    expect((await restarted.read()).entries['host-active']).toMatchObject({ payload: 'ready' })
+    await inactiveReadStarted.promise
+    releaseInactiveRead.resolve()
+    await expect(restarted.readHydrated()).rejects.toMatchObject({ code: 'storage.read_limit' })
+  })
+
+  it('does not let stale background hydration overwrite a newer mutation', async () => {
+    const directory = await temporaryDirectory()
+    const seeded = createStore(directory)
+    await seeded.update((cache) => ({
+      ...cache,
+      activeHostId: 'host-active',
+      entries: {
+        'host-active': { hostId: 'host-active', payload: 'old' },
+        'host-inactive': { hostId: 'host-inactive', payload: 'preserved' },
+      },
+    }))
+
+    const backgroundReadStarted = deferred<void>()
+    const releaseBackgroundRead = deferred<void>()
+    const backgroundReadReturned = deferred<void>()
+    let inactiveReadCount = 0
+    const restarted = createStore(directory, undefined, {
+      readProjection: async (hostId, read) => {
+        if (hostId === 'host-inactive' && ++inactiveReadCount === 1) {
+          backgroundReadStarted.resolve()
+          await releaseBackgroundRead.promise
+          const value = await read()
+          backgroundReadReturned.resolve()
+          return value
+        }
+        return await read()
+      },
+    })
+
+    expect((await restarted.read()).entries['host-active']).toMatchObject({ payload: 'old' })
+    await backgroundReadStarted.promise
+
+    const updated = await restarted.update((cache) => ({
+      ...cache,
+      entries: {
+        ...cache.entries,
+        'host-active': { hostId: 'host-active', payload: 'new' },
+      },
+    }))
+    expect(updated.entries['host-active']).toMatchObject({ payload: 'new' })
+    expect(updated.entries['host-inactive']).toMatchObject({ payload: 'preserved' })
+
+    releaseBackgroundRead.resolve()
+    await backgroundReadReturned.promise
+
+    const afterBackgroundHydration = await restarted.readHydrated()
+    expect(afterBackgroundHydration.entries['host-active']).toMatchObject({ payload: 'new' })
+    expect(afterBackgroundHydration.entries['host-inactive']).toMatchObject({ payload: 'preserved' })
+    expect((await createStore(directory).read()).entries['host-active']).toMatchObject({ payload: 'new' })
   })
 })
 
 function createStore(
   directory: string,
   limits?: { fileMaxBytes: number; totalMaxBytes: number; hostLimit: number },
+  options?: IndexedProjectionCacheStoreOptions,
 ): IndexedProjectionCacheStore<TestEnvelope> {
   return new IndexedProjectionCacheStore(
     path.join(directory, 'projection-cache.json'),
@@ -104,6 +263,7 @@ function createStore(
     normalize,
     () => ({ version: 3, entries: {} }),
     limits,
+    options,
   )
 }
 
@@ -129,6 +289,17 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), 'prime-projection-cache-test-'))
   temporaryDirectories.push(directory)
   return directory
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

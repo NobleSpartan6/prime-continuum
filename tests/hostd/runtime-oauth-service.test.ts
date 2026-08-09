@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HostOAuthComposition, OAuthLoginCallbacks } from "../../src/hostd/oauth-session-broker";
-import { plaintextRuntimeOAuthDevelopmentEnabled } from "../../src/hostd/index";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "../../src/hostd/server";
 import { HostService, SSH_BRIDGE_SESSION, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
@@ -24,14 +23,6 @@ afterEach(async () => {
 });
 
 describe("HostService runtime OAuth boundary", () => {
-  it("keeps plaintext Prime AuthStorage composition disabled unless development opt-in is exactly 1", () => {
-    expect(plaintextRuntimeOAuthDevelopmentEnabled({})).toBe(false);
-    expect(plaintextRuntimeOAuthDevelopmentEnabled({ PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV: "true" })).toBe(false);
-    expect(plaintextRuntimeOAuthDevelopmentEnabled({ PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV: "01" })).toBe(false);
-    expect(plaintextRuntimeOAuthDevelopmentEnabled({ PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV: "1 " })).toBe(false);
-    expect(plaintextRuntimeOAuthDevelopmentEnabled({ PRIME_CONTINUIM_ENABLE_PLAINTEXT_OAUTH_DEV: "1" })).toBe(true);
-  });
-
   it("does not advertise runtime OAuth when no explicitly gated composition was injected", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-disabled-"));
     temporaryDirectories.push(directory);
@@ -50,6 +41,118 @@ describe("HostService runtime OAuth boundary", () => {
     } finally {
       await service.close();
     }
+  });
+
+  it("keeps the core host ready while a credential-security initialization failure omits OAuth", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-security-failed-"));
+    temporaryDirectories.push(directory);
+    const composition = oauthComposition();
+    composition.initialize = vi.fn(async () => {
+      throw new Error("credential boundary unavailable");
+    });
+    const service = new HostService(new HostStore(directory), undefined, undefined, {
+      runtimeOAuthComposition: composition,
+    });
+    try {
+      await expect(service.initialize()).resolves.toBeUndefined();
+      const health = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oauth-security-failed-health",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      expect(health).toMatchObject({ ok: true, result: { serviceState: "ready" } });
+      if (!health.ok || health.method !== "health.get") throw new Error("health response was not successful");
+      expect(health.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("does not hold core host readiness behind optional OAuth custody verification", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-warming-"));
+    temporaryDirectories.push(directory);
+    const composition = oauthComposition();
+    const initialization = deferred<void>();
+    composition.initialize = vi.fn(async () => await initialization.promise);
+    const service = new HostService(new HostStore(directory), undefined, undefined, {
+      runtimeOAuthComposition: composition,
+    });
+    try {
+      await expect(service.initialize()).resolves.toBeUndefined();
+      const warming = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oauth-warming-health",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      expect(warming).toMatchObject({ ok: true, result: { serviceState: "ready" } });
+      if (!warming.ok || warming.method !== "health.get") throw new Error("health response was not successful");
+      expect(warming.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
+
+      initialization.resolve();
+      await vi.waitFor(async () => {
+        const ready = await service.handle({
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "oauth-ready-health",
+          method: "health.get",
+          payload: {},
+        }, TRUSTED_USER_SESSION);
+        expect(ready).toMatchObject({
+          ok: true,
+          result: { capabilities: expect.arrayContaining([RUNTIME_OAUTH_CAPABILITY]) },
+        });
+      });
+    } finally {
+      initialization.resolve();
+      await service.close();
+    }
+  });
+
+  it("removes the OAuth capability when credential custody revokes the provider", async () => {
+    const { service, composition } = await temporaryService();
+    try {
+      const ready = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oauth-before-revocation",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      if (!ready.ok || ready.method !== "health.get") throw new Error("health response was not successful");
+      expect(ready.result.capabilities).toContain(RUNTIME_OAUTH_CAPABILITY);
+
+      composition.getProvider.mockReturnValue(undefined);
+      const revoked = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oauth-after-revocation",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      if (!revoked.ok || revoked.method !== "health.get") throw new Error("health response was not successful");
+      expect(revoked.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("joins an in-flight OAuth initialization before closing and never publishes a late broker", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-warming-close-"));
+    temporaryDirectories.push(directory);
+    const composition = oauthComposition();
+    const initialization = deferred<void>();
+    composition.initialize = vi.fn(async () => await initialization.promise);
+    const service = new HostService(new HostStore(directory), undefined, undefined, {
+      runtimeOAuthComposition: composition,
+    });
+    await service.initialize();
+
+    const closing = service.close();
+    await Promise.resolve();
+    expect(composition.close).not.toHaveBeenCalled();
+    initialization.resolve();
+    await expect(closing).resolves.toBeUndefined();
+    expect(composition.close).toHaveBeenCalledOnce();
+    expect(composition.getProvider).not.toHaveBeenCalled();
   });
 
   it("advertises only the trusted-local capability, binds host/authority, and never projects credentials", async () => {
@@ -74,6 +177,7 @@ describe("HostService runtime OAuth boundary", () => {
           expectedHostId: hostId,
           authorityId: "desktop-authority-1",
           providerId: "openai-codex",
+          operationId: "oauth-start-operation",
         },
       }, TRUSTED_USER_SESSION);
       expect(started).toMatchObject({
@@ -132,6 +236,7 @@ describe("HostService runtime OAuth boundary", () => {
           expectedHostId: hostId,
           authorityId: "remote-authority",
           providerId: "openai-codex",
+          operationId: "oauth-remote-operation",
         },
       }, {
         transport: "relay",
@@ -164,7 +269,12 @@ describe("HostService runtime OAuth boundary", () => {
           protocolVersion: PROTOCOL_VERSION,
           requestId: "ssh-oauth-start",
           method: "oauth.session.start",
-          payload: { expectedHostId: hostId, authorityId: "ssh-authority", providerId: "openai-codex" },
+          payload: {
+            expectedHostId: hostId,
+            authorityId: "ssh-authority",
+            providerId: "openai-codex",
+            operationId: "oauth-ssh-operation",
+          },
         },
         {
           protocolVersion: PROTOCOL_VERSION,
@@ -217,7 +327,12 @@ describe("HostService runtime OAuth boundary", () => {
         protocolVersion: PROTOCOL_VERSION,
         requestId: "bridge-oauth",
         method: "oauth.session.start",
-        payload: { expectedHostId: hostId, authorityId: "remote", providerId: "openai-codex" },
+        payload: {
+          expectedHostId: hostId,
+          authorityId: "remote",
+          providerId: "openai-codex",
+          operationId: "oauth-bridge-operation",
+        },
       }));
       await receivedResponses;
       const [health, oauth] = responses as Array<Record<string, any>>;
@@ -281,7 +396,12 @@ describe("HostService runtime OAuth boundary", () => {
       protocolVersion: PROTOCOL_VERSION,
       requestId: "close-order-start",
       method: "oauth.session.start",
-      payload: { expectedHostId: hostId, authorityId: "desktop", providerId: "openai-codex" },
+      payload: {
+        expectedHostId: hostId,
+        authorityId: "desktop",
+        providerId: "openai-codex",
+        operationId: "oauth-close-operation",
+      },
     }, TRUSTED_USER_SESSION);
 
     const closing = service.close();

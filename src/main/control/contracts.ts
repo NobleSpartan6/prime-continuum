@@ -12,17 +12,6 @@ import type {
   CandidateEvaluationSnapshot,
   CandidateEvaluationStartRequest,
   CandidateEvaluationStatus,
-  CodexSubscriptionAccountSnapshot,
-  CodexSubscriptionAccountReadRequest,
-  CodexSubscriptionConversationLookup,
-  CodexSubscriptionConversationSnapshot,
-  CodexSubscriptionLoginCancelRequest,
-  CodexSubscriptionLoginStartRequest,
-  CodexSubscriptionLogoutRequest,
-  CodexSubscriptionRequestBinding,
-  CodexSubscriptionTurnInterruptRequest,
-  CodexSubscriptionTurnReconciliation,
-  CodexSubscriptionTurnStartRequest,
   ResidentLifecycleLookupResult,
   ResidentLifecycleStatus,
   RuntimeIntegritySnapshot,
@@ -53,14 +42,6 @@ export const IPC = {
   candidateEvaluationPreflight: 'prime:candidate:evaluation:preflight',
   startCandidateEvaluation: 'prime:candidate:evaluation:start',
   candidateEvaluationSnapshot: 'prime:candidate:evaluation:snapshot',
-  codexSubscriptionAccountRead: 'prime:codex-subscription:account:read',
-  codexSubscriptionLoginStart: 'prime:codex-subscription:login:start',
-  codexSubscriptionLoginCancel: 'prime:codex-subscription:login:cancel',
-  codexSubscriptionLogout: 'prime:codex-subscription:logout',
-  codexSubscriptionConversationSnapshot: 'prime:codex-subscription:conversation:snapshot',
-  codexSubscriptionTurnStart: 'prime:codex-subscription:turn:start',
-  codexSubscriptionTurnInterrupt: 'prime:codex-subscription:turn:interrupt',
-  codexSubscriptionTurnReconcile: 'prime:codex-subscription:turn:reconcile',
   selectResidentWorkspace: 'prime:resident:workspace:select',
   provisionResident: 'prime:resident:provision',
   prepareResidentEnd: 'prime:resident:end:prepare',
@@ -212,7 +193,10 @@ export interface RuntimeOAuthSessionView {
     | { kind: 'manual'; state: 'unavailable' }
     | { kind: 'selection'; state: 'unavailable' }
   configured?: true
-  error?: RuntimeOAuthSessionSnapshot['error']
+  error?: {
+    code: NonNullable<RuntimeOAuthSessionSnapshot['error']>['code']
+    retryable: boolean
+  }
 }
 
 /**
@@ -432,23 +416,7 @@ export interface Diagnostics {
   }>
 }
 
-/**
- * Renderer-safe access to the distinct local Codex app-server backend.
- * Authorization URLs and credential material are deliberately absent.
- */
-export interface CodexSubscriptionBridge {
-  accountRead(input: CodexSubscriptionAccountReadRequest): Promise<Result<CodexSubscriptionAccountSnapshot>>
-  loginStart(input: CodexSubscriptionLoginStartRequest): Promise<Result<CodexSubscriptionAccountSnapshot>>
-  loginCancel(input: CodexSubscriptionLoginCancelRequest): Promise<Result<CodexSubscriptionAccountSnapshot>>
-  logout(input: CodexSubscriptionLogoutRequest): Promise<Result<CodexSubscriptionAccountSnapshot>>
-  conversationSnapshot(input: CodexSubscriptionRequestBinding): Promise<Result<CodexSubscriptionConversationLookup>>
-  turnStart(input: CodexSubscriptionTurnStartRequest): Promise<Result<CodexSubscriptionConversationSnapshot>>
-  turnInterrupt(input: CodexSubscriptionTurnInterruptRequest): Promise<Result<CodexSubscriptionConversationSnapshot>>
-  turnReconcile(input: CodexSubscriptionTurnStartRequest): Promise<Result<CodexSubscriptionTurnReconciliation>>
-}
-
 export interface PrimeBridge {
-  readonly codexSubscription: CodexSubscriptionBridge
   bootstrap(): Promise<Result<BootstrapPayload>>
   discoverSshHosts(): Promise<Result<SshHostAlias[]>>
   probeSshHost(input: { alias: string }): Promise<Result<SshProbe>>

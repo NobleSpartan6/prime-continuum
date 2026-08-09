@@ -99,6 +99,92 @@ describe("verified Prime Agent runtime OAuth composition", () => {
     expect(calls).toEqual(["set", "drainErrors", "reload", "getAuthStatus", "close"]);
   });
 
+  it("withholds the provider until credential custody is initialized and rechecks it around mutation", async () => {
+    const securityCalls: string[] = [];
+    const storage = {
+      set: vi.fn(async () => undefined),
+      drainErrors: vi.fn(async () => []),
+      reload: vi.fn(async () => undefined),
+      getAuthStatus: vi.fn(async () => ({ configured: true })),
+      close: vi.fn(async () => undefined),
+    };
+    const composition = new VerifiedRuntimeOAuthComposition({
+      runtimeHandles: { acquireVerifiedRuntimeHandle: vi.fn(async () => verifiedHandle()) },
+      runLogin: vi.fn(async () => SECRET_CREDENTIALS),
+      openStorage: vi.fn(async () => storage),
+      environment: {},
+      credentialSecurity: {
+        prepareAndVerify: async () => { securityCalls.push("prepare"); },
+        assertStillSecure: async () => { securityCalls.push("assert"); },
+      },
+    });
+
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeUndefined();
+    await composition.initialize();
+    await composition.initialize();
+    const provider = composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID);
+    await provider!.login({ onAuth: vi.fn(), onPrompt: async () => "" });
+    await composition.set(CODEX_SUBSCRIPTION_PROVIDER_ID, { ...SECRET_CREDENTIALS, type: "oauth" });
+    await composition.reload();
+    await composition.getAuthStatus(CODEX_SUBSCRIPTION_PROVIDER_ID);
+
+    expect(securityCalls).toEqual([
+      "prepare",
+      "assert", "assert",
+      "assert", "assert",
+      "assert", "assert",
+      "assert", "assert",
+    ]);
+  });
+
+  it("revokes the provider when credential custody drifts after a storage mutation", async () => {
+    let assertions = 0;
+    const composition = new VerifiedRuntimeOAuthComposition({
+      runtimeHandles: { acquireVerifiedRuntimeHandle: vi.fn(async () => verifiedHandle()) },
+      openStorage: vi.fn(async () => ({
+        set: vi.fn(async () => undefined),
+        drainErrors: vi.fn(async () => []),
+        reload: vi.fn(async () => undefined),
+        getAuthStatus: vi.fn(async () => ({ configured: true })),
+        close: vi.fn(async () => undefined),
+      })),
+      environment: {},
+      credentialSecurity: {
+        prepareAndVerify: async () => undefined,
+        assertStillSecure: async () => {
+          assertions += 1;
+          if (assertions === 2) throw new Error("permission drift");
+        },
+      },
+    });
+
+    await composition.initialize();
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeDefined();
+    await expect(composition.set(
+      CODEX_SUBSCRIPTION_PROVIDER_ID,
+      { ...SECRET_CREDENTIALS, type: "oauth" },
+    )).rejects.toThrow("permission drift");
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeUndefined();
+  });
+
+  it("withdraws the provider synchronously when another consumer revokes the shared guard", async () => {
+    let capabilityAvailable = true;
+    const composition = new VerifiedRuntimeOAuthComposition({
+      runtimeHandles: { acquireVerifiedRuntimeHandle: vi.fn(async () => verifiedHandle()) },
+      environment: {},
+      credentialSecurity: {
+        prepareAndVerify: async () => undefined,
+        assertStillSecure: async () => undefined,
+        capabilityAvailable: () => capabilityAvailable,
+      },
+    });
+
+    await composition.initialize();
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeDefined();
+    capabilityAvailable = false;
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeUndefined();
+  });
+
   it("builds a fixed invocation with only the minimal OAuth environment allowlist", () => {
     const environment = {
       Path: "C:\\Windows\\System32",

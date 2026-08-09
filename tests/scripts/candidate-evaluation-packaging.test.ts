@@ -44,5 +44,9 @@ describe("candidate evaluation Windows packaging boundary", () => {
     expect(source).toContain("TerminateProcess(process,1)");
     expect(source).toContain("WaitForSingleObject(process,5000)!=WAIT_OBJECT_0");
     expect(source).toContain("if(a.active==0)return unchecked((int)exitCode)");
+    expect(source).toContain("CreateJobObject(IntPtr.Zero,null)");
+    expect(source).not.toContain("CodexAppServer");
+    expect(source).not.toContain("ownershipMutexName");
+    expect(source).not.toContain("ownershipJobName");
   });
 });

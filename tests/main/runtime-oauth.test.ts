@@ -78,6 +78,38 @@ describe("DesktopControlService runtime OAuth ownership", () => {
     await service.disconnect();
   });
 
+  it("strips provider failure messages before they cross the preload boundary", async () => {
+    const connection = connectionFor((method) => {
+      if (method === "oauth.session.start") {
+        return {
+          sessionId: "oauth-session-failed",
+          providerId: "openai-codex",
+          phase: "failed",
+          expiresAt: "2099-08-07T18:00:00.000Z",
+          error: {
+            code: "OAUTH_PROVIDER_FAILED",
+            message: "https://secret.example/callback?token=do-not-cross",
+            retryable: true,
+          },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const service = await connectedService(connection, async () => undefined);
+
+    const view = await service.startRuntimeOAuth("host-a", "openai-codex");
+
+    expect(view).toEqual({
+      sessionId: "oauth-session-failed",
+      providerId: "openai-codex",
+      phase: "failed",
+      expiresAt: "2099-08-07T18:00:00.000Z",
+      error: { code: "OAUTH_PROVIDER_FAILED", retryable: true },
+    });
+    expect(JSON.stringify(view)).not.toMatch(/secret\.example|token=|do-not-cross/);
+    await service.disconnect();
+  });
+
   it("refuses a different HTTPS authorization host before invoking the system browser", async () => {
     const openExternal = vi.fn(async () => undefined);
     const connection = connectionFor((method) => {
@@ -271,6 +303,39 @@ describe("DesktopControlService runtime OAuth ownership", () => {
     await second.disconnect();
   });
 
+  it("reuses one start operation identity when a terminal host response is lost", async () => {
+    let providerStarts = 0;
+    let admittedOperationId: string | undefined;
+    const connection = connectionFor((method, params) => {
+      if (method !== "oauth.session.start") throw new Error(`Unexpected request: ${method}`);
+      const operationId = (params as { operationId: string }).operationId;
+      if (!admittedOperationId) {
+        admittedOperationId = operationId;
+        providerStarts += 1;
+        throw new Error("terminal response was lost");
+      }
+      expect(operationId).toBe(admittedOperationId);
+      return {
+        sessionId: "oauth-session-terminal",
+        providerId: "openai-codex",
+        phase: "completed",
+        expiresAt: "2099-08-07T18:00:00.000Z",
+        configured: true,
+      };
+    });
+    const service = await connectedService(connection, async () => undefined);
+
+    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).resolves.toMatchObject({
+      sessionId: "oauth-session-terminal",
+      phase: "completed",
+      configured: true,
+    });
+    expect(providerStarts).toBe(1);
+    expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(2);
+    expect(admittedOperationId).toMatch(/^[0-9a-f-]{36}$/);
+    await service.disconnect();
+  });
+
   it("fails closed on disconnect and target switch when an admitted start response stays ambiguous", async () => {
     const connection = connectionFor((method) => {
       if (method === "oauth.session.start") throw new Error("response lost");
@@ -281,6 +346,10 @@ describe("DesktopControlService runtime OAuth ownership", () => {
       code: "runtime.oauth_start_ambiguous",
     });
     expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(2);
+    const operationIds = connection.requests
+      .filter(({ method }) => method === "oauth.session.start")
+      .map(({ params }) => (params as { operationId: string }).operationId);
+    expect(new Set(operationIds).size).toBe(1);
 
     await expect(service.disconnect()).rejects.toMatchObject({ code: "runtime.oauth_drain_unconfirmed" });
     expect(connection.isClosed).toBe(false);
@@ -288,6 +357,82 @@ describe("DesktopControlService runtime OAuth ownership", () => {
       code: "runtime.oauth_drain_unconfirmed",
     });
     expect(connection.isClosed).toBe(false);
+  });
+
+  it("does not project malformed OAuth snapshot diagnostics or provider-controlled values", async () => {
+    const secret = "https://secret.example/callback?token=must-not-cross";
+    const connection = connectionFor((method) => {
+      if (method === "oauth.session.start") {
+        return {
+          sessionId: "oauth-session-1",
+          providerId: "openai-codex",
+          phase: secret,
+          expiresAt: "2099-08-07T18:00:00.000Z",
+        };
+      }
+      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const service = await connectedService(connection, async () => undefined);
+
+    const error = await service.startRuntimeOAuth("host-a", "openai-codex").catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "protocol.oauth_snapshot_invalid",
+      message: "The host returned an invalid Prime Agent sign-in status.",
+    });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    await service.disconnect();
+  });
+
+  it("normalizes host status failures before they can cross IPC", async () => {
+    const connection = connectionFor((method) => {
+      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
+      if (method === "oauth.session.status") {
+        throw new Error("https://secret.example/status?access_token=must-not-cross");
+      }
+      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const service = await connectedService(connection, async () => undefined);
+    await service.startRuntimeOAuth("host-a", "openai-codex");
+
+    const error = await service.runtimeOAuthStatus("host-a", "oauth-session-1").catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "runtime.oauth_status_failed",
+      message: "Prime Agent sign-in status could not be read from this host.",
+      retryable: true,
+    });
+    expect(JSON.stringify(error)).not.toMatch(/secret\.example|access_token|must-not-cross/);
+    await service.disconnect();
+  });
+
+  it("normalizes host cancellation failures before they can cross IPC", async () => {
+    let cancellationAttempts = 0;
+    const connection = connectionFor((method) => {
+      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
+      if (method === "oauth.session.cancel") {
+        cancellationAttempts += 1;
+        if (cancellationAttempts === 1) {
+          throw new Error("https://secret.example/cancel?refresh_token=must-not-cross");
+        }
+        return cancelledSnapshot("oauth-session-1");
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const service = await connectedService(connection, async () => undefined);
+    await service.startRuntimeOAuth("host-a", "openai-codex");
+
+    const error = await service.cancelRuntimeOAuth("host-a", "oauth-session-1").catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "runtime.oauth_cancel_failed",
+      message: "Prime Agent sign-in cancellation could not be confirmed by this host.",
+      retryable: true,
+    });
+    expect(JSON.stringify(error)).not.toMatch(/secret\.example|refresh_token|must-not-cross/);
+    await service.disconnect();
   });
 });
 

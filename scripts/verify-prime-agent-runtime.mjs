@@ -4,7 +4,6 @@ import {
   REPO_ROOT,
   RUNTIME_TEMPLATE_DIRECTORY,
   loadRuntimeInputs,
-  smokeCodexAppServerCompanion,
   smokeRuntime,
   sha256File,
   verifyBuiltRuntime,
@@ -41,7 +40,6 @@ if ((await sha256File(manifestPath)) !== pointer.manifestSha256) {
 }
 const verified = await verifyBuiltRuntime(runtimeDirectory, { inputs, policy: inputs.policy });
 if (verified.manifest.tree.sha256 !== pointer.treeSha256) throw new Error("Runtime pointer tree digest does not match.");
-let codexAppServerSmoke;
 if (argumentsValue.smoke) {
   const runtimeExecutable = resolve(argumentsValue.runtimeNode ?? process.execPath);
   if (!isAbsolute(runtimeExecutable)) throw new Error("Runtime executable must be absolute.");
@@ -50,13 +48,11 @@ if (argumentsValue.smoke) {
     electronRunAsNode: argumentsValue.electronRunAsNode,
     policy: inputs.policy,
   });
-  codexAppServerSmoke = await smokeCodexAppServerCompanion(runtimeDirectory, { policy: inputs.policy });
 }
 process.stdout.write(`${JSON.stringify({
   runtimeDirectory,
   treeSha256: verified.manifest.tree.sha256,
   smoke: Boolean(argumentsValue.smoke),
-  ...(codexAppServerSmoke ? { codexAppServerSmoke } : {}),
 }, null, 2)}\n`);
 
 function parseArguments(args) {

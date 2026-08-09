@@ -8,12 +8,12 @@ import {
   resolveCanonicalLocalHostTarget,
   type CanonicalLocalHostTarget
 } from '../../shared/local-host-target'
+import { LOCAL_HOSTD_DESKTOP_START_DEADLINE_MS } from '../../shared/local-host-startup-policy.mjs'
 import { ControlError } from './errors'
 import { FramedConnection } from './framed-connection'
 import { buildSshConnectArgs, classifySshFailure } from './ssh'
 
 const LOCAL_CONNECT_TIMEOUT_MS = 750
-const LOCAL_START_TIMEOUT_MS = 8_000
 const PACKAGE_SMOKE_SHUTDOWN_TIMEOUT_MS = 60_000
 const PACKAGE_SMOKE_WRAPPER_IDENTITY = 'prime-continuim-package-smoke-wrapper'
 const packageSmokeHostdChildren = new Set<ChildProcess>()
@@ -142,7 +142,7 @@ async function startBundledHostdOnce(app: App, endpoint: string, dataDirectory: 
   if (existing) return await existing
   const started = (async () => {
     await startBundledHostd(app, endpoint, dataDirectory)
-    const deadline = Date.now() + LOCAL_START_TIMEOUT_MS
+    const deadline = Date.now() + LOCAL_HOSTD_DESKTOP_START_DEADLINE_MS
     let lastError: unknown
     while (Date.now() < deadline) {
       try {

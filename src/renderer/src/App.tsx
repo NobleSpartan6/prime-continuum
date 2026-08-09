@@ -61,6 +61,9 @@ import {
   type ResidentLifecycleOperationSummary,
   type ResidentWorkspaceSelection,
   type RuntimeModelCatalog,
+  type RuntimeOAuthProgress,
+  type RuntimeOAuthRequest,
+  type RuntimeOAuthResult,
   type RuntimeSummary,
   type TaskState,
   type ThreadSummary,
@@ -77,7 +80,6 @@ import type {
 } from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
-import { CodexSubscriptionWorkspace } from './CodexSubscriptionWorkspace'
 import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
@@ -98,7 +100,6 @@ type HostActivationView = {
   message: string
 }
 type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
-type WorkbenchBackend = 'prime' | 'codex_subscription'
 type ResidentLifecycleRecoveryReference = {
   operationId: string
   expectedHostId: string
@@ -118,8 +119,10 @@ type ResidentEndDialogContext = {
   hostName: string
 }
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
-const EMPTY_COMPOSER_ERROR = 'Write a prompt before running Prime Agent.'
+const EMPTY_COMPOSER_ERROR = 'Describe the task before delegating to Prime Agent.'
+const MAX_COMPOSER_DRAFTS = 128
 const MODEL_REVEAL_INCREMENT = 80
+const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = 'openai-codex'
 const CANDIDATE_PREFLIGHT_REFRESH_MS = 25_000
 const CANDIDATE_EVALUATION_POLL_MS = 1_500
 
@@ -220,16 +223,16 @@ function AttentionDiagnosticCopy({ item }: { item: WorkbenchSnapshot['attention'
 }
 
 function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): string {
-  return `${hostId}\u0000${thread.id}\u0000${thread.executionGenerationId ?? ''}`
+  return `${hostId}\u0000${thread.remoteId ?? thread.id}\u0000${thread.executionGenerationId ?? ''}`
 }
 
-function codexSubscriptionAuthorityKey(snapshot: WorkbenchSnapshot): string {
-  if (!snapshot.operations.codexSubscription) return ''
-  const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
-  if (!thread?.executionGenerationId) return ''
-  const host = snapshot.hosts.find((candidate) => candidate.id === thread.hostId)
-  if (host?.kind !== 'local' || host.connection !== 'online') return ''
-  return [host.id, thread.remoteId ?? thread.id, thread.executionGenerationId].join('\u0000')
+function rememberComposerDraft(drafts: Map<string, string>, authorityKey: string, text: string): void {
+  drafts.delete(authorityKey)
+  if (!text) return
+  drafts.set(authorityKey, text)
+  if (drafts.size <= MAX_COMPOSER_DRAFTS) return
+  const oldestAuthorityKey = drafts.keys().next().value
+  if (oldestAuthorityKey !== undefined) drafts.delete(oldestAuthorityKey)
 }
 
 function threadMatchesHudTarget(thread: ThreadSummary, target: HudTarget): boolean {
@@ -805,7 +808,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [moveDestinationId, setMoveDestinationId] = useState('')
   const [composerText, setComposerText] = useState('')
   const [composerValidationError, setComposerValidationError] = useState('')
-  const [workbenchBackend, setWorkbenchBackend] = useState<WorkbenchBackend>('prime')
   const [composerReceipt, setComposerReceipt] = useState<ComposerReceiptView>({
     state: 'idle',
     message: '',
@@ -825,7 +827,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
-  const codexBackendAuthorityRef = useRef('')
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
@@ -842,7 +843,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [inspectorIsOverlay, sidebarIsOverlay])
 
   useEffect(() => {
-    if (surface === 'hud' || workbenchBackend !== 'prime') return
+    if (surface === 'hud') return
     const openPalette = (event: globalThis.KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -853,7 +854,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     }
     window.addEventListener('keydown', openPalette)
     return () => window.removeEventListener('keydown', openPalette)
-  }, [openCommandPalette, surface, workbenchBackend])
+  }, [openCommandPalette, surface])
 
   useResponsiveDrawerFocus({
     open: sidebarOpen,
@@ -876,6 +877,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const composerAuthorityGenerationRef = useRef(0)
   const composerActionSequenceRef = useRef(0)
   const latestComposerActionsRef = useRef(new Map<string, ComposerLocalAction>())
+  const composerDraftsRef = useRef(new Map<string, string>())
+  const composerDraftAuthorityKeyRef = useRef('')
   const hudSelectionRequestRef = useRef('')
   const previousHudTargetKeyRef = useRef('')
   const hudFocusKeyRef = useRef('')
@@ -884,13 +887,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     setSnapshot(nextSnapshot)
     setSelectedProjectId(nextSnapshot.selectedProjectId)
     setSelectedThreadId(nextSnapshot.selectedThreadId)
-    const selectedCodexAuthority = codexBackendAuthorityRef.current
-    if (selectedCodexAuthority && codexSubscriptionAuthorityKey(nextSnapshot) !== selectedCodexAuthority) {
-      // Consume capability/tuple loss at the subscription boundary itself. A
-      // same-tick recovery must not make React silently re-enter Codex mode.
-      codexBackendAuthorityRef.current = ''
-      setWorkbenchBackend('prime')
-    }
     const nextReceipt: ComposerReceiptView = {
       state: nextSnapshot.composerReceipt.state,
       message: nextSnapshot.composerReceipt.message ?? '',
@@ -1039,36 +1035,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
   const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
+  const composerDraftAuthorityKey = selectedHost && selectedThread
+    ? composerActionAuthorityKey(selectedHost.id, selectedThread)
+    : ''
+
+  useLayoutEffect(() => {
+    if (composerDraftAuthorityKeyRef.current === composerDraftAuthorityKey) return
+    composerDraftAuthorityKeyRef.current = composerDraftAuthorityKey
+    composerAuthorityGenerationRef.current += 1
+    setComposerText(composerDraftAuthorityKey ? composerDraftsRef.current.get(composerDraftAuthorityKey) ?? '' : '')
+    setComposerValidationError('')
+  }, [composerDraftAuthorityKey])
+
+  const updateComposerText = (nextText: string) => {
+    setComposerText(nextText)
+    if (composerDraftAuthorityKey) {
+      rememberComposerDraft(composerDraftsRef.current, composerDraftAuthorityKey, nextText)
+    }
+    if (composerValidationError) setComposerValidationError('')
+  }
+
   const canStartResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.startResidentTurn ?? false)
   const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   const canLoadModelCatalog = api.environment === 'native' && (snapshot?.operations.modelCatalog ?? false)
+  const canSelectResidentModel = selectedThreadIsMaterialized && (snapshot?.operations.selectResidentModel ?? false)
+  const canConnectRuntimeOAuth = Boolean(
+    selectedHost &&
+    selectedHost.kind === 'local' &&
+    selectedHost.connection === 'online' &&
+    snapshot?.operations.runtimeOAuth &&
+    api.startRuntimeOAuth &&
+    api.cancelRuntimeOAuth,
+  )
   const canManageComputers = api.environment === 'native'
   const canProvisionResident = snapshot?.operations.provisionResident ?? false
-  const canUseCodexSubscription = Boolean(
-    surface === 'workbench' &&
-    api.environment === 'native' &&
-    api.codexSubscription &&
-    selectedThreadIsMaterialized &&
-    selectedHost?.kind === 'local' &&
-    selectedHost.connection === 'online' &&
-    selectedThread?.executionGenerationId &&
-    snapshot?.operations.codexSubscription,
-  )
-  const activeWorkbenchBackend: WorkbenchBackend =
-    workbenchBackend === 'codex_subscription' && canUseCodexSubscription
-      ? 'codex_subscription'
-      : 'prime'
-  const codexBackendAuthorityKey = canUseCodexSubscription && snapshot
-    ? codexSubscriptionAuthorityKey(snapshot)
-    : ''
-
-  useLayoutEffect(() => {
-    if (workbenchBackend !== 'codex_subscription') return
-    if (codexBackendAuthorityKey && codexBackendAuthorityRef.current === codexBackendAuthorityKey) return
-    codexBackendAuthorityRef.current = ''
-    setWorkbenchBackend('prime')
-  }, [codexBackendAuthorityKey, workbenchBackend])
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
     : []
@@ -1118,7 +1119,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [exactHudThread?.title, surface])
   const canOpenHud = Boolean(
     surface === 'workbench' &&
-    activeWorkbenchBackend === 'prime' &&
     api.environment === 'native' &&
     selectedThreadIsMaterialized &&
     selectedHost &&
@@ -1136,7 +1136,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     if (!previousTargetKey || previousTargetKey === activeHudTargetKey) return
     composerAuthorityGenerationRef.current += 1
     latestComposerActionsRef.current.clear()
-    setComposerText('')
     setComposerValidationError('')
     setComposerReceipt({ state: 'idle', message: '' })
   }, [activeHudTargetKey, surface])
@@ -1305,10 +1304,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   ])
   activeHostIdRef.current = selectedHost?.id
   activeThreadIdRef.current = selectedThread?.id
-
-  useEffect(() => {
-    setComposerValidationError('')
-  }, [selectedThread?.id])
 
   useEffect(() => {
     if (!hostActivation || hostActivation.hostId === selectedHost?.id) return
@@ -1483,6 +1478,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
       ) return
       if (receipt.state !== 'rejected') {
+        if (composerDraftsRef.current.get(actionKey) === submittedDraft) {
+          composerDraftsRef.current.delete(actionKey)
+        }
         setComposerText((current) => current === submittedDraft ? '' : current)
       }
       if (latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence) return
@@ -1947,14 +1945,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             <Transcript thread={selectedThread} />
             <Composer
               connection={selectedHost.connection}
+              authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
               runtime={selectedRuntime}
               text={composerText}
-              onTextChange={(nextText) => {
-                setComposerText(nextText)
-                if (composerValidationError) setComposerValidationError('')
-              }}
+              onTextChange={updateComposerText}
               validationError={composerValidationError}
               receipt={composerReceipt}
               canStartTurn={canStartResidentTurn}
@@ -2116,6 +2112,18 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 {residentWorkspacePicking ? 'Opening folder picker…' : 'Choose workspace folder'}
               </button>
             )}
+            {selectedHost && canLoadModelCatalog && (
+              <button
+                className="button button--secondary"
+                type="button"
+                onClick={(event) => {
+                  modelsDialogTriggerRef.current = event.currentTarget
+                  setModelsOpen(true)
+                }}
+              >
+                <Icon icon={Bot} /> Models &amp; accounts
+              </button>
+            )}
             {localSetup?.stage === 'needs_attention' &&
               (localSetup.issue?.action === 'retry_connection' || localSetup.issue?.action === 'retry_runtime') &&
               localSetup.issue.retryable && (
@@ -2224,6 +2232,20 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           onClose={() => setAddComputerOpen(false)}
           triggerRef={addComputerReturnTargetRef}
         />
+        {selectedHost && (
+          <ModelsDialog
+            api={api}
+            open={modelsOpen}
+            host={selectedHost}
+            threadId={selectedThread?.id}
+            executionGenerationId={selectedThread?.executionGenerationId}
+            currentModel={selectedRuntime.session?.model}
+            canSelectResidentModel={canSelectResidentModel}
+            canConnectRuntimeOAuth={canConnectRuntimeOAuth}
+            triggerRef={modelsDialogTriggerRef}
+            onClose={() => setModelsOpen(false)}
+          />
+        )}
       </div>
     )
   }
@@ -2304,60 +2326,18 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         </div>
 
         <div className="topbar__controls">
-          {canUseCodexSubscription && (
-            <div className="backend-switch" role="group" aria-label="Conversation backend">
-              <button
-                type="button"
-                aria-pressed={activeWorkbenchBackend === 'prime'}
-                onClick={() => {
-                  codexBackendAuthorityRef.current = ''
-                  setWorkbenchBackend('prime')
-                  window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#thread-heading')?.focus())
-                }}
-              >
-                Prime Agent
-              </button>
-              <button
-                type="button"
-                aria-label="Use Codex via ChatGPT subscription"
-                aria-pressed={activeWorkbenchBackend === 'codex_subscription'}
-                onClick={() => {
-                  codexBackendAuthorityRef.current = codexBackendAuthorityKey
-                  setInspectorOpen(false)
-                  setCommandPaletteOpen(false)
-                  setModelsOpen(false)
-                  setMoveThreadOpen(false)
-                  setWorkbenchBackend('codex_subscription')
-                  window.requestAnimationFrame(() => document.querySelector<HTMLElement>('#codex-workspace-heading')?.focus())
-                }}
-              >
-                Codex
-              </button>
-            </div>
-          )}
-          {activeWorkbenchBackend === 'prime' ? (
-            <>
-              <div
-                className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
-                aria-hidden="true"
-                title={`Task state: ${visibleTaskState}`}
-              >
-                <Icon icon={taskIcon(selectedThread.status)} size={14} />
-                <span className="task-state__label">{visibleTaskState}</span>
-              </div>
-              <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-                Task state: {visibleTaskState}
-              </span>
-            </>
-          ) : (
-            <span className="task-state task-state--codex" aria-label="Codex backend selected">
-              <Icon icon={Bot} size={14} />
-              <span className="task-state__label">Codex</span>
-            </span>
-          )}
+          <div
+            className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
+            aria-hidden="true"
+            title={`Task state: ${visibleTaskState}`}
+          >
+            <Icon icon={taskIcon(selectedThread.status)} size={14} />
+            <span className="task-state__label">{visibleTaskState}</span>
+          </div>
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            Task state: {visibleTaskState}
+          </span>
 
-          {activeWorkbenchBackend === 'prime' && (
-            <>
               {canOpenHud && (
                 <button
                   className="icon-button topbar__hud-control"
@@ -2427,8 +2407,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               >
                 <Icon icon={inspectorOpen ? PanelRightClose : ListChecks} size={18} />
               </button>
-            </>
-          )}
         </div>
       </header>
 
@@ -2439,7 +2417,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         onSelectProject={selectProject}
         onSelectThread={selectThread}
         onSearch={openCommandPalette}
-        primeControlsVisible={activeWorkbenchBackend === 'prime'}
+        primeControlsVisible
         onClose={closeSidebar}
         onAddComputer={(trigger) => {
           addComputerReturnTargetRef.current = sidebarIsOverlay ? sidebarToggleRef.current : trigger
@@ -2471,11 +2449,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           setModelsOpen(true)
         }}
         onMoveThread={openMoveThread}
-        canMoveThread={activeWorkbenchBackend === 'prime' && canMoveThreads}
-        canLoadModelCatalog={activeWorkbenchBackend === 'prime' && canLoadModelCatalog}
+        canMoveThread={canMoveThreads}
+        canLoadModelCatalog={canLoadModelCatalog}
         canManageComputers={canManageComputers}
-        canProvisionResident={activeWorkbenchBackend === 'prime' && canProvisionResident}
-        residentLifecycleOperations={activeWorkbenchBackend === 'prime' ? residentLifecycleOperations : []}
+        canProvisionResident={canProvisionResident}
+        residentLifecycleOperations={residentLifecycleOperations}
         residentRecoveryReference={residentRecoveryReference}
         residentLifecycleBusy={residentWorkspacePicking || residentStatusChecking}
         addComputerTriggerRef={addComputerTriggerRef}
@@ -2543,34 +2521,16 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           )}
         </div>
 
-        {activeWorkbenchBackend === 'codex_subscription' && api.codexSubscription && selectedThread.executionGenerationId ? (
-          <CodexSubscriptionWorkspace
-            key={[
-              selectedHost.id,
-              selectedThread.remoteId ?? selectedThread.id,
-              selectedThread.executionGenerationId,
-            ].join('\u0000')}
-            api={api.codexSubscription}
-            binding={{
-              expectedHostId: selectedHost.id,
-              threadId: selectedThread.remoteId ?? selectedThread.id,
-              expectedExecutionGenerationId: selectedThread.executionGenerationId,
-            }}
-          />
-        ) : (
-          <>
-            <Transcript thread={selectedThread} />
+        <Transcript thread={selectedThread} />
 
-            <Composer
+        <Composer
               connection={selectedHost.connection}
+              authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
               runtime={selectedRuntime}
               text={composerText}
-              onTextChange={(nextText) => {
-                setComposerText(nextText)
-                if (composerValidationError) setComposerValidationError('')
-              }}
+              onTextChange={updateComposerText}
               validationError={composerValidationError}
               receipt={composerReceipt}
               canStartTurn={canStartResidentTurn}
@@ -2582,13 +2542,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               }}
               onSubmit={submitComposer}
               onStop={() => void stopResidentTurn()}
-            />
-          </>
-        )}
+        />
       </main>
 
-      {activeWorkbenchBackend === 'prime' && (
-        <Inspector
+      <Inspector
           api={api}
           snapshot={snapshot}
           selectedThread={selectedThread}
@@ -2605,8 +2562,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           residentEndPreparing={residentEndPreparing}
           residentEndError={residentEndError}
           onEndResident={(trigger) => void reviewResidentEnd(trigger)}
-        />
-      )}
+      />
 
       {(sidebarOpen || inspectorOpen) && (
         <button
@@ -2656,7 +2612,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         }}
       />
 
-      {activeWorkbenchBackend === 'prime' && <CommandPaletteDialog
+      <CommandPaletteDialog
         open={commandPaletteOpen}
         snapshot={snapshot}
         selectedThreadId={selectedThread.id}
@@ -2694,18 +2650,22 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           setCommandPaletteOpen(false)
           if (trigger) void reviewResidentEnd(trigger)
         }}
-      />}
+      />
 
-      {activeWorkbenchBackend === 'prime' && <ModelsDialog
+      <ModelsDialog
         api={api}
         open={modelsOpen}
         host={selectedHost}
+        threadId={selectedThread.id}
+        executionGenerationId={selectedThread.executionGenerationId}
         currentModel={selectedRuntime.session?.model}
+        canSelectResidentModel={canSelectResidentModel}
+        canConnectRuntimeOAuth={canConnectRuntimeOAuth}
         triggerRef={modelsDialogTriggerRef}
         onClose={() => setModelsOpen(false)}
-      />}
+      />
 
-      {activeWorkbenchBackend === 'prime' && <MoveThreadDialog
+      <MoveThreadDialog
         api={api}
         open={moveThreadOpen}
         thread={selectedThread}
@@ -2714,7 +2674,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         triggerRef={moveThreadTriggerRef}
         onClose={() => setMoveThreadOpen(false)}
         onMoved={finishMove}
-      />}
+      />
     </div>
   )
 }
@@ -3188,6 +3148,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
 
 interface ComposerProps {
   connection: ConnectionState
+  authorityVerified: boolean
   hostName: string
   taskState: TaskState
   runtime: RuntimeSummary
@@ -3203,13 +3164,106 @@ interface ComposerProps {
   onStop: () => void
 }
 
+type SessionContinuityTone = 'ready' | 'working' | 'needs-you' | 'reconnecting'
+
+function sessionContinuityPresentation(
+  connection: ConnectionState,
+  authorityVerified: boolean,
+  hostName: string,
+  taskState: TaskState,
+  runtime: RuntimeSummary,
+  receipt: ComposerReceiptView,
+): { label: 'Ready' | 'Working' | 'Needs you' | 'Reconnecting'; detail: string; icon: LucideIcon; tone: SessionContinuityTone } {
+  if (connection !== 'online' || !authorityVerified) {
+    return {
+      label: 'Reconnecting',
+      detail: `Reconnecting to ${hostName}. Saved activity is available; current status is unverified.`,
+      icon: RefreshCw,
+      tone: 'reconnecting',
+    }
+  }
+
+  const residentControlOperation = receipt.operation === 'prompt' || receipt.operation === 'abort'
+  if (residentControlOperation && (receipt.state === 'uncertain' || receipt.state === 'rejected')) {
+    const operation = receipt.operation === 'abort' ? 'Stop' : 'delegated task'
+    return {
+      label: 'Needs you',
+      detail: receipt.state === 'uncertain'
+        ? `The last ${operation} outcome on ${hostName} is unknown. Inspect the resident thread before another action.`
+        : `The last ${operation} request was not accepted on ${hostName}. Review the composer before trying again.`,
+      icon: AlertCircle,
+      tone: 'needs-you',
+    }
+  }
+
+  if (residentControlOperation && (receipt.state === 'sending' || receipt.state === 'sent')) {
+    const detail = receipt.operation === 'abort'
+      ? receipt.state === 'sending'
+        ? `Requesting a safe stop on ${hostName}.`
+        : `Stop was accepted on ${hostName}; waiting for authoritative idle proof.`
+      : receipt.state === 'sending'
+        ? `Delegating this task to Prime Agent on ${hostName}.`
+        : `Prime Agent owns this task on ${hostName}; waiting for authoritative activity.`
+    return {
+      label: 'Working',
+      detail,
+      icon: Activity,
+      tone: 'working',
+    }
+  }
+
+  if (taskState === 'waiting' || taskState === 'needs_approval' || taskState === 'failed') {
+    return {
+      label: 'Needs you',
+      detail: taskState === 'failed'
+        ? `Prime Agent needs review on ${hostName} before work can continue.`
+        : `Prime Agent needs your input on ${hostName} before it can continue.`,
+      icon: taskState === 'needs_approval' ? ShieldCheck : AlertCircle,
+      tone: 'needs-you',
+    }
+  }
+
+  const session = runtime.session
+  const verifiedResident = Boolean(
+    session?.residency === 'resident' &&
+    session.activeSessionId &&
+    session.sessionId,
+  )
+
+  if (taskState === 'running') {
+    return {
+      label: 'Working',
+      detail: verifiedResident
+        ? `Prime Agent keeps working on ${hostName} after this window closes.`
+        : session?.residency === 'client_owned'
+          ? `Prime Agent is working on ${hostName} while this client remains attached.`
+          : `Prime Agent is working on ${hostName}. Resident offload is not verified.`,
+      icon: Activity,
+      tone: 'working',
+    }
+  }
+
+  return {
+    label: 'Ready',
+    detail: verifiedResident
+      ? `${hostName} is ready for another delegated task.`
+      : session?.residency === 'client_owned'
+        ? `${hostName} is ready. Tasks run only while this client remains attached.`
+        : `${hostName} is ready, but resident offload is not verified.`,
+    icon: taskState === 'complete' ? CheckCircle2 : Circle,
+    tone: 'ready',
+  }
+}
+
 function SessionContinuity({
   connection,
+  authorityVerified,
   hostName,
   taskState,
   runtime,
-}: Pick<ComposerProps, 'connection' | 'hostName' | 'taskState' | 'runtime'>) {
-  const isFresh = connection === 'online'
+  receipt,
+}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'hostName' | 'taskState' | 'runtime' | 'receipt'>) {
+  const isFresh = connection === 'online' && authorityVerified
   const reportedGoals = runtime.goals
   const activeGoal = reportedGoals?.find((goal) => goal.state === 'active')
   const interruptedGoal = reportedGoals?.find((goal) => goal.state !== 'complete')
@@ -3231,33 +3285,25 @@ function SessionContinuity({
   const queueCopy = isFresh || queueStateCopy === 'Queue state unavailable'
     ? queueStateCopy
     : `Cached · ${queueStateCopy}`
-  const residencyCopy = runtime.session?.residency === 'resident'
-    ? isFresh
-      ? `Reported resident on ${hostName}`
-      : `Last reported resident on ${hostName} · current status unverified`
-    : runtime.session?.residency === 'client_owned'
-      ? isFresh
-        ? 'Runs while this client remains attached'
-        : 'Last reported client-owned · current status unverified'
-      : undefined
-  const taskCopy = isFresh ? taskLabel(taskState) : `Last reported ${taskLabel(taskState).toLocaleLowerCase()}`
+  const continuity = sessionContinuityPresentation(connection, authorityVerified, hostName, taskState, runtime, receipt)
 
   return (
     <section className="session-continuity" aria-label="Session status">
       <span
-        className={cx('session-continuity__state', `session-continuity__state--${taskState}`)}
-        title={`Task state: ${taskLabel(taskState)}`}
+        className={cx('session-continuity__state', `session-continuity__state--${continuity.tone}`)}
+        title={`${continuity.label}: ${continuity.detail}`}
       >
-        <Icon icon={taskIcon(taskState)} size={14} />
+        <Icon icon={continuity.icon} size={14} />
       </span>
       <span className="session-continuity__body">
-        <span className="eyebrow">
-          {displayedGoal
-            ? `Goal · ${isFresh ? runtimeStateLabel(displayedGoal.state) : `last reported ${runtimeStateLabel(displayedGoal.state).toLocaleLowerCase()}`}`
-            : 'Session status'}
+        <span className="session-continuity__summary">
+          <span className="session-continuity__label" role="status" aria-live="polite" aria-atomic="true">
+            {continuity.label}
+          </span>
+          <span aria-hidden="true">·</span>
+          <strong title={displayedGoal?.objective}>{goalCopy}</strong>
         </span>
-        <strong title={displayedGoal?.objective}>{goalCopy}</strong>
-        <small>Run location: <bdi>{hostName}</bdi> · {taskCopy}{residencyCopy ? ` · ${residencyCopy}` : ''}</small>
+        <small>{continuity.detail}</small>
       </span>
       <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
         <Icon icon={runtime.queue?.paused ? Clock3 : ListChecks} size={13} />
@@ -3267,7 +3313,7 @@ function SessionContinuity({
   )
 }
 
-function Composer({ connection, hostName, taskState, runtime, text, onTextChange, validationError, receipt, canStartTurn, canStopTurn, modelCatalogAvailable, onOpenModelCatalog, onSubmit, onStop }: ComposerProps) {
+function Composer({ connection, authorityVerified, hostName, taskState, runtime, text, onTextChange, validationError, receipt, canStartTurn, canStopTurn, modelCatalogAvailable, onOpenModelCatalog, onSubmit, onStop }: ComposerProps) {
   const disconnected = connection !== 'online'
   const projectionReportsRunning = taskState === 'running'
   const promptSending = receipt.operation === 'prompt' && receipt.state === 'sending'
@@ -3315,7 +3361,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
       ? 'Prime Agent is working · Stop requests a safe boundary'
       : 'Waiting for authoritative resident activity'
     : canStartTurn
-      ? 'Ready for a new prompt'
+      ? 'Ready to delegate a task'
       : unavailableCopy
   const receiptStatusCopy = receipt.operation && receipt.state !== 'idle'
     ? receipt.message || defaultStatus
@@ -3349,8 +3395,8 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
     : promptSending
       ? 'Submitting prompt'
       : disconnected
-      ? 'Reconnect to run'
-      : 'Run prompt'
+      ? 'Reconnect to delegate'
+      : 'Delegate task'
   const compactComposer = controlMode
   const textareaDisabled = !canStartNow
   const intentCopy = endLifecyclePresent
@@ -3373,17 +3419,17 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
               ? 'Admitting resident prompt'
               : promptAwaitingProof
                 ? 'Prompt owned by Prime Agent'
-                : running
+                   : running
                   ? disconnected
                     ? 'Resident status unverified'
                     : projectionReportsRunning
                       ? 'Active resident turn'
                       : 'Resident turn owned'
-                  : 'New resident prompt'
+                  : 'Delegate a task'
 
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
-      <SessionContinuity connection={connection} hostName={hostName} taskState={taskState} runtime={runtime} />
+      <SessionContinuity connection={connection} authorityVerified={authorityVerified} hostName={hostName} taskState={taskState} runtime={runtime} receipt={receipt} />
       <form
         className={cx('composer', compactComposer && 'composer--compact', controlMode && 'composer--running')}
         onSubmit={(event) => {
@@ -3418,7 +3464,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
 
         {!compactComposer && (
           <>
-            <label className="sr-only" htmlFor="thread-composer">Message</label>
+            <label className="sr-only" htmlFor="thread-composer">Task brief</label>
             <textarea
               id="thread-composer"
               name="message"
@@ -3427,7 +3473,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
               placeholder={disconnected
                 ? 'Reconnect to verify this resident session'
                 : canStartNow
-                  ? 'Ask Prime Agent to build, inspect, or fix…'
+                  ? 'Describe the outcome, constraints, and done criteria…'
                   : 'Resident prompt unavailable'}
               disabled={textareaDisabled}
               onChange={(event) => onTextChange(event.target.value)}
@@ -3467,7 +3513,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
                   ? unavailableCopy
                   : 'Stop asks Prime Agent to end at the next safe boundary'
                 : canStartNow
-                  ? 'Ctrl or ⌘ + Enter to run'
+                  ? 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
                   : unavailableCopy}
             </span>
           </div>
@@ -5821,7 +5867,11 @@ interface ModelsDialogProps {
   api: RendererApi
   open: boolean
   host: HostSummary
+  threadId?: string
+  executionGenerationId?: string
   currentModel?: string
+  canSelectResidentModel: boolean
+  canConnectRuntimeOAuth: boolean
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
 }
@@ -5831,17 +5881,72 @@ type ModelsCatalogError = {
   message: string
 }
 
-function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: ModelsDialogProps) {
+type ModelSelectionView = {
+  providerId: string
+  modelId: string
+  modelName: string
+  state: 'selecting' | 'completed' | 'rejected' | 'uncertain'
+  message: string
+  projected?: boolean
+  retryable?: boolean
+}
+
+type RuntimeOAuthView = {
+  providerId: string
+  providerName: string
+  state: RuntimeOAuthProgress['phase'] | RuntimeOAuthResult['state']
+  message: string
+  retryable?: boolean
+}
+
+function ModelsDialog({
+  api,
+  open,
+  host,
+  threadId,
+  executionGenerationId,
+  currentModel,
+  canSelectResidentModel,
+  canConnectRuntimeOAuth,
+  triggerRef,
+  onClose,
+}: ModelsDialogProps) {
   const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ModelsCatalogError | null>(null)
+  const [selection, setSelection] = useState<ModelSelectionView | null>(null)
+  const [oauth, setOAuth] = useState<RuntimeOAuthView | null>(null)
   const [query, setQuery] = useState('')
   const [selectedProviderId, setSelectedProviderId] = useState('all')
   const [showAllModels, setShowAllModels] = useState(false)
   const [visibleModelLimit, setVisibleModelLimit] = useState(MODEL_REVEAL_INCREMENT)
   const [loadAttempt, setLoadAttempt] = useState(0)
   const providerNavRef = useRef<HTMLElement>(null)
+  const selectionRequestRef = useRef(0)
+  const oauthRequestRef = useRef(0)
+  const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
+  const dialogOpenRef = useRef(open)
+  const selectionAuthorityKey = JSON.stringify([host.id, threadId ?? '', executionGenerationId ?? ''])
+  const oauthAuthorityKey = JSON.stringify([host.id])
+  const selectionAuthorityRef = useRef(selectionAuthorityKey)
+  const oauthAuthorityRef = useRef(oauthAuthorityKey)
   const providerRailHorizontal = useMediaQueryMatch('(max-width: 75rem)')
+  dialogOpenRef.current = open
+  selectionAuthorityRef.current = selectionAuthorityKey
+  oauthAuthorityRef.current = oauthAuthorityKey
+
+  useEffect(() => {
+    selectionRequestRef.current += 1
+    setSelection(null)
+  }, [open, selectionAuthorityKey])
+
+  useEffect(() => {
+    oauthRequestRef.current += 1
+    const oauthRequest = activeOAuthRequestRef.current
+    activeOAuthRequestRef.current = null
+    setOAuth(null)
+    if (oauthRequest && api.cancelRuntimeOAuth) void api.cancelRuntimeOAuth(oauthRequest)
+  }, [api, oauthAuthorityKey, open])
 
   useEffect(() => {
     if (!open) return
@@ -5904,6 +6009,55 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
   const oauthProviders = catalog?.providers.filter((provider) => provider.oauthSupported) ?? []
   const configuredProviders = catalog?.providers.filter((provider) => provider.configured) ?? []
   const providerIds = catalog ? ['all', ...catalog.providers.map((provider) => provider.providerId)] : []
+  const selectionMatchesCurrentModel = Boolean(
+    selection && modelMatchesCurrent(selection.providerId, selection.modelId, selection.modelName, currentModel),
+  )
+  const selectionLocksActions = Boolean(
+    selection?.state === 'selecting'
+      || selection?.state === 'uncertain'
+      || (selection?.state === 'completed' && !selectionMatchesCurrentModel),
+  )
+  const selectionStatusMessage = !selection
+    ? ''
+    : selection.state === 'selecting'
+      ? `Selecting ${selection.modelName} for this thread's next prompt…`
+      : selection.state === 'completed'
+        ? selectionMatchesCurrentModel
+          ? `${selection.message} ${selection.modelName} is now shown as current for this thread.`
+          : selection.projected
+            ? `${selection.message} Refreshing this dialog's current-model label. Continuim will not resend the selection.`
+            : `${selection.message} Selected on host · refreshing current model. Continuim will not resend the selection.`
+        : ''
+  const selectionErrorMessage = !selection
+    ? ''
+    : selection.state === 'uncertain'
+      ? `${selection.message} The outcome is unknown. Continuim will not send this model change again automatically. Do not retry it from this dialog; close Models & accounts and inspect the current thread first.`
+      : selection.state === 'rejected'
+        ? `${selection.message} No model change was applied.${selection.retryable ? ' You can choose a model again.' : ' This request cannot be retried.'}`
+        : ''
+  const oauthInProgress = Boolean(
+    oauth && ['starting', 'awaiting_user', 'committing', 'cancelling'].includes(oauth.state),
+  )
+  const oauthLocksConnect = Boolean(
+    oauthInProgress || oauth?.state === 'uncertain' || oauth?.state === 'completed' || (oauth?.state === 'failed' && !oauth.retryable),
+  )
+  const selectedProviderCanConnect = Boolean(
+    selectedProvider &&
+    selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID &&
+    selectedProvider.oauthSupported &&
+    !selectedProvider.configured &&
+    canConnectRuntimeOAuth &&
+    api.startRuntimeOAuth &&
+    api.cancelRuntimeOAuth,
+  )
+  const oauthStatusMessage = oauth && ['starting', 'awaiting_user', 'committing', 'cancelling', 'completed', 'cancelled'].includes(oauth.state)
+    ? oauth.message
+    : ''
+  const oauthErrorMessage = oauth?.state === 'failed'
+    ? `${oauth.message}${oauth.retryable ? ' You can start sign-in again.' : ''}`
+    : oauth?.state === 'uncertain'
+      ? `${oauth.message} Do not start another sign-in from this dialog. Close it and inspect the Prime Agent account on this computer first.`
+      : ''
 
   const selectProvider = (providerId: string) => {
     setSelectedProviderId(providerId)
@@ -5939,6 +6093,160 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
     nextButton.focus()
   }
 
+  const selectModel = async (model: RuntimeModelCatalog['models'][number]) => {
+    if (
+      !open
+      || !threadId
+      || !canSelectResidentModel
+      || selectionLocksActions
+      || !model.available
+      || modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
+    ) return
+
+    const requestId = selectionRequestRef.current + 1
+    selectionRequestRef.current = requestId
+    const requestAuthorityKey = selectionAuthorityKey
+    const target = {
+      providerId: model.providerId,
+      modelId: model.modelId,
+      modelName: model.name,
+    }
+    setSelection({
+      ...target,
+      state: 'selecting',
+      message: `Selecting ${model.name} for the next prompt.`,
+    })
+
+    try {
+      const result = await api.selectResidentModel({
+        threadId,
+        providerId: model.providerId,
+        modelId: model.modelId,
+      })
+      if (
+        !dialogOpenRef.current
+        || selectionRequestRef.current !== requestId
+        || selectionAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setSelection({ ...target, ...result })
+    } catch (reason: unknown) {
+      if (
+        !dialogOpenRef.current
+        || selectionRequestRef.current !== requestId
+        || selectionAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setSelection(
+        isStaleHostAuthorityError(reason)
+          ? {
+              ...target,
+              state: 'rejected',
+              retryable: false,
+              message: 'The active host or thread changed before this selection could be verified.',
+            }
+          : {
+              ...target,
+              state: 'uncertain',
+              retryable: false,
+              message: reason instanceof Error
+                ? reason.message
+                : 'The model selection response could not be verified.',
+            },
+      )
+    }
+  }
+
+  const startProviderOAuth = async () => {
+    if (
+      !open ||
+      !selectedProviderCanConnect ||
+      oauthLocksConnect ||
+      !selectedProvider ||
+      !api.startRuntimeOAuth
+    ) return
+
+    const request: RuntimeOAuthRequest = {
+      hostId: host.id,
+      providerId: selectedProvider.providerId,
+    }
+    const requestId = oauthRequestRef.current + 1
+    oauthRequestRef.current = requestId
+    activeOAuthRequestRef.current = request
+    const requestAuthorityKey = oauthAuthorityKey
+    const providerName = selectedProvider.displayName
+    setOAuth({
+      providerId: request.providerId,
+      providerName,
+      state: 'starting',
+      message: 'Opening the verified ChatGPT sign-in page…',
+    })
+
+    try {
+      const result = await api.startRuntimeOAuth(request, (progress) => {
+        if (
+          !dialogOpenRef.current ||
+          oauthRequestRef.current !== requestId ||
+          oauthAuthorityRef.current !== requestAuthorityKey
+        ) return
+        setOAuth({
+          providerId: request.providerId,
+          providerName,
+          state: progress.phase,
+          message: progress.message,
+        })
+      })
+      if (
+        !dialogOpenRef.current ||
+        oauthRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
+      if (result.state === 'completed' && result.catalog) setCatalog(result.catalog)
+      setOAuth({
+        providerId: request.providerId,
+        providerName,
+        state: result.state,
+        message: result.message,
+        ...('retryable' in result ? { retryable: result.retryable } : {}),
+      })
+    } catch (reason: unknown) {
+      if (
+        !dialogOpenRef.current ||
+        oauthRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setOAuth({
+        providerId: request.providerId,
+        providerName,
+        state: isStaleHostAuthorityError(reason) ? 'failed' : 'uncertain',
+        retryable: false,
+        message: isStaleHostAuthorityError(reason)
+          ? 'The active computer connection changed before sign-in could start.'
+          : 'Prime Agent sign-in could not be verified. Prime Continuim will not start it again automatically.',
+      })
+    } finally {
+      if (oauthRequestRef.current === requestId) activeOAuthRequestRef.current = null
+    }
+  }
+
+  const cancelProviderOAuth = async () => {
+    const request = activeOAuthRequestRef.current
+    if (!request || !api.cancelRuntimeOAuth || !oauthInProgress) return
+    setOAuth((current) => current ? {
+      ...current,
+      state: 'cancelling',
+      message: 'Cancelling ChatGPT sign-in…',
+    } : current)
+    await api.cancelRuntimeOAuth(request)
+  }
+
+  const closeDialog = () => {
+    selectionRequestRef.current += 1
+    oauthRequestRef.current += 1
+    const oauthRequest = activeOAuthRequestRef.current
+    activeOAuthRequestRef.current = null
+    if (oauthRequest && api.cancelRuntimeOAuth) void api.cancelRuntimeOAuth(oauthRequest)
+    onClose()
+  }
+
   return (
     <NativeDialog
       open={open}
@@ -5946,7 +6254,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
       describedBy="models-description"
       triggerRef={triggerRef}
       className="models-sheet"
-      onClose={onClose}
+      onClose={closeDialog}
     >
       <div className="sheet__surface models-sheet__surface">
         <header className="sheet__header models-sheet__header">
@@ -5959,7 +6267,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
               </p>
             </div>
           </div>
-          <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={onClose}>
+          <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={closeDialog}>
             <Icon icon={X} size={17} />
           </button>
         </header>
@@ -5981,7 +6289,7 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                   Retry loading catalog
                 </button>
               ) : (
-                <button className="button button--secondary" type="button" onClick={onClose}>Close dialog</button>
+                <button className="button button--secondary" type="button" onClick={closeDialog}>Close dialog</button>
               )}
             </div>
           </div>
@@ -6049,16 +6357,72 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
               </div>
 
               {selectedProvider && !selectedProvider.configured && (
-                <div className="provider-setup-note">
+                <div
+                  className="provider-setup-note"
+                  aria-busy={oauthInProgress && oauth?.providerId === selectedProvider.providerId ? 'true' : undefined}
+                >
                   <span><Icon icon={LockKeyhole} size={16} /></span>
-                  <div>
+                  <div className="provider-setup-note__body">
                     <strong>{selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
-                    <p>
-                      Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim's host protocol and renderer.
-                    </p>
+                    {selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && selectedProvider.oauthSupported ? (
+                      <>
+                        <p>
+                          {selectedProviderCanConnect
+                            ? <>Connect ChatGPT to this Prime Agent runtime on <bdi>{host.name}</bdi>. The verified sign-in page opens in your system browser; no authorization URL or credential is exposed to this view.</>
+                            : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. This desktop can connect ChatGPT only when the trusted local host advertises OAuth support.</>}
+                        </p>
+                        <p className="provider-setup-note__storage">
+                          Prime Agent {catalog.releaseVersion} stores OAuth credentials in its host-only <code>auth.json</code>, protected by this operating-system account’s file permissions. Availability checks reload the account state before model selection.
+                        </p>
+                        <p className="provider-setup-note__storage">
+                          auth.json is plaintext at rest; it is not a keychain or keyring.
+                        </p>
+                        {selectedProviderCanConnect && (
+                          <div className="provider-setup-note__actions">
+                            <button
+                              className="button button--secondary"
+                              type="button"
+                              disabled={oauthLocksConnect}
+                              onClick={() => void startProviderOAuth()}
+                            >
+                              <Icon icon={oauthInProgress ? Loader2 : ShieldCheck} size={14} />
+                              {oauthInProgress ? 'Signing in…' : 'Connect ChatGPT'}
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <p>
+                        Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim’s host protocol and renderer.
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
+
+              <div className={cx('runtime-oauth-feedback', !oauth && 'runtime-oauth-feedback--empty')} aria-busy={oauthInProgress ? 'true' : undefined}>
+                <p
+                  className={cx('runtime-oauth-feedback__message', !oauthStatusMessage && 'sr-only')}
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
+                  {oauthStatusMessage && <Icon icon={oauth?.state === 'completed' ? CheckCircle2 : Loader2} size={14} />}
+                  {oauthStatusMessage}
+                </p>
+                <p
+                  className={cx('runtime-oauth-feedback__message', 'runtime-oauth-feedback__message--error', !oauthErrorMessage && 'sr-only')}
+                  role="alert"
+                >
+                  {oauthErrorMessage && <Icon icon={AlertCircle} size={14} />}
+                  {oauthErrorMessage}
+                </p>
+                {oauthInProgress && api.cancelRuntimeOAuth && (
+                  <button className="button button--quiet" type="button" onClick={() => void cancelProviderOAuth()} disabled={oauth?.state === 'cancelling'}>
+                    {oauth?.state === 'cancelling' ? 'Cancelling…' : 'Cancel sign-in'}
+                  </button>
+                )}
+              </div>
 
               <div className="model-catalog__controls">
                 <label className="model-search">
@@ -6104,6 +6468,11 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                 {visibleModels.length > 0 ? visibleModels.map((model) => {
                   const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
                   const current = modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
+                  const selectionTargeted = selection?.providerId === model.providerId && selection.modelId === model.modelId
+                  const selectingTarget = selectionTargeted && selection?.state === 'selecting'
+                  const refreshingTarget = selectionTargeted && selection?.state === 'completed' && !selectionMatchesCurrentModel
+                  const rejectedWithoutRetry = selectionTargeted && selection?.state === 'rejected' && !selection.retryable
+                  const selectionButtonLabel = selectingTarget ? 'Selecting…' : refreshingTarget ? 'Refreshing…' : 'Use model'
                   return (
                     <article className={cx('model-row', current && 'model-row--current')} key={`${model.providerId}:${model.modelId}`}>
                       <span className="model-row__icon"><Icon icon={Bot} size={16} /></span>
@@ -6116,10 +6485,24 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                         <span><bdi>{provider?.displayName ?? model.providerId}</bdi> · <bdi>{model.modelId}</bdi></span>
                         <small>{formatTokenCapacity(model.contextWindow)} context · {formatTokenCapacity(model.maxOutputTokens)} max output{model.reasoning ? ' · Reasoning' : ''}{model.input.includes('image') ? ' · Images' : ''}</small>
                       </div>
-                      <span className={cx('model-row__status', model.available && 'model-row__status--ready')}>
-                        <Icon icon={model.available ? CheckCircle2 : LockKeyhole} size={14} />
-                        {model.available ? 'Available' : 'Setup required'}
-                      </span>
+                      <div className="model-row__actions">
+                        <span className={cx('model-row__status', model.available && 'model-row__status--ready')}>
+                          <Icon icon={model.available ? CheckCircle2 : LockKeyhole} size={14} />
+                          {model.available ? 'Available' : 'Setup required'}
+                        </span>
+                        {model.available && !current && canSelectResidentModel && (
+                          <button
+                            className="button button--secondary model-row__select"
+                            type="button"
+                            aria-label={`${selectionButtonLabel.replace('…', '')} ${model.name}`}
+                            disabled={selectionLocksActions || rejectedWithoutRetry}
+                            onClick={() => void selectModel(model)}
+                          >
+                            {(selectingTarget || refreshingTarget) && <Icon icon={Loader2} size={14} />}
+                            {selectionButtonLabel}
+                          </button>
+                        )}
+                      </div>
                     </article>
                   )
                 }) : (
@@ -6141,9 +6524,31 @@ function ModelsDialog({ api, open, host, currentModel, triggerRef, onClose }: Mo
                   </button>
                 </div>
               )}
+              <div className="model-selection-feedback">
+                <p
+                  className={cx('model-selection-feedback__message', !selectionStatusMessage && 'sr-only')}
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
+                  {selectionStatusMessage && <Icon icon={selectionMatchesCurrentModel ? CheckCircle2 : Loader2} size={14} />}
+                  {selectionStatusMessage}
+                </p>
+                <p
+                  className={cx('model-selection-feedback__message', 'model-selection-feedback__message--error', !selectionErrorMessage && 'sr-only')}
+                  role="alert"
+                >
+                  {selectionErrorMessage && <Icon icon={AlertCircle} size={14} />}
+                  {selectionErrorMessage}
+                </p>
+              </div>
               <footer className="model-catalog__footer">
                 <Icon icon={Info} size={14} />
-                <span>This registry view is read-only. “Available” means Prime Agent reports provider access; no inference smoke test was run. Model changes stay disabled until the resident session can reconcile them authoritatively.</span>
+                <span>
+                  {canSelectResidentModel
+                    ? 'Choose a model for this thread’s next prompt. This changes the resident session only; it does not send a prompt. “Available” means Prime Agent reports provider access, not that an inference smoke test passed.'
+                    : 'Model selection is available only while this exact resident session is idle and ready for its next prompt. “Available” means Prime Agent reports provider access; no inference smoke test was run.'}
+                </span>
               </footer>
             </section>
           </div>

@@ -25,6 +25,12 @@ const temporaryDirectories: string[] = []
 const DIGEST_A = 'a'.repeat(64)
 const DIGEST_B = 'b'.repeat(64)
 const DIGEST_C = 'c'.repeat(64)
+const WARMED_RUNTIME_CAPABILITIES = [
+  'runtime_model_catalog_v1',
+  'resident_lifecycle_v1',
+  'runtime_oauth_v1',
+  'candidate_evaluation_probe_v1',
+] as const
 
 interface RequestRecord {
   method: string
@@ -233,12 +239,12 @@ describe('DesktopControlService runtime readiness', () => {
       health({ runtime: runtimeSnapshot('initializing', { phase: 'verifying' }), checkedAt: '2026-08-07T12:00:00.500Z' }),
       health({
         runtime: runtimeSnapshot('ready'),
-        capabilities: ['prime_agent_commands_v2'],
+        capabilities: ['prime_agent_commands_v2', ...WARMED_RUNTIME_CAPABILITIES],
         checkedAt: '2026-08-07T12:00:01.000Z',
       }),
       health({
         runtime: { ...runtimeSnapshot('ready'), changedAt: '2026-08-07T12:00:16.000Z' },
-        capabilities: ['prime_agent_commands_v2'],
+        capabilities: ['prime_agent_commands_v2', ...WARMED_RUNTIME_CAPABILITIES],
         checkedAt: '2026-08-07T12:00:16.000Z',
       }),
     ]
@@ -264,7 +270,7 @@ describe('DesktopControlService runtime readiness', () => {
     expect(states).toHaveLength(2)
     expect(states[1]).toMatchObject({
       phase: 'online',
-      capabilities: ['prime_agent_commands_v2', 'runtime_integrity_v1'],
+      capabilities: expect.arrayContaining(['prime_agent_commands_v2', ...WARMED_RUNTIME_CAPABILITIES]),
       runtimeReadiness: { kind: 'reported', snapshot: { status: 'ready' } },
     })
 
@@ -272,6 +278,84 @@ describe('DesktopControlService runtime readiness', () => {
     await vi.advanceTimersByTimeAsync(15_000)
     expect(states).toEqual([])
     expect(service.getConnectionState().runtimeReadiness?.observedAt).toBe('2026-08-07T12:00:16.000Z')
+    await service.disconnect()
+  })
+
+  it('observes the model catalog promptly while its shared custody gate warms in the background', async () => {
+    const samples = [
+      health({
+        runtime: runtimeSnapshot('ready'),
+        capabilities: [
+          'resident_lifecycle_v1',
+          'runtime_oauth_v1',
+          'candidate_evaluation_probe_v1',
+        ],
+      }),
+      health({
+        runtime: runtimeSnapshot('ready'),
+        capabilities: [
+          'runtime_model_catalog_v1',
+          'resident_lifecycle_v1',
+          'runtime_oauth_v1',
+          'candidate_evaluation_probe_v1',
+        ],
+        checkedAt: '2026-08-07T12:00:00.500Z',
+      }),
+    ]
+    const connection = new TestConnection((method, requestIndex) => {
+      if (method === 'health.get') return samples[Math.min(requestIndex, samples.length - 1)]
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest()
+
+    await service.connect({ kind: 'local' })
+    expect(connection.requests.filter(({ method }) => method === 'health.get')).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(connection.requests.filter(({ method }) => method === 'health.get')).toHaveLength(2)
+    expect(service.getConnectionState().capabilities).toEqual(expect.arrayContaining([
+      'runtime_model_catalog_v1',
+      'resident_lifecycle_v1',
+      'runtime_oauth_v1',
+    ]))
+    await service.disconnect()
+  })
+
+  it('observes the Windows candidate capability promptly after every other runtime gate is ready', async () => {
+    const samples = [
+      health({
+        runtime: runtimeSnapshot('ready'),
+        capabilities: [
+          'runtime_model_catalog_v1',
+          'resident_lifecycle_v1',
+          'runtime_oauth_v1',
+        ],
+      }),
+      health({
+        runtime: runtimeSnapshot('ready'),
+        capabilities: [
+          'runtime_model_catalog_v1',
+          'resident_lifecycle_v1',
+          'runtime_oauth_v1',
+          'candidate_evaluation_probe_v1',
+        ],
+        checkedAt: '2026-08-07T12:00:00.500Z',
+      }),
+    ]
+    const connection = new TestConnection((method, requestIndex) => {
+      if (method === 'health.get') return samples[Math.min(requestIndex, samples.length - 1)]
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest('win32')
+
+    await service.connect({ kind: 'local' })
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(connection.requests.filter(({ method }) => method === 'health.get')).toHaveLength(2)
+    expect(service.getConnectionState().capabilities).toContain('candidate_evaluation_probe_v1')
     await service.disconnect()
   })
 
@@ -510,7 +594,10 @@ describe('DesktopControlService runtime readiness', () => {
       },
     })],
   ] as const)('terminates and reconnects when the %s changes within one connection', async (_label, field, mutate) => {
-    const initial = health({ runtime: runtimeSnapshot('ready') })
+    const initial = health({
+      runtime: runtimeSnapshot('ready'),
+      capabilities: [...WARMED_RUNTIME_CAPABILITIES],
+    })
     const connection = new TestConnection((method, requestIndex) => {
       if (method !== 'health.get') throw new Error(`Unexpected request: ${method}`)
       return requestIndex === 0 ? initial : mutate(initial)
@@ -651,11 +738,11 @@ function commandReceipt(command: ClientCommand) {
   }
 }
 
-async function serviceForTest(): Promise<DesktopControlService> {
+async function serviceForTest(platform?: NodeJS.Platform): Promise<DesktopControlService> {
   const directory = await mkdtemp(path.join(tmpdir(), 'prime-runtime-readiness-test-'))
   temporaryDirectories.push(directory)
   await mkdir(path.join(directory, 'control'), { recursive: true })
-  return new DesktopControlService({ app: testApp(directory) })
+  return new DesktopControlService({ app: testApp(directory), ...(platform ? { platform } : {}) })
 }
 
 function testApp(directory: string): App {

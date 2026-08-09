@@ -41,7 +41,11 @@ describe('control IPC trusted-window fan-out', () => {
       service,
       getWindows: () => [main.window, hud.window, duplicateHud.window, destroyed.window, contentsDestroyed.window],
       isTrustedSender: () => true,
+      isTrustedWorkbenchSender: () => true,
     })
+    const registeredChannels = (ipcMain.handle as ReturnType<typeof vi.fn>).mock.calls
+      .map(([channel]) => channel as string)
+    expect(registeredChannels.some((channel) => channel.startsWith('prime:codex-subscription:'))).toBe(false)
 
     const events = [
       ['connection-state', IPC.connectionState],
@@ -64,6 +68,50 @@ describe('control IPC trusted-window fan-out', () => {
     service.emit('snapshot', { after: 'dispose' })
     expect(main.send).toHaveBeenCalledTimes(events.length)
     expect(hud.send).toHaveBeenCalledTimes(events.length)
+  })
+
+  it('admits host OAuth authority only from the workbench window', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input: unknown) => Promise<unknown>>()
+    const ipcMain = {
+      handle: vi.fn((channel: string, handler: (event: IpcMainInvokeEvent, input: unknown) => Promise<unknown>) => {
+        handlers.set(channel, handler)
+      }),
+      removeHandler: vi.fn(),
+    } as unknown as IpcMain
+    const startRuntimeOAuth = vi.fn(async () => ({ sessionId: 'oauth-1' }))
+    const runtimeOAuthStatus = vi.fn(async () => ({ sessionId: 'oauth-1' }))
+    const cancelRuntimeOAuth = vi.fn(async () => ({ sessionId: 'oauth-1' }))
+    const service = Object.assign(new EventEmitter(), {
+      startRuntimeOAuth,
+      runtimeOAuthStatus,
+      cancelRuntimeOAuth,
+    }) as unknown as DesktopControlService
+    const workbenchEvent = {} as IpcMainInvokeEvent
+    const hudEvent = {} as IpcMainInvokeEvent
+    const dispose = registerControlIpc({
+      ipcMain,
+      service,
+      getWindows: () => [],
+      isTrustedSender: () => true,
+      isTrustedWorkbenchSender: (event) => event === workbenchEvent,
+    })
+    const cases = [
+      [IPC.startRuntimeOAuth, { expectedHostId: 'host-a', providerId: 'openai-codex' }, startRuntimeOAuth],
+      [IPC.runtimeOAuthStatus, { expectedHostId: 'host-a', sessionId: 'oauth-1' }, runtimeOAuthStatus],
+      [IPC.cancelRuntimeOAuth, { expectedHostId: 'host-a', sessionId: 'oauth-1' }, cancelRuntimeOAuth],
+    ] as const
+
+    for (const [channel, input, operation] of cases) {
+      await expect(handlers.get(channel)?.(hudEvent, input)).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'ipc.untrusted_sender' },
+      })
+      expect(operation).not.toHaveBeenCalled()
+      await expect(handlers.get(channel)?.(workbenchEvent, input)).resolves.toMatchObject({ ok: true })
+      expect(operation).toHaveBeenCalledOnce()
+    }
+
+    dispose()
   })
 
   it('trusts only the exact main frame of an explicitly supplied live window', () => {

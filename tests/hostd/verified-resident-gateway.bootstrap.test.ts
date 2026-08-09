@@ -52,10 +52,35 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     await fixture.gateway.close();
   });
 
+  it("withdraws resident execution and lifecycle readiness when the shared custody proof drifts", async () => {
+    const durableBinding = binding("thread-secure", "execution-secure", "active-secure");
+    let secure = true;
+    const credentialSecurity = {
+      prepareAndVerify: vi.fn(async () => undefined),
+      assertStillSecure: vi.fn(async () => {
+        if (!secure) throw new Error("simulated custody drift");
+      }),
+    };
+    const fixture = await gatewayFixture([durableBinding], {}, { credentialSecurity });
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.residentLifecycleCapabilityReady()).toBe(true));
+
+    secure = false;
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(false);
+    await expect(fixture.gateway.isLive("thread-secure", "execution-secure")).resolves.toBe(false);
+
+    await fixture.gateway.close();
+  });
+
   it("proves lifecycle composition with zero bindings without advertising command readiness", async () => {
     const fixture = await gatewayFixture([]);
 
-    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(true);
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.residentLifecycleCapabilityReady()).toBe(true));
     expect(fixture.runtimeHandles.acquireVerifiedRuntimeHandle).toHaveBeenCalledOnce();
     expect(fixture.adapterFactory).toHaveBeenCalledOnce();
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
@@ -76,11 +101,13 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
 
     const firstReadiness = fixture.gateway.residentLifecycleCapabilityReady();
     const concurrentReadiness = fixture.gateway.residentLifecycleCapabilityReady();
+    await expect(Promise.all([firstReadiness, concurrentReadiness])).resolves.toEqual([false, false]);
     await vi.waitFor(() => expect(moduleLoader).toHaveBeenCalledOnce());
     expect(fixture.adapterFactory).not.toHaveBeenCalled();
 
     moduleLoad.reject(new Error("verified Worker import failed"));
-    await expect(Promise.all([firstReadiness, concurrentReadiness])).resolves.toEqual([false, false]);
+    await vi.waitFor(() => expect(moduleLoader.close).toHaveBeenCalledOnce());
+    await expect(fixture.gateway.residentLifecycleCapabilityReady()).resolves.toBe(false);
     expect(fixture.runtimeHandles.acquireVerifiedRuntimeHandle).toHaveBeenCalledOnce();
     expect(moduleLoaderFactory).toHaveBeenCalledOnce();
     expect(moduleLoader).toHaveBeenCalledOnce();
@@ -485,6 +512,10 @@ async function gatewayFixture(
     readonly moduleLoaderFactory?: (
       handle: VerifiedInstalledRuntimeHandle,
     ) => PrimeAgentPublicModuleLoader;
+    readonly credentialSecurity?: {
+      prepareAndVerify(): Promise<void>;
+      assertStillSecure(): Promise<void>;
+    };
   } = {},
 ) {
   const root = await canonicalTemporaryDirectory("prime-resident-gateway-bootstrap-test-");
@@ -577,6 +608,7 @@ async function gatewayFixture(
     environment: {},
     adapterFactory,
     moduleLoaderFactory: fixtureOptions.moduleLoaderFactory ?? (() => async () => ({})),
+    credentialSecurity: fixtureOptions.credentialSecurity,
   });
   return {
     gateway,

@@ -39,10 +39,6 @@ export interface HostDataPaths {
   commandJournal: string;
   workspaceAuthorities: string;
   residentSessionBindings: string;
-  codexSubscription: string;
-  codexSubscriptionState: string;
-  codexHome: string;
-  codexTemporary: string;
 }
 
 export function resolveHostDataDir(
@@ -81,7 +77,6 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
   const journals = join(root, "journals");
   const security = join(root, "security");
   const runtime = join(root, "runtime");
-  const codexSubscription = join(root, "codex-subscription");
   return {
     root,
     host: join(root, "host.json"),
@@ -114,9 +109,5 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     commandJournal: join(journals, "commands.jsonl"),
     workspaceAuthorities: join(root, "workspace-authorities.json"),
     residentSessionBindings: join(root, "resident-session-bindings.json"),
-    codexSubscription,
-    codexSubscriptionState: join(codexSubscription, "state.json"),
-    codexHome: join(codexSubscription, "home"),
-    codexTemporary: join(codexSubscription, "private-temp"),
   };
 }

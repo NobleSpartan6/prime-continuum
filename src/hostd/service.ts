@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
-  CODEX_SUBSCRIPTION_CAPABILITY,
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
@@ -65,10 +64,6 @@ import {
   type ResidentEndRequest as CoordinatorResidentEndRequest,
   type ResidentProvisionRequest as CoordinatorResidentProvisionRequest,
 } from "./resident-lifecycle-coordinator";
-import {
-  CodexSubscriptionBackendError,
-  type CodexSubscriptionBackend,
-} from "./codex-subscription-backend";
 
 // The durable store contains a single-process handoff harness for protocol and
 // rollback testing. Production hostd must not advertise executable handoff
@@ -90,14 +85,6 @@ const KNOWN_METHODS = new Set([
   "oauth.session.start",
   "oauth.session.status",
   "oauth.session.cancel",
-  "codex.subscription.account.read",
-  "codex.subscription.login.start",
-  "codex.subscription.login.cancel",
-  "codex.subscription.logout",
-  "codex.subscription.conversation.snapshot",
-  "codex.subscription.turn.start",
-  "codex.subscription.turn.interrupt",
-  "codex.subscription.turn.reconcile",
   "catalog.snapshot",
   "thread.snapshot",
   "thread.control.snapshot",
@@ -131,6 +118,7 @@ export const SSH_BRIDGE_SESSION: HostSessionContext = Object.freeze({
 });
 
 const DEFAULT_IDENTITY_LOAD_TIMEOUT_MS = 5_000;
+const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = "openai-codex";
 
 export interface HostServiceOptions {
   hostIdentityProvider?: HostIdentityKeyProvider;
@@ -139,7 +127,6 @@ export interface HostServiceOptions {
   runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
   runtimeOAuthComposition?: HostOAuthComposition;
   candidateEvaluationCoordinator?: CandidateEvaluationCoordinator;
-  codexSubscriptionBackend?: CodexSubscriptionBackend;
 }
 
 export interface RuntimeIntegrityReadinessProvider {
@@ -177,7 +164,7 @@ export class HostService {
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
   private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
   private readonly candidateEvaluationCoordinator: CandidateEvaluationCoordinator | undefined;
-  private readonly codexSubscriptionBackend: CodexSubscriptionBackend | undefined;
+  private candidateEvaluationInitializationPromise: Promise<void> | undefined;
   private readonly projectionChangeListeners = new Set<(change: PrimeAgentProjectionChange) => void>();
   private readonly promptIdleListeners = new Set<(event: ResidentPromptIdleObservedEvent) => void>();
   private readonly abortIdleListeners = new Set<(event: ResidentAbortIdleObservedEvent) => void>();
@@ -185,6 +172,8 @@ export class HostService {
   private readonly unsubscribeGatewayPromptIdle: () => void;
   private readonly unsubscribeGatewayAbortIdle: () => void;
   private oauthSessionBroker: HostOAuthSessionBroker | undefined;
+  private oauthInitializationPromise: Promise<void> | undefined;
+  private closing = false;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
   readonly startedAt = new Date().toISOString();
@@ -204,7 +193,6 @@ export class HostService {
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
     this.runtimeOAuthComposition = options.runtimeOAuthComposition;
     this.candidateEvaluationCoordinator = options.candidateEvaluationCoordinator;
-    this.codexSubscriptionBackend = options.codexSubscriptionBackend;
     this.unsubscribeGatewayProjection = this.gateway.subscribeProjectionChanges?.((change) => {
       for (const listener of this.projectionChangeListeners) {
         try {
@@ -242,36 +230,36 @@ export class HostService {
 
   async initialize(): Promise<void> {
     await this.store.initialize();
-    await this.candidateEvaluationCoordinator?.initialize();
     const host = await this.store.getHost();
-    await this.codexSubscriptionBackend?.initialize(host.hostId);
-    if (this.runtimeOAuthComposition && !this.oauthSessionBroker) {
-      this.oauthSessionBroker = new HostOAuthSessionBroker({
-        hostId: host.hostId,
-        providers: this.runtimeOAuthComposition,
-        storage: this.runtimeOAuthComposition,
-      });
-    }
+    this.startRuntimeOAuthInitialization(host.hostId);
     const authority = await this.pairingAuthority.initialize({ hostId: host.hostId });
     this.pairingIdentity = authority.identity
       ? await this.loadConfiguredHostIdentity(host.hostId, authority.identity)
       : Object.freeze({ state: "not_configured" });
+    this.startCandidateEvaluationInitialization();
   }
 
   close(): Promise<void> {
-    this.closePromise ??= (async () => {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = (async () => {
+      // Optional OAuth custody verification warms in parallel with core host
+      // startup. Join that bounded work before closing its composition so a
+      // late completion can never publish a broker after shutdown begins.
+      await this.oauthInitializationPromise;
       // OAuth helpers can hold freshly verified runtime handles. Revoke and
       // drain them before the integrity coordinator releases that authority.
       // If helper exit cannot be positively observed, fail closed here and do
       // not release any of the verified runtime ownership below.
-      // Codex holds the embedded verified companion and a long-lived Job.
-      // Positive tree retirement is required before runtime ownership closes.
-      await this.codexSubscriptionBackend?.close();
       await this.oauthSessionBroker?.close();
       // Broker close waits for each abort-triggered login run. Only afterwards
       // can the composition surface a helper termination failure latched by
       // that run; starting these two closes concurrently would race the latch.
       await this.runtimeOAuthComposition?.close?.();
+      // Candidate recovery is optional for serving core health and resident
+      // work, but its bounded reconciliation can still own poll timers and
+      // process observations. Join it before closing the coordinator.
+      await this.candidateEvaluationInitializationPromise;
       await this.candidateEvaluationCoordinator?.close();
       this.unsubscribeGatewayProjection();
       this.unsubscribeGatewayPromptIdle();
@@ -295,6 +283,48 @@ export class HostService {
       }
     })();
     return this.closePromise;
+  }
+
+  private startRuntimeOAuthInitialization(hostId: string): void {
+    if (
+      !this.runtimeOAuthComposition ||
+      this.oauthSessionBroker ||
+      this.oauthInitializationPromise ||
+      this.closing
+    ) return;
+    const composition = this.runtimeOAuthComposition;
+    this.oauthInitializationPromise = (async () => {
+      try {
+        await composition.initialize?.();
+        if (this.closing) return;
+        this.oauthSessionBroker = new HostOAuthSessionBroker({
+          hostId,
+          providers: composition,
+          storage: composition,
+        });
+      } catch {
+        // Cached host/thread projections remain readable, but the same sticky
+        // custody guard also withholds OAuth, catalog, and resident execution.
+        this.oauthSessionBroker = undefined;
+      }
+    })();
+  }
+
+  private startCandidateEvaluationInitialization(): void {
+    if (
+      !this.candidateEvaluationCoordinator ||
+      this.candidateEvaluationInitializationPromise ||
+      this.closing
+    ) return;
+    const coordinator = this.candidateEvaluationCoordinator;
+    this.candidateEvaluationInitializationPromise = (async () => {
+      try {
+        await coordinator.initialize();
+      } catch {
+        // Candidate evaluation is an optional capability. Its coordinator
+        // remains fail-closed while core host and resident surfaces stay live.
+      }
+    })();
   }
 
   subscribeProjectionChanges(listener: (change: PrimeAgentProjectionChange) => void): () => void {
@@ -371,12 +401,6 @@ export class HostService {
       throw new PairingAuthorityError(
         "REMOTE_CANDIDATE_EVALUATION_FORBIDDEN",
         "Candidate evaluation is available only to the trusted local desktop",
-      );
-    }
-    if (isCodexSubscriptionRequest(request) && context.transport !== "trusted_user") {
-      throw new PairingAuthorityError(
-        "REMOTE_CODEX_SUBSCRIPTION_FORBIDDEN",
-        "Codex via ChatGPT subscription is available only to the trusted local desktop",
       );
     }
     if (context.transport === "trusted_user") return this.dispatch(request, context);
@@ -465,11 +489,20 @@ export class HostService {
         const residentLifecycleCapabilities = residentLifecycleReady
           ? [RESIDENT_LIFECYCLE_CAPABILITY]
           : [];
-        const modelCatalogCapabilities = this.runtimeModelCatalogProvider &&
-          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
+        let modelCatalogReady = Boolean(this.runtimeModelCatalogProvider) &&
+          (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready");
+        if (modelCatalogReady && this.runtimeModelCatalogProvider?.capabilityReady) {
+          try {
+            modelCatalogReady = await this.runtimeModelCatalogProvider.capabilityReady();
+          } catch {
+            modelCatalogReady = false;
+          }
+        }
+        const modelCatalogCapabilities = modelCatalogReady
           ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
           : [];
         const oauthCapabilities = context.transport === "trusted_user" && this.oauthSessionBroker &&
+          this.runtimeOAuthComposition?.getProvider(PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID) &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [RUNTIME_OAUTH_CAPABILITY]
           : [];
@@ -488,7 +521,6 @@ export class HostService {
         if (runtimeIntegrityRepairReady) {
           try {
             await this.store.assertRuntimeRepairQuiescent();
-            await this.codexSubscriptionBackend?.assertQuiescent();
           } catch {
             runtimeIntegrityRepairReady = false;
           }
@@ -500,21 +532,6 @@ export class HostService {
           runtimeIntegrity?.status === "ready" &&
           this.candidateEvaluationCoordinator?.capabilityReady()
           ? [CANDIDATE_EVALUATION_PROBE_CAPABILITY]
-          : [];
-        let codexSubscriptionReady = false;
-        if (
-          context.transport === "trusted_user" &&
-          runtimeIntegrity?.status === "ready" &&
-          this.codexSubscriptionBackend
-        ) {
-          try {
-            codexSubscriptionReady = await this.codexSubscriptionBackend.capabilityReady();
-          } catch {
-            codexSubscriptionReady = false;
-          }
-        }
-        const codexSubscriptionCapabilities = codexSubscriptionReady
-          ? [CODEX_SUBSCRIPTION_CAPABILITY]
           : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
@@ -533,7 +550,6 @@ export class HostService {
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
                 ...candidateEvaluationCapabilities,
-                ...codexSubscriptionCapabilities,
               ]
             : [
                 ...HOST_CAPABILITIES,
@@ -545,7 +561,6 @@ export class HostService {
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
                 ...candidateEvaluationCapabilities,
-                ...codexSubscriptionCapabilities,
               ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
@@ -572,7 +587,6 @@ export class HostService {
             "Runtime verification is not currently eligible for retry.",
           );
         }
-        await this.codexSubscriptionBackend?.drainForRuntimeMutation();
         if (!provider.retry()) {
           throw new HostStoreError(
             "RUNTIME_INTEGRITY_RETRY_REJECTED",
@@ -624,7 +638,6 @@ export class HostService {
           );
         }
         await this.store.assertRuntimeRepairQuiescent();
-        await this.codexSubscriptionBackend?.drainForRuntimeMutation();
         if (!provider.repair()) {
           throw new HostStoreError(
             "RUNTIME_INTEGRITY_REPAIR_REJECTED",
@@ -660,32 +673,20 @@ export class HostService {
       }
       case "oauth.session.start": {
         const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
-        return broker.start(request.payload);
+        const snapshot = await broker.start(request.payload);
+        if (snapshot.phase === "completed") this.runtimeModelCatalogProvider?.invalidate?.();
+        return snapshot;
       }
       case "oauth.session.status": {
         const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
-        return broker.status(request.payload);
+        const snapshot = await broker.status(request.payload);
+        if (snapshot.phase === "completed") this.runtimeModelCatalogProvider?.invalidate?.();
+        return snapshot;
       }
       case "oauth.session.cancel": {
         const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
         return broker.cancel(request.payload);
       }
-      case "codex.subscription.account.read":
-        return (await this.requireCodexSubscriptionBackend()).accountRead(request.payload);
-      case "codex.subscription.login.start":
-        return (await this.requireCodexSubscriptionBackend()).loginStart(request.payload);
-      case "codex.subscription.login.cancel":
-        return (await this.requireCodexSubscriptionBackend()).loginCancel(request.payload);
-      case "codex.subscription.logout":
-        return (await this.requireCodexSubscriptionBackend()).logout(request.payload);
-      case "codex.subscription.conversation.snapshot":
-        return (await this.requireCodexSubscriptionBackend()).conversationSnapshot(request.payload);
-      case "codex.subscription.turn.start":
-        return (await this.requireCodexSubscriptionBackend()).turnStart(request.payload);
-      case "codex.subscription.turn.interrupt":
-        return (await this.requireCodexSubscriptionBackend()).turnInterrupt(request.payload);
-      case "codex.subscription.turn.reconcile":
-        return (await this.requireCodexSubscriptionBackend()).turnReconcile(request.payload);
       case "candidate.evaluation.preflight": {
         return (await this.requireCandidateEvaluationCoordinator()).preflight(request.payload);
       }
@@ -1109,22 +1110,6 @@ export class HostService {
     return this.oauthSessionBroker;
   }
 
-  private async requireCodexSubscriptionBackend(): Promise<CodexSubscriptionBackend> {
-    const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
-    if (
-      !this.codexSubscriptionBackend ||
-      runtimeIntegrity?.status !== "ready" ||
-      !(await this.codexSubscriptionBackend.capabilityReady())
-    ) {
-      throw new CodexSubscriptionBackendError(
-        "CODEX_SUBSCRIPTION_UNAVAILABLE",
-        "Codex via ChatGPT subscription is not ready on this host",
-        true,
-      );
-    }
-    return this.codexSubscriptionBackend;
-  }
-
   private async requireCandidateEvaluationCoordinator(): Promise<CandidateEvaluationCoordinator> {
     const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
     if (
@@ -1268,17 +1253,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
     case "oauth.session.start":
     case "oauth.session.status":
     case "oauth.session.cancel":
-    case "codex.subscription.account.read":
-    case "codex.subscription.login.start":
-    case "codex.subscription.login.cancel":
-    case "codex.subscription.logout":
-    case "codex.subscription.conversation.snapshot":
-    case "codex.subscription.turn.start":
-    case "codex.subscription.turn.interrupt":
-    case "codex.subscription.turn.reconcile":
       // Relay requests are rejected before scope evaluation. This branch keeps
-      // the protocol switch exhaustive without granting remote account or
-      // Codex conversation access.
+      // the protocol switch exhaustive without granting remote account access.
       return "host.admin";
     case "runtime.integrity.retry":
     case "runtime.integrity.repair":
@@ -1526,9 +1502,6 @@ function invalidRequestResponse(value: unknown, error: ZodError): HostIpcRespons
 
 function toStructuredError(error: unknown): StructuredError {
   if (error instanceof HostStoreError) return error.toStructuredError();
-  if (error instanceof CodexSubscriptionBackendError) {
-    return { code: error.code, message: error.message, retryable: error.retryable };
-  }
   if (error instanceof PairingAuthorityError) {
     return { code: error.code, message: error.message, retryable: false };
   }
@@ -1566,17 +1539,6 @@ function isOAuthRequest(request: HostIpcRequest): boolean {
   return request.method === "oauth.session.start" ||
     request.method === "oauth.session.status" ||
     request.method === "oauth.session.cancel";
-}
-
-function isCodexSubscriptionRequest(request: HostIpcRequest): boolean {
-  return request.method === "codex.subscription.account.read" ||
-    request.method === "codex.subscription.login.start" ||
-    request.method === "codex.subscription.login.cancel" ||
-    request.method === "codex.subscription.logout" ||
-    request.method === "codex.subscription.conversation.snapshot" ||
-    request.method === "codex.subscription.turn.start" ||
-    request.method === "codex.subscription.turn.interrupt" ||
-    request.method === "codex.subscription.turn.reconcile";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

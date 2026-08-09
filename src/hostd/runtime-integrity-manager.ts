@@ -12,10 +12,9 @@ import {
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
-import runtimePolicy from "../../runtime/prime-agent/runtime-policy.json";
 import {
   AtomicWriteAmbiguousCommitError,
   atomicWriteJson,
@@ -26,7 +25,7 @@ import {
   type HostOwnershipLease,
 } from "./ownership-lease";
 import { getHostDataPaths, type HostDataPaths } from "./paths";
-import type { EmbeddedCodexAppServerAttestation, EmbeddedRuntimeAttestation } from "./runtime-attestation";
+import type { EmbeddedRuntimeAttestation } from "./runtime-attestation";
 import {
   assertSameRuntimeFileIdentity,
   isCtimeOnlyRuntimeFileIdentityChange,
@@ -52,132 +51,6 @@ const RuntimeVersionSchema = z.object({
   node: BoundedStringSchema,
   modules: BoundedStringSchema,
   napi: BoundedStringSchema,
-}).strict();
-const CodexAppServerContract = runtimePolicy.codexAppServer;
-const CodexAppServerManifestSchema = z.object({
-  release: z.object({
-    repository: z.literal("https://github.com/openai/codex"),
-    tag: z.literal("rust-v0.147.0"),
-    version: z.literal("0.147.0"),
-    tagObject: z.literal("3ed6f04f6bf8b7c46299d1cb1ff99c74ce21a51d"),
-    commit: z.literal("be6e8eac029b183056b7e4402879f15d2c85f61b"),
-  }).strict(),
-  asset: z.object({
-    fileName: z.literal("codex-app-server-package-x86_64-pc-windows-msvc.tar.gz"),
-    url: z.literal("https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-app-server-package-x86_64-pc-windows-msvc.tar.gz"),
-    size: z.literal(110_054_928),
-    expandedSize: z.literal(319_488_000),
-    sha256: z.literal("c8908d687cf7caa3074921479726db32f96a295372c3544f1e96919a7254951f"),
-  }).strict(),
-  legalFiles: z.tuple([
-    z.object({
-      fileName: z.literal("codex-LICENSE"),
-      path: z.literal("legal/LICENSE"),
-      url: z.literal("https://raw.githubusercontent.com/openai/codex/be6e8eac029b183056b7e4402879f15d2c85f61b/LICENSE"),
-      sourceCommit: z.literal("be6e8eac029b183056b7e4402879f15d2c85f61b"),
-      size: z.literal(10_926),
-      sha256: z.literal("d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"),
-    }).strict(),
-    z.object({
-      fileName: z.literal("codex-NOTICE"),
-      path: z.literal("legal/NOTICE"),
-      url: z.literal("https://raw.githubusercontent.com/openai/codex/be6e8eac029b183056b7e4402879f15d2c85f61b/NOTICE"),
-      sourceCommit: z.literal("be6e8eac029b183056b7e4402879f15d2c85f61b"),
-      size: z.literal(242),
-      sha256: z.literal("9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"),
-    }).strict(),
-  ]),
-  platform: z.literal("win32"),
-  arch: z.literal("x64"),
-  target: z.literal("x86_64-pc-windows-msvc"),
-  directory: z.literal("companions/codex-app-server"),
-  entrypoint: z.literal("companions/codex-app-server/bin/codex-app-server.exe"),
-  packageMetadata: z.object({
-    path: z.literal("companions/codex-app-server/codex-package.json"),
-    sha256: z.literal("90f75ac3f356281935567105ce486bd42fc23f25812d1629f2a048255a1b6496"),
-    layoutVersion: z.literal(1),
-    version: z.literal("0.147.0"),
-    target: z.literal("x86_64-pc-windows-msvc"),
-    variant: z.literal("codex-app-server"),
-    entrypoint: z.literal("bin/codex-app-server.exe"),
-    resourcesDir: z.literal("codex-resources"),
-    pathDir: z.literal("codex-path"),
-  }).strict(),
-  fixedArguments: z.array(BoundedStringSchema)
-    .length(CodexAppServerContract.fixedArguments.length)
-    .refine((value) => jsonEqual(value, CodexAppServerContract.fixedArguments)),
-  sessionConfig: z.record(z.string(), z.unknown())
-    .refine((value) => jsonEqual(value, CodexAppServerContract.sessionConfig)),
-  threadConfig: z.record(z.string(), z.union([z.boolean(), BoundedStringSchema]))
-    .refine((value) => jsonEqual(value, CodexAppServerContract.threadConfig)),
-  initializeIdentity: z.object({
-    clientInfoName: z.literal("prime_continuim"),
-    clientInfoTitle: z.literal("Prime Continuim"),
-    capabilities: z.object({ experimentalApi: z.literal(true) }).strict(),
-    userAgentTemplate: z.literal("prime_continuim/0.147.0 (Windows <major>.<minor>.<build>; x86_64) unknown (prime_continuim; <clientVersion>)"),
-    platformFamily: z.literal("windows"),
-    platformOs: z.literal("windows"),
-  }).strict(),
-  threadStartPolicy: z.record(z.string(), z.unknown())
-    .refine((value) => jsonEqual(value, CodexAppServerContract.threadStartPolicy)),
-  environmentPolicy: z.object({
-    inherit: z.literal("none"),
-    requiredSourceVariables: z.tuple([z.literal("SystemRoot"), z.literal("WINDIR")]),
-    constructedVariables: z.tuple([
-      z.literal("ComSpec"),
-      z.literal("TEMP"),
-      z.literal("TMP"),
-      z.literal("PATH"),
-      z.literal("PATHEXT"),
-      z.literal("CODEX_HOME"),
-    ]),
-    privateTemporaryDirectoryRequired: z.literal(true),
-    pathEntries: z.tuple([
-      z.literal("codex-path"),
-      z.literal("System32"),
-      z.literal("WindowsPowerShell/v1.0"),
-    ]),
-    pathExt: z.literal(".COM;.EXE;.BAT;.CMD"),
-  }).strict(),
-  codexHomePolicy: z.object({
-    requireEmptyAtLaunch: z.literal(true),
-    allowedGeneratedSystemSkillsRoot: z.literal("skills/.system"),
-    forbiddenBasenames: z.array(BoundedStringSchema),
-    forbiddenTopLevelDirectories: z.array(BoundedStringSchema),
-    forbiddenExecutableExtensions: z.array(BoundedStringSchema),
-  }).strict().refine((value) => jsonEqual(value, CodexAppServerContract.codexHomePolicy)),
-  publisher: z.object({
-    status: z.literal("valid"),
-    subject: z.literal('CN="OpenAI OpCo, LLC", O="OpenAI OpCo, LLC", L=San Francisco, S=California, C=US'),
-    issuer: z.literal("CN=Microsoft ID Verified CS EOC CA 04, O=Microsoft Corporation, C=US"),
-    thumbprint: z.literal("8B0ADFB840E141DAD3044D2B5AC819873DDE3590"),
-    signedFiles: z.tuple([
-      z.literal("bin/codex-app-server.exe"),
-      z.literal("bin/codex-code-mode-host.exe"),
-      z.literal("codex-resources/codex-command-runner.exe"),
-      z.literal("codex-resources/codex-windows-sandbox-setup.exe"),
-    ]),
-    unsignedFiles: z.tuple([z.literal("codex-path/rg.exe")]),
-  }).strict(),
-  smoke: z.object({
-    protocol: z.literal("jsonl-stdio"),
-    initialize: z.literal(true),
-    initializeIdentity: z.literal(true),
-    configRead: z.literal(true),
-    denyVectorEffective: z.literal(true),
-    windowsSandboxUnelevatedPrivateDesktop: z.literal(true),
-    mcpServersEmpty: z.literal(true),
-    hooksEmpty: z.literal(true),
-    pluginsEmpty: z.literal(true),
-    appsEmpty: z.literal(true),
-    threadStartReadOnly: z.literal(true),
-    threadNetworkAccessDisabled: z.literal(true),
-    threadDeleted: z.literal(true),
-    accountReadSignedOut: z.literal(true),
-    requiresOpenaiAuth: z.literal(true),
-    forbiddenConfigAbsent: z.literal(true),
-    authJsonAbsent: z.literal(true),
-  }).strict(),
 }).strict();
 const RuntimeManifestSchema = z.object({
   schemaVersion: z.literal(1),
@@ -219,7 +92,6 @@ const RuntimeManifestSchema = z.object({
     schemaId: BoundedStringSchema,
     requiredCapabilities: z.array(BoundedStringSchema).min(1).max(32),
   }).strict(),
-  codexAppServer: CodexAppServerManifestSchema.optional(),
   sources: z.array(z.object({
     packageName: BoundedStringSchema,
     fileName: BoundedStringSchema,
@@ -285,24 +157,6 @@ export interface InstalledRuntimeIntegrityIdentity extends InstalledPointer {
 }
 
 declare const verifiedInstalledRuntimeHandleBrand: unique symbol;
-const verifiedCodexAppServerLaunchDescriptorBrand: unique symbol = Symbol("verified-codex-app-server-launch");
-
-export interface VerifiedCodexAppServerLaunchDescriptor {
-  readonly [verifiedCodexAppServerLaunchDescriptorBrand]: true;
-  readonly executable: string;
-  readonly companionDirectory: string;
-  readonly fixedArguments: readonly string[];
-  readonly sessionConfig: EmbeddedCodexAppServerAttestation["sessionConfig"];
-  readonly threadConfig: EmbeddedCodexAppServerAttestation["threadConfig"];
-  readonly initializeCapabilities: EmbeddedCodexAppServerAttestation["initializeIdentity"]["capabilities"];
-  readonly initializeIdentity: EmbeddedCodexAppServerAttestation["initializeIdentity"];
-  readonly threadStartPolicy: EmbeddedCodexAppServerAttestation["threadStartPolicy"];
-  readonly environmentPolicy: EmbeddedCodexAppServerAttestation["environmentPolicy"];
-  readonly codexHomePolicy: EmbeddedCodexAppServerAttestation["codexHomePolicy"];
-  readonly releaseVersion: "0.147.0";
-  readonly target: "x86_64-pc-windows-msvc";
-  readonly assetSha256: string;
-}
 
 /**
  * Process-local proof that the exact installed runtime tree was freshly
@@ -322,8 +176,6 @@ export interface VerifiedInstalledRuntimeHandle {
   readonly moduleUrl: string;
   /** Absolute path of the verified Prime Agent CLI entrypoint. */
   readonly cliEntrypoint: string;
-  /** Whole-tree-verified direct launcher for the optional attested Codex app-server companion. */
-  readonly codexAppServer?: VerifiedCodexAppServerLaunchDescriptor;
 }
 
 export const RUNTIME_INTEGRITY_CANCELLED = "RUNTIME_INTEGRITY_CANCELLED" as const;
@@ -1085,43 +937,11 @@ export class RuntimeIntegrityManager {
     const finalDirectory = this.finalDirectory();
     const moduleEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.module, "module");
     const cliEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.cli, "CLI");
-    const codexAppServer: VerifiedCodexAppServerLaunchDescriptor | undefined = this.attestation.codexAppServer
-      ? deepFreeze({
-        [verifiedCodexAppServerLaunchDescriptorBrand]: true as const,
-        executable: this.entrypointLocation(finalDirectory, this.attestation.codexAppServer.entrypoint, "Codex app-server"),
-        companionDirectory: boundedAbsoluteRuntimeLocation(
-          dirname(dirname(this.entrypointLocation(finalDirectory, this.attestation.codexAppServer.entrypoint, "Codex app-server"))),
-          "Codex app-server companion directory",
-        ),
-        fixedArguments: Object.freeze([...this.attestation.codexAppServer.fixedArguments]),
-        sessionConfig: structuredClone(this.attestation.codexAppServer.sessionConfig),
-        threadConfig: { ...this.attestation.codexAppServer.threadConfig },
-        initializeCapabilities: { ...this.attestation.codexAppServer.initializeIdentity.capabilities },
-        initializeIdentity: { ...this.attestation.codexAppServer.initializeIdentity },
-        threadStartPolicy: structuredClone(this.attestation.codexAppServer.threadStartPolicy),
-        environmentPolicy: {
-          ...this.attestation.codexAppServer.environmentPolicy,
-          requiredSourceVariables: [...this.attestation.codexAppServer.environmentPolicy.requiredSourceVariables],
-          constructedVariables: [...this.attestation.codexAppServer.environmentPolicy.constructedVariables],
-          pathEntries: [...this.attestation.codexAppServer.environmentPolicy.pathEntries],
-        },
-        codexHomePolicy: {
-          ...this.attestation.codexAppServer.codexHomePolicy,
-          forbiddenBasenames: [...this.attestation.codexAppServer.codexHomePolicy.forbiddenBasenames],
-          forbiddenTopLevelDirectories: [...this.attestation.codexAppServer.codexHomePolicy.forbiddenTopLevelDirectories],
-          forbiddenExecutableExtensions: [...this.attestation.codexAppServer.codexHomePolicy.forbiddenExecutableExtensions],
-        },
-        releaseVersion: this.attestation.codexAppServer.releaseVersion,
-        target: this.attestation.codexAppServer.target,
-        assetSha256: this.attestation.codexAppServer.assetSha256,
-      })
-      : undefined;
     return Object.freeze({
       identity,
       executable,
       moduleUrl: pathToFileURL(moduleEntrypoint).href,
       cliEntrypoint,
-      ...(codexAppServer ? { codexAppServer } : {}),
     }) as VerifiedInstalledRuntimeHandle;
   }
 
@@ -1205,7 +1025,6 @@ export function parseRuntimeFileManifest(
   value: Uint8Array | string,
   expectedCount: number,
   signal?: AbortSignal,
-  allowedNativeExecutablePaths: ReadonlySet<string> = new Set(),
 ): readonly RuntimeFileEntry[] {
   if (signal) throwIfRuntimeIntegrityCancelled(signal);
   const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
@@ -1235,7 +1054,7 @@ export function parseRuntimeFileManifest(
     if (path === "files.sha256" || path === "runtime.json") {
       throw new Error("Runtime metadata cannot attest itself as a payload file");
     }
-    if (/\.(?:dll|exe|dylib|so)$/i.test(path) && !allowedNativeExecutablePaths.has(path)) {
+    if (/\.(?:dll|exe|dylib|so)$/i.test(path)) {
       throw new Error("Runtime file manifest contains an unattested native executable or library");
     }
     const folded = windowsFoldPath(path);
@@ -1293,34 +1112,18 @@ async function verifyRuntimeDirectory(
   }
   const manifest = RuntimeManifestSchema.parse(parseJson(manifestBytes, "runtime manifest"));
   assertManifestMatchesAttestation(manifest, attestation);
-  const codexAppServer = manifest.codexAppServer;
-  const allowedNativeExecutablePaths = codexAppServer
-    ? new Set([
-        ...codexAppServer.publisher.signedFiles,
-        ...codexAppServer.publisher.unsignedFiles,
-      ].map((path) => `${codexAppServer.directory}/${path}`))
-    : new Set<string>();
   const files = parseRuntimeFileManifest(
     fileManifestBytes,
     attestation.tree.fileCount,
     signal,
-    allowedNativeExecutablePaths,
   );
   const payloadPaths = new Set(files.map((file) => file.path));
   for (const requiredPath of [
     manifest.entrypoints.module,
     manifest.entrypoints.cli,
     "node_modules/prime-agent/package.json",
-    ...(manifest.codexAppServer
-      ? [manifest.codexAppServer.entrypoint, manifest.codexAppServer.packageMetadata.path]
-      : []),
   ]) {
     if (!payloadPaths.has(requiredPath)) throw new Error(`Runtime image is missing a required entrypoint file: ${requiredPath}`);
-  }
-  for (const requiredNativePath of allowedNativeExecutablePaths) {
-    if (!payloadPaths.has(requiredNativePath)) {
-      throw new Error(`Runtime image is missing an attested Codex companion executable: ${requiredNativePath}`);
-    }
   }
   const expectedDirectories = runtimeDirectorySet(files, signal);
   await assertExactRuntimeNamespace(directory, files, expectedDirectories, signal);
@@ -1755,7 +1558,6 @@ function assertManifestMatchesAttestation(
     !jsonEqual(manifest.tree, attestation.tree) ||
     !jsonEqual(manifest.entrypoints, attestation.entrypoints) ||
     !jsonEqual(manifest.daemon, attestation.daemon) ||
-    !jsonEqual(selectCodexAppServerAttestation(manifest.codexAppServer), attestation.codexAppServer) ||
     !jsonEqual(manifest.nativeAddons, attestation.nativeAddons)
   ) {
     throw new Error("Runtime manifest identity does not match the embedded attestation");
@@ -1767,7 +1569,6 @@ function assertManifestMatchesAttestation(
   for (const entrypoint of [
     manifest.entrypoints.module,
     manifest.entrypoints.cli,
-    ...(manifest.codexAppServer ? [manifest.codexAppServer.entrypoint] : []),
   ]) {
     if (!isSafeRuntimePath(entrypoint)) throw new Error("Runtime manifest contains an unsafe entrypoint");
   }
@@ -1775,33 +1576,6 @@ function assertManifestMatchesAttestation(
   if (new Set(addonPaths).size !== addonPaths.length || manifest.nativeAddons.some((addon) => !isSafeRuntimePath(addon.path))) {
     throw new Error("Runtime manifest native-addon allowlist is ambiguous");
   }
-}
-
-function selectCodexAppServerAttestation(value: RuntimeManifest["codexAppServer"]): unknown {
-  if (!value) return undefined;
-  return {
-    releaseVersion: value.release.version,
-    platform: value.platform,
-    arch: value.arch,
-    target: value.target,
-    entrypoint: value.entrypoint,
-    fixedArguments: value.fixedArguments,
-    legalFiles: value.legalFiles,
-    sessionConfig: value.sessionConfig,
-    threadConfig: value.threadConfig,
-    initializeIdentity: value.initializeIdentity,
-    threadStartPolicy: value.threadStartPolicy,
-    environmentPolicy: value.environmentPolicy,
-    codexHomePolicy: value.codexHomePolicy,
-    assetSha256: value.asset.sha256,
-    publisher: {
-      subject: value.publisher.subject,
-      thumbprint: value.publisher.thumbprint,
-      signedFiles: value.publisher.signedFiles,
-      unsignedFiles: value.publisher.unsignedFiles,
-    },
-    smoke: value.smoke,
-  };
 }
 
 function runtimeDirectorySet(files: readonly RuntimeFileEntry[], signal?: AbortSignal): ReadonlySet<string> {

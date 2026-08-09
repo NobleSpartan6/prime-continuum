@@ -3,19 +3,13 @@ import {
   CandidateEvaluationPreflightSchema,
   CandidateEvaluationSnapshotSchema,
   CandidateEvaluationStatusSchema,
-  CODEX_SUBSCRIPTION_BACKEND_ID,
-  CODEX_SUBSCRIPTION_BACKEND_LABEL,
-  CODEX_SUBSCRIPTION_CAPABILITY,
-  CodexSubscriptionAccountSnapshotSchema,
-  CodexSubscriptionConversationLookupSchema,
-  CodexSubscriptionConversationSnapshotSchema,
-  CodexSubscriptionTurnReconciliationSchema,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
   ResidentLifecycleDispositionSchema,
@@ -29,17 +23,6 @@ import {
   type CandidateEvaluationSnapshot,
   type CandidateEvaluationStartRequest,
   type CandidateEvaluationStatus,
-  type CodexSubscriptionAccountReadRequest,
-  type CodexSubscriptionAccountSnapshot,
-  type CodexSubscriptionConversationLookup,
-  type CodexSubscriptionConversationSnapshot,
-  type CodexSubscriptionLoginCancelRequest,
-  type CodexSubscriptionLoginStartRequest,
-  type CodexSubscriptionLogoutRequest,
-  type CodexSubscriptionRequestBinding,
-  type CodexSubscriptionTurnInterruptRequest,
-  type CodexSubscriptionTurnReconciliation,
-  type CodexSubscriptionTurnStartRequest,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
@@ -278,10 +261,12 @@ export interface WorkbenchSnapshot {
     provisionResident?: boolean
     crossHostHandoff: boolean
     modelCatalog?: boolean
+    /** Eligibility only; the native action revalidates the exact idle resident authority. */
+    selectResidentModel?: boolean
+    /** Eligibility only; native OAuth revalidates the exact trusted local host connection. */
+    runtimeOAuth?: boolean
     /** Capability-derived probe availability only; never an action authorization. */
     candidateEvaluationProbe?: boolean
-    /** Eligibility only; every Codex action revalidates exact native authority. */
-    codexSubscription?: boolean
   }
   composerReceipt: {
     state: ComposerReceiptState
@@ -400,9 +385,35 @@ export interface ComposerRequest {
   text: string
 }
 
+export interface ResidentModelSelectionRequest {
+  threadId: string
+  providerId: string
+  modelId: string
+}
+
+export type ResidentModelSelectionResult =
+  | { state: 'completed'; message: string; projected: boolean }
+  | { state: 'rejected'; message: string; retryable: boolean }
+  | { state: 'uncertain'; message: string; retryable: false }
+
+export interface RuntimeOAuthRequest {
+  hostId: string
+  providerId: string
+}
+
+export type RuntimeOAuthProgress = {
+  phase: 'starting' | 'awaiting_user' | 'committing' | 'cancelling'
+  message: string
+}
+
+export type RuntimeOAuthResult =
+  | { state: 'completed'; message: string; catalog?: RuntimeModelCatalog }
+  | { state: 'cancelled'; message: string }
+  | { state: 'failed'; message: string; retryable: boolean }
+  | { state: 'uncertain'; message: string; retryable: false }
+
 export interface RendererApi {
   environment: 'native' | 'preview'
-  codexSubscription?: CodexSubscriptionRendererApi
   loadWorkbench(): Promise<WorkbenchSnapshot>
   subscribe?(listener: (snapshot: WorkbenchSnapshot) => void): () => void
   hudOpen(target: HudTarget): Promise<HudState>
@@ -417,6 +428,12 @@ export interface RendererApi {
   selectThread(threadId: string): Promise<void>
   activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
+  selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult>
+  startRuntimeOAuth?(
+    request: RuntimeOAuthRequest,
+    onProgress: (progress: RuntimeOAuthProgress) => void,
+  ): Promise<RuntimeOAuthResult>
+  cancelRuntimeOAuth?(request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null>
   selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
   provisionResident(input: {
     selectionToken: string
@@ -463,17 +480,6 @@ export interface RendererApi {
   ): Promise<{ destinationHostId: string; receiptId: string }>
 }
 
-export interface CodexSubscriptionRendererApi {
-  accountRead(input: CodexSubscriptionAccountReadRequest): Promise<CodexSubscriptionAccountSnapshot>
-  loginStart(input: CodexSubscriptionLoginStartRequest): Promise<CodexSubscriptionAccountSnapshot>
-  loginCancel(input: CodexSubscriptionLoginCancelRequest): Promise<CodexSubscriptionAccountSnapshot>
-  logout(input: CodexSubscriptionLogoutRequest): Promise<CodexSubscriptionAccountSnapshot>
-  conversationSnapshot(input: CodexSubscriptionRequestBinding): Promise<CodexSubscriptionConversationLookup>
-  turnStart(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionConversationSnapshot>
-  turnInterrupt(input: CodexSubscriptionTurnInterruptRequest): Promise<CodexSubscriptionConversationSnapshot>
-  turnReconcile(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionTurnReconciliation>
-}
-
 export class StaleHostAuthorityError extends Error {
   readonly code = 'STALE_HOST_AUTHORITY'
 
@@ -489,7 +495,7 @@ export function isStaleHostAuthorityError(value: unknown): value is StaleHostAut
 
 type NativePrimeBridge = object
 
-const delay = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds))
+const delay = (milliseconds: number) => new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds))
 const previewSimulation = (message: string) => `Preview simulation · ${message}`
 
 const seedTranscript: TranscriptBlock[] = [
@@ -751,6 +757,8 @@ export const previewSnapshot: WorkbenchSnapshot = {
 export type PreviewVisualState =
   | 'reconnecting'
   | 'idle'
+  | 'model-selection'
+  | 'prime-oauth'
   | 'prompt-admission'
   | 'prompt-awaiting-idle-proof'
   | 'stop-awaiting-idle-proof'
@@ -760,14 +768,14 @@ export type PreviewVisualState =
   | 'resident-end-review'
   | 'resident-end-pending'
   | 'candidate-evaluation-review'
-  | 'codex-subscription-signed-out'
-  | 'codex-subscription-ready'
   | 'hud-expanded'
   | 'hud-buddy'
 
 const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
   'idle',
+  'model-selection',
+  'prime-oauth',
   'prompt-admission',
   'prompt-awaiting-idle-proof',
   'stop-awaiting-idle-proof',
@@ -777,8 +785,6 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'resident-end-review',
   'resident-end-pending',
   'candidate-evaluation-review',
-  'codex-subscription-signed-out',
-  'codex-subscription-ready',
   'hud-expanded',
   'hud-buddy',
 ])
@@ -794,14 +800,15 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
   const snapshot = structuredClone(previewSnapshot)
   if (visualState === 'reconnecting') return snapshot
 
-  if (visualState === 'codex-subscription-signed-out' || visualState === 'codex-subscription-ready') {
+  if (visualState === 'prime-oauth') {
     const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
     const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
-    if (!thread || !host) return snapshot
+    if (!thread || !host || !snapshot.runtime.session) return snapshot
     snapshot.selectedProjectId = thread.projectId
     snapshot.selectedThreadId = thread.id
-    thread.remoteId = PREVIEW_CODEX_BINDING.threadId
-    thread.executionGenerationId = PREVIEW_CODEX_BINDING.expectedExecutionGenerationId
+    thread.remoteId = 'thread-prime-oauth-preview'
+    thread.workspaceId = 'workspace-prime-oauth-preview'
+    thread.executionGenerationId = 'execution-prime-oauth-preview'
     thread.status = 'idle'
     host.kind = 'local'
     host.connection = 'online'
@@ -809,15 +816,25 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     host.latencyMs = 2
     delete host.lastSynchronized
     snapshot.attention = []
-    snapshot.runtime = {}
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      activeSessionId: 'session-prime-oauth-preview',
+      sessionId: 'session-prime-oauth-preview',
+      sessionName: thread.title,
+      isStreaming: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
     snapshot.operations = {
-      submitCommands: false,
-      startResidentTurn: false,
+      submitCommands: true,
+      startResidentTurn: true,
       stopResidentTurn: false,
       crossHostHandoff: false,
-      codexSubscription: true,
+      modelCatalog: true,
+      runtimeOAuth: true,
     }
-    snapshot.composerReceipt = { state: 'idle', message: previewSimulation('Codex visual fixture; no command can run') }
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
   }
 
@@ -1000,13 +1017,22 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     previewUpdate.detail = previewSimulation(detail)
   }
 
-  if (visualState === 'idle' || visualState === 'hud-expanded' || visualState === 'hud-buddy') {
+  if (
+    visualState === 'idle' ||
+    visualState === 'model-selection' ||
+    visualState === 'hud-expanded' ||
+    visualState === 'hud-buddy'
+  ) {
     if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
       selectedThread.workspaceId = 'workspace-preview-hud'
       selectedThread.executionGenerationId = 'execution-preview-hud'
     }
     selectedThread.status = 'idle'
     snapshot.operations.startResidentTurn = true
+    if (visualState === 'model-selection') {
+      snapshot.operations.modelCatalog = true
+      snapshot.operations.selectResidentModel = true
+    }
     snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     setPreviewUpdate(
       'fixture resident session is attached and ready for another prompt',
@@ -1257,147 +1283,17 @@ const previewCandidateEvaluationSnapshot = CandidateEvaluationSnapshotSchema.par
   evaluations: [],
 })
 
-const PREVIEW_CODEX_BINDING = Object.freeze({
-  expectedHostId: 'host-local',
-  threadId: 'codex-preview-source-thread',
-  expectedExecutionGenerationId: 'codex-preview-execution',
-})
-
-const PREVIEW_CODEX_EXECUTION_POLICY = Object.freeze({
-  filesystem: 'read_only_user_scope' as const,
-  workspaceReadConfinement: false as const,
-  toolNetworkAccess: false as const,
-  approvalPolicy: 'never' as const,
-  disclosure: 'Codex tools cannot write files or open network connections. They may read other files available to your Windows account; this is not a workspace-only sandbox. Prompts and content Codex reads—including workspace instructions and tool-read files—are sent to OpenAI for the turn.' as const,
-})
-
-const PREVIEW_CODEX_BACKEND = Object.freeze({
-  id: CODEX_SUBSCRIPTION_BACKEND_ID,
-  kind: 'codex_subscription' as const,
-  label: CODEX_SUBSCRIPTION_BACKEND_LABEL,
-})
-
-function previewCodexAccount(visualState: PreviewVisualState): CodexSubscriptionAccountSnapshot {
-  const account = visualState === 'codex-subscription-ready'
-    ? {
-        backend: PREVIEW_CODEX_BACKEND,
-        backendIncarnationId: 'codex-preview-backend',
-        phase: 'signed_in' as const,
-        accountType: 'chatgpt' as const,
-        requiresOpenaiAuth: true as const,
-        planType: 'plus' as const,
-        executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
-        turnReadiness: { state: 'ready' as const, verifiedAt: '2026-08-09T12:03:00.000Z' },
-        updatedAt: '2026-08-09T12:03:00.000Z',
-      }
-    : {
-        backend: PREVIEW_CODEX_BACKEND,
-        backendIncarnationId: 'codex-preview-backend',
-        phase: 'signed_out' as const,
-        executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
-        turnReadiness: { state: 'unavailable' as const, reason: 'account_required' as const },
-        updatedAt: '2026-08-09T12:00:00.000Z',
-      }
-  return CodexSubscriptionAccountSnapshotSchema.parse(account)
-}
-
-function previewCodexConversation(visualState: PreviewVisualState): CodexSubscriptionConversationSnapshot | null {
-  if (visualState !== 'codex-subscription-ready') return null
-  return CodexSubscriptionConversationSnapshotSchema.parse({
-    backend: PREVIEW_CODEX_BACKEND,
-    backendIncarnationId: 'codex-preview-backend',
-    binding: {
-      hostId: PREVIEW_CODEX_BINDING.expectedHostId,
-      sourceThreadId: PREVIEW_CODEX_BINDING.threadId,
-      executionGenerationId: PREVIEW_CODEX_BINDING.expectedExecutionGenerationId,
-    },
-    sessionId: 'codex-preview-session',
-    threadId: 'codex-preview-thread',
-    revision: 4,
-    state: 'terminal',
-    executionPolicy: PREVIEW_CODEX_EXECUTION_POLICY,
-    latestTurn: {
-      operationId: 'codex-preview-turn-operation',
-      turnId: 'codex-preview-turn',
-      state: 'completed',
-      terminal: true,
-      startedAt: '2026-08-09T12:01:00.000Z',
-      completedAt: '2026-08-09T12:02:00.000Z',
-    },
-    transcript: [
-      {
-        itemId: 'codex-preview-user-item',
-        turnOperationId: 'codex-preview-turn-operation',
-        turnId: 'codex-preview-turn',
-        sequence: 0,
-        role: 'user',
-        state: 'completed',
-        text: 'Summarize the execution boundary for this preview.',
-        createdAt: '2026-08-09T12:01:00.000Z',
-        updatedAt: '2026-08-09T12:01:00.000Z',
-      },
-      {
-        itemId: 'codex-preview-assistant-item',
-        turnOperationId: 'codex-preview-turn-operation',
-        turnId: 'codex-preview-turn',
-        sequence: 1,
-        role: 'assistant',
-        state: 'completed',
-        text: 'This is a non-executing visual fixture. Codex tools cannot write files or open network connections, but reads are not confined to this workspace.',
-        createdAt: '2026-08-09T12:01:01.000Z',
-        updatedAt: '2026-08-09T12:02:00.000Z',
-      },
-    ],
-    transcriptTruncated: false,
-    updatedAt: '2026-08-09T12:02:00.000Z',
-  })
-}
-
-function previewCodexBindingMatches(input: CodexSubscriptionRequestBinding): boolean {
-  return input.expectedHostId === PREVIEW_CODEX_BINDING.expectedHostId &&
-    input.threadId === PREVIEW_CODEX_BINDING.threadId &&
-    input.expectedExecutionGenerationId === PREVIEW_CODEX_BINDING.expectedExecutionGenerationId
-}
-
-function createPreviewCodexSubscriptionApi(visualState: PreviewVisualState): CodexSubscriptionRendererApi {
-  const account = previewCodexAccount(visualState)
-  const conversation = previewCodexConversation(visualState)
-  const rejectMutation = async (_input: unknown): Promise<never> => {
-    throw new Error('The internal Codex visual-QA fixture never invokes login, logout, turn, or interrupt operations.')
-  }
-  return Object.freeze({
-    accountRead: async (input: CodexSubscriptionAccountReadRequest) => {
-      if (input.expectedHostId !== PREVIEW_CODEX_BINDING.expectedHostId) {
-        throw new Error('The internal Codex visual-QA account authority changed.')
-      }
-      return structuredClone(account)
-    },
-    loginStart: rejectMutation,
-    loginCancel: rejectMutation,
-    logout: rejectMutation,
-    conversationSnapshot: async (input: CodexSubscriptionRequestBinding) => {
-      if (!previewCodexBindingMatches(input)) {
-        throw new Error('The internal Codex visual-QA conversation authority changed.')
-      }
-      return { conversation: structuredClone(conversation) }
-    },
-    turnStart: rejectMutation,
-    turnInterrupt: rejectMutation,
-    turnReconcile: rejectMutation,
-  })
-}
-
 class BrowserPreviewApi implements RendererApi {
   readonly environment: 'native' | 'preview'
-  readonly codexSubscription?: CodexSubscriptionRendererApi
   private previewHudState: HudState = { state: 'closed' }
   private readonly hudListeners = new Set<(state: HudState) => void>()
 
   constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
-    const codexVisualState = visualState === 'codex-subscription-signed-out' ||
-      visualState === 'codex-subscription-ready'
-    this.environment = visualState === 'candidate-evaluation-review' || codexVisualState ? 'native' : 'preview'
-    if (codexVisualState) this.codexSubscription = createPreviewCodexSubscriptionApi(visualState)
+    this.environment = visualState === 'candidate-evaluation-review' ||
+      visualState === 'model-selection' ||
+      visualState === 'prime-oauth'
+      ? 'native'
+      : 'preview'
     if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
       this.previewHudState = {
         state: visualState === 'hud-buddy' ? 'buddy' : 'expanded',
@@ -1476,7 +1372,36 @@ class BrowserPreviewApi implements RendererApi {
 
   async loadRuntimeModelCatalog(_hostId: string): Promise<RuntimeModelCatalogSnapshot> {
     await delay(180)
-    return structuredClone(previewRuntimeModelCatalog)
+    const catalog = structuredClone(previewRuntimeModelCatalog)
+    if (this.visualState === 'prime-oauth') {
+      const provider = catalog.providers.find((candidate) => candidate.providerId === 'openai-codex')
+      if (provider) {
+        provider.configured = false
+        provider.availableModelCount = 0
+        delete provider.authSource
+      }
+      for (const model of catalog.models) {
+        if (model.providerId !== 'openai-codex') continue
+        model.available = false
+        model.usingOAuth = false
+      }
+    }
+    return catalog
+  }
+
+  async selectResidentModel(_request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult> {
+    throw new Error('Resident model selection is available only in the native desktop app.')
+  }
+
+  async startRuntimeOAuth(
+    _request: RuntimeOAuthRequest,
+    _onProgress: (progress: RuntimeOAuthProgress) => void,
+  ): Promise<RuntimeOAuthResult> {
+    throw new Error('Prime Agent sign-in is available only in the native desktop app.')
+  }
+
+  async cancelRuntimeOAuth(_request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null> {
+    throw new Error('Prime Agent sign-in is available only in the native desktop app.')
   }
 
   async selectResidentWorkspace(_input: { resumeOperationId?: string } = {}): Promise<ResidentWorkspaceSelection> {
@@ -2759,6 +2684,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId)
   const selectedProjectId = selectedThread?.projectId ?? projects[0]?.id ?? ''
   const selectedHostHasAuthority = Boolean(activeHostId && selectedThread?.hostId === activeHostId)
+  const activeHostHasAuthority = Boolean(
+    activeHostId && hosts.some((host) => host.id === activeHostId && host.connection === 'online'),
+  )
   const hostName = hosts.find((host) => host.id === selectedThread?.hostId)?.name ?? 'Execution host'
   const selectedSnapshotIsMaterialized = Boolean(
     snapshotThreadId &&
@@ -3176,6 +3104,31 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     runtime.session?.isBashRunning ||
     (runtime.session?.queuedActionCount ?? 0) > 0,
   )
+  const residentTurnStartReady = Boolean(
+    residentSessionReady &&
+    !residentTurnActive &&
+    !retainedPromptOwned &&
+    !promptDispatchPending &&
+    !abortCommandPending &&
+    selectedThread?.status !== 'waiting' &&
+    selectedThread?.status !== 'needs_approval',
+  )
+  const activeAccountHostReady = Boolean(
+    activeHostHasAuthority && (!selectedThread || selectedHostHasAuthority),
+  )
+  const modelCatalogReady = Boolean(
+    activeAccountHostReady &&
+    activePhase === 'online' &&
+    advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY),
+  )
+  const runtimeOAuthReady = Boolean(
+    input.mutationAuthorityReady !== false &&
+    activeAccountHostReady &&
+    activePhase === 'online' &&
+    asString(activeTarget?.kind) === 'local' &&
+    asString(rawConnection?.path) === 'local_socket' &&
+    advertisedCapabilities.includes(RUNTIME_OAUTH_CAPABILITY),
+  )
   return {
     selectedProjectId,
     selectedThreadId,
@@ -3191,25 +3144,20 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     residentLifecycleOperations,
     operations: {
       submitCommands: residentSessionReady,
-      startResidentTurn:
-        residentSessionReady &&
-        !residentTurnActive &&
-        !retainedPromptOwned &&
-        !promptDispatchPending &&
-        !abortCommandPending &&
-        selectedThread?.status !== 'waiting' &&
-        selectedThread?.status !== 'needs_approval',
+      startResidentTurn: residentTurnStartReady,
       stopResidentTurn: residentSessionReady && !abortCommandPending && (residentTurnActive || retainedPromptOwned),
       ...(residentProvisioningReady ? { provisionResident: true } : {}),
       crossHostHandoff:
         selectedHostHasAuthority &&
         activePhase === 'online' &&
         advertisedCapabilities.includes(THREAD_HANDOFF_CAPABILITY),
-      ...(selectedHostHasAuthority &&
-      activePhase === 'online' &&
-      advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)
-        ? { modelCatalog: true }
+      ...(modelCatalogReady
+        ? {
+            modelCatalog: true,
+            ...(residentTurnStartReady ? { selectResidentModel: true } : {}),
+          }
         : {}),
+      ...(runtimeOAuthReady ? { runtimeOAuth: true } : {}),
       ...(selectedHostHasAuthority &&
       selectedSnapshotIsMaterialized &&
       activePhase === 'online' &&
@@ -3217,14 +3165,6 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       asString(rawConnection?.path) === 'local_socket' &&
       advertisedCapabilities.includes(CANDIDATE_EVALUATION_PROBE_CAPABILITY)
         ? { candidateEvaluationProbe: true }
-        : {}),
-      ...(selectedHostHasAuthority &&
-      selectedSnapshotIsMaterialized &&
-      activePhase === 'online' &&
-      asString(activeTarget?.kind) === 'local' &&
-      asString(rawConnection?.path) === 'local_socket' &&
-      advertisedCapabilities.includes(CODEX_SUBSCRIPTION_CAPABILITY)
-        ? { codexSubscription: true }
         : {}),
     },
     composerReceipt: selectedResidentEnd
@@ -3326,185 +3266,113 @@ interface ComposerActionFence {
   sequence: number
 }
 
-function codexSubscriptionBindingKey(input: CodexSubscriptionRequestBinding): string {
-  return `${input.expectedHostId}\u0000${input.threadId}\u0000${input.expectedExecutionGenerationId}`
+interface ResidentModelSelectionAuthority {
+  localThreadId: string
+  remoteThreadId: string
+  expectedHostId: string
+  expectedExecutionGenerationId: string
+  connectionGeneration: number
 }
 
-function codexSubscriptionBindingMatches(
-  binding: { hostId: string; sourceThreadId: string; executionGenerationId: string },
-  input: CodexSubscriptionRequestBinding,
-): boolean {
-  return (
-    binding.hostId === input.expectedHostId &&
-    binding.sourceThreadId === input.threadId &&
-    binding.executionGenerationId === input.expectedExecutionGenerationId
-  )
+interface ActiveResidentModelSelection {
+  bindingKey: string
+  result: Promise<ResidentModelSelectionResult>
 }
 
-class NativeCodexSubscriptionRendererApi implements CodexSubscriptionRendererApi {
-  private readonly acceptedAccounts = new Map<
-    string,
-    { snapshot: CodexSubscriptionAccountSnapshot; fingerprint: string }
-  >()
-  private readonly acceptedConversations = new Map<
-    string,
-    { snapshot: CodexSubscriptionConversationSnapshot; fingerprint: string }
-  >()
+interface RuntimeOAuthAuthority {
+  expectedHostId: string
+  connectionGeneration: number
+}
 
-  constructor(private readonly bridge: object) {}
+interface NativeRuntimeOAuthView {
+  sessionId: string
+  providerId: string
+  phase: 'starting' | 'awaiting_user' | 'committing' | 'completed' | 'cancelled' | 'failed'
+  expiresAt: string
+  interaction?: 'browser' | 'manual' | 'selection'
+  configured: boolean
+  retryable: boolean
+}
 
-  private async call<T>(method: string, payload: unknown): Promise<T> {
-    const candidate = (this.bridge as Record<string, unknown>)[method]
-    if (typeof candidate !== 'function') {
-      throw new Error(`The native Codex subscription bridge does not expose ${method}.`)
-    }
-    const raw = await (candidate as (input: unknown) => Promise<unknown>).call(this.bridge, payload)
-    return unwrapResult<T>(raw)
-  }
+interface ActiveRuntimeOAuth {
+  bindingKey: string
+  request: RuntimeOAuthRequest
+  authority: RuntimeOAuthAuthority
+  onProgress: (progress: RuntimeOAuthProgress) => void
+  cancelRequested: boolean
+  sessionId?: string
+  result?: Promise<RuntimeOAuthResult>
+}
 
-  async accountRead(input: CodexSubscriptionAccountReadRequest): Promise<CodexSubscriptionAccountSnapshot> {
-    return this.acceptAccount(input.expectedHostId, CodexSubscriptionAccountSnapshotSchema.parse(
-      await this.call<unknown>('accountRead', input),
+const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = 'openai-codex'
+const RUNTIME_OAUTH_POLL_INTERVAL_MS = 500
+const RUNTIME_OAUTH_MAX_POLLS = 600
+const RUNTIME_OAUTH_MAX_DURATION_MS = 5 * 60 * 1_000
+
+const RUNTIME_OAUTH_VIEW_KEYS = new Set([
+  'sessionId',
+  'providerId',
+  'phase',
+  'expiresAt',
+  'interaction',
+  'configured',
+  'error',
+])
+
+function runtimeOAuthViewFromNative(value: unknown): NativeRuntimeOAuthView {
+  const raw = asRecord(value)
+  const sessionId = asString(raw?.sessionId)
+  const providerId = asString(raw?.providerId)
+  const phase = asString(raw?.phase)
+  const expiresAt = asString(raw?.expiresAt)
+  const interaction = asRecord(raw?.interaction)
+  const interactionKind = asString(interaction?.kind)
+  const interactionState = asString(interaction?.state)
+  const error = asRecord(raw?.error)
+  const errorKeys = error ? Object.keys(error) : []
+  if (
+    !raw ||
+    Object.keys(raw).some((key) => !RUNTIME_OAUTH_VIEW_KEYS.has(key)) ||
+    !sessionId ||
+    sessionId.length > 512 ||
+    /[\0\r\n]/.test(sessionId) ||
+    !providerId ||
+    providerId.length > 128 ||
+    /[\0\r\n]/.test(providerId) ||
+    !phase ||
+    !['starting', 'awaiting_user', 'committing', 'completed', 'cancelled', 'failed'].includes(phase) ||
+    !expiresAt ||
+    !Number.isFinite(Date.parse(expiresAt)) ||
+    (raw.configured !== undefined && raw.configured !== true) ||
+    (interaction !== undefined && (
+      !interaction ||
+      Object.keys(interaction).some((key) => key !== 'kind' && key !== 'state') ||
+      !['browser', 'manual', 'selection'].includes(interactionKind ?? '') ||
+      !['opened', 'unavailable'].includes(interactionState ?? '') ||
+      (interactionKind === 'browser' ? interactionState !== 'opened' : interactionState !== 'unavailable')
+    )) ||
+    (error !== undefined && (
+      !error ||
+      errorKeys.some((key) => key !== 'code' && key !== 'retryable') ||
+      typeof error.code !== 'string' ||
+      typeof error.retryable !== 'boolean'
     ))
+  ) {
+    throw new Error('The native Prime OAuth bridge returned an invalid renderer-safe status.')
   }
-
-  async loginStart(input: CodexSubscriptionLoginStartRequest): Promise<CodexSubscriptionAccountSnapshot> {
-    const account = CodexSubscriptionAccountSnapshotSchema.parse(
-      await this.call<unknown>('loginStart', input),
-    )
-    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
-      throw new StaleHostAuthorityError()
-    }
-    return this.acceptAccount(input.expectedHostId, account)
-  }
-
-  async loginCancel(input: CodexSubscriptionLoginCancelRequest): Promise<CodexSubscriptionAccountSnapshot> {
-    const account = CodexSubscriptionAccountSnapshotSchema.parse(
-      await this.call<unknown>('loginCancel', input),
-    )
-    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
-      throw new StaleHostAuthorityError()
-    }
-    return this.acceptAccount(input.expectedHostId, account)
-  }
-
-  async logout(input: CodexSubscriptionLogoutRequest): Promise<CodexSubscriptionAccountSnapshot> {
-    const account = CodexSubscriptionAccountSnapshotSchema.parse(
-      await this.call<unknown>('logout', input),
-    )
-    if (account.backendIncarnationId !== input.expectedBackendIncarnationId) {
-      throw new StaleHostAuthorityError()
-    }
-    return this.acceptAccount(input.expectedHostId, account)
-  }
-
-  async conversationSnapshot(input: CodexSubscriptionRequestBinding): Promise<CodexSubscriptionConversationLookup> {
-    const lookup = CodexSubscriptionConversationLookupSchema.parse(
-      await this.call<unknown>('conversationSnapshot', input),
-    )
-    if (!lookup.conversation) {
-      const accepted = this.acceptedConversations.get(codexSubscriptionBindingKey(input))
-      if (accepted) return { conversation: structuredClone(accepted.snapshot) }
-      return { conversation: null }
-    }
-    return { conversation: this.acceptConversation(input, lookup.conversation) }
-  }
-
-  async turnStart(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionConversationSnapshot> {
-    const conversation = CodexSubscriptionConversationSnapshotSchema.parse(
-      await this.call<unknown>('turnStart', input),
-    )
-    if (
-      conversation.backendIncarnationId !== input.expectedBackendIncarnationId ||
-      conversation.latestTurn?.operationId !== input.operationId
-    ) {
-      throw new StaleHostAuthorityError()
-    }
-    return this.acceptConversation(input, conversation)
-  }
-
-  async turnInterrupt(input: CodexSubscriptionTurnInterruptRequest): Promise<CodexSubscriptionConversationSnapshot> {
-    const conversation = CodexSubscriptionConversationSnapshotSchema.parse(
-      await this.call<unknown>('turnInterrupt', input),
-    )
-    if (
-      conversation.backendIncarnationId !== input.expectedBackendIncarnationId ||
-      conversation.sessionId !== input.sessionId ||
-      conversation.threadId !== input.codexThreadId ||
-      conversation.latestTurn?.operationId !== input.expectedTurnOperationId ||
-      conversation.latestTurn.turnId !== input.turnId
-    ) {
-      throw new StaleHostAuthorityError()
-    }
-    return this.acceptConversation(input, conversation)
-  }
-
-  async turnReconcile(input: CodexSubscriptionTurnStartRequest): Promise<CodexSubscriptionTurnReconciliation> {
-    const result = CodexSubscriptionTurnReconciliationSchema.parse(
-      await this.call<unknown>('turnReconcile', input),
-    )
-    if (result.operationId !== input.operationId) throw new StaleHostAuthorityError()
-    if (result.known) {
-      if (result.conversation.backendIncarnationId !== input.expectedBackendIncarnationId) {
-        throw new StaleHostAuthorityError()
-      }
-      return {
-        ...result,
-        conversation: this.acceptConversation(input, result.conversation),
-      }
-    }
-    if (!codexSubscriptionBindingMatches(result.binding, input)) throw new StaleHostAuthorityError()
-    return structuredClone(result)
-  }
-
-  private acceptAccount(
-    expectedHostId: string,
-    candidate: CodexSubscriptionAccountSnapshot,
-  ): CodexSubscriptionAccountSnapshot {
-    const fingerprint = JSON.stringify(candidate)
-    const accepted = this.acceptedAccounts.get(expectedHostId)
-    if (accepted && accepted.snapshot.backendIncarnationId === candidate.backendIncarnationId) {
-      const acceptedTime = Date.parse(accepted.snapshot.updatedAt)
-      const candidateTime = Date.parse(candidate.updatedAt)
-      if (candidateTime < acceptedTime) return structuredClone(accepted.snapshot)
-      if (candidateTime === acceptedTime) {
-        if (fingerprint !== accepted.fingerprint) {
-          throw new Error('The local Codex backend changed an account snapshot without advancing its timestamp.')
-        }
-        return structuredClone(accepted.snapshot)
-      }
-    }
-    const retained = structuredClone(candidate)
-    this.acceptedAccounts.set(expectedHostId, { snapshot: retained, fingerprint })
-    return structuredClone(retained)
-  }
-
-  private acceptConversation(
-    input: CodexSubscriptionRequestBinding,
-    candidate: CodexSubscriptionConversationSnapshot,
-  ): CodexSubscriptionConversationSnapshot {
-    if (!codexSubscriptionBindingMatches(candidate.binding, input)) throw new StaleHostAuthorityError()
-    const key = codexSubscriptionBindingKey(input)
-    const fingerprint = JSON.stringify(candidate)
-    const accepted = this.acceptedConversations.get(key)
-    if (accepted && accepted.snapshot.backendIncarnationId === candidate.backendIncarnationId) {
-      if (candidate.revision < accepted.snapshot.revision) return structuredClone(accepted.snapshot)
-      if (candidate.revision === accepted.snapshot.revision) {
-        if (fingerprint !== accepted.fingerprint) {
-          throw new Error('The local Codex backend changed a conversation without advancing its revision.')
-        }
-        return structuredClone(accepted.snapshot)
-      }
-    }
-    const retained = structuredClone(candidate)
-    this.acceptedConversations.set(key, { snapshot: retained, fingerprint })
-    return structuredClone(retained)
+  return {
+    sessionId,
+    providerId,
+    phase: phase as NativeRuntimeOAuthView['phase'],
+    expiresAt,
+    ...(interactionKind ? { interaction: interactionKind as NativeRuntimeOAuthView['interaction'] } : {}),
+    configured: raw.configured === true,
+    retryable: asBoolean(error?.retryable) ?? false,
   }
 }
 
 export class NativeRendererApi implements RendererApi {
   readonly environment = 'native' as const
-  readonly codexSubscription?: CodexSubscriptionRendererApi
   private readonly deviceId = getDeviceId()
   private projectionEntries: Record<string, NativeProjectionCacheEntry> = {}
   private catalog?: unknown
@@ -3551,6 +3419,8 @@ export class NativeRendererApi implements RendererApi {
   private composerActionSequence = 0
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
+  private activeResidentModelSelection?: ActiveResidentModelSelection
+  private activeRuntimeOAuth?: ActiveRuntimeOAuth
   private mutationAuthorityReadyHostId?: string
   private mutationAuthorityHydrationGeneration?: number
   private mutationAuthorityHydrationPromise?: Promise<void>
@@ -3577,10 +3447,7 @@ export class NativeRendererApi implements RendererApi {
   constructor(
     private readonly bridge: NativePrimeBridge,
     private readonly options: { allowConnectionInitiation?: boolean } = {},
-  ) {
-    const candidate = asRecord((bridge as Record<string, unknown>).codexSubscription)
-    if (candidate) this.codexSubscription = new NativeCodexSubscriptionRendererApi(candidate)
-  }
+  ) {}
 
   private async call<T>(method: string, payload?: unknown): Promise<T> {
     const candidate = (this.bridge as Record<string, unknown>)[method]
@@ -4925,6 +4792,578 @@ export class NativeRendererApi implements RendererApi {
       throw new StaleHostAuthorityError()
     }
     return RuntimeModelCatalogSnapshotSchema.parse(raw)
+  }
+
+  startRuntimeOAuth(
+    request: RuntimeOAuthRequest,
+    onProgress: (progress: RuntimeOAuthProgress) => void,
+  ): Promise<RuntimeOAuthResult> {
+    const frozenRequest = { ...request }
+    const active = this.activeRuntimeOAuth
+    if (active) {
+      const currentBinding = this.currentRuntimeOAuthBindingKey(frozenRequest)
+      if (currentBinding && active.bindingKey === currentBinding && active.result) return active.result
+      return Promise.resolve({
+        state: 'failed',
+        retryable: true,
+        message: 'Another Prime Agent sign-in is already active on this computer.',
+      })
+    }
+
+    const authority = this.captureRuntimeOAuthAuthority(frozenRequest)
+    const bindingKey = this.runtimeOAuthBindingKey(authority, frozenRequest.providerId)
+    const tracked: ActiveRuntimeOAuth = {
+      bindingKey,
+      request: frozenRequest,
+      authority,
+      onProgress,
+      cancelRequested: false,
+    }
+    const result = this.performRuntimeOAuth(tracked)
+    tracked.result = result
+    this.activeRuntimeOAuth = tracked
+    const clear = (): void => {
+      if (this.activeRuntimeOAuth === tracked) this.activeRuntimeOAuth = undefined
+    }
+    void result.then(clear, clear)
+    return result
+  }
+
+  cancelRuntimeOAuth(request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null> {
+    const active = this.activeRuntimeOAuth
+    if (
+      !active ||
+      active.request.hostId !== request.hostId ||
+      active.request.providerId !== request.providerId
+    ) return Promise.resolve(null)
+    active.cancelRequested = true
+    this.publishRuntimeOAuthProgress(active, {
+      phase: 'cancelling',
+      message: 'Cancelling ChatGPT sign-in…',
+    })
+    return active.result ?? Promise.resolve(null)
+  }
+
+  private runtimeOAuthBindingKey(authority: RuntimeOAuthAuthority, providerId: string): string {
+    return canonicalRendererJson([
+      authority.expectedHostId,
+      authority.connectionGeneration,
+      providerId,
+    ])
+  }
+
+  private currentRuntimeOAuthBindingKey(request: RuntimeOAuthRequest): string | undefined {
+    if (request.providerId !== PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID) return undefined
+    const connection = asRecord(this.connection)
+    const target = asRecord(connection?.target)
+    const expectedHostId = asString(connection?.hostId)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (
+      !expectedHostId ||
+      request.hostId !== expectedHostId ||
+      asString(connection?.phase) !== 'online' ||
+      asString(target?.kind) !== 'local' ||
+      asString(connection?.path) !== 'local_socket' ||
+      this.mutationAuthorityReadyHostId !== expectedHostId ||
+      !capabilities.includes(RUNTIME_OAUTH_CAPABILITY)
+    ) return undefined
+    return canonicalRendererJson([
+      expectedHostId,
+      this.connectionGeneration,
+      request.providerId,
+    ])
+  }
+
+  private captureRuntimeOAuthAuthority(request: RuntimeOAuthRequest): RuntimeOAuthAuthority {
+    if (
+      request.providerId !== PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID ||
+      request.hostId.length < 1 ||
+      request.hostId.length > 512 ||
+      /[\0\r\n]/.test(request.hostId)
+    ) throw new Error('Choose the ChatGPT OAuth provider reported by this Prime Agent runtime.')
+
+    const projection = this.projection
+    const connection = asRecord(this.connection)
+    const target = asRecord(connection?.target)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    const expectedHostId = request.hostId
+    const selectedHost = projection?.hosts.find((candidate) => candidate.id === expectedHostId)
+    if (
+      !this.workbenchLoaded ||
+      !projection ||
+      projection.operations.runtimeOAuth !== true ||
+      !expectedHostId ||
+      selectedHost?.kind !== 'local' ||
+      selectedHost.connection !== 'online' ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== expectedHostId ||
+      asString(target?.kind) !== 'local' ||
+      asString(connection?.path) !== 'local_socket' ||
+      this.mutationAuthorityReadyHostId !== expectedHostId ||
+      !capabilities.includes(RUNTIME_OAUTH_CAPABILITY) ||
+      !capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)
+    ) throw new StaleHostAuthorityError()
+
+    return {
+      expectedHostId,
+      connectionGeneration: this.connectionGeneration,
+    }
+  }
+
+  private runtimeOAuthAuthorityIsCurrent(authority: RuntimeOAuthAuthority): boolean {
+    const connection = asRecord(this.connection)
+    const target = asRecord(connection?.target)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    return Boolean(
+      authority.connectionGeneration === this.connectionGeneration &&
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.hostId) === authority.expectedHostId &&
+      asString(target?.kind) === 'local' &&
+      asString(connection?.path) === 'local_socket' &&
+      this.mutationAuthorityReadyHostId === authority.expectedHostId &&
+      capabilities.includes(RUNTIME_OAUTH_CAPABILITY)
+    )
+  }
+
+  private publishRuntimeOAuthProgress(active: ActiveRuntimeOAuth, progress: RuntimeOAuthProgress): void {
+    if (!this.runtimeOAuthAuthorityIsCurrent(active.authority)) return
+    try {
+      active.onProgress(progress)
+    } catch {
+      // A renderer callback cannot change the native OAuth operation outcome.
+    }
+  }
+
+  private acceptRuntimeOAuthView(
+    active: ActiveRuntimeOAuth,
+    raw: unknown,
+    expectedSessionId?: string,
+  ): NativeRuntimeOAuthView {
+    const view = runtimeOAuthViewFromNative(raw)
+    if (
+      view.providerId !== active.request.providerId ||
+      (expectedSessionId !== undefined && view.sessionId !== expectedSessionId)
+    ) {
+      throw new Error('Prime Agent returned sign-in status for a different authorization session.')
+    }
+    return view
+  }
+
+  private runtimeOAuthIntermediateProgress(view: NativeRuntimeOAuthView): RuntimeOAuthProgress {
+    if (view.phase === 'committing') {
+      return { phase: 'committing', message: 'Saving the Prime Agent account on this computer…' }
+    }
+    if (view.phase === 'awaiting_user') {
+      return view.interaction === 'browser'
+        ? { phase: 'awaiting_user', message: 'Finish signing in in your browser. This window will update automatically.' }
+        : { phase: 'awaiting_user', message: 'Prime Agent is waiting for sign-in to finish.' }
+    }
+    return { phase: 'starting', message: 'Opening the verified ChatGPT sign-in page…' }
+  }
+
+  private async terminalRuntimeOAuthResult(
+    active: ActiveRuntimeOAuth,
+    view: NativeRuntimeOAuthView,
+  ): Promise<RuntimeOAuthResult | undefined> {
+    if (view.phase === 'cancelled') {
+      return { state: 'cancelled', message: 'ChatGPT sign-in was cancelled.' }
+    }
+    if (view.phase === 'failed') {
+      return {
+        state: 'failed',
+        retryable: view.retryable,
+        message: view.retryable
+          ? 'Prime Agent could not complete ChatGPT sign-in. Check the browser flow, then try again.'
+          : 'Prime Agent could not safely store this ChatGPT account on the selected computer.',
+      }
+    }
+    if (view.phase !== 'completed') return undefined
+    if (!view.configured) {
+      return {
+        state: 'failed',
+        retryable: false,
+        message: 'Prime Agent ended sign-in without confirming that the account was stored.',
+      }
+    }
+
+    let catalog: RuntimeModelCatalog | undefined
+    if (this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+      try {
+        const refreshed = await this.loadRuntimeModelCatalog(active.authority.expectedHostId)
+        if (this.runtimeOAuthAuthorityIsCurrent(active.authority)) catalog = refreshed
+      } catch {
+        // Exact completion proof remains dominant over a later catalog refresh failure.
+      }
+    }
+    return {
+      state: 'completed',
+      message: catalog
+        ? 'ChatGPT is connected to Prime Agent and the model catalog is refreshed.'
+        : 'ChatGPT is connected to Prime Agent. Reopen Models & accounts to refresh the catalog.',
+      ...(catalog ? { catalog } : {}),
+    }
+  }
+
+  private async cancelActiveRuntimeOAuth(active: ActiveRuntimeOAuth): Promise<RuntimeOAuthResult> {
+    const sessionId = active.sessionId
+    if (!sessionId || !this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'Sign-in outcome is unknown. Prime Continuim did not repeat or replace the authorization request.',
+      }
+    }
+    this.publishRuntimeOAuthProgress(active, {
+      phase: 'cancelling',
+      message: 'Cancelling ChatGPT sign-in…',
+    })
+    try {
+      const raw = await this.call<unknown>('cancelRuntimeOAuth', {
+        expectedHostId: active.authority.expectedHostId,
+        sessionId,
+      })
+      if (!this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+        return {
+          state: 'uncertain',
+          retryable: false,
+          message: 'Sign-in outcome is unknown because the active computer changed during cancellation.',
+        }
+      }
+      const view = this.acceptRuntimeOAuthView(active, raw, sessionId)
+      const terminal = await this.terminalRuntimeOAuthResult(active, view)
+      return terminal ?? {
+        state: 'uncertain',
+        retryable: false,
+        message: 'Prime Agent did not confirm that sign-in was cancelled. Prime Continuim will not send another cancellation.',
+      }
+    } catch {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'Prime Agent did not confirm that sign-in was cancelled. Prime Continuim will not send another cancellation.',
+      }
+    }
+  }
+
+  private async performRuntimeOAuth(active: ActiveRuntimeOAuth): Promise<RuntimeOAuthResult> {
+    this.publishRuntimeOAuthProgress(active, {
+      phase: 'starting',
+      message: 'Opening the verified ChatGPT sign-in page…',
+    })
+
+    let view: NativeRuntimeOAuthView
+    try {
+      const raw = await this.call<unknown>('startRuntimeOAuth', {
+        expectedHostId: active.authority.expectedHostId,
+        providerId: active.request.providerId,
+      })
+      if (!this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+        return {
+          state: 'uncertain',
+          retryable: false,
+          message: 'Sign-in outcome is unknown because the active computer changed after authorization started.',
+        }
+      }
+      view = this.acceptRuntimeOAuthView(active, raw)
+      active.sessionId = view.sessionId
+    } catch {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'Prime Agent may have started sign-in, but its session could not be verified. Prime Continuim will not start it again automatically.',
+      }
+    }
+
+    const expiresAt = Date.parse(view.expiresAt)
+    const deadline = Math.min(expiresAt, Date.now() + RUNTIME_OAUTH_MAX_DURATION_MS)
+    let polls = 0
+    while (true) {
+      const terminal = await this.terminalRuntimeOAuthResult(active, view)
+      if (terminal) return terminal
+      this.publishRuntimeOAuthProgress(active, this.runtimeOAuthIntermediateProgress(view))
+
+      if (active.cancelRequested) return this.cancelActiveRuntimeOAuth(active)
+      if (polls >= RUNTIME_OAUTH_MAX_POLLS || Date.now() >= deadline) {
+        active.cancelRequested = true
+        const cancellation = await this.cancelActiveRuntimeOAuth(active)
+        return cancellation.state === 'cancelled'
+          ? {
+              state: 'failed',
+              retryable: true,
+              message: 'ChatGPT sign-in expired before it completed. Start a new sign-in when you are ready.',
+            }
+          : cancellation
+      }
+
+      await delay(RUNTIME_OAUTH_POLL_INTERVAL_MS)
+      if (active.cancelRequested) return this.cancelActiveRuntimeOAuth(active)
+      if (!this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+        return {
+          state: 'uncertain',
+          retryable: false,
+          message: 'Sign-in outcome is unknown because the active computer connection changed.',
+        }
+      }
+      try {
+        const raw = await this.call<unknown>('runtimeOAuthStatus', {
+          expectedHostId: active.authority.expectedHostId,
+          sessionId: active.sessionId,
+        })
+        if (!this.runtimeOAuthAuthorityIsCurrent(active.authority)) {
+          return {
+            state: 'uncertain',
+            retryable: false,
+            message: 'Sign-in outcome is unknown because the active computer connection changed.',
+          }
+        }
+        view = this.acceptRuntimeOAuthView(active, raw, active.sessionId)
+      } catch {
+        return {
+          state: 'uncertain',
+          retryable: false,
+          message: 'Prime Agent sign-in status could not be verified. Prime Continuim will not repeat the authorization request.',
+        }
+      }
+      polls += 1
+    }
+  }
+
+  selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult> {
+    const frozenRequest = { ...request }
+    const active = this.activeResidentModelSelection
+    if (active) {
+      if (active.bindingKey === this.currentResidentModelSelectionBindingKey(frozenRequest)) return active.result
+      return Promise.resolve({
+        state: 'rejected',
+        retryable: true,
+        message: 'Another resident model change is already being verified. Try again after it finishes.',
+      })
+    }
+
+    const authority = this.captureResidentModelSelectionAuthority(frozenRequest)
+    const bindingKey = canonicalRendererJson([
+      authority.expectedHostId,
+      authority.remoteThreadId,
+      authority.expectedExecutionGenerationId,
+      frozenRequest.providerId,
+      frozenRequest.modelId,
+    ])
+    const result = this.performResidentModelSelection(frozenRequest, authority)
+    const tracked: ActiveResidentModelSelection = { bindingKey, result }
+    this.activeResidentModelSelection = tracked
+    const clear = (): void => {
+      if (this.activeResidentModelSelection === tracked) this.activeResidentModelSelection = undefined
+    }
+    void result.then(clear, clear)
+    return result
+  }
+
+  private currentResidentModelSelectionBindingKey(request: ResidentModelSelectionRequest): string | undefined {
+    const thread = this.projection?.threads.find((candidate) => candidate.id === request.threadId)
+    const expectedHostId = thread?.hostId
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    const expectedExecutionGenerationId = thread?.executionGenerationId
+    if (!expectedHostId || !remoteThreadId || !expectedExecutionGenerationId) return undefined
+    return canonicalRendererJson([
+      expectedHostId,
+      remoteThreadId,
+      expectedExecutionGenerationId,
+      request.providerId,
+      request.modelId,
+    ])
+  }
+
+  private captureResidentModelSelectionAuthority(
+    request: ResidentModelSelectionRequest,
+  ): ResidentModelSelectionAuthority {
+    if (
+      request.providerId.length < 1 ||
+      request.providerId.length > 128 ||
+      request.modelId.length < 1 ||
+      request.modelId.length > 512 ||
+      /[\0\r\n]/.test(request.providerId) ||
+      /[\0\r\n]/.test(request.modelId)
+    ) throw new Error('Choose a valid provider and model from the verified runtime catalog.')
+
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === request.threadId)
+    const connection = asRecord(this.connection)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    const expectedHostId = thread?.hostId
+    const expectedExecutionGenerationId = thread?.executionGenerationId
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    if (
+      !this.workbenchLoaded ||
+      !projection ||
+      projection.selectedThreadId !== request.threadId ||
+      projection.operations.startResidentTurn !== true ||
+      projection.operations.selectResidentModel !== true ||
+      !thread ||
+      !expectedHostId ||
+      !expectedExecutionGenerationId ||
+      !remoteThreadId ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== expectedHostId ||
+      this.mutationAuthorityReadyHostId !== expectedHostId ||
+      !capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) ||
+      !capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY) ||
+      snapshotHostId(this.threadSnapshot) !== expectedHostId ||
+      snapshotThreadId(this.threadSnapshot) !== remoteThreadId ||
+      snapshotExecutionGenerationId(this.threadSnapshot) !== expectedExecutionGenerationId
+    ) throw new StaleHostAuthorityError()
+
+    return {
+      localThreadId: request.threadId,
+      remoteThreadId,
+      expectedHostId,
+      expectedExecutionGenerationId,
+      connectionGeneration: this.connectionGeneration,
+    }
+  }
+
+  private residentModelSelectionAuthorityIsCurrent(authority: ResidentModelSelectionAuthority): boolean {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === authority.localThreadId)
+    const connection = asRecord(this.connection)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    return Boolean(
+      projection &&
+      authority.connectionGeneration === this.connectionGeneration &&
+      projection.selectedThreadId === authority.localThreadId &&
+      projection.operations.startResidentTurn === true &&
+      projection.operations.selectResidentModel === true &&
+      thread?.hostId === authority.expectedHostId &&
+      protocolThreadId(thread) === authority.remoteThreadId &&
+      thread.executionGenerationId === authority.expectedExecutionGenerationId &&
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.hostId) === authority.expectedHostId &&
+      this.mutationAuthorityReadyHostId === authority.expectedHostId &&
+      capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+      capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY) &&
+      snapshotHostId(this.threadSnapshot) === authority.expectedHostId &&
+      snapshotThreadId(this.threadSnapshot) === authority.remoteThreadId &&
+      snapshotExecutionGenerationId(this.threadSnapshot) === authority.expectedExecutionGenerationId
+    )
+  }
+
+  private async performResidentModelSelection(
+    request: ResidentModelSelectionRequest,
+    authority: ResidentModelSelectionAuthority,
+  ): Promise<ResidentModelSelectionResult> {
+    const commandId = createStableId('command')
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId: authority.expectedHostId,
+      threadId: authority.remoteThreadId,
+      kind: 'model.select',
+      payload: { providerId: request.providerId, modelId: request.modelId },
+      delivery: 'live_only',
+      expectedExecutionGenerationId: authority.expectedExecutionGenerationId,
+      issuedAt: this.nextComposerIssuedAt(authority.expectedHostId, authority.remoteThreadId),
+    }
+
+    let receipt: UnknownRecord | undefined
+    try {
+      receipt = asRecord(await this.call<unknown>('submitCommand', clientCommand))
+    } catch (error) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: error instanceof Error
+          ? `${error.message} Prime Continuim will not replay this model change without terminal proof.`
+          : 'Model-change outcome unknown. Prime Continuim will not replay it without terminal proof.',
+      }
+    }
+
+    if (
+      !receipt ||
+      asString(receipt.deviceId) !== this.deviceId ||
+      asString(receipt.commandId) !== commandId ||
+      asString(receipt.hostId) !== authority.expectedHostId ||
+      asString(receipt.threadId) !== authority.remoteThreadId ||
+      asString(receipt.executionGenerationId) !== authority.expectedExecutionGenerationId
+    ) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'The host returned a receipt for another command authority. Prime Continuim will not replay this model change.',
+      }
+    }
+
+    const status = asString(receipt.status)
+    const error = asRecord(receipt.error)
+    const detail = asString(receipt.detail) ?? asString(receipt.message) ?? asString(error?.message)
+    if (status === 'completed') {
+      let projected = false
+      if (this.residentModelSelectionAuthorityIsCurrent(authority)) {
+        try {
+          projected = await this.refreshResidentModelSelectionProjection(authority, request)
+        } catch {
+          // The exact terminal receipt is stronger proof than any later display-refresh failure.
+          projected = false
+        }
+      }
+      return {
+        state: 'completed',
+        projected,
+        message: projected
+          ? detail ?? 'Prime Agent selected and verified this model.'
+          : 'Prime Agent completed this model change, but the current thread display has not refreshed yet.',
+      }
+    }
+    if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
+      return {
+        state: 'rejected',
+        retryable: asBoolean(error?.retryable) ?? false,
+        message: detail ?? 'Prime Agent rejected this model change before completion.',
+      }
+    }
+    return {
+      state: 'uncertain',
+      retryable: false,
+      message: detail
+        ? `${detail} Prime Continuim will not replay this model change without terminal proof.`
+        : 'Model-change outcome unknown. Prime Continuim will not replay it without terminal proof.',
+    }
+  }
+
+  private async refreshResidentModelSelectionProjection(
+    authority: ResidentModelSelectionAuthority,
+    request: ResidentModelSelectionRequest,
+  ): Promise<boolean> {
+    let snapshot: unknown
+    try {
+      snapshot = await this.call<unknown>('requestSnapshot', { threadId: authority.remoteThreadId })
+    } catch {
+      if (!this.residentModelSelectionAuthorityIsCurrent(authority)) throw new StaleHostAuthorityError()
+      return false
+    }
+    if (!this.residentModelSelectionAuthorityIsCurrent(authority)) throw new StaleHostAuthorityError()
+    const runtime = asRecord(asRecord(snapshot)?.runtime)
+    if (
+      snapshotHostId(snapshot) !== authority.expectedHostId ||
+      snapshotThreadId(snapshot) !== authority.remoteThreadId ||
+      snapshotExecutionGenerationId(snapshot) !== authority.expectedExecutionGenerationId ||
+      asString(runtime?.model) !== `${request.providerId}/${request.modelId}`
+    ) return false
+
+    if (this.replaceSnapshotEntry(authority.expectedHostId, snapshot)) {
+      this.threadSnapshot = snapshot
+      this.publish()
+    }
+    if (!this.residentModelSelectionAuthorityIsCurrent(authority)) throw new StaleHostAuthorityError()
+    return this.projection?.runtime.session?.model === `${request.providerId}/${request.modelId}`
   }
 
   private residentLifecycleAuthority(options: { requireCapability: boolean }): {
