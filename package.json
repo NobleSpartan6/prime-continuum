@@ -29,6 +29,7 @@
     "verify:runtime:smoke": "node scripts/verify-prime-agent-runtime.mjs --smoke",
     "verify:hostd-runtime:smoke": "node scripts/verify-hostd-runtime-initialization.mjs",
     "verify:hostd-resident-lifecycle:smoke": "node scripts/verify-hostd-resident-lifecycle.mjs",
+    "verify:codex-subscription-provider:e2e": "node scripts/verify-codex-subscription-provider-e2e.mjs",
     "verify:renderer-visual": "node scripts/run-workflow.mjs verify:renderer-visual",
     "self-build": "node scripts/self-build.mjs",
     "verify:self-build-receipt": "node scripts/self-build.mjs --verify-receipt",
