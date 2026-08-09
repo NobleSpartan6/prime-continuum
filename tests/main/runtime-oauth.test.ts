@@ -263,9 +263,13 @@ describe("DesktopControlService runtime OAuth ownership", () => {
 
   it("drains the exact old host before a target switch closes its connection", async () => {
     const cancelGate = deferred<unknown>();
+    const cancelRequested = deferred<void>();
     const local = connectionFor((method) => {
       if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.cancel") return cancelGate.promise;
+      if (method === "oauth.session.cancel") {
+        cancelRequested.resolve();
+        return cancelGate.promise;
+      }
       throw new Error(`Unexpected request: ${method}`);
     });
     const remote = connectionFor(() => { throw new Error("Unexpected remote request"); }, health("host-b", []));
@@ -275,7 +279,7 @@ describe("DesktopControlService runtime OAuth ownership", () => {
     await service.startRuntimeOAuth("host-a", "openai-codex");
 
     const switching = service.connect({ kind: "ssh", alias: "remote" });
-    await waitFor(() => local.requests.some(({ method }) => method === "oauth.session.cancel"));
+    await cancelRequested.promise;
     expect(local.isClosed).toBe(false);
     expect(connectSshHost).not.toHaveBeenCalled();
     cancelGate.resolve(cancelledSnapshot("oauth-session-1"));
