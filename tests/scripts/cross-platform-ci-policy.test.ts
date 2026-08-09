@@ -40,7 +40,7 @@ describe('cross-platform source CI policy', () => {
   it('runs every test with a deterministic hosted-runner concurrency ceiling', () => {
     expect(workflow).toContain('run: pnpm test')
     expect(vitestConfig).toContain("include: ['tests/**/*.test.{ts,tsx}']")
-    expect(vitestConfig).toContain('maxWorkers: process.env.CI ? 2 : undefined')
+    expect(vitestConfig).toContain("maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined")
     expect(vitestConfig).not.toMatch(/\b(?:exclude|shard|passWithNoTests)\s*:/)
   })
 })

@@ -11,11 +11,11 @@ export default defineConfig({
   test: {
     globals: true,
     include: ['tests/**/*.test.{ts,tsx}'],
-    // Hosted runners expose enough logical CPUs to start many heavyweight
-    // process/filesystem suites concurrently, but not enough sustained I/O to
-    // keep their 5s semantic deadlines meaningful. Every file still runs;
-    // CI merely uses a deterministic two-worker ceiling.
-    maxWorkers: process.env.CI ? 2 : undefined,
+    // Windows hosted runners serialize substantially more filesystem/process
+    // work than Linux and macOS. Keep one Windows worker so semantic 5s
+    // deadlines measure the behavior under test instead of cross-file I/O
+    // contention; every file still runs, and the other CI hosts retain two.
+    maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined,
     reporters: ['default'],
     coverage: {
       reporter: ['text', 'html'],
