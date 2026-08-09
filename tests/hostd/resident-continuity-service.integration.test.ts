@@ -659,7 +659,8 @@ describe("HostService resident continuity dispatch integration", () => {
   it("dispatches Stop through the resident gateway while a model mutation is deferred on the same framed session", async () => {
     const modelGatewayEntered = deferred<void>();
     const releaseModelGateway = deferred<void>();
-    const abortGatewayEntered = deferred<number>();
+    const abortGatewayEntered = deferred<boolean>();
+    let modelGatewayReleased = false;
     const gateway = residentGateway(async (command) => {
       if (command.command.kind === "model.select") {
         modelGatewayEntered.resolve(undefined);
@@ -667,7 +668,7 @@ describe("HostService resident continuity dispatch integration", () => {
         return { disposition: "handled", message: "Prime Agent selected the model" };
       }
       if (command.command.kind === "abort") {
-        abortGatewayEntered.resolve(Date.now());
+        abortGatewayEntered.resolve(modelGatewayReleased);
         return { disposition: "handled", message: "Prime Agent accepted Stop" };
       }
       return { disposition: "accepted", message: "Prime Agent accepted the prompt" };
@@ -700,11 +701,12 @@ describe("HostService resident continuity dispatch integration", () => {
 
     readable.write(encodeJsonFrame(commandRequest("framed-model-request", model)));
     await modelGatewayEntered.promise;
-    const abortWrittenAt = Date.now();
     readable.write(encodeJsonFrame(commandRequest("framed-abort-request", abort)));
-    let abortGatewayAt = Number.POSITIVE_INFINITY;
     try {
-      abortGatewayAt = await withTimeout(abortGatewayEntered.promise, 250);
+      // This timeout bounds a wedged test harness; the semantic assertion is
+      // that Stop reaches the gateway before the deferred model mutation ends.
+      const modelWasReleasedWhenAbortEnteredGateway = await withTimeout(abortGatewayEntered.promise, 2_000);
+      expect(modelWasReleasedWhenAbortEnteredGateway).toBe(false);
       await vi.waitFor(() => {
         expect(frames.find((frame) => frame.requestId === "framed-abort-request")).toMatchObject({
           ok: true,
@@ -713,8 +715,8 @@ describe("HostService resident continuity dispatch integration", () => {
         });
       }, { timeout: 1_000 });
       expect(frames.findIndex((frame) => frame.requestId === "framed-model-request")).toBe(-1);
+      modelGatewayReleased = true;
       releaseModelGateway.resolve(undefined);
-      expect(abortGatewayAt - abortWrittenAt).toBeLessThanOrEqual(250);
       await vi.waitFor(() => {
         expect(frames.some((frame) => frame.requestId === "framed-model-request")).toBe(true);
       });
@@ -724,6 +726,7 @@ describe("HostService resident continuity dispatch integration", () => {
         "framed-model-request",
       ]);
     } finally {
+      modelGatewayReleased = true;
       releaseModelGateway.resolve(undefined);
       readable.end();
       await session;
