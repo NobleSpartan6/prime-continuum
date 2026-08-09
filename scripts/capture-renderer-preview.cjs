@@ -124,6 +124,23 @@ const targets = [
     expectScrollableEmpty: true,
   },
   {
+    name: 'candidate-evaluation-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'candidate-evaluation-review',
+    expectedText: 'Evaluate this candidate?',
+    openCandidateEvaluationDialog: true,
+  },
+  {
+    name: 'candidate-evaluation-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'candidate-evaluation-review',
+    expectedText: 'Evaluate this candidate?',
+    openCandidateEvaluationDialog: true,
+    expectShortCandidateEvaluationDialog: true,
+  },
+  {
     name: 'hud-expanded',
     width: 620,
     height: 380,
@@ -292,6 +309,42 @@ async function capture(target, rendererOrigin) {
       }
       await delay(300)
     }
+    if (target.openCandidateEvaluationDialog) {
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const inspectorButton = document.querySelector('button[aria-label="Open inspector"]')
+        if (inspectorButton instanceof HTMLButtonElement) inspectorButton.click()
+        const evidenceTab = document.querySelector('#inspector-tab-evidence')
+        if (!(evidenceTab instanceof HTMLButtonElement)) throw new Error('Evidence inspector tab was not found')
+        evidenceTab.click()
+      })()`)
+      const actionDeadline = Date.now() + 10_000
+      while (Date.now() < actionDeadline) {
+        const actionReady = await browserWindow.webContents.executeJavaScript(`(() => {
+          const button = [...document.querySelectorAll('button')]
+            .find((candidate) => candidate.textContent?.trim() === 'Evaluate candidate')
+          return button instanceof HTMLButtonElement && !button.disabled
+        })()`)
+        if (actionReady) break
+        await delay(25)
+      }
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = [...document.querySelectorAll('button')]
+          .find((candidate) => candidate.textContent?.trim() === 'Evaluate candidate')
+        if (!(button instanceof HTMLButtonElement) || button.disabled) throw new Error('Candidate evaluation action was not ready')
+        button.click()
+      })()`)
+      const dialogDeadline = Date.now() + 10_000
+      while (Date.now() < dialogDeadline) {
+        const open = await browserWindow.webContents.executeJavaScript(
+          `Boolean(document.querySelector('dialog[open][aria-labelledby="candidate-evaluation-dialog-title"]'))`,
+        )
+        if (open) break
+        await delay(25)
+      }
+      await delay(300)
+    }
     const selector = target.expectHud
       ? `.hud-${target.expectHud}`
       : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
@@ -330,6 +383,10 @@ async function capture(target, rendererOrigin) {
       const residentEndDialogScroll = residentEndDialog?.querySelector('.sheet__scroll')
       const residentEndDialogScrollStyle = residentEndDialogScroll ? window.getComputedStyle(residentEndDialogScroll) : undefined
       const residentEndDialogFooterRect = residentEndDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
+      const candidateEvaluationDialog = document.querySelector('dialog[aria-labelledby="candidate-evaluation-dialog-title"]')
+      const candidateEvaluationDialogScroll = candidateEvaluationDialog?.querySelector('.sheet__scroll')
+      const candidateEvaluationDialogScrollStyle = candidateEvaluationDialogScroll ? window.getComputedStyle(candidateEvaluationDialogScroll) : undefined
+      const candidateEvaluationDialogFooterRect = candidateEvaluationDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
       const emptyMain = document.querySelector('.empty-workbench__main')
       const emptyMainStyle = emptyMain ? window.getComputedStyle(emptyMain) : undefined
       const hudSurface = document.querySelector(${JSON.stringify(target.expectHud ? `.hud-${target.expectHud}` : '.hud-never')})
@@ -369,6 +426,16 @@ async function capture(target, rendererOrigin) {
           residentEndDialogFooterRect.height > 0 &&
           residentEndDialogFooterRect.bottom <= window.innerHeight
         ),
+        candidateEvaluationDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="candidate-evaluation-dialog-title"]')),
+        candidateEvaluationDialogContentReachable: Boolean(
+          candidateEvaluationDialogScroll &&
+          candidateEvaluationDialogScrollStyle &&
+          (candidateEvaluationDialogScrollStyle.overflowY === 'auto' || candidateEvaluationDialogScrollStyle.overflowY === 'scroll') &&
+          candidateEvaluationDialogScroll.clientHeight >= 48 &&
+          candidateEvaluationDialogFooterRect &&
+          candidateEvaluationDialogFooterRect.height > 0 &&
+          candidateEvaluationDialogFooterRect.bottom <= window.innerHeight
+        ),
         residentPickerBusy: document.querySelector('.empty-workbench__actions .button--primary')?.getAttribute('aria-busy'),
         emptyMainScrollable: Boolean(
           emptyMain &&
@@ -406,6 +473,12 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectShortResidentEndDialog) {
       invariant(stateEvidence.residentEndDialogContentReachable, `${target.name} did not keep the resident end review and actions reachable`)
+    }
+    if (target.openCandidateEvaluationDialog) {
+      invariant(stateEvidence.candidateEvaluationDialogOpen, `${target.name} did not open the candidate evaluation review`)
+    }
+    if (target.expectShortCandidateEvaluationDialog) {
+      invariant(stateEvidence.candidateEvaluationDialogContentReachable, `${target.name} did not keep the candidate evaluation review and actions reachable`)
     }
     if (target.expectScrollableEmpty) {
       invariant(

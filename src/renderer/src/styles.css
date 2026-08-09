@@ -2106,6 +2106,11 @@ code,
   background: var(--color-warning-soft);
 }
 
+.evidence-state--warning {
+  color: var(--color-danger);
+  background: var(--color-danger-soft);
+}
+
 .agent-list__body strong,
 .evidence-list strong {
   font-size: var(--font-ui);
@@ -2131,6 +2136,134 @@ code,
 .evidence-list time {
   color: var(--color-text-muted);
   font-size: var(--font-caption);
+}
+
+.candidate-evaluation {
+  display: grid;
+  gap: 0.8rem;
+  padding-block-start: 1rem;
+  border-block-start: 1px solid var(--color-border);
+}
+
+.candidate-evaluation__heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.candidate-evaluation__heading h3,
+.candidate-evaluation__heading p,
+.candidate-evaluation__status,
+.candidate-evaluation__result p,
+.candidate-evaluation__boundary p {
+  margin: 0;
+}
+
+.candidate-evaluation__heading h3 {
+  font-size: var(--font-ui);
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.candidate-evaluation__heading p,
+.candidate-evaluation__status {
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.candidate-evaluation__heading p {
+  margin-block-start: 0.2rem;
+}
+
+.candidate-evaluation__status {
+  min-block-size: 1.3rem;
+  outline-offset: 0.2rem;
+}
+
+.candidate-evaluation__status--warning {
+  color: var(--color-danger);
+}
+
+.candidate-evaluation__identity {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.candidate-evaluation__identity > div {
+  min-inline-size: 0;
+  padding: 0.55rem 0.6rem;
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
+}
+
+.candidate-evaluation__identity dt {
+  color: var(--color-text-faint);
+  font-size: var(--font-caption);
+}
+
+.candidate-evaluation__identity dd {
+  margin: 0.15rem 0 0;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: var(--font-meta);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.candidate-evaluation__result {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.65rem;
+  padding: 0.7rem;
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: inset 0 0 0 1px var(--color-border);
+}
+
+.candidate-evaluation__result > div {
+  display: grid;
+  gap: 0.2rem;
+  min-inline-size: 0;
+}
+
+.candidate-evaluation__result strong {
+  font-size: var(--font-ui);
+  font-weight: 620;
+}
+
+.candidate-evaluation__result p,
+.candidate-evaluation__result code {
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+  line-height: 1.4;
+}
+
+.candidate-evaluation__result code {
+  overflow-wrap: anywhere;
+}
+
+.candidate-evaluation__boundary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  color: var(--color-text-secondary);
+  background: var(--color-warning-soft);
+  border-radius: var(--radius-lg);
+  font-size: var(--font-caption);
+  line-height: 1.5;
+}
+
+.candidate-evaluation__boundary svg {
+  margin-block-start: 0.1rem;
+  color: var(--color-warning);
 }
 
 .runtime-section + .runtime-section {
@@ -2894,14 +3027,20 @@ dialog.sheet--resident-end {
   inline-size: min(calc(100% - 2rem), 40rem);
 }
 
+dialog.sheet--candidate-evaluation {
+  inline-size: min(calc(100% - 2rem), 42rem);
+}
+
 .sheet--resident .sheet__frame,
-.sheet--resident-end .sheet__frame {
+.sheet--resident-end .sheet__frame,
+.sheet--candidate-evaluation .sheet__frame {
   block-size: auto;
   max-block-size: min(calc(100dvh - 2rem), 38rem);
 }
 
 .sheet--resident .sheet__scroll,
-.sheet--resident-end .sheet__scroll {
+.sheet--resident-end .sheet__scroll,
+.sheet--candidate-evaluation .sheet__scroll {
   max-block-size: min(24rem, calc(100dvh - 12rem));
 }
 
@@ -2914,6 +3053,34 @@ dialog.sheet--resident-end {
   display: grid;
   align-content: start;
   gap: 1rem;
+}
+
+.candidate-evaluation-dialog__body {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+}
+
+.candidate-evaluation__boundary--dialog {
+  font-size: var(--font-meta);
+}
+
+.candidate-evaluation-dialog__confirmation {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.65rem;
+  color: var(--color-text-secondary);
+  font-size: var(--font-meta);
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.candidate-evaluation-dialog__confirmation input {
+  inline-size: 1rem;
+  block-size: 1rem;
+  margin-block-start: 0.15rem;
+  accent-color: var(--color-accent);
 }
 
 .resident-end-dialog__distinction {
@@ -5316,8 +5483,21 @@ body[data-surface="hud"] {
 
   .empty-workbench__actions .button,
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button {
+  .sheet--resident-end .sheet__footer .button,
+  .sheet--candidate-evaluation .sheet__footer .button {
     inline-size: 100%;
+  }
+
+  .candidate-evaluation__heading {
+    display: grid;
+  }
+
+  .candidate-evaluation__heading .button {
+    inline-size: 100%;
+  }
+
+  .candidate-evaluation__identity {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .topbar {
@@ -5801,34 +5981,41 @@ body[data-surface="hud"] {
   }
 
   dialog.sheet--resident,
-  dialog.sheet--resident-end {
+  dialog.sheet--resident-end,
+  dialog.sheet--candidate-evaluation {
     max-block-size: calc(100dvh - 0.5rem);
   }
 
   .sheet--resident .sheet__frame,
-  .sheet--resident-end .sheet__frame {
+  .sheet--resident-end .sheet__frame,
+  .sheet--candidate-evaluation .sheet__frame {
     max-block-size: calc(100dvh - 0.5rem);
   }
 
   .sheet--resident .sheet__header,
   .sheet--resident .sheet__footer,
   .sheet--resident-end .sheet__header,
-  .sheet--resident-end .sheet__footer {
+  .sheet--resident-end .sheet__footer,
+  .sheet--candidate-evaluation .sheet__header,
+  .sheet--candidate-evaluation .sheet__footer {
     padding: 0.5rem 0.75rem;
   }
 
   .sheet--resident .sheet__header,
-  .sheet--resident-end .sheet__header {
+  .sheet--resident-end .sheet__header,
+  .sheet--candidate-evaluation .sheet__header {
     min-block-size: 3.25rem;
   }
 
   .sheet--resident .sheet__title-icon,
-  .sheet--resident-end .sheet__title-icon {
+  .sheet--resident-end .sheet__title-icon,
+  .sheet--candidate-evaluation .sheet__title-icon {
     display: none;
   }
 
   .sheet--resident .sheet__title-group p,
-  .sheet--resident-end .sheet__title-group p {
+  .sheet--resident-end .sheet__title-group p,
+  .sheet--candidate-evaluation .sheet__title-group p {
     display: -webkit-box;
     overflow: hidden;
     -webkit-box-orient: vertical;
@@ -5837,27 +6024,31 @@ body[data-surface="hud"] {
   }
 
   .sheet--resident .sheet__scroll,
-  .sheet--resident-end .sheet__scroll {
+  .sheet--resident-end .sheet__scroll,
+  .sheet--candidate-evaluation .sheet__scroll {
     max-block-size: none;
     padding: 0.65rem 0.75rem;
   }
 
   .sheet--resident .sheet__footer,
-  .sheet--resident-end .sheet__footer {
+  .sheet--resident-end .sheet__footer,
+  .sheet--candidate-evaluation .sheet__footer {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.5rem;
   }
 
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button {
+  .sheet--resident-end .sheet__footer .button,
+  .sheet--candidate-evaluation .sheet__footer .button {
     inline-size: 100%;
     min-block-size: 2.25rem;
     padding-block: 0.35rem;
   }
 
   .sheet--resident .sheet__footer .button svg,
-  .sheet--resident-end .sheet__footer .button svg {
+  .sheet--resident-end .sheet__footer .button svg,
+  .sheet--candidate-evaluation .sheet__footer .button svg {
     display: none;
   }
 

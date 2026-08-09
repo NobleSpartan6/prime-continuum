@@ -45,6 +45,7 @@ import {
 } from 'lucide-react'
 import {
   createRendererApi,
+  isDefinitiveCandidateEvaluationStartError,
   isStaleHostAuthorityError,
   type ComposerReceiptState,
   type ConnectionState,
@@ -66,6 +67,14 @@ import {
   type WorkbenchSnapshot,
 } from './api'
 import type { HudMode, HudState, HudTarget } from '../../shared/window-control'
+import type {
+  CandidateEvaluationPreflight,
+  CandidateEvaluationPreflightRequest,
+  CandidateEvaluationReviewIdentity,
+  CandidateEvaluationSnapshot,
+  CandidateEvaluationStartRequest,
+  CandidateEvaluationStatus,
+} from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
 import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -109,6 +118,8 @@ type ResidentEndDialogContext = {
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Write a prompt before running Prime Agent.'
 const MODEL_REVEAL_INCREMENT = 80
+const CANDIDATE_PREFLIGHT_REFRESH_MS = 25_000
+const CANDIDATE_EVALUATION_POLL_MS = 1_500
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
   { phase: 'quiescing', label: 'Prepare source' },
@@ -2469,6 +2480,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       </main>
 
       <Inspector
+        api={api}
         snapshot={snapshot}
         selectedThread={selectedThread}
         selectedProject={selectedProject}
@@ -3404,6 +3416,7 @@ function Composer({ connection, hostName, taskState, runtime, text, onTextChange
 }
 
 interface InspectorProps {
+  api: RendererApi
   snapshot: WorkbenchSnapshot
   selectedThread: ThreadSummary
   selectedProject: WorkbenchSnapshot['projects'][number]
@@ -3421,7 +3434,7 @@ interface InspectorProps {
   onEndResident: (trigger: HTMLElement) => void
 }
 
-function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentEndPreparing, residentEndError, onEndResident }: InspectorProps) {
+function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentEndPreparing, residentEndError, onEndResident }: InspectorProps) {
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const activateRelativeTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex = index
@@ -3492,7 +3505,15 @@ function Inspector({ snapshot, selectedThread, selectedProject, selectedHost, ru
             onEndResident={onEndResident}
           />
         )}
-        {activeTab === 'Evidence' && <EvidencePanel snapshot={snapshot} />}
+        {activeTab === 'Evidence' && (
+          <EvidencePanel
+            key={`${selectedHost.id}\u0000${selectedThread.remoteId ?? selectedThread.id}\u0000${selectedThread.executionGenerationId ?? ''}`}
+            api={api}
+            snapshot={snapshot}
+            thread={selectedThread}
+            host={selectedHost}
+          />
+        )}
         {activeTab === 'Context' && (
           <ContextPanel project={selectedProject} host={selectedHost} />
         )}
@@ -3992,7 +4013,384 @@ function RuntimePanel({
   )
 }
 
-function EvidencePanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
+type CandidateEvaluationLoadState =
+  | { kind: 'idle'; message: string }
+  | { kind: 'checking'; message: string }
+  | { kind: 'ready'; message: string; preflight: Extract<CandidateEvaluationPreflight, { status: 'ready' }> }
+  | { kind: 'unavailable'; message: string }
+  | { kind: 'error'; message: string }
+
+function candidateEvaluationMatchesAuthority(
+  authority: CandidateEvaluationPreflightRequest,
+  value: CandidateEvaluationPreflightRequest,
+): boolean {
+  return value.expectedHostId === authority.expectedHostId &&
+    value.threadId === authority.threadId &&
+    value.expectedExecutionGenerationId === authority.expectedExecutionGenerationId
+}
+
+function sameCandidateEvaluationReview(
+  left: CandidateEvaluationReviewIdentity,
+  right: CandidateEvaluationReviewIdentity,
+): boolean {
+  return left.headCommit === right.headCommit &&
+    left.gitIndexSha256 === right.gitIndexSha256 &&
+    left.gitIndexBytes === right.gitIndexBytes &&
+    left.packageManifestSha256 === right.packageManifestSha256 &&
+    left.lockfileSha256 === right.lockfileSha256 &&
+    left.lockfileBytes === right.lockfileBytes &&
+    left.nodeVersionPinSha256 === right.nodeVersionPinSha256 &&
+    left.selfBuildEntrypointSha256 === right.selfBuildEntrypointSha256 &&
+    left.launcherBootstrapSha256 === right.launcherBootstrapSha256 &&
+    left.launcherBootstrapFileCount === right.launcherBootstrapFileCount &&
+    left.runtimePointerSha256 === right.runtimePointerSha256 &&
+    left.nodePackageManifestSha256 === right.nodePackageManifestSha256 &&
+    left.nodeExecutableSha256 === right.nodeExecutableSha256 &&
+    left.pnpmCliSha256 === right.pnpmCliSha256 &&
+    left.reviewAggregateSha256 === right.reviewAggregateSha256
+}
+
+function candidateEvaluationIsNonterminal(status: CandidateEvaluationStatus): boolean {
+  return status.status === 'prepared' || status.status === 'running'
+}
+
+function candidateEvaluationStatusLabel(status: CandidateEvaluationStatus): string {
+  if (status.status === 'prepared') return 'Evaluation prepared'
+  if (status.status === 'running') return 'Self-build invocation started'
+  if (status.status === 'passed') return 'Candidate evaluation passed'
+  if (status.status === 'failed') return 'Candidate evaluation failed'
+  return 'Evaluation outcome unknown'
+}
+
+function candidateEvaluationStatusDetail(status: CandidateEvaluationStatus): string {
+  if (status.receipt) {
+    const artifactDetail = status.receipt.artifactFileCount === undefined
+      ? ''
+      : ` · ${status.receipt.artifactFileCount.toLocaleString()} release ${status.receipt.artifactFileCount === 1 ? 'artifact' : 'artifacts'}`
+    return `${status.receipt.settledGateCount} of ${status.receipt.gateCount} build gates settled${artifactDetail}`
+  }
+  if (status.error) return `${status.error.code} · ${status.error.message}`
+  if (status.status === 'prepared') return 'The passive launcher/workspace review fingerprint is admitted, not a canonical candidate identity. Canonical candidate and toolchain capture occurs inside the consented evaluation.'
+  if (status.status === 'running') return 'The host is observing the exact workflow or receipt. It will not replay the invocation automatically.'
+  return 'The host has not published terminal receipt evidence.'
+}
+
+function candidateEvaluationTone(status: CandidateEvaluationStatus): WorkbenchSnapshot['evidence'][number]['status'] {
+  if (status.status === 'passed') return 'passed'
+  if (status.status === 'prepared' || status.status === 'running') return 'running'
+  return 'warning'
+}
+
+function candidateOperationId(): string {
+  const unique = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `candidate-evaluation:${unique}`
+}
+
+function EvidencePanel({
+  api,
+  snapshot,
+  thread,
+  host,
+}: {
+  api: RendererApi
+  snapshot: WorkbenchSnapshot
+  thread: ThreadSummary
+  host: HostSummary
+}) {
+  const authority = useMemo<CandidateEvaluationPreflightRequest | null>(() => {
+    if (
+      api.environment !== 'native' ||
+      snapshot.operations.candidateEvaluationProbe !== true ||
+      snapshot.selectedThreadId !== thread.id ||
+      host.id !== thread.hostId ||
+      host.kind !== 'local' ||
+      host.connection !== 'online' ||
+      !thread.executionGenerationId ||
+      !api.candidateEvaluationPreflight ||
+      !api.startCandidateEvaluation ||
+      !api.candidateEvaluationSnapshot
+    ) return null
+    return {
+      expectedHostId: host.id,
+      threadId: thread.remoteId ?? thread.id,
+      expectedExecutionGenerationId: thread.executionGenerationId,
+    }
+  }, [api, host.connection, host.id, host.kind, snapshot.operations.candidateEvaluationProbe, snapshot.selectedThreadId, thread.executionGenerationId, thread.hostId, thread.id, thread.remoteId])
+  const [loadState, setLoadState] = useState<CandidateEvaluationLoadState>({
+    kind: 'idle',
+    message: 'Candidate evaluation is available only for an exact online workspace on this computer.',
+  })
+  const [evaluations, setEvaluations] = useState<CandidateEvaluationStatus[]>([])
+  const [repeatEffectsWarningRequired, setRepeatEffectsWarningRequired] = useState(false)
+  const [activeOperationId, setActiveOperationId] = useState('')
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [confirmed, setConfirmed] = useState(false)
+  const [starting, setStarting] = useState(false)
+  const [dialogError, setDialogError] = useState('')
+  const [announcement, setAnnouncement] = useState('')
+  const triggerRef = useRef<HTMLElement | null>(null)
+  const confirmationRef = useRef<HTMLInputElement>(null)
+  const statusRef = useRef<HTMLParagraphElement>(null)
+  const authorityEpochRef = useRef(0)
+  const latestSnapshotTimeRef = useRef(0)
+  const pendingStartRef = useRef<CandidateEvaluationStartRequest | null>(null)
+
+  const publishEvaluationSnapshot = useCallback((result: CandidateEvaluationSnapshot): void => {
+    if (!authority || !candidateEvaluationMatchesAuthority(authority, result)) return
+    const generatedAt = Date.parse(result.generatedAt)
+    if (!Number.isFinite(generatedAt) || generatedAt < latestSnapshotTimeRef.current) return
+    latestSnapshotTimeRef.current = generatedAt
+    setRepeatEffectsWarningRequired(result.repeatEffectsWarningRequired)
+    const ordered = [...result.evaluations].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    setEvaluations(ordered)
+    const nonterminal = ordered.find(candidateEvaluationIsNonterminal)
+    if (nonterminal) {
+      setActiveOperationId(nonterminal.operationId)
+      return
+    }
+    const pending = pendingStartRef.current
+    if (!pending) {
+      setActiveOperationId('')
+      return
+    }
+    const exactPending = ordered.find((evaluation) => evaluation.operationId === pending.operationId)
+    if (exactPending) {
+      pendingStartRef.current = null
+      setActiveOperationId('')
+    }
+  }, [authority])
+
+  useEffect(() => {
+    const epoch = authorityEpochRef.current + 1
+    authorityEpochRef.current = epoch
+    latestSnapshotTimeRef.current = 0
+    pendingStartRef.current = null
+    setEvaluations([])
+    setRepeatEffectsWarningRequired(false)
+    setActiveOperationId('')
+    setDialogOpen(false)
+    setConfirmed(false)
+    setStarting(false)
+    setDialogError('')
+    setAnnouncement('')
+    if (!authority || !api.candidateEvaluationPreflight || !api.candidateEvaluationSnapshot) {
+      setLoadState({
+        kind: 'idle',
+        message: 'Candidate evaluation is available only for an exact online workspace on this computer.',
+      })
+      return () => {
+        authorityEpochRef.current += 1
+      }
+    }
+
+    let cancelled = false
+    let refreshTimer: number | undefined
+    const refresh = async (): Promise<void> => {
+      setLoadState({ kind: 'checking', message: 'Checking the passive workspace and launcher fingerprint with durable evaluation history…' })
+      try {
+        const [preflight, history] = await Promise.all([
+          api.candidateEvaluationPreflight!(authority),
+          api.candidateEvaluationSnapshot!(authority),
+        ])
+        if (cancelled || authorityEpochRef.current !== epoch) return
+        if (
+          !candidateEvaluationMatchesAuthority(authority, preflight) ||
+          !candidateEvaluationMatchesAuthority(authority, history)
+        ) {
+          throw new Error('The evaluation preflight did not match the selected host and thread generation.')
+        }
+        publishEvaluationSnapshot(history)
+        if (preflight.status === 'ready') {
+          setLoadState({
+            kind: 'ready',
+            preflight,
+            message: 'Passive launcher/workspace review fingerprint ready · this is not the canonical candidate; canonical candidate and toolchain capture occurs only inside the consented evaluation',
+          })
+        } else {
+          setLoadState({ kind: 'unavailable', message: `${preflight.code} · ${preflight.message}` })
+        }
+      } catch (reason) {
+        if (cancelled || authorityEpochRef.current !== epoch) return
+        setLoadState({
+          kind: 'error',
+          message: reason instanceof Error ? reason.message : 'Candidate evaluation preflight is unavailable.',
+        })
+      } finally {
+        if (!cancelled && authorityEpochRef.current === epoch) {
+          refreshTimer = window.setTimeout(() => void refresh(), CANDIDATE_PREFLIGHT_REFRESH_MS)
+        }
+      }
+    }
+    void refresh()
+    return () => {
+      cancelled = true
+      authorityEpochRef.current += 1
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer)
+    }
+  }, [api, authority, publishEvaluationSnapshot])
+
+  useEffect(() => {
+    if (!authority || !activeOperationId || !api.candidateEvaluationSnapshot) return
+    const epoch = authorityEpochRef.current
+    let cancelled = false
+    let pollTimer: number | undefined
+    const poll = async (): Promise<void> => {
+      try {
+        const result = await api.candidateEvaluationSnapshot!(authority)
+        if (cancelled || authorityEpochRef.current !== epoch) return
+        if (!candidateEvaluationMatchesAuthority(authority, result)) return
+        publishEvaluationSnapshot(result)
+        const exact = result.evaluations.find((evaluation) => evaluation.operationId === activeOperationId)
+        if (exact && !candidateEvaluationIsNonterminal(exact)) {
+          setAnnouncement(candidateEvaluationStatusLabel(exact))
+          return
+        }
+      } catch (reason) {
+        if (cancelled || authorityEpochRef.current !== epoch) return
+        setAnnouncement(reason instanceof Error
+          ? `Evaluation status unavailable · ${reason.message}`
+          : 'Evaluation status is temporarily unavailable. The operation will not be replayed automatically.')
+      }
+      if (!cancelled && authorityEpochRef.current === epoch) {
+        pollTimer = window.setTimeout(() => void poll(), CANDIDATE_EVALUATION_POLL_MS)
+      }
+    }
+    pollTimer = window.setTimeout(() => void poll(), CANDIDATE_EVALUATION_POLL_MS)
+    return () => {
+      cancelled = true
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer)
+    }
+  }, [activeOperationId, api, authority, publishEvaluationSnapshot])
+
+  const reviewedPreflight = loadState.kind === 'ready' ? loadState.preflight : undefined
+  const sameReviewEvaluations = reviewedPreflight
+    ? evaluations.filter((evaluation) => sameCandidateEvaluationReview(evaluation.review, reviewedPreflight.review))
+    : []
+  const sameReviewBlocked = sameReviewEvaluations.some((evaluation) =>
+    evaluation.status === 'passed' || candidateEvaluationIsNonterminal(evaluation),
+  )
+  const secondEffectsWarning = repeatEffectsWarningRequired
+  const canStartEvaluation = Boolean(
+    authority &&
+    reviewedPreflight &&
+    !activeOperationId &&
+    !pendingStartRef.current &&
+    !sameReviewBlocked &&
+    !starting,
+  )
+  const displayedEvaluation = evaluations.find((evaluation) => evaluation.operationId === activeOperationId) ?? evaluations[0]
+
+  const openConfirmation = (trigger: HTMLElement): void => {
+    if (!canStartEvaluation) return
+    triggerRef.current = trigger
+    setConfirmed(false)
+    setDialogError('')
+    setDialogOpen(true)
+  }
+
+  const startEvaluation = async (event: FormEvent): Promise<void> => {
+    event.preventDefault()
+    if (!authority || !reviewedPreflight || !api.startCandidateEvaluation || !api.candidateEvaluationPreflight || !api.candidateEvaluationSnapshot || starting) return
+    if (!confirmed) {
+      setDialogError('Confirm that you understand this evaluation is not a security sandbox.')
+      confirmationRef.current?.focus()
+      return
+    }
+    const epoch = authorityEpochRef.current
+    const envelope = pendingStartRef.current ?? {
+      ...authority,
+      operationId: candidateOperationId(),
+      requestedAt: new Date().toISOString(),
+      kind: 'prime_continuim_self_build_v1' as const,
+      expectedReview: reviewedPreflight.review,
+    }
+    pendingStartRef.current = envelope
+    let invocationAttempted = false
+    setStarting(true)
+    setDialogError('')
+    setAnnouncement('Rechecking the passive workspace and launcher fingerprint before admission…')
+    try {
+      const [freshPreflight, history] = await Promise.all([
+        api.candidateEvaluationPreflight(authority),
+        api.candidateEvaluationSnapshot(authority),
+      ])
+      if (authorityEpochRef.current !== epoch) return
+      if (
+        !candidateEvaluationMatchesAuthority(authority, freshPreflight) ||
+        !candidateEvaluationMatchesAuthority(authority, history)
+      ) throw new Error('The selected host or thread generation changed during confirmation.')
+      publishEvaluationSnapshot(history)
+      const nonterminal = history.evaluations.find(candidateEvaluationIsNonterminal)
+      if (nonterminal) {
+        pendingStartRef.current = null
+        setActiveOperationId(nonterminal.operationId)
+        setAnnouncement('An evaluation for this exact authority is already in progress. Its status is shown below.')
+        setDialogOpen(false)
+        return
+      }
+      if (freshPreflight.status !== 'ready') {
+        pendingStartRef.current = null
+        setLoadState({ kind: 'unavailable', message: `${freshPreflight.code} · ${freshPreflight.message}` })
+        throw new Error('The evaluation is no longer ready. Review the refreshed passive preflight.')
+      }
+      if (!sameCandidateEvaluationReview(freshPreflight.review, envelope.expectedReview)) {
+        pendingStartRef.current = null
+        setLoadState({
+          kind: 'ready',
+          preflight: freshPreflight,
+          message: 'The passive workspace or launcher fingerprint changed after review. Confirm the new fingerprint before running the evaluation.',
+        })
+        throw new Error('The passive workspace or launcher fingerprint changed after review. No evaluation was started.')
+      }
+      if (history.repeatEffectsWarningRequired && !secondEffectsWarning) {
+        pendingStartRef.current = null
+        setConfirmed(false)
+        window.requestAnimationFrame(() => confirmationRef.current?.focus())
+        throw new Error('Evaluation history now requires the repeated-effects warning. Review the stronger warning and confirm again. No evaluation was started.')
+      }
+      if (authorityEpochRef.current !== epoch) return
+      setAnnouncement('Admitting the consented evaluation…')
+      invocationAttempted = true
+      const status = await api.startCandidateEvaluation(envelope)
+      if (authorityEpochRef.current !== epoch) return
+      if (
+        !candidateEvaluationMatchesAuthority(authority, status) ||
+        status.operationId !== envelope.operationId ||
+        !sameCandidateEvaluationReview(status.review, envelope.expectedReview)
+      ) throw new Error('The evaluation admission reply did not match the exact confirmed operation and passive review identity.')
+      setEvaluations((current) => [status, ...current.filter((entry) => entry.operationId !== status.operationId)])
+      if (candidateEvaluationIsNonterminal(status)) {
+        setActiveOperationId(status.operationId)
+      } else {
+        pendingStartRef.current = null
+        setActiveOperationId('')
+      }
+      setAnnouncement(candidateEvaluationStatusLabel(status))
+      setDialogOpen(false)
+      window.requestAnimationFrame(() => statusRef.current?.focus())
+    } catch (reason) {
+      if (authorityEpochRef.current !== epoch) return
+      if (
+        invocationAttempted &&
+        pendingStartRef.current &&
+        !isDefinitiveCandidateEvaluationStartError(reason)
+      ) {
+        setActiveOperationId(envelope.operationId)
+        setAnnouncement('The start acknowledgement is unavailable. Checking the exact operation without creating or replaying another one.')
+        setDialogOpen(false)
+        window.requestAnimationFrame(() => statusRef.current?.focus())
+      } else {
+        pendingStartRef.current = null
+        if (invocationAttempted) {
+          setAnnouncement('The evaluation was rejected before admission. No operation was started.')
+        }
+        setDialogError(reason instanceof Error ? reason.message : 'The consented evaluation could not be admitted.')
+      }
+    } finally {
+      if (authorityEpochRef.current === epoch) setStarting(false)
+    }
+  }
+
   return (
     <div className="inspector-content">
       <PanelHeading icon={TestTube2} title="Evidence" meta="Checks and durable receipts" />
@@ -4011,6 +4409,128 @@ function EvidencePanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
           </li>
         ))}
       </ul>
+      {api.environment === 'native' && (
+        <section className="candidate-evaluation" aria-labelledby="candidate-evaluation-heading">
+          <div className="candidate-evaluation__heading">
+            <div>
+              <h3 id="candidate-evaluation-heading">Candidate evaluation</h3>
+              <p>Canonical self-build evidence for this exact local thread generation.</p>
+            </div>
+            {canStartEvaluation && (
+              <button
+                className="button button--secondary button--small"
+                type="button"
+                onClick={(event) => openConfirmation(event.currentTarget)}
+              >
+                <Icon icon={TestTube2} size={14} />
+                Evaluate candidate
+              </button>
+            )}
+          </div>
+          <p
+            ref={statusRef}
+            className={cx('candidate-evaluation__status', loadState.kind === 'error' && 'candidate-evaluation__status--warning')}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            tabIndex={-1}
+          >
+            {announcement || loadState.message}
+          </p>
+          {reviewedPreflight && (
+            <dl className="candidate-evaluation__identity">
+              <div><dt>Reviewed HEAD</dt><dd><code>{reviewedPreflight.review.headCommit.slice(0, 12)}</code></dd></div>
+              <div><dt>Passive fingerprint</dt><dd><code>{reviewedPreflight.review.reviewAggregateSha256.slice(0, 12)}</code></dd></div>
+              <div><dt>Required toolchain</dt><dd className="tabular">Node {reviewedPreflight.executor.requiredNodeVersion} · pnpm {reviewedPreflight.executor.requiredPnpmVersion}</dd></div>
+            </dl>
+          )}
+          {displayedEvaluation && (
+            <article className={cx('candidate-evaluation__result', `candidate-evaluation__result--${candidateEvaluationTone(displayedEvaluation)}`)}>
+              <span className={cx('evidence-state', `evidence-state--${candidateEvaluationTone(displayedEvaluation)}`)}>
+                <Icon icon={displayedEvaluation.status === 'passed' ? CheckCircle2 : candidateEvaluationIsNonterminal(displayedEvaluation) ? Loader2 : AlertCircle} size={15} />
+              </span>
+              <div>
+                <strong>{candidateEvaluationStatusLabel(displayedEvaluation)}</strong>
+                <p>{candidateEvaluationStatusDetail(displayedEvaluation)}</p>
+                <code>{displayedEvaluation.operationId}</code>
+              </div>
+            </article>
+          )}
+          <div className="candidate-evaluation__boundary" role="note">
+            <Icon icon={AlertCircle} size={15} />
+            <p><strong>Runs with your user permissions.</strong> Candidate scripts can access the same files you can. The copied worktree is not a security sandbox and does not isolate the main filesystem.</p>
+          </div>
+
+          <NativeDialog
+            open={dialogOpen}
+            labelledBy="candidate-evaluation-dialog-title"
+            describedBy="candidate-evaluation-dialog-description"
+            triggerRef={triggerRef}
+            onClose={() => {
+              if (starting) return
+              setDialogOpen(false)
+              setDialogError('')
+            }}
+            className="sheet--candidate-evaluation"
+            dismissible={!starting}
+          >
+            <form className="sheet__frame" onSubmit={(event) => void startEvaluation(event)} aria-busy={starting}>
+              <header className="sheet__header">
+                <div className="sheet__title-group">
+                  <span className="sheet__title-icon sheet__title-icon--warning"><Icon icon={AlertCircle} size={18} /></span>
+                  <div>
+                    <h2 id="candidate-evaluation-dialog-title">Evaluate this candidate?</h2>
+                    <p id="candidate-evaluation-dialog-description">Prime Continuim will recheck this passive launcher/workspace fingerprint—not the canonical candidate—then capture the canonical candidate and toolchain inside the consented self-build evaluation.</p>
+                  </div>
+                </div>
+                <button className="icon-button" type="button" aria-label="Close candidate evaluation review" onClick={() => setDialogOpen(false)} disabled={starting}>
+                  <Icon icon={X} size={17} />
+                </button>
+              </header>
+              <div className="sheet__scroll candidate-evaluation-dialog__body">
+                <div className="candidate-evaluation__boundary candidate-evaluation__boundary--dialog" role="note">
+                  <Icon icon={AlertCircle} size={16} />
+                  <p>
+                    <strong>{secondEffectsWarning ? 'The previous outcome is unknown.' : 'This is not a security sandbox.'}</strong>{' '}
+                    {secondEffectsWarning
+                      ? 'Starting a separate operation may repeat candidate-script effects. It still runs with your user permissions and the copied worktree does not isolate the main filesystem.'
+                      : 'Candidate scripts run with your user permissions. The copied worktree does not isolate the main filesystem.'}
+                  </p>
+                </div>
+                <label className="candidate-evaluation-dialog__confirmation">
+                  <input
+                    ref={confirmationRef}
+                    data-dialog-autofocus
+                    type="checkbox"
+                    checked={confirmed}
+                    disabled={starting}
+                    aria-invalid={dialogError && !confirmed ? 'true' : undefined}
+                    aria-describedby="candidate-evaluation-dialog-error"
+                    onChange={(event) => {
+                      setConfirmed(event.target.checked)
+                      if (event.target.checked) setDialogError('')
+                    }}
+                  />
+                  <span>{secondEffectsWarning
+                    ? 'I understand that this separate operation may repeat effects from the evaluation whose outcome is unknown.'
+                    : 'I understand that this evaluation runs untrusted candidate scripts with my user permissions.'}</span>
+                </label>
+                <p id="candidate-evaluation-dialog-error" className="form-error" role="alert">{dialogError}</p>
+                <p className="form-status" role="status" aria-live="polite" aria-atomic="true">
+                  {starting ? 'Rechecking the passive fingerprint and admitting the evaluation…' : ''}
+                </p>
+              </div>
+              <footer className="sheet__footer">
+                <button className="button button--secondary" type="button" onClick={() => setDialogOpen(false)} disabled={starting}>Cancel</button>
+                <button className="button button--primary" type="submit" disabled={starting}>
+                  <Icon icon={starting ? Loader2 : TestTube2} size={15} />
+                  {starting ? 'Starting…' : 'Run evaluation'}
+                </button>
+              </footer>
+            </form>
+          </NativeDialog>
+        </section>
+      )}
     </div>
   )
 }

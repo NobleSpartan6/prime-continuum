@@ -13,8 +13,12 @@ import { VerifiedResidentGateway } from "./verified-resident-gateway";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
 import { HostService } from "./service";
 import { HostStore } from "./store";
+import { CandidateEvaluationCoordinator } from "./candidate-evaluation";
+import { CandidateEvaluationStore } from "./candidate-evaluation-store";
 
 export * from "./gateway";
+export * from "./candidate-evaluation";
+export * from "./candidate-evaluation-store";
 export * from "./oauth-session-broker";
 export * from "./paths";
 export * from "./probe";
@@ -89,6 +93,12 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
     const runtimeModelCatalog = runtimeInitialization
       ? new VerifiedRuntimeModelCatalog({ runtimeHandles: runtimeInitialization })
       : undefined;
+    const candidateEvaluation = runtimeInitialization
+      ? new CandidateEvaluationCoordinator({
+          authorityStore: store,
+          persistence: new CandidateEvaluationStore(store.paths),
+        })
+      : undefined;
     const runtimeOAuthComposition = runtimeInitialization && plaintextRuntimeOAuthDevelopmentEnabled(process.env)
       ? new VerifiedRuntimeOAuthComposition({ runtimeHandles: runtimeInitialization })
       : undefined;
@@ -109,6 +119,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         runtimeIntegrityProvider: runtimeInitialization,
         runtimeModelCatalogProvider: runtimeModelCatalog,
         runtimeOAuthComposition,
+        candidateEvaluationCoordinator: candidateEvaluation,
       },
     );
     const endpoint = options.socket ?? target.endpoint;

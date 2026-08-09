@@ -1,4 +1,9 @@
 import {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  CandidateEvaluationPreflightSchema,
+  CandidateEvaluationSnapshotSchema,
+  CandidateEvaluationStatusSchema,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
@@ -11,6 +16,12 @@ import {
   RuntimeModelCatalogSnapshotSchema,
   THREAD_HANDOFF_CAPABILITY,
   type ResidentLifecycleStatus,
+  type CandidateEvaluationPreflight,
+  type CandidateEvaluationPreflightRequest,
+  type CandidateEvaluationReviewIdentity,
+  type CandidateEvaluationSnapshot,
+  type CandidateEvaluationStartRequest,
+  type CandidateEvaluationStatus,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
 } from '../../shared/protocol'
@@ -249,6 +260,8 @@ export interface WorkbenchSnapshot {
     provisionResident?: boolean
     crossHostHandoff: boolean
     modelCatalog?: boolean
+    /** Capability-derived probe availability only; never an action authorization. */
+    candidateEvaluationProbe?: boolean
   }
   composerReceipt: {
     state: ComposerReceiptState
@@ -403,6 +416,9 @@ export interface RendererApi {
     expectedHostId: string
     operationId: string
   }): Promise<ResidentLifecycleStatus | null>
+  candidateEvaluationPreflight?(input: CandidateEvaluationPreflightRequest): Promise<CandidateEvaluationPreflight>
+  startCandidateEvaluation?(input: CandidateEvaluationStartRequest): Promise<CandidateEvaluationStatus>
+  candidateEvaluationSnapshot?(input: CandidateEvaluationPreflightRequest): Promise<CandidateEvaluationSnapshot>
   discoverComputers(): Promise<DiscoveredComputer[]>
   probeComputer(input: { alias?: string; hostname?: string; user?: string }): Promise<DiscoveredComputer>
   addComputer(input: {
@@ -711,6 +727,7 @@ export type PreviewVisualState =
   | 'resident-recovery'
   | 'resident-end-review'
   | 'resident-end-pending'
+  | 'candidate-evaluation-review'
   | 'hud-expanded'
   | 'hud-buddy'
 
@@ -725,6 +742,7 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'resident-recovery',
   'resident-end-review',
   'resident-end-pending',
+  'candidate-evaluation-review',
   'hud-expanded',
   'hud-buddy',
 ])
@@ -865,6 +883,32 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
           message: 'Ending resident session · Prime Continuim will not send another kill automatically',
         }
       : { state: 'idle', message: 'Ready for a new prompt' }
+    return snapshot
+  }
+
+  if (visualState === 'candidate-evaluation-review') {
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
+    if (!thread || !host) return snapshot
+    snapshot.selectedProjectId = thread.projectId
+    snapshot.selectedThreadId = thread.id
+    thread.status = 'idle'
+    thread.workspaceId = 'candidate-preview-workspace'
+    thread.executionGenerationId = 'candidate-preview-generation'
+    host.kind = 'local'
+    host.connection = 'online'
+    host.connectionPath = 'Local socket'
+    host.latencyMs = 2
+    delete host.lastSynchronized
+    snapshot.runtime = {}
+    snapshot.operations = {
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+      candidateEvaluationProbe: true,
+    }
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
   }
 
@@ -1089,12 +1133,74 @@ const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCata
   ],
 })
 
+const previewCandidateEvaluationBoundary = {
+  securitySandbox: false,
+  mainFilesystemIsolation: false,
+  providerBackedEvaluation: false,
+  autonomousPromotion: false,
+  candidateControlledEvaluation: true,
+  packageOrInstallerGate: false,
+  authenticated: false,
+  integrity: 'sha256-correlation-only-not-authentication' as const,
+}
+
+const previewCandidateEvaluationReview: CandidateEvaluationReviewIdentity = {
+  headCommit: 'a'.repeat(40),
+  gitIndexSha256: '1'.repeat(64),
+  gitIndexBytes: 1_024,
+  packageManifestSha256: '2'.repeat(64),
+  lockfileSha256: '3'.repeat(64),
+  lockfileBytes: 32_768,
+  nodeVersionPinSha256: '4'.repeat(64),
+  selfBuildEntrypointSha256: '5'.repeat(64),
+  launcherBootstrapSha256: 'a'.repeat(64),
+  launcherBootstrapFileCount: 9,
+  runtimePointerSha256: '6'.repeat(64),
+  nodePackageManifestSha256: '7'.repeat(64),
+  nodeExecutableSha256: '8'.repeat(64),
+  pnpmCliSha256: '9'.repeat(64),
+  reviewAggregateSha256: '0'.repeat(64),
+}
+
+const previewCandidateEvaluationAuthority: CandidateEvaluationPreflightRequest = {
+  expectedHostId: 'host-local',
+  threadId: 'thread-protocol',
+  expectedExecutionGenerationId: 'candidate-preview-generation',
+}
+
+const previewCandidateEvaluationPreflight = CandidateEvaluationPreflightSchema.parse({
+  preflightVersion: 1,
+  ...previewCandidateEvaluationAuthority,
+  observedAt: '2026-08-09T12:00:00.000Z',
+  boundary: previewCandidateEvaluationBoundary,
+  status: 'ready',
+  capability: PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  review: previewCandidateEvaluationReview,
+  executor: {
+    kind: 'canonical_self_build',
+    gateProcessContainment: 'windows_job',
+    requiredNodeVersion: '24.14.0',
+    requiredPnpmVersion: '11.9.0',
+    verification: 'passive-structure-before-consent;canonical-toolchain-inside-evaluation',
+    launcherSource: 'workspace-dependency-tree-candidate-controlled',
+  },
+})
+
+const previewCandidateEvaluationSnapshot = CandidateEvaluationSnapshotSchema.parse({
+  snapshotVersion: 1,
+  ...previewCandidateEvaluationAuthority,
+  generatedAt: '2026-08-09T12:00:01.000Z',
+  repeatEffectsWarningRequired: false,
+  evaluations: [],
+})
+
 class BrowserPreviewApi implements RendererApi {
-  readonly environment = 'preview' as const
+  readonly environment: 'native' | 'preview'
   private previewHudState: HudState = { state: 'closed' }
   private readonly hudListeners = new Set<(state: HudState) => void>()
 
   constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
+    this.environment = visualState === 'candidate-evaluation-review' ? 'native' : 'preview'
     if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
       this.previewHudState = {
         state: visualState === 'hud-buddy' ? 'buddy' : 'expanded',
@@ -1228,6 +1334,30 @@ class BrowserPreviewApi implements RendererApi {
     operationId: string
   }): Promise<ResidentLifecycleStatus | null> {
     return null
+  }
+
+  async candidateEvaluationPreflight(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationPreflight> {
+    if (
+      this.visualState !== 'candidate-evaluation-review' ||
+      !candidateEvaluationAuthorityMatches(input, previewCandidateEvaluationAuthority)
+    ) throw new Error('Candidate evaluation preflight is available only in its internal visual-QA state.')
+    return structuredClone(previewCandidateEvaluationPreflight)
+  }
+
+  async candidateEvaluationSnapshot(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationSnapshot> {
+    if (
+      this.visualState !== 'candidate-evaluation-review' ||
+      !candidateEvaluationAuthorityMatches(input, previewCandidateEvaluationAuthority)
+    ) throw new Error('Candidate evaluation history is available only in its internal visual-QA state.')
+    return structuredClone(previewCandidateEvaluationSnapshot)
+  }
+
+  async startCandidateEvaluation(_input: CandidateEvaluationStartRequest): Promise<CandidateEvaluationStatus> {
+    throw new Error('The visual-QA renderer never invokes candidate code.')
   }
 
   async discoverComputers(): Promise<DiscoveredComputer[]> {
@@ -1727,6 +1857,34 @@ class NativeBridgeError extends Error {
   }
 }
 
+const DEFINITIVE_CANDIDATE_EVALUATION_START_CODES = new Set([
+  'candidate.evaluation_live_connection_required',
+  'candidate.evaluation_authority_changed',
+  'candidate.evaluation_local_required',
+  'candidate.evaluation_unavailable',
+  'host.evaluation_busy',
+  'host.evaluation_outcome_unknown',
+  'host.candidate_changed',
+  'host.request_expired',
+  'host.evaluation_id_conflict',
+  'host.evaluation_storage_full',
+  'host.host_id_mismatch',
+  'host.evaluator_not_ready',
+  'host.evaluation_closed',
+  'host.invalid_request',
+  'host.incompatible_protocol',
+  'transport.offline',
+  'ipc.untrusted_sender',
+  'ipc.invalid_payload',
+  'ipc.payload_limit',
+])
+
+export function isDefinitiveCandidateEvaluationStartError(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const code = 'code' in value ? (value as { code?: unknown }).code : undefined
+  return typeof code === 'string' && DEFINITIVE_CANDIDATE_EVALUATION_START_CODES.has(code)
+}
+
 function bridgeError(raw: unknown): Error {
   const error = asRecord(raw)
   const message = asString(error?.message) ?? 'The native Prime service could not complete this request.'
@@ -1821,6 +1979,36 @@ function residentEndPreparationFromNative(value: unknown): ResidentEndPreparatio
 function createStableId(prefix: string): string {
   const uuid = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
   return `${prefix}:${uuid}`
+}
+
+function candidateEvaluationAuthorityMatches(
+  expected: CandidateEvaluationPreflightRequest,
+  received: CandidateEvaluationPreflightRequest,
+): boolean {
+  return expected.expectedHostId === received.expectedHostId &&
+    expected.threadId === received.threadId &&
+    expected.expectedExecutionGenerationId === received.expectedExecutionGenerationId
+}
+
+function candidateEvaluationReviewMatches(
+  expected: CandidateEvaluationReviewIdentity,
+  received: CandidateEvaluationReviewIdentity,
+): boolean {
+  return expected.headCommit === received.headCommit &&
+    expected.gitIndexSha256 === received.gitIndexSha256 &&
+    expected.gitIndexBytes === received.gitIndexBytes &&
+    expected.packageManifestSha256 === received.packageManifestSha256 &&
+    expected.lockfileSha256 === received.lockfileSha256 &&
+    expected.lockfileBytes === received.lockfileBytes &&
+    expected.nodeVersionPinSha256 === received.nodeVersionPinSha256 &&
+    expected.selfBuildEntrypointSha256 === received.selfBuildEntrypointSha256 &&
+    expected.launcherBootstrapSha256 === received.launcherBootstrapSha256 &&
+    expected.launcherBootstrapFileCount === received.launcherBootstrapFileCount &&
+    expected.runtimePointerSha256 === received.runtimePointerSha256 &&
+    expected.nodePackageManifestSha256 === received.nodePackageManifestSha256 &&
+    expected.nodeExecutableSha256 === received.nodeExecutableSha256 &&
+    expected.pnpmCliSha256 === received.pnpmCliSha256 &&
+    expected.reviewAggregateSha256 === received.reviewAggregateSha256
 }
 
 function getDeviceId(): string {
@@ -2825,6 +3013,14 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)
         ? { modelCatalog: true }
         : {}),
+      ...(selectedHostHasAuthority &&
+      selectedSnapshotIsMaterialized &&
+      activePhase === 'online' &&
+      asString(activeTarget?.kind) === 'local' &&
+      asString(rawConnection?.path) === 'local_socket' &&
+      advertisedCapabilities.includes(CANDIDATE_EVALUATION_PROBE_CAPABILITY)
+        ? { candidateEvaluationProbe: true }
+        : {}),
     },
     composerReceipt: selectedResidentEnd
       ? {
@@ -3012,6 +3208,40 @@ export class NativeRendererApi implements RendererApi {
 
   async hudOpen(target: HudTarget): Promise<HudState> {
     return this.call<HudState>('hudOpen', target)
+  }
+
+  async candidateEvaluationPreflight(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationPreflight> {
+    const preflight = CandidateEvaluationPreflightSchema.parse(
+      await this.call<unknown>('candidateEvaluationPreflight', input),
+    )
+    if (!candidateEvaluationAuthorityMatches(input, preflight)) throw new StaleHostAuthorityError()
+    return preflight
+  }
+
+  async startCandidateEvaluation(
+    input: CandidateEvaluationStartRequest,
+  ): Promise<CandidateEvaluationStatus> {
+    const status = CandidateEvaluationStatusSchema.parse(
+      await this.call<unknown>('startCandidateEvaluation', input),
+    )
+    if (
+      !candidateEvaluationAuthorityMatches(input, status) ||
+      status.operationId !== input.operationId ||
+      !candidateEvaluationReviewMatches(input.expectedReview, status.review)
+    ) throw new StaleHostAuthorityError()
+    return status
+  }
+
+  async candidateEvaluationSnapshot(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationSnapshot> {
+    const snapshot = CandidateEvaluationSnapshotSchema.parse(
+      await this.call<unknown>('candidateEvaluationSnapshot', input),
+    )
+    if (!candidateEvaluationAuthorityMatches(input, snapshot)) throw new StaleHostAuthorityError()
+    return snapshot
   }
 
   async hudState(): Promise<HudState> {

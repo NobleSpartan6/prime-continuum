@@ -15,7 +15,9 @@ import {
   describeToolchainSentinelMetadata,
   materializeEvaluationNodeRuntimeDependency,
   materializeGitCandidate,
+  requireCoordinatorRunId,
   runCommandSequence,
+  selfBuildWorkflowName,
   verifyReceiptFile,
   writeReceiptEnvelope,
 } from '../../scripts/self-build-lib.mjs'
@@ -31,6 +33,15 @@ afterEach(async () => {
 })
 
 describe('Prime Continuim self-build evidence', () => {
+  it('correlates coordinator runs through one exact top-level workflow identity', () => {
+    const runId = '12345678-1234-4123-8123-123456789abc'
+    expect(requireCoordinatorRunId(runId.toUpperCase())).toBe(runId)
+    expect(selfBuildWorkflowName(runId)).toBe(`self-build:${runId}`)
+    expect(selfBuildWorkflowName()).toBe('self-build')
+    expect(() => requireCoordinatorRunId('../receipt-private')).toThrow(/canonical UUID/)
+    expect(() => selfBuildWorkflowName('12345678-1234-0123-8123-123456789abc')).toThrow(/canonical UUID/)
+  })
+
   it('fences physical directory identity without treating pnpm index churn as tool replacement', () => {
     const directory = {
       isDirectory: () => true,
@@ -291,12 +302,18 @@ describe('Prime Continuim self-build evidence', () => {
     expect(environment).not.toHaveProperty('ELECTRON_RUN_AS_NODE')
     expect(environment).not.toHaveProperty('npm_config_modules_dir')
     expect(environment).not.toHaveProperty('VITE_PRIVATE_TOKEN')
-    expect(environment).toMatchObject({ CI: '1', npm_config_offline: 'true', GIT_CONFIG_NOSYSTEM: '1' })
+    expect(environment).toMatchObject({
+      CI: '1',
+      npm_config_offline: 'true',
+      COREPACK_ENABLE_NETWORK: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+    })
 
     const plan = createSelfBuildCommandPlan({
       root: process.cwd(),
       evaluationRoot: process.cwd(),
       toolchain: {
+        node: { absoluteExecutable: process.execPath },
         pnpm: { absoluteCli: process.execPath, absoluteStore: 'C:\\bounded-store' },
         electron: { absoluteExecutable: 'C:\\electron\\electron.exe' },
         runtimeSeed: { absoluteRoot: 'C:\\runtime-seed' },

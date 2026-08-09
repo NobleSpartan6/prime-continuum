@@ -5,6 +5,10 @@ import { isDeepStrictEqual } from 'node:util'
 import type { App } from 'electron'
 import {
   CapabilitySchema,
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  CandidateEvaluationPreflightSchema,
+  CandidateEvaluationSnapshotSchema,
+  CandidateEvaluationStatusSchema,
   CatalogProjectionSnapshotSchema,
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
@@ -26,6 +30,11 @@ import {
   ThreadProjectionSnapshotSchema,
   ThreadChangedEventPayloadSchema,
   type CatalogProjectionSnapshot,
+  type CandidateEvaluationPreflight,
+  type CandidateEvaluationPreflightRequest,
+  type CandidateEvaluationSnapshot,
+  type CandidateEvaluationStartRequest,
+  type CandidateEvaluationStatus,
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
@@ -690,6 +699,63 @@ export class DesktopControlService extends EventEmitter {
     )
     this.assertProjectionAuthority(authority, 'runtime model catalog')
     return RuntimeModelCatalogSnapshotSchema.parse(result)
+  }
+
+  async candidateEvaluationPreflight(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationPreflight> {
+    return await this.latency.measure('candidate.evaluation.preflight', async () => {
+      const authority = this.captureCandidateEvaluationAuthority(input.expectedHostId)
+      const result = await authority.connection.request(
+        'candidate.evaluation.preflight',
+        input,
+        { timeoutMs: 60_000 },
+      )
+      this.assertProjectionAuthority(authority, 'candidate evaluation preflight')
+      const preflight = CandidateEvaluationPreflightSchema.parse(result)
+      assertCandidateEvaluationAuthority(input, preflight, 'preflight')
+      return preflight
+    })
+  }
+
+  async startCandidateEvaluation(
+    input: CandidateEvaluationStartRequest,
+  ): Promise<CandidateEvaluationStatus> {
+    return await this.latency.measure('candidate.evaluation.start', async () => {
+      const authority = this.captureCandidateEvaluationAuthority(input.expectedHostId)
+      const result = await authority.connection.request(
+        'candidate.evaluation.start',
+        input,
+        { timeoutMs: 60_000 },
+      )
+      this.assertProjectionAuthority(authority, 'candidate evaluation start')
+      const status = CandidateEvaluationStatusSchema.parse(result)
+      assertCandidateEvaluationAuthority(input, status, 'start')
+      if (status.operationId !== input.operationId || !isDeepStrictEqual(status.review, input.expectedReview)) {
+        throw new ControlError(
+          'protocol.candidate_evaluation_identity_mismatch',
+          'The candidate evaluation reply did not match the exact operation and passive review identity.',
+        )
+      }
+      return status
+    })
+  }
+
+  async candidateEvaluationSnapshot(
+    input: CandidateEvaluationPreflightRequest,
+  ): Promise<CandidateEvaluationSnapshot> {
+    return await this.latency.measure('candidate.evaluation.snapshot', async () => {
+      const authority = this.captureCandidateEvaluationAuthority(input.expectedHostId)
+      const result = await authority.connection.request(
+        'candidate.evaluation.snapshot',
+        input,
+        { timeoutMs: 30_000 },
+      )
+      this.assertProjectionAuthority(authority, 'candidate evaluation snapshot')
+      const snapshot = CandidateEvaluationSnapshotSchema.parse(result)
+      assertCandidateEvaluationAuthority(input, snapshot, 'snapshot')
+      return snapshot
+    })
   }
 
   async retryRuntimeIntegrity(expectedHostId: string): Promise<RuntimeIntegritySnapshot> {
@@ -2717,6 +2783,41 @@ export class DesktopControlService extends EventEmitter {
     return authority
   }
 
+  private captureCandidateEvaluationAuthority(expectedHostId: string): CapturedProjectionAuthority {
+    const authority = this.captureProjectionAuthority()
+    if (this.state.phase !== 'online') {
+      throw new ControlError(
+        'candidate.evaluation_live_connection_required',
+        'Candidate evaluation requires a live, fully reconciled host connection.',
+        { retryable: true },
+      )
+    }
+    if (authority.hostId !== expectedHostId) {
+      throw new ControlError(
+        'candidate.evaluation_authority_changed',
+        'The candidate evaluation belongs to a different host authority.',
+        {
+          retryable: true,
+          details: { expectedHostId, connectedHostId: authority.hostId },
+        },
+      )
+    }
+    if (authority.target.kind !== 'local' || this.state.path !== 'local_socket') {
+      throw new ControlError(
+        'candidate.evaluation_local_required',
+        'Candidate evaluation is available only for a workspace on this computer.',
+      )
+    }
+    if (!this.authorityCapabilities.includes(CANDIDATE_EVALUATION_PROBE_CAPABILITY)) {
+      throw new ControlError(
+        'candidate.evaluation_unavailable',
+        'The connected host does not expose candidate evaluation preflight.',
+        { retryable: true },
+      )
+    }
+    return authority
+  }
+
   private async readResidentLifecycleLedger(): Promise<ResidentLifecycleLedger> {
     return normalizeResidentLifecycleLedger(await this.residentLifecycleLedger.read())
   }
@@ -4727,6 +4828,23 @@ export class DesktopControlService extends EventEmitter {
       await this.retireDurableUncertainReceipt(receipt)
       await this.removeOutbox([identity])
     })
+  }
+}
+
+function assertCandidateEvaluationAuthority(
+  expected: CandidateEvaluationPreflightRequest,
+  received: CandidateEvaluationPreflightRequest,
+  operation: string,
+): void {
+  if (
+    received.expectedHostId !== expected.expectedHostId ||
+    received.threadId !== expected.threadId ||
+    received.expectedExecutionGenerationId !== expected.expectedExecutionGenerationId
+  ) {
+    throw new ControlError(
+      'protocol.candidate_evaluation_authority_mismatch',
+      `The candidate evaluation ${operation} reply did not match the exact reviewed host and thread generation.`,
+    )
   }
 }
 

@@ -17,6 +17,12 @@ import {
   type WorkbenchSnapshot,
 } from '../../src/renderer/src/api'
 import type { HudMode, HudState, HudTarget } from '../../src/shared/window-control'
+import type {
+  CandidateEvaluationPreflight,
+  CandidateEvaluationSnapshot,
+  CandidateEvaluationStartRequest,
+  CandidateEvaluationStatus,
+} from '../../src/shared/protocol'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -44,6 +50,172 @@ function createNativeUiFixture(): RendererApi {
   api.discoverComputers = async () => (await discoverComputers()).map(verified)
   api.probeComputer = async (input) => verified(await probeComputer(input))
   return api
+}
+
+const candidateEvaluationBoundary = {
+  securitySandbox: false,
+  mainFilesystemIsolation: false,
+  providerBackedEvaluation: false,
+  autonomousPromotion: false,
+  candidateControlledEvaluation: true,
+  packageOrInstallerGate: false,
+  authenticated: false,
+  integrity: 'sha256-correlation-only-not-authentication' as const,
+}
+
+const candidateEvaluationSource = {
+  headCommit: 'a'.repeat(40),
+  dirty: true,
+  statusPorcelainV2Sha256: 'b'.repeat(64),
+  statusBytes: 42,
+  binaryPatchSha256: 'c'.repeat(64),
+  binaryPatchBytes: 512,
+  untrackedManifestSha256: 'd'.repeat(64),
+  untrackedFileCount: 1,
+  untrackedBytes: 24,
+  treeSha256: 'e'.repeat(64),
+  treeFileCount: 334,
+  treeBytes: 7_879_590,
+}
+
+const candidateEvaluationReview = {
+  headCommit: 'a'.repeat(40),
+  gitIndexSha256: '1'.repeat(64),
+  gitIndexBytes: 1_024,
+  packageManifestSha256: '2'.repeat(64),
+  lockfileSha256: '3'.repeat(64),
+  lockfileBytes: 32_768,
+  nodeVersionPinSha256: '4'.repeat(64),
+  selfBuildEntrypointSha256: '5'.repeat(64),
+  launcherBootstrapSha256: 'a'.repeat(64),
+  launcherBootstrapFileCount: 9 as const,
+  runtimePointerSha256: '6'.repeat(64),
+  nodePackageManifestSha256: '7'.repeat(64),
+  nodeExecutableSha256: '8'.repeat(64),
+  pnpmCliSha256: '9'.repeat(64),
+  reviewAggregateSha256: '0'.repeat(64),
+}
+
+const candidateEvaluationUncertain: CandidateEvaluationStatus = {
+  statusVersion: 1,
+  expectedHostId: 'host-local',
+  threadId: 'thread-protocol',
+  expectedExecutionGenerationId: 'candidate-generation-one',
+  operationId: 'candidate-evaluation:uncertain-one',
+  kind: 'prime_continuim_self_build_v1',
+  requestedAt: '2026-08-09T12:00:00.000Z',
+  updatedAt: '2026-08-09T12:01:00.000Z',
+  completedAt: '2026-08-09T12:01:00.000Z',
+  invocationStartedAt: '2026-08-09T12:00:01.000Z',
+  status: 'uncertain',
+  review: candidateEvaluationReview,
+  boundary: candidateEvaluationBoundary,
+  error: {
+    code: 'EVALUATION_OUTCOME_UNKNOWN',
+    message: 'The exact invocation outcome is unknown.',
+    retryable: false,
+  },
+}
+
+function createCandidateEvaluationHarness(
+  initialEvaluations: CandidateEvaluationStatus[] = [],
+  initialRepeatEffectsWarningRequired = initialEvaluations.some((evaluation) => evaluation.status === 'uncertain'),
+) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  const listeners = new Set<(next: WorkbenchSnapshot) => void>()
+  let current = structuredClone(previewSnapshot)
+  const thread = current.threads.find((entry) => entry.id === 'thread-protocol')!
+  const host = current.hosts.find((entry) => entry.id === 'host-local')!
+  current.selectedThreadId = thread.id
+  current.selectedProjectId = thread.projectId
+  thread.executionGenerationId = 'candidate-generation-one'
+  thread.workspaceId = 'candidate-workspace-one'
+  thread.status = 'idle'
+  host.connection = 'online'
+  host.kind = 'local'
+  host.connectionPath = 'Local socket'
+  current.evidence = []
+  current.operations = {
+    submitCommands: false,
+    crossHostHandoff: false,
+    candidateEvaluationProbe: true,
+  }
+  current.runtime = {}
+  current.composerReceipt = { state: 'idle', message: '' }
+  const authority = {
+    expectedHostId: host.id,
+    threadId: thread.id,
+    expectedExecutionGenerationId: thread.executionGenerationId,
+  }
+  let evaluations = structuredClone(initialEvaluations)
+  let repeatEffectsWarningRequired = initialRepeatEffectsWarningRequired
+  let snapshotSequence = 0
+  const ready: CandidateEvaluationPreflight = {
+    preflightVersion: 1,
+    ...authority,
+    observedAt: '2026-08-09T12:00:00.000Z',
+    boundary: candidateEvaluationBoundary,
+    status: 'ready',
+    capability: 'prime_continuim_self_build_evaluation_v1',
+    review: candidateEvaluationReview,
+    executor: {
+      kind: 'canonical_self_build',
+      gateProcessContainment: 'windows_job',
+      requiredNodeVersion: '24.14.0',
+      requiredPnpmVersion: '11.9.0',
+      verification: 'passive-structure-before-consent;canonical-toolchain-inside-evaluation',
+      launcherSource: 'workspace-dependency-tree-candidate-controlled',
+    },
+  }
+  const snapshot = (): CandidateEvaluationSnapshot => ({
+    snapshotVersion: 1,
+    ...authority,
+    generatedAt: `2026-08-09T12:00:${String(snapshotSequence++).padStart(2, '0')}.000Z`,
+    repeatEffectsWarningRequired,
+    evaluations: structuredClone(evaluations),
+  })
+  api.loadWorkbench = vi.fn(async () => structuredClone(current))
+  api.subscribe = vi.fn((listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  })
+  api.candidateEvaluationPreflight = vi.fn(async () => structuredClone(ready))
+  api.candidateEvaluationSnapshot = vi.fn(async () => snapshot())
+  api.startCandidateEvaluation = vi.fn(async (input: CandidateEvaluationStartRequest) => {
+    const running: CandidateEvaluationStatus = {
+      statusVersion: 1,
+      expectedHostId: input.expectedHostId,
+      threadId: input.threadId,
+      expectedExecutionGenerationId: input.expectedExecutionGenerationId,
+      operationId: input.operationId,
+      kind: input.kind,
+      requestedAt: input.requestedAt,
+      updatedAt: '2026-08-09T12:00:10.000Z',
+      status: 'running',
+      review: input.expectedReview,
+      invocationStartedAt: '2026-08-09T12:00:10.000Z',
+      boundary: candidateEvaluationBoundary,
+    }
+    evaluations = [running]
+    return structuredClone(running)
+  })
+  const publish = (next: WorkbenchSnapshot) => {
+    current = structuredClone(next)
+    listeners.forEach((listener) => listener(structuredClone(current)))
+  }
+  return {
+    api,
+    authority,
+    ready,
+    snapshot: () => structuredClone(current),
+    publish,
+    setEvaluations(next: CandidateEvaluationStatus[]) {
+      evaluations = structuredClone(next)
+    },
+    setRepeatEffectsWarningRequired(next: boolean) {
+      repeatEffectsWarningRequired = next
+    },
+  }
 }
 
 function createHostActivationHarness() {
@@ -2562,6 +2734,397 @@ describe('Prime Continuim renderer', () => {
     const contextPanel = screen.getByRole('tabpanel', { name: 'Context' })
     expect(within(contextPanel).getByText(/Offline · Last synchronized 18 min ago/)).toBeVisible()
     expect(within(contextPanel).queryByText('Running')).not.toBeInTheDocument()
+  })
+
+  it('withholds candidate evaluation until fresh exact preflight and restores focus when Escape cancels review', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    const preflight = deferred<CandidateEvaluationPreflight>()
+    harness.api.candidateEvaluationPreflight = vi.fn(() => preflight.promise)
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    expect(screen.queryByRole('button', { name: 'Evaluate candidate' })).not.toBeInTheDocument()
+
+    await act(async () => preflight.resolve(structuredClone(harness.ready)))
+    const trigger = await screen.findByRole('button', { name: 'Evaluate candidate' })
+    expect(screen.getByText(/Passive launcher\/workspace review fingerprint ready · this is not the canonical candidate/i)).toBeVisible()
+    expect(screen.getByText('Passive fingerprint')).toBeVisible()
+    expect(screen.queryByText(/Includes uncommitted bytes|334 files/i)).not.toBeInTheDocument()
+    trigger.focus()
+    await user.click(trigger)
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    expect(within(dialog).getByText(/capture the canonical candidate and toolchain inside the consented self-build evaluation/i)).toBeVisible()
+    expect(within(dialog).getByText(/Candidate scripts run with your user permissions/i)).toBeVisible()
+    expect(within(dialog).getByText(/copied worktree does not isolate the main filesystem/i)).toBeVisible()
+
+    fireEvent(dialog, new Event('cancel', { bubbles: false, cancelable: true }))
+    await waitFor(() => expect(dialog).not.toHaveAttribute('open'))
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(harness.api.startCandidateEvaluation).not.toHaveBeenCalled()
+  })
+
+  it('clears an unused envelope when the pre-start read-only recheck fails and permits a fresh review', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    const basePreflight = harness.api.candidateEvaluationPreflight!.bind(harness.api)
+    let preflightCall = 0
+    harness.api.candidateEvaluationPreflight = vi.fn((input) => {
+      preflightCall += 1
+      if (preflightCall === 2) return Promise.reject(new Error('Fresh preflight connection lost'))
+      return basePreflight(input)
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    let dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    expect(await within(dialog).findByText('Fresh preflight connection lost')).toBeVisible()
+    expect(harness.api.startCandidateEvaluation).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    const retryTrigger = await screen.findByRole('button', { name: 'Evaluate candidate' })
+    await user.click(retryTrigger)
+    dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    await waitFor(() => expect(harness.api.startCandidateEvaluation).toHaveBeenCalledOnce())
+    expect(harness.api.candidateEvaluationSnapshot).toHaveBeenCalledTimes(3)
+  })
+
+  it('reconciles a lost start acknowledgement by the one minted operation without invoking it again', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    let invokedEnvelope: CandidateEvaluationStartRequest | undefined
+    harness.api.startCandidateEvaluation = vi.fn(async (input) => {
+      invokedEnvelope = input
+      throw new Error('Start acknowledgement lost')
+    })
+    const baseSnapshot = harness.api.candidateEvaluationSnapshot!.bind(harness.api)
+    let snapshotCall = 0
+    harness.api.candidateEvaluationSnapshot = vi.fn(async (input) => {
+      snapshotCall += 1
+      if (snapshotCall < 3 || !invokedEnvelope) return baseSnapshot(input)
+      const running: CandidateEvaluationStatus = {
+        statusVersion: 1,
+        expectedHostId: invokedEnvelope.expectedHostId,
+        threadId: invokedEnvelope.threadId,
+        expectedExecutionGenerationId: invokedEnvelope.expectedExecutionGenerationId,
+        operationId: invokedEnvelope.operationId,
+        kind: invokedEnvelope.kind,
+        requestedAt: invokedEnvelope.requestedAt,
+        updatedAt: '2026-08-09T12:00:20.000Z',
+        status: 'running',
+        review: invokedEnvelope.expectedReview,
+        invocationStartedAt: '2026-08-09T12:00:10.000Z',
+        boundary: candidateEvaluationBoundary,
+      }
+      return {
+        snapshotVersion: 1,
+        ...harness.authority,
+        generatedAt: '2026-08-09T12:00:21.000Z',
+        repeatEffectsWarningRequired: false,
+        evaluations: [running],
+      }
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    expect(await screen.findByText(/start acknowledgement is unavailable/i)).toBeVisible()
+    await waitFor(() => expect(harness.api.candidateEvaluationSnapshot).toHaveBeenCalledTimes(3), { timeout: 3_000 })
+    expect(invokedEnvelope).toBeDefined()
+    expect(screen.getByText(invokedEnvelope!.operationId)).toBeVisible()
+    expect(harness.api.startCandidateEvaluation).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: 'Evaluate candidate' })).not.toBeInTheDocument()
+  })
+
+  it('clears the pending envelope after a definitive pre-admission host rejection', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    harness.api.startCandidateEvaluation = vi.fn(async () => {
+      throw Object.assign(new Error('Another evaluation is already active.'), {
+        code: 'host.evaluation_busy',
+      })
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    expect(await within(dialog).findByText('Another evaluation is already active.')).toBeVisible()
+    expect(screen.getByText('The evaluation was rejected before admission. No operation was started.')).toBeVisible()
+    expect(screen.queryByText(/start acknowledgement is unavailable/i)).not.toBeInTheDocument()
+    expect(harness.api.startCandidateEvaluation).toHaveBeenCalledTimes(1)
+    expect(harness.api.candidateEvaluationSnapshot).toHaveBeenCalledTimes(2)
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(await screen.findByRole('button', { name: 'Evaluate candidate' })).toBeVisible()
+  })
+
+  it('keeps an unresolved uncertain invocation behind the host-wide preflight barrier', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness([candidateEvaluationUncertain])
+    harness.api.candidateEvaluationPreflight = vi.fn(async () => ({
+      preflightVersion: 1,
+      ...harness.authority,
+      observedAt: '2026-08-09T12:02:00.000Z',
+      boundary: candidateEvaluationBoundary,
+      status: 'unavailable' as const,
+      code: 'EVALUATION_OUTCOME_UNKNOWN' as const,
+      message: 'The prior invocation has not been proven retired.',
+      retryable: false,
+    }))
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+
+    expect(await screen.findByText(/EVALUATION_OUTCOME_UNKNOWN · The prior invocation has not been proven retired/)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Evaluate candidate' })).not.toBeInTheDocument()
+    expect(harness.api.startCandidateEvaluation).not.toHaveBeenCalled()
+  })
+
+  it('uses the authority hazard when an uncertain record is hidden beyond the 32 returned evaluations', async () => {
+    const user = userEvent.setup()
+    const visibleHistory = Array.from({ length: 32 }, (_, index): CandidateEvaluationStatus => ({
+      statusVersion: 1,
+      expectedHostId: 'host-local',
+      threadId: 'thread-protocol',
+      expectedExecutionGenerationId: 'candidate-generation-one',
+      operationId: `candidate-evaluation:visible-failure-${index}`,
+      kind: 'prime_continuim_self_build_v1',
+      requestedAt: '2026-08-09T11:59:00.000Z',
+      updatedAt: `2026-08-09T12:00:${String(index).padStart(2, '0')}.000Z`,
+      completedAt: `2026-08-09T12:00:${String(index).padStart(2, '0')}.000Z`,
+      status: 'failed',
+      review: candidateEvaluationReview,
+      boundary: candidateEvaluationBoundary,
+      error: {
+        code: 'EVALUATION_FAILED',
+        message: 'Visible settled failure.',
+        retryable: true,
+      },
+    }))
+    expect(visibleHistory).toHaveLength(32)
+    expect(visibleHistory.some((evaluation) => evaluation.status === 'uncertain')).toBe(false)
+    const harness = createCandidateEvaluationHarness(visibleHistory, true)
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    expect(within(dialog).getByText(/previous outcome is unknown/i)).toBeVisible()
+    expect(within(dialog).getByText(/may repeat candidate-script effects/i)).toBeVisible()
+  })
+
+  it('requires stronger re-consent when the authority hazard appears during the submit recheck', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    const baseSnapshot = harness.api.candidateEvaluationSnapshot!.bind(harness.api)
+    let snapshotCall = 0
+    harness.api.candidateEvaluationSnapshot = vi.fn(async (input) => {
+      const result = await baseSnapshot(input)
+      snapshotCall += 1
+      return snapshotCall >= 2
+        ? { ...result, repeatEffectsWarningRequired: true }
+        : result
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    expect(within(dialog).getByText(/This is not a security sandbox/i)).toBeVisible()
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    expect(await within(dialog).findByText(/history now requires the repeated-effects warning/i)).toBeVisible()
+    expect(within(dialog).getByText(/previous outcome is unknown/i)).toBeVisible()
+    expect(within(dialog).getByRole('checkbox')).not.toBeChecked()
+    await waitFor(() => expect(within(dialog).getByRole('checkbox')).toHaveFocus())
+    expect(harness.api.startCandidateEvaluation).not.toHaveBeenCalled()
+
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+    await waitFor(() => expect(harness.api.startCandidateEvaluation).toHaveBeenCalledOnce())
+  })
+
+  it('requires fresh consent and a new operation after the host retires a different uncertain passive review', async () => {
+    const user = userEvent.setup()
+    const differentReviewUncertain: CandidateEvaluationStatus = {
+      ...candidateEvaluationUncertain,
+      review: {
+        ...candidateEvaluationReview,
+        headCommit: 'f'.repeat(40),
+        reviewAggregateSha256: 'f'.repeat(64),
+      },
+    }
+    const harness = createCandidateEvaluationHarness([differentReviewUncertain])
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    expect(within(dialog).getByText(/previous outcome is unknown/i)).toBeVisible()
+    expect(within(dialog).getByText(/may repeat candidate-script effects/i)).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+    expect(await within(dialog).findByText(/Confirm that you understand/i)).toBeVisible()
+    expect(harness.api.startCandidateEvaluation).not.toHaveBeenCalled()
+
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+    await waitFor(() => expect(harness.api.startCandidateEvaluation).toHaveBeenCalledOnce())
+    const envelope = vi.mocked(harness.api.startCandidateEvaluation!).mock.calls[0]?.[0]
+    expect(envelope?.operationId).not.toBe(differentReviewUncertain.operationId)
+    expect(envelope?.expectedReview).toEqual(candidateEvaluationReview)
+    expect(harness.api.candidateEvaluationPreflight).toHaveBeenCalledTimes(2)
+  })
+
+  it('mints one exact confirmed envelope and cancels stale polling when selection changes', async () => {
+    const user = userEvent.setup()
+    const harness = createCandidateEvaluationHarness()
+    const baseSnapshot = harness.api.candidateEvaluationSnapshot!.bind(harness.api)
+    const inFlightPoll = deferred<CandidateEvaluationSnapshot>()
+    let snapshotCall = 0
+    harness.api.candidateEvaluationSnapshot = vi.fn((input) => {
+      snapshotCall += 1
+      return snapshotCall === 3 ? inFlightPoll.promise : baseSnapshot(input)
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    await user.click(await screen.findByRole('button', { name: 'Evaluate candidate' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Evaluate this candidate?' })
+    await user.click(within(dialog).getByRole('checkbox'))
+    await user.click(within(dialog).getByRole('button', { name: 'Run evaluation' }))
+
+    await waitFor(() => expect(harness.api.startCandidateEvaluation).toHaveBeenCalledOnce())
+    const envelope = vi.mocked(harness.api.startCandidateEvaluation!).mock.calls[0]?.[0]
+    expect(envelope).toMatchObject({
+      ...harness.authority,
+      kind: 'prime_continuim_self_build_v1',
+      expectedReview: candidateEvaluationReview,
+    })
+    expect(envelope).not.toHaveProperty('expectedCandidate')
+    expect(envelope?.operationId).toMatch(/^candidate-evaluation:/)
+    expect(JSON.stringify(envelope)).not.toMatch(/[A-Z]:\\|\/Users\/|workspaceDirectory|receiptPath/i)
+    expect((await screen.findAllByText('Self-build invocation started'))[0]).toBeVisible()
+    await waitFor(() => expect(harness.api.candidateEvaluationSnapshot).toHaveBeenCalledTimes(3), { timeout: 3_000 })
+
+    const next = harness.snapshot()
+    const nextThread = next.threads.find((entry) => entry.id === 'thread-seamless')!
+    next.selectedThreadId = nextThread.id
+    next.selectedProjectId = nextThread.projectId
+    next.operations.candidateEvaluationProbe = false
+    await act(async () => harness.publish(next))
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    const passed: CandidateEvaluationStatus = {
+      statusVersion: 1,
+      ...harness.authority,
+      operationId: envelope!.operationId,
+      kind: 'prime_continuim_self_build_v1',
+      requestedAt: envelope!.requestedAt,
+      updatedAt: '2026-08-09T12:00:20.000Z',
+      completedAt: '2026-08-09T12:00:20.000Z',
+      invocationStartedAt: '2026-08-09T12:00:10.000Z',
+      status: 'passed',
+      review: candidateEvaluationReview,
+      candidate: candidateEvaluationSource,
+      boundary: candidateEvaluationBoundary,
+      receipt: {
+        receiptVersion: 1,
+        kind: 'prime_continuim_candidate_evaluation_evidence',
+        selfBuildRunId: '11111111-1111-4111-8111-111111111111',
+        selfBuildReceiptSha256: 'f'.repeat(64),
+        outcome: 'passed',
+        settledGateCount: 6,
+        gateCount: 6,
+        artifactAggregateSha256: '0'.repeat(64),
+        artifactFileCount: 2,
+        completedAt: '2026-08-09T12:00:20.000Z',
+        boundary: candidateEvaluationBoundary,
+      },
+    }
+    await act(async () => inFlightPoll.resolve({
+      snapshotVersion: 1,
+      ...harness.authority,
+      generatedAt: '2026-08-09T12:00:21.000Z',
+      repeatEffectsWarningRequired: false,
+      evaluations: [passed],
+    }))
+    expect(screen.queryByText('Candidate evaluation passed')).not.toBeInTheDocument()
+  })
+
+  it('reports only receipt-backed gates and artifacts without inventing test counts', async () => {
+    const user = userEvent.setup()
+    const passed: CandidateEvaluationStatus = {
+      statusVersion: 1,
+      expectedHostId: 'host-local',
+      threadId: 'thread-protocol',
+      expectedExecutionGenerationId: 'candidate-generation-one',
+      operationId: 'candidate-evaluation:passed-one',
+      kind: 'prime_continuim_self_build_v1',
+      requestedAt: '2026-08-09T12:00:00.000Z',
+      updatedAt: '2026-08-09T12:01:00.000Z',
+      completedAt: '2026-08-09T12:01:00.000Z',
+      invocationStartedAt: '2026-08-09T12:00:01.000Z',
+      status: 'passed',
+      review: candidateEvaluationReview,
+      candidate: candidateEvaluationSource,
+      boundary: candidateEvaluationBoundary,
+      receipt: {
+        receiptVersion: 1,
+        kind: 'prime_continuim_candidate_evaluation_evidence',
+        selfBuildRunId: '22222222-2222-4222-8222-222222222222',
+        selfBuildReceiptSha256: 'f'.repeat(64),
+        outcome: 'passed',
+        settledGateCount: 6,
+        gateCount: 6,
+        artifactAggregateSha256: '0'.repeat(64),
+        artifactFileCount: 2,
+        completedAt: '2026-08-09T12:01:00.000Z',
+        boundary: candidateEvaluationBoundary,
+      },
+    }
+    const harness = createCandidateEvaluationHarness([passed])
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Frame protocol boundaries' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    expect(await screen.findByText('Candidate evaluation passed')).toBeVisible()
+    expect(screen.getByText('6 of 6 build gates settled · 2 release artifacts')).toBeVisible()
+    expect(screen.queryByText(/tests passed/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Evaluate candidate' })).not.toBeInTheDocument()
   })
 
   it('omits controls that do not have backing operations', async () => {

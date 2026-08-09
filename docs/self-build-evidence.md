@@ -93,3 +93,40 @@ a security sandbox, ask a model to review or improve the candidate,
 authenticate a provider, promote or commit a result, package an installer,
 sign an artifact, or prove a non-Windows release. Those are separate
 implementation and release gates.
+
+## Native evaluation coordinator
+
+The Windows desktop can start this same runner from the **Evidence** panel for
+one exact local host, thread, and execution generation. The renderer never
+sends a filesystem path, executable, argument vector, or environment value.
+Before showing the action, hostd performs a bounded passive review of Git
+administrative bytes, the canonical launcher bootstrap, required manifests,
+and the resolved Node and pnpm launcher bytes. It uses direct file reads and
+hashes only. It does not run Git, Node, pnpm, hooks, filters, or candidate code.
+
+The passive fingerprint is an advisory consent aid. It is not the canonical
+candidate identity, an executed-byte attestation, or a security boundary. The
+complete candidate and toolchain identities are captured by the consented
+self-build itself and become public only with its verified no-replace receipt.
+The confirmation therefore says that candidate scripts run with the current
+Windows user's permissions and can access the same files as that user.
+
+Before launch, the host persists an immutable operation ID, request time,
+passive review, private workspace authority, and coordinator-chosen self-build
+run ID. The runner writes that run ID into its main workflow lock, so recovery
+can distinguish the operation from an unrelated manual self-build. A lost
+start response is reconciled by the same operation ID and is never retried with
+a new invocation. Receipt publication and process retirement are independent:
+a valid receipt may settle the public outcome, but no new evaluation is
+admitted until the trusted Windows Job holder has retired; candidate processes
+admitted to that Job are kill-on-close. A timeout, invalid receipt, crash, or
+unknown outcome cannot weaken that barrier. Once retirement is proven, a
+separate operation still requires a fresh passive review and explicit consent;
+the interface warns that an earlier unknown operation may have had external
+effects.
+
+This coordinator is intentionally unavailable on macOS, Linux, SSH, and relay
+sessions. Process groups are not a non-escapable containment boundary for
+candidate-controlled code, and this slice does not substitute them for the
+Windows Job Object proof. The coordinator does not install, commit, promote,
+or automatically modify the evaluated source.

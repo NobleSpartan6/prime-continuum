@@ -56,6 +56,10 @@ export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const
 export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
 export const RESIDENT_CONTROL_PROJECTION_CAPABILITY = "resident_control_projection_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
+/** Trusted-local probe only; executable self-evaluation remains workspace-scoped. */
+export const CANDIDATE_EVALUATION_PROBE_CAPABILITY = "candidate_evaluation_probe_v1" as const;
+export const PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY =
+  "prime_continuim_self_build_evaluation_v1" as const;
 
 /** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
 export const ThreadChangedEventPayloadSchema = z
@@ -541,6 +545,349 @@ export const EvidenceSummarySchema = z.object({
   lastUpdatedAt: IsoDateTimeSchema.optional(),
 });
 export type EvidenceSummary = z.infer<typeof EvidenceSummarySchema>;
+
+const Sha256Schema = z.string().length(64).regex(/^[a-f0-9]{64}$/);
+
+/**
+ * Exact path-free identity emitted by the canonical self-build candidate
+ * capture. It correlates evidence to bytes; it is not an authenticated source
+ * identity.
+ */
+export const CandidateSourceIdentitySchema = z
+  .object({
+    headCommit: z.string().regex(/^[a-f0-9]{40,64}$/),
+    dirty: z.boolean(),
+    statusPorcelainV2Sha256: Sha256Schema,
+    statusBytes: z.number().int().nonnegative().max(16 * 1024 * 1024),
+    binaryPatchSha256: Sha256Schema,
+    binaryPatchBytes: z.number().int().nonnegative().max(64 * 1024 * 1024),
+    untrackedManifestSha256: Sha256Schema,
+    untrackedFileCount: z.number().int().nonnegative().max(2_000),
+    untrackedBytes: z.number().int().nonnegative().max(128 * 1024 * 1024),
+    treeSha256: Sha256Schema,
+    treeFileCount: z.number().int().positive().max(20_000),
+    treeBytes: z.number().int().nonnegative().max(512 * 1024 * 1024),
+  })
+  .strict();
+export type CandidateSourceIdentity = z.infer<typeof CandidateSourceIdentitySchema>;
+
+/** Passive, non-executing identity for the bytes reviewed before consent. */
+/**
+ * Passive, path-free change-detection fingerprint shown before consent. It is
+ * rechecked immediately before admission but is not an authenticated or
+ * handle-pinned execution identity; canonical candidate/toolchain evidence is
+ * produced only by the consented self-build receipt.
+ */
+export const CandidateEvaluationReviewIdentitySchema = z
+  .object({
+    headCommit: z.string().regex(/^[a-f0-9]{40,64}$/),
+    gitIndexSha256: Sha256Schema,
+    gitIndexBytes: z.number().int().positive().max(128 * 1024 * 1024),
+    packageManifestSha256: Sha256Schema,
+    lockfileSha256: Sha256Schema,
+    lockfileBytes: z.number().int().positive().max(64 * 1024 * 1024),
+    nodeVersionPinSha256: Sha256Schema,
+    selfBuildEntrypointSha256: Sha256Schema,
+    launcherBootstrapSha256: Sha256Schema,
+    launcherBootstrapFileCount: z.literal(9),
+    runtimePointerSha256: Sha256Schema,
+    nodePackageManifestSha256: Sha256Schema,
+    nodeExecutableSha256: Sha256Schema,
+    pnpmCliSha256: Sha256Schema,
+    reviewAggregateSha256: Sha256Schema,
+  })
+  .strict();
+export type CandidateEvaluationReviewIdentity = z.infer<
+  typeof CandidateEvaluationReviewIdentitySchema
+>;
+
+/** Explicitly negative assurance claims for the first self-evaluation slice. */
+export const CandidateEvaluationBoundarySchema = z
+  .object({
+    securitySandbox: z.literal(false),
+    mainFilesystemIsolation: z.literal(false),
+    providerBackedEvaluation: z.literal(false),
+    autonomousPromotion: z.literal(false),
+    candidateControlledEvaluation: z.literal(true),
+    packageOrInstallerGate: z.literal(false),
+    authenticated: z.literal(false),
+    integrity: z.literal("sha256-correlation-only-not-authentication"),
+  })
+  .strict();
+export type CandidateEvaluationBoundary = z.infer<typeof CandidateEvaluationBoundarySchema>;
+
+const CandidateEvaluationAuthorityFields = {
+  expectedHostId: IdSchema,
+  threadId: IdSchema,
+  expectedExecutionGenerationId: IdSchema,
+};
+
+export const CandidateEvaluationPreflightRequestSchema = z
+  .object(CandidateEvaluationAuthorityFields)
+  .strict();
+export type CandidateEvaluationPreflightRequest = z.infer<
+  typeof CandidateEvaluationPreflightRequestSchema
+>;
+
+const CandidateEvaluationUnavailableCodeSchema = z.enum([
+  "EVALUATOR_NOT_CONFIGURED",
+  "RUNTIME_NOT_READY",
+  "WORKSPACE_NOT_PRIME_CONTINUIM",
+  "WORKSPACE_AUTHORITY_CHANGED",
+  "GIT_CONTEXT_INVALID",
+  "TOOLCHAIN_UNAVAILABLE",
+  "CANDIDATE_INVALID",
+  "EVALUATION_BUSY",
+  "EVALUATION_OUTCOME_UNKNOWN",
+]);
+
+const CandidateEvaluationPreflightBase = {
+  preflightVersion: z.literal(1),
+  ...CandidateEvaluationAuthorityFields,
+  observedAt: IsoDateTimeSchema,
+  boundary: CandidateEvaluationBoundarySchema,
+};
+
+export const CandidateEvaluationPreflightSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      ...CandidateEvaluationPreflightBase,
+      status: z.literal("ready"),
+      capability: z.literal(PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY),
+      review: CandidateEvaluationReviewIdentitySchema,
+      executor: z
+        .object({
+          kind: z.literal("canonical_self_build"),
+          gateProcessContainment: z.enum(["windows_job", "posix_process_group"]),
+          requiredNodeVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
+          requiredPnpmVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
+          verification: z.literal("passive-structure-before-consent;canonical-toolchain-inside-evaluation"),
+          launcherSource: z.literal("workspace-dependency-tree-candidate-controlled"),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...CandidateEvaluationPreflightBase,
+      status: z.literal("unavailable"),
+      code: CandidateEvaluationUnavailableCodeSchema,
+      message: z.string().min(1).max(1_024).regex(/^[^\0\r\n]+$/),
+      retryable: z.boolean(),
+    })
+    .strict(),
+]);
+export type CandidateEvaluationPreflight = z.infer<typeof CandidateEvaluationPreflightSchema>;
+
+export const CandidateEvaluationStartRequestSchema = z
+  .object({
+    ...CandidateEvaluationAuthorityFields,
+    operationId: IdSchema,
+    requestedAt: IsoDateTimeSchema,
+    kind: z.literal("prime_continuim_self_build_v1"),
+    expectedReview: CandidateEvaluationReviewIdentitySchema,
+  })
+  .strict();
+export type CandidateEvaluationStartRequest = z.infer<typeof CandidateEvaluationStartRequestSchema>;
+
+export const CandidateEvaluationReceiptSummarySchema = z
+  .object({
+    receiptVersion: z.literal(1),
+    kind: z.literal("prime_continuim_candidate_evaluation_evidence"),
+    selfBuildRunId: z.string().uuid(),
+    selfBuildReceiptSha256: Sha256Schema,
+    outcome: z.enum(["passed", "failed"]),
+    settledGateCount: z.number().int().nonnegative().max(6),
+    gateCount: z.literal(6),
+    artifactAggregateSha256: Sha256Schema.optional(),
+    artifactFileCount: z.number().int().positive().max(50_000).optional(),
+    completedAt: IsoDateTimeSchema,
+    boundary: CandidateEvaluationBoundarySchema,
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if ((receipt.artifactAggregateSha256 === undefined) !== (receipt.artifactFileCount === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactAggregateSha256"],
+        message: "Artifact digest and file count must be present together",
+      });
+    }
+    if (
+      receipt.outcome === "passed" &&
+      (receipt.settledGateCount !== receipt.gateCount ||
+        receipt.artifactAggregateSha256 === undefined ||
+        receipt.artifactFileCount === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["outcome"],
+        message: "Passing evidence requires all gates and the artifact aggregate",
+      });
+    }
+  });
+export type CandidateEvaluationReceiptSummary = z.infer<
+  typeof CandidateEvaluationReceiptSummarySchema
+>;
+
+export const CandidateEvaluationErrorSchema = z
+  .object({
+    code: z.enum([
+      "CANDIDATE_CHANGED",
+      "EVALUATION_LAUNCH_FAILED",
+      "EVALUATION_FAILED",
+      "EVALUATION_RECEIPT_INVALID",
+      "EVALUATION_OUTCOME_UNKNOWN",
+      "EVALUATION_STORAGE_FULL",
+      "EVALUATION_CLOSED",
+      "EVALUATION_NOT_INVOKED",
+    ]),
+    message: z.string().min(1).max(1_024).regex(/^[^\0\r\n]+$/),
+    retryable: z.boolean(),
+  })
+  .strict();
+export type CandidateEvaluationError = z.infer<typeof CandidateEvaluationErrorSchema>;
+
+export const CandidateEvaluationStatusSchema = z
+  .object({
+    statusVersion: z.literal(1),
+    ...CandidateEvaluationAuthorityFields,
+    operationId: IdSchema,
+    kind: z.literal("prime_continuim_self_build_v1"),
+    requestedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    status: z.enum(["prepared", "running", "passed", "failed", "uncertain"]),
+    review: CandidateEvaluationReviewIdentitySchema,
+    candidate: CandidateSourceIdentitySchema.optional(),
+    invocationStartedAt: IsoDateTimeSchema.optional(),
+    completedAt: IsoDateTimeSchema.optional(),
+    receipt: CandidateEvaluationReceiptSummarySchema.optional(),
+    error: CandidateEvaluationErrorSchema.optional(),
+    boundary: CandidateEvaluationBoundarySchema,
+  })
+  .strict()
+  .superRefine((status, context) => {
+    const terminal = status.status === "passed" || status.status === "failed" || status.status === "uncertain";
+    if (terminal !== (status.completedAt !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "Only terminal candidate evaluations have a completion time",
+      });
+    }
+    if (status.status === "prepared" && status.invocationStartedAt !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["invocationStartedAt"],
+        message: "A prepared candidate evaluation cannot record an invocation boundary",
+      });
+    }
+    if (
+      (status.status === "running" || status.status === "passed" || status.status === "uncertain") &&
+      status.invocationStartedAt === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["invocationStartedAt"],
+        message: "Every invoked candidate evaluation records its invocation boundary",
+      });
+    }
+    if (status.status === "passed" && status.receipt?.outcome !== "passed") {
+      context.addIssue({
+        code: "custom",
+        path: ["receipt"],
+        message: "A passing evaluation requires an exact passing self-build receipt",
+      });
+    }
+    if ((status.receipt !== undefined) !== (status.candidate !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["candidate"],
+        message: "Canonical candidate identity is exposed only with exact receipt evidence",
+      });
+    }
+    if (status.receipt !== undefined && status.invocationStartedAt === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["invocationStartedAt"],
+        message: "Immutable self-build evidence requires the durable invocation boundary",
+      });
+    }
+    if (status.status === "failed" && !status.receipt && !status.error) {
+      context.addIssue({
+        code: "custom",
+        path: ["error"],
+        message: "A failed evaluation requires receipt or error evidence",
+      });
+    }
+    if (status.status === "failed" && status.receipt?.outcome !== undefined && status.receipt.outcome !== "failed") {
+      context.addIssue({
+        code: "custom",
+        path: ["receipt", "outcome"],
+        message: "A failed evaluation cannot expose a passing self-build receipt",
+      });
+    }
+    if ((status.status === "prepared" || status.status === "running" || status.status === "uncertain") && status.receipt) {
+      context.addIssue({
+        code: "custom",
+        path: ["receipt"],
+        message: "This candidate evaluation state cannot expose a settled receipt",
+      });
+    }
+    if (status.status === "uncertain" && !status.error) {
+      context.addIssue({
+        code: "custom",
+        path: ["error"],
+        message: "An uncertain evaluation requires explicit outcome-unknown evidence",
+      });
+    }
+    if (
+      (status.status === "prepared" || status.status === "running" || status.status === "passed") &&
+      status.error
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["error"],
+        message: "Prepared, running, and passing evaluations cannot expose an error",
+      });
+    }
+  });
+export type CandidateEvaluationStatus = z.infer<typeof CandidateEvaluationStatusSchema>;
+
+export const CandidateEvaluationSnapshotSchema = z
+  .object({
+    snapshotVersion: z.literal(1),
+    ...CandidateEvaluationAuthorityFields,
+    generatedAt: IsoDateTimeSchema,
+    repeatEffectsWarningRequired: z.boolean(),
+    evaluations: z.array(CandidateEvaluationStatusSchema).max(32),
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    const operationIds = new Set<string>();
+    snapshot.evaluations.forEach((evaluation, index) => {
+      if (
+        evaluation.expectedHostId !== snapshot.expectedHostId ||
+        evaluation.threadId !== snapshot.threadId ||
+        evaluation.expectedExecutionGenerationId !== snapshot.expectedExecutionGenerationId
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["evaluations", index],
+          message: "Every evaluation must belong to the snapshot authority",
+        });
+      }
+      if (operationIds.has(evaluation.operationId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["evaluations", index, "operationId"],
+          message: "Candidate evaluation operation identities must be unique",
+        });
+      }
+      operationIds.add(evaluation.operationId);
+    });
+  });
+export type CandidateEvaluationSnapshot = z.infer<typeof CandidateEvaluationSnapshotSchema>;
 
 export const AttentionEventSchema = z.object({
   attentionId: IdSchema,
@@ -1688,6 +2035,21 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   z.object({ ...RequestBase, method: z.literal("health.get"), payload: z.object({}) }),
   z.object({
     ...RequestBase,
+    method: z.literal("candidate.evaluation.preflight"),
+    payload: CandidateEvaluationPreflightRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("candidate.evaluation.start"),
+    payload: CandidateEvaluationStartRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("candidate.evaluation.snapshot"),
+    payload: CandidateEvaluationPreflightRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("runtime.integrity.retry"),
     payload: z.object({ expectedHostId: IdSchema }).strict(),
   }),
@@ -1836,6 +2198,21 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("health.get"), result: HealthSnapshotSchema }),
   z.object({
     ...SuccessBase,
+    method: z.literal("candidate.evaluation.preflight"),
+    result: CandidateEvaluationPreflightSchema,
+  }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("candidate.evaluation.start"),
+    result: CandidateEvaluationStatusSchema,
+  }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("candidate.evaluation.snapshot"),
+    result: CandidateEvaluationSnapshotSchema,
+  }),
+  z.object({
+    ...SuccessBase,
     method: z.literal("runtime.integrity.retry"),
     result: RuntimeIntegritySnapshotSchema,
   }),
@@ -1874,6 +2251,9 @@ export const HostIpcErrorResponseSchema = z.object({
   requestId: IdSchema,
   method: z.enum([
     "health.get",
+    "candidate.evaluation.preflight",
+    "candidate.evaluation.start",
+    "candidate.evaluation.snapshot",
     "runtime.integrity.retry",
     "runtime.integrity.repair",
     "runtime.model_catalog",

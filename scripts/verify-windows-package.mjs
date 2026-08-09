@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify, isDeepStrictEqual } from 'node:util'
+import { pathToFileURL } from 'node:url'
 import { extractFile, listPackage } from '@electron/asar'
 import {
   RUNTIME_TEMPLATE_DIRECTORY,
@@ -280,7 +281,7 @@ async function main() {
   }, null, 2))
 }
 
-function parseHostdBuildProvenance(bytes) {
+export function parseHostdBuildProvenance(bytes) {
   invariant(bytes.length > 0 && bytes.length <= 4 * 1024 * 1024, 'The host daemon build provenance is empty or oversized.')
   let value
   try {
@@ -297,6 +298,10 @@ function parseHostdBuildProvenance(bytes) {
     'The host daemon build provenance contains an invalid input path.',
   )
   invariant(new Set(value.inputs).size === value.inputs.length, 'The host daemon build provenance contains duplicate inputs.')
+  invariant(
+    value.inputs.includes('scripts/windows-job-supervisor.ps1'),
+    'The host daemon build provenance does not bind the Windows Job Object supervisor input.',
+  )
   return value
 }
 
@@ -525,7 +530,9 @@ async function readTextArtifacts(root) {
   return result
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error)
-  process.exitCode = 1
-})
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error)
+    process.exitCode = 1
+  })
+}

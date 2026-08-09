@@ -7,6 +7,11 @@
  */
 
 import type {
+  CandidateEvaluationPreflight,
+  CandidateEvaluationPreflightRequest,
+  CandidateEvaluationSnapshot,
+  CandidateEvaluationStartRequest,
+  CandidateEvaluationStatus,
   ResidentLifecycleLookupResult,
   ResidentLifecycleStatus,
   RuntimeIntegritySnapshot,
@@ -34,6 +39,9 @@ export const IPC = {
   startRuntimeOAuth: 'prime:runtime:oauth:start',
   runtimeOAuthStatus: 'prime:runtime:oauth:status',
   cancelRuntimeOAuth: 'prime:runtime:oauth:cancel',
+  candidateEvaluationPreflight: 'prime:candidate:evaluation:preflight',
+  startCandidateEvaluation: 'prime:candidate:evaluation:start',
+  candidateEvaluationSnapshot: 'prime:candidate:evaluation:snapshot',
   selectResidentWorkspace: 'prime:resident:workspace:select',
   provisionResident: 'prime:resident:provision',
   prepareResidentEnd: 'prime:resident:end:prepare',
@@ -424,6 +432,9 @@ export interface PrimeBridge {
   startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
   runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
   cancelRuntimeOAuth(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
+  candidateEvaluationPreflight(input: CandidateEvaluationPreflightRequest): Promise<Result<CandidateEvaluationPreflight>>
+  startCandidateEvaluation(input: CandidateEvaluationStartRequest): Promise<Result<CandidateEvaluationStatus>>
+  candidateEvaluationSnapshot(input: CandidateEvaluationPreflightRequest): Promise<Result<CandidateEvaluationSnapshot>>
   selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<Result<ResidentWorkspaceSelection>>
   provisionResident(input: ResidentProvisionInput): Promise<Result<ResidentLifecycleStatus>>
   prepareResidentEnd(input: ResidentEndPreparationInput): Promise<Result<ResidentEndPreparation>>

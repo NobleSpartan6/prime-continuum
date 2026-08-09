@@ -22,11 +22,20 @@ export class SelfBuildFailure extends Error {
   stage?: string
 }
 
-export function runSelfBuild(options?: Record<string, unknown>): Promise<{
+export function runSelfBuild(options?: {
+  projectRoot?: string
+  retainFailedWorktree?: boolean
+  coordinatorRunId?: string
+  stepTimeoutMs?: number
+  now?: () => Date
+  runStep?: (...args: any[]) => Promise<any>
+}): Promise<{
   receiptPath: string
   relativeReceiptPath: string
   envelope: { integrity: string; receipt: Record<string, unknown>; receiptSha256: string }
 }>
+export function requireCoordinatorRunId(value: unknown): string
+export function selfBuildWorkflowName(coordinatorRunId?: string): string
 export function captureGitCandidate(projectRoot: string, options?: { gitExecutable?: string }): Promise<CandidateSourceIdentity>
 export function assertMaterializedContentEqual(expected: CandidateSourceIdentity, actual: CandidateSourceIdentity, message: string): void
 export function captureCandidateTree(root: string, paths: string[]): Promise<{
@@ -40,7 +49,17 @@ export function cleanupEvaluationWorktree(options: { projectRoot: string; evalua
 export function createSelfBuildCommandPlan(options: Record<string, unknown>): Array<Record<string, unknown>>
 export function createSelfBuildEnvironment(source?: NodeJS.ProcessEnv): NodeJS.ProcessEnv
 export function runCommandSequence(options: Record<string, unknown>): Promise<{ passed: boolean; results: Array<Record<string, unknown>> }>
-export function inspectToolchain(root: string): Promise<Record<string, unknown>>
+export function inspectToolchain(root: string, options?: {
+  nodeExecutable?: string
+  pnpmCli?: string
+}): Promise<{
+  node: Record<string, unknown> & { version: string; absoluteExecutable: string }
+  pnpm: Record<string, unknown> & { version: string; absoluteCli: string; absoluteStore: string }
+  git: Record<string, unknown> & { absoluteExecutable: string }
+  electron: Record<string, unknown> & { absoluteExecutable: string }
+  runtimeSeed: Record<string, unknown> & { absoluteRoot: string }
+  environment: Record<string, unknown>
+}>
 export function assertEvaluationDependencyIsolation(mainRoot: string, evaluationRoot: string): Promise<void>
 export function materializeEvaluationNodeRuntimeDependency(evaluationRoot: string, toolchain: {
   node: { version: string; executableSha256: string }
@@ -60,4 +79,5 @@ export function digestFileTree(root: string, options?: { maxFiles?: number; maxB
 export function createReceiptEnvelope(receipt: Record<string, unknown>): { integrity: string; receipt: Record<string, unknown>; receiptSha256: string }
 export function writeReceiptEnvelope(receiptDirectory: string, envelope: Record<string, unknown>): Promise<string>
 export function verifyReceiptFile(path: string): Promise<{ integrity: string; receipt: Record<string, unknown>; receiptSha256: string }>
+export function verifyReceiptEnvelope(value: unknown): { integrity: string; receipt: Record<string, unknown>; receiptSha256: string }
 export function canonicalJson(value: unknown): string

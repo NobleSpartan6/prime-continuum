@@ -2,6 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPreviewRendererApi } from '../../src/renderer/src/api'
+import {
+  CandidateEvaluationPreflightSchema,
+  CandidateEvaluationSnapshotSchema,
+} from '../../src/shared/protocol'
 
 const previewPrefix = 'Preview simulation ·'
 
@@ -145,6 +149,51 @@ describe('browser preview evidence labels', () => {
     const reconnectHost = reconnectSnapshot.hosts.find((host) => host.id === reconnectThread?.hostId)
     expect(reconnectHost?.connection).toBe('reconnecting')
     expect(reconnectSnapshot.composerReceipt.message).toBe(`${previewPrefix} waiting for a fixture connection`)
+  })
+
+  it('scopes the non-executing candidate review fixture to its exact visual-QA authority', async () => {
+    const api = createPreviewRendererApi('candidate-evaluation-review')
+    expect(api.environment).toBe('native')
+    expect(createPreviewRendererApi().environment).toBe('preview')
+
+    const load = api.loadWorkbench()
+    await vi.advanceTimersByTimeAsync(120)
+    const snapshot = await load
+    const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+    const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+    expect(thread).toMatchObject({
+      id: 'thread-protocol',
+      executionGenerationId: 'candidate-preview-generation',
+      status: 'idle',
+    })
+    expect(host).toMatchObject({ id: 'host-local', kind: 'local', connection: 'online' })
+    expect(snapshot.operations.candidateEvaluationProbe).toBe(true)
+
+    const authority = {
+      expectedHostId: 'host-local',
+      threadId: 'thread-protocol',
+      expectedExecutionGenerationId: 'candidate-preview-generation',
+    }
+    const preflight = CandidateEvaluationPreflightSchema.parse(
+      await api.candidateEvaluationPreflight!(authority),
+    )
+    const history = CandidateEvaluationSnapshotSchema.parse(
+      await api.candidateEvaluationSnapshot!(authority),
+    )
+    expect(preflight).toMatchObject({ status: 'ready', ...authority })
+    expect(history).toMatchObject({ ...authority, evaluations: [], repeatEffectsWarningRequired: false })
+    if (preflight.status !== 'ready') throw new Error('The candidate visual fixture did not return its ready preflight')
+    const publicEvidence = JSON.stringify({ preflight, history })
+    expect(publicEvidence).not.toMatch(/[A-Za-z]:\\|\/(?:Users|home|tmp)\/|\\\\/)
+    expect(publicEvidence).not.toMatch(/"(?:path|argv|env)"\s*:/)
+
+    await expect(api.startCandidateEvaluation!({
+      ...authority,
+      operationId: 'candidate-evaluation:visual-qa-never-runs',
+      requestedAt: '2026-08-09T12:00:02.000Z',
+      kind: 'prime_continuim_self_build_v1',
+      expectedReview: preflight.review,
+    })).rejects.toThrow('never invokes candidate code')
   })
 
   it('labels the handoff plan, progress, checkpoint, and receipt as a simulation', async () => {

@@ -100,6 +100,22 @@ evaluator, malicious-candidate filesystem isolation, security sandbox,
 autonomous promotion, installer/package gate, or cross-platform release proof.
 See `docs/self-build-evidence.md`.
 
+On a verified local Windows host, the native **Evidence** panel can admit that
+same canonical self-build as an explicit **Evaluate candidate** operation. Its
+automatic check is passive: it reads and fingerprints a bounded launcher and
+workspace review set, but it does not execute Git, Node, pnpm, or workspace
+scripts. That review is advisory rather than an exact executed-byte or security
+attestation. After you confirm that candidate-controlled scripts will run with
+your Windows user permissions, the host records a durable operation before
+launch and publishes only path-free status and verified receipt summaries. A
+lost reply, restart, timeout, or unknown outcome never replays the same
+operation. Another evaluation remains blocked until the trusted Windows Job
+holder has retired; candidate processes admitted to that Job are kill-on-close.
+A later operation requires a new review and consent. The action remains absent
+on macOS, Linux, SSH, and relay
+connections because this release does not provide a non-escapable evaluation
+process-tree backend there.
+
 `pnpm dev` now holds one exclusive workspace workflow lock, verifies or repairs the
 Electron payload, and accepts `out/runtime` only after its pinned pointer,
 manifest, file list, and complete payload tree verify. A missing or invalid
@@ -147,7 +163,7 @@ pnpm self-build
 
 `verify:hostd-resident-lifecycle:smoke` requires the current release build and runtime seed. With an isolated empty Prime Agent home, it waits for zero-binding `resident_lifecycle_v1`, submits production `resident.provision` through HostService, the gateway, the coordinator, and the isolated Worker, then verifies the exact committed projection, command capability, restart reattachment, and provision replay suppression. It registers a credential-free deterministic Prime extension, completes the baseline and target model-selection transactions, proves three exact Prompt calls and results, exercises two urgent Stops, replays the older completed Stop while a newer Prompt continues, and verifies the resulting transcript, receipts, attempt-scoped idle proofs, provider ledger, and restart durability without mutation replay. A distinct stale-cursor End is rejected before lifecycle WAL, binding revocation, adapter use, or daemon kill. The smoke then discards the confirmed End response after its first byte, recovers the exact completed result through lifecycle status, and proves the terminal projection, ended disposition, binding retirement, zero daemon sessions, and verified supervisor/worker shutdown. It also requires exact parent-process signal/function identity across Worker passes. No user credential or provider network is used; this does not prove real provider authentication, network execution, Bash, Python, or production authorization.
 
-`verify:renderer-visual` rebuilds the complete attested release tree before explicitly injecting the internal visual-QA fixture through real Electron across 13 desktop, resident-setup, End-review, and recovery states, including 1600×1000, exact 390/320-pixel widths, and 320×256 short-height stress cases. Activation requires the harness's exact user agent, an explicit state, and its ephemeral `127.0.0.1` HTTP origin; an ordinary browser without the native bridge cannot activate the fixture. The gate fails on page or surface-level horizontal overflow, unreachable compact actions, or a non-scrollable short recovery/setup surface, and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
+`verify:renderer-visual` rebuilds the complete attested release tree before explicitly injecting the internal visual-QA fixture through real Electron across 15 desktop, resident-setup, End-review, recovery, and candidate-evaluation states, plus the expanded and buddy HUD modes. It includes 1600×1000, exact 390/320-pixel widths, and 320×256 short-height stress cases. Activation requires the harness's exact user agent, an explicit state, and its ephemeral `127.0.0.1` HTTP origin; an ordinary browser without the native bridge cannot activate the fixture. The gate fails on page or surface-level horizontal overflow, unreachable compact actions, or a non-scrollable short recovery/setup/review surface, and leaves `out/` ready for packaging instead of removing the runtime attestation. Reviewable PNGs and layout metrics are written under `out/visual-qa/`. This verifies responsive presentation; it does not substitute for a native host-session execution test.
 
 On the verified Windows x64 development path, `pnpm package` keeps Windows
 executable resource editing and ASAR integrity enabled, then rejects a

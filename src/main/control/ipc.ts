@@ -1,6 +1,10 @@
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent } from 'electron'
 import { z } from 'zod'
-import { RuntimeIntegrityTargetSchema } from '../../shared/protocol'
+import {
+  CandidateEvaluationPreflightRequestSchema,
+  CandidateEvaluationStartRequestSchema,
+  RuntimeIntegrityTargetSchema,
+} from '../../shared/protocol'
 import { IPC, type Result, type RuntimeIntegrityRepairInput } from './contracts'
 import { ControlError, toStructuredError } from './errors'
 import type { DesktopControlService } from './service'
@@ -185,6 +189,24 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     z.object({ expectedHostId: id, sessionId: id }).strict(),
     (input: { expectedHostId: string; sessionId: string }) =>
       service.cancelRuntimeOAuth(input.expectedHostId, input.sessionId)
+  )
+  handle(
+    IPC.candidateEvaluationPreflight,
+    CandidateEvaluationPreflightRequestSchema,
+    (input: Parameters<DesktopControlService['candidateEvaluationPreflight']>[0]) =>
+      service.candidateEvaluationPreflight(input)
+  )
+  handle(
+    IPC.startCandidateEvaluation,
+    CandidateEvaluationStartRequestSchema,
+    (input: Parameters<DesktopControlService['startCandidateEvaluation']>[0]) =>
+      service.startCandidateEvaluation(input)
+  )
+  handle(
+    IPC.candidateEvaluationSnapshot,
+    CandidateEvaluationPreflightRequestSchema,
+    (input: Parameters<DesktopControlService['candidateEvaluationSnapshot']>[0]) =>
+      service.candidateEvaluationSnapshot(input)
   )
   handle(
     IPC.selectResidentWorkspace,

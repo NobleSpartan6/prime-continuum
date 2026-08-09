@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
@@ -24,6 +25,10 @@ import {
   type RuntimeIntegritySnapshot,
   type StructuredError,
 } from "../shared/protocol";
+import {
+  CandidateEvaluationCoordinatorError,
+  type CandidateEvaluationCoordinator,
+} from "./candidate-evaluation";
 import {
   GatewayError,
   type PrimeAgentGateway,
@@ -88,6 +93,9 @@ const KNOWN_METHODS = new Set([
   "resident.provision",
   "resident.end",
   "resident.lifecycle.status",
+  "candidate.evaluation.preflight",
+  "candidate.evaluation.start",
+  "candidate.evaluation.snapshot",
   "handoff.plan",
   "handoff.commit",
 ]);
@@ -117,6 +125,7 @@ export interface HostServiceOptions {
   runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
   runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
   runtimeOAuthComposition?: HostOAuthComposition;
+  candidateEvaluationCoordinator?: CandidateEvaluationCoordinator;
 }
 
 export interface RuntimeIntegrityReadinessProvider {
@@ -153,6 +162,7 @@ export class HostService {
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
   private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
+  private readonly candidateEvaluationCoordinator: CandidateEvaluationCoordinator | undefined;
   private readonly projectionChangeListeners = new Set<(change: PrimeAgentProjectionChange) => void>();
   private readonly promptIdleListeners = new Set<(event: ResidentPromptIdleObservedEvent) => void>();
   private readonly abortIdleListeners = new Set<(event: ResidentAbortIdleObservedEvent) => void>();
@@ -178,6 +188,7 @@ export class HostService {
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
     this.runtimeOAuthComposition = options.runtimeOAuthComposition;
+    this.candidateEvaluationCoordinator = options.candidateEvaluationCoordinator;
     this.unsubscribeGatewayProjection = this.gateway.subscribeProjectionChanges?.((change) => {
       for (const listener of this.projectionChangeListeners) {
         try {
@@ -215,6 +226,7 @@ export class HostService {
 
   async initialize(): Promise<void> {
     await this.store.initialize();
+    await this.candidateEvaluationCoordinator?.initialize();
     const host = await this.store.getHost();
     if (this.runtimeOAuthComposition && !this.oauthSessionBroker) {
       this.oauthSessionBroker = new HostOAuthSessionBroker({
@@ -240,6 +252,7 @@ export class HostService {
       // can the composition surface a helper termination failure latched by
       // that run; starting these two closes concurrently would race the latch.
       await this.runtimeOAuthComposition?.close?.();
+      await this.candidateEvaluationCoordinator?.close();
       this.unsubscribeGatewayProjection();
       this.unsubscribeGatewayPromptIdle();
       this.unsubscribeGatewayAbortIdle();
@@ -332,6 +345,12 @@ export class HostService {
       throw new PairingAuthorityError(
         "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN",
         "Resident session lifecycle operations are available only to the trusted local desktop",
+      );
+    }
+    if (isCandidateEvaluationRequest(request) && context.transport !== "trusted_user") {
+      throw new PairingAuthorityError(
+        "REMOTE_CANDIDATE_EVALUATION_FORBIDDEN",
+        "Candidate evaluation is available only to the trusted local desktop",
       );
     }
     if (context.transport === "trusted_user") return this.dispatch(request, context);
@@ -450,6 +469,11 @@ export class HostService {
         const runtimeIntegrityRepairCapabilities = runtimeIntegrityRepairReady
           ? [RUNTIME_INTEGRITY_REPAIR_CAPABILITY]
           : [];
+        const candidateEvaluationCapabilities = context.transport === "trusted_user" &&
+          runtimeIntegrity?.status === "ready" &&
+          this.candidateEvaluationCoordinator?.capabilityReady()
+          ? [CANDIDATE_EVALUATION_PROBE_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
@@ -466,6 +490,7 @@ export class HostService {
                 ...oauthCapabilities,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
+                ...candidateEvaluationCapabilities,
               ]
             : [
                 ...HOST_CAPABILITIES,
@@ -476,6 +501,7 @@ export class HostService {
                 RUNTIME_INTEGRITY_CAPABILITY,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
+                ...candidateEvaluationCapabilities,
               ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
@@ -597,6 +623,15 @@ export class HostService {
       case "oauth.session.cancel": {
         const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
         return broker.cancel(request.payload);
+      }
+      case "candidate.evaluation.preflight": {
+        return (await this.requireCandidateEvaluationCoordinator()).preflight(request.payload);
+      }
+      case "candidate.evaluation.start": {
+        return (await this.requireCandidateEvaluationCoordinator()).start(request.payload);
+      }
+      case "candidate.evaluation.snapshot": {
+        return (await this.requireCandidateEvaluationCoordinator()).snapshot(request.payload);
       }
       case "catalog.snapshot":
         return this.store.getCatalogSnapshot();
@@ -1012,6 +1047,21 @@ export class HostService {
     return this.oauthSessionBroker;
   }
 
+  private async requireCandidateEvaluationCoordinator(): Promise<CandidateEvaluationCoordinator> {
+    const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+    if (
+      !this.candidateEvaluationCoordinator ||
+      !this.candidateEvaluationCoordinator.capabilityReady() ||
+      runtimeIntegrity?.status !== "ready"
+    ) {
+      throw new CandidateEvaluationCoordinatorError(
+        "EVALUATOR_NOT_READY",
+        "Candidate evaluation requires the verified local runtime and evaluator authority",
+      );
+    }
+    return this.candidateEvaluationCoordinator;
+  }
+
   private async loadConfiguredHostIdentity(
     hostId: string,
     expected: Readonly<NonNullable<Awaited<ReturnType<PairingAuthority["getSnapshot"]>>["identity"]>>,
@@ -1145,6 +1195,9 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       return "host.admin";
     case "runtime.integrity.retry":
     case "runtime.integrity.repair":
+    case "candidate.evaluation.preflight":
+    case "candidate.evaluation.start":
+    case "candidate.evaluation.snapshot":
       // SSH and relay requests are rejected before scope evaluation. Keep the
       // protocol switch exhaustive without granting remote repair authority.
       return "host.admin";
@@ -1180,6 +1233,12 @@ function isResidentLifecycleRequest(request: HostIpcRequest): boolean {
   return request.method === "resident.provision" ||
     request.method === "resident.end" ||
     request.method === "resident.lifecycle.status";
+}
+
+function isCandidateEvaluationRequest(request: HostIpcRequest): boolean {
+  return request.method === "candidate.evaluation.preflight" ||
+    request.method === "candidate.evaluation.start" ||
+    request.method === "candidate.evaluation.snapshot";
 }
 
 function isResidentLifecycleGateway(gateway: PrimeAgentGateway): gateway is ResidentLifecycleGateway {
@@ -1391,6 +1450,15 @@ function toStructuredError(error: unknown): StructuredError {
   }
   if (error instanceof ResidentProvisionCoordinatorError) {
     return { code: error.code, message: error.message, retryable: error.retryable };
+  }
+  if (error instanceof CandidateEvaluationCoordinatorError) {
+    return {
+      code: error.code,
+      message: error.message,
+      retryable: error.code === "EVALUATION_BUSY" ||
+        error.code === "EVALUATOR_NOT_READY" ||
+        error.code === "CANDIDATE_CHANGED",
+    };
   }
   if (error instanceof ZodError) {
     return { code: "INVALID_STATE", message: "Durable host state failed schema validation", retryable: false };

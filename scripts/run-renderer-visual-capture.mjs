@@ -24,6 +24,8 @@ const expectedTargets = [
   ['resident-end-dialog-short-320', 320, 256, 'resident-end-review', undefined],
   ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
+  ['candidate-evaluation-dialog-390', 390, 844, 'candidate-evaluation-review', undefined],
+  ['candidate-evaluation-dialog-short-320', 320, 256, 'candidate-evaluation-review', undefined],
   ['hud-expanded', 620, 380, 'hud-expanded', 'hud'],
   ['hud-buddy', 184, 64, 'hud-buddy', 'hud'],
 ]
@@ -91,6 +93,8 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     (name === 'resident-dialog-short-320' && result.stateEvidence?.residentDialogContentReachable !== true) ||
     ((name === 'resident-end-dialog-390' || name === 'resident-end-dialog-short-320') && result.stateEvidence?.residentEndDialogOpen !== true) ||
     (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
+    ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||
+    (name === 'candidate-evaluation-dialog-short-320' && result.stateEvidence?.candidateEvaluationDialogContentReachable !== true) ||
     (name === 'resident-recovery-short-320' && result.stateEvidence?.emptyMainScrollable !== true)
     || (name.startsWith('hud-') && (
       result.stateEvidence?.hudSurfaceVisible !== true ||
