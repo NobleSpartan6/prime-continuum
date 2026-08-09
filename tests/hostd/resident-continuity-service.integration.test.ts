@@ -657,6 +657,7 @@ describe("HostService resident continuity dispatch integration", () => {
   });
 
   it("dispatches Stop through the resident gateway while a model mutation is deferred on the same framed session", async () => {
+    const progressTimeoutMs = process.env.CI && process.platform === "win32" ? 30_000 : 2_000;
     const modelGatewayEntered = deferred<void>();
     const releaseModelGateway = deferred<void>();
     const abortGatewayEntered = deferred<boolean>();
@@ -705,7 +706,10 @@ describe("HostService resident continuity dispatch integration", () => {
     try {
       // This timeout bounds a wedged test harness; the semantic assertion is
       // that Stop reaches the gateway before the deferred model mutation ends.
-      const modelWasReleasedWhenAbortEnteredGateway = await withTimeout(abortGatewayEntered.promise, 2_000);
+      const modelWasReleasedWhenAbortEnteredGateway = await withTimeout(
+        abortGatewayEntered.promise,
+        progressTimeoutMs,
+      );
       expect(modelWasReleasedWhenAbortEnteredGateway).toBe(false);
       await vi.waitFor(() => {
         expect(frames.find((frame) => frame.requestId === "framed-abort-request")).toMatchObject({
@@ -713,13 +717,13 @@ describe("HostService resident continuity dispatch integration", () => {
           method: "command.submit",
           result: { status: "running", message: "Prime Agent accepted Stop" },
         });
-      }, { timeout: 1_000 });
+      }, { timeout: progressTimeoutMs });
       expect(frames.findIndex((frame) => frame.requestId === "framed-model-request")).toBe(-1);
       modelGatewayReleased = true;
       releaseModelGateway.resolve(undefined);
       await vi.waitFor(() => {
         expect(frames.some((frame) => frame.requestId === "framed-model-request")).toBe(true);
-      });
+      }, { timeout: progressTimeoutMs });
       const correlatedResponses = frames.filter((frame) => typeof frame.requestId === "string");
       expect(correlatedResponses.map((frame) => frame.requestId)).toEqual([
         "framed-abort-request",
