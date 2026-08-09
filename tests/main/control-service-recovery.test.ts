@@ -1436,66 +1436,72 @@ describe('DesktopControlService recovery', () => {
   })
 
   it('supervises exact read-only cleanup when direct resident proof wins before local cleanup fails', async () => {
-    const directory = await createUserData({})
-    const command = prompt('device-a', 'direct-proof-cleanup-recovery')
-    const connection = new TestConnection((method) => {
-      if (method === 'health.get') return health('host-a')
-      if (method === 'command.submit') return commandReceipt(command, 'completed')
-      if (method === 'command.reconcile') {
-        return { receipts: [commandReceipt(command, 'completed')], unknown: [] }
+    vi.useFakeTimers()
+    try {
+      const directory = await createUserData({})
+      const command = prompt('device-a', 'direct-proof-cleanup-recovery')
+      const connection = new TestConnection((method) => {
+        if (method === 'health.get') return health('host-a')
+        if (method === 'command.submit') return commandReceipt(command, 'completed')
+        if (method === 'command.reconcile') {
+          return { receipts: [commandReceipt(command, 'completed')], unknown: [] }
+        }
+        throw new Error(`Unexpected request: ${method}`)
+      })
+      connectLocalHostd.mockResolvedValue(connection)
+      const service = new DesktopControlService({ app: testApp(directory) })
+      await service.connect({ kind: 'local' })
+      const internals = service as unknown as {
+        recordDurableUncertainReceipt(receipt: Record<string, unknown>, command: ClientCommand): Promise<void>
+        retireDurableUncertainReceipt(receipt: Record<string, unknown>): Promise<void>
+        drainNonterminalReconciliation(): Promise<void>
       }
-      throw new Error(`Unexpected request: ${method}`)
-    })
-    connectLocalHostd.mockResolvedValue(connection)
-    const service = new DesktopControlService({ app: testApp(directory) })
-    await service.connect({ kind: 'local' })
-    const internals = service as unknown as {
-      recordDurableUncertainReceipt(receipt: Record<string, unknown>, command: ClientCommand): Promise<void>
-      retireDurableUncertainReceipt(receipt: Record<string, unknown>): Promise<void>
-    }
-    await internals.recordDurableUncertainReceipt({
-      ...commandReceipt(command, 'uncertain'),
-      hostId: 'host-a',
-      durable: true,
-      error: {
-        code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
-        message: 'Seeded diagnostic must be retired by exact proof.',
-        retryable: false,
-        diagnosticId: 'diagnostic-direct-proof-cleanup',
-      },
-    }, command)
-    const retireDurableUncertainReceipt = internals.retireDurableUncertainReceipt.bind(service)
-    let failCleanupOnce = true
-    internals.retireDurableUncertainReceipt = async (receipt) => {
-      if (failCleanupOnce) {
-        failCleanupOnce = false
-        throw new Error('Injected post-proof diagnostic cleanup failure')
+      await internals.recordDurableUncertainReceipt({
+        ...commandReceipt(command, 'uncertain'),
+        hostId: 'host-a',
+        durable: true,
+        error: {
+          code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+          message: 'Seeded diagnostic must be retired by exact proof.',
+          retryable: false,
+          diagnosticId: 'diagnostic-direct-proof-cleanup',
+        },
+      }, command)
+      const retireDurableUncertainReceipt = internals.retireDurableUncertainReceipt.bind(service)
+      let failCleanupOnce = true
+      internals.retireDurableUncertainReceipt = async (receipt) => {
+        if (failCleanupOnce) {
+          failCleanupOnce = false
+          throw new Error('Injected post-proof diagnostic cleanup failure')
+        }
+        await retireDurableUncertainReceipt(receipt)
       }
-      await retireDurableUncertainReceipt(receipt)
-    }
 
-    await expect(service.submitCommand(command)).resolves.toMatchObject({
-      commandId: command.commandId,
-      status: 'completed',
-    })
-    await expect(service.bootstrap()).resolves.toMatchObject({
-      outbox: [expect.objectContaining({ command, state: 'uncertain' })],
-      durableUncertainReceipts: [expect.objectContaining({
+      await expect(service.submitCommand(command)).resolves.toMatchObject({
         commandId: command.commandId,
-        error: expect.objectContaining({ diagnosticId: 'diagnostic-direct-proof-cleanup' }),
-      })],
-    })
+        status: 'completed',
+      })
+      await expect(service.bootstrap()).resolves.toMatchObject({
+        outbox: [expect.objectContaining({ command, state: 'uncertain' })],
+        durableUncertainReceipts: [expect.objectContaining({
+          commandId: command.commandId,
+          error: expect.objectContaining({ diagnosticId: 'diagnostic-direct-proof-cleanup' }),
+        })],
+      })
 
-    await vi.waitFor(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+      await internals.drainNonterminalReconciliation()
       await expect(service.bootstrap()).resolves.toMatchObject({
         outbox: [],
         durableUncertainReceipts: [],
       })
-    }, { timeout: 2_000 })
-    expect(connection.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(1)
-    expect(connection.requests.filter(({ method }) => method === 'command.reconcile')).toHaveLength(1)
-    expect(connection.terminatedWith).toBeUndefined()
-    await service.disconnect()
+      expect(connection.requests.filter(({ method }) => method === 'command.submit')).toHaveLength(1)
+      expect(connection.requests.filter(({ method }) => method === 'command.reconcile')).toHaveLength(1)
+      expect(connection.terminatedWith).toBeUndefined()
+      await service.disconnect()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('normalizes a restart-reconciled completed prompt into the dedicated idle proof event', async () => {
