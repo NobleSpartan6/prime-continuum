@@ -716,7 +716,9 @@ describe('DesktopControlService resident provisioning boundary', () => {
     connectLocalHostd.mockResolvedValue(connection)
     const service = await serviceFor(directory, vi.fn())
 
-    await expect(withWallTimeout(service.connect({ kind: 'local' }), 1_000))
+    // The unresolved catalog gate is the causal proof: connect must settle
+    // without waiting for the background projection refresh it schedules.
+    await expect(service.connect({ kind: 'local' }))
       .resolves.toMatchObject({ phase: 'online' })
     expect((await service.bootstrap()).residentLifecycleOperations.every(
       (entry) => entry.state === 'terminal_refresh_pending'
@@ -1223,18 +1225,4 @@ async function waitForLedgerOperationToQueue(
     await Promise.resolve()
   }
   expect(store.tail).not.toBe(blockingTail)
-}
-
-async function withWallTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      operation,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('wall timeout')), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
 }

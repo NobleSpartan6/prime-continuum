@@ -24,6 +24,7 @@ import { acquireWorkflowLock, WorkflowLockError } from '../../scripts/workflow-l
 import { runSupervisedWorkflowStep } from '../../scripts/workflow-supervised-step-lib.mjs'
 
 const temporaryDirectories: string[] = []
+const WINDOWS_TIMEOUT_FIXTURE_TEARDOWN_MS = 30_000
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })))
@@ -366,6 +367,13 @@ setInterval(() => undefined, 1000)
         // 500ms execution timeout instead of racing Windows process startup.
         runStep: (options: Parameters<typeof runSupervisedWorkflowStep>[0]) => runSupervisedWorkflowStep({
           ...options,
+          // A saturated hosted Windows runner can deliver the Job completion
+          // message before its Node supervisor receives enough CPU to exit.
+          // Keep the real 500ms command deadline above; only give this fixture
+          // longer to observe the already-requested process-tree teardown.
+          teardownTimeoutMs: process.platform === 'win32'
+            ? WINDOWS_TIMEOUT_FIXTURE_TEARDOWN_MS
+            : undefined,
           createLease: async (leaseOptions: Parameters<typeof createWorkflowChildLease>[0]) => {
             const lease = await createWorkflowChildLease(leaseOptions)
             return {
@@ -385,7 +393,7 @@ setInterval(() => undefined, 1000)
     } finally {
       await lock.release()
     }
-  }, 20_000)
+  }, 45_000)
 
   it('detects receipt tampering and never overwrites an existing no-replace receipt', async () => {
     const root = await temporaryDirectory('prime-self-build-receipt-')

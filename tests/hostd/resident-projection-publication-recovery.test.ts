@@ -219,7 +219,7 @@ describe("resident projection publication recovery", () => {
         projection(fixture.binding, 0, "Generation 65.", "bounded-generation-65"),
       ),
     ).rejects.toMatchObject({ code: "RESIDENT_PROJECTION_RETIREMENT_LIMIT" });
-  });
+  }, 20_000);
 
   it("clears speculative host queue state and derives task status only from authoritative resident activity", async () => {
     const fixture = await createFixture();

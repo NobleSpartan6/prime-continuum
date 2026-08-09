@@ -219,7 +219,7 @@ describe("HostStore resident model-selection journal", () => {
     ).resolves.toMatchObject({ status: "completed" });
   });
 
-  it("rejects stale authority and fences binding refresh throughout the model transition", async () => {
+  it("rejects stale model-selection authority without opening a mutation attempt", async () => {
     const fixture = await createFixture();
     const stale = modelSelectionCommand(fixture.hostId, "model-stale-generation", "stale-generation");
     const staleAdmission = await fixture.store.admitCommand(stale, true);
@@ -228,7 +228,10 @@ describe("HostStore resident model-selection journal", () => {
       error: { code: "STALE_EXECUTION_GENERATION" },
     });
     expect(await modelAttemptNames(fixture.store)).toEqual([]);
+  });
 
+  it("fences binding refresh throughout the model transition", async () => {
+    const fixture = await createFixture();
     const exact = modelSelectionCommand(fixture.hostId, "model-binding-changed");
     await fixture.store.publishResidentProjectionSnapshot(
       fixture.binding,
