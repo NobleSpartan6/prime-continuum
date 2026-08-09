@@ -103,9 +103,22 @@ describe("Prime Agent package-smoke custody cleanup", () => {
     const custody = await createPrimeAgentSmokeCustody(fixture.options);
     await custody.assertInitiallyAbsent();
     await mkdir(custody.agentDirectory, { mode: 0o700 });
-    await custody.captureExisting();
+    const proof = await custody.captureExisting();
+    expect(proof).toBeDefined();
     await rm(custody.agentDirectory, { recursive: true, force: true });
-    await mkdir(custody.agentDirectory, { mode: 0o700 });
+    let replacementIdentity = "";
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await mkdir(custody.agentDirectory, { mode: 0o700 });
+      const replacement = await lstat(custody.agentDirectory);
+      replacementIdentity = `${replacement.dev}:${replacement.ino}`;
+      if (replacementIdentity !== proof?.agentDirectoryIdentity) break;
+      await rm(custody.agentDirectory, { recursive: true, force: true });
+      // Some filesystems immediately recycle the just-freed inode. Consume it
+      // with an unrelated fixture directory so this case continues to test a
+      // replacement whose identity is actually different.
+      await mkdir(join(fixture.root, `replacement-spacer-${attempt}`), { mode: 0o700 });
+    }
+    expect(replacementIdentity).not.toBe(proof?.agentDirectoryIdentity);
 
     await expect(custody.removeAfterConfirmedShutdown({ confirmedCleanShutdown: true })).rejects.toThrow(
       /identity drift|identity changed/i,
@@ -115,7 +128,9 @@ describe("Prime Agent package-smoke custody cleanup", () => {
 });
 
 async function makeFixture() {
-  const root = await mkdtemp(join(tmpdir(), "prime-smoke-custody-test-"));
+  // macOS spells the temporary root through a /var symlink. The production
+  // boundary rightly rejects aliases, so tests use the physical path.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "prime-smoke-custody-test-")));
   roots.push(root);
   const hostDataRoot = join(root, "host-data");
   const programDataRoot = process.platform === "win32" ? join(root, "ProgramData") : hostDataRoot;

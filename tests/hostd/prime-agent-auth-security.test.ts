@@ -1,4 +1,4 @@
-import { chmod, link, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -297,7 +297,10 @@ async function windowsFixture(options: WindowsFixtureOptions = {}) {
 }
 
 async function temporaryRoot(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "prime-agent-auth-security-"));
+  // macOS exposes tmpdir() through /var while the physical path is /private/var.
+  // Production deliberately rejects such aliases, so fixtures must hand the
+  // security boundary the canonical directory they actually created.
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "prime-agent-auth-security-")));
   temporaryDirectories.push(directory);
   return directory;
 }
