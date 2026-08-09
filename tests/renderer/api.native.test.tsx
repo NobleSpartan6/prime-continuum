@@ -639,6 +639,143 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('projects one exact generation-bound assistant stream and preserves its identity while the body grows', async () => {
+    const catalog = recoveryCatalog()
+    const initial = {
+      ...recoverySnapshot(catalog.threads[0], 'The admitted user turn is retained.'),
+      inProgressStream: {
+        blockId: 'assistant-stream-one',
+        text: 'First authoritative assistant fragment.',
+        startedAt: '2026-08-05T20:00:02.000Z',
+      },
+    }
+    let snapshotListener: ((snapshot: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: initial },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+        snapshotListener = listener
+        return () => undefined
+      }),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const loaded = await api.loadWorkbench()
+
+    expect(loaded.threads[0]?.transcript.at(-1)).toMatchObject({
+      id: 'assistant-stream-one',
+      kind: 'assistant',
+      author: 'Prime Agent',
+      body: 'First authoritative assistant fragment.',
+      streaming: true,
+    })
+
+    const growing = structuredClone(initial)
+    growing.generatedAt = '2026-08-05T20:00:03.000Z'
+    growing.latestCursor.sequence = 2
+    growing.inProgressStream.text = 'First authoritative assistant fragment. Then the verified continuation.'
+    snapshotListener?.(growing)
+
+    const projectedGrowth = published.at(-1)?.threads[0]?.transcript
+    expect(projectedGrowth).toHaveLength(2)
+    expect(projectedGrowth?.at(-1)).toMatchObject({
+      id: 'assistant-stream-one',
+      body: 'First authoritative assistant fragment. Then the verified continuation.',
+      streaming: true,
+    })
+
+    const completed = structuredClone(growing)
+    completed.generatedAt = '2026-08-05T20:00:04.000Z'
+    completed.latestCursor.sequence = 3
+    completed.materializedRecentBlocks.push({
+      blockId: 'assistant-materialized-one',
+      kind: 'assistant',
+      text: 'First authoritative assistant fragment. Then the completed answer.',
+      createdAt: '2026-08-05T20:00:02.000Z',
+      sequence: 2,
+    })
+    delete (completed as Partial<typeof completed>).inProgressStream
+    snapshotListener?.(completed)
+
+    const projectedCompletion = published.at(-1)?.threads[0]?.transcript ?? []
+    expect(projectedCompletion.some((block) => block.id === 'assistant-stream-one')).toBe(false)
+    const materializedCompletion = projectedCompletion.filter((block) => block.id === 'assistant-materialized-one')
+    expect(materializedCompletion).toHaveLength(1)
+    expect(materializedCompletion[0]).toMatchObject({
+      body: 'First authoritative assistant fragment. Then the completed answer.',
+    })
+    expect(materializedCompletion[0]?.streaming).toBeUndefined()
+    unsubscribe()
+  })
+
+  it('fails closed for malformed, colliding, or cross-generation assistant streams', async () => {
+    const catalog = recoveryCatalog()
+    const loadCached = async (snapshot: unknown, cachedCatalog: unknown = catalog) => {
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog: cachedCatalog, lastSnapshot: snapshot },
+          outbox: [],
+          connection: onlineConnection(),
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+        requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      return new NativeRendererApi(bridge).loadWorkbench()
+    }
+
+    const malformed = {
+      ...recoverySnapshot(catalog.threads[0], 'Only the materialized answer is safe.'),
+      inProgressStream: {
+        blockId: 'malformed-stream',
+        text: 'This must not render.',
+        startedAt: 'not-an-iso-date',
+      },
+    }
+    expect((await loadCached(malformed)).threads[0]?.transcript.map((block) => block.id))
+      .toEqual(['block-thread-one'])
+
+    const colliding = {
+      ...recoverySnapshot(catalog.threads[0], 'The materialized block wins the collision.'),
+      inProgressStream: {
+        blockId: 'block-thread-one',
+        text: 'A conflicting transient duplicate must not render.',
+        startedAt: '2026-08-05T20:00:02.000Z',
+      },
+    }
+    const collisionProjection = await loadCached(colliding)
+    expect(collisionProjection.threads[0]?.transcript).toHaveLength(1)
+    expect(collisionProjection.threads[0]?.transcript[0]).toMatchObject({
+      id: 'block-thread-one',
+      body: 'The materialized block wins the collision.',
+    })
+    expect(collisionProjection.threads[0]?.transcript[0]?.streaming).toBeUndefined()
+
+    const advancedCatalog = structuredClone(catalog)
+    advancedCatalog.threads[0].currentLocation.executionGenerationId = 'generation-advanced'
+    const staleGeneration = {
+      ...recoverySnapshot(catalog.threads[0], 'Retired generation materialization.'),
+      inProgressStream: {
+        blockId: 'retired-generation-stream',
+        text: 'A different execution generation must never project.',
+        startedAt: '2026-08-05T20:00:02.000Z',
+      },
+    }
+    expect((await loadCached(staleGeneration, advancedCatalog)).threads[0]?.transcript).toEqual([])
+  })
+
   it('keeps non-empty retained work reports when live session telemetry is absent', async () => {
     const catalog = recoveryCatalog()
     const snapshot = {

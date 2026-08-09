@@ -38,6 +38,18 @@ describe('renderer style contracts', () => {
     expect(forcedColors).toContain('outline: 2px solid Highlight')
   })
 
+  it('keeps the authoritative assistant stream indicator compact, static, and legible in forced colors', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
+
+    expect(css).toMatch(/\.message__identity\s*{[^}]*display:\s*inline-flex;[^}]*min-inline-size:\s*0;/s)
+    expect(css).toMatch(/\.message__streaming-indicator\s*{[^}]*display:\s*inline-flex;[^}]*flex:\s*0 0 auto;[^}]*min-block-size:\s*1\.25rem;[^}]*border-radius:\s*999px;/s)
+    expect(css).toMatch(/\.message__streaming-dot\s*{[^}]*background:\s*currentColor;[^}]*border-radius:\s*50%;/s)
+    expect(css).not.toMatch(/\.message__(?:streaming-indicator|streaming-dot)\s*{[^}]*animation:/s)
+    expect(forcedColors).toMatch(/\.message__streaming-indicator\s*{[^}]*border-color:\s*ButtonText;/s)
+    expect(forcedColors).toContain('.message__streaming-dot')
+  })
+
   it('keeps transcript metadata and the composer action inside narrow viewports', async () => {
     const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
     const narrowLayout = css.slice(

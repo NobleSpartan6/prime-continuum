@@ -3,6 +3,7 @@ import {
   CandidateEvaluationPreflightSchema,
   CandidateEvaluationSnapshotSchema,
   CandidateEvaluationStatusSchema,
+  InProgressStreamSchema,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
@@ -101,6 +102,8 @@ export interface TranscriptBlock {
   body: string
   detail?: string
   receipt?: string
+  /** Authoritative, generation-bound assistant output that has not materialized yet. */
+  streaming?: true
 }
 
 export interface ThreadSummary {
@@ -2163,6 +2166,22 @@ function nativeTranscriptBlock(raw: UnknownRecord): TranscriptBlock | undefined 
   }
 }
 
+function nativeInProgressTranscriptBlock(
+  value: unknown,
+  materializedBlockIds: ReadonlySet<string>,
+): TranscriptBlock | undefined {
+  const parsed = InProgressStreamSchema.safeParse(value)
+  if (!parsed.success || materializedBlockIds.has(parsed.data.blockId)) return undefined
+  return {
+    id: parsed.data.blockId,
+    kind: 'assistant',
+    author: 'Prime Agent',
+    time: clockTime(parsed.data.startedAt),
+    body: parsed.data.text,
+    streaming: true,
+  }
+}
+
 interface NativeProjectionInput {
   catalog?: unknown
   threadSnapshot?: unknown
@@ -2621,6 +2640,10 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const recentBlocks = records(threadSnapshot?.materializedRecentBlocks)
     .map(nativeTranscriptBlock)
     .filter((block): block is TranscriptBlock => Boolean(block))
+  const inProgressBlock = nativeInProgressTranscriptBlock(
+    threadSnapshot?.inProgressStream,
+    new Set(recentBlocks.map((block) => block.id)),
+  )
   const parsedResidentLifecycle = ResidentLifecycleDispositionSchema.safeParse(threadSnapshot?.residentLifecycle)
   const rawThreads = records(catalog?.threads)
   if (rawThreads.length === 0 && snapshotThread) rawThreads.push(snapshotThread)
@@ -2667,7 +2690,11 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
             },
           }
         : {}),
-      transcript: isMaterialized ? recentBlocks : [],
+      transcript: isMaterialized
+        ? inProgressBlock
+          ? [...recentBlocks, inProgressBlock]
+          : recentBlocks
+        : [],
     }
   })
 

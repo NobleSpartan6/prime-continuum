@@ -4136,6 +4136,84 @@ describe('Prime Continuim renderer', () => {
     expect(scrollTop).toBe(1_180)
   })
 
+  it('renders one restrained accessible assistant stream and replaces it with the completed materialization', async () => {
+    const api = createPreviewRendererApi()
+    const initial = await api.loadWorkbench()
+    let current = structuredClone(initial)
+    const selected = current.threads.find((thread) => thread.id === current.selectedThreadId)
+    if (!selected) throw new Error('Expected the selected preview thread')
+    selected.transcript.push({
+      id: 'authoritative-assistant-stream',
+      kind: 'assistant',
+      author: 'Prime Agent',
+      time: 'Now',
+      body: 'The authoritative assistant response has started.',
+      streaming: true,
+    })
+    let publish: ((next: typeof current) => void) | undefined
+    api.loadWorkbench = vi.fn(() => Promise.resolve(structuredClone(current)))
+    api.subscribe = vi.fn((listener) => {
+      publish = listener
+      return () => undefined
+    })
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    const startingBody = within(transcript).getByText('The authoritative assistant response has started.')
+    const streamingArticle = startingBody.closest('article')
+    if (!streamingArticle) throw new Error('Expected the streaming assistant article')
+    expect(streamingArticle).toHaveClass('message--assistant', 'message--streaming')
+    expect(streamingArticle).toHaveAttribute('aria-busy', 'true')
+    expect(within(streamingArticle).getByText('Live')).toBeVisible()
+    expect(within(streamingArticle).queryByRole('status')).not.toBeInTheDocument()
+    const oneTimeStatus = screen.getByText('Prime Agent is responding.').closest('[role="status"]')
+    if (!oneTimeStatus) throw new Error('Expected the one-time assistant stream status')
+    expect(oneTimeStatus).toHaveTextContent('Prime Agent is responding.')
+    expect(streamingArticle.querySelector('.message__body [aria-live]')).toBeNull()
+
+    current = structuredClone(current)
+    const growingBlock = current.threads
+      .find((thread) => thread.id === current.selectedThreadId)
+      ?.transcript.find((block) => block.id === 'authoritative-assistant-stream')
+    if (!growingBlock) throw new Error('Expected the authoritative assistant stream')
+    growingBlock.body = 'The authoritative assistant response has started. Verified output keeps growing.'
+    await act(async () => publish?.(structuredClone(current)))
+
+    const growingArticle = within(transcript)
+      .getByText('The authoritative assistant response has started. Verified output keeps growing.')
+      .closest('article')
+    expect(growingArticle).toBe(streamingArticle)
+    expect(screen.getByText('Prime Agent is responding.').closest('[role="status"]')).toBe(oneTimeStatus)
+
+    current = structuredClone(current)
+    const completingThread = current.threads.find((thread) => thread.id === current.selectedThreadId)
+    if (!completingThread) throw new Error('Expected the assistant stream to materialize')
+    completingThread.transcript = completingThread.transcript
+      .filter((block) => block.id !== 'authoritative-assistant-stream')
+      .concat({
+        id: 'authoritative-assistant-materialized',
+        kind: 'assistant',
+        author: 'Prime Agent',
+        time: 'Now',
+        body: 'The authoritative assistant response is complete.',
+      })
+    await act(async () => publish?.(structuredClone(current)))
+
+    const completedArticle = within(transcript)
+      .getByText('The authoritative assistant response is complete.')
+      .closest('article')
+    expect(completedArticle).not.toBe(streamingArticle)
+    expect(streamingArticle).not.toBeInTheDocument()
+    expect(completedArticle).toHaveClass('message--assistant')
+    expect(completedArticle).not.toHaveClass('message--streaming')
+    expect(completedArticle).not.toHaveAttribute('aria-busy')
+    expect(within(completedArticle!).queryByRole('status')).not.toBeInTheDocument()
+    expect(oneTimeStatus.textContent).toBe('')
+    expect(within(transcript).queryByText('Live')).not.toBeInTheDocument()
+    expect(within(transcript).getAllByText('The authoritative assistant response is complete.')).toHaveLength(1)
+  })
+
   it('contains focus in narrow drawers, closes with Escape, and restores each trigger', async () => {
     const user = userEvent.setup()
     render(<App api={createPreviewRendererApi()} />)

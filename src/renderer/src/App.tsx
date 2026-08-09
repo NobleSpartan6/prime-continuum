@@ -2980,6 +2980,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
   const [historyWindow, setHistoryWindow] = useState({ threadId: thread.id, count: TRANSCRIPT_BLOCK_INCREMENT })
   const [hasNewActivity, setHasNewActivity] = useState(false)
   const lastBlock = thread.transcript[thread.transcript.length - 1]
+  const hasStreamingBlock = thread.transcript.some((block) => block.streaming)
   const visibleBlockCount = historyWindow.threadId === thread.id ? historyWindow.count : TRANSCRIPT_BLOCK_INCREMENT
   const firstVisibleIndex = Math.max(0, thread.transcript.length - visibleBlockCount)
   const visibleBlocks = thread.transcript.slice(firstVisibleIndex)
@@ -3096,12 +3097,25 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
             }
 
             return (
-              <article className={cx('message', `message--${block.kind}`)} data-transcript-block key={block.id}>
+              <article
+                className={cx('message', `message--${block.kind}`, block.streaming && 'message--streaming')}
+                data-transcript-block
+                aria-busy={block.streaming ? true : undefined}
+                key={block.id}
+              >
                 <header className="message__header">
                   <span className="message__avatar" aria-hidden="true">
                     <Icon icon={block.kind === 'user' ? Laptop : block.kind === 'tool' ? Terminal : Bot} size={15} />
                   </span>
-                  <strong>{block.author}</strong>
+                  <span className="message__identity">
+                    <strong>{block.author}</strong>
+                    {block.streaming && (
+                      <span className="message__streaming-indicator" aria-hidden="true">
+                        <span className="message__streaming-dot" aria-hidden="true" />
+                        <span>Live</span>
+                      </span>
+                    )}
+                  </span>
                   <time>{block.time}</time>
                 </header>
                 <div className="message__body">
@@ -3119,6 +3133,9 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
           })}
         </div>
       </section>
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {hasStreamingBlock ? 'Prime Agent is responding.' : ''}
+      </span>
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {hasNewActivity ? 'New transcript activity is available.' : ''}
       </span>
