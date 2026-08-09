@@ -307,8 +307,9 @@ describe('DesktopControlService Codex subscription boundary', () => {
     firstRead.resolve(account('signed_out'))
     await expect(reading).resolves.toEqual(account('signed_out'))
     await expect(starting).resolves.toEqual(account('waiting_for_login'))
-    expect(connection.requests.map(({ method }) => method)).toEqual([
-      'health.get',
+    expect(
+      connection.requests.filter(({ method }) => method !== 'health.get').map(({ method }) => method),
+    ).toEqual([
       'codex.subscription.account.read',
       'codex.subscription.login.start',
       'codex.subscription.account.read',

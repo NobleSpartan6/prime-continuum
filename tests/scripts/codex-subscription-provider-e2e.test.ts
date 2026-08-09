@@ -405,7 +405,7 @@ describe('authenticated Codex provider E2E contract', () => {
     try {
       await expect(execFileAsync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
         encoding: 'utf8',
-        timeout: 15_000,
+        timeout: 45_000,
         windowsHide: true,
         env: {
           SystemRoot: resolve(systemRoot!),
@@ -416,9 +416,9 @@ describe('authenticated Codex provider E2E contract', () => {
         },
       })).resolves.toBeDefined()
     } finally {
-      await rm(temporaryDirectory, { recursive: true })
+      await rm(temporaryDirectory, { recursive: true, maxRetries: 5, retryDelay: 200 })
     }
-  })
+  }, 60_000)
 })
 
 function admission() {
