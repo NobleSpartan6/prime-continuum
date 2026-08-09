@@ -4,6 +4,8 @@
 
 A native desktop workbench for durable [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) coding sessions.
 
+Use the upstream [Prime Agent coding-agent documentation](https://github.com/PrimeIntellect-ai/prime-agent/tree/main/packages/coding-agent/docs) for current development concepts and workflows. Prime Continuim's shipped compatibility remains defined by this repository's pinned, attested Prime Agent artifact rather than by the moving upstream `main` branch.
+
 The current Windows development build follows one local-first path: start the
 verified service and bundled runtime, choose a workspace, then open its durable
 thread. Provisioning, explicit End, restart recovery, exact reselection, and
