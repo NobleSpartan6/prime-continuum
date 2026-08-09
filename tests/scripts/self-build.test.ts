@@ -19,7 +19,9 @@ import {
   verifyReceiptFile,
   writeReceiptEnvelope,
 } from '../../scripts/self-build-lib.mjs'
+import { createWorkflowChildLease } from '../../scripts/workflow-child-lease-lib.mjs'
 import { acquireWorkflowLock, WorkflowLockError } from '../../scripts/workflow-lock-lib.mjs'
+import { runSupervisedWorkflowStep } from '../../scripts/workflow-supervised-step-lib.mjs'
 
 const temporaryDirectories: string[] = []
 
@@ -358,6 +360,23 @@ setInterval(() => undefined, 1000)
         }],
         workflow: 'self-build',
         lock,
+        // The supervisor starts the command deadline after setChildPid()
+        // resolves. Retain the real durable lease, but hold that boundary until
+        // the fixture has published both descendant identities. This proves a
+        // 500ms execution timeout instead of racing Windows process startup.
+        runStep: (options: Parameters<typeof runSupervisedWorkflowStep>[0]) => runSupervisedWorkflowStep({
+          ...options,
+          createLease: async (leaseOptions: Parameters<typeof createWorkflowChildLease>[0]) => {
+            const lease = await createWorkflowChildLease(leaseOptions)
+            return {
+              ...lease,
+              async setChildPid(childPid: number) {
+                await lease.setChildPid(childPid)
+                await waitForReadableFile(pidFile)
+              },
+            }
+          },
+        }),
       }) as { passed: boolean; results: Array<{ timedOut: boolean }> }
       expect(result).toMatchObject({ passed: false, results: [{ timedOut: true }] })
       const pids = JSON.parse(await readFile(pidFile, 'utf8')) as { child: number; grandchild: number }
@@ -612,6 +631,22 @@ async function waitForProcessesToExit(pids: number[]) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50))
   }
   expect(pids.filter(isProcessAlive)).toEqual([])
+}
+
+async function waitForReadableFile(path: string) {
+  const deadline = Date.now() + 5_000
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      await readFile(path)
+      return
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error
+      lastError = error
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25))
+  }
+  throw new Error('The timeout fixture did not publish its descendant identities.', { cause: lastError })
 }
 
 function isProcessAlive(pid: number) {
