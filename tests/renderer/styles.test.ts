@@ -3,6 +3,32 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 describe('renderer style contracts', () => {
+  it('keeps the Prime-inspired visual language local, restrained, and semantic', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const darkTheme = css.slice(
+      css.indexOf('@media (prefers-color-scheme: dark)'),
+      css.indexOf('@media (prefers-contrast: more)'),
+    )
+    const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
+
+    expect(css).toContain('"IBM Plex Sans", "Segoe UI Variable Text"')
+    expect(css).toContain('"IBM Plex Mono", "SFMono-Regular"')
+    expect(css).not.toMatch(/@import\s+url|@font-face\s*{[^}]*https?:/s)
+    expect(css).toContain('--color-text-faint: oklch(0.52 0.006 258)')
+    expect(css).not.toMatch(/--color-(?:accent|focus):\s*oklch\([^)]*\s258\)/)
+    expect(css).toContain('--color-surface-selected: oklch(0.865 0.045 292)')
+    expect(css).toContain('--color-surface-selected: oklch(0.3 0.07 292)')
+    expect(darkTheme).toContain('--color-canvas: oklch(0.08 0 0)')
+    expect(darkTheme).toContain('--color-surface: oklch(0.158 0 0)')
+    expect(darkTheme).toContain('--color-border: oklch(0.301 0 0)')
+    expect(darkTheme).toContain('--color-accent: oklch(0.64 0.19 292)')
+    expect(css).toMatch(/\.app-shell\s*{[^}]*grid-template-columns:\s*16rem minmax\(25rem, 1fr\);/s)
+    expect(css).toMatch(/\.nav-row,\s*\.thread-row\s*{[^}]*border-radius:\s*0\.1875rem;/s)
+    expect(css).toMatch(/\.backend-switch\s*{[^}]*background:\s*var\(--color-canvas\);[^}]*border:\s*1px solid var\(--color-border\);/s)
+    expect(css).toMatch(/\.empty-workbench::before\s*{[^}]*background-size:\s*3rem 3rem, 3rem 3rem, 100% 100%;[^}]*pointer-events:\s*none;/s)
+    expect(forcedColors).toMatch(/\.empty-workbench::before\s*{[^}]*display:\s*none;/s)
+  })
+
   it('restores text-field focus outlines in Windows forced-colors mode', async () => {
     const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
     const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
