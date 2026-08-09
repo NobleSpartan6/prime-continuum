@@ -458,6 +458,10 @@ describe("hostd local transport", () => {
     }
 
     await expect(server.closed).rejects.toMatchObject({ code: "HOST_OWNERSHIP_PUBLICATION_UNCERTAIN" });
+    if (process.platform !== "win32") {
+      await expect(access(endpoint)).resolves.toBeUndefined();
+      await expect(access(unixEndpointOwnershipLockPath(endpoint))).rejects.toMatchObject({ code: "ENOENT" });
+    }
     const successorService = new HostService(new HostStore(directory));
     await successorService.initialize();
     const successor = await serveLocalSocket({

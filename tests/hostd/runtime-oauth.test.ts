@@ -35,6 +35,7 @@ const VERIFIED_RUNTIME_MODULE_PATH = join(
 );
 const VERIFIED_RUNTIME_MODULE_URL = pathToFileURL(VERIFIED_RUNTIME_MODULE_PATH).href;
 const VERIFIED_RUNTIME_CLI = join(dirname(VERIFIED_RUNTIME_MODULE_PATH), "bundle", "cli.js");
+const VERIFIED_AGENT_DIRECTORY = join(VERIFIED_RUNTIME_ROOT, "agent");
 
 const SECRET_CREDENTIALS = Object.freeze({
   access: "private-access-token",
@@ -104,7 +105,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
       SystemRoot: "C:\\Windows",
       HOME: "C:\\Users\\prime",
       TEMP: "C:\\Temp",
-      PRIME_AGENT_CODING_AGENT_DIR: "C:\\Users\\prime\\.prime\\agent",
+      PRIME_AGENT_CODING_AGENT_DIR: VERIFIED_AGENT_DIRECTORY,
       PI_CODING_AGENT_DIR: "C:\\attacker\\wrong-key",
       OPENAI_API_KEY: "provider-environment-value",
       ANTHROPIC_API_KEY: "anthropic-canary",
@@ -144,7 +145,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
         SYSTEMROOT: "C:\\Windows",
         HOME: "C:\\Users\\prime",
         TEMP: "C:\\Temp",
-        PRIME_AGENT_CODING_AGENT_DIR: "C:\\Users\\prime\\.prime\\agent",
+        PRIME_AGENT_CODING_AGENT_DIR: VERIFIED_AGENT_DIRECTORY,
         ELECTRON_RUN_AS_NODE: "1",
         PI_OAUTH_CALLBACK_HOST: "127.0.0.1",
       });

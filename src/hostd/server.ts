@@ -220,20 +220,21 @@ export async function serveLocalSocket(options: {
         cleanupError ??= error;
       }
     }
-    if (!cleanupError && !fatalOwnershipError) {
+    if (!cleanupError) {
       try {
-        // Unix release re-proves the exact directory identity and token before
-        // removing anything. A physically displaced owner is a safe no-op.
+        // Unix release re-proves the exact sidecar directory identity and
+        // token before removing anything. This is replacement-safe even after
+        // socket ownership loss, and runs only once service/listener teardown
+        // has made this generation inert.
         await unixOwnership?.release();
         ownershipLeaseController.markReleased();
       } catch (error) {
         cleanupError = error;
       }
     }
-    // After physical ownership loss, pathname cleanup is unsafe: without the
-    // sidecar fence a successor could replace the socket between lstat and rm.
-    // Leave both path and sidecar untouched for the proven successor or stale
-    // recovery path; this generation is already synchronously revoked.
+    // After physical ownership loss, pathname cleanup is unsafe: a successor
+    // could replace the socket between lstat and rm. Leave the pathname for a
+    // newly elected sidecar owner; exact-token sidecar release above is safe.
     if (fatalOwnershipError) throw fatalOwnershipError;
     if (cleanupError) throw cleanupError;
   };

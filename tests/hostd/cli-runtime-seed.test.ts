@@ -1,8 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseHostdCli, runHostdCli } from "../../src/hostd";
+import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 describe("hostd runtime seed CLI authority", () => {
   const seed = path.resolve("test-runtime-seed");
@@ -32,7 +32,7 @@ describe("hostd runtime seed CLI authority", () => {
   });
 
   it("installs termination handling before asynchronous ownership startup settles", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "prime-hostd-early-signal-test-"));
+    const directory = await canonicalTemporaryDirectory("prime-hostd-early-signal-test-");
     const priorListeners = new Set(process.listeners("SIGTERM"));
     let terminate: NodeJS.SignalsListener | undefined;
     const running = runHostdCli(["serve", "--data-dir", directory]);
