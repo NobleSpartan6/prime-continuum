@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   WindowsCodexHomeSecurityProvider,
   areAllExactProtectedCodexHomeDacls,
+  areAllSecureCodexHomeDacls,
   assertSafeCodexHomeTree,
   isExactProtectedCodexHomeDacl,
+  isSecureInheritedCodexHomeDacl,
 } from "../../src/hostd/codex-home-security";
 import { CodexSubscriptionStore } from "../../src/hostd/codex-subscription-store";
 import type { VerifiedCodexAppServerLaunchDescriptor } from "../../src/hostd/runtime-integrity-manager";
@@ -43,6 +45,49 @@ describe("Codex home security boundary", () => {
       `D:PAI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
       USER_SID,
     )).toBe(true);
+    expect(isExactProtectedCodexHomeDacl(
+      `D:PARAI(A;CIOI;0x001F01FF;;;${USER_SID})` +
+        `(A;OICI;GA;;;S-1-5-18)(A;CIOI;FA;;;S-1-5-32-544)`,
+      USER_SID,
+    )).toBe(true);
+    const inheritedDirectory = `D:ARAI(A;IDCIOI;0x1f01ff;;;${USER_SID})` +
+      `(A;OICIID;FA;;;SY)(A;CIIDOI;FA;;;S-1-5-32-544)`;
+    const inheritedFile = `D:AI(A;ID;FA;;;${USER_SID})(A;ID;FA;;;SY)(A;ID;FA;;;BA)`;
+    expect(isSecureInheritedCodexHomeDacl(inheritedDirectory, USER_SID)).toBe(true);
+    expect(isSecureInheritedCodexHomeDacl(inheritedFile, USER_SID)).toBe(true);
+    expect(areAllSecureCodexHomeDacls(
+      `root ${exact}\ndirectory ${inheritedDirectory}\nfile ${inheritedFile}\n`,
+      USER_SID,
+      3,
+    )).toBe(true);
+
+    for (const nearMiss of [
+      `D:AI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:PRAI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(A;OICI;0x001301ff;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(A;OICI;GRGWGX;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(A;OICIIO;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(A;OICI;FA;11111111-1111-1111-1111-111111111111;;${USER_SID})` +
+        `(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(D;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      `D:P(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)`,
+    ]) expect(isExactProtectedCodexHomeDacl(nearMiss, USER_SID)).toBe(false);
+    expect(isSecureInheritedCodexHomeDacl(
+      `D:AI(A;OICI;FA;;;${USER_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`,
+      USER_SID,
+    )).toBe(false);
+    expect(isSecureInheritedCodexHomeDacl(
+      `D:AR(A;OICIID;FA;;;${USER_SID})(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)`,
+      USER_SID,
+    )).toBe(false);
+    expect(isSecureInheritedCodexHomeDacl(
+      `D:AI(A;ID;FA;;;${USER_SID})(A;OICIID;FA;;;SY)(A;ID;FA;;;BA)`,
+      USER_SID,
+    )).toBe(false);
+    expect(isSecureInheritedCodexHomeDacl(
+      `D:AI(A;CIID;FA;;;${USER_SID})(A;CIID;FA;;;SY)(A;CIID;FA;;;BA)`,
+      USER_SID,
+    )).toBe(false);
   });
 
   it("permits encrypted keyring and bounded session data without permitting plaintext auth", async () => {
@@ -225,7 +270,7 @@ describe("Codex home security boundary", () => {
       const home = join(privateRoot, "home");
       const privateTemporary = join(privateRoot, "private-temp");
       const provider = new WindowsCodexHomeSecurityProvider();
-      const proof = await provider.prepareAndVerify(root, home, privateTemporary);
+      const proof = await prepareNativeBoundary(provider, root, home, privateTemporary);
 
       const store = new CodexSubscriptionStore({ statePath: join(privateRoot, "state.json") });
       await store.initialize();
@@ -264,7 +309,7 @@ describe("Codex home security boundary", () => {
       const home = join(root, "codex-subscription", "home");
       const privateTemporary = join(root, "codex-subscription", "private-temp");
       const provider = new WindowsCodexHomeSecurityProvider();
-      const proof = await provider.prepareAndVerify(root, home, privateTemporary);
+      const proof = await prepareNativeBoundary(provider, root, home, privateTemporary);
       await mkdir(join(home, "secrets"));
       const credential = join(home, "secrets", "codex_auth.age");
       await writeFile(credential, "encrypted fixture");
@@ -346,6 +391,78 @@ function runNative(executable: string, args: readonly string[]): Promise<void> {
     child.once("close", (code, signal) => {
       if (code === 0 && signal === null) resolvePromise();
       else rejectPromise(new Error("Native ACL fixture command failed"));
+    });
+  });
+}
+
+async function prepareNativeBoundary(
+  provider: WindowsCodexHomeSecurityProvider,
+  root: string,
+  home: string,
+  privateTemporary: string,
+) {
+  try {
+    return await provider.prepareAndVerify(root, home, privateTemporary);
+  } catch (error) {
+    const diagnostic = await captureSanitizedDaclDiagnostic(join(root, "codex-subscription"));
+    const code = typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "unknown";
+    throw new Error(
+      `Native CODEX_HOME provisioning failed (${code}); sanitized DACLs=${JSON.stringify(diagnostic)}`,
+      { cause: error },
+    );
+  }
+}
+
+async function captureSanitizedDaclDiagnostic(privateRoot: string): Promise<Readonly<Record<string, unknown>>> {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot) return Object.freeze({ unavailable: "system_root_missing" });
+  try {
+    const whoami = await runNativeCapture(join(systemRoot, "System32", "whoami.exe"), ["/user", "/fo", "csv", "/nh"]);
+    const currentUserSid = whoami.match(/S-\d-\d+(?:-\d+)+/)?.[0];
+    const root = await runNativeCapture(join(systemRoot, "System32", "cacls.exe"), [privateRoot, "/s"]);
+    const tree = await runNativeCapture(join(systemRoot, "System32", "cacls.exe"), [privateRoot, "/t", "/s"]);
+    const sanitize = (output: string) => (output.match(/D:[A-Z]*(?:\([^()\r\n]+\))+/g) ?? []).map((dacl) =>
+      dacl.replace(/S-\d-\d+(?:-\d+)+/g, (sid) => {
+        if (sid === currentUserSid) return "CURRENT_USER_SID";
+        if (sid === "S-1-5-18" || sid === "S-1-5-32-544") return sid;
+        return "OTHER_SID";
+      }));
+    return Object.freeze({ root: sanitize(root), tree: sanitize(tree) });
+  } catch {
+    return Object.freeze({ unavailable: "native_query_failed" });
+  }
+}
+
+function runNativeCapture(executable: string, args: readonly string[]): Promise<string> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(executable, [...args], { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (error?: Error, value = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Native diagnostic timed out"));
+    }, 15_000);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      bytes += chunk.byteLength;
+      if (bytes > 64 * 1024) {
+        child.kill();
+        finish(new Error("Native diagnostic output exceeded its bound"));
+      } else chunks.push(Buffer.from(chunk));
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      if (code !== 0 || signal !== null) finish(new Error("Native diagnostic failed"));
+      else finish(undefined, Buffer.concat(chunks).toString("ascii"));
     });
   });
 }

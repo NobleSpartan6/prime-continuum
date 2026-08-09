@@ -37,10 +37,13 @@ describe('cross-platform source CI policy', () => {
     expect(actionReferences.every((match) => /^[0-9a-f]{40}$/.test(match[2]!))).toBe(true)
   })
 
-  it('runs every test with a deterministic hosted-runner concurrency ceiling', () => {
+  it('runs every test with deterministic hosted-runner concurrency and watchdog bounds', () => {
     expect(workflow).toContain('run: pnpm test')
     expect(vitestConfig).toContain("include: ['tests/**/*.test.{ts,tsx}']")
+    expect(vitestConfig).toContain("const hostedWindows = Boolean(process.env.CI) && process.platform === 'win32'")
     expect(vitestConfig).toContain("maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined")
+    expect(vitestConfig).toContain('testTimeout: hostedWindows ? 20_000 : 5_000')
+    expect([...vitestConfig.matchAll(/\btestTimeout\s*:/g)]).toHaveLength(1)
     expect(vitestConfig).not.toMatch(/\b(?:exclude|shard|passWithNoTests)\s*:/)
   })
 })

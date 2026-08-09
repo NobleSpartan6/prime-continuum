@@ -627,22 +627,22 @@ export async function assertPlainPrivateTree(root: string): Promise<void> {
 
 export function isExactProtectedCodexHomeDacl(sddl: string, currentUserSid: string): boolean {
   if (!isUserSid(currentUserSid)) return false;
-  const prefix = sddl.startsWith("D:PAI") ? "D:PAI" : sddl.startsWith("D:P") ? "D:P" : undefined;
-  if (!prefix) return false;
-  const body = sddl.slice(prefix.length);
+  const parsed = parseDacl(sddl);
+  if (!parsed || !hasExactDaclFlags(parsed.flags, "protected")) return false;
+  const body = parsed.body;
   const aces = body.match(/\([^()]+\)/g) ?? [];
   if (aces.join("") !== body || aces.length !== 3) return false;
   const trustees = new Set<string>();
   for (const ace of aces) {
     const fields = ace.slice(1, -1).split(";");
-    if (fields.length !== 6 || fields[0] !== "A" || fields[1] !== "OICI" || fields[2] !== "FA") {
+    if (
+      fields.length !== 6 || fields[0] !== "A" ||
+      !hasExactAceFlags(fields[1]!, ["OI", "CI"]) ||
+      !isFileFullControl(fields[2]!) || fields[3] !== "" || fields[4] !== ""
+    ) {
       return false;
     }
-    const trustee = fields[5] === "SY"
-      ? SYSTEM_SID
-      : fields[5] === "BA"
-        ? ADMINISTRATORS_SID
-        : fields[5]!;
+    const trustee = canonicalTrustee(fields[5]!);
     trustees.add(trustee);
   }
   return trustees.size === 3 && trustees.has(currentUserSid) && trustees.has(SYSTEM_SID) &&
@@ -657,7 +657,7 @@ export function areAllExactProtectedCodexHomeDacls(
   if (!Number.isSafeInteger(expectedEntryCount) || expectedEntryCount < 1 || expectedEntryCount > MAX_HOME_ENTRIES + 1) {
     return false;
   }
-  const dacls = output.match(/D:P(?:AI)?(?:\([^()\r\n]+\))+/g) ?? [];
+  const dacls = extractDacls(output);
   return dacls.length === expectedEntryCount &&
     dacls.every((dacl) => isExactProtectedCodexHomeDacl(dacl, currentUserSid));
 }
@@ -668,22 +668,29 @@ export function areAllExactProtectedCodexHomeDacls(
  * partial access, inherit-only ACE, or explicit broad grant is accepted.
  */
 export function isSecureInheritedCodexHomeDacl(sddl: string, currentUserSid: string): boolean {
-  if (!isUserSid(currentUserSid) || !sddl.startsWith("D:AI")) return false;
-  const body = sddl.slice(4);
+  if (!isUserSid(currentUserSid)) return false;
+  const parsed = parseDacl(sddl);
+  if (!parsed || !hasExactDaclFlags(parsed.flags, "inherited")) return false;
+  const body = parsed.body;
   const aces = body.match(/\([^()]+\)/g) ?? [];
   if (aces.join("") !== body || aces.length !== 3) return false;
   const trustees = new Set<string>();
+  let inheritanceKind: "file" | "directory" | undefined;
   for (const ace of aces) {
     const fields = ace.slice(1, -1).split(";");
-    if (fields.length !== 6 || fields[0] !== "A" || fields[2] !== "FA") return false;
-    const flags = fields[1]!;
-    const tokens: string[] = flags.match(/OI|CI|ID/g) ?? [];
-    if (tokens.join("") !== flags || !tokens.includes("ID")) return false;
-    const trustee = fields[5] === "SY"
-      ? SYSTEM_SID
-      : fields[5] === "BA"
-        ? ADMINISTRATORS_SID
-        : fields[5]!;
+    if (
+      fields.length !== 6 || fields[0] !== "A" ||
+      !isFileFullControl(fields[2]!) || fields[3] !== "" || fields[4] !== ""
+    ) return false;
+    const observedInheritanceKind = hasExactAceFlags(fields[1]!, ["ID"])
+      ? "file" as const
+      : hasExactAceFlags(fields[1]!, ["OI", "CI", "ID"])
+        ? "directory" as const
+        : undefined;
+    if (!observedInheritanceKind) return false;
+    if (inheritanceKind && inheritanceKind !== observedInheritanceKind) return false;
+    inheritanceKind = observedInheritanceKind;
+    const trustee = canonicalTrustee(fields[5]!);
     trustees.add(trustee);
   }
   return trustees.size === 3 && trustees.has(currentUserSid) && trustees.has(SYSTEM_SID) &&
@@ -698,15 +705,55 @@ export function areAllSecureCodexHomeDacls(
   if (!Number.isSafeInteger(expectedEntryCount) || expectedEntryCount < 1 || expectedEntryCount > MAX_HOME_ENTRIES + 1) {
     return false;
   }
-  const dacls = output.match(/D:(?:P(?:AI)?|AI)(?:\([^()\r\n]+\))+/g) ?? [];
+  const dacls = extractDacls(output);
   return dacls.length === expectedEntryCount && dacls.every((dacl) =>
     isExactProtectedCodexHomeDacl(dacl, currentUserSid) ||
     isSecureInheritedCodexHomeDacl(dacl, currentUserSid));
 }
 
 function containsOneExactProtectedCodexHomeDacl(output: string, currentUserSid: string): boolean {
-  const dacls = output.match(/D:(?:P(?:AI)?|AI)(?:\([^()\r\n]+\))+/g) ?? [];
+  const dacls = extractDacls(output);
   return dacls.length === 1 && isExactProtectedCodexHomeDacl(dacls[0]!, currentUserSid);
+}
+
+function parseDacl(sddl: string): Readonly<{ flags: string; body: string }> | undefined {
+  if (!sddl.startsWith("D:")) return undefined;
+  const bodyStart = sddl.indexOf("(", 2);
+  if (bodyStart < 2) return undefined;
+  return Object.freeze({ flags: sddl.slice(2, bodyStart), body: sddl.slice(bodyStart) });
+}
+
+function hasExactDaclFlags(flags: string, kind: "protected" | "inherited"): boolean {
+  const tokens: string[] = flags.match(/AI|AR|P/g) ?? [];
+  if (tokens.join("") !== flags || new Set(tokens).size !== tokens.length) return false;
+  if (kind === "protected") return tokens.includes("P");
+  return !tokens.includes("P") && tokens.includes("AI");
+}
+
+function hasExactAceFlags(
+  flags: string,
+  required: readonly string[],
+): boolean {
+  const tokens: string[] = flags.match(/OI|CI|ID/g) ?? [];
+  if (tokens.join("") !== flags || new Set(tokens).size !== tokens.length) return false;
+  const requiredSet = new Set(required);
+  return tokens.length === requiredSet.size && tokens.every((token) => requiredSet.has(token));
+}
+
+function isFileFullControl(rights: string): boolean {
+  if (rights === "FA" || rights === "GA") return true;
+  if (!/^0x[0-9a-f]{1,8}$/i.test(rights)) return false;
+  return Number.parseInt(rights.slice(2), 16) === 0x001f01ff;
+}
+
+function canonicalTrustee(value: string): string {
+  if (value === "SY") return SYSTEM_SID;
+  if (value === "BA") return ADMINISTRATORS_SID;
+  return value;
+}
+
+function extractDacls(output: string): string[] {
+  return output.match(/D:[A-Z]*(?:\([^()\r\n]+\))+/g) ?? [];
 }
 
 function protectedDacl(currentUserSid: string): string {

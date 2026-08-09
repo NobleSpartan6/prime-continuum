@@ -1658,7 +1658,9 @@ describe('DesktopControlService recovery', () => {
 
     await vi.waitFor(() => expect(counts.get(converging.commandId)).toBe(2), { timeout: 2_000 })
     await vi.waitFor(() => expect(counts.get(transient.commandId)).toBe(3), { timeout: 3_000 })
-    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toHaveLength(1), { timeout: 2_000 })
+    await (service as unknown as { drainNonterminalReconciliation(): Promise<void> })
+      .drainNonterminalReconciliation()
+    expect(await readStoredOutbox(directory)).toHaveLength(1)
 
     expect(service.getConnectionState().phase).toBe('online')
     expect(connection.terminatedWith).toBeUndefined()

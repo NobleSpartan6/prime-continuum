@@ -26,7 +26,9 @@ import { acquireWorkflowLock, WorkflowLockError } from '../../scripts/workflow-l
 import { runSupervisedWorkflowStep } from '../../scripts/workflow-supervised-step-lib.mjs'
 
 const temporaryDirectories: string[] = []
+const WINDOWS_TIMEOUT_FIXTURE_STARTUP_MS = 30_000
 const WINDOWS_TIMEOUT_FIXTURE_TEARDOWN_MS = 30_000
+const WINDOWS_TIMEOUT_FIXTURE_TEST_MS = 75_000
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })))
@@ -397,24 +399,51 @@ setInterval(() => undefined, 1000)
             : undefined,
           createLease: async (leaseOptions: Parameters<typeof createWorkflowChildLease>[0]) => {
             const lease = await createWorkflowChildLease(leaseOptions)
+            let descendantPublication: Promise<void> | undefined
             return {
               ...lease,
               async setChildPid(childPid: number) {
                 await lease.setChildPid(childPid)
-                await waitForReadableFile(pidFile)
+                descendantPublication ??= waitForReadableFile(
+                  pidFile,
+                  process.platform === 'win32' ? WINDOWS_TIMEOUT_FIXTURE_STARTUP_MS : 5_000,
+                )
+                await descendantPublication
               },
             }
           },
         }),
-      }) as { passed: boolean; results: Array<{ timedOut: boolean }> }
-      expect(result).toMatchObject({ passed: false, results: [{ timedOut: true }] })
+      }) as {
+        passed: boolean
+        results: Array<{
+          durationMs: number
+          code: number | null
+          signal: string | null
+          timedOut: boolean
+          supervisorError: string | null
+          collateralState: string
+        }>
+      }
+      const record = result.results[0]!
+      const diagnostic = JSON.stringify({
+        durationMs: record.durationMs,
+        code: record.code,
+        signal: record.signal,
+        timedOut: record.timedOut,
+        supervisorError: record.supervisorError,
+        collateralState: record.collateralState,
+      })
+      expect(result.passed, diagnostic).toBe(false)
+      expect(record.supervisorError, diagnostic).toBeNull()
+      expect(record.collateralState, diagnostic).toBe('supervised_tree_settled')
+      expect(record.timedOut, diagnostic).toBe(true)
       const pids = JSON.parse(await readFile(pidFile, 'utf8')) as { child: number; grandchild: number }
       await waitForProcessesToExit([pids.child, pids.grandchild])
       await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
     } finally {
       await lock.release()
     }
-  }, 45_000)
+  }, process.platform === 'win32' ? WINDOWS_TIMEOUT_FIXTURE_TEST_MS : 45_000)
 
   it('detects receipt tampering and never overwrites an existing no-replace receipt', async () => {
     const root = await temporaryDirectory('prime-self-build-receipt-')
@@ -662,8 +691,8 @@ async function waitForProcessesToExit(pids: number[]) {
   expect(pids.filter(isProcessAlive)).toEqual([])
 }
 
-async function waitForReadableFile(path: string) {
-  const deadline = Date.now() + 5_000
+async function waitForReadableFile(path: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs
   let lastError: unknown
   while (Date.now() < deadline) {
     try {
