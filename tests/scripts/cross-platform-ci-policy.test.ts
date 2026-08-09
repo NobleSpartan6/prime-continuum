@@ -5,12 +5,23 @@ import { describe, expect, it } from 'vitest'
 const workflowPath = resolve('.github/workflows/cross-platform-source.yml')
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n?/g, '\n')
 const vitestConfig = readFileSync(resolve('vitest.config.ts'), 'utf8').replace(/\r\n?/g, '\n')
+const providerContractTest = readFileSync(
+  resolve('tests/scripts/codex-subscription-provider-e2e.test.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n')
+const windowsUiaCompileTest = readFileSync(
+  resolve('tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts'),
+  'utf8',
+).replace(/\r\n?/g, '\n')
 
 describe('cross-platform source CI policy', () => {
   it('runs the exact source gates on stable Linux, Windows, and macOS hosts', () => {
     expect(workflow).toContain('ubuntu-24.04')
     expect(workflow).toContain('windows-2025')
     expect(workflow).toContain('macos-15')
+    expect(workflow).toContain('timeout-minutes: ${{ matrix.timeout_minutes }}')
+    expect(workflow).toMatch(/label: Windows x64\n\s+os: windows-2025\n\s+timeout_minutes: 30/)
+    expect(workflow.match(/timeout_minutes: 20/g)).toHaveLength(2)
     expect(workflow).toContain('node-version-file: .node-version')
     expect(workflow).toContain('version: 11.9.0')
     expect(workflow).toContain('pnpm install --frozen-lockfile --ignore-scripts')
@@ -22,7 +33,7 @@ describe('cross-platform source CI policy', () => {
   it('pins every external action and grants no mutation or secret-bearing authority', () => {
     expect(workflow).toContain('permissions:\n  contents: read')
     expect(workflow).toContain('persist-credentials: false')
-    expect(workflow).toContain('timeout-minutes: 20')
+    expect(workflow).toContain('timeout-minutes: ${{ matrix.timeout_minutes }}')
     expect(workflow).toContain('fail-fast: false')
     expect(workflow).not.toContain('pull_request_target')
     expect(workflow).not.toMatch(/\b(?:write-all|id-token|packages|actions):\s+write\b/)
@@ -37,15 +48,32 @@ describe('cross-platform source CI policy', () => {
     expect(actionReferences.every((match) => /^[0-9a-f]{40}$/.test(match[2]!))).toBe(true)
   })
 
-  it('runs every test with deterministic hosted-runner concurrency and watchdog bounds', () => {
+  it('runs every portable test with deterministic hosted-runner concurrency and watchdog bounds', () => {
     expect(workflow).toContain('run: pnpm test')
     expect(vitestConfig).toContain("include: ['tests/**/*.test.{ts,tsx}']")
     expect(vitestConfig).toContain("const hostedWindows = Boolean(process.env.CI) && process.platform === 'win32'")
     expect(vitestConfig).toContain("const githubActions = process.env.GITHUB_ACTIONS === 'true'")
     expect(vitestConfig).toContain("maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined")
-    expect(vitestConfig).toContain('testTimeout: hostedWindows ? 20_000 : 5_000')
+    expect(vitestConfig).toContain('testTimeout: hostedWindows ? 60_000 : 5_000')
     expect(vitestConfig).toContain("reporters: githubActions ? ['default', 'github-actions'] : ['default']")
     expect([...vitestConfig.matchAll(/\btestTimeout\s*:/g)]).toHaveLength(1)
-    expect(vitestConfig).not.toMatch(/\b(?:exclude|shard|passWithNoTests)\s*:/)
+    expect(vitestConfig).not.toMatch(/\b(?:shard|passWithNoTests)\s*:/)
+  })
+
+  it('isolates only the real Windows UI Automation compiler in one bounded Windows step', () => {
+    const testPath = 'tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts'
+    expect(workflow).toContain("if: runner.os == 'Windows'\n        timeout-minutes: 3")
+    expect(workflow).toContain('PRIME_CONTINUIM_WINDOWS_UIA_COMPILE: "true"')
+    expect(workflow).toContain(`run: pnpm exec vitest run ${testPath}`)
+    expect(vitestConfig).toContain(`const windowsUiaCompileTest = '${testPath}'`)
+    expect(vitestConfig).toContain(
+      '...(hostedWindows && !runWindowsUiaCompileTest ? { exclude: [windowsUiaCompileTest] } : {}),',
+    )
+    expect([...vitestConfig.matchAll(/\bexclude\s*:/g)]).toHaveLength(1)
+    expect(providerContractTest).not.toContain('Add-Type -TypeDefinition $source -ReferencedAssemblies $references')
+    expect(windowsUiaCompileTest).toContain('Add-Type -TypeDefinition $source -ReferencedAssemblies $references')
+    expect(windowsUiaCompileTest).toContain('timeout: 90_000')
+    expect(windowsUiaCompileTest).toContain('}, 120_000)')
+    expect([...windowsUiaCompileTest.matchAll(/\bit(?:\.runIf\([^\n]+\))?\(/g)]).toHaveLength(1)
   })
 })

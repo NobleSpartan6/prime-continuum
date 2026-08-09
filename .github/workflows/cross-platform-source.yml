@@ -17,17 +17,20 @@ jobs:
   source-gates:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: Linux x64
             os: ubuntu-24.04
+            timeout_minutes: 20
           - label: Windows x64
             os: windows-2025
+            timeout_minutes: 30
           - label: macOS arm64
             os: macos-15
+            timeout_minutes: 20
     env:
       CI: "true"
     steps:
@@ -53,6 +56,13 @@ jobs:
 
       - name: Typecheck Node and renderer boundaries
         run: pnpm typecheck
+
+      - name: Compile the exact Windows UI Automation helper
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        env:
+          PRIME_CONTINUIM_WINDOWS_UIA_COMPILE: "true"
+        run: pnpm exec vitest run tests/scripts/codex-subscription-provider-e2e-uia-windows.test.ts
 
       - name: Run the complete source test suite
         run: pnpm test

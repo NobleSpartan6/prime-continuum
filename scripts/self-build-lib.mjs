@@ -1368,7 +1368,10 @@ function runCaptured(executable, args, { cwd, input, maxOutputBytes, allowFailur
       clearTimeout(timer)
       rejectPromise(error)
     })
-    child.once('exit', (code, signal) => {
+    // `exit` can precede the final stdout/stderr data events. Candidate
+    // identity must therefore settle only after the stdio pipes close, or a
+    // fast Git process can be recorded with a truncated (even empty) patch.
+    child.once('close', (code, signal) => {
       if (settled) return
       settled = true
       clearTimeout(timer)

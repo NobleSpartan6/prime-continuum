@@ -193,16 +193,20 @@ setInterval(() => undefined, 1000)
     })).rejects.toThrow('injected child publication failure')
 
     expect(publishedChildPid).toEqual(expect.any(Number))
-    await expect(rejectActiveWorkflowChild({
-      lockPath,
-      lockToken: main.owner.token,
-      workflow: 'dist',
-    }))
-      .rejects.toBeInstanceOf(WorkflowChildLeaseError)
     const retainedOwner = JSON.parse(await readFile(`${lockPath}.child`, 'utf8')) as {
       supervisorPid: number
       childPid: number
     }
+    await expect(rejectActiveWorkflowChild({
+      lockPath,
+      lockToken: main.owner.token,
+      workflow: 'dist',
+      // The injected teardown observer deliberately returned "unconfirmed".
+      // Control the matching liveness observation here so a fast real
+      // supervisor exit cannot turn this policy assertion into a timing race.
+      isProcessAlive: (pid) => pid === retainedOwner.supervisorPid,
+    }))
+      .rejects.toBeInstanceOf(WorkflowChildLeaseError)
     await waitForProcessesToExit([publishedChildPid!, retainedOwner.supervisorPid])
     await rejectActiveWorkflowChild({
       lockPath,
