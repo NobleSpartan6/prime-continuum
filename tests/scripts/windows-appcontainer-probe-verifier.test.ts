@@ -84,8 +84,10 @@ describe('Windows AppContainer static receipt verifier', () => {
       createAppContainerProbeReceiptEnvelope(functionalReceipt()),
     )
 
-    for (const leaf of ['receipt-Σ.json', 'receipt-ς.json', 'receipt-COM¹.json']) {
-      const receiptPath = join(root, leaf)
+    for (const [index, leaf] of ['receipt-Σ.json', 'receipt-ς.json', 'receipt-COM¹.json'].entries()) {
+      const caseRoot = join(root, `case-${index}`)
+      await mkdir(caseRoot)
+      const receiptPath = join(caseRoot, leaf)
       await writeFile(receiptPath, bytes, { flag: 'wx' })
       await expect(verifyWindowsAppContainerProbeReceiptFile(receiptPath))
         .rejects.toThrow(/receipt_path_non_ascii/)
