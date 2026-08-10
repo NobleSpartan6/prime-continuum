@@ -226,6 +226,8 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
     let terminal!: ReturnType<typeof completedRecord>;
     let releaseBrowser!: () => void;
     const browserPending = new Promise<void>((resolve) => { releaseBrowser = resolve; });
+    let markBrowserEntered!: () => void;
+    const browserEntered = new Promise<void>((resolve) => { markBrowserEntered = resolve; });
     const connection = connectionFor((method, params) => {
       if (method === "oauth.attempt.start") {
         attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
@@ -244,13 +246,22 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
       }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const openExternal = vi.fn(async () => { await browserPending; });
+    const openExternal = vi.fn(async () => {
+      markBrowserEntered();
+      await browserPending;
+    });
     const fixture = await connectedService(connection, openExternal);
 
     const started = fixture.service.startRuntimeOAuth("host-a", "openai-codex");
-    await waitFor(() => openExternal.mock.calls.length === 1);
+    await Promise.race([
+      browserEntered,
+      started.then(
+        () => { throw new Error("OAuth start completed before entering openExternal"); },
+        (error: unknown) => { throw error; },
+      ),
+    ]);
     const dispatchingUpdatedAt = (await readAttemptLedger(fixture.directory)).attempts[0]!.updatedAt as string;
-    await waitFor(() => Date.now() > Date.parse(dispatchingUpdatedAt));
+    await waitUntilAfter(dispatchingUpdatedAt);
     terminal = completedRecord(attempt, dispatchingUpdatedAt);
     releaseBrowser();
     await expect(started).resolves.toMatchObject({ phase: "awaiting_user" });
@@ -296,10 +307,10 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
       throw new Error(`Unexpected request: ${method}`);
     });
     const openExternal = vi.fn(async () => undefined);
-    const second = await connectedService(secondConnection, openExternal, first.directory);
-    await waitFor(async () =>
-      (await readAttemptLedger(first.directory)).attempts[0]?.phase === "host_admitted"
-    );
+    const second = await bootstrappedService(secondConnection, openExternal, first.directory);
+    const admitted = observeNextRuntimeOAuthAcceptance(second.service, "host_admitted");
+    await second.service.connect({ kind: "local" });
+    await admitted;
 
     await expect(second.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
       phase: "awaiting_user",
@@ -449,8 +460,10 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
       throw new Error(`Unexpected request: ${method}`);
     });
     const restartedOpen = vi.fn(async () => undefined);
-    const restarted = await connectedService(restartedConnection, restartedOpen, fixture.directory);
-    await waitFor(() => restartedConnection.requests.some(({ method }) => method === "oauth.attempt.status"));
+    const restarted = await bootstrappedService(restartedConnection, restartedOpen, fixture.directory);
+    const reconciled = observeNextRuntimeOAuthAcceptance(restarted.service, "browser_dispatching");
+    await restarted.service.connect({ kind: "local" });
+    await reconciled;
     expect(restartedOpen).not.toHaveBeenCalled();
     expect(restartedConnection.requests.every(({ method }) =>
       method === "health.get" || method === "oauth.attempt.status"
@@ -872,12 +885,14 @@ async function readAttemptLedger(directory: string): Promise<{
   )) as { version: number; attempts: Array<Record<string, unknown>> };
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (await predicate()) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+async function waitUntilAfter(timestamp: string): Promise<void> {
+  const instant = Date.parse(timestamp);
+  if (!Number.isFinite(instant)) throw new Error(`Invalid timestamp: ${timestamp}`);
+  while (Date.now() <= instant) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.max(1, instant - Date.now() + 1));
+    });
   }
-  throw new Error("Timed out waiting for test state");
 }
 
 function validAuthorizationUrl(origin = "https://auth.openai.com"): string {
