@@ -307,37 +307,20 @@ describe("DesktopControlService runtime OAuth ownership", () => {
     await second.disconnect();
   });
 
-  it("reuses one start operation identity when a terminal host response is lost", async () => {
-    let providerStarts = 0;
-    let admittedOperationId: string | undefined;
-    const connection = connectionFor((method, params) => {
+  it("never replays an effect-bearing start when the host response is lost", async () => {
+    const connection = connectionFor((method) => {
       if (method !== "oauth.session.start") throw new Error(`Unexpected request: ${method}`);
-      const operationId = (params as { operationId: string }).operationId;
-      if (!admittedOperationId) {
-        admittedOperationId = operationId;
-        providerStarts += 1;
-        throw new Error("terminal response was lost");
-      }
-      expect(operationId).toBe(admittedOperationId);
-      return {
-        sessionId: "oauth-session-terminal",
-        providerId: "openai-codex",
-        phase: "completed",
-        expiresAt: "2099-08-07T18:00:00.000Z",
-        configured: true,
-      };
+      throw new Error("terminal response was lost");
     });
     const service = await connectedService(connection, async () => undefined);
 
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).resolves.toMatchObject({
-      sessionId: "oauth-session-terminal",
-      phase: "completed",
-      configured: true,
+    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_start_ambiguous",
     });
-    expect(providerStarts).toBe(1);
-    expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(2);
-    expect(admittedOperationId).toMatch(/^[0-9a-f-]{36}$/);
-    await service.disconnect();
+    const starts = connection.requests.filter(({ method }) => method === "oauth.session.start");
+    expect(starts).toHaveLength(1);
+    expect((starts[0]!.params as { operationId: string }).operationId).toMatch(/^[0-9a-f-]{36}$/);
+    await expect(service.disconnect()).rejects.toMatchObject({ code: "runtime.oauth_drain_unconfirmed" });
   });
 
   it("fails closed on disconnect and target switch when an admitted start response stays ambiguous", async () => {
@@ -349,7 +332,7 @@ describe("DesktopControlService runtime OAuth ownership", () => {
     await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
       code: "runtime.oauth_start_ambiguous",
     });
-    expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(2);
+    expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(1);
     const operationIds = connection.requests
       .filter(({ method }) => method === "oauth.session.start")
       .map(({ params }) => (params as { operationId: string }).operationId);

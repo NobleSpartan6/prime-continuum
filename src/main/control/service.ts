@@ -1006,24 +1006,16 @@ export class DesktopControlService extends EventEmitter {
           { expectedHostId, authorityId: this.oauthAuthorityId, providerId, operationId },
           { timeoutMs: 30_000 }
         )
-      } catch (firstError) {
-        // The host may have admitted the session even when its response was
-        // lost. Broker start is idempotent for this exact authority/provider,
-        // so retry only that binding to recover the original session id.
-        try {
-          raw = await authority.connection.request(
-            'oauth.session.start',
-            { expectedHostId, authorityId: this.oauthAuthorityId, providerId, operationId },
-            { timeoutMs: 10_000, priority: 'urgent' }
-          )
-        } catch (reconciliationError) {
-          this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
-          throw new ControlError(
-            'runtime.oauth_start_ambiguous',
-            'The host may have started sign-in, but its session identity could not be recovered. Retry sign-in on this host before disconnecting.',
-            { retryable: true, cause: new AggregateError([firstError, reconciliationError]) }
-          )
-        }
+      } catch (cause) {
+        // A lost response may follow provider-login admission. Never replay the
+        // effect-bearing start request; only the durable read-only attempt
+        // reconciliation vertical may clear this ambiguity.
+        this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
+        throw new ControlError(
+          'runtime.oauth_start_ambiguous',
+          'The host may have started sign-in, but its session identity could not be recovered. Keep this host connected while Prime Continuim checks the original attempt.',
+          { retryable: true, cause }
+        )
       }
       // Until the returned identity is parsed and bound, treat the admitted
       // start as ambiguous so a protocol violation cannot permit disconnect.
