@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import {
+  REMOTE_DEVICE_SCOPE_COUNT,
+  REMOTE_DEVICE_SCOPES,
+} from '../../src/shared/protocol'
 
 const readRepositoryFile = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8')
 
@@ -35,5 +39,18 @@ describe('documented release boundary', () => {
     expect(status).toMatch(/durable generation-bound dispatch lease/i)
     expect(status).toMatch(/command and handoff receipts must share one reserved/i)
     expect(threatModel).toMatch(/clocks never grant authority/i)
+  })
+
+  it('keeps the threat-model scope table identical to the source vocabulary', () => {
+    const threatModel = readRepositoryFile('docs/relay-threat-model.md')
+    const scopeSection = threatModel.match(
+      /Scopes remain granular and default deny:\r?\n\r?\n([\s\S]*?)\r?\n\r?\nNo scope grants/,
+    )
+    expect(scopeSection).not.toBeNull()
+
+    const documentedScopes = [...(scopeSection?.[1] ?? '').matchAll(/^\| `([^`]+)` \|/gm)]
+      .map((match) => match[1])
+    expect(documentedScopes).toHaveLength(REMOTE_DEVICE_SCOPE_COUNT)
+    expect(documentedScopes).toEqual([...REMOTE_DEVICE_SCOPES])
   })
 })

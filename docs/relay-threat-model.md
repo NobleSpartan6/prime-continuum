@@ -288,6 +288,7 @@ Scopes remain granular and default deny:
 | `thread.steer` | Steer a live running thread | Live authoritative execution generation |
 | `thread.abort` | Request cancellation | Live/cancellable execution state |
 | `thread.start` | Start work in an authorized saved project | Production session manager |
+| `model.select` | Select a model for an exact authorized resident thread | Current resident binding, runtime catalog, and exact idle command capability; configured access is not provider proof |
 | `approval.resolve` | Resolve a claimed approval | `approval_claims_v1` and active lease |
 | `run_location.change` | Request a reviewed move | `thread_handoff_v1`; does not imply live migration |
 | `host.admin` | Pair/revoke/configure within explicitly defined methods | Never grants arbitrary command or filesystem access |

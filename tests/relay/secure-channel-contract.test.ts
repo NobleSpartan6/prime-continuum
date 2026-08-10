@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  REMOTE_DEVICE_SCOPE_COUNT,
+  REMOTE_DEVICE_SCOPES,
+  type RemoteDeviceScope,
+} from "../../src/shared/protocol";
+import {
   SecureChannelTranscriptBindingSchema,
   canonicalSecureChannelTranscriptBytes,
   deriveNoisePublicKeyFingerprint,
@@ -81,6 +86,49 @@ describe("secure relay channel contract", () => {
         grantedScopes: ["thread.follow_up"],
       }).success,
     ).toBe(false);
+    expect(
+      SecureChannelTranscriptBindingSchema.safeParse({
+        ...binding,
+        requestedScopes: ["projection.read", "projection.read"],
+      }).success,
+    ).toBe(false);
+    expect(
+      SecureChannelTranscriptBindingSchema.safeParse({
+        ...binding,
+        requestedScopes: ["projection.read", "thread.inspect"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts the complete canonical nine-scope vocabulary for pairing and reconnect transcripts", async () => {
+    const scopes = canonicalRemoteDeviceScopes();
+    expect(scopes).toHaveLength(REMOTE_DEVICE_SCOPE_COUNT);
+
+    const pairing: Extract<
+      SecureChannelTranscriptBinding,
+      { handshakePattern: "Noise_XKpsk3_25519_ChaChaPoly_BLAKE2s" }
+    > = {
+      ...(await pairingBinding()),
+      requestedScopes: scopes,
+      grantedScopes: [...scopes],
+    };
+    expect(SecureChannelTranscriptBindingSchema.parse(pairing)).toMatchObject({
+      requestedScopes: scopes,
+      grantedScopes: scopes,
+    });
+    await expect(deriveSecureChannelTranscriptBindingHash(pairing, sha256)).resolves.toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const { ticketId: _ticketId, ticketContextHash: _ticketContextHash, ...common } = pairing;
+    const reconnect: SecureChannelTranscriptBinding = {
+      ...common,
+      handshakePattern: "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+      expectedDeviceKeyFingerprint: pairing.deviceKeyFingerprint,
+    };
+    expect(SecureChannelTranscriptBindingSchema.parse(reconnect)).toMatchObject({
+      requestedScopes: scopes,
+      grantedScopes: scopes,
+    });
+    await expect(deriveSecureChannelTranscriptBindingHash(reconnect, sha256)).resolves.toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 
   it("ties the returned principal to the exact transcript, channel, grant, and peer role", async () => {
@@ -188,6 +236,9 @@ function b64(byte: number): string {
   return Buffer.alloc(32, byte).toString("base64url");
 }
 
+function canonicalRemoteDeviceScopes(): RemoteDeviceScope[] {
+  return [...REMOTE_DEVICE_SCOPES].sort();
+}
 
 async function expectRejectedOrDifferent(field: string, result: Promise<string>, baseline: string): Promise<void> {
   const outcome = await result.then(

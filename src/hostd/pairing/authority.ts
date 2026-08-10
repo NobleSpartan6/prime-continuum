@@ -5,6 +5,7 @@ import {
   IdSchema,
   IsoDateTimeSchema,
   RelayOriginSchema,
+  REMOTE_DEVICE_SCOPE_COUNT,
   RemoteDeviceScopeSchema,
   type RemoteDeviceScope,
 } from "../../shared/protocol";
@@ -61,7 +62,7 @@ const DigestSchema = z
 const IdentityEpochSchema = z.number().int().positive().max(MAX_IDENTITY_EPOCH);
 const GrantVersionSchema = z.number().int().positive().max(MAX_GRANT_VERSION);
 
-const InputScopeArraySchema = z.array(RemoteDeviceScopeSchema).min(1).max(9);
+const InputScopeArraySchema = z.array(RemoteDeviceScopeSchema).min(1).max(REMOTE_DEVICE_SCOPE_COUNT);
 const SortedScopeArraySchema = InputScopeArraySchema.superRefine((scopes, context) => {
   if (new Set(scopes).size !== scopes.length) {
     context.addIssue({ code: "custom", message: "Device scopes must be unique" });

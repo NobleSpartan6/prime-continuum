@@ -11,6 +11,8 @@ import {
   PairedDeviceSchema,
   PairingTicketDescriptorSchema,
   PROTOCOL_VERSION,
+  REMOTE_DEVICE_SCOPE_COUNT,
+  REMOTE_DEVICE_SCOPES,
   RemoteDeviceScopesSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
@@ -449,6 +451,29 @@ describe("host protocol schemas", () => {
       "projection.read",
       "model.select",
     ]);
+  });
+
+  it("publishes one immutable exact nine-scope vocabulary without accepting aliases or duplicates", () => {
+    expect(Object.isFrozen(REMOTE_DEVICE_SCOPES)).toBe(true);
+    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(9);
+    expect(REMOTE_DEVICE_SCOPES).toEqual([
+      "projection.read",
+      "thread.follow_up",
+      "thread.steer",
+      "thread.abort",
+      "thread.start",
+      "model.select",
+      "approval.resolve",
+      "run_location.change",
+      "host.admin",
+    ]);
+    expect(RemoteDeviceScopesSchema.parse([...REMOTE_DEVICE_SCOPES])).toEqual(REMOTE_DEVICE_SCOPES);
+    expect(
+      RemoteDeviceScopesSchema.safeParse([...REMOTE_DEVICE_SCOPES, "projection.read"]).success,
+    ).toBe(false);
+    expect(
+      RemoteDeviceScopesSchema.safeParse(["projection.read", "thread.inspect"]).success,
+    ).toBe(false);
   });
 
   it("exposes one discriminated IPC request surface", () => {

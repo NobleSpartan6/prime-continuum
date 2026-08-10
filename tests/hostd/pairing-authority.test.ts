@@ -2,7 +2,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RemoteDeviceScope } from "../../src/shared/protocol";
+import {
+  REMOTE_DEVICE_SCOPE_COUNT,
+  REMOTE_DEVICE_SCOPES,
+  type RemoteDeviceScope,
+} from "../../src/shared/protocol";
 import { AtomicWriteAmbiguousCommitError, atomicWriteJson } from "../../src/hostd/atomic-files";
 import {
   PairingAuthority,
@@ -275,6 +279,33 @@ describe("PairingAuthority", () => {
       }),
     ).rejects.toMatchObject({ code: "SCOPE_ESCALATION" });
     expect(findDevice(await fixture.authority.getSnapshot(), device.fingerprint).grantVersion).toBe(1);
+  });
+
+  it("keeps the complete nine-scope durable grant aligned with the test-only transcript boundary", async () => {
+    const fixture = await temporaryAuthority();
+    const scopes: RemoteDeviceScope[] = [...REMOTE_DEVICE_SCOPES].sort();
+    expect(scopes).toHaveLength(REMOTE_DEVICE_SCOPE_COUNT);
+
+    const device = await pairDevice(fixture.authority, {
+      ticketId: "ticket-complete-scope-contract",
+      reservationId: "attempt-complete-scope-contract",
+      keyByte: 33,
+      requestedScopes: scopes,
+      grantedScopes: [...scopes],
+    });
+    expect(device.scopeCeiling).toEqual(scopes);
+    expect(device.scopes).toEqual(scopes);
+
+    const registration = await registerTestChannel(
+      fixture.authority,
+      device,
+      "00000000000000000000000000000030",
+    );
+    for (const scope of scopes) {
+      await expect(
+        fixture.authority.withAuthorizedChannel(registration.lease, scope, async () => scope),
+      ).resolves.toBe(scope);
+    }
   });
 
   it("derives stable identity from the authenticated public key, ignores a client claim, and persists one atomic grant", async () => {

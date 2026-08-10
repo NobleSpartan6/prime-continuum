@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { IdSchema, RelayOriginSchema, RemoteDeviceScopeSchema, type RemoteDeviceScope } from "./protocol";
+import {
+  IdSchema,
+  RelayOriginSchema,
+  REMOTE_DEVICE_SCOPE_COUNT,
+  RemoteDeviceScopeSchema,
+  type RemoteDeviceScope,
+} from "./protocol";
 import type { RelayRoutingFrame } from "./relay-routing";
 
 const BASE64URL_SHA256_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -23,7 +29,7 @@ const GrantVersionSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const SortedScopeArraySchema = z
   .array(RemoteDeviceScopeSchema)
   .min(1)
-  .max(8)
+  .max(REMOTE_DEVICE_SCOPE_COUNT)
   .superRefine((scopes, context) => {
     if (new Set(scopes).size !== scopes.length || scopes.some((scope, index) => index > 0 && scopes[index - 1]! >= scope)) {
       context.addIssue({ code: "custom", message: "Scopes must be unique and sorted lexically" });

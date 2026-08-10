@@ -1691,7 +1691,7 @@ export const CommandIdentitySchema = z.object({
 });
 export type CommandIdentity = z.infer<typeof CommandIdentitySchema>;
 
-export const RemoteDeviceScopeSchema = z.enum([
+export const REMOTE_DEVICE_SCOPES = Object.freeze([
   "projection.read",
   "thread.follow_up",
   "thread.steer",
@@ -1701,13 +1701,15 @@ export const RemoteDeviceScopeSchema = z.enum([
   "approval.resolve",
   "run_location.change",
   "host.admin",
-]);
-export type RemoteDeviceScope = z.infer<typeof RemoteDeviceScopeSchema>;
+] as const);
+export type RemoteDeviceScope = (typeof REMOTE_DEVICE_SCOPES)[number];
+export const REMOTE_DEVICE_SCOPE_COUNT = REMOTE_DEVICE_SCOPES.length;
+export const RemoteDeviceScopeSchema = z.enum(REMOTE_DEVICE_SCOPES);
 
 export const RemoteDeviceScopesSchema = z
   .array(RemoteDeviceScopeSchema)
   .min(1)
-  .max(9)
+  .max(REMOTE_DEVICE_SCOPE_COUNT)
   .refine((scopes) => new Set(scopes).size === scopes.length, "Device scopes must be unique");
 
 /** Public identity metadata only. The secretRef and private key stay inside hostd. */

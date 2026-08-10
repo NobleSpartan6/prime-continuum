@@ -385,6 +385,42 @@ describe("HostService handoff availability", () => {
     });
   });
 
+  it("denies relay model selection without its exact scope before durable mutation admission", async () => {
+    const { service, store, pairingAuthority, relayDevice } = await temporaryService();
+    const host = await store.getHost();
+    const projectionChannel = await registerTestChannel(pairingAuthority, host.hostId, relayDevice, 19);
+    const command: CommandEnvelope = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: relayDevice.deviceId,
+      commandId: "relay-model-selection-scope-canary",
+      expectedHostId: host.hostId,
+      threadId: "test-thread",
+      issuedAt: "2026-08-10T12:00:00.000Z",
+      expectedExecutionGenerationId: "test-execution-1",
+      command: {
+        kind: "model.select",
+        providerId: "openai",
+        modelId: "gpt-5.6-sol",
+      },
+    };
+
+    const response = await service.handle(
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "relay-model-selection-scope-denied",
+        method: "command.submit",
+        payload: { command },
+      },
+      { transport: "relay", channel: projectionChannel.lease },
+    );
+
+    expect(response).toMatchObject({ ok: false, error: { code: "REMOTE_SCOPE_DENIED" } });
+    expect((await store.reconcileCommands([command])).unknown).toEqual([
+      { deviceId: command.deviceId, commandId: command.commandId },
+    ]);
+    await service.close();
+  });
+
   it("reveals resident control state only through a current authenticated projection-read channel", async () => {
     const { service, store, pairingAuthority, relayDevice, workspaceDirectory } = await temporaryService();
     const host = await store.getHost();
@@ -536,7 +572,13 @@ async function pairTestDevice(authority: PairingAuthority, hostId: string): Prom
     expectedHostId: hostId,
     ticketId: "service-test-ticket",
     relayOrigin: "wss://relay.service.test",
-    requestedScopes: ["projection.read", "thread.follow_up", "thread.start", "run_location.change"],
+    requestedScopes: [
+      "projection.read",
+      "thread.follow_up",
+      "thread.start",
+      "model.select",
+      "run_location.change",
+    ],
     ttlSeconds: 300,
   });
   await authority.reserveVerifiedTicket(ceremonies.issueReservation({
