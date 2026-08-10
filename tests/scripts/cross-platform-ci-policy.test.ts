@@ -64,6 +64,7 @@ describe('cross-platform source CI policy', () => {
     expect(workflowRunnerSource).not.toContain('windows-appcontainer-probe')
     const rootScripts = Object.values(rootPackage.scripts).join('\n')
     expect(rootScripts).not.toContain('windows-appcontainer-probe.ps1')
+    expect(rootScripts).not.toContain('windows-appcontainer-probe-payload-protocol')
     expect(rootScripts).not.toContain('--live')
     expect(rootScripts).not.toContain('CreateAppContainerProfile')
   })

@@ -25,7 +25,13 @@ The implemented Phase A files are:
   canonical, link-free, bounded receipt file under a stable physical identity;
 - `scripts/verify-windows-appcontainer-probe.d.mts` and
   `tests/scripts/windows-appcontainer-probe-verifier.test.ts`, the verifier's
-  declaration and source-only custody/CLI tests.
+  declaration and source-only custody/CLI tests;
+- `scripts/windows-appcontainer-probe-payload-protocol.mjs` and its `.d.mts`,
+  the pure `PCAPM001` manifest / `PCAPE001` evidence byte-protocol builders and
+  strict parsers; and
+- `tests/scripts/windows-appcontainer-probe-payload.test.ts`, which freezes the
+  protocol layout, child-gate contract, canonical vectors, result coherence,
+  and adversarial parser rejections without launching a process.
 
 `pnpm verify:windows-appcontainer-probe:receipt -- --receipt <path>` performs
 only that static verification. It accepts no live-probe flag, creates no files,
@@ -37,6 +43,18 @@ PowerShell operator harness, native supervisor, dedicated probe payload,
 no-replace receipt publisher, and disposable-machine evidence run are Phase B
 work. Source tests cannot establish any Windows security property.
 
+The payload protocol is only a host/child wire contract. `PCAPM001` binds a
+future payload digest and size to the exact package SID, empty child
+environment, controlled paths, correlation-scoped pipe, parent PID, concrete
+handle sentinel, fixed network sentinels, and the ordered child-gate contract.
+`PCAPE001` binds exactly 31 child observations back to that manifest and
+payload, requires a coherent complete-match, complete-nonmatch, or incomplete
+result, and carries an internal digest. Both parsers reject extensions,
+noncanonical layouts, padding drift, zero identities/digests, pseudo handles,
+and cross-fed bindings. Their returned summaries contain no path, SID, PID,
+handle, or pipe material. This protocol does not implement the payload that
+would consume or produce those bytes.
+
 The pre-live v1 schema had no producer or accepted disposable-machine receipt.
 V2 deliberately replaces it so the payload provenance says only `launch_target`
 and the supervisor gate says only that launch-handle inheritance was disabled;
@@ -44,10 +62,11 @@ neither field can imply that a child executed or that every kernel handle was
 enumerated.
 
 The live boundary is blocked until the repository contains a separately
-reviewed reproducible native x64 payload with a pinned build/provenance path and
-a static/system-only dependency closure. An arbitrary external executable,
-PowerShell, Node.js, or .NET payload cannot establish reproducible probe
-evidence for a zero-capability LPAC. Until that payload and the native
+reviewed reproducible native x64 payload implementation with a pinned build and
+provenance path and a static/system-only dependency closure. The source-only
+byte protocol is not that implementation or provenance. An arbitrary external
+executable, PowerShell, Node.js, or .NET payload cannot establish reproducible
+probe evidence for a zero-capability LPAC. Until that payload and the native
 supervisor exist, there is deliberately no live flag.
 
 ## Admission contract
@@ -90,12 +109,12 @@ AppContainers:
 - `bInheritHandles=FALSE`, zero capabilities, and no fallback or experimental
   sandbox API.
 
-The child must receive an explicitly constructed, alphabetically sorted,
-double-NUL-terminated UTF-16 environment block with
-`CREATE_UNICODE_ENVIRONMENT`. It may contain only the reviewed probe variables
-needed for its sealed tool, scratch, profile, and Windows loader. Passing a null
-environment pointer or copying the operator environment is forbidden. The gate
-matrix separately requires the exact allowlist and denial of any
+The child must receive the exact empty, double-NUL-terminated UTF-16 environment
+block frozen by `PCAPM001`, with `CREATE_UNICODE_ENVIRONMENT`. Passing a null
+environment pointer, copying the operator environment, or adding even a
+reviewed-looking variable is forbidden. The future native payload must obtain
+its bounded inputs from the manifest rather than ambient environment state. The
+gate matrix separately requires the exact empty allowlist and denial of any
 credential-shaped child environment entry.
 
 Microsoft documents the profile lifecycle and AppContainer dual-principal
@@ -149,7 +168,7 @@ The fixed receipt matrix verifies intended facts without accepting arbitrary
 gate names. It covers:
 
 - exact AppContainer SID, Low integrity, zero capability SIDs, LPAC policy,
-  in-Job-at-creation, disabled launch-handle inheritance, and an exact sanitized
+  in-Job-at-creation, disabled launch-handle inheritance, and an exact empty
   child environment with no credential-shaped entry;
 - read/execute access to the sealed tool tree, read/write access to scratch and
   profile, and absence of a writable executable closure;
