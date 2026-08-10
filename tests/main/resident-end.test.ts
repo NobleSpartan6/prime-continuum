@@ -155,6 +155,48 @@ describe('DesktopControlService resident end boundary', () => {
     expect(connection.requests.filter(({ method }) => method === 'resident.end')).toHaveLength(1)
   })
 
+  it('allows exact SSH End only through the registered-workspace lifecycle capability', async () => {
+    const directory = await testDirectory()
+    let ended = false
+    let endPayload: Record<string, unknown> | undefined
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health(['resident_registered_workspace_lifecycle_v1'])
+      if (method === 'thread.snapshot') return ended ? terminalSnapshot(String(endPayload?.operationId)) : liveSnapshot()
+      if (method === 'resident.end') {
+        endPayload = params as Record<string, unknown>
+        ended = true
+        return endStatus(endPayload, 'completed')
+      }
+      if (method === 'catalog.snapshot') return terminalCatalog()
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedServiceWithProjection(directory, connection)
+    markAsRegisteredSsh(service, ['resident_registered_workspace_lifecycle_v1'])
+
+    const prepared = await service.prepareResidentEnd(identity)
+    await expect(service.endResident({ confirmationToken: prepared.confirmationToken, consent: true }))
+      .resolves.toMatchObject({ kind: 'end', phase: 'completed' })
+    expect(endPayload).toEqual({
+      operationId: prepared.operationId,
+      ...identity,
+      expectedSourceCursor: cursor,
+    })
+    expect(connection.requests.filter(({ method }) => method === 'resident.end')).toHaveLength(1)
+
+    const secondDirectory = await testDirectory()
+    const secondConnection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      if (method === 'thread.snapshot') return liveSnapshot()
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const withoutCapability = await connectedServiceWithProjection(secondDirectory, secondConnection)
+    markAsRegisteredSsh(withoutCapability, [])
+    await expect(withoutCapability.prepareResidentEnd(identity)).rejects.toMatchObject({
+      code: 'resident.lifecycle_unavailable',
+    })
+    expect(secondConnection.requests.filter(({ method }) => method === 'resident.end')).toEqual([])
+  })
+
   it.each(['idle', 'failed'] as const)(
     'preserves a terminal %s task outcome instead of synthesizing task completion',
     async (terminalStatus) => {
@@ -473,7 +515,7 @@ describe('DesktopControlService resident end boundary', () => {
     const service = await serviceFor(directory)
 
     expect((await service.bootstrap()).residentLifecycleOperations).toEqual([
-      { ...legacy, kind: 'provision' },
+      { ...legacy, kind: 'provision', provisionMode: 'local_path' },
     ])
   })
 
@@ -708,6 +750,21 @@ async function writeEndLedger(directory: string, entries: ResidentEndOperationVi
     JSON.stringify({ version: 1, entries }),
     'utf8',
   )
+}
+
+function markAsRegisteredSsh(service: DesktopControlService, capabilities: string[]): void {
+  const mutable = service as unknown as {
+    target: { kind: 'ssh'; alias: string }
+    state: ReturnType<DesktopControlService['getConnectionState']>
+    authorityCapabilities: string[]
+  }
+  mutable.target = { kind: 'ssh', alias: 'remote' }
+  mutable.state = {
+    ...service.getConnectionState(),
+    target: { kind: 'ssh', alias: 'remote' },
+    path: 'ssh',
+  }
+  mutable.authorityCapabilities = capabilities
 }
 
 async function connectedServiceWithProjection(

@@ -54,6 +54,8 @@ export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as co
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
 export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
+export const RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY =
+  "resident_registered_workspace_lifecycle_v1" as const;
 export const RESIDENT_CONTROL_PROJECTION_CAPABILITY = "resident_control_projection_v1" as const;
 export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
 /** Trusted-local probe only; executable self-evaluation remains workspace-scoped. */
@@ -1993,8 +1995,33 @@ export const ResidentProvisionRequestSchema = z
 export type ResidentProvisionRequest = z.infer<typeof ResidentProvisionRequestSchema>;
 
 /**
- * Path-free trusted-desktop request to end one exact resident binding. Upstream
- * session identities remain private to the host Store and verified adapter.
+ * Path-free provisioning envelope for an exact saved workspace already owned
+ * by this host. The private path is resolved only from the reference thread's
+ * durable workspace authority and never crosses the SSH bridge.
+ */
+export const ResidentRegisteredWorkspaceProvisionRequestSchema = z
+  .object({
+    expectedHostId: IdSchema,
+    operationId: IdSchema,
+    projectId: IdSchema,
+    workspaceId: IdSchema,
+    referenceThreadId: IdSchema,
+    referenceExecutionGenerationId: IdSchema,
+    threadId: IdSchema,
+    executionGenerationId: IdSchema,
+    threadTitle: z.string().trim().min(1).max(255).refine((value) => !/[\0\r\n]/.test(value)),
+    createdAt: IsoDateTimeSchema,
+    sessionName: z.string().trim().min(1).max(255).refine((value) => !/[\0\r\n]/.test(value)).optional(),
+  })
+  .strict();
+export type ResidentRegisteredWorkspaceProvisionRequest = z.infer<
+  typeof ResidentRegisteredWorkspaceProvisionRequestSchema
+>;
+
+/**
+ * Path-free trusted-desktop or verified-SSH request to end one exact resident
+ * binding. Upstream session identities remain private to the host Store and
+ * verified adapter.
  */
 export const ResidentEndRequestSchema = z
   .object({
@@ -2145,6 +2172,11 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   }),
   z.object({
     ...RequestBase,
+    method: z.literal("resident.provision.registered"),
+    payload: ResidentRegisteredWorkspaceProvisionRequestSchema,
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("resident.end"),
     payload: ResidentEndRequestSchema,
   }),
@@ -2235,6 +2267,11 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("command.submit"), result: CommandReceiptSchema }),
   z.object({ ...SuccessBase, method: z.literal("command.reconcile"), result: CommandReconciliationSchema }),
   z.object({ ...SuccessBase, method: z.literal("resident.provision"), result: ResidentLifecycleStatusSchema }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("resident.provision.registered"),
+    result: ResidentLifecycleStatusSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("resident.end"), result: ResidentLifecycleStatusSchema }),
   z.object({
     ...SuccessBase,
@@ -2266,6 +2303,7 @@ export const HostIpcErrorResponseSchema = z.object({
     "command.submit",
     "command.reconcile",
     "resident.provision",
+    "resident.provision.registered",
     "resident.end",
     "resident.lifecycle.status",
     "handoff.plan",

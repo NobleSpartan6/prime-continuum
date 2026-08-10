@@ -200,8 +200,8 @@ export interface RuntimeOAuthSessionView {
 }
 
 /**
- * A short-lived renderer authorization for one directory selected by Electron.
- * The selected path is retained only inside the main process.
+ * A short-lived renderer authorization for one workspace. A native-selected
+ * path is retained only inside main; a registered SSH selection is path-free.
  */
 export interface ResidentWorkspaceSelection {
   selectionToken: string
@@ -211,15 +211,32 @@ export interface ResidentWorkspaceSelection {
   expiresAt: string
 }
 
-export interface ResidentWorkspaceSelectionInput {
-  /**
-   * Re-authorize the private path for a path-free durable operation. A null
-   * status resumes the exact operation; a definitive pre-effect completion
-   * reuses its workspace identity under a newly minted lifecycle operation.
-   */
-  resumeOperationId?: string
-}
+export type ResidentWorkspaceSelectionInput =
+  | {
+      /** Missing in older renderer calls; normalized to `local_path` in main. */
+      kind?: 'local_path'
+      /**
+       * Re-authorize the private path for a path-free durable operation. A null
+       * status resumes the exact operation; a definitive pre-effect completion
+       * reuses its workspace identity under a newly minted lifecycle operation.
+       */
+      resumeOperationId?: string
+    }
+  | {
+      kind: 'registered_workspace'
+      /** Exact path-free saved workspace and donor-generation authority. */
+      projectId: string
+      workspaceId: string
+      referenceThreadId: string
+      referenceExecutionGenerationId: string
+      /** Status-first recovery; never authorizes replay of an uncertain mutation. */
+      resumeOperationId?: string
+    }
 
+/*
+ * Provisioning metadata is renderer-authored display text. Main separately
+ * retains all filesystem authority and registered-workspace lineage.
+ */
 export interface ResidentProvisionInput {
   selectionToken: string
   projectDisplayName: string
@@ -272,12 +289,29 @@ interface ResidentLifecycleOperationBase {
 }
 
 /** Path-free durable provisioning state exposed during bootstrap and recovery. */
-export interface ResidentProvisionOperationView extends ResidentLifecycleOperationBase {
+interface ResidentProvisionOperationBase extends ResidentLifecycleOperationBase {
   kind: 'provision'
   projectDisplayName: string
   threadTitle: string
   sessionName?: string
 }
+
+/** A local native-picker operation. Its private path is never persisted. */
+export interface LocalResidentProvisionOperationView extends ResidentProvisionOperationBase {
+  provisionMode: 'local_path'
+}
+
+/** A path-free operation against an existing workspace registered on the host. */
+export interface RegisteredWorkspaceResidentProvisionOperationView
+  extends ResidentProvisionOperationBase {
+  provisionMode: 'registered_workspace'
+  referenceThreadId: string
+  referenceExecutionGenerationId: string
+}
+
+export type ResidentProvisionOperationView =
+  | LocalResidentProvisionOperationView
+  | RegisteredWorkspaceResidentProvisionOperationView
 
 /** Path-free durable permanent-end intent and its exact source projection. */
 export interface ResidentEndOperationView extends ResidentLifecycleOperationBase {

@@ -16,7 +16,7 @@ import {
   ResidentRuntimeContractError,
   type ResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
-import { HostService, TRUSTED_USER_SESSION } from "../../src/hostd/service";
+import { HostService, SSH_BRIDGE_SESSION, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore, type ResidentKillLease } from "../../src/hostd/store";
 import { PROTOCOL_VERSION, type CommandEnvelope, type HostIpcRequest } from "../../src/shared/protocol";
 
@@ -28,6 +28,47 @@ afterEach(async () => {
 });
 
 describe("HostService resident end causal recovery", () => {
+  it("allows exact End and status recovery over SSH while denying relay lifecycle access", async () => {
+    const fixture = await serviceFixture();
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: fixture.store,
+      adapter: async () => ({
+        createOwnedCandidate: undefined as never,
+        readStableResidentProjection: undefined as never,
+        endResidentSession: async (lease: ResidentKillLease) => {
+          await fixture.store.authorizeResidentKillInvocation(lease);
+          return {
+            acknowledgementVersion: 1 as const,
+            operation: "end" as const,
+            activeSessionId: lease.binding.activeSessionId,
+            sessionId: lease.binding.sessionId,
+          };
+        },
+      }),
+    });
+    const service = new HostService(fixture.store, lifecycleGateway(coordinator, fixture.binding));
+
+    await expect(service.handle(endProtocolRequest(fixture), {
+      transport: "relay",
+      channel: {} as never,
+    })).resolves.toMatchObject({
+      ok: false,
+      method: "resident.end",
+      error: { code: "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN" },
+    });
+    await expect(service.handle(endProtocolRequest(fixture), SSH_BRIDGE_SESSION)).resolves.toMatchObject({
+      ok: true,
+      method: "resident.end",
+      result: { kind: "end", phase: "completed" },
+    });
+    await expect(service.handle(statusProtocolRequest(fixture), SSH_BRIDGE_SESSION)).resolves.toMatchObject({
+      ok: true,
+      method: "resident.lifecycle.status",
+      result: { status: { kind: "end", phase: "completed" } },
+    });
+    await service.close();
+  });
+
   it("retains a terminal ended control projection across restart", async () => {
     const fixture = await serviceFixture();
     const coordinator = new ResidentLifecycleCoordinator({

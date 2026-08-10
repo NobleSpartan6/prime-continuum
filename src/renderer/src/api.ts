@@ -7,6 +7,7 @@ import {
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
@@ -262,6 +263,7 @@ export interface WorkbenchSnapshot {
     startResidentTurn?: boolean
     stopResidentTurn?: boolean
     provisionResident?: boolean
+    endResident?: boolean
     crossHostHandoff: boolean
     modelCatalog?: boolean
     /** Eligibility only; the native action revalidates the exact idle resident authority. */
@@ -304,6 +306,9 @@ export interface ResidentProvisionOperationSummary extends ResidentLifecycleOper
   projectDisplayName: string
   threadTitle: string
   sessionName?: string
+  provisionMode?: 'local_path' | 'registered_workspace'
+  referenceThreadId?: string
+  referenceExecutionGenerationId?: string
 }
 
 export interface ResidentEndOperationSummary extends ResidentLifecycleOperationBase {
@@ -320,13 +325,105 @@ export type ResidentLifecycleOperationSummary =
   | ResidentProvisionOperationSummary
   | ResidentEndOperationSummary
 
-export interface ResidentWorkspaceSelection {
+const RESIDENT_PROVISION_PHASE_RESERVES_WORKSPACE: Record<ResidentLifecycleStatus['phase'], boolean> = {
+  prepared: true,
+  owned_create_dispatching: true,
+  owned_observed: true,
+  promotion_dispatching: true,
+  promoted_observed: true,
+  projection_committed: true,
+  committed: true,
+  quarantined: true,
+  completed: false,
+  ending: false,
+  kill_dispatching: false,
+  kill_acknowledged: false,
+  detached: false,
+}
+
+export function registeredWorkspaceProvisionHoldsAuthority(
+  operation: ResidentLifecycleOperationSummary,
+  operations: ResidentLifecycleOperationSummary[],
+  threads: ThreadSummary[],
+): boolean {
+  if (
+    operation.kind !== 'provision' ||
+    operation.provisionMode !== 'registered_workspace'
+  ) return false
+
+  const statusHoldsAuthority = operation.lastStatus?.kind === 'provision'
+    ? RESIDENT_PROVISION_PHASE_RESERVES_WORKSPACE[operation.lastStatus.phase]
+    : true
+  if (!statusHoldsAuthority) return false
+
+  const exactThreadIsEnded = threads.some((thread) =>
+    thread.hostId === operation.expectedHostId &&
+    (thread.remoteId ?? thread.id) === operation.threadId &&
+    thread.executionGenerationId === operation.executionGenerationId &&
+    thread.residentLifecycle?.state === 'ended',
+  )
+  const exactCompletedEnd = operations.some((candidate) =>
+    candidate.kind === 'end' &&
+    candidate.expectedHostId === operation.expectedHostId &&
+    candidate.projectId === operation.projectId &&
+    candidate.workspaceId === operation.workspaceId &&
+    candidate.threadId === operation.threadId &&
+    candidate.executionGenerationId === operation.executionGenerationId &&
+    candidate.lastStatus?.kind === 'end' &&
+    candidate.lastStatus.phase === 'completed',
+  )
+  return !exactThreadIsEnded && !exactCompletedEnd
+}
+
+type ResidentProvisionResumeMode = 'continue' | 'retry' | 'main_validated'
+
+function residentProvisionResumeMode(operation: ResidentProvisionOperationSummary): ResidentProvisionResumeMode | undefined {
+  if (operation.state === 'requires_reselection') return 'continue'
+  const status = operation.lastStatus
+  if (status?.kind !== 'provision') return undefined
+  if (status.phase === 'completed') {
+    return status.completionReason === 'owned_create_failed_before_effect' ||
+      status.completionReason === 'owned_create_cleaned'
+      ? 'retry'
+      : undefined
+  }
+  return operation.state === 'submitted' && (
+    status.phase === 'prepared' ||
+    status.phase === 'promoted_observed' ||
+    status.phase === 'projection_committed'
+  )
+    ? 'continue'
+    : undefined
+}
+
+interface ResidentWorkspaceSelectionBase {
   selectionToken: string
   operationId: string
   expectedHostId: string
   suggestedName: string
   expiresAt: string
 }
+
+export type ResidentWorkspaceSelection =
+  | (ResidentWorkspaceSelectionBase & { kind?: 'local_path' })
+  | (ResidentWorkspaceSelectionBase & {
+      kind: 'registered_workspace'
+      projectId: string
+      workspaceId: string
+      referenceThreadId: string
+      referenceExecutionGenerationId: string
+    })
+
+export type ResidentWorkspaceSelectionInput =
+  | { kind?: 'local_path'; resumeOperationId?: string }
+  | {
+      kind: 'registered_workspace'
+      projectId: string
+      workspaceId: string
+      referenceThreadId: string
+      referenceExecutionGenerationId: string
+      resumeOperationId?: string
+    }
 
 export interface ResidentEndPreparation {
   confirmationToken: string
@@ -437,7 +534,7 @@ export interface RendererApi {
     onProgress: (progress: RuntimeOAuthProgress) => void,
   ): Promise<RuntimeOAuthResult>
   cancelRuntimeOAuth?(request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null>
-  selectResidentWorkspace(input?: { resumeOperationId?: string }): Promise<ResidentWorkspaceSelection>
+  selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<ResidentWorkspaceSelection>
   provisionResident(input: {
     selectionToken: string
     projectDisplayName: string
@@ -494,6 +591,37 @@ export class StaleHostAuthorityError extends Error {
 
 export function isStaleHostAuthorityError(value: unknown): value is StaleHostAuthorityError {
   return value instanceof StaleHostAuthorityError
+}
+
+export class ResidentProvisionError extends Error {
+  readonly durableOperationPossible: boolean
+  readonly code?: string
+  readonly receiptId?: string
+  readonly details?: UnknownRecord
+  readonly retryable?: boolean
+
+  constructor(message: string, options: {
+    durableOperationPossible: boolean
+    code?: string
+    receiptId?: string
+    details?: UnknownRecord
+    retryable?: boolean
+    cause?: unknown
+  }) {
+    super(message, { cause: options.cause })
+    this.name = 'ResidentProvisionError'
+    this.durableOperationPossible = options.durableOperationPossible
+    this.code = options.code
+    this.receiptId = options.receiptId
+    this.details = options.details
+    this.retryable = options.retryable
+  }
+}
+
+export function residentProvisionMayHaveDurableOperation(value: unknown): boolean {
+  return value instanceof ResidentProvisionError
+    ? value.durableOperationPossible
+    : true
 }
 
 type NativePrimeBridge = object
@@ -767,6 +895,7 @@ export type PreviewVisualState =
   | 'stop-awaiting-idle-proof'
   | 'nonretryable-uncertainty'
   | 'resident-start'
+  | 'ssh-registered-workspace'
   | 'resident-recovery'
   | 'resident-end-review'
   | 'resident-end-pending'
@@ -784,6 +913,7 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'stop-awaiting-idle-proof',
   'nonretryable-uncertainty',
   'resident-start',
+  'ssh-registered-workspace',
   'resident-recovery',
   'resident-end-review',
   'resident-end-pending',
@@ -836,6 +966,48 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       crossHostHandoff: false,
       modelCatalog: true,
       runtimeOAuth: true,
+    }
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+    return snapshot
+  }
+
+  if (visualState === 'ssh-registered-workspace') {
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-seamless')
+    const project = snapshot.projects.find((candidate) => candidate.id === 'project-prime')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-devbox')
+    if (!thread || !project || !host || !snapshot.runtime.session) return snapshot
+    snapshot.selectedProjectId = project.id
+    snapshot.selectedThreadId = thread.id
+    thread.remoteId = 'thread-seamless-remote'
+    thread.workspaceId = 'workspace-prime-devbox'
+    thread.executionGenerationId = 'execution-registered-workspace-preview'
+    thread.status = 'idle'
+    host.kind = 'ssh'
+    host.connection = 'online'
+    host.connectionPath = 'SSH'
+    host.latencyMs = 24
+    delete host.activationRequired
+    delete host.lastSynchronized
+    snapshot.attention = []
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      residency: 'client_owned',
+      sessionName: thread.title,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    delete snapshot.runtime.session.activeSessionId
+    delete snapshot.runtime.session.sessionId
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    snapshot.operations = {
+      submitCommands: true,
+      startResidentTurn: true,
+      stopResidentTurn: false,
+      crossHostHandoff: false,
+      provisionResident: true,
+      endResident: true,
     }
     snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
@@ -925,6 +1097,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       startResidentTurn: visualState === 'resident-end-review',
       stopResidentTurn: false,
       provisionResident: true,
+      endResident: visualState === 'resident-end-review',
     }
     snapshot.residentLifecycleOperations = visualState === 'resident-end-pending'
       ? [{
@@ -1294,7 +1467,8 @@ class BrowserPreviewApi implements RendererApi {
   constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
     this.environment = visualState === 'candidate-evaluation-review' ||
       visualState === 'model-selection' ||
-      visualState === 'prime-oauth'
+      visualState === 'prime-oauth' ||
+      visualState === 'ssh-registered-workspace'
       ? 'native'
       : 'preview'
     if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
@@ -1407,7 +1581,31 @@ class BrowserPreviewApi implements RendererApi {
     throw new Error('Prime Agent sign-in is available only in the native desktop app.')
   }
 
-  async selectResidentWorkspace(_input: { resumeOperationId?: string } = {}): Promise<ResidentWorkspaceSelection> {
+  async selectResidentWorkspace(
+    _input: ResidentWorkspaceSelectionInput = {},
+  ): Promise<ResidentWorkspaceSelection> {
+    if (_input.kind === 'registered_workspace') {
+      const exactVisualAuthority = this.visualState === 'ssh-registered-workspace' &&
+        _input.projectId === 'project-prime' &&
+        _input.workspaceId === 'workspace-prime-devbox' &&
+        _input.referenceThreadId === 'thread-seamless-remote' &&
+        _input.referenceExecutionGenerationId === 'execution-registered-workspace-preview'
+      if (!exactVisualAuthority) {
+        throw new Error('Saved-workspace resident provisioning is available only for its exact internal visual-QA authority.')
+      }
+      return {
+        kind: 'registered_workspace',
+        selectionToken: 'preview-registered-workspace-selection-token',
+        operationId: _input.resumeOperationId ?? 'resident-preview-registered-create',
+        expectedHostId: 'host-devbox',
+        suggestedName: 'Prime Continuim',
+        projectId: _input.projectId,
+        workspaceId: _input.workspaceId,
+        referenceThreadId: _input.referenceThreadId,
+        referenceExecutionGenerationId: _input.referenceExecutionGenerationId,
+        expiresAt: '2099-08-07T12:05:00.000Z',
+      }
+    }
     if (this.visualState === 'resident-start' || this.visualState === 'resident-recovery') {
       return {
         selectionToken: 'preview-selection-token',
@@ -1972,13 +2170,23 @@ class NativeBridgeError extends Error {
   readonly code?: string
   readonly receiptId?: string
   readonly details?: UnknownRecord
+  readonly durableOperationPossible?: boolean
+  readonly retryable?: boolean
 
-  constructor(message: string, options: { code?: string; receiptId?: string; details?: UnknownRecord }) {
+  constructor(message: string, options: {
+    code?: string
+    receiptId?: string
+    details?: UnknownRecord
+    durableOperationPossible?: boolean
+    retryable?: boolean
+  }) {
     super(message)
     this.name = 'NativeBridgeError'
     this.code = options.code
     this.receiptId = options.receiptId
     this.details = options.details
+    this.durableOperationPossible = options.durableOperationPossible
+    this.retryable = options.retryable
   }
 }
 
@@ -2015,12 +2223,48 @@ function bridgeError(raw: unknown): Error {
   const message = asString(error?.message) ?? 'The native Prime service could not complete this request.'
   const code = asString(error?.code)
   const receipt = asString(error?.receiptId)
+  const details = asRecord(error?.details)
+  const durableOperationPossible = asBoolean(error?.durableOperationPossible) ??
+    asBoolean(details?.durableOperationPossible)
+  const retryable = asBoolean(error?.retryable) ?? asBoolean(details?.retryable)
   const suffix = [code, receipt ? `receipt ${receipt}` : undefined].filter(Boolean).join(' · ')
   return new NativeBridgeError(suffix ? `${message} (${suffix})` : message, {
     ...(code ? { code } : {}),
     ...(receipt ? { receiptId: receipt } : {}),
-    ...(asRecord(error?.details) ? { details: asRecord(error?.details) } : {}),
+    ...(details ? { details } : {}),
+    ...(durableOperationPossible !== undefined ? { durableOperationPossible } : {}),
+    ...(retryable !== undefined ? { retryable } : {}),
   })
+}
+
+function residentProvisionErrorFrom(
+  error: unknown,
+  defaultDurableOperationPossible: boolean,
+): ResidentProvisionError {
+  if (error instanceof ResidentProvisionError) return error
+  const nativeError = error instanceof NativeBridgeError ? error : undefined
+  const code = nativeError?.code ?? (
+    error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined
+  )
+  const durableOperationPossible = nativeError?.durableOperationPossible ?? defaultDurableOperationPossible
+  const retryable = nativeError?.retryable ?? (
+    error && typeof error === 'object' && 'retryable' in error && typeof error.retryable === 'boolean'
+      ? error.retryable
+      : undefined
+  )
+  return new ResidentProvisionError(
+    error instanceof Error ? error.message : 'Resident setup did not finish.',
+    {
+      durableOperationPossible,
+      ...(code ? { code } : {}),
+      ...(nativeError?.receiptId ? { receiptId: nativeError.receiptId } : {}),
+      ...(nativeError?.details ? { details: nativeError.details } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+      cause: error,
+    },
+  )
 }
 
 function unwrapResult<T>(raw: unknown): T {
@@ -2066,7 +2310,7 @@ function residentWorkspaceSelectionFromNative(value: unknown): ResidentWorkspace
     !expiresAt ||
     !Number.isFinite(Date.parse(expiresAt))
   ) {
-    throw new Error('The native workspace picker returned an invalid path-free selection receipt.')
+    throw new Error('The native service returned an invalid path-free selection receipt for a workspace.')
   }
   return { selectionToken, operationId, expectedHostId, suggestedName, expiresAt }
 }
@@ -2222,6 +2466,9 @@ function residentLifecycleOperationsFromNative(
       const projectDisplayName = asString(entry.projectDisplayName)
       const threadTitle = asString(entry.threadTitle)
       const sessionName = asString(entry.sessionName)
+      const provisionMode = asString(entry.provisionMode)
+      const referenceThreadId = asString(entry.referenceThreadId)
+      const referenceExecutionGenerationId = asString(entry.referenceExecutionGenerationId)
       const createdAt = asString(entry.createdAt)
       const updatedAt = asString(entry.updatedAt)
       const state = asString(entry.state) as ResidentLifecycleOperationState | undefined
@@ -2244,6 +2491,10 @@ function residentLifecycleOperationsFromNative(
         (parsedStatus !== undefined && !parsedStatus.success) ||
         (parsedStatus?.success && parsedStatus.data.kind !== kind) ||
         (kind === 'provision' && (!projectDisplayName || !threadTitle)) ||
+        (kind === 'provision' && provisionMode !== undefined &&
+          provisionMode !== 'local_path' && provisionMode !== 'registered_workspace') ||
+        (kind === 'provision' && provisionMode === 'registered_workspace' &&
+          (!referenceThreadId || !referenceExecutionGenerationId)) ||
         (kind === 'end' && !sourceCursor)
       ) return []
       const base = {
@@ -2266,6 +2517,15 @@ function residentLifecycleOperationsFromNative(
             projectDisplayName: projectDisplayName!,
             threadTitle: threadTitle!,
             ...(sessionName ? { sessionName } : {}),
+            ...(provisionMode === 'local_path' || provisionMode === 'registered_workspace'
+              ? { provisionMode }
+              : {}),
+            ...(provisionMode === 'registered_workspace'
+              ? {
+                  referenceThreadId: referenceThreadId!,
+                  referenceExecutionGenerationId: referenceExecutionGenerationId!,
+                }
+              : {}),
           }]
     })
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
@@ -2710,6 +2970,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     ''
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId)
   const selectedProjectId = selectedThread?.projectId ?? projects[0]?.id ?? ''
+  const selectedProject = projects.find((project) => project.id === selectedProjectId)
   const selectedHostHasAuthority = Boolean(activeHostId && selectedThread?.hostId === activeHostId)
   const activeHostHasAuthority = Boolean(
     activeHostId && hosts.some((host) => host.id === activeHostId && host.connection === 'online'),
@@ -3083,6 +3344,13 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         operation.executionGenerationId === selectedThread.executionGenerationId,
       )
     : undefined
+  const selectedResidentLineageIsExact = Boolean(
+    selectedHostHasAuthority &&
+    selectedSnapshotIsMaterialized &&
+    selectedThread?.workspaceId &&
+    selectedThread.executionGenerationId &&
+    selectedProject?.hostIds.includes(selectedThread.hostId),
+  )
   const residentSessionReady = Boolean(
     input.mutationAuthorityReady !== false &&
     selectedHostHasAuthority &&
@@ -3095,15 +3363,41 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     !selectedResidentEnd &&
     selectedThread?.residentLifecycle?.state !== 'ended',
   )
-  const residentProvisioningReady = Boolean(
+  const localResidentLifecycleReady = Boolean(
     input.mutationAuthorityReady !== false &&
     activePhase === 'online' &&
     asString(activeTarget?.kind) === 'local' &&
     asString(rawConnection?.path) === 'local_socket' &&
+    advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
+  )
+  const localResidentProvisioningReady = Boolean(
+    localResidentLifecycleReady &&
     exactActiveRuntimeReadiness?.kind === 'reported' &&
     exactActiveRuntimeReadiness.freshness === 'live' &&
-    exactActiveRuntimeReadiness.status === 'ready' &&
-    advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
+    exactActiveRuntimeReadiness.status === 'ready',
+  )
+  const registeredWorkspaceLifecycleReady = Boolean(
+    input.mutationAuthorityReady !== false &&
+    selectedHostHasAuthority &&
+    activePhase === 'online' &&
+    asString(activeTarget?.kind) === 'ssh' &&
+    asString(rawConnection?.path) === 'ssh' &&
+    advertisedCapabilities.includes(RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY),
+  )
+  const registeredWorkspaceProvisioningReady = Boolean(
+    registeredWorkspaceLifecycleReady &&
+    selectedResidentLineageIsExact,
+  )
+  const residentProvisioningReady = Boolean(
+    localResidentProvisioningReady || registeredWorkspaceProvisioningReady,
+  )
+  const residentEndReady = Boolean(
+    (localResidentLifecycleReady || registeredWorkspaceLifecycleReady) &&
+    selectedResidentLineageIsExact &&
+    runtime.session?.residency === 'resident' &&
+    runtime.session.activeSessionId &&
+    runtime.session.sessionId &&
+    selectedThread?.residentLifecycle?.state !== 'ended',
   )
   const localSetup = localSetupFromNative({
     rawConnection,
@@ -3121,7 +3415,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       asString(rawConnection?.path) === 'local_socket' &&
       advertisedCapabilities.includes(RUNTIME_INTEGRITY_REPAIR_CAPABILITY)
     ),
-    residentProvisioningReady,
+    residentProvisioningReady: localResidentProvisioningReady,
     residentLifecycleAdvertised: advertisedCapabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY),
   })
   const residentTurnActive = Boolean(
@@ -3174,6 +3468,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       startResidentTurn: residentTurnStartReady,
       stopResidentTurn: residentSessionReady && !abortCommandPending && (residentTurnActive || retainedPromptOwned),
       ...(residentProvisioningReady ? { provisionResident: true } : {}),
+      ...(residentEndReady ? { endResident: true } : {}),
       crossHostHandoff:
         selectedHostHasAuthority &&
         activePhase === 'online' &&
@@ -3331,6 +3626,34 @@ interface ActiveRuntimeOAuth {
   result?: Promise<RuntimeOAuthResult>
 }
 
+type ResidentLifecycleWorkspaceKind = 'local_path' | 'registered_workspace'
+
+interface ResidentLifecycleAuthority {
+  expectedHostId: string
+  generation: number
+  workspaceKind: ResidentLifecycleWorkspaceKind
+  capabilityRequired: boolean
+}
+
+interface ResidentWorkspaceReference {
+  projectId: string
+  workspaceId: string
+  referenceThreadId: string
+  referenceExecutionGenerationId: string
+}
+
+interface RetainedResidentWorkspaceSelection {
+  selection: ResidentWorkspaceSelection
+  connectionGeneration: number
+}
+
+interface RetainedResidentEndPreparation {
+  preparation: ResidentEndPreparation
+  connectionGeneration: number
+  workspaceKind: ResidentLifecycleWorkspaceKind
+  reference?: ResidentWorkspaceReference
+}
+
 const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = 'openai-codex'
 const RUNTIME_OAUTH_POLL_INTERVAL_MS = 500
 const RUNTIME_OAUTH_MAX_POLLS = 600
@@ -3414,8 +3737,9 @@ export class NativeRendererApi implements RendererApi {
   private activeProgress?: (phase: HandoffPhase, message: string) => void
   private readonly installPlans = new Map<string, UnknownRecord>()
   private readonly discoveredComputers = new Map<string, DiscoveredComputer>()
-  private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelection>()
-  private readonly residentEndPreparations = new Map<string, ResidentEndPreparation>()
+  private readonly residentWorkspaceSelections = new Map<string, RetainedResidentWorkspaceSelection>()
+  private readonly residentEndPreparations = new Map<string, RetainedResidentEndPreparation>()
+  private readonly consumedRegisteredWorkspaceSelectionTokens = new Set<string>()
   private readonly pendingResidentMaterializations = new Set<string>()
   private readonly handoffDestinations = new Map<string, string>()
   private readonly handoffSources = new Map<string, string>()
@@ -3481,6 +3805,20 @@ export class NativeRendererApi implements RendererApi {
     if (typeof candidate !== 'function') {
       throw new Error(`The native Prime bridge does not expose ${method}.`)
     }
+    const raw = await (candidate as (input?: unknown) => Promise<unknown>)(payload)
+    return unwrapResult<T>(raw)
+  }
+
+  private async callAtInvocationBoundary<T>(
+    method: string,
+    payload: unknown,
+    onInvoke: () => void,
+  ): Promise<T> {
+    const candidate = (this.bridge as Record<string, unknown>)[method]
+    if (typeof candidate !== 'function') {
+      throw new Error(`The native Prime bridge does not expose ${method}.`)
+    }
+    onInvoke()
     const raw = await (candidate as (input?: unknown) => Promise<unknown>)(payload)
     return unwrapResult<T>(raw)
   }
@@ -3909,6 +4247,7 @@ export class NativeRendererApi implements RendererApi {
     this.handoffSources.clear()
     this.residentWorkspaceSelections.clear()
     this.residentEndPreparations.clear()
+    this.consumedRegisteredWorkspaceSelectionTokens.clear()
     this.pendingResidentMaterializations.clear()
     this.activeProgress = undefined
     this.mutationAuthorityReadyHostId = undefined
@@ -4576,11 +4915,11 @@ export class NativeRendererApi implements RendererApi {
 
   private async performCommittedResidentMaterialization(
     status: ResidentLifecycleStatus,
-    authority: { expectedHostId: string; generation: number },
+    authority: ResidentLifecycleAuthority,
   ): Promise<void> {
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     const catalog = await this.call<unknown>('hostCatalog')
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (!catalogHostIds(catalog).includes(authority.expectedHostId)) {
       throw new StaleHostAuthorityError()
     }
@@ -4605,7 +4944,7 @@ export class NativeRendererApi implements RendererApi {
 
     const selectionGeneration = this.threadSelectionGeneration
     const snapshot = await this.call<unknown>('requestSnapshot', { threadId: status.threadId })
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
     const currentThread = this.projectedResidentThread(status)
     const snapshotLocation = asRecord(asRecord(asRecord(snapshot)?.thread)?.currentLocation)
@@ -4647,7 +4986,7 @@ export class NativeRendererApi implements RendererApi {
       }
       materializedSnapshot = retained
     }
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
     const finalThread = this.projectedResidentThread(status)
     if (!finalThread || finalThread.id !== projectedThread.id) throw new StaleHostAuthorityError()
@@ -4657,14 +4996,14 @@ export class NativeRendererApi implements RendererApi {
     this.threadSnapshot = materializedSnapshot
     this.setResidentLifecycleProjectionState(status, 'terminal')
     this.publish()
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
   }
 
   private forceCommittedResidentMaterialization(
     status: ResidentLifecycleStatus,
-    authority: { expectedHostId: string; generation: number },
+    authority: ResidentLifecycleAuthority,
   ): Promise<void> {
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (this.setResidentLifecycleProjectionState(status, 'terminal_refresh_pending')) this.publish()
     const previous = this.authoritativeRefreshPromise
     const refresh = (async () => {
@@ -4672,7 +5011,7 @@ export class NativeRendererApi implements RendererApi {
       // thread exists. Let it drain, fence its authority, then issue a distinct
       // catalog + exact-thread observation after the reply.
       if (previous) await previous.catch(() => undefined)
-      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      this.assertResidentLifecycleAuthority(authority)
       await this.performCommittedResidentMaterialization(status, authority)
     })()
     this.authoritativeRefreshGeneration = authority.generation
@@ -5393,63 +5732,235 @@ export class NativeRendererApi implements RendererApi {
     return this.projection?.runtime.session?.model === `${request.providerId}/${request.modelId}`
   }
 
-  private residentLifecycleAuthority(options: { requireCapability: boolean }): {
-    expectedHostId: string
-    generation: number
-  } {
+  private residentLifecycleAuthority(options: {
+    requireCapability: boolean
+    expectedWorkspaceKind?: ResidentLifecycleWorkspaceKind
+  }): ResidentLifecycleAuthority {
     const connection = asRecord(this.connection)
     const expectedHostId = asString(connection?.hostId)
     const phase = asString(connection?.phase)
     const target = asRecord(connection?.target)
+    const targetKind = asString(target?.kind)
+    const path = asString(connection?.path)
     const capabilities = Array.isArray(connection?.capabilities)
       ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
       : []
+    const workspaceKind: ResidentLifecycleWorkspaceKind | undefined =
+      targetKind === 'local' && path === 'local_socket'
+        ? 'local_path'
+        : targetKind === 'ssh' && path === 'ssh'
+          ? 'registered_workspace'
+          : undefined
+    const requiredCapability = workspaceKind === 'registered_workspace'
+      ? RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY
+      : RESIDENT_LIFECYCLE_CAPABILITY
     if (
       !expectedHostId ||
       phase !== 'online' ||
-      asString(target?.kind) !== 'local' ||
-      asString(connection?.path) !== 'local_socket' ||
+      !workspaceKind ||
+      (options.expectedWorkspaceKind !== undefined && workspaceKind !== options.expectedWorkspaceKind) ||
       this.mutationAuthorityReadyHostId !== expectedHostId ||
-      (options.requireCapability && !capabilities.includes(RESIDENT_LIFECYCLE_CAPABILITY))
+      (options.requireCapability && !capabilities.includes(requiredCapability))
     ) {
       throw new Error(options.requireCapability
-        ? 'Resident lifecycle control is not ready on this verified local host.'
-        : 'Reconnect this verified local host before checking resident lifecycle status.')
+        ? 'Resident lifecycle control is not ready on this verified host.'
+        : 'Reconnect this verified host before checking resident lifecycle status.')
     }
-    return { expectedHostId, generation: this.connectionGeneration }
+    return {
+      expectedHostId,
+      generation: this.connectionGeneration,
+      workspaceKind,
+      capabilityRequired: options.requireCapability,
+    }
   }
 
-  private assertResidentLifecycleAuthority(expectedHostId: string, generation: number): void {
+  private assertResidentLifecycleAuthority(authority: ResidentLifecycleAuthority): void {
     const connection = asRecord(this.connection)
+    const targetKind = authority.workspaceKind === 'local_path' ? 'local' : 'ssh'
+    const path = authority.workspaceKind === 'local_path' ? 'local_socket' : 'ssh'
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    const requiredCapability = authority.workspaceKind === 'local_path'
+      ? RESIDENT_LIFECYCLE_CAPABILITY
+      : RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY
     if (
-      generation !== this.connectionGeneration ||
+      authority.generation !== this.connectionGeneration ||
       asString(connection?.phase) !== 'online' ||
-      asString(connection?.hostId) !== expectedHostId ||
-      asString(asRecord(connection?.target)?.kind) !== 'local' ||
-      asString(connection?.path) !== 'local_socket'
+      asString(connection?.hostId) !== authority.expectedHostId ||
+      this.mutationAuthorityReadyHostId !== authority.expectedHostId ||
+      asString(asRecord(connection?.target)?.kind) !== targetKind ||
+      asString(connection?.path) !== path ||
+      (authority.capabilityRequired && !capabilities.includes(requiredCapability))
     ) throw new StaleHostAuthorityError()
   }
 
+  private registeredWorkspaceReferenceIsCurrent(
+    reference: ResidentWorkspaceReference,
+    expectedHostId: string,
+    operation: 'provisionResident' | 'endResident',
+  ): boolean {
+    const projection = this.projection ?? this.updateProjection()
+    const thread = projection.threads.find((candidate) =>
+      candidate.hostId === expectedHostId &&
+      protocolThreadId(candidate) === reference.referenceThreadId &&
+      candidate.executionGenerationId === reference.referenceExecutionGenerationId,
+    )
+    const project = projection.projects.find((candidate) => candidate.id === reference.projectId)
+    return Boolean(
+      projection.operations[operation] === true &&
+      thread &&
+      projection.selectedThreadId === thread.id &&
+      projection.selectedProjectId === reference.projectId &&
+      thread.projectId === reference.projectId &&
+      thread.workspaceId === reference.workspaceId &&
+      project?.hostIds.includes(expectedHostId) &&
+      snapshotHostId(this.threadSnapshot) === expectedHostId &&
+      snapshotThreadId(this.threadSnapshot) === reference.referenceThreadId &&
+      snapshotExecutionGenerationId(this.threadSnapshot) === reference.referenceExecutionGenerationId,
+    )
+  }
+
+  private registeredWorkspaceReferenceHasResidentAuthority(
+    reference: ResidentWorkspaceReference,
+    expectedHostId: string,
+    exemptOperationId?: string,
+  ): boolean {
+    const projection = this.projection ?? this.updateProjection()
+    const thread = projection.threads.find((candidate) =>
+      candidate.hostId === expectedHostId &&
+      protocolThreadId(candidate) === reference.referenceThreadId &&
+      candidate.executionGenerationId === reference.referenceExecutionGenerationId,
+    )
+    return Boolean(
+      thread &&
+      (
+        (
+          projection.runtime.session?.residency === 'resident' &&
+          thread.residentLifecycle?.state !== 'ended'
+        ) ||
+        projection.residentLifecycleOperations.some((operation) =>
+          operation.operationId !== exemptOperationId &&
+          operation.expectedHostId === expectedHostId &&
+          operation.projectId === reference.projectId &&
+          operation.workspaceId === reference.workspaceId &&
+          registeredWorkspaceProvisionHoldsAuthority(
+            operation,
+            projection.residentLifecycleOperations,
+            projection.threads,
+          )
+        )
+      ),
+    )
+  }
+
+  private residentProvisionResumeMode(
+    operationId: string,
+    expectedHostId: string,
+    reference?: ResidentWorkspaceReference,
+  ): ResidentProvisionResumeMode | undefined {
+    const projection = this.projection ?? this.updateProjection()
+    const operation = projection.residentLifecycleOperations.find((candidate) =>
+      candidate.operationId === operationId &&
+      candidate.expectedHostId === expectedHostId,
+    )
+    if (!operation) return 'main_validated'
+    if (
+      operation.kind !== 'provision' ||
+      (reference
+        ? operation.provisionMode !== 'registered_workspace' ||
+          operation.projectId !== reference.projectId ||
+          operation.workspaceId !== reference.workspaceId ||
+          operation.referenceThreadId !== reference.referenceThreadId ||
+          operation.referenceExecutionGenerationId !== reference.referenceExecutionGenerationId
+        : operation.provisionMode === 'registered_workspace')
+    ) return undefined
+    // Only a genuinely missing renderer projection is deferred to the main
+    // durable ledger. A visible operation with an unsafe phase is definitive
+    // renderer evidence and must remain check-only.
+    const mode = residentProvisionResumeMode(operation)
+    return reference && operation.state === 'requires_reselection' ? undefined : mode
+  }
+
   async selectResidentWorkspace(
-    input: { resumeOperationId?: string } = {},
+    input: ResidentWorkspaceSelectionInput = {},
   ): Promise<ResidentWorkspaceSelection> {
-    const authority = this.residentLifecycleAuthority({ requireCapability: true })
-    const selection = residentWorkspaceSelectionFromNative(
+    const requestedWorkspaceKind = input.kind ?? 'local_path'
+    const authority = this.residentLifecycleAuthority({
+      requireCapability: true,
+      expectedWorkspaceKind: requestedWorkspaceKind,
+    })
+    const reference = input.kind === 'registered_workspace'
+      ? {
+          projectId: input.projectId,
+          workspaceId: input.workspaceId,
+          referenceThreadId: input.referenceThreadId,
+          referenceExecutionGenerationId: input.referenceExecutionGenerationId,
+        }
+      : undefined
+    const resumeMode = input.resumeOperationId
+      ? this.residentProvisionResumeMode(input.resumeOperationId, authority.expectedHostId, reference)
+      : undefined
+    if (input.resumeOperationId && !resumeMode) throw new StaleHostAuthorityError()
+    if (reference) {
+      if (
+        !this.registeredWorkspaceReferenceIsCurrent(reference, authority.expectedHostId, 'provisionResident') ||
+        (input.resumeOperationId
+          ? this.registeredWorkspaceReferenceHasResidentAuthority(
+              reference,
+              authority.expectedHostId,
+              input.resumeOperationId,
+            )
+          : this.registeredWorkspaceReferenceHasResidentAuthority(reference, authority.expectedHostId))
+      ) throw new StaleHostAuthorityError()
+    }
+    if (!reference && (this.projection ?? this.updateProjection()).operations.provisionResident !== true) {
+      throw new Error('Resident lifecycle control is not ready on this verified host.')
+    }
+    const nativeSelection = residentWorkspaceSelectionFromNative(
       await this.call<unknown>('selectResidentWorkspace', input),
     )
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
-    if (selection.expectedHostId !== authority.expectedHostId || Date.parse(selection.expiresAt) <= Date.now()) {
+    this.assertResidentLifecycleAuthority(authority)
+    const postSelectionResumeMode = input.resumeOperationId
+      ? this.residentProvisionResumeMode(input.resumeOperationId, authority.expectedHostId, reference)
+      : undefined
+    if (
+      nativeSelection.expectedHostId !== authority.expectedHostId ||
+      (input.resumeOperationId && !postSelectionResumeMode) ||
+      (resumeMode !== 'main_validated' && postSelectionResumeMode !== resumeMode) ||
+      (postSelectionResumeMode === 'continue' && nativeSelection.operationId !== input.resumeOperationId) ||
+      (postSelectionResumeMode === 'retry' && nativeSelection.operationId === input.resumeOperationId) ||
+      Date.parse(nativeSelection.expiresAt) <= Date.now() ||
+      (reference && (
+        !this.registeredWorkspaceReferenceIsCurrent(reference, authority.expectedHostId, 'provisionResident') ||
+        (input.resumeOperationId
+          ? this.registeredWorkspaceReferenceHasResidentAuthority(
+              reference,
+              authority.expectedHostId,
+              input.resumeOperationId,
+            )
+          : this.registeredWorkspaceReferenceHasResidentAuthority(reference, authority.expectedHostId))
+      ))
+    ) {
       throw new StaleHostAuthorityError()
     }
+    const selection: ResidentWorkspaceSelection = reference
+      ? { ...nativeSelection, kind: 'registered_workspace', ...reference }
+      : { ...nativeSelection, kind: 'local_path' }
     for (const [token, retained] of this.residentWorkspaceSelections) {
-      if (Date.parse(retained.expiresAt) <= Date.now()) this.residentWorkspaceSelections.delete(token)
+      if (Date.parse(retained.selection.expiresAt) <= Date.now()) this.residentWorkspaceSelections.delete(token)
     }
     if (this.residentWorkspaceSelections.size >= 32) {
       const oldestToken = [...this.residentWorkspaceSelections.entries()]
-        .sort((left, right) => Date.parse(left[1].expiresAt) - Date.parse(right[1].expiresAt))[0]?.[0]
+        .sort((left, right) =>
+          Date.parse(left[1].selection.expiresAt) - Date.parse(right[1].selection.expiresAt)
+        )[0]?.[0]
       if (oldestToken) this.residentWorkspaceSelections.delete(oldestToken)
     }
-    this.residentWorkspaceSelections.set(selection.selectionToken, selection)
+    this.residentWorkspaceSelections.set(selection.selectionToken, {
+      selection,
+      connectionGeneration: authority.generation,
+    })
     return { ...selection }
   }
 
@@ -5459,24 +5970,57 @@ export class NativeRendererApi implements RendererApi {
     threadTitle: string
     sessionName?: string
   }): Promise<ResidentLifecycleStatus> {
-    const authority = this.residentLifecycleAuthority({ requireCapability: true })
-    const selection = this.residentWorkspaceSelections.get(input.selectionToken)
+    let mainInvocationStarted = false
+    try {
+    const retained = this.residentWorkspaceSelections.get(input.selectionToken)
+    const expectedWorkspaceKind = retained?.selection.kind === 'registered_workspace'
+      ? 'registered_workspace'
+      : this.consumedRegisteredWorkspaceSelectionTokens.has(input.selectionToken)
+        ? 'registered_workspace'
+        : 'local_path'
+    const authority = this.residentLifecycleAuthority({ requireCapability: true, expectedWorkspaceKind })
+    const selection = retained?.selection
+    const reference = selection?.kind === 'registered_workspace'
+      ? {
+          projectId: selection.projectId,
+          workspaceId: selection.workspaceId,
+          referenceThreadId: selection.referenceThreadId,
+          referenceExecutionGenerationId: selection.referenceExecutionGenerationId,
+        }
+      : undefined
     if (
       !selection ||
       selection.expectedHostId !== authority.expectedHostId ||
+      retained?.connectionGeneration !== authority.generation ||
+      (reference && !this.registeredWorkspaceReferenceIsCurrent(reference, authority.expectedHostId, 'provisionResident')) ||
       Date.parse(selection.expiresAt) <= Date.now()
-    ) throw new Error('Choose the workspace folder again before starting this resident thread.')
+    ) throw new Error(expectedWorkspaceKind === 'registered_workspace'
+      ? 'Select this saved workspace again before starting the resident thread.'
+      : 'Choose the workspace folder again before starting this resident thread.')
 
     // The main process consumes this receipt at the invocation boundary. Drop
     // the renderer copy first so no UI retry can replay an ambiguous mutation.
     this.residentWorkspaceSelections.delete(input.selectionToken)
+    if (selection.kind === 'registered_workspace') {
+      this.consumedRegisteredWorkspaceSelectionTokens.add(input.selectionToken)
+      if (this.consumedRegisteredWorkspaceSelectionTokens.size > 32) {
+        const oldestToken = this.consumedRegisteredWorkspaceSelectionTokens.values().next().value
+        if (oldestToken) this.consumedRegisteredWorkspaceSelectionTokens.delete(oldestToken)
+      }
+    }
     let status: ResidentLifecycleStatus | undefined
     let statusAccepted = false
     try {
       status = ResidentLifecycleStatusSchema.parse(
-        await this.call<unknown>('provisionResident', input),
+        await this.callAtInvocationBoundary<unknown>(
+          'provisionResident',
+          selection.kind === 'registered_workspace'
+            ? { ...input, projectDisplayName: selection.suggestedName }
+            : input,
+          () => { mainInvocationStarted = true },
+        ),
       )
-      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      this.assertResidentLifecycleAuthority(authority)
       if (
         status.operationId !== selection.operationId ||
         status.expectedHostId !== authority.expectedHostId ||
@@ -5500,12 +6044,15 @@ export class NativeRendererApi implements RendererApi {
       }
     }
     if (!status) throw new Error('The native resident provision response was unavailable.')
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (status.phase === 'committed') {
       await this.forceCommittedResidentMaterialization(status, authority)
     }
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     return status
+    } catch (error) {
+      throw residentProvisionErrorFrom(error, mainInvocationStarted)
+    }
   }
 
   async prepareResidentEnd(input: {
@@ -5518,28 +6065,73 @@ export class NativeRendererApi implements RendererApi {
   }): Promise<ResidentEndPreparation> {
     const authority = this.residentLifecycleAuthority({ requireCapability: true })
     if (input.expectedHostId !== authority.expectedHostId) throw new StaleHostAuthorityError()
+    const projection = this.projection ?? this.updateProjection()
+    const exactEndOperation = projection.residentLifecycleOperations.find((operation) =>
+      operation.kind === 'end' &&
+      operation.expectedHostId === input.expectedHostId &&
+      operation.projectId === input.projectId &&
+      operation.workspaceId === input.workspaceId &&
+      operation.threadId === input.threadId &&
+      operation.executionGenerationId === input.executionGenerationId,
+    )
+    if (input.resumeOperationId) {
+      if (
+        exactEndOperation?.operationId !== input.resumeOperationId ||
+        exactEndOperation.lastStatus?.kind !== 'end' ||
+        exactEndOperation.lastStatus.phase !== 'ending'
+      ) throw new StaleHostAuthorityError()
+    } else if (exactEndOperation) {
+      throw new Error('Review the existing resident end operation before starting another one.')
+    }
+    const reference: ResidentWorkspaceReference = {
+      projectId: input.projectId,
+      workspaceId: input.workspaceId,
+      referenceThreadId: input.threadId,
+      referenceExecutionGenerationId: input.executionGenerationId,
+    }
+    if (authority.workspaceKind === 'registered_workspace') {
+      if (!this.registeredWorkspaceReferenceIsCurrent(reference, authority.expectedHostId, 'endResident')) {
+        throw new StaleHostAuthorityError()
+      }
+    } else if ((this.projection ?? this.updateProjection()).operations.endResident !== true) {
+      throw new Error('Resident lifecycle control is not ready on this verified host.')
+    }
     const preparation = residentEndPreparationFromNative(
       await this.call<unknown>('prepareResidentEnd', input),
     )
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (
       preparation.expectedHostId !== authority.expectedHostId ||
       preparation.threadId !== input.threadId ||
       preparation.executionGenerationId !== input.executionGenerationId ||
       (input.resumeOperationId && preparation.operationId !== input.resumeOperationId) ||
-      Date.parse(preparation.expiresAt) <= Date.now()
+      Date.parse(preparation.expiresAt) <= Date.now() ||
+      (authority.workspaceKind === 'registered_workspace' &&
+        !this.registeredWorkspaceReferenceIsCurrent(reference, authority.expectedHostId, 'endResident'))
     ) throw new StaleHostAuthorityError()
     this.residentEndPreparations.clear()
-    this.residentEndPreparations.set(preparation.confirmationToken, preparation)
+    this.residentEndPreparations.set(preparation.confirmationToken, {
+      preparation,
+      connectionGeneration: authority.generation,
+      workspaceKind: authority.workspaceKind,
+      ...(authority.workspaceKind === 'registered_workspace' ? { reference } : {}),
+    })
     return { ...preparation }
   }
 
   async endResident(input: { confirmationToken: string; consent: true }): Promise<ResidentLifecycleStatus> {
-    const authority = this.residentLifecycleAuthority({ requireCapability: true })
-    const preparation = this.residentEndPreparations.get(input.confirmationToken)
+    const retained = this.residentEndPreparations.get(input.confirmationToken)
+    const authority = this.residentLifecycleAuthority({
+      requireCapability: true,
+      ...(retained ? { expectedWorkspaceKind: retained.workspaceKind } : {}),
+    })
+    const preparation = retained?.preparation
     if (
       !preparation ||
       preparation.expectedHostId !== authority.expectedHostId ||
+      retained?.connectionGeneration !== authority.generation ||
+      (retained.reference &&
+        !this.registeredWorkspaceReferenceIsCurrent(retained.reference, authority.expectedHostId, 'endResident')) ||
       Date.parse(preparation.expiresAt) <= Date.now()
     ) throw new Error('Review this resident session again before ending it.')
 
@@ -5552,7 +6144,7 @@ export class NativeRendererApi implements RendererApi {
       status = ResidentLifecycleStatusSchema.parse(
         await this.call<unknown>('endResident', input),
       )
-      this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+      this.assertResidentLifecycleAuthority(authority)
       if (
         status.kind !== 'end' ||
         status.operationId !== preparation.operationId ||
@@ -5575,11 +6167,11 @@ export class NativeRendererApi implements RendererApi {
       }
     }
     if (!status) throw new Error('The native resident end response was unavailable.')
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (status.phase === 'completed') {
       await this.forceCommittedResidentMaterialization(status, authority)
     }
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     return status
   }
 
@@ -5592,7 +6184,7 @@ export class NativeRendererApi implements RendererApi {
     const result = ResidentLifecycleLookupResultSchema.parse(
       await this.call<unknown>('residentLifecycleStatus', input),
     )
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (
       result.status &&
       (result.status.expectedHostId !== authority.expectedHostId || result.status.operationId !== input.operationId)
@@ -5604,11 +6196,11 @@ export class NativeRendererApi implements RendererApi {
     )
     if (residentLifecycleNeedsProjectionMaterialization(result.status)) await hydration
     else await hydration.catch(() => undefined)
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     if (residentLifecycleNeedsProjectionMaterialization(result.status)) {
       await this.forceCommittedResidentMaterialization(result.status, authority)
     }
-    this.assertResidentLifecycleAuthority(authority.expectedHostId, authority.generation)
+    this.assertResidentLifecycleAuthority(authority)
     return result.status
   }
 

@@ -5,6 +5,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'electron'
 import type {
+  ResidentEndOperationView,
   ResidentLifecycleOperationView,
   ResidentProvisionOperationView,
 } from '../../src/main/control/contracts'
@@ -149,6 +150,186 @@ describe('DesktopControlService resident provisioning boundary', () => {
     expect(picker).not.toHaveBeenCalled()
   })
 
+  it('provisions an exact saved SSH workspace without a picker, remote path, or renderer-authored project rename', async () => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    let provisionPayload: Record<string, unknown> | undefined
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health(['resident_registered_workspace_lifecycle_v1'])
+      if (method === 'catalog.snapshot') return registeredCatalog(provisionPayload)
+      if (method === 'thread.snapshot') {
+        const threadId = String((params as Record<string, unknown>).threadId)
+        return threadId === registeredReference.referenceThreadId
+          ? registeredReferenceSnapshot()
+          : threadSnapshotFor({
+              ...provisionPayload!,
+              projectDisplayName: 'Remote workspace',
+              threadTitle: 'Remote resident thread',
+            })
+      }
+      if (method === 'resident.provision.registered') {
+        provisionPayload = params as Record<string, unknown>
+        return provisionStatus(provisionPayload, 'committed')
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, picker)
+    markAsRegisteredSsh(service)
+
+    const selection = await service.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      ...registeredReference,
+    })
+    await expect(service.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Renderer attempted rename',
+      threadTitle: 'Remote resident thread',
+    })).resolves.toMatchObject({ kind: 'provision', phase: 'committed' })
+
+    expect(picker).not.toHaveBeenCalled()
+    expect(provisionPayload).toEqual({
+      expectedHostId: 'host-a',
+      operationId: selection.operationId,
+      projectId: registeredReference.projectId,
+      workspaceId: registeredReference.workspaceId,
+      referenceThreadId: registeredReference.referenceThreadId,
+      referenceExecutionGenerationId: registeredReference.referenceExecutionGenerationId,
+      threadId: expect.stringMatching(/^thread-/),
+      executionGenerationId: expect.stringMatching(/^execution-/),
+      threadTitle: 'Remote resident thread',
+      createdAt: timestamp,
+    })
+    expect(JSON.stringify(provisionPayload)).not.toMatch(/workspaceDirectory|projectDisplayName|private/i)
+    expect((await service.bootstrap()).residentLifecycleOperations).toEqual([
+      expect.objectContaining({
+        kind: 'provision',
+        provisionMode: 'registered_workspace',
+        projectDisplayName: 'Remote workspace',
+        referenceThreadId: registeredReference.referenceThreadId,
+        referenceExecutionGenerationId: registeredReference.referenceExecutionGenerationId,
+        state: 'terminal',
+      }),
+    ])
+  })
+
+  it('fails closed when the saved donor changes between authoritative catalog and thread reads', async () => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health(['resident_registered_workspace_lifecycle_v1'])
+      if (method === 'catalog.snapshot') return registeredCatalog()
+      if (method === 'thread.snapshot') {
+        const snapshot = registeredReferenceSnapshot()
+        return {
+          ...snapshot,
+          thread: { ...snapshot.thread, title: 'Changed between reads' },
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, picker)
+    markAsRegisteredSsh(service)
+
+    await expect(service.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      ...registeredReference,
+    })).rejects.toMatchObject({ code: 'resident.registered_workspace_reference_changed' })
+    expect(picker).not.toHaveBeenCalled()
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision.registered')).toEqual([])
+  })
+
+  it('invalidates saved-workspace selection when the exact connection generation drifts', async () => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    let service!: DesktopControlService
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health(['resident_registered_workspace_lifecycle_v1'])
+      if (method === 'catalog.snapshot') {
+        ;(service as unknown as { reconnectGeneration: number }).reconnectGeneration += 1
+        return registeredCatalog()
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    service = await connectedService(directory, connection, picker)
+    markAsRegisteredSsh(service)
+
+    await expect(service.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      ...registeredReference,
+    })).rejects.toMatchObject({ code: 'connection.superseded' })
+    expect(picker).not.toHaveBeenCalled()
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision.registered')).toEqual([])
+  })
+
+  it.each([
+    'prepared',
+    'promoted_observed',
+    'projection_committed',
+  ] as const)('continues the exact saved-workspace operation only after durable %s status', async (continuationPhase) => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    let provisionPayload: Record<string, unknown> | undefined
+    let provisionAttempts = 0
+    let statusAvailable = false
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health(['resident_registered_workspace_lifecycle_v1'])
+      if (method === 'catalog.snapshot') return registeredCatalog()
+      if (method === 'thread.snapshot') return registeredReferenceSnapshot()
+      if (method === 'resident.provision.registered') {
+        provisionAttempts += 1
+        if (!provisionPayload) provisionPayload = params as Record<string, unknown>
+        expect(params).toEqual(provisionPayload)
+        if (provisionAttempts === 1) throw new Error('response lost')
+        return provisionStatus(provisionPayload, continuationPhase)
+      }
+      if (method === 'resident.lifecycle.status') {
+        return {
+          status: statusAvailable && provisionPayload
+            ? provisionStatus(provisionPayload, continuationPhase)
+            : null,
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, picker)
+    markAsRegisteredSsh(service)
+    const selectionInput = { kind: 'registered_workspace' as const, ...registeredReference }
+    const selection = await service.selectResidentWorkspace(selectionInput)
+    const provision = {
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Remote workspace',
+      threadTitle: 'Remote resident thread',
+    }
+
+    await expect(service.provisionResident(provision)).rejects.toMatchObject({
+      code: 'resident.provision_outcome_unknown',
+    })
+    await expect(service.provisionResident(provision)).rejects.toMatchObject({
+      code: 'resident.registered_workspace_replay_blocked',
+    })
+    statusAvailable = true
+    markAsRegisteredSsh(service, [])
+    await expect(service.residentLifecycleStatus({
+      expectedHostId: 'host-a',
+      operationId: selection.operationId,
+    })).resolves.toMatchObject({ status: expect.objectContaining({ phase: continuationPhase }) })
+    await expect(service.provisionResident(provision)).rejects.toMatchObject({
+      code: 'resident.registered_workspace_unavailable',
+    })
+    markAsRegisteredSsh(service)
+    const resumed = await service.selectResidentWorkspace({
+      ...selectionInput,
+      resumeOperationId: selection.operationId,
+    })
+    expect(resumed.operationId).toBe(selection.operationId)
+    await expect(service.provisionResident({
+      ...provision,
+      selectionToken: resumed.selectionToken,
+    })).resolves.toMatchObject({ phase: continuationPhase })
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision.registered')).toHaveLength(2)
+    expect(picker).not.toHaveBeenCalled()
+  })
+
   it('rejects superseded and expired selection tokens', async () => {
     const directory = await testDirectory()
     const picker = vi.fn()
@@ -164,10 +345,12 @@ describe('DesktopControlService resident provisioning boundary', () => {
 
     await expect(service.provisionResident(provisionInput(first.selectionToken))).rejects.toMatchObject({
       code: 'resident.workspace_selection_superseded',
+      details: { durableOperationPossible: false },
     })
     vi.setSystemTime(new Date(Date.parse(second.expiresAt) + 1))
     await expect(service.provisionResident(provisionInput(second.selectionToken))).rejects.toMatchObject({
       code: 'resident.workspace_selection_expired',
+      details: { durableOperationPossible: false },
     })
     expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
   })
@@ -206,6 +389,7 @@ describe('DesktopControlService resident provisioning boundary', () => {
     await expect(service.provisionResident(padded)).rejects.toMatchObject({
       code: 'resident.provision_outcome_unknown',
       retryable: true,
+      details: { durableOperationPossible: true },
     })
     expect(connection.requests.map(({ method }) => method)).toEqual([
       'health.get',
@@ -244,10 +428,330 @@ describe('DesktopControlService resident provisioning boundary', () => {
       selectionToken: selection.selectionToken,
       projectDisplayName: '   ',
       threadTitle: 'Thread',
-    })).rejects.toMatchObject({ code: 'resident.provision_label_invalid' })
+    })).rejects.toMatchObject({
+      code: 'resident.provision_label_invalid',
+      details: { durableOperationPossible: false },
+    })
     expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
     await expect(readFile(path.join(directory, 'control', 'resident-lifecycle.json'), 'utf8'))
       .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('shares one queued pre-admission failure across exact joiners after generation replacement', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`A superseded queued provision must not dispatch ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const store = residentLedgerStore(service)
+    const ledgerGate = deferred<void>()
+    store.tail = ledgerGate.promise
+    const update = vi.spyOn(store, 'update')
+
+    const first = service.provisionResident(provisionInput(selection.selectionToken))
+    await waitForLedgerOperationToQueue(store, ledgerGate.promise)
+    ;(service as unknown as { reconnectGeneration: number }).reconnectGeneration += 1
+    const second = service.provisionResident(provisionInput(selection.selectionToken))
+    const third = service.provisionResident(provisionInput(selection.selectionToken))
+    ledgerGate.resolve()
+
+    const errors = await rejectedValues([first, second, third])
+    for (const error of errors) {
+      expect(error).toMatchObject({
+        code: 'connection.superseded',
+        details: { durableOperationPossible: false },
+      })
+    }
+    expect(update).toHaveBeenCalledOnce()
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
+    await expect(readFile(path.join(directory, 'control', 'resident-lifecycle.json'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it.each([
+    { existing: false, durableOperationPossible: false },
+    { existing: true, durableOperationPossible: true },
+  ])(
+    'classifies a definite pre-rename write failure with existing=$existing as durable=$durableOperationPossible',
+    async ({ existing, durableOperationPossible }) => {
+      const directory = await testDirectory()
+      const connection = new TestConnection((method) => {
+        if (method === 'health.get') return health()
+        throw new Error(`A definite ledger failure must not dispatch ${method}`)
+      })
+      const service = await connectedService(
+        directory,
+        connection,
+        vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+      )
+      const selection = await service.selectResidentWorkspace()
+      const record = residentSelectionRecord(service, selection.selectionToken)
+      if (existing) {
+        await writeResidentLedger(directory, [provisionEntryForSelection(record)])
+      }
+      const store = residentLedgerStore(service)
+      vi.spyOn(store, 'writeUnqueued').mockRejectedValue(new ControlError(
+        'storage.write_limit',
+        'The value is too large for the native cache.',
+        { details: { stage: 'before_rename' } },
+      ))
+
+      await expect(service.provisionResident(provisionInput(selection.selectionToken))).rejects.toMatchObject({
+        code: 'storage.write_limit',
+        details: {
+          durableOperationPossible,
+          stage: 'before_rename',
+        },
+      })
+      expect(record.durableOperationPossible).toBe(durableOperationPossible)
+      expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
+    },
+  )
+
+  it('classifies a post-rename commit uncertainty as durable for every exact joiner', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`An uncertain admission must not dispatch ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const store = residentLedgerStore(service)
+    const syncStarted = deferred<void>()
+    const syncGate = deferred<void>()
+    store.options.syncParentDirectory = async () => {
+      syncStarted.resolve()
+      await syncGate.promise
+    }
+
+    const first = service.provisionResident(provisionInput(selection.selectionToken))
+    await syncStarted.promise
+    const second = service.provisionResident(provisionInput(selection.selectionToken))
+    const third = service.provisionResident(provisionInput(selection.selectionToken))
+    syncGate.reject(new Error('directory fsync failed'))
+
+    const errors = await rejectedValues([first, second, third])
+    for (const error of errors) {
+      expect(error).toMatchObject({
+        code: 'storage.commit_uncertain',
+        details: {
+          durableOperationPossible: true,
+          file: 'resident-lifecycle.json',
+        },
+      })
+    }
+    expect(residentSelectionRecord(service, selection.selectionToken).durableOperationPossible).toBe(true)
+    expect(await readFile(path.join(directory, 'control', 'resident-lifecycle.json'), 'utf8'))
+      .toContain(selection.operationId)
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
+  })
+
+  it('keeps a terminal selection joinable until its shared projection refresh settles', async () => {
+    const directory = await testDirectory()
+    const catalogStarted = deferred<void>()
+    const catalogGate = deferred<unknown>()
+    let payload: Record<string, unknown> | undefined
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health()
+      if (method === 'resident.provision') {
+        payload = params as Record<string, unknown>
+        return provisionStatus(payload, 'committed')
+      }
+      if (method === 'catalog.snapshot') {
+        catalogStarted.resolve()
+        return catalogGate.promise
+      }
+      if (method === 'thread.snapshot') return threadSnapshotFor(payload!)
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const input = provisionInput(selection.selectionToken)
+    const first = service.provisionResident(input)
+    await catalogStarted.promise
+
+    const joined = service.provisionResident(input)
+    catalogGate.resolve(catalogFor(payload!))
+    const [firstStatus, joinedStatus] = await Promise.all([first, joined])
+
+    expect(joinedStatus).toEqual(firstStatus)
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toHaveLength(1)
+    expect(connection.requests.filter(({ method }) => method === 'catalog.snapshot')).toHaveLength(1)
+    await expect(service.provisionResident(input)).rejects.toMatchObject({
+      code: 'resident.workspace_selection_completed',
+    })
+  })
+
+  it('bounds selection retirement when every older selection is still in flight', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const original = residentSelectionRecord(service, selection.selectionToken)
+    const selections = residentSelectionMap(service)
+    selections.clear()
+    const neverSettles = new Promise<ResidentLifecycleStatus>(() => undefined)
+    for (let index = 0; index < 32; index += 1) {
+      const selectionToken = `active-selection-${index}`
+      selections.set(selectionToken, {
+        ...original,
+        selectionToken,
+        selection: { ...original.selection, selectionToken },
+        inFlight: neverSettles,
+      })
+    }
+    const overflowToken = 'overflow-selection'
+    selections.set(overflowToken, {
+      ...original,
+      selectionToken: overflowToken,
+      selection: { ...original.selection, selectionToken: overflowToken },
+      inFlight: undefined,
+    })
+
+    enforceResidentSelectionLimit(service)
+
+    expect(selections.size).toBe(32)
+    expect(selections.has(overflowToken)).toBe(false)
+    expect([...selections.values()]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ pendingRetirement: 'superseded', inFlight: neverSettles }),
+      ]),
+    )
+  })
+
+  it('uses a matching refresh-pending completed End to evict its committed provision first', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Capacity admission must not dispatch ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const record = residentSelectionRecord(service, selection.selectionToken)
+    const committed = committedProvisionEntry('committed-before-end', 'terminal_refresh_pending')
+    const end = completedEndEntry('refresh-pending-end', committed, 'terminal_refresh_pending')
+    const locked = Array.from({ length: 126 }, (_, index) => ledgerEntry(`locked-pending-${index}`, {}))
+    await writeResidentLedger(directory, [end, committed, ...locked])
+
+    await recordResidentSubmission(service, record)
+
+    const operations = (await service.bootstrap()).residentLifecycleOperations
+    expect(operations).toHaveLength(128)
+    expect(operations.some(({ operationId }) => operationId === committed.operationId)).toBe(false)
+    expect(operations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operationId: end.operationId, state: 'terminal_refresh_pending' }),
+      expect.objectContaining({ operationId: selection.operationId, state: 'submitted' }),
+    ]))
+  })
+
+  it('retains a terminal End until its committed provision is removed, then evicts the End next', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Capacity admission must not dispatch ${method}`)
+    })
+    const picker = vi.fn().mockResolvedValue(path.join(directory, 'Workspace'))
+    const service = await connectedService(directory, connection, picker)
+    const committed = committedProvisionEntry('committed-release-order')
+    const end = completedEndEntry('terminal-end-proof', committed, 'terminal')
+    const locked = Array.from({ length: 125 }, (_, index) => ledgerEntry(`locked-order-${index}`, {}))
+    await writeResidentLedger(directory, [end, committed, ...locked])
+
+    const first = await service.selectResidentWorkspace()
+    await recordResidentSubmission(service, residentSelectionRecord(service, first.selectionToken))
+    const second = await service.selectResidentWorkspace()
+    await recordResidentSubmission(service, residentSelectionRecord(service, second.selectionToken))
+    const afterProvisionEviction = (await service.bootstrap()).residentLifecycleOperations
+    expect(afterProvisionEviction.some(({ operationId }) => operationId === committed.operationId)).toBe(false)
+    expect(afterProvisionEviction.some(({ operationId }) => operationId === end.operationId)).toBe(true)
+
+    const third = await service.selectResidentWorkspace()
+    await recordResidentSubmission(service, residentSelectionRecord(service, third.selectionToken))
+    const afterEndEviction = (await service.bootstrap()).residentLifecycleOperations
+    expect(afterEndEviction).toHaveLength(128)
+    expect(afterEndEviction.some(({ operationId }) => operationId === end.operationId)).toBe(false)
+    expect(afterEndEviction).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operationId: first.operationId }),
+      expect.objectContaining({ operationId: second.operationId }),
+      expect.objectContaining({ operationId: third.operationId }),
+    ]))
+  })
+
+  it('evicts a terminal pre-effect provision completion at capacity', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`Capacity admission must not dispatch ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const completed = completedPreEffectProvisionEntry('completed-before-effect')
+    const locked = Array.from({ length: 127 }, (_, index) => ledgerEntry(`locked-completed-${index}`, {}))
+    await writeResidentLedger(directory, [completed, ...locked])
+
+    await recordResidentSubmission(service, residentSelectionRecord(service, selection.selectionToken))
+
+    const operations = (await service.bootstrap()).residentLifecycleOperations
+    expect(operations).toHaveLength(128)
+    expect(operations.some(({ operationId }) => operationId === completed.operationId)).toBe(false)
+    expect(operations.some(({ operationId }) => operationId === selection.operationId)).toBe(true)
+  })
+
+  it('keeps quarantined and outcome-unknown entries locked when the ledger is full', async () => {
+    const directory = await testDirectory()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return health()
+      throw new Error(`A full locked ledger must not dispatch ${method}`)
+    })
+    const service = await connectedService(
+      directory,
+      connection,
+      vi.fn().mockResolvedValue(path.join(directory, 'Workspace')),
+    )
+    const selection = await service.selectResidentWorkspace()
+    const quarantined = quarantinedEndEntry('quarantined-end')
+    const unknown = Array.from({ length: 127 }, (_, index) => ledgerEntry(`locked-unknown-${index}`, {}))
+    await writeResidentLedger(directory, [quarantined, ...unknown])
+
+    await expect(service.provisionResident(provisionInput(selection.selectionToken))).rejects.toMatchObject({
+      code: 'resident.lifecycle_ledger_full',
+      details: { durableOperationPossible: false },
+    })
+
+    const operations = (await service.bootstrap()).residentLifecycleOperations
+    expect(operations).toHaveLength(128)
+    expect(operations.some(({ operationId }) => operationId === quarantined.operationId)).toBe(true)
+    expect(operations.some(({ operationId }) => operationId === selection.operationId)).toBe(false)
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
   })
 
   it('reconciles an ambiguous provision response through status without replaying provision', async () => {
@@ -545,6 +1049,7 @@ describe('DesktopControlService resident provisioning boundary', () => {
     }, 'committed', new Date(Date.parse(timestamp) + 1_000).toISOString())
     await writeResidentLedger(directory, [{
       kind: 'provision',
+      provisionMode: 'local_path',
       operationId: selection.operationId,
       expectedHostId: selection.expectedHostId,
       projectId: record!.projectId,
@@ -976,6 +1481,87 @@ describe('DesktopControlService resident provisioning boundary', () => {
   })
 })
 
+const registeredReference = {
+  projectId: 'project-remote',
+  workspaceId: 'workspace-remote',
+  referenceThreadId: 'thread-reference',
+  referenceExecutionGenerationId: 'execution-reference',
+}
+
+function markAsRegisteredSsh(
+  service: DesktopControlService,
+  capabilities = ['resident_registered_workspace_lifecycle_v1'],
+): void {
+  const mutable = service as unknown as {
+    target: { kind: 'ssh'; alias: string }
+    state: ReturnType<DesktopControlService['getConnectionState']>
+    authorityCapabilities: string[]
+  }
+  mutable.target = { kind: 'ssh', alias: 'remote' }
+  mutable.state = {
+    ...service.getConnectionState(),
+    target: { kind: 'ssh', alias: 'remote' },
+    path: 'ssh',
+  }
+  mutable.authorityCapabilities = capabilities
+}
+
+function registeredCatalog(provisionPayload?: Record<string, unknown>) {
+  const referencePayload = {
+    expectedHostId: 'host-a',
+    projectId: registeredReference.projectId,
+    workspaceId: registeredReference.workspaceId,
+    threadId: registeredReference.referenceThreadId,
+    executionGenerationId: registeredReference.referenceExecutionGenerationId,
+    projectDisplayName: 'Remote workspace',
+    threadTitle: 'Reference thread',
+  }
+  const referenceThread = threadSummaryFor(referencePayload)
+  return {
+    snapshotVersion: 1,
+    generatedAt: timestamp,
+    host: {
+      hostId: 'host-a',
+      displayName: 'Remote host',
+      kind: 'ssh',
+      connectionPaths: [{ kind: 'ssh', priority: 0, state: 'available' }],
+      reachability: 'online',
+      compatibility: 'compatible',
+      platform: { os: 'linux', architecture: 'x64' },
+      attentionCounts: { total: 0, unread: 0, questions: 0, approvals: 0 },
+    },
+    projects: [{
+      projectId: registeredReference.projectId,
+      hostId: 'host-a',
+      workspaceId: registeredReference.workspaceId,
+      displayName: 'Remote workspace',
+      lastOpenedAt: timestamp,
+    }],
+    threads: [
+      referenceThread,
+      ...(provisionPayload
+        ? [threadSummaryFor({
+            ...provisionPayload,
+            projectDisplayName: 'Remote workspace',
+            threadTitle: 'Remote resident thread',
+          })]
+        : []),
+    ],
+  }
+}
+
+function registeredReferenceSnapshot() {
+  return threadSnapshotFor({
+    expectedHostId: 'host-a',
+    projectId: registeredReference.projectId,
+    workspaceId: registeredReference.workspaceId,
+    threadId: registeredReference.referenceThreadId,
+    executionGenerationId: registeredReference.referenceExecutionGenerationId,
+    projectDisplayName: 'Remote workspace',
+    threadTitle: 'Reference thread',
+  })
+}
+
 function provisionInput(selectionToken: string) {
   return {
     selectionToken,
@@ -1012,7 +1598,7 @@ function completedProvisionStatus(payload: Record<string, unknown>): ResidentLif
 
 function provisionStatus(
   payload: Record<string, unknown>,
-  phase: 'prepared' | 'committed',
+  phase: 'prepared' | 'promoted_observed' | 'projection_committed' | 'committed',
   statusTimestamp = timestamp,
 ): ResidentLifecycleStatus {
   return {
@@ -1119,6 +1705,7 @@ function ledgerEntry(
     updatedAt: timestamp,
     state: 'outcome_unknown',
     ...overrides,
+    provisionMode: 'local_path',
   }
 }
 
@@ -1154,6 +1741,205 @@ function ledgerPayload(entry: ResidentProvisionOperationView): Record<string, un
     threadTitle: entry.threadTitle,
     createdAt: entry.createdAt,
   }
+}
+
+interface TestResidentSelectionRecord {
+  provisionMode: 'local_path' | 'registered_workspace'
+  selectionToken: string
+  selection: {
+    selectionToken: string
+    operationId: string
+    expectedHostId: string
+    suggestedName: string
+    expiresAt: string
+  }
+  authority: unknown
+  projectId: string
+  workspaceId: string
+  threadId: string
+  executionGenerationId: string
+  createdAt: string
+  durableOperationPossible: boolean
+  pendingRetirement?: 'expired' | 'superseded' | 'authority_changed' | 'terminal'
+  inFlight?: Promise<ResidentLifecycleStatus>
+}
+
+interface TestResidentLedgerStore {
+  tail: Promise<void>
+  options: {
+    syncParentDirectory?: (directory: string) => Promise<void>
+  }
+  update(update: (current: unknown) => unknown | Promise<unknown>): Promise<unknown>
+  writeUnqueued(value: unknown): Promise<void>
+}
+
+function residentSelectionMap(
+  service: DesktopControlService,
+): Map<string, TestResidentSelectionRecord> {
+  return (service as unknown as {
+    residentWorkspaceSelections: Map<string, TestResidentSelectionRecord>
+  }).residentWorkspaceSelections
+}
+
+function residentSelectionRecord(
+  service: DesktopControlService,
+  selectionToken: string,
+): TestResidentSelectionRecord {
+  const record = residentSelectionMap(service).get(selectionToken)
+  if (!record) throw new Error(`Missing test selection record: ${selectionToken}`)
+  return record
+}
+
+function residentLedgerStore(service: DesktopControlService): TestResidentLedgerStore {
+  return (service as unknown as { residentLifecycleLedger: TestResidentLedgerStore })
+    .residentLifecycleLedger
+}
+
+function enforceResidentSelectionLimit(service: DesktopControlService): void {
+  ;(service as unknown as { enforceResidentSelectionLimit(): void }).enforceResidentSelectionLimit()
+}
+
+async function recordResidentSubmission(
+  service: DesktopControlService,
+  record: TestResidentSelectionRecord,
+): Promise<void> {
+  await (service as unknown as {
+    recordResidentLifecycleSubmission(
+      record: unknown,
+      metadata: { projectDisplayName: string; threadTitle: string },
+    ): Promise<void>
+  }).recordResidentLifecycleSubmission(record, {
+    projectDisplayName: 'Workspace',
+    threadTitle: 'New resident thread',
+  })
+}
+
+function provisionEntryForSelection(
+  record: TestResidentSelectionRecord,
+): ResidentProvisionOperationView {
+  return {
+    kind: 'provision',
+    provisionMode: 'local_path',
+    operationId: record.selection.operationId,
+    expectedHostId: record.selection.expectedHostId,
+    projectId: record.projectId,
+    workspaceId: record.workspaceId,
+    threadId: record.threadId,
+    executionGenerationId: record.executionGenerationId,
+    projectDisplayName: 'Workspace',
+    threadTitle: 'New resident thread',
+    createdAt: record.createdAt,
+    updatedAt: timestamp,
+    state: 'submitted',
+  }
+}
+
+function committedProvisionEntry(
+  operationId: string,
+  state: 'terminal_refresh_pending' | 'terminal' = 'terminal',
+): ResidentProvisionOperationView {
+  const entry = ledgerEntry(operationId, {})
+  return {
+    ...entry,
+    state,
+    lastStatus: provisionStatus(ledgerPayload(entry), 'committed'),
+  }
+}
+
+function completedPreEffectProvisionEntry(operationId: string): ResidentProvisionOperationView {
+  const entry = ledgerEntry(operationId, {})
+  return {
+    ...entry,
+    state: 'terminal',
+    lastStatus: completedProvisionStatus(ledgerPayload(entry)),
+  }
+}
+
+function completedEndEntry(
+  operationId: string,
+  lineage: ResidentProvisionOperationView,
+  state: 'terminal_refresh_pending' | 'terminal',
+): ResidentEndOperationView {
+  const lastStatus: ResidentLifecycleStatus = {
+    version: 1,
+    kind: 'end',
+    operationId,
+    phase: 'completed',
+    expectedHostId: lineage.expectedHostId,
+    projectId: lineage.projectId,
+    workspaceId: lineage.workspaceId,
+    threadId: lineage.threadId,
+    executionGenerationId: lineage.executionGenerationId,
+    preparedAt: timestamp,
+    updatedAt: timestamp,
+    terminalAt: timestamp,
+  }
+  return {
+    kind: 'end',
+    operationId,
+    expectedHostId: lineage.expectedHostId,
+    projectId: lineage.projectId,
+    workspaceId: lineage.workspaceId,
+    threadId: lineage.threadId,
+    executionGenerationId: lineage.executionGenerationId,
+    sourceCursor: {
+      threadId: lineage.threadId,
+      executionGenerationId: lineage.executionGenerationId,
+      generation: `cursor-${operationId}`,
+      sequence: 1,
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    state,
+    lastStatus,
+  }
+}
+
+function quarantinedEndEntry(operationId: string): ResidentEndOperationView {
+  const lineage = ledgerEntry(`lineage-${operationId}`, {})
+  const lastStatus: ResidentLifecycleStatus = {
+    version: 1,
+    kind: 'end',
+    operationId,
+    phase: 'quarantined',
+    expectedHostId: lineage.expectedHostId,
+    projectId: lineage.projectId,
+    workspaceId: lineage.workspaceId,
+    threadId: lineage.threadId,
+    executionGenerationId: lineage.executionGenerationId,
+    preparedAt: timestamp,
+    updatedAt: timestamp,
+    quarantinedFrom: 'kill_dispatching',
+    quarantineReason: 'external_outcome_unknown',
+  }
+  return {
+    kind: 'end',
+    operationId,
+    expectedHostId: lineage.expectedHostId,
+    projectId: lineage.projectId,
+    workspaceId: lineage.workspaceId,
+    threadId: lineage.threadId,
+    executionGenerationId: lineage.executionGenerationId,
+    sourceCursor: {
+      threadId: lineage.threadId,
+      executionGenerationId: lineage.executionGenerationId,
+      generation: `cursor-${operationId}`,
+      sequence: 1,
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    state: 'terminal',
+    lastStatus,
+  }
+}
+
+async function rejectedValues<T>(promises: Promise<T>[]): Promise<unknown[]> {
+  return await Promise.all(promises.map(async (promise) => await promise.then(
+    () => {
+      throw new Error('Expected the operation to reject.')
+    },
+    (error: unknown) => error,
+  )))
 }
 
 async function writeResidentLedger(

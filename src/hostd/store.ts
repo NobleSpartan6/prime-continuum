@@ -17,6 +17,7 @@ import {
   IdSchema,
   IsoDateTimeSchema,
   PROTOCOL_VERSION,
+  ResidentRegisteredWorkspaceProvisionRequestSchema,
   ResidentControlProjectionSnapshotSchema,
   RuntimeSessionSummarySchema,
   RunLocationSchema,
@@ -155,6 +156,15 @@ export const WorkspaceThreadBootstrapInputSchema = z
     thread: ThreadSummarySchema,
     initialProjection: ThreadProjectionSnapshotSchema,
     workspaceDirectory: WorkspaceDirectorySchema,
+    registeredWorkspaceReservation: z
+      .object({
+        lifecycleOperationId: IdSchema,
+        lifecycleRequestDigest: Sha256DigestSchema,
+        referenceThreadId: IdSchema,
+        referenceExecutionGenerationId: IdSchema,
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((input, context) => {
@@ -184,8 +194,37 @@ export const WorkspaceThreadBootstrapInputSchema = z
         message: "The bootstrap projection must contain the exact requested thread",
       });
     }
+    if (
+      input.registeredWorkspaceReservation &&
+      input.registeredWorkspaceReservation.referenceThreadId === input.thread.threadId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["registeredWorkspaceReservation", "referenceThreadId"],
+        message: "A registered workspace reservation must reference a different existing thread",
+      });
+    }
   });
 export type WorkspaceThreadBootstrapInput = z.infer<typeof WorkspaceThreadBootstrapInputSchema>;
+
+export const RegisteredWorkspaceThreadBootstrapInputSchema =
+  ResidentRegisteredWorkspaceProvisionRequestSchema.extend({
+    bootstrapOperationId: IdSchema,
+    lifecycleRequestDigest: Sha256DigestSchema,
+  })
+    .strict()
+    .superRefine((input, context) => {
+      if (input.threadId === input.referenceThreadId) {
+        context.addIssue({
+          code: "custom",
+          path: ["threadId"],
+          message: "Registered workspace provisioning must create a new thread",
+        });
+      }
+    });
+export type RegisteredWorkspaceThreadBootstrapInput = z.infer<
+  typeof RegisteredWorkspaceThreadBootstrapInputSchema
+>;
 
 const WorkspaceThreadBootstrapPhaseSchema = z.enum([
   "prepared",
@@ -252,6 +291,16 @@ interface WorkspaceThreadBootstrapArtifactPresence {
   readonly authority: boolean;
 }
 
+const RegisteredWorkspaceReservationReleaseSchema = z
+  .object({
+    retirementTransactionId: IdSchema,
+    releasedAt: IsoDateTimeSchema,
+  })
+  .strict();
+type RegisteredWorkspaceReservationRelease = z.infer<
+  typeof RegisteredWorkspaceReservationReleaseSchema
+>;
+
 const WorkspaceThreadBootstrapOperationRecordSchema = z
   .object({
     version: z.literal(1),
@@ -273,6 +322,7 @@ const WorkspaceThreadBootstrapOperationRecordSchema = z
     preparedAt: IsoDateTimeSchema,
     updatedAt: IsoDateTimeSchema,
     committedAt: IsoDateTimeSchema.optional(),
+    registeredWorkspaceReservationRelease: RegisteredWorkspaceReservationReleaseSchema.optional(),
     rollback: WorkspaceThreadBootstrapRollbackSchema.optional(),
   })
   .strict()
@@ -308,6 +358,19 @@ const WorkspaceThreadBootstrapOperationRecordSchema = z
     }
     if (record.committedAt !== undefined && record.committedAt !== record.updatedAt) {
       context.addIssue({ code: "custom", path: ["committedAt"], message: "Workspace bootstrap completion time changed" });
+    }
+    if (
+      record.registeredWorkspaceReservationRelease &&
+      (!record.input.registeredWorkspaceReservation ||
+        record.phase !== "committed" ||
+        !record.committedAt ||
+        Date.parse(record.registeredWorkspaceReservationRelease.releasedAt) < Date.parse(record.committedAt))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["registeredWorkspaceReservationRelease"],
+        message: "Registered workspace reservation release lacks exact committed bootstrap authority",
+      });
     }
     if (record.rollback) {
       if (record.phase === "committed") {
@@ -1722,6 +1785,18 @@ const ResidentLifecycleRetirementTransactionSchema = z
     if (operationIds.size !== transaction.operations.length) {
       context.addIssue({ code: "custom", path: ["operations"], message: "Retired operations must be unique" });
     }
+    if (
+      transaction.transactionId !== deterministicId(
+        "resident-lifecycle-retirement",
+        ...[...operationIds].sort(),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["transactionId"],
+        message: "Resident lifecycle retirement transaction identity changed",
+      });
+    }
     const bindingRecord = transaction.bindingRecord;
     if (bindingRecord) {
       const terminal = transaction.operations.find(
@@ -1738,6 +1813,30 @@ const ResidentLifecycleRetirementTransactionSchema = z
           code: "custom",
           path: ["bindingRecord"],
           message: "Retired binding must match its exact terminal successor",
+        });
+      }
+      const predecessors = transaction.operations.filter(
+        (operation) => operation.operationId !== terminal?.operationId,
+      );
+      const predecessor = predecessors[0];
+      if (
+        predecessors.length > 1 ||
+        (predecessor !== undefined &&
+          (predecessor.kind !== "provision" ||
+            predecessor.phase !== "committed" ||
+            !predecessor.binding ||
+            !isDeepStrictEqual(predecessor.binding, bindingRecord.binding) ||
+            predecessor.authority.threadId !== bindingRecord.binding.threadId ||
+            predecessor.authority.executionGenerationId !== bindingRecord.binding.executionGenerationId ||
+            !sameCanonicalPath(
+              predecessor.authority.workspaceDirectory,
+              bindingRecord.binding.workspaceDirectory,
+            )))
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["operations"],
+          message: "Retired predecessor must be the exact committed provision for the terminal binding",
         });
       }
       const expectedAuthority = residentProjectionAuthorityFromBinding(bindingRecord.binding);
@@ -1761,6 +1860,7 @@ const ResidentLifecycleRetirementTransactionSchema = z
         });
       }
       if (
+        transaction.operations.length !== 1 ||
         transaction.operations.some(
           (operation) =>
             operation.kind !== "provision" ||
@@ -2190,9 +2290,12 @@ export type ResidentLifecycleFaultPoint =
   | "after_detached_binding"
   | "after_retirement_prepare"
   | "after_retirement_fence"
+  | "after_retirement_reservation_release"
   | "after_retirement_lineage"
   | "after_retirement_binding"
-  | "after_retirement_operations";
+  | "after_retirement_operations"
+  | "before_retirement_bootstrap_compaction"
+  | "after_retirement_bootstrap_compaction";
 
 export type WorkspaceThreadBootstrapFaultPoint =
   | "after_prepared"
@@ -2215,6 +2318,8 @@ export type WorkspaceThreadBootstrapFaultPoint =
 export type HandoffCheckpointWriter = (path: string, checkpoint: HandoffCheckpoint) => Promise<boolean>;
 
 export interface HostStoreOptions {
+  /** Test-only seam immediately before registered authority is canonicalized a second time. */
+  registeredWorkspaceBootstrapBeforeCanonicalRecheck?: (operationId: string) => void | Promise<void>;
   workspaceThreadBootstrapFaultInjector?: (
     point: WorkspaceThreadBootstrapFaultPoint,
     operationId: string,
@@ -2234,6 +2339,8 @@ export interface HostStoreOptions {
   ) => void | Promise<void>;
   /** Test-only pressure override; production always uses the exported maximum. */
   residentLifecycleOperationLimit?: number;
+  /** Test-only pressure override; production always uses the exported maximum. */
+  workspaceThreadBootstrapOperationLimit?: number;
   /** Test-only pressure override for exact projection-lineage churn. */
   residentProjectionLineageLimit?: number;
   /** Test-only pressure override; production retains this bounded maximum. */
@@ -2281,6 +2388,7 @@ export class HostStore {
   private residentSubsystemFault: HostStoreError | undefined;
   private readonly options: HostStoreOptions;
   private readonly residentLifecycleOperationLimit: number;
+  private readonly workspaceThreadBootstrapOperationLimit: number;
   private readonly residentProjectionLineageLimit: number;
   private readonly residentControlProjectionLimit: number;
   private readonly residentPromptReconciliationLeases = new WeakSet<object>();
@@ -2302,6 +2410,18 @@ export class HostStore {
       throw new TypeError("residentLifecycleOperationLimit must be an integer from 4 through the production maximum");
     }
     this.residentLifecycleOperationLimit = operationLimit;
+    const bootstrapOperationLimit =
+      options.workspaceThreadBootstrapOperationLimit ?? MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS;
+    if (
+      !Number.isInteger(bootstrapOperationLimit) ||
+      bootstrapOperationLimit < 1 ||
+      bootstrapOperationLimit > MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS
+    ) {
+      throw new TypeError(
+        "workspaceThreadBootstrapOperationLimit must be an integer from 1 through the production maximum",
+      );
+    }
+    this.workspaceThreadBootstrapOperationLimit = bootstrapOperationLimit;
     const lineageLimit = options.residentProjectionLineageLimit ?? MAX_RESIDENT_PROJECTION_LINEAGES;
     if (!Number.isInteger(lineageLimit) || lineageLimit < 1 || lineageLimit > MAX_RESIDENT_PROJECTION_LINEAGES) {
       throw new TypeError("residentProjectionLineageLimit must be an integer from 1 through the production maximum");
@@ -2354,7 +2474,7 @@ export class HostStore {
       let workspaceBootstrapRecoveryPending = false;
       try {
         await this.validateWorkspaceThreadBootstrapOperationDirectoryUnlocked();
-        workspaceBootstrapRecoveryPending = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).some(
+        const workspaceBootstrapNeedsRecovery = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).some(
           (operation) =>
             operation.phase !== "committed" && operation.rollback?.phase !== "retired",
         );
@@ -2370,8 +2490,6 @@ export class HostStore {
             MAX_WORKSPACE_AUTHORITY_FILE_BYTES,
           );
         }
-        await this.recoverWorkspaceThreadBootstrapOperationsUnlocked();
-        workspaceBootstrapRecoveryPending = false;
         const residentBindingFile = await readJsonFile(
           this.paths.residentSessionBindings,
           ResidentSessionBindingFileSchema,
@@ -2389,7 +2507,15 @@ export class HostStore {
           emptyResidentLifecycleRetiredFence(),
           MAX_RESIDENT_LIFECYCLE_RETIRED_FENCE_BYTES,
         );
+        // Finish any terminal retirement before a committed registered
+        // bootstrap consults the lifecycle registry. An exact transaction-bound
+        // marker is the authority for release; bootstrap recovery must never
+        // recreate an operation that an interrupted compaction is already
+        // retiring.
         await this.recoverResidentLifecycleRetirementUnlocked();
+        workspaceBootstrapRecoveryPending = workspaceBootstrapNeedsRecovery;
+        await this.recoverWorkspaceThreadBootstrapOperationsUnlocked();
+        workspaceBootstrapRecoveryPending = false;
         await this.validateResidentLifecycleOperationDirectoryUnlocked();
         await this.recoverResidentLifecycleOperationsUnlocked("before_projection_recovery");
         await this.validateResidentProjectionLineageDirectoryUnlocked();
@@ -2700,111 +2826,466 @@ export class HostStore {
     inputValue: WorkspaceThreadBootstrapInput,
   ): Promise<WorkspaceThreadBootstrapStatus> {
     const parsedInput = WorkspaceThreadBootstrapInputSchema.parse(inputValue);
+    return this.exclusive(() => this.bootstrapWorkspaceThreadUnlocked(parsedInput));
+  }
+
+  /**
+   * Creates a new thread from an already-registered saved workspace without
+   * accepting or returning its private path. Reference authority resolution,
+   * same-workspace exclusion, and bootstrap preparation share one Store lock.
+   */
+  async bootstrapRegisteredWorkspaceThread(
+    inputValue: RegisteredWorkspaceThreadBootstrapInput,
+  ): Promise<WorkspaceThreadBootstrapStatus> {
+    const input = RegisteredWorkspaceThreadBootstrapInputSchema.parse(inputValue);
     return this.exclusive(async () => {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
-      const canonicalDirectory = await canonicalWorkspaceDirectory(parsedInput.workspaceDirectory);
-      const input = WorkspaceThreadBootstrapInputSchema.parse({
-        ...parsedInput,
-        workspaceDirectory: canonicalDirectory,
-      });
-      const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(input.operationId);
-      if (existing) {
-        if (!isDeepStrictEqual(existing.input, input)) {
-          throw new HostStoreError(
-            "WORKSPACE_BOOTSTRAP_OPERATION_ID_REUSED",
-            "This workspace bootstrap operation ID is already bound to a different exact envelope",
-          );
-        }
-        if (existing.phase === "committed") {
-          await this.assertWorkspaceThreadBootstrapCommittedAuthorityCurrentUnlocked(existing);
-          return workspaceThreadBootstrapStatus(existing);
-        }
-        try {
-          const recoverable =
-            existing.rollback?.phase === "retired"
-              ? await this.reactivateRetiredWorkspaceThreadBootstrapOperationUnlocked(existing, input)
-              : existing;
-          const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(recoverable, true);
-          return workspaceThreadBootstrapStatus(completed);
-        } catch (error) {
-          this.initialized = false;
-          throw error;
-        }
-      }
 
-      const host = await this.readHostUnlocked();
+      const [host, projects, threads, authorities] = await Promise.all([
+        this.readHostUnlocked(),
+        this.readProjectsUnlocked(),
+        this.readThreadsUnlocked(),
+        this.readWorkspaceAuthoritiesUnlocked(),
+      ]);
       if (host.hostId !== input.expectedHostId) {
         throw new HostStoreError(
-          "WORKSPACE_BOOTSTRAP_HOST_MISMATCH",
-          "The workspace bootstrap operation targets a different host authority",
+          "REGISTERED_WORKSPACE_HOST_MISMATCH",
+          "The registered workspace provisioning operation targets a different host authority",
         );
       }
-      await this.assertNoResidentLifecycleOperationUnlocked(input.thread.threadId);
-      await this.assertNoResidentDispatchTransitionUnlocked(
-        input.thread.threadId,
-        "Workspace bootstrap cannot begin while a resident dispatch is unresolved",
-      );
-      const bindingRecord = (await this.readResidentSessionBindingRecordsUnlocked()).find(
-        (record) =>
-          record.binding.threadId === input.thread.threadId &&
-          (record.state === "active" || record.state === "activating"),
-      );
-      if (bindingRecord) {
+      const matchingProjects = projects.filter((candidate) => candidate.projectId === input.projectId);
+      const project = matchingProjects[0];
+      if (
+        matchingProjects.length !== 1 ||
+        !project ||
+        project.hostId !== input.expectedHostId ||
+        project.workspaceId !== input.workspaceId
+      ) {
         throw new HostStoreError(
-          "WORKSPACE_BOOTSTRAP_RESIDENT_ACTIVE",
-          "Workspace bootstrap requires a thread without active resident authority",
-        );
-      }
-      const competing = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).find(
-        (operation) =>
-          operation.phase !== "committed" &&
-          operation.rollback?.phase !== "retired" &&
-          operation.input.thread.threadId === input.thread.threadId,
-      );
-      if (competing) {
-        throw new HostStoreError(
-          "WORKSPACE_BOOTSTRAP_IN_PROGRESS",
-          "This thread already has a nonterminal workspace bootstrap operation",
+          "REGISTERED_WORKSPACE_PROJECT_MISMATCH",
+          "The requested saved project does not match this host workspace authority",
         );
       }
 
-      const observedAt = now();
-      const authority = await this.resolveWorkspaceThreadBootstrapAuthorityUnlocked(input, observedAt);
-      const artifactProvenance = await this.resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
-        input,
-        authority,
+      const matchingReferenceThreads = threads.filter(
+        (candidate) => candidate.threadId === input.referenceThreadId,
       );
-      const preparedAt = causalNow(authority.registeredAt);
-      const prepared = WorkspaceThreadBootstrapOperationRecordSchema.parse({
-        version: 1,
-        operationId: input.operationId,
-        input,
-        operationFingerprint: workspaceThreadBootstrapOperationFingerprint(input),
-        canonicalWorkspaceDigest: workspaceThreadBootstrapCanonicalWorkspaceDigest(canonicalDirectory),
-        authority,
-        artifactProvenance,
-        materializationClaims: [],
-        phase: "prepared",
-        preparedAt,
-        updatedAt: preparedAt,
-      });
-      await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(prepared, "prepared");
-      if (Buffer.byteLength(`${JSON.stringify(prepared)}\n`, "utf8") > MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES) {
+      const referenceThread = matchingReferenceThreads[0];
+      if (
+        matchingReferenceThreads.length !== 1 ||
+        !referenceThread ||
+        referenceThread.projectIdentity !== input.projectId ||
+        referenceThread.currentLocation.hostId !== input.expectedHostId ||
+        referenceThread.currentLocation.projectId !== input.projectId ||
+        referenceThread.currentLocation.workspaceId !== input.workspaceId ||
+        referenceThread.currentLocation.executionGenerationId !== input.referenceExecutionGenerationId
+      ) {
         throw new HostStoreError(
-          "WORKSPACE_BOOTSTRAP_RECORD_TOO_LARGE",
-          "The bounded workspace bootstrap operation record is too large",
+          "REGISTERED_WORKSPACE_REFERENCE_MISMATCH",
+          "The reference thread is stale or does not own the requested saved workspace",
         );
       }
+      const referenceSnapshot = await this.readSnapshotUnlocked(input.referenceThreadId);
+      if (
+        !isDeepStrictEqual(referenceSnapshot.thread, referenceThread) ||
+        referenceSnapshot.latestCursor.threadId !== input.referenceThreadId ||
+        referenceSnapshot.latestCursor.executionGenerationId !== input.referenceExecutionGenerationId
+      ) {
+        throw new HostStoreError(
+          "REGISTERED_WORKSPACE_REFERENCE_MISMATCH",
+          "The durable reference projection no longer matches its exact thread generation",
+        );
+      }
+
+      const matchingAuthorities = authorities.filter(
+        (candidate) => candidate.threadId === input.referenceThreadId,
+      );
+      const referenceAuthority = matchingAuthorities[0];
+      const referenceScope: CurrentWorkspaceScope = {
+        hostId: input.expectedHostId,
+        projectId: input.projectId,
+        workspaceId: input.workspaceId,
+        threadId: input.referenceThreadId,
+        executionGenerationId: input.referenceExecutionGenerationId,
+      };
+      if (
+        matchingAuthorities.length !== 1 ||
+        !referenceAuthority ||
+        !workspaceAuthorityMatchesScope(referenceAuthority, referenceScope)
+      ) {
+        throw new HostStoreError(
+          "REGISTERED_WORKSPACE_AUTHORITY_MISMATCH",
+          "The reference thread has no exact private workspace authority",
+        );
+      }
+      const canonicalDirectory = await canonicalWorkspaceDirectory(referenceAuthority.workspaceDirectory);
+      if (!sameCanonicalPath(referenceAuthority.workspaceDirectory, canonicalDirectory)) {
+        throw new HostStoreError(
+          "REGISTERED_WORKSPACE_PATH_CHANGED",
+          "The registered workspace path no longer resolves to its original canonical authority",
+        );
+      }
+
+      const artifacts = initialRegisteredWorkspaceArtifacts(input, project);
+      const bootstrapInput = WorkspaceThreadBootstrapInputSchema.parse({
+        operationId: input.bootstrapOperationId,
+        requestDigest: registeredWorkspaceProvisionRequestDigest(input),
+        expectedHostId: input.expectedHostId,
+        project,
+        thread: artifacts.thread,
+        initialProjection: artifacts.projection,
+        workspaceDirectory: canonicalDirectory,
+        registeredWorkspaceReservation: {
+          lifecycleOperationId: input.operationId,
+          lifecycleRequestDigest: input.lifecycleRequestDigest,
+          referenceThreadId: input.referenceThreadId,
+          referenceExecutionGenerationId: input.referenceExecutionGenerationId,
+        },
+      });
+      const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(input.bootstrapOperationId);
+      if (existing) {
+        await this.assertRegisteredWorkspaceReservationAvailableUnlocked(
+          bootstrapInput,
+          canonicalDirectory,
+        );
+        await this.options.registeredWorkspaceBootstrapBeforeCanonicalRecheck?.(input.operationId);
+        return this.bootstrapWorkspaceThreadUnlocked(bootstrapInput);
+      }
+      if (await this.residentLifecycleRetiredKeyIsFencedUnlocked(
+        residentLifecycleRetiredOperationKey(input.operationId),
+      )) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+          "A retired lifecycle operation ID cannot reserve a new registered workspace bootstrap",
+        );
+      }
+
+      await this.assertRegisteredWorkspaceReservationAvailableUnlocked(
+        bootstrapInput,
+        canonicalDirectory,
+      );
+
+      await this.options.registeredWorkspaceBootstrapBeforeCanonicalRecheck?.(input.operationId);
+      return this.bootstrapWorkspaceThreadUnlocked(bootstrapInput);
+    });
+  }
+
+  private async bootstrapWorkspaceThreadUnlocked(
+    parsedInput: WorkspaceThreadBootstrapInput,
+  ): Promise<WorkspaceThreadBootstrapStatus> {
+    this.assertInitialized();
+    this.assertResidentSubsystemAvailable();
+    const canonicalDirectory = await canonicalWorkspaceDirectory(parsedInput.workspaceDirectory);
+    if (
+      parsedInput.registeredWorkspaceReservation &&
+      !sameCanonicalPath(canonicalDirectory, parsedInput.workspaceDirectory)
+    ) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_PATH_CHANGED",
+        "The registered workspace path changed during bootstrap authority validation",
+      );
+    }
+    const input = WorkspaceThreadBootstrapInputSchema.parse({
+      ...parsedInput,
+      workspaceDirectory: canonicalDirectory,
+    });
+    const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(input.operationId);
+    if (existing) {
+      if (!isDeepStrictEqual(existing.input, input)) {
+        throw new HostStoreError(
+          "WORKSPACE_BOOTSTRAP_OPERATION_ID_REUSED",
+          "This workspace bootstrap operation ID is already bound to a different exact envelope",
+        );
+      }
+      if (existing.phase === "committed") {
+        await this.assertWorkspaceThreadBootstrapCommittedAuthorityCurrentUnlocked(existing);
+        return workspaceThreadBootstrapStatus(existing);
+      }
       try {
-        await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(prepared, "after_prepared", true);
-        const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(prepared, true);
+        const recoverable =
+          existing.rollback?.phase === "retired"
+            ? await this.reactivateRetiredWorkspaceThreadBootstrapOperationUnlocked(existing, input)
+            : existing;
+        const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(recoverable, true);
         return workspaceThreadBootstrapStatus(completed);
       } catch (error) {
         this.initialized = false;
         throw error;
       }
+    }
+
+    const host = await this.readHostUnlocked();
+    if (host.hostId !== input.expectedHostId) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_HOST_MISMATCH",
+        "The workspace bootstrap operation targets a different host authority",
+      );
+    }
+    await this.assertNoResidentLifecycleOperationUnlocked(input.thread.threadId);
+    await this.assertNoResidentDispatchTransitionUnlocked(
+      input.thread.threadId,
+      "Workspace bootstrap cannot begin while a resident dispatch is unresolved",
+    );
+    const bindingRecord = (await this.readResidentSessionBindingRecordsUnlocked()).find(
+      (record) =>
+        record.binding.threadId === input.thread.threadId &&
+        (record.state === "active" || record.state === "activating"),
+    );
+    if (bindingRecord) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_RESIDENT_ACTIVE",
+        "Workspace bootstrap requires a thread without active resident authority",
+      );
+    }
+    const competing = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).find(
+      (operation) =>
+        operation.phase !== "committed" &&
+        operation.rollback?.phase !== "retired" &&
+        operation.input.thread.threadId === input.thread.threadId,
+    );
+    if (competing) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_IN_PROGRESS",
+        "This thread already has a nonterminal workspace bootstrap operation",
+      );
+    }
+
+    const observedAt = now();
+    const authority = await this.resolveWorkspaceThreadBootstrapAuthorityUnlocked(input, observedAt);
+    const artifactProvenance = await this.resolveWorkspaceThreadBootstrapArtifactProvenanceUnlocked(
+      input,
+      authority,
+    );
+    const preparedAt = causalNow(authority.registeredAt);
+    const prepared = WorkspaceThreadBootstrapOperationRecordSchema.parse({
+      version: 1,
+      operationId: input.operationId,
+      input,
+      operationFingerprint: workspaceThreadBootstrapOperationFingerprint(input),
+      canonicalWorkspaceDigest: workspaceThreadBootstrapCanonicalWorkspaceDigest(canonicalDirectory),
+      authority,
+      artifactProvenance,
+      materializationClaims: [],
+      phase: "prepared",
+      preparedAt,
+      updatedAt: preparedAt,
     });
+    await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(prepared, "prepared");
+    if (Buffer.byteLength(`${JSON.stringify(prepared)}\n`, "utf8") > MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATION_BYTES) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_RECORD_TOO_LARGE",
+        "The bounded workspace bootstrap operation record is too large",
+      );
+    }
+    try {
+      await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(prepared, "after_prepared", true);
+      const completed = await this.materializeWorkspaceThreadBootstrapOperationUnlocked(prepared, true);
+      return workspaceThreadBootstrapStatus(completed);
+    } catch (error) {
+      this.initialized = false;
+      throw error;
+    }
+  }
+
+  private async assertRegisteredWorkspaceReservationAvailableUnlocked(
+    input: WorkspaceThreadBootstrapInput,
+    canonicalDirectory: string,
+  ): Promise<void> {
+    const reservation = input.registeredWorkspaceReservation;
+    if (!reservation) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESERVATION_INVALID",
+        "Registered workspace bootstrap is missing its durable lifecycle reservation",
+      );
+    }
+    const [bindingRecords, lifecycleOperations, bootstrapOperations] = await Promise.all([
+      this.readResidentSessionBindingRecordsUnlocked(),
+      this.readResidentLifecycleOperationsUnlocked(),
+      this.readWorkspaceThreadBootstrapOperationsUnlocked(),
+    ]);
+    const ownLifecycle = lifecycleOperations.find(
+      (operation) => operation.operationId === reservation.lifecycleOperationId,
+    );
+    if (
+      ownLifecycle &&
+      (ownLifecycle.kind !== "provision" ||
+        ownLifecycle.input.projectId !== input.project.projectId ||
+        ownLifecycle.input.workspaceId !== input.project.workspaceId ||
+        ownLifecycle.input.threadId !== input.thread.threadId ||
+        ownLifecycle.input.executionGenerationId !== input.thread.currentLocation.executionGenerationId ||
+        ownLifecycle.input.requestDigest !== reservation.lifecycleRequestDigest ||
+        !sameCanonicalPath(ownLifecycle.authority.workspaceDirectory, canonicalDirectory))
+    ) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESERVATION_REUSED",
+        "The registered workspace reservation lifecycle ID is bound to a different exact authority",
+      );
+    }
+
+    const activeOnWorkspace = bindingRecords.filter(
+      (record) =>
+        (record.state === "active" || record.state === "activating") &&
+        sameCanonicalPath(record.binding.workspaceDirectory, canonicalDirectory),
+    );
+    const activeOwnedByRequest =
+      activeOnWorkspace.length === 1 &&
+      ownLifecycle?.binding &&
+      isDeepStrictEqual(activeOnWorkspace[0]?.binding, ownLifecycle.binding);
+    if (activeOnWorkspace.length > 0 && !activeOwnedByRequest) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESIDENT_ACTIVE",
+        "A registered workspace cannot start another resident while it has active resident authority",
+      );
+    }
+
+    const competingLifecycle = lifecycleOperations.find(
+      (operation) =>
+        operation.operationId !== reservation.lifecycleOperationId &&
+        residentLifecycleOperationIsNonterminal(operation) &&
+        sameCanonicalPath(operation.authority.workspaceDirectory, canonicalDirectory),
+    );
+    if (competingLifecycle) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_LIFECYCLE_IN_PROGRESS",
+        "A registered workspace cannot start another resident while a lifecycle operation is unresolved",
+        competingLifecycle.phase !== "quarantined",
+      );
+    }
+
+    const sameOperationReservations = bootstrapOperations.filter(
+      (operation) =>
+        operation.phase === "committed" &&
+        operation.input.registeredWorkspaceReservation?.lifecycleOperationId ===
+          reservation.lifecycleOperationId,
+    );
+    if (
+      sameOperationReservations.length > 1 ||
+      (sameOperationReservations[0] &&
+        !isDeepStrictEqual(sameOperationReservations[0].input, input))
+    ) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESERVATION_REUSED",
+        "The lifecycle operation is already reserved for another registered workspace envelope",
+      );
+    }
+
+    let pendingCompetingReservation: WorkspaceThreadBootstrapOperationRecord | undefined;
+    for (const operation of bootstrapOperations) {
+      const candidate = operation.input.registeredWorkspaceReservation;
+      if (
+        operation.phase !== "committed" ||
+        !candidate ||
+        candidate.lifecycleOperationId === reservation.lifecycleOperationId ||
+        !sameCanonicalPath(operation.input.workspaceDirectory, canonicalDirectory)
+      ) {
+        continue;
+      }
+      if (lifecycleOperations.some(
+        (lifecycle) => lifecycle.operationId === candidate.lifecycleOperationId,
+      )) continue;
+      if (operation.registeredWorkspaceReservationRelease) continue;
+      pendingCompetingReservation = operation;
+      break;
+    }
+    if (pendingCompetingReservation) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESERVED",
+        "The registered workspace is durably reserved by another lifecycle operation",
+        true,
+      );
+    }
+  }
+
+  private async registeredWorkspaceReservationForLifecycleUnlocked(
+    operationId: string,
+  ): Promise<WorkspaceThreadBootstrapOperationRecord | undefined> {
+    const matches = (await this.readWorkspaceThreadBootstrapOperationsUnlocked()).filter(
+      (operation) =>
+        operation.phase === "committed" &&
+        operation.input.registeredWorkspaceReservation?.lifecycleOperationId === operationId,
+    );
+    if (matches.length > 1) {
+      throw new HostStoreError(
+        "REGISTERED_WORKSPACE_RESERVATION_INVALID",
+        "One lifecycle operation is claimed by multiple registered workspace reservations",
+      );
+    }
+    return matches[0];
+  }
+
+  /**
+   * Closes the bootstrap-to-provider crash window for a registered workspace.
+   * The bootstrap record carries the complete path-free lifecycle identity and
+   * exact request digest, so startup can converge `prepared` without replaying
+   * a provider mutation. While a retired bootstrap is retained, only its exact
+   * release marker suppresses reconstruction; after compaction, the retired-ID
+   * fence continues to deny exact lifecycle replay.
+   */
+  private async ensureRegisteredWorkspaceLifecyclePreparedUnlocked(
+    bootstrap: WorkspaceThreadBootstrapOperationRecord,
+  ): Promise<ResidentLifecycleStatus | undefined> {
+    const reservation = bootstrap.input.registeredWorkspaceReservation;
+    if (!reservation) return undefined;
+    if (bootstrap.registeredWorkspaceReservationRelease) return undefined;
+    if (
+      workspaceThreadBootstrapPhaseRank(bootstrap.phase) <
+      workspaceThreadBootstrapPhaseRank("authority_committed")
+    ) {
+      throw new HostStoreError(
+        "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+        "Registered lifecycle preparation requires exact materialized workspace authority",
+      );
+    }
+    const input = ResidentLifecycleOperationInputSchema.parse({
+      operationId: reservation.lifecycleOperationId,
+      expectedHostId: bootstrap.input.expectedHostId,
+      projectId: bootstrap.input.project.projectId,
+      workspaceId: bootstrap.input.project.workspaceId,
+      threadId: bootstrap.input.thread.threadId,
+      executionGenerationId: bootstrap.input.thread.currentLocation.executionGenerationId,
+      requestDigest: reservation.lifecycleRequestDigest,
+    });
+    const existing = await this.readResidentLifecycleOperationUnlocked(input.operationId);
+    if (existing) {
+      if (existing.kind !== "provision" || !isDeepStrictEqual(existing.input, input)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+          "The registered bootstrap lifecycle ID is bound to a different exact envelope",
+        );
+      }
+      if (
+        existing.authority.hostId !== bootstrap.authority.hostId ||
+        existing.authority.projectId !== bootstrap.authority.projectId ||
+        existing.authority.workspaceId !== bootstrap.authority.workspaceId ||
+        existing.authority.threadId !== bootstrap.authority.threadId ||
+        existing.authority.executionGenerationId !== bootstrap.authority.executionGenerationId ||
+        !sameCanonicalPath(existing.authority.workspaceDirectory, bootstrap.authority.workspaceDirectory)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+          "The registered bootstrap lifecycle authority differs from its exact prepared operation",
+        );
+      }
+      return residentLifecycleStatus(existing);
+    }
+    if (
+      await this.residentLifecycleRetiredKeyIsFencedUnlocked(
+        residentLifecycleRetiredOperationKey(input.operationId),
+      )
+    ) {
+      if (bootstrap.phase !== "committed") {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_OPERATION_ID_REUSED",
+          "A retired lifecycle operation ID cannot complete a fresh registered workspace bootstrap",
+        );
+      }
+      // Bloom membership denies ID reuse but is not exact retirement proof.
+      // Leave this committed reservation orphaned and blocking until an exact
+      // retirement transaction materializes its record-level release marker.
+      return undefined;
+    }
+    return this.prepareResidentProvisionUnlocked(input);
   }
 
   async upsertProject(projectValue: SavedProject): Promise<void> {
@@ -3048,15 +3529,99 @@ export class HostStore {
 
   async prepareResidentProvision(inputValue: ResidentLifecycleOperationInput): Promise<ResidentLifecycleStatus> {
     const input = ResidentLifecycleOperationInputSchema.parse(inputValue);
-    return this.exclusive(async () => {
+    return this.exclusive(() => {
       this.assertInitialized();
       this.assertResidentSubsystemAvailable();
+      return this.prepareResidentProvisionUnlocked(input);
+    });
+  }
+
+  private async prepareResidentProvisionUnlocked(
+    input: ResidentLifecycleOperationInput,
+  ): Promise<ResidentLifecycleStatus> {
       const existing = await this.resolveExactResidentLifecycleOperationUnlocked("provision", input, {
         optional: true,
       });
-      if (existing) return residentLifecycleStatus(existing);
+      if (existing) {
+        const reservation = await this.registeredWorkspaceReservationForLifecycleUnlocked(input.operationId);
+        if (reservation) {
+          await this.assertRegisteredWorkspaceReservationAvailableUnlocked(
+            reservation.input,
+            existing.authority.workspaceDirectory,
+          );
+        }
+        return residentLifecycleStatus(existing);
+      }
 
       const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
+      const reservation = await this.registeredWorkspaceReservationForLifecycleUnlocked(input.operationId);
+      if (reservation) {
+        if (
+          reservation.input.expectedHostId !== input.expectedHostId ||
+          reservation.input.project.projectId !== input.projectId ||
+          reservation.input.project.workspaceId !== input.workspaceId ||
+          reservation.input.thread.threadId !== input.threadId ||
+          reservation.input.thread.currentLocation.executionGenerationId !== input.executionGenerationId ||
+          reservation.input.registeredWorkspaceReservation?.lifecycleRequestDigest !== input.requestDigest ||
+          !sameCanonicalPath(reservation.input.workspaceDirectory, authority.workspaceDirectory)
+        ) {
+          throw new HostStoreError(
+            "REGISTERED_WORKSPACE_RESERVATION_REUSED",
+            "The lifecycle request does not match its exact registered workspace reservation",
+          );
+        }
+        await this.assertRegisteredWorkspaceReservationAvailableUnlocked(
+          reservation.input,
+          authority.workspaceDirectory,
+        );
+      } else {
+        const [lifecycleOperations, bindingRecords, bootstrapOperations] = await Promise.all([
+          this.readResidentLifecycleOperationsUnlocked(),
+          this.readResidentSessionBindingRecordsUnlocked(),
+          this.readWorkspaceThreadBootstrapOperationsUnlocked(),
+        ]);
+        const registeredWorkspaceReservations = bootstrapOperations.filter(
+          (operation) =>
+            operation.phase === "committed" &&
+            operation.input.registeredWorkspaceReservation !== undefined &&
+            sameCanonicalPath(operation.input.workspaceDirectory, authority.workspaceDirectory),
+        );
+        let unresolvedReservation: WorkspaceThreadBootstrapOperationRecord | undefined;
+        for (const operation of registeredWorkspaceReservations) {
+          const lifecycleOperationId = operation.input.registeredWorkspaceReservation?.lifecycleOperationId;
+          const lifecycle = lifecycleOperations.find(
+            (candidate) => candidate.operationId === lifecycleOperationId,
+          );
+          if (lifecycle && residentLifecycleOperationIsNonterminal(lifecycle)) {
+            unresolvedReservation = operation;
+            break;
+          }
+          if (!lifecycle && !operation.registeredWorkspaceReservationRelease) {
+            unresolvedReservation = operation;
+            break;
+          }
+        }
+        if (unresolvedReservation) {
+          throw new HostStoreError(
+            "REGISTERED_WORKSPACE_RESERVED",
+            "The registered workspace is durably reserved by another lifecycle operation",
+            true,
+          );
+        }
+        if (
+          registeredWorkspaceReservations.length > 0 &&
+          bindingRecords.some(
+            (record) =>
+              (record.state === "active" || record.state === "activating") &&
+              sameCanonicalPath(record.binding.workspaceDirectory, authority.workspaceDirectory),
+          )
+        ) {
+          throw new HostStoreError(
+            "REGISTERED_WORKSPACE_RESIDENT_ACTIVE",
+            "A registered workspace cannot start another resident while it has active resident authority",
+          );
+        }
+      }
       await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
       if ((await this.readResidentSessionBindingsUnlocked()).some((binding) => binding.threadId === input.threadId)) {
         throw new HostStoreError(
@@ -3078,7 +3643,6 @@ export class HostStore {
       });
       await this.writeResidentLifecycleBoundaryUnlocked(record, "after_prepared");
       return residentLifecycleStatus(record);
-    });
   }
 
   async beginResidentOwnedCreate(inputValue: ResidentLifecycleOperationInput): Promise<ResidentOwnedCreateLease> {
@@ -8657,7 +9221,18 @@ export class HostStore {
     try {
       const records = await this.readWorkspaceThreadBootstrapOperationsUnlocked(true);
       const nonterminalThreads = new Set<string>();
+      const registeredLifecycleReservations = new Set<string>();
       for (const record of records) {
+        const reservation = record.input.registeredWorkspaceReservation;
+        if (record.phase === "committed" && reservation) {
+          if (registeredLifecycleReservations.has(reservation.lifecycleOperationId)) {
+            throw new HostStoreError(
+              "WORKSPACE_BOOTSTRAP_STATE_INVALID",
+              "A lifecycle operation has more than one committed registered workspace reservation",
+            );
+          }
+          registeredLifecycleReservations.add(reservation.lifecycleOperationId);
+        }
         if (record.phase === "committed" || record.rollback?.phase === "retired") continue;
         const threadId = record.input.thread.threadId;
         if (nonterminalThreads.has(threadId)) {
@@ -8708,7 +9283,7 @@ export class HostStore {
           "The workspace bootstrap registry contains an unexpected entry",
         );
       }
-      if (records.length >= MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS) {
+      if (records.length >= this.workspaceThreadBootstrapOperationLimit) {
         throw new HostStoreError(
           "WORKSPACE_BOOTSTRAP_LIMIT_REACHED",
           "The workspace bootstrap registry exceeds its bounded entry limit",
@@ -8778,6 +9353,13 @@ export class HostStore {
     const record = WorkspaceThreadBootstrapOperationRecordSchema.parse(recordValue);
     const existing = await this.readWorkspaceThreadBootstrapOperationUnlocked(record.operationId);
     if (existing) {
+      const reservationReleaseTransitionInvalid = existing.registeredWorkspaceReservationRelease
+        ? !record.registeredWorkspaceReservationRelease ||
+          !isDeepStrictEqual(
+            existing.registeredWorkspaceReservationRelease,
+            record.registeredWorkspaceReservationRelease,
+          )
+        : record.registeredWorkspaceReservationRelease !== undefined && existing.phase !== "committed";
       const rollbackTransitionInvalid = existing.rollback
         ? !record.rollback ||
           !isDeepStrictEqual(existing.rollback.plan, record.rollback.plan) ||
@@ -8805,6 +9387,7 @@ export class HostStore {
         (record.rollback !== undefined && existing.rollback === undefined && record.phase !== existing.phase) ||
         (existing.rollback !== undefined &&
           !isDeepStrictEqual(existing.materializationClaims, record.materializationClaims)) ||
+        reservationReleaseTransitionInvalid ||
         rollbackTransitionInvalid
       ) {
         throw new HostStoreError(
@@ -8813,8 +9396,20 @@ export class HostStore {
         );
       }
     } else {
-      const records = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
-      if (records.length >= MAX_WORKSPACE_THREAD_BOOTSTRAP_OPERATIONS) {
+      let records = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
+      if (
+        records.length >= this.workspaceThreadBootstrapOperationLimit &&
+        record.input.registeredWorkspaceReservation
+      ) {
+        // A registered bootstrap is written before its lifecycle preparation.
+        // Give an older exact registered terminal group one chance to finish
+        // retirement and compact its released reservation before rejecting the
+        // new path-free request at the bounded registry limit. Local bootstrap
+        // admission never enters this compaction path.
+        await this.retireOneRegisteredWorkspaceBootstrapTerminalGroupUnlocked(records);
+        records = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
+      }
+      if (records.length >= this.workspaceThreadBootstrapOperationLimit) {
         throw new HostStoreError(
           "WORKSPACE_BOOTSTRAP_LIMIT_REACHED",
           "The workspace bootstrap operation registry is full",
@@ -9307,7 +9902,10 @@ export class HostStore {
     injectFaults: boolean,
   ): Promise<WorkspaceThreadBootstrapOperationRecord> {
     let operation = WorkspaceThreadBootstrapOperationRecordSchema.parse(operationValue);
-    if (operation.phase === "committed") return operation;
+    if (operation.phase === "committed") {
+      await this.ensureRegisteredWorkspaceLifecyclePreparedUnlocked(operation);
+      return operation;
+    }
     await this.assertWorkspaceThreadBootstrapArtifactsConvergentUnlocked(operation, operation.phase);
 
     if (workspaceThreadBootstrapPhaseRank(operation.phase) < workspaceThreadBootstrapPhaseRank("project_committed")) {
@@ -9363,6 +9961,11 @@ export class HostStore {
       committedAt,
     });
     await this.writeWorkspaceThreadBootstrapBoundaryUnlocked(operation, "after_committed", injectFaults);
+    // The exact bootstrap and lifecycle preparation share this Store lock. If
+    // the durable bootstrap boundary crashes before this local lifecycle write,
+    // initialization scans the committed reservation and performs only this
+    // deterministic preparation; provider mutation is never replayed.
+    await this.ensureRegisteredWorkspaceLifecyclePreparedUnlocked(operation);
     return operation;
   }
 
@@ -9749,7 +10352,7 @@ export class HostStore {
       );
     }
     for (const operation of operations) {
-      if (operation.phase === "committed" || operation.rollback?.phase === "retired") continue;
+      if (operation.rollback?.phase === "retired") continue;
       try {
         if (operation.rollback) {
           await this.rollbackUnavailableWorkspaceThreadBootstrapOperationUnlocked(operation);
@@ -9807,7 +10410,38 @@ export class HostStore {
     if (transaction) await this.materializeResidentLifecycleRetirementUnlocked(transaction);
   }
 
-  private async retireOneResidentLifecycleTerminalGroupUnlocked(threadId?: string): Promise<boolean> {
+  private async retireOneRegisteredWorkspaceBootstrapTerminalGroupUnlocked(
+    bootstrapOperations: readonly WorkspaceThreadBootstrapOperationRecord[],
+  ): Promise<boolean> {
+    const candidates = bootstrapOperations
+      .filter(
+        (bootstrap) =>
+          bootstrap.phase === "committed" &&
+          bootstrap.registeredWorkspaceReservationRelease === undefined &&
+          bootstrap.input.registeredWorkspaceReservation !== undefined,
+      )
+      .sort((left, right) =>
+        (left.committedAt ?? left.updatedAt).localeCompare(right.committedAt ?? right.updatedAt) ||
+        left.operationId.localeCompare(right.operationId),
+      );
+    for (const bootstrap of candidates) {
+      const lifecycleOperationId =
+        bootstrap.input.registeredWorkspaceReservation?.lifecycleOperationId;
+      if (!lifecycleOperationId) continue;
+      if (await this.retireOneResidentLifecycleTerminalGroupUnlocked(
+        bootstrap.input.thread.threadId,
+        lifecycleOperationId,
+      )) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async retireOneResidentLifecycleTerminalGroupUnlocked(
+    threadId?: string,
+    requiredProvisionOperationId?: string,
+  ): Promise<boolean> {
     await this.recoverResidentLifecycleRetirementUnlocked();
     const [operations, bindingRecords] = await Promise.all([
       this.readResidentLifecycleOperationsUnlocked(),
@@ -9834,7 +10468,22 @@ export class HostStore {
         (left.terminalAt ?? left.updatedAt).localeCompare(right.terminalAt ?? right.updatedAt) ||
         left.operationId.localeCompare(right.operationId),
       );
-    const terminal = terminalCandidates[0];
+    const terminal = requiredProvisionOperationId === undefined
+      ? terminalCandidates[0]
+      : terminalCandidates.find((candidate) => {
+          if (candidate.kind === "provision") {
+            return candidate.operationId === requiredProvisionOperationId;
+          }
+          if (!candidate.binding) return false;
+          return operations.some(
+            (operation) =>
+              operation.operationId === requiredProvisionOperationId &&
+              operation.kind === "provision" &&
+              operation.phase === "committed" &&
+              operation.binding !== undefined &&
+              isDeepStrictEqual(operation.binding, candidate.binding),
+          );
+        });
     if (!terminal) return false;
 
     const bindingRecord = terminal.binding
@@ -9952,6 +10601,147 @@ export class HostStore {
     }
   }
 
+  private async materializeRegisteredWorkspaceReservationReleasesUnlocked(
+    transaction: ResidentLifecycleRetirementTransaction,
+  ): Promise<string[]> {
+    const bootstraps = await this.readWorkspaceThreadBootstrapOperationsUnlocked();
+    const releasedBootstrapOperationIds: string[] = [];
+    const releasableOperations = this.registeredWorkspaceReleasableLifecycleOperations(transaction);
+    for (const operation of releasableOperations) {
+      const matches = bootstraps.filter(
+        (bootstrap) =>
+          bootstrap.phase === "committed" &&
+          bootstrap.input.registeredWorkspaceReservation?.lifecycleOperationId === operation.operationId,
+      );
+      if (matches.length > 1) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "One retiring lifecycle operation is claimed by multiple registered workspace reservations",
+        );
+      }
+      const bootstrap = matches[0];
+      if (!bootstrap) continue;
+      const release = this.registeredWorkspaceReservationReleaseForRetirement(
+        bootstrap,
+        operation,
+        transaction,
+      );
+      if (bootstrap.registeredWorkspaceReservationRelease) {
+        if (!isDeepStrictEqual(bootstrap.registeredWorkspaceReservationRelease, release)) {
+          throw new HostStoreError(
+            "RESIDENT_LIFECYCLE_STATE_INVALID",
+            "Registered workspace reservation was released by a different retirement transaction",
+          );
+        }
+      } else {
+        await this.writeWorkspaceThreadBootstrapOperationUnlocked(
+          WorkspaceThreadBootstrapOperationRecordSchema.parse({
+            ...bootstrap,
+            registeredWorkspaceReservationRelease: release,
+          }),
+        );
+      }
+      releasedBootstrapOperationIds.push(bootstrap.operationId);
+    }
+    return releasedBootstrapOperationIds;
+  }
+
+  private registeredWorkspaceReleasableLifecycleOperations(
+    transaction: ResidentLifecycleRetirementTransaction,
+  ): ResidentLifecycleOperationRecord[] {
+    const retirementBinding = transaction.bindingRecord?.binding;
+    return retirementBinding
+      ? transaction.operations.filter(
+          (operation) =>
+            operation.kind === "provision" &&
+            operation.phase === "committed" &&
+            operation.binding !== undefined &&
+            isDeepStrictEqual(operation.binding, retirementBinding) &&
+            operation.authority.threadId === retirementBinding.threadId &&
+            operation.authority.executionGenerationId ===
+              retirementBinding.executionGenerationId &&
+            sameCanonicalPath(
+              operation.authority.workspaceDirectory,
+              retirementBinding.workspaceDirectory,
+            ),
+        )
+      : transaction.operations.filter(
+          (operation) =>
+            operation.kind === "provision" &&
+            operation.phase === "completed" &&
+            operation.binding === undefined,
+        );
+  }
+
+  private registeredWorkspaceReservationReleaseForRetirement(
+    bootstrap: WorkspaceThreadBootstrapOperationRecord,
+    operation: ResidentLifecycleOperationRecord,
+    transaction: ResidentLifecycleRetirementTransaction,
+  ): RegisteredWorkspaceReservationRelease {
+    const reservation = bootstrap.input.registeredWorkspaceReservation;
+    if (
+      !reservation ||
+      operation.kind !== "provision" ||
+      operation.operationId !== reservation.lifecycleOperationId ||
+      operation.input.expectedHostId !== bootstrap.input.expectedHostId ||
+      operation.input.projectId !== bootstrap.input.project.projectId ||
+      operation.input.workspaceId !== bootstrap.input.project.workspaceId ||
+      operation.input.threadId !== bootstrap.input.thread.threadId ||
+      operation.input.executionGenerationId !== bootstrap.input.thread.currentLocation.executionGenerationId ||
+      operation.input.requestDigest !== reservation.lifecycleRequestDigest ||
+      operation.authority.hostId !== bootstrap.authority.hostId ||
+      operation.authority.projectId !== bootstrap.authority.projectId ||
+      operation.authority.workspaceId !== bootstrap.authority.workspaceId ||
+      operation.authority.threadId !== bootstrap.authority.threadId ||
+      operation.authority.executionGenerationId !== bootstrap.authority.executionGenerationId ||
+      !sameCanonicalPath(operation.authority.workspaceDirectory, bootstrap.authority.workspaceDirectory)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_STATE_INVALID",
+        "Registered workspace release does not match its exact retiring lifecycle authority",
+      );
+    }
+    return RegisteredWorkspaceReservationReleaseSchema.parse({
+      retirementTransactionId: transaction.transactionId,
+      releasedAt: transaction.preparedAt,
+    });
+  }
+
+  private async compactRegisteredWorkspaceReservationReleasesUnlocked(
+    transaction: ResidentLifecycleRetirementTransaction,
+    releasedBootstrapOperationIds: readonly string[],
+  ): Promise<void> {
+    const releasableOperations = this.registeredWorkspaceReleasableLifecycleOperations(transaction);
+    for (const bootstrapOperationId of releasedBootstrapOperationIds) {
+      const bootstrap = await this.readWorkspaceThreadBootstrapOperationUnlocked(bootstrapOperationId);
+      if (!bootstrap) continue;
+      const reservation = bootstrap.input.registeredWorkspaceReservation;
+      const operation = reservation
+        ? releasableOperations.find(
+            (candidate) => candidate.operationId === reservation.lifecycleOperationId,
+          )
+        : undefined;
+      if (!operation) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "Registered workspace bootstrap compaction lost its exact retiring lifecycle operation",
+        );
+      }
+      const release = this.registeredWorkspaceReservationReleaseForRetirement(
+        bootstrap,
+        operation,
+        transaction,
+      );
+      if (!isDeepStrictEqual(bootstrap.registeredWorkspaceReservationRelease, release)) {
+        throw new HostStoreError(
+          "RESIDENT_LIFECYCLE_STATE_INVALID",
+          "Registered workspace bootstrap compaction requires its exact durable release marker",
+        );
+      }
+      await durableRemoveFile(this.workspaceThreadBootstrapOperationPath(bootstrap.operationId));
+    }
+  }
+
   private async materializeResidentLifecycleRetirementUnlocked(
     transaction: ResidentLifecycleRetirementTransaction,
   ): Promise<void> {
@@ -10027,6 +10817,16 @@ export class HostStore {
       transaction.operations.at(-1)!.operationId,
     );
 
+    // Bloom membership is only a conservative reuse denial. Release of a
+    // saved-workspace reservation requires this exact transaction-bound marker
+    // and must be durable before its lifecycle operation can be deleted.
+    const releasedBootstrapOperationIds =
+      await this.materializeRegisteredWorkspaceReservationReleasesUnlocked(transaction);
+    await this.injectResidentLifecycleFault(
+      "after_retirement_reservation_release",
+      transaction.operations.at(-1)!.operationId,
+    );
+
     if (projectionLineage) {
       await durableRemoveFile(this.residentProjectionLineagePath(projectionLineage.authorityId));
     }
@@ -10050,6 +10850,21 @@ export class HostStore {
     }
     await this.injectResidentLifecycleFault(
       "after_retirement_operations",
+      transaction.operations.at(-1)!.operationId,
+    );
+    await this.injectResidentLifecycleFault(
+      "before_retirement_bootstrap_compaction",
+      transaction.operations.at(-1)!.operationId,
+    );
+    // The pending retirement transaction and its exact record-level release
+    // marker remain durable until lifecycle records are gone. Only then may the
+    // fully validated registered bootstrap reservation itself be compacted.
+    await this.compactRegisteredWorkspaceReservationReleasesUnlocked(
+      transaction,
+      releasedBootstrapOperationIds,
+    );
+    await this.injectResidentLifecycleFault(
+      "after_retirement_bootstrap_compaction",
       transaction.operations.at(-1)!.operationId,
     );
     await durableRemoveFile(this.paths.residentLifecycleRetirement);
@@ -12859,6 +13674,86 @@ function canonicalPathKey(value: string): string {
 
 function sameCanonicalPath(left: string, right: string): boolean {
   return canonicalPathKey(left) === canonicalPathKey(right);
+}
+
+function registeredWorkspaceProvisionRequestDigest(
+  input: RegisteredWorkspaceThreadBootstrapInput,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      version: 1,
+      operation: "resident.workspace.bootstrap.registered",
+      expectedHostId: input.expectedHostId,
+      operationId: input.operationId,
+      projectId: input.projectId,
+      workspaceId: input.workspaceId,
+      referenceThreadId: input.referenceThreadId,
+      referenceExecutionGenerationId: input.referenceExecutionGenerationId,
+      threadId: input.threadId,
+      executionGenerationId: input.executionGenerationId,
+      threadTitle: input.threadTitle,
+      createdAt: input.createdAt,
+      sessionName: input.sessionName ?? null,
+    }))
+    .digest("hex");
+}
+
+function initialRegisteredWorkspaceArtifacts(
+  input: RegisteredWorkspaceThreadBootstrapInput,
+  project: SavedProject,
+): Readonly<{
+  thread: ThreadSummary;
+  projection: ThreadProjectionSnapshot;
+}> {
+  const bootstrapLineage = createHash("sha256")
+    .update(JSON.stringify({
+      version: 1,
+      hostId: input.expectedHostId,
+      projectId: input.projectId,
+      workspaceId: input.workspaceId,
+      threadId: input.threadId,
+      executionGenerationId: input.executionGenerationId,
+    }))
+    .digest("hex")
+    .slice(0, 40);
+  const cursor = SessionCursorSchema.parse({
+    threadId: input.threadId,
+    executionGenerationId: input.executionGenerationId,
+    generation: `resident-bootstrap-${bootstrapLineage}`,
+    sequence: 0,
+  });
+  const thread = ThreadSummarySchema.parse({
+    threadId: input.threadId,
+    title: input.threadTitle,
+    projectIdentity: project.projectId,
+    currentLocation: {
+      hostId: input.expectedHostId,
+      projectId: project.projectId,
+      workspaceId: project.workspaceId,
+      executionGenerationId: input.executionGenerationId,
+    },
+    status: "idle",
+    unread: false,
+    updatedAt: input.createdAt,
+    lastKnownCursor: cursor,
+  });
+  const projection = ThreadProjectionSnapshotSchema.parse({
+    snapshotVersion: SNAPSHOT_VERSION,
+    generatedAt: input.createdAt,
+    thread,
+    transcriptBlockIndex: [],
+    materializedRecentBlocks: [],
+    queueState: { pendingCommandIds: [], paused: false },
+    approvals: [],
+    childAgents: [],
+    goals: [],
+    schedules: [],
+    git: { stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
+    evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
+    pendingAttention: [],
+    latestCursor: cursor,
+  });
+  return Object.freeze({ thread, projection });
 }
 
 function workspaceAuthorityMatchesScope(

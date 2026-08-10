@@ -47,6 +47,8 @@ import {
   createRendererApi,
   isDefinitiveCandidateEvaluationStartError,
   isStaleHostAuthorityError,
+  registeredWorkspaceProvisionHoldsAuthority,
+  residentProvisionMayHaveDurableOperation,
   type ComposerReceiptState,
   type ConnectionState,
   type DiscoveredComputer,
@@ -60,6 +62,7 @@ import {
   type ResidentEndPreparation,
   type ResidentLifecycleOperationSummary,
   type ResidentWorkspaceSelection,
+  type ResidentWorkspaceSelectionInput,
   type RuntimeModelCatalog,
   type RuntimeOAuthProgress,
   type RuntimeOAuthRequest,
@@ -80,7 +83,7 @@ import type {
 } from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
-import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
@@ -101,9 +104,15 @@ type HostActivationView = {
 }
 type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
 type ResidentLifecycleRecoveryReference = {
+  kind: 'provision'
   operationId: string
   expectedHostId: string
   suggestedName: string
+  workspaceKind?: 'local_path' | 'registered_workspace'
+  projectId?: string
+  workspaceId?: string
+  referenceThreadId?: string
+  referenceExecutionGenerationId?: string
   threadId?: string
   executionGenerationId?: string
   status?: ResidentLifecycleStatusResult
@@ -138,6 +147,224 @@ const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
 
 function cx(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
+}
+
+function residentLifecycleHostIsCheckable(host: HostSummary | undefined): boolean {
+  if (!host || host.connection !== 'online' || host.activationRequired) return false
+  return (host.kind === 'local' && host.connectionPath === 'Local socket') ||
+    (host.kind === 'ssh' && host.connectionPath === 'SSH')
+}
+
+function operationUsesRegisteredWorkspace(operation: ResidentLifecycleOperationSummary): boolean {
+  return operation.kind === 'provision' && operation.provisionMode === 'registered_workspace'
+}
+
+function registeredWorkspaceRecoveryDonorIsSelected(
+  source: ResidentLifecycleOperationSummary | ResidentLifecycleRecoveryReference,
+  snapshot: WorkbenchSnapshot,
+  selectedThread: ThreadSummary | undefined,
+  selectedHost: HostSummary | undefined,
+): boolean {
+  const operation = 'state' in source ? source : undefined
+  const recoveryReference = 'state' in source ? undefined : source
+  const registeredWorkspace = operation
+    ? operationUsesRegisteredWorkspace(operation)
+    : recoveryReference?.workspaceKind === 'registered_workspace'
+  if (!registeredWorkspace) return true
+
+  const projectId = source.projectId
+  const workspaceId = source.workspaceId
+  const referenceThreadId = operation?.kind === 'provision'
+    ? operation.referenceThreadId
+    : recoveryReference?.referenceThreadId
+  const referenceExecutionGenerationId = operation?.kind === 'provision'
+    ? operation.referenceExecutionGenerationId
+    : recoveryReference?.referenceExecutionGenerationId
+  const project = projectId
+    ? snapshot.projects.find((candidate) => candidate.id === projectId)
+    : undefined
+  return Boolean(
+    projectId &&
+    workspaceId &&
+    referenceThreadId &&
+    referenceExecutionGenerationId &&
+    selectedHost?.kind === 'ssh' &&
+    selectedHost.id === source.expectedHostId &&
+    selectedThread &&
+    snapshot.selectedProjectId === projectId &&
+    snapshot.selectedThreadId === selectedThread.id &&
+    selectedThread.hostId === source.expectedHostId &&
+    selectedThread.projectId === projectId &&
+    selectedThread.workspaceId === workspaceId &&
+    (selectedThread.remoteId ?? selectedThread.id) === referenceThreadId &&
+    selectedThread.executionGenerationId === referenceExecutionGenerationId &&
+    project?.hostIds.includes(source.expectedHostId),
+  )
+}
+
+function residentEndRecoveryIsSelected(
+  operation: ResidentLifecycleOperationSummary,
+  snapshot: WorkbenchSnapshot,
+  selectedThread: ThreadSummary | undefined,
+  selectedHost: HostSummary | undefined,
+): boolean {
+  if (operation.kind !== 'end') return false
+  const project = snapshot.projects.find((candidate) => candidate.id === operation.projectId)
+  return Boolean(
+    selectedHost &&
+    selectedHost.id === operation.expectedHostId &&
+    selectedThread &&
+    snapshot.selectedProjectId === operation.projectId &&
+    snapshot.selectedThreadId === selectedThread.id &&
+    selectedThread.hostId === operation.expectedHostId &&
+    selectedThread.projectId === operation.projectId &&
+    selectedThread.workspaceId === operation.workspaceId &&
+    (selectedThread.remoteId ?? selectedThread.id) === operation.threadId &&
+    selectedThread.executionGenerationId === operation.executionGenerationId &&
+    project?.hostIds.includes(operation.expectedHostId),
+  )
+}
+
+type RegisteredWorkspaceCreateBlock = 'active_resident' | 'setup_recovery'
+type ResidentLifecycleMutationBlock =
+  | RegisteredWorkspaceCreateBlock
+  | 'capability_unavailable'
+  | 'donor_not_selected'
+  | 'target_not_selected'
+
+function selectedRegisteredWorkspaceCreateBlock(
+  snapshot: WorkbenchSnapshot | null,
+  selectedThread: ThreadSummary | undefined,
+  selectedHost: HostSummary | undefined,
+  exemptOperationId?: string,
+  fallbackReference?: ResidentLifecycleRecoveryReference | null,
+): RegisteredWorkspaceCreateBlock | null {
+  if (
+    !snapshot ||
+    selectedHost?.kind !== 'ssh' ||
+    !selectedThread ||
+    snapshot.selectedThreadId !== selectedThread.id ||
+    !selectedThread.workspaceId ||
+    !selectedThread.executionGenerationId
+  ) return null
+
+  if (
+    snapshot.runtime.session?.residency === 'resident' &&
+    selectedThread.residentLifecycle?.state !== 'ended'
+  ) return 'active_resident'
+
+  const holdingOperations = snapshot.residentLifecycleOperations.filter((operation) =>
+    operation.operationId !== exemptOperationId &&
+    operation.expectedHostId === selectedHost.id &&
+    operation.projectId === selectedThread.projectId &&
+    operation.workspaceId === selectedThread.workspaceId &&
+    registeredWorkspaceProvisionHoldsAuthority(
+      operation,
+      snapshot.residentLifecycleOperations,
+      snapshot.threads,
+    ),
+  )
+  if (holdingOperations.some((operation) =>
+    operation.lastStatus?.phase === 'promoted_observed' ||
+    operation.lastStatus?.phase === 'projection_committed' ||
+    operation.lastStatus?.phase === 'committed'
+  )) {
+    return 'active_resident'
+  }
+  if (holdingOperations.length > 0) return 'setup_recovery'
+
+  const fallbackTargetsWorkspace = Boolean(
+    fallbackReference &&
+    fallbackReference.operationId !== exemptOperationId &&
+    fallbackReference.workspaceKind === 'registered_workspace' &&
+    fallbackReference.expectedHostId === selectedHost.id &&
+    fallbackReference.projectId === selectedThread.projectId &&
+    fallbackReference.workspaceId === selectedThread.workspaceId,
+  )
+  if (!fallbackTargetsWorkspace || !fallbackReference) return null
+  if (fallbackReference.status?.kind === 'provision' && fallbackReference.status.phase === 'completed') {
+    return null
+  }
+  return fallbackReference.status?.kind === 'provision' && (
+    fallbackReference.status.phase === 'promoted_observed' ||
+    fallbackReference.status.phase === 'projection_committed' ||
+    fallbackReference.status.phase === 'committed'
+  )
+    ? 'active_resident'
+    : 'setup_recovery'
+}
+
+function residentLifecycleMutationBlock(
+  operation: ResidentLifecycleOperationSummary,
+  snapshot: WorkbenchSnapshot,
+  selectedThread: ThreadSummary | undefined,
+  selectedHost: HostSummary | undefined,
+  fallbackReference?: ResidentLifecycleRecoveryReference | null,
+): ResidentLifecycleMutationBlock | null {
+  if (operation.kind === 'end') {
+    if (!residentEndRecoveryIsSelected(operation, snapshot, selectedThread, selectedHost)) {
+      return 'target_not_selected'
+    }
+    return snapshot.operations.endResident === true ? null : 'capability_unavailable'
+  }
+
+  if (operationUsesRegisteredWorkspace(operation)) {
+    if (!registeredWorkspaceRecoveryDonorIsSelected(operation, snapshot, selectedThread, selectedHost)) {
+      return 'donor_not_selected'
+    }
+    const workspaceBlock = selectedRegisteredWorkspaceCreateBlock(
+      snapshot,
+      selectedThread,
+      selectedHost,
+      operation.operationId,
+      fallbackReference,
+    )
+    if (workspaceBlock) return workspaceBlock
+  }
+  return snapshot.operations.provisionResident === true ? null : 'capability_unavailable'
+}
+
+function residentLifecycleFallbackMutationBlock(
+  reference: ResidentLifecycleRecoveryReference,
+  snapshot: WorkbenchSnapshot,
+  selectedThread: ThreadSummary | undefined,
+  selectedHost: HostSummary | undefined,
+): ResidentLifecycleMutationBlock | null {
+  if (reference.workspaceKind === 'registered_workspace') {
+    if (!registeredWorkspaceRecoveryDonorIsSelected(reference, snapshot, selectedThread, selectedHost)) {
+      return 'donor_not_selected'
+    }
+    const workspaceBlock = selectedRegisteredWorkspaceCreateBlock(
+      snapshot,
+      selectedThread,
+      selectedHost,
+      reference.operationId,
+      reference,
+    )
+    if (workspaceBlock) return workspaceBlock
+  }
+  return snapshot.operations.provisionResident === true ? null : 'capability_unavailable'
+}
+
+function residentLifecycleMutationBlockedDetail(
+  block: ResidentLifecycleMutationBlock,
+  operationKind: 'provision' | 'end',
+): string {
+  if (block === 'donor_not_selected') {
+    return 'Open the saved workspace and its original source thread to continue. You can still check the exact setup status here.'
+  }
+  if (block === 'active_resident') {
+    return 'Another resident session owns this workspace. Open or select the resident thread, then choose End resident session in Runtime. You can still check this exact status here.'
+  }
+  if (block === 'setup_recovery') {
+    return 'Another resident setup holds this workspace. Continue or inspect that setup before resuming this one. You can still check this exact status here.'
+  }
+  if (block === 'target_not_selected') {
+    return 'Open or select the resident thread, then choose End resident session in Runtime. You can still check this exact end status here.'
+  }
+  return operationKind === 'end'
+    ? 'Resident end control is unavailable for this verified host. You can still check the exact end status here.'
+    : 'Resident lifecycle control is unavailable for this verified host. You can still check the exact setup status here.'
 }
 
 function AttentionDiagnostic({ item }: { item: WorkbenchSnapshot['attention'][number] }) {
@@ -278,26 +505,8 @@ function actionableResidentLifecycleOperations(
   })
 }
 
-const RESIDENT_PROVISION_ERRORS_WITHOUT_DURABLE_OPERATION = new Set([
-  'resident.lifecycle_authority_changed',
-  'resident.lifecycle_local_required',
-  'resident.lifecycle_unavailable',
-  'resident.workspace_selection_expired',
-  'resident.workspace_selection_superseded',
-  'resident.workspace_selection_authority_changed',
-  'resident.workspace_selection_completed',
-  'resident.workspace_selection_unknown',
-  'resident.provision_label_invalid',
-  'resident.provision_metadata_missing',
-])
-
-function residentProvisionMayNeedRecovery(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code
-  return typeof code !== 'string' || !RESIDENT_PROVISION_ERRORS_WITHOUT_DURABLE_OPERATION.has(code)
-}
-
 function residentLifecycleAnnouncement(status: ResidentLifecycleStatusResult | null): string {
-  if (!status) return 'No durable setup was found. You can start a new resident thread.'
+  if (!status) return 'No durable setup record was returned. Prime Continuim will not retry it; check this host again before starting another resident thread.'
   if (status.kind === 'end') {
     if (status.phase === 'completed') return 'Resident session ended. The saved thread and workspace remain available.'
     if (status.phase === 'quarantined') {
@@ -788,7 +997,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [addComputerOpen, setAddComputerOpen] = useState(false)
   const [residentWorkspaceSelection, setResidentWorkspaceSelection] = useState<ResidentWorkspaceSelection | null>(null)
-  const [residentProvisionOrigin, setResidentProvisionOrigin] = useState<'empty' | 'workbench' | null>(null)
+  const [residentProvisionOrigin, setResidentProvisionOrigin] = useState<'empty' | 'workbench' | 'recovery' | null>(null)
   const [residentWorkspacePicking, setResidentWorkspacePicking] = useState(false)
   const [residentStatusChecking, setResidentStatusChecking] = useState(false)
   const [residentWorkspaceError, setResidentWorkspaceError] = useState('')
@@ -1031,7 +1240,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     selectedHost?.kind === 'ssh' &&
     (selectedHost.connection === 'offline' || selectedHost.activationRequired === true),
   )
-  const activeLocalHostId = snapshot?.hosts.find((host) => host.kind === 'local' && host.connection === 'online')?.id
+  const activeResidentLifecycleHost = residentLifecycleHostIsCheckable(selectedHost)
+    ? selectedHost
+    : snapshot?.hosts.find((host) => host.kind === 'local' && residentLifecycleHostIsCheckable(host))
+  const activeResidentLifecycleHostId = activeResidentLifecycleHost?.id
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
   const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
@@ -1070,6 +1282,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   )
   const canManageComputers = api.environment === 'native'
   const canProvisionResident = snapshot?.operations.provisionResident ?? false
+  const registeredWorkspaceCreateBlock = selectedRegisteredWorkspaceCreateBlock(
+    snapshot ?? null,
+    selectedThread,
+    selectedHost,
+    undefined,
+    residentRecoveryReference,
+  )
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
     : []
@@ -1082,10 +1301,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       )
     : undefined
   const canEndResident = Boolean(
-    canProvisionResident &&
+    snapshot?.operations.endResident === true &&
     selectedThreadIsMaterialized &&
-    selectedHost?.kind === 'local' &&
-    selectedHost.connection === 'online' &&
+    residentLifecycleHostIsCheckable(selectedHost) &&
     selectedRuntime.session?.residency === 'resident' &&
     selectedThread?.workspaceId &&
     selectedThread.executionGenerationId &&
@@ -1162,32 +1380,67 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   }, [residentRecoveryReference, snapshot])
 
   useEffect(() => {
-    if (residentWorkspaceSelection && residentWorkspaceSelection.expectedHostId !== activeLocalHostId) {
+    const registeredWorkspaceSelectionBlock = residentWorkspaceSelection
+      ? selectedRegisteredWorkspaceCreateBlock(
+          snapshot ?? null,
+          selectedThread,
+          selectedHost,
+          residentWorkspaceSelection.operationId,
+          residentRecoveryReference,
+        )
+      : registeredWorkspaceCreateBlock
+    const registeredWorkspaceChanged = Boolean(
+      residentWorkspaceSelection?.kind === 'registered_workspace' &&
+      (
+        selectedHost?.id !== residentWorkspaceSelection.expectedHostId ||
+        selectedHost.kind !== 'ssh' ||
+        !selectedThread ||
+        snapshot?.selectedThreadId !== selectedThread.id ||
+        selectedThread.projectId !== residentWorkspaceSelection.projectId ||
+        selectedThread.workspaceId !== residentWorkspaceSelection.workspaceId ||
+        (selectedThread.remoteId ?? selectedThread.id) !== residentWorkspaceSelection.referenceThreadId ||
+        selectedThread.executionGenerationId !== residentWorkspaceSelection.referenceExecutionGenerationId ||
+        registeredWorkspaceSelectionBlock
+      ),
+    )
+    if (
+      residentWorkspaceSelection &&
+      (residentWorkspaceSelection.expectedHostId !== activeResidentLifecycleHostId || registeredWorkspaceChanged)
+    ) {
       setResidentWorkspaceSelection(null)
       setResidentProvisionOrigin(null)
     }
     if (
-      activeLocalHostId &&
-      residentRecoveryReference &&
-      residentRecoveryReference.expectedHostId !== activeLocalHostId
-    ) {
-      setResidentRecoveryReference(null)
-    }
-    if (
-      activeLocalHostId &&
+      activeResidentLifecycleHostId &&
       residentThreadFocusTarget &&
-      residentThreadFocusTarget.expectedHostId !== activeLocalHostId
+      residentThreadFocusTarget.expectedHostId !== activeResidentLifecycleHostId
     ) {
       setResidentThreadFocusTarget(null)
     }
     if (
-      activeLocalHostId &&
+      activeResidentLifecycleHostId &&
       residentEndContext &&
-      residentEndContext.preparation.expectedHostId !== activeLocalHostId
+      (
+        residentEndContext.preparation.expectedHostId !== activeResidentLifecycleHostId ||
+        !selectedThread ||
+        (selectedThread.remoteId ?? selectedThread.id) !== residentEndContext.preparation.threadId ||
+        selectedThread.executionGenerationId !== residentEndContext.preparation.executionGenerationId
+      )
     ) {
       setResidentEndContext(null)
     }
-  }, [activeLocalHostId, residentEndContext, residentRecoveryReference, residentThreadFocusTarget, residentWorkspaceSelection])
+  }, [
+    activeResidentLifecycleHostId,
+    residentEndContext,
+    residentRecoveryReference,
+    residentThreadFocusTarget,
+    residentProvisionOrigin,
+    residentWorkspaceSelection,
+    registeredWorkspaceCreateBlock,
+    selectedHost,
+    selectedThread,
+    snapshot,
+  ])
 
   useEffect(() => {
     if (!snapshot || !residentThreadFocusTarget) return
@@ -1597,22 +1850,87 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const chooseResidentWorkspace = async (
     trigger: HTMLElement,
     resumeOperationId?: string,
+    recoverySource?: ResidentLifecycleOperationSummary | ResidentLifecycleRecoveryReference,
   ) => {
+    const recoveryOperation = recoverySource && 'state' in recoverySource
+      ? recoverySource.kind === 'provision' ? recoverySource : undefined
+      : undefined
+    const recoveryReference = recoverySource && !('state' in recoverySource)
+      ? recoverySource
+      : undefined
+    const workspaceKind = recoveryOperation?.provisionMode ?? recoveryReference?.workspaceKind ??
+      (selectedHost?.kind === 'ssh' ? 'registered_workspace' : 'local_path')
+    let selectionInput: ResidentWorkspaceSelectionInput | undefined
+    if (workspaceKind === 'registered_workspace') {
+      const conflictingAuthority = selectedRegisteredWorkspaceCreateBlock(
+        snapshot ?? null,
+        selectedThread,
+        selectedHost,
+        resumeOperationId,
+        residentRecoveryReference,
+      )
+      if (conflictingAuthority) {
+        setResidentWorkspaceError(conflictingAuthority === 'active_resident'
+          ? 'Open or select the resident thread that owns this workspace, then choose End resident session in Runtime before creating another thread.'
+          : 'Continue or inspect the earlier resident setup for this workspace before starting another thread.')
+        window.requestAnimationFrame(() => trigger.focus())
+        return
+      }
+      const projectId = recoveryOperation?.projectId ?? recoveryReference?.projectId ?? selectedProject?.id
+      const workspaceId = recoveryOperation?.workspaceId ?? recoveryReference?.workspaceId ?? selectedThread?.workspaceId
+      const referenceThreadId = recoveryOperation?.referenceThreadId ??
+        recoveryReference?.referenceThreadId ??
+        (selectedThread ? selectedThread.remoteId ?? selectedThread.id : undefined)
+      const referenceExecutionGenerationId = recoveryOperation?.referenceExecutionGenerationId ??
+        recoveryReference?.referenceExecutionGenerationId ??
+        selectedThread?.executionGenerationId
+      const exactReferenceIsMaterialized = Boolean(
+        projectId &&
+        workspaceId &&
+        referenceThreadId &&
+        referenceExecutionGenerationId &&
+        selectedHost?.kind === 'ssh' &&
+        residentLifecycleHostIsCheckable(selectedHost) &&
+        selectedThread &&
+        snapshot?.selectedThreadId === selectedThread.id &&
+        selectedThread.projectId === projectId &&
+        selectedThread.workspaceId === workspaceId &&
+        (selectedThread.remoteId ?? selectedThread.id) === referenceThreadId &&
+        selectedThread.executionGenerationId === referenceExecutionGenerationId,
+      )
+      if (!exactReferenceIsMaterialized) {
+        setResidentWorkspaceError('Refresh this exact saved workspace before starting or recovering its resident thread.')
+        window.requestAnimationFrame(() => trigger.focus())
+        return
+      }
+      selectionInput = {
+        kind: 'registered_workspace',
+        projectId: projectId!,
+        workspaceId: workspaceId!,
+        referenceThreadId: referenceThreadId!,
+        referenceExecutionGenerationId: referenceExecutionGenerationId!,
+        ...(resumeOperationId ? { resumeOperationId } : {}),
+      }
+    } else if (resumeOperationId) {
+      selectionInput = { resumeOperationId }
+    }
     residentProvisionReturnTargetRef.current = trigger
-    setResidentProvisionOrigin(!selectedThread || !selectedProject || !selectedHost ? 'empty' : 'workbench')
+    setResidentProvisionOrigin(resumeOperationId
+      ? 'recovery'
+      : !selectedThread || !selectedProject || !selectedHost ? 'empty' : 'workbench')
     setResidentWorkspaceError('')
     setResidentWorkspacePicking(true)
     try {
-      const selection = await api.selectResidentWorkspace(
-        resumeOperationId ? { resumeOperationId } : undefined,
-      )
+      const selection = await api.selectResidentWorkspace(selectionInput)
       setResidentWorkspaceSelection(selection)
     } catch (error) {
       setResidentProvisionOrigin(null)
       if ((error as { code?: string })?.code !== 'resident.workspace_selection_cancelled') {
         setResidentWorkspaceError(error instanceof Error
           ? error.message
-          : 'The workspace picker could not be opened.')
+          : workspaceKind === 'registered_workspace'
+            ? 'The saved workspace could not be prepared.'
+            : 'The workspace picker could not be opened.')
       }
       window.requestAnimationFrame(() => trigger.focus())
     } finally {
@@ -1768,20 +2086,30 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       })
       setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
       if (!status) {
+        setResidentRecoveryReference((current) => {
+          if (
+            current?.operationId !== reference.operationId ||
+            current.expectedHostId !== reference.expectedHostId
+          ) return current
+          const { status: _staleStatus, ...preservedReference } = current
+          return preservedReference
+        })
+      } else {
+        if (status.kind !== 'provision') {
+          throw new Error('The durable setup lookup returned a different resident lifecycle operation.')
+        }
         setResidentRecoveryReference((current) =>
           current?.operationId === reference.operationId && current.expectedHostId === reference.expectedHostId
-            ? null
+            ? {
+                ...current,
+                operationId: status.operationId,
+                expectedHostId: status.expectedHostId,
+                threadId: status.threadId,
+                executionGenerationId: status.executionGenerationId,
+                status,
+              }
             : current,
         )
-      } else {
-        setResidentRecoveryReference({
-          operationId: status.operationId,
-          expectedHostId: status.expectedHostId,
-          suggestedName: reference.suggestedName,
-          threadId: status.threadId,
-          executionGenerationId: status.executionGenerationId,
-          status,
-        })
         if (status.phase === 'committed') {
           setResidentThreadFocusTarget({
             expectedHostId: status.expectedHostId,
@@ -2061,26 +2389,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           {residentRecoveryReference && (
             <ResidentLifecycleFallbackCard
               reference={residentRecoveryReference}
-              capable={canProvisionResident}
-              checkable={snapshot.hosts.some((host) =>
-                host.id === residentRecoveryReference.expectedHostId && host.kind === 'local' && host.connection === 'online',
+              mutationBlock={residentLifecycleFallbackMutationBlock(
+                residentRecoveryReference,
+                snapshot,
+                selectedThread,
+                selectedHost,
               )}
+              checkable={residentLifecycleHostIsCheckable(snapshot.hosts.find((host) =>
+                host.id === residentRecoveryReference.expectedHostId,
+              ))}
               busy={residentWorkspacePicking || residentStatusChecking}
-              onChoose={(event) => void chooseResidentWorkspace(event.currentTarget, residentRecoveryReference.operationId)}
+              onChoose={(event) => void chooseResidentWorkspace(
+                event.currentTarget,
+                residentRecoveryReference.operationId,
+                residentRecoveryReference,
+              )}
               onCheck={() => void checkResidentRecoveryReference(residentRecoveryReference)}
             />
           )}
           {lifecycleOperations.length > 0 && (
             <ResidentLifecycleRecoveryList
               operations={lifecycleOperations}
-              capable={canProvisionResident}
-              isCheckable={(operation) => snapshot.hosts.some((host) =>
-                host.id === operation.expectedHostId && host.kind === 'local' && host.connection === 'online',
+              mutationBlock={(operation) => residentLifecycleMutationBlock(
+                operation,
+                snapshot,
+                selectedThread,
+                selectedHost,
+                residentRecoveryReference,
               )}
+              isCheckable={(operation) => residentLifecycleHostIsCheckable(snapshot.hosts.find((host) =>
+                host.id === operation.expectedHostId,
+              ))}
               busy={residentWorkspacePicking || residentStatusChecking}
               onChoose={(operation, event) => void (operation.kind === 'end'
                 ? reviewResidentEnd(event.currentTarget, operation)
-                : chooseResidentWorkspace(event.currentTarget, operation.operationId))}
+                : chooseResidentWorkspace(event.currentTarget, operation.operationId, operation))}
               onCheck={(operation) => void checkResidentLifecycle(operation)}
             />
           )}
@@ -2434,13 +2777,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           closeSidebar()
           if (returnTarget) void (operation.kind === 'end'
             ? reviewResidentEnd(returnTarget, operation)
-            : chooseResidentWorkspace(returnTarget, operation.operationId))
+            : chooseResidentWorkspace(returnTarget, operation.operationId, operation))
         }}
         onCheckResident={(operation) => void checkResidentLifecycle(operation)}
         onRecoverResidentReference={(reference, trigger) => {
           const returnTarget = sidebarIsOverlay ? sidebarToggleRef.current : trigger
           closeSidebar()
-          if (returnTarget) void chooseResidentWorkspace(returnTarget, reference.operationId)
+          if (returnTarget) void chooseResidentWorkspace(returnTarget, reference.operationId, reference)
         }}
         onCheckResidentReference={(reference) => void checkResidentRecoveryReference(reference)}
         onOpenModels={(trigger) => {
@@ -2453,6 +2796,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         canLoadModelCatalog={canLoadModelCatalog}
         canManageComputers={canManageComputers}
         canProvisionResident={canProvisionResident}
+        registeredWorkspaceCreateBlock={registeredWorkspaceCreateBlock}
         residentLifecycleOperations={residentLifecycleOperations}
         residentRecoveryReference={residentRecoveryReference}
         residentLifecycleBusy={residentWorkspacePicking || residentStatusChecking}
@@ -2700,6 +3044,7 @@ interface SidebarProps {
   canLoadModelCatalog: boolean
   canManageComputers: boolean
   canProvisionResident: boolean
+  registeredWorkspaceCreateBlock: RegisteredWorkspaceCreateBlock | null
   residentLifecycleOperations: ResidentLifecycleOperationSummary[]
   residentRecoveryReference: ResidentLifecycleRecoveryReference | null
   residentLifecycleBusy: boolean
@@ -2730,6 +3075,7 @@ function Sidebar({
   canLoadModelCatalog,
   canManageComputers,
   canProvisionResident,
+  registeredWorkspaceCreateBlock,
   residentLifecycleOperations,
   residentRecoveryReference,
   residentLifecycleBusy,
@@ -2762,7 +3108,32 @@ function Sidebar({
             <Icon icon={X} size={17} />
           </button>
         </div>
-        {canProvisionResident && (
+        {selectedHost?.kind === 'ssh' && registeredWorkspaceCreateBlock ? (
+          <div className="sidebar__registered-resident">
+            <small>
+              {registeredWorkspaceCreateBlock === 'active_resident'
+                ? 'A resident session already owns this workspace. Open or select that resident thread, then choose End resident session in Runtime before creating another.'
+                : 'An earlier resident setup still holds this workspace. Continue or inspect that setup below before starting another thread.'}
+            </small>
+          </div>
+        ) : canProvisionResident && (selectedHost?.kind === 'ssh' ? (
+          <div className="sidebar__registered-resident">
+            <button
+              className="button button--primary button--full sidebar__create-resident"
+              type="button"
+              disabled={residentLifecycleBusy}
+              aria-busy={residentLifecycleBusy}
+              aria-describedby="registered-resident-action-description"
+              onClick={(event) => onProvisionResident(event.currentTarget)}
+            >
+              <Icon icon={residentLifecycleBusy ? Loader2 : FolderGit2} size={16} />
+              {residentLifecycleBusy ? 'Preparing…' : 'New resident thread in this workspace'}
+            </button>
+            <small id="registered-resident-action-description">
+              Uses this saved host-owned workspace. You’ll name only the new thread.
+            </small>
+          </div>
+        ) : (
           <button
             className="button button--primary button--full sidebar__create-resident"
             type="button"
@@ -2773,14 +3144,19 @@ function Sidebar({
             <Icon icon={residentLifecycleBusy ? Loader2 : FolderGit2} size={16} />
             {residentLifecycleBusy ? 'Working…' : 'New resident thread'}
           </button>
-        )}
+        ))}
         {residentRecoveryReference && (
           <ResidentLifecycleFallbackCard
             reference={residentRecoveryReference}
-            capable={canProvisionResident}
-            checkable={snapshot.hosts.some((host) =>
-              host.id === residentRecoveryReference.expectedHostId && host.kind === 'local' && host.connection === 'online',
+            mutationBlock={residentLifecycleFallbackMutationBlock(
+              residentRecoveryReference,
+              snapshot,
+              selectedThread,
+              selectedHost,
             )}
+            checkable={residentLifecycleHostIsCheckable(snapshot.hosts.find((host) =>
+              host.id === residentRecoveryReference.expectedHostId,
+            ))}
             busy={residentLifecycleBusy}
             onChoose={(event) => onRecoverResidentReference(residentRecoveryReference, event.currentTarget)}
             onCheck={() => onCheckResidentReference(residentRecoveryReference)}
@@ -2789,10 +3165,16 @@ function Sidebar({
         {residentLifecycleOperations.length > 0 && (
           <ResidentLifecycleRecoveryList
             operations={residentLifecycleOperations}
-            capable={canProvisionResident}
-            isCheckable={(operation) => snapshot.hosts.some((host) =>
-              host.id === operation.expectedHostId && host.kind === 'local' && host.connection === 'online',
+            mutationBlock={(operation) => residentLifecycleMutationBlock(
+              operation,
+              snapshot,
+              selectedThread,
+              selectedHost,
+              residentRecoveryReference,
             )}
+            isCheckable={(operation) => residentLifecycleHostIsCheckable(snapshot.hosts.find((host) =>
+              host.id === operation.expectedHostId,
+            ))}
             busy={residentLifecycleBusy}
             onChoose={(operation, event) => onRecoverResident(operation, event.currentTarget)}
             onCheck={onCheckResident}
@@ -2877,7 +3259,12 @@ function Sidebar({
             ) : (
               <li className="empty-list">
                 <span>No threads in this project</span>
-                <small>{canProvisionResident ? 'Choose New resident thread to add one.' : 'Reconnect the verified local host to add one.'}</small>
+                <small>{canProvisionResident
+                  ? selectedHost?.kind === 'ssh'
+                    ? 'Use New resident thread in this workspace to add one.'
+                    : 'Choose New resident thread to add one.'
+                  : `Reconnect the verified ${selectedHost?.kind === 'ssh' ? 'SSH' : 'local'} host to add one.`}
+                </small>
               </li>
             )}
           </ul>
@@ -5160,22 +5547,27 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
       actionLabel: 'Check status',
     }
   }
+  const registeredWorkspace = operationUsesRegisteredWorkspace(operation)
   if (operation.state === 'requires_reselection') {
     return {
       label: 'Workspace confirmation needed',
-      detail: 'Choose the same folder again so Prime Continuim can safely resume this exact setup.',
+      detail: registeredWorkspace
+        ? 'Use the same saved host-owned workspace so Prime Continuim can safely resume this exact setup.'
+        : 'Choose the same folder again so Prime Continuim can safely resume this exact setup.',
       tone: 'warning',
       action: 'choose',
-      actionLabel: 'Choose original folder',
+      actionLabel: registeredWorkspace ? 'Use saved workspace' : 'Choose original folder',
     }
   }
   if (status?.phase === 'completed' && status.completionReason === 'owned_create_failed_before_effect') {
     return {
       label: 'Resident setup did not start',
-      detail: 'Prime Agent did not create a session. Choose the same folder to try a new setup safely.',
+      detail: registeredWorkspace
+        ? 'Prime Agent did not create a session. Use this saved workspace to try a new setup safely.'
+        : 'Prime Agent did not create a session. Choose the same folder to try a new setup safely.',
       tone: 'warning',
       action: 'choose',
-      actionLabel: 'Choose folder and try again',
+      actionLabel: registeredWorkspace ? 'Use workspace and try again' : 'Choose folder and try again',
     }
   }
   if (status?.phase === 'completed' && status.completionReason === 'owned_create_cleaned') {
@@ -5184,7 +5576,7 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
       detail: 'Prime Agent removed the temporary session before resident setup completed. No resident session remains.',
       tone: 'warning',
       action: 'choose',
-      actionLabel: 'Choose folder and try again',
+      actionLabel: registeredWorkspace ? 'Use workspace and try again' : 'Choose folder and try again',
     }
   }
   if (
@@ -5193,10 +5585,12 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
   ) {
     return {
       label: 'Setup paused safely',
-      detail: 'Choose the original folder to continue this exact operation. Prime Continuim will not repeat a completed mutation.',
+      detail: registeredWorkspace
+        ? 'Continue in the saved host-owned workspace. Prime Continuim will not repeat a completed mutation.'
+        : 'Choose the original folder to continue this exact operation. Prime Continuim will not repeat a completed mutation.',
       tone: 'warning',
       action: 'choose',
-      actionLabel: 'Choose original folder',
+      actionLabel: registeredWorkspace ? 'Continue in saved workspace' : 'Choose original folder',
     }
   }
   if (status?.phase === 'quarantined') {
@@ -5238,14 +5632,14 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
 
 function ResidentLifecycleRecoveryList({
   operations,
-  capable,
+  mutationBlock,
   isCheckable,
   busy,
   onChoose,
   onCheck,
 }: {
   operations: ResidentLifecycleOperationSummary[]
-  capable: boolean
+  mutationBlock: (operation: ResidentLifecycleOperationSummary) => ResidentLifecycleMutationBlock | null
   isCheckable: (operation: ResidentLifecycleOperationSummary) => boolean
   busy: boolean
   onChoose: (operation: ResidentLifecycleOperationSummary, event: ReactMouseEvent<HTMLButtonElement>) => void
@@ -5257,7 +5651,7 @@ function ResidentLifecycleRecoveryList({
     <ResidentLifecycleRecoveryCard
       key={operation.operationId}
       operation={operation}
-      capable={capable}
+      mutationBlock={mutationBlock(operation)}
       checkable={isCheckable(operation)}
       busy={busy}
       onChoose={(event) => onChoose(operation, event)}
@@ -5279,21 +5673,21 @@ function ResidentLifecycleRecoveryList({
 
 function ResidentLifecycleFallbackCard({
   reference,
-  capable,
+  mutationBlock,
   checkable,
   busy,
   onChoose,
   onCheck,
 }: {
   reference: ResidentLifecycleRecoveryReference
-  capable: boolean
+  mutationBlock: ResidentLifecycleMutationBlock | null
   checkable: boolean
   busy: boolean
   onChoose: (event: ReactMouseEvent<HTMLButtonElement>) => void
   onCheck: () => void
 }) {
-  const [diagnosticCopied, setDiagnosticCopied] = useState(false)
   const status = reference.status
+  const registeredWorkspace = reference.workspaceKind === 'registered_workspace'
   const safelyReselectable = status?.phase === 'prepared' ||
     status?.phase === 'promoted_observed' ||
     status?.phase === 'projection_committed' ||
@@ -5307,17 +5701,27 @@ function ResidentLifecycleFallbackCard({
       : committed
         ? 'Resident thread created'
         : 'Setup outcome needs inspection'
-  const detail = quarantined
+  const baseDetail = quarantined
     ? residentLifecycleQuarantineStatusDetail(status)
     : safelyReselectable
       ? status?.phase === 'completed'
         ? status.completionReason === 'owned_create_cleaned'
-          ? 'Prime Agent cleaned up the temporary session. Choose the original folder to start a new setup.'
-          : 'Prime Agent did not create a session. Choose the original folder to try again.'
-        : 'Choose the original folder to continue this exact operation without replaying a completed mutation.'
+          ? registeredWorkspace
+            ? 'Prime Agent cleaned up the temporary session. Use the saved workspace to start a new setup.'
+            : 'Prime Agent cleaned up the temporary session. Choose the original folder to start a new setup.'
+          : registeredWorkspace
+            ? 'Prime Agent did not create a session. Use the saved workspace to try again.'
+            : 'Prime Agent did not create a session. Choose the original folder to try again.'
+        : registeredWorkspace
+          ? 'Continue in the saved host-owned workspace without replaying a completed mutation.'
+          : 'Choose the original folder to continue this exact operation without replaying a completed mutation.'
       : committed
         ? 'The durable setup is complete. Prime Continuim is refreshing its authoritative thread snapshot.'
         : 'The setup request ended before its durable record could be displayed. Prime Continuim will not retry it automatically.'
+  const canResume = mutationBlock === null
+  const detail = safelyReselectable && mutationBlock
+    ? residentLifecycleMutationBlockedDetail(mutationBlock, 'provision')
+    : baseDetail
   return (
     <section
       className="resident-recovery resident-recovery--warning resident-recovery--fallback"
@@ -5330,31 +5734,22 @@ function ResidentLifecycleFallbackCard({
         <small><bdi>{reference.suggestedName}</bdi></small>
       </div>
       <div className="resident-recovery__actions">
-        {(quarantined || (!status || safelyReselectable === false)) && (
+        {(quarantined || !status || safelyReselectable === false || !canResume) && (
           quarantined ? (
-            <button
-              className="button button--secondary button--small"
-              type="button"
-              onClick={() => {
-                void writeClipboardText(residentLifecycleFallbackQuarantineDiagnostic(reference)).then(() => {
-                  setDiagnosticCopied(true)
-                  window.setTimeout(() => setDiagnosticCopied(false), 1_600)
-                }).catch(() => setDiagnosticCopied(false))
-              }}
-            >
-              <Icon icon={diagnosticCopied ? Check : Copy} size={14} />
-              {diagnosticCopied ? 'Diagnostic copied' : 'Copy diagnostic'}
-              <span className="sr-only" aria-live="polite">{diagnosticCopied ? 'Diagnostic copied' : ''}</span>
-            </button>
+            <ResidentLifecycleDiagnosticAction
+              diagnostic={residentLifecycleFallbackQuarantineDiagnostic(reference)}
+              diagnosticLabel="Resident setup diagnostic"
+            />
           ) : (
             <button className="button button--secondary button--small" type="button" disabled={!checkable || busy} onClick={onCheck}>
               <Icon icon={RefreshCw} size={14} /> {busy ? 'Checking…' : committed ? 'Refresh status' : 'Check status'}
             </button>
           )
         )}
-        {(!status || safelyReselectable) && (
-          <button className="button button--secondary button--small" type="button" disabled={!capable || busy} onClick={onChoose}>
-            <Icon icon={FolderGit2} size={14} /> Choose original folder
+        {Boolean(status) && safelyReselectable && canResume && (
+          <button className="button button--secondary button--small" type="button" disabled={busy} onClick={onChoose}>
+            <Icon icon={FolderGit2} size={14} />
+            {registeredWorkspace ? 'Use saved workspace' : 'Choose original folder'}
           </button>
         )}
       </div>
@@ -5364,40 +5759,51 @@ function ResidentLifecycleFallbackCard({
 
 function ResidentLifecycleRecoveryCard({
   operation,
-  capable,
+  mutationBlock,
   checkable,
   busy,
   onChoose,
   onCheck,
 }: {
   operation: ResidentLifecycleOperationSummary
-  capable: boolean
+  mutationBlock: ResidentLifecycleMutationBlock | null
   checkable: boolean
   busy: boolean
   onChoose: (event: ReactMouseEvent<HTMLButtonElement>) => void
   onCheck: () => void
 }) {
   const presentation = residentLifecycleRecoveryCopy(operation)
-  const [diagnosticCopied, setDiagnosticCopied] = useState(false)
-  const canAct = presentation.action === 'check'
+  const statusOnly = presentation.action === 'choose' && mutationBlock !== null
+  const detail = statusOnly
+    ? residentLifecycleMutationBlockedDetail(mutationBlock, operation.kind)
+    : presentation.detail
+  const canAct = statusOnly || presentation.action === 'check'
     ? checkable
     : presentation.action === 'copy'
       ? true
-      : capable
-  const performAction = presentation.action === 'choose'
-    ? onChoose
-    : presentation.action === 'copy'
-      ? () => {
-          if (!presentation.diagnostic) return
-          void writeClipboardText(presentation.diagnostic).then(() => {
-            setDiagnosticCopied(true)
-            window.setTimeout(() => setDiagnosticCopied(false), 1_600)
-          }).catch(() => setDiagnosticCopied(false))
-        }
+      : mutationBlock === null
+  const performAction = statusOnly
+    ? onCheck
+    : presentation.action === 'choose'
+      ? onChoose
       : onCheck
+  const actionIcon = statusOnly
+    ? RefreshCw
+    : presentation.action === 'choose'
+      ? FolderGit2
+      : RefreshCw
+  const actionLabel = statusOnly
+    ? busy ? 'Checking…' : 'Check status'
+    : busy
+      ? presentation.action === 'choose' ? 'Opening…' : 'Checking…'
+      : presentation.actionLabel
   return (
     <section
-      className={cx('resident-recovery', `resident-recovery--${presentation.tone}`)}
+      className={cx(
+        'resident-recovery',
+        `resident-recovery--${presentation.tone}`,
+        presentation.action === 'copy' && 'resident-recovery--fallback',
+      )}
       aria-labelledby={`resident-recovery-${operation.operationId}`}
     >
       <span className="resident-recovery__icon">
@@ -5405,7 +5811,7 @@ function ResidentLifecycleRecoveryCard({
       </span>
       <div className="resident-recovery__body">
         <h2 id={`resident-recovery-${operation.operationId}`}>{presentation.label}</h2>
-        <p>{presentation.detail}</p>
+        <p>{detail}</p>
         <small>
           {operation.kind === 'provision'
             ? <><bdi>{operation.projectDisplayName}</bdi> · <bdi>{operation.threadTitle}</bdi></>
@@ -5413,22 +5819,112 @@ function ResidentLifecycleRecoveryCard({
         </small>
       </div>
       {presentation.action && (
-        <button
-          className="button button--secondary button--small"
-          type="button"
-          disabled={!canAct || (presentation.action !== 'copy' && busy)}
-          onClick={performAction}
-        >
-          <Icon icon={presentation.action === 'choose' ? FolderGit2 : presentation.action === 'copy' ? diagnosticCopied ? Check : Copy : RefreshCw} size={14} />
-          {presentation.action === 'copy'
-            ? diagnosticCopied ? 'Diagnostic copied' : presentation.actionLabel
-            : busy ? presentation.action === 'choose' ? 'Opening…' : 'Checking…' : presentation.actionLabel}
-          {presentation.action === 'copy' && (
-            <span className="sr-only" aria-live="polite">{diagnosticCopied ? 'Diagnostic copied' : ''}</span>
-          )}
-        </button>
+        presentation.action === 'copy' && presentation.diagnostic ? (
+          <div className="resident-recovery__actions">
+            <ResidentLifecycleDiagnosticAction
+              diagnostic={presentation.diagnostic}
+              diagnosticLabel={operation.kind === 'end' ? 'Resident end diagnostic' : 'Resident setup diagnostic'}
+            />
+          </div>
+        ) : (
+          <button
+            className="button button--secondary button--small"
+            type="button"
+            disabled={!canAct || busy}
+            onClick={performAction}
+          >
+            <Icon icon={actionIcon} size={14} />
+            {actionLabel}
+          </button>
+        )
       )}
     </section>
+  )
+}
+
+function ResidentLifecycleDiagnosticAction({
+  diagnostic,
+  diagnosticLabel,
+}: {
+  diagnostic: string
+  diagnosticLabel: string
+}) {
+  const [copyState, setCopyState] = useState<LocalSetupDiagnosticCopyState>('idle')
+  const [fallbackDiagnostic, setFallbackDiagnostic] = useState('')
+  const fallbackRef = useRef<HTMLTextAreaElement>(null)
+  const requestRef = useRef(0)
+  const id = useId()
+  const fieldId = `${id}-resident-diagnostic`
+  const instructionsId = `${id}-resident-diagnostic-instructions`
+
+  useEffect(() => {
+    requestRef.current += 1
+    setCopyState('idle')
+    setFallbackDiagnostic('')
+    return () => {
+      requestRef.current += 1
+    }
+  }, [diagnostic])
+
+  const copyDiagnostic = async () => {
+    const requestId = ++requestRef.current
+    setCopyState('copying')
+    setFallbackDiagnostic('')
+    try {
+      await writeClipboardText(diagnostic)
+      if (requestId !== requestRef.current) return
+      setCopyState('copied')
+      window.setTimeout(() => {
+        if (requestId === requestRef.current) setCopyState('idle')
+      }, 1_600)
+    } catch {
+      if (requestId !== requestRef.current) return
+      setCopyState('failed')
+      setFallbackDiagnostic(diagnostic)
+      window.requestAnimationFrame(() => {
+        const field = fallbackRef.current
+        field?.focus()
+        field?.select()
+      })
+    }
+  }
+
+  return (
+    <>
+      <button
+        className="button button--secondary button--small"
+        type="button"
+        disabled={copyState === 'copying'}
+        aria-busy={copyState === 'copying'}
+        onClick={() => void copyDiagnostic()}
+      >
+        <Icon icon={copyState === 'copying' ? Loader2 : copyState === 'copied' ? Check : Copy} size={14} />
+        {copyState === 'copying'
+          ? 'Copying diagnostic…'
+          : copyState === 'copied'
+            ? 'Diagnostic copied'
+            : 'Copy diagnostic'}
+        <span className="sr-only" aria-live="polite">{copyState === 'copied' ? 'Diagnostic copied' : ''}</span>
+      </button>
+      {fallbackDiagnostic && (
+        <div className="local-setup__diagnostic-fallback">
+          <strong>Clipboard unavailable</strong>
+          <p id={instructionsId} role="alert">
+            Unable to copy the diagnostic. It is selected below; copy it manually and share it with Prime Continuim support.
+          </p>
+          <label htmlFor={fieldId}>{diagnosticLabel}</label>
+          <textarea
+            ref={fallbackRef}
+            id={fieldId}
+            readOnly
+            rows={5}
+            value={fallbackDiagnostic}
+            aria-describedby={instructionsId}
+            onFocus={(event) => event.currentTarget.select()}
+          />
+        </div>
+      )}
+    </>
   )
 }
 
@@ -5447,6 +5943,7 @@ function ResidentProvisionDialog({
   onRecoveryRequired: (reference: ResidentLifecycleRecoveryReference) => void
   onCommitted: (status: ResidentLifecycleStatusResult) => void
 }) {
+  const registeredWorkspace = selection?.kind === 'registered_workspace'
   const [projectDisplayName, setProjectDisplayName] = useState('')
   const [threadTitle, setThreadTitle] = useState('')
   const [invalidField, setInvalidField] = useState<'project' | 'thread' | null>(null)
@@ -5477,9 +5974,9 @@ function ResidentProvisionDialog({
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!selection || submitting || settled) return
-    const project = projectDisplayName.trim()
+    const project = registeredWorkspace ? selection.suggestedName : projectDisplayName.trim()
     const thread = threadTitle.trim()
-    if (!project || project.length > 255 || /[\0\r\n]/.test(project)) {
+    if (!registeredWorkspace && (!project || project.length > 255 || /[\0\r\n]/.test(project))) {
       setInvalidField('project')
       setError('Enter a project name between 1 and 255 characters.')
       projectRef.current?.focus()
@@ -5503,9 +6000,19 @@ function ResidentProvisionDialog({
       })
       setSettled(true)
       onRecoveryRequired({
+        kind: 'provision',
         operationId: status.operationId,
         expectedHostId: status.expectedHostId,
         suggestedName: selection.suggestedName,
+        workspaceKind: selection.kind ?? 'local_path',
+        ...(selection.kind === 'registered_workspace'
+          ? {
+              projectId: selection.projectId,
+              workspaceId: selection.workspaceId,
+              referenceThreadId: selection.referenceThreadId,
+              referenceExecutionGenerationId: selection.referenceExecutionGenerationId,
+            }
+          : {}),
         threadId: status.threadId,
         executionGenerationId: status.executionGenerationId,
         status,
@@ -5517,30 +6024,48 @@ function ResidentProvisionDialog({
         return
       }
       if (status.phase === 'completed') {
-        setMessage(status.completionReason === 'owned_create_cleaned'
-          ? 'Prime Agent cleaned up the temporary session. No resident session remains; choose the original folder when you are ready to try again.'
-          : 'Prime Agent did not create a session. Choose the original folder again when you are ready to retry.')
+        setMessage(registeredWorkspace
+          ? status.completionReason === 'owned_create_cleaned'
+            ? 'Prime Agent cleaned up the temporary session. No resident session remains; use this saved workspace when you are ready to try again.'
+            : 'Prime Agent did not create a session. Use this saved workspace when you are ready to retry.'
+          : status.completionReason === 'owned_create_cleaned'
+            ? 'Prime Agent cleaned up the temporary session. No resident session remains; choose the original folder when you are ready to try again.'
+            : 'Prime Agent did not create a session. Choose the original folder again when you are ready to retry.')
       } else if (status.phase === 'quarantined') {
         setError('The setup outcome is not proven. Prime Continuim will not retry it automatically; inspect the durable host state first.')
         setMessage('Resident setup stopped at an uncertain mutation boundary.')
       } else {
-        setMessage('Setup is durably recorded. Choose the original folder again if recovery asks for it.')
+        setMessage(registeredWorkspace
+          ? 'Setup is durably recorded. Continue in this saved workspace if recovery asks for it.'
+          : 'Setup is durably recorded. Choose the original folder again if recovery asks for it.')
       }
     } catch (reason) {
       setSettled(true)
-      if (residentProvisionMayNeedRecovery(reason)) {
+      if (residentProvisionMayHaveDurableOperation(reason)) {
         onRecoveryRequired({
+          kind: 'provision',
           operationId: selection.operationId,
           expectedHostId: selection.expectedHostId,
           suggestedName: selection.suggestedName,
+          workspaceKind: selection.kind ?? 'local_path',
+          ...(selection.kind === 'registered_workspace'
+            ? {
+                projectId: selection.projectId,
+                workspaceId: selection.workspaceId,
+                referenceThreadId: selection.referenceThreadId,
+                referenceExecutionGenerationId: selection.referenceExecutionGenerationId,
+              }
+            : {}),
         })
       }
       setError(reason instanceof Error
         ? reason.message
         : 'Resident setup did not finish. Prime Continuim will not retry it automatically.')
-      setMessage(residentProvisionMayNeedRecovery(reason)
+      setMessage(residentProvisionMayHaveDurableOperation(reason)
         ? 'Check the durable recovery state before trying again.'
-        : 'Close this dialog, correct the issue, and choose the workspace folder again.')
+        : registeredWorkspace
+          ? 'Close this dialog, refresh the saved workspace, and try again.'
+          : 'Close this dialog, correct the issue, and choose the workspace folder again.')
     } finally {
       setSubmitting(false)
     }
@@ -5561,43 +6086,61 @@ function ResidentProvisionDialog({
           <div className="sheet__title-group">
             <span className="sheet__title-icon"><Icon icon={FolderGit2} size={18} /></span>
             <div>
-              <h2 id="resident-provision-title">Start resident thread</h2>
+              <h2 id="resident-provision-title">
+                {registeredWorkspace ? 'New resident thread in this workspace' : 'Start resident thread'}
+              </h2>
               <p id="resident-provision-description">
-                Confirm how this workspace appears in Prime Continuim. The verified local host keeps its folder location.
+                {registeredWorkspace
+                  ? 'Prime Agent will start this thread in the saved host-owned workspace. Only the new thread title can be changed here.'
+                  : 'Confirm how this workspace appears in Prime Continuim. The verified local host keeps its folder location.'}
               </p>
             </div>
           </div>
-          <button className="icon-button" type="button" aria-label="Close resident setup" onClick={onClose} disabled={submitting}>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={registeredWorkspace ? 'Close new resident thread setup' : 'Close resident setup'}
+            onClick={onClose}
+            disabled={submitting}
+          >
             <Icon icon={X} size={17} />
           </button>
         </header>
 
         <div className="sheet__scroll resident-provision__fields">
-          <div className="form-field">
-            <label htmlFor="resident-project-name">Project name</label>
-            <input
-              ref={projectRef}
-              id="resident-project-name"
-              type="text"
-              value={projectDisplayName}
-              maxLength={255}
-              data-dialog-autofocus
-              autoComplete="off"
-              aria-invalid={invalidField === 'project'}
-              aria-describedby={invalidField === 'project'
-                ? 'resident-project-help resident-provision-error'
-                : 'resident-project-help'}
-              disabled={submitting || settled}
-              onChange={(event) => {
-                setProjectDisplayName(event.target.value)
-                if (invalidField === 'project') {
-                  setInvalidField(null)
-                  setError('')
-                }
-              }}
-            />
-            <small id="resident-project-help">Shown in the project list.</small>
-          </div>
+          {registeredWorkspace ? (
+            <div className="form-field">
+              <span className="form-field__label">Saved project</span>
+              <div className="form-field__fixed-value"><bdi>{selection?.suggestedName}</bdi></div>
+              <small>Fixed by the selected host-owned workspace.</small>
+            </div>
+          ) : (
+            <div className="form-field">
+              <label htmlFor="resident-project-name">Project name</label>
+              <input
+                ref={projectRef}
+                id="resident-project-name"
+                type="text"
+                value={projectDisplayName}
+                maxLength={255}
+                data-dialog-autofocus
+                autoComplete="off"
+                aria-invalid={invalidField === 'project'}
+                aria-describedby={invalidField === 'project'
+                  ? 'resident-project-help resident-provision-error'
+                  : 'resident-project-help'}
+                disabled={submitting || settled}
+                onChange={(event) => {
+                  setProjectDisplayName(event.target.value)
+                  if (invalidField === 'project') {
+                    setInvalidField(null)
+                    setError('')
+                  }
+                }}
+              />
+              <small id="resident-project-help">Shown in the project list.</small>
+            </div>
+          )}
           <div className="form-field">
             <label htmlFor="resident-thread-title">Thread title</label>
             <input
@@ -5606,6 +6149,7 @@ function ResidentProvisionDialog({
               type="text"
               value={threadTitle}
               maxLength={255}
+              data-dialog-autofocus={registeredWorkspace || undefined}
               autoComplete="off"
               aria-invalid={invalidField === 'thread'}
               aria-describedby={invalidField === 'thread'
@@ -5624,7 +6168,11 @@ function ResidentProvisionDialog({
           </div>
           <div className="resident-provision__privacy">
             <Icon icon={LockKeyhole} size={15} />
-            <span>Prime Continuim does not display this folder location or send it to another computer. The verified local host uses it for this workspace.</span>
+            <span>
+              {registeredWorkspace
+                ? 'Prime Continuim uses the saved project and workspace identity reported by this verified SSH host. No filesystem location is selected or shown.'
+                : 'Prime Continuim does not display this folder location or send it to another computer. The verified local host uses it for this workspace.'}
+            </span>
           </div>
           <p id="resident-provision-error" className="form-error" role="alert">{error}</p>
           <p
@@ -5646,7 +6194,9 @@ function ResidentProvisionDialog({
           {!settled && (
             <button className="button button--primary" type="submit" disabled={submitting}>
               <Icon icon={submitting ? Loader2 : FolderGit2} />
-              {submitting ? 'Starting…' : 'Start resident thread'}
+              {submitting
+                ? 'Starting…'
+                : registeredWorkspace ? 'Create resident thread' : 'Start resident thread'}
             </button>
           )}
         </footer>

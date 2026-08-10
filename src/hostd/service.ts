@@ -8,6 +8,7 @@ import {
   PROTOCOL_VERSION,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   ResidentLifecycleStatusSchema,
   SavedProjectSchema,
   RUNTIME_INTEGRITY_CAPABILITY,
@@ -61,6 +62,7 @@ import {
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
 import {
   ResidentProvisionCoordinatorError,
+  residentProvisionRequestDigest,
   type ResidentEndRequest as CoordinatorResidentEndRequest,
   type ResidentProvisionRequest as CoordinatorResidentProvisionRequest,
 } from "./resident-lifecycle-coordinator";
@@ -91,6 +93,7 @@ const KNOWN_METHODS = new Set([
   "command.submit",
   "command.reconcile",
   "resident.provision",
+  "resident.provision.registered",
   "resident.end",
   "resident.lifecycle.status",
   "candidate.evaluation.preflight",
@@ -391,10 +394,16 @@ export class HostService {
           : "Runtime verification can be retried only by the trusted local desktop",
       );
     }
-    if (isResidentLifecycleRequest(request) && context.transport !== "trusted_user") {
+    if (request.method === "resident.provision" && context.transport !== "trusted_user") {
       throw new PairingAuthorityError(
         "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN",
         "Resident session lifecycle operations are available only to the trusted local desktop",
+      );
+    }
+    if (isRegisteredWorkspaceLifecycleRequest(request) && context.transport === "relay") {
+      throw new PairingAuthorityError(
+        "REMOTE_RESIDENT_LIFECYCLE_FORBIDDEN",
+        "Registered workspace lifecycle operations are available only to the trusted desktop or SSH bridge",
       );
     }
     if (isCandidateEvaluationRequest(request) && context.transport !== "trusted_user") {
@@ -475,7 +484,7 @@ export class HostService {
           : [];
         let residentLifecycleReady = false;
         if (
-          context.transport === "trusted_user" &&
+          (context.transport === "trusted_user" || context.transport === "ssh_bridge") &&
           this.gateway.continuity === "resident" &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready") &&
           isResidentLifecycleGateway(this.gateway)
@@ -487,7 +496,9 @@ export class HostService {
           }
         }
         const residentLifecycleCapabilities = residentLifecycleReady
-          ? [RESIDENT_LIFECYCLE_CAPABILITY]
+          ? context.transport === "ssh_bridge"
+            ? [RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY]
+            : [RESIDENT_LIFECYCLE_CAPABILITY]
           : [];
         let modelCatalogReady = Boolean(this.runtimeModelCatalogProvider) &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready");
@@ -974,7 +985,8 @@ export class HostService {
         }
         return this.store.reconcileCommands(request.payload.commands);
       }
-      case "resident.provision": {
+      case "resident.provision":
+      case "resident.provision.registered": {
         const host = await this.store.getHost();
         if (request.payload.expectedHostId !== host.hostId) {
           throw new HostStoreError(
@@ -998,16 +1010,37 @@ export class HostService {
           );
         }
 
-        const artifacts = initialResidentWorkspaceArtifacts(request.payload);
-        await this.store.bootstrapWorkspaceThread({
-          operationId: residentWorkspaceBootstrapOperationId(request.payload.operationId),
-          requestDigest: residentWorkspaceBootstrapDigest(request.payload),
-          expectedHostId: request.payload.expectedHostId,
-          project: artifacts.project,
-          thread: artifacts.thread,
-          initialProjection: artifacts.projection,
-          workspaceDirectory: request.payload.workspaceDirectory,
-        });
+        const selection = {
+          kind: "new" as const,
+          ...(request.payload.sessionName === undefined
+            ? {}
+            : { sessionName: request.payload.sessionName }),
+        };
+        if (request.method === "resident.provision") {
+          const artifacts = initialResidentWorkspaceArtifacts(request.payload);
+          await this.store.bootstrapWorkspaceThread({
+            operationId: residentWorkspaceBootstrapOperationId(request.payload.operationId),
+            requestDigest: residentWorkspaceBootstrapDigest(request.payload),
+            expectedHostId: request.payload.expectedHostId,
+            project: artifacts.project,
+            thread: artifacts.thread,
+            initialProjection: artifacts.projection,
+            workspaceDirectory: request.payload.workspaceDirectory,
+          });
+        } else {
+          await this.store.bootstrapRegisteredWorkspaceThread({
+            ...request.payload,
+            bootstrapOperationId: residentWorkspaceBootstrapOperationId(request.payload.operationId),
+            lifecycleRequestDigest: residentProvisionRequestDigest({
+              operationId: request.payload.operationId,
+              expectedHostId: request.payload.expectedHostId,
+              projectId: request.payload.projectId,
+              workspaceId: request.payload.workspaceId,
+              threadId: request.payload.threadId,
+              executionGenerationId: request.payload.executionGenerationId,
+            }, selection),
+          });
+        }
         const status = await this.gateway.provisionResident({
           operationId: request.payload.operationId,
           expectedHostId: request.payload.expectedHostId,
@@ -1015,12 +1048,7 @@ export class HostService {
           workspaceId: request.payload.workspaceId,
           threadId: request.payload.threadId,
           executionGenerationId: request.payload.executionGenerationId,
-          selection: {
-            kind: "new",
-            ...(request.payload.sessionName === undefined
-              ? {}
-              : { sessionName: request.payload.sessionName }),
-          },
+          selection,
         });
         return ResidentLifecycleStatusSchema.parse(status);
       }
@@ -1265,11 +1293,11 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
       // protocol switch exhaustive without granting remote repair authority.
       return "host.admin";
     case "resident.provision":
+    case "resident.provision.registered":
     case "resident.end":
     case "resident.lifecycle.status":
-      // Remote and SSH lifecycle requests are rejected before this scope is
-      // evaluated. Keep the protocol switch exhaustive without granting a
-      // remote session-management capability.
+      // Relay lifecycle requests are rejected before this scope is evaluated.
+      // SSH bridges are host-authenticated rather than paired-device scoped.
       return "host.admin";
     case "handoff.plan":
     case "handoff.commit":
@@ -1292,8 +1320,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
   }
 }
 
-function isResidentLifecycleRequest(request: HostIpcRequest): boolean {
-  return request.method === "resident.provision" ||
+function isRegisteredWorkspaceLifecycleRequest(request: HostIpcRequest): boolean {
+  return request.method === "resident.provision.registered" ||
     request.method === "resident.end" ||
     request.method === "resident.lifecycle.status";
 }

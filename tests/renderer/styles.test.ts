@@ -153,10 +153,21 @@ describe('renderer style contracts', () => {
     expect(shortLayout).toMatch(/dialog\.sheet--resident,\s*dialog\.sheet--resident-end,\s*dialog\.sheet--candidate-evaluation\s*{[^}]*max-block-size:\s*calc\(100dvh - 0\.5rem\);/s)
     expect(shortLayout).toMatch(/\.sheet--resident \.sheet__scroll,\s*\.sheet--resident-end \.sheet__scroll,\s*\.sheet--candidate-evaluation \.sheet__scroll\s*{[^}]*max-block-size:\s*none;[^}]*padding:\s*0\.65rem 0\.75rem;/s)
     expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer,\s*\.sheet--resident-end \.sheet__footer,\s*\.sheet--candidate-evaluation \.sheet__footer\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s)
+    expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer\s*{[^}]*grid-template-columns:\s*minmax\(5\.5rem, 2fr\) minmax\(10rem, 3fr\);/s)
     expect(shortLayout).toMatch(/\.sheet--resident \.sheet__footer \.button,\s*\.sheet--resident-end \.sheet__footer \.button,\s*\.sheet--candidate-evaluation \.sheet__footer \.button\s*{[^}]*inline-size:\s*100%;[^}]*min-block-size:\s*2\.25rem;/s)
+    const visuallyHiddenResidentCopy = shortLayout.match(
+      /\.sheet--resident \.sheet__title-group p,\s*\.sheet--resident \.form-field small\s*{[^}]*}/s,
+    )?.[0]
+    expect(visuallyHiddenResidentCopy).toMatch(/position:\s*absolute;[^}]*inline-size:\s*1px;[^}]*block-size:\s*1px;/s)
+    expect(visuallyHiddenResidentCopy).toMatch(/clip:\s*rect\(0 0 0 0\);[^}]*clip-path:\s*inset\(50%\);/s)
+    expect(visuallyHiddenResidentCopy).not.toMatch(/display:\s*none/)
     expect(css).toMatch(/dialog\.sheet--resident-end\s*{[^}]*inline-size:\s*min\(calc\(100% - 2rem\), 40rem\);/s)
     expect(css).toMatch(/\.resident-end-dialog__confirmation:has\(input:focus-visible\)\s*{[^}]*outline:\s*2px solid var\(--color-focus\);/s)
     expect(css).toMatch(/\.resident-end-state\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
+    expect(css).toMatch(/\.sidebar__registered-resident \.sidebar__create-resident\s*{[^}]*min-block-size:\s*2\.75rem;[^}]*white-space:\s*normal;/s)
+    expect(css).toMatch(/\.sidebar__registered-resident > small\s*{[^}]*line-height:\s*1\.4;[^}]*text-wrap:\s*pretty;/s)
+    expect(css).toMatch(/\.form-field__fixed-value\s*{[^}]*min-inline-size:\s*0;[^}]*overflow-wrap:\s*anywhere;/s)
+    expect(css).not.toMatch(/\.sidebar__registered-resident(?:\s+[^,{]+)?\s*{[^}]*animation:/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {

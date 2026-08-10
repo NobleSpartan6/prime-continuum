@@ -580,6 +580,43 @@ describe("host protocol schemas", () => {
     expect(JSON.stringify(response)).not.toMatch(/workspaceDirectory|sessionFile|activeSessionId/);
   });
 
+  it("keeps registered-workspace SSH provisioning path-free and strict", () => {
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "registered-resident-provision-1",
+      method: "resident.provision.registered",
+      payload: {
+        expectedHostId: "host-1",
+        operationId: "resident-op-2",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        referenceThreadId: "saved-thread-1",
+        referenceExecutionGenerationId: "saved-execution-1",
+        threadId: "thread-2",
+        executionGenerationId: "execution-2",
+        threadTitle: "Remote resident thread",
+        createdAt: "2026-08-08T12:00:00.000Z",
+        sessionName: "Remote resident",
+      },
+    } as const;
+    expect(HostIpcRequestSchema.safeParse(request).success).toBe(true);
+    for (const forbidden of [
+      { workspaceDirectory: "C:\\private\\workspace" },
+      { projectDisplayName: "Forged project" },
+      { repository: { root: "C:\\private\\workspace" } },
+      { unexpected: true },
+    ]) {
+      expect(HostIpcRequestSchema.safeParse({
+        ...request,
+        payload: { ...request.payload, ...forbidden },
+      }).success).toBe(false);
+    }
+    expect(HostIpcRequestSchema.safeParse({
+      ...request,
+      payload: { ...request.payload, referenceThreadId: undefined },
+    }).success).toBe(false);
+  });
+
   it("requires exactly one reconciliation outcome", () => {
     const receipt = {
       protocolVersion: PROTOCOL_VERSION,

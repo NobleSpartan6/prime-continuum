@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { NativeRendererApi, StaleHostAuthorityError } from '../../src/renderer/src/api'
+import {
+  NativeRendererApi,
+  StaleHostAuthorityError,
+  type ResidentLifecycleOperationSummary,
+} from '../../src/renderer/src/api'
 
 const ok = <T,>(value: T) => Promise.resolve({ ok: true as const, value })
 
@@ -172,6 +176,145 @@ function residentLifecycleConnection() {
         status: 'ready',
         assurance: 'development-integrity',
       },
+    },
+  }
+}
+
+function registeredWorkspaceConnection(capabilities = [
+  'prime_agent_commands_v2',
+  'resident_registered_workspace_lifecycle_v1',
+]) {
+  return {
+    phase: 'online',
+    target: { kind: 'ssh', alias: 'saved-build-host' },
+    hostId: 'host-b',
+    path: 'ssh',
+    since: '2026-08-05T20:00:00.000Z',
+    attempt: 2,
+    capabilities,
+  }
+}
+
+function registeredWorkspaceFixture(residentActive = false) {
+  const catalog = sshActivationCatalog('registered-generation', '2026-08-05T20:00:00.000Z')
+  const thread = catalog.threads[0]
+  const snapshot = recoverySnapshot(thread, 'Saved SSH workspace authority.')
+  if (!residentActive) {
+    snapshot.runtime.residency = 'client_owned'
+    delete snapshot.runtime.activeSessionId
+    delete snapshot.runtime.sessionId
+  }
+  const connection = registeredWorkspaceConnection()
+  const cache = {
+    version: 3,
+    activeHostId: 'host-b',
+    entries: {
+      'host-b': { hostId: 'host-b', catalog, lastSnapshot: snapshot },
+    },
+  }
+  return { catalog, thread, snapshot, connection, cache }
+}
+
+function registeredWorkspaceSelection() {
+  return {
+    selectionToken: 'registered-selection-one',
+    operationId: 'registered-operation-one',
+    expectedHostId: 'host-b',
+    suggestedName: 'Prime GUI',
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }
+}
+
+function registeredProvisionStatus() {
+  return {
+    version: 1 as const,
+    kind: 'provision' as const,
+    operationId: 'registered-operation-one',
+    phase: 'prepared' as const,
+    expectedHostId: 'host-b',
+    projectId: 'registered-project-one',
+    workspaceId: 'registered-workspace-one',
+    threadId: 'registered-thread-one',
+    executionGenerationId: 'registered-thread-generation-one',
+    preparedAt: '2026-08-05T20:00:01.000Z',
+    updatedAt: '2026-08-05T20:00:02.000Z',
+  }
+}
+
+function registeredSiblingProvisionOperation(
+  fixture: ReturnType<typeof registeredWorkspaceFixture>,
+  phase: 'prepared' | 'committed' | 'completed' = 'committed',
+) {
+  return {
+    kind: 'provision' as const,
+    provisionMode: 'registered_workspace' as const,
+    operationId: 'registered-sibling-operation',
+    expectedHostId: 'host-b',
+    projectId: fixture.thread.currentLocation.projectId,
+    workspaceId: fixture.thread.currentLocation.workspaceId,
+    referenceThreadId: fixture.thread.threadId,
+    referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    threadId: 'registered-sibling-thread',
+    executionGenerationId: 'registered-sibling-generation',
+    projectDisplayName: 'Prime GUI',
+    threadTitle: 'Sibling resident',
+    createdAt: '2026-08-05T20:00:01.000Z',
+    updatedAt: '2026-08-05T20:00:02.000Z',
+    state: (phase === 'prepared' ? 'submitted' : 'terminal') as 'terminal' | 'submitted',
+    lastStatus: {
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-sibling-operation',
+      phase,
+      expectedHostId: 'host-b',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      threadId: 'registered-sibling-thread',
+      executionGenerationId: 'registered-sibling-generation',
+      preparedAt: '2026-08-05T20:00:01.000Z',
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      ...(phase === 'committed' || phase === 'completed'
+        ? { terminalAt: '2026-08-05T20:00:02.000Z' }
+        : {}),
+      ...(phase === 'completed' ? { completionReason: 'owned_create_failed_before_effect' as const } : {}),
+    },
+  }
+}
+
+function registeredSiblingEndOperation(
+  fixture: ReturnType<typeof registeredWorkspaceFixture>,
+  phase: 'ending' | 'completed',
+) {
+  return {
+    kind: 'end' as const,
+    operationId: 'registered-sibling-end-operation',
+    expectedHostId: 'host-b',
+    projectId: fixture.thread.currentLocation.projectId,
+    workspaceId: fixture.thread.currentLocation.workspaceId,
+    threadId: 'registered-sibling-thread',
+    executionGenerationId: 'registered-sibling-generation',
+    sourceCursor: {
+      threadId: 'registered-sibling-thread',
+      executionGenerationId: 'registered-sibling-generation',
+      generation: 'registered-sibling-daemon-generation',
+      sequence: 7,
+    },
+    createdAt: '2026-08-05T20:00:03.000Z',
+    updatedAt: '2026-08-05T20:00:04.000Z',
+    state: (phase === 'completed' ? 'terminal' : 'submitted') as 'terminal' | 'submitted',
+    lastStatus: {
+      version: 1 as const,
+      kind: 'end' as const,
+      operationId: 'registered-sibling-end-operation',
+      phase,
+      expectedHostId: 'host-b',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      threadId: 'registered-sibling-thread',
+      executionGenerationId: 'registered-sibling-generation',
+      preparedAt: '2026-08-05T20:00:03.000Z',
+      updatedAt: '2026-08-05T20:00:04.000Z',
+      ...(phase === 'completed' ? { terminalAt: '2026-08-05T20:00:04.000Z' } : {}),
     },
   }
 }
@@ -408,6 +551,764 @@ describe('NativeRendererApi', () => {
     expect(bridge.hudOpen).toHaveBeenCalledWith(target)
     expect(bridge.hudSetMode).toHaveBeenCalledWith('buddy')
     expect(bridge.hudSetIgnoreMouseEvents).toHaveBeenCalledWith(true)
+  })
+
+  it('uses one exact idle saved SSH workspace authority without accepting renderer project edits', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const reference = {
+      kind: 'registered_workspace' as const,
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      provisionResident: vi.fn(() => ok(registeredProvisionStatus())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    const initial = await api.loadWorkbench()
+
+    expect(initial.operations.provisionResident).toBe(true)
+    expect(initial.operations.endResident).toBeUndefined()
+    const selection = await api.selectResidentWorkspace(reference)
+    expect(selection).toEqual(expect.objectContaining({
+      ...reference,
+      expectedHostId: 'host-b',
+      suggestedName: 'Prime GUI',
+    }))
+    expect(bridge.selectResidentWorkspace).toHaveBeenCalledWith(reference)
+
+    await expect(api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Renderer must not rename this project',
+      threadTitle: 'New saved-workspace thread',
+    })).resolves.toEqual(registeredProvisionStatus())
+    expect(bridge.provisionResident).toHaveBeenCalledWith({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: selection.suggestedName,
+      threadTitle: 'New saved-workspace thread',
+    })
+    await expect(api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: selection.suggestedName,
+      threadTitle: 'New saved-workspace thread',
+    })).rejects.toThrow(/select this saved workspace again/i)
+    expect(bridge.provisionResident).toHaveBeenCalledTimes(1)
+
+    unsubscribe()
+  })
+
+  it('withholds saved-workspace create while the exact selected resident authority remains endable', async () => {
+    const fixture = registeredWorkspaceFixture(true)
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const snapshot = await api.loadWorkbench()
+
+    expect(snapshot.operations.provisionResident).toBe(true)
+    expect(snapshot.operations.endResident).toBe(true)
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('withholds saved-workspace create for an exact committed sibling resident in the same workspace', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const operation = registeredSiblingProvisionOperation(fixture)
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const snapshot = await api.loadWorkbench()
+
+    expect(snapshot.operations.provisionResident).toBe(true)
+    expect(snapshot.residentLifecycleOperations).toEqual([
+      expect.objectContaining({ operationId: operation.operationId, lastStatus: expect.objectContaining({ phase: 'committed' }) }),
+    ])
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('denies fresh create but permits only the exact prepared saved-workspace continuation', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const operation: ResidentLifecycleOperationSummary = registeredSiblingProvisionOperation(fixture, 'prepared')
+    const selection = { ...registeredWorkspaceSelection(), operationId: operation.operationId }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(selection)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+    const reference = {
+      kind: 'registered_workspace' as const,
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    }
+
+    await expect(api.selectResidentWorkspace(reference)).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    await expect(api.selectResidentWorkspace({
+      ...reference,
+      resumeOperationId: operation.operationId,
+    })).resolves.toMatchObject({ operationId: operation.operationId, ...reference })
+    expect(bridge.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    'owned_create_dispatching',
+    'owned_observed',
+    'promotion_dispatching',
+    'promoted_observed',
+    'projection_committed',
+    'quarantined',
+  ] as const)('denies fresh create while a foreign saved-workspace provision is %s', async (phase) => {
+    const fixture = registeredWorkspaceFixture()
+    const operation: ResidentLifecycleOperationSummary = registeredSiblingProvisionOperation(fixture, 'prepared')
+    operation.state = 'outcome_unknown'
+    operation.lastStatus = {
+      ...operation.lastStatus!,
+      phase,
+      ...(phase === 'quarantined'
+        ? {
+            quarantinedFrom: 'promotion_dispatching' as const,
+            quarantineReason: 'external_outcome_unknown' as const,
+          }
+        : {}),
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it.each(['outcome_unknown', 'quarantined', 'committed'] as const)(
+    'keeps a visible %s saved-workspace operation check-only instead of deferring it to main validation',
+    async (state) => {
+      const fixture = registeredWorkspaceFixture()
+      const operation: ResidentLifecycleOperationSummary = registeredSiblingProvisionOperation(
+        fixture,
+        state === 'committed' ? 'committed' : 'prepared',
+      )
+      if (state === 'outcome_unknown') {
+        operation.state = 'outcome_unknown'
+        operation.lastStatus = undefined
+      } else if (state === 'quarantined') {
+        operation.state = 'outcome_unknown'
+        operation.lastStatus = {
+          ...operation.lastStatus!,
+          phase: 'quarantined',
+          quarantinedFrom: 'promotion_dispatching',
+          quarantineReason: 'external_outcome_unknown',
+        }
+      }
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: fixture.cache,
+          outbox: [],
+          residentLifecycleOperations: [operation],
+          connection: fixture.connection,
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => ok(fixture.catalog)),
+        requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+        selectResidentWorkspace: vi.fn(() => ok({
+          ...registeredWorkspaceSelection(),
+          operationId: operation.operationId,
+        })),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      const api = new NativeRendererApi(bridge)
+      await api.loadWorkbench()
+
+      await expect(api.selectResidentWorkspace({
+        kind: 'registered_workspace',
+        projectId: fixture.thread.currentLocation.projectId,
+        workspaceId: fixture.thread.currentLocation.workspaceId,
+        referenceThreadId: fixture.thread.threadId,
+        referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+        resumeOperationId: operation.operationId,
+      })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+      expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+    },
+  )
+
+  it('mints a fresh registered operation after an exact completed pre-effect setup', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const operation = registeredSiblingProvisionOperation(fixture, 'completed')
+    const selection = { ...registeredWorkspaceSelection(), operationId: 'registered-safe-retry-operation' }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(selection)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+      resumeOperationId: operation.operationId,
+    })).resolves.toMatchObject({ operationId: selection.operationId })
+    expect(selection.operationId).not.toBe(operation.operationId)
+  })
+
+  it('defers a missing projected saved-workspace continuation to the main durable ledger', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      provisionResident: vi.fn(() => ok(registeredProvisionStatus())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+    const reference = {
+      kind: 'registered_workspace' as const,
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    }
+    const selection = await api.selectResidentWorkspace(reference)
+    await expect(api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: selection.suggestedName,
+      threadTitle: 'Prepared fallback thread',
+    })).resolves.toMatchObject({ phase: 'prepared', operationId: selection.operationId })
+
+    await expect(api.selectResidentWorkspace({
+      ...reference,
+      resumeOperationId: selection.operationId,
+    })).resolves.toMatchObject({ operationId: selection.operationId, ...reference })
+    expect(bridge.selectResidentWorkspace).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not let main-ledger validation bypass a visible resident runtime hold', async () => {
+    const fixture = registeredWorkspaceFixture(true)
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok({
+        ...registeredWorkspaceSelection(),
+        operationId: 'missing-from-renderer-hydration',
+      })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+      resumeOperationId: 'missing-from-renderer-hydration',
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('keeps unresolved no-status saved-workspace authority closed to fresh create', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const operation = {
+      ...registeredSiblingProvisionOperation(fixture, 'prepared'),
+      state: 'outcome_unknown' as const,
+      lastStatus: undefined,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('does not let one recovery operation bypass a different same-workspace resident authority', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const recovery = registeredSiblingProvisionOperation(fixture, 'prepared')
+    const conflict = {
+      ...registeredSiblingProvisionOperation(fixture, 'committed'),
+      operationId: 'registered-conflicting-operation',
+      threadId: 'registered-conflicting-thread',
+      executionGenerationId: 'registered-conflicting-generation',
+      lastStatus: {
+        ...registeredSiblingProvisionOperation(fixture, 'committed').lastStatus!,
+        operationId: 'registered-conflicting-operation',
+        threadId: 'registered-conflicting-thread',
+        executionGenerationId: 'registered-conflicting-generation',
+      },
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [recovery, conflict],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok({ ...registeredWorkspaceSelection(), operationId: recovery.operationId })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+      resumeOperationId: recovery.operationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('releases committed sibling authority only for an exact completed End record', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const provision = registeredSiblingProvisionOperation(fixture)
+    const completedEnd = registeredSiblingEndOperation(fixture, 'completed')
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [provision, completedEnd],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).resolves.toMatchObject({ kind: 'registered_workspace' })
+    expect(bridge.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not release a saved workspace for a completed End from another resident lineage', async () => {
+    const fixture = registeredWorkspaceFixture()
+    const provision = registeredSiblingProvisionOperation(fixture)
+    const completedEnd = registeredSiblingEndOperation(fixture, 'completed')
+    completedEnd.executionGenerationId = 'different-resident-generation'
+    completedEnd.sourceCursor.executionGenerationId = 'different-resident-generation'
+    completedEnd.lastStatus = {
+      ...completedEnd.lastStatus!,
+      executionGenerationId: 'different-resident-generation',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [provision, completedEnd],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('keeps exact registered End review available while fresh create is occupied', async () => {
+    const fixture = registeredWorkspaceFixture(true)
+    const threadId = fixture.thread.threadId
+    const executionGenerationId = fixture.thread.currentLocation.executionGenerationId
+    const operation = {
+      kind: 'end' as const,
+      operationId: 'registered-end-operation-one',
+      expectedHostId: 'host-b',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      threadId,
+      executionGenerationId,
+      sourceCursor: {
+        threadId,
+        executionGenerationId,
+        generation: 'registered-end-daemon-generation',
+        sequence: 7,
+      },
+      createdAt: '2026-08-05T20:00:01.000Z',
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      state: 'submitted' as const,
+      lastStatus: {
+        version: 1 as const,
+        kind: 'end' as const,
+        operationId: 'registered-end-operation-one',
+        phase: 'ending' as const,
+        expectedHostId: 'host-b',
+        projectId: fixture.thread.currentLocation.projectId,
+        workspaceId: fixture.thread.currentLocation.workspaceId,
+        threadId,
+        executionGenerationId,
+        preparedAt: '2026-08-05T20:00:01.000Z',
+        updatedAt: '2026-08-05T20:00:02.000Z',
+      },
+    }
+    const preparation = {
+      confirmationToken: 'registered-end-confirmation-one',
+      operationId: operation.operationId,
+      expectedHostId: 'host-b',
+      threadId,
+      executionGenerationId,
+      expiresAt: '2099-08-05T20:05:00.000Z',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [operation],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      prepareResidentEnd: vi.fn(() => ok(preparation)),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const snapshot = await api.loadWorkbench()
+
+    expect(snapshot.operations.provisionResident).toBe(true)
+    expect(snapshot.operations.endResident).toBe(true)
+    await expect(api.prepareResidentEnd({
+      expectedHostId: operation.expectedHostId,
+      projectId: operation.projectId,
+      workspaceId: operation.workspaceId,
+      threadId: operation.threadId,
+      executionGenerationId: operation.executionGenerationId,
+      resumeOperationId: operation.operationId,
+    })).resolves.toEqual(preparation)
+    expect(bridge.prepareResidentEnd).toHaveBeenCalledTimes(1)
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+  })
+
+  it('invalidates a saved-workspace selection across connection and source-generation fences without mutation', async () => {
+    const fixture = registeredWorkspaceFixture()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn((input: { threadId: string }) => {
+        const thread = fixture.catalog.threads.find((candidate) => candidate.threadId === input.threadId)!
+        const selected = recoverySnapshot(thread, 'Exact selected SSH source.')
+        selected.runtime.residency = 'client_owned'
+        delete selected.runtime.activeSessionId
+        delete selected.runtime.sessionId
+        return ok(selected)
+      }),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      provisionResident: vi.fn(() => ok(registeredProvisionStatus())),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const unsubscribe = api.subscribe(() => undefined)
+    await api.loadWorkbench()
+    const input = {
+      kind: 'registered_workspace' as const,
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    }
+    const first = await api.selectResidentWorkspace(input)
+    await api.selectThread(fixture.catalog.threads[1].threadId)
+    await expect(api.provisionResident({
+      selectionToken: first.selectionToken,
+      projectDisplayName: first.suggestedName,
+      threadTitle: 'Stale source must not start',
+    })).rejects.toMatchObject({ durableOperationPossible: false })
+
+    await api.selectThread(fixture.thread.threadId)
+    const second = await api.selectResidentWorkspace(input)
+    connectionListener?.({ ...fixture.connection, phase: 'reconnecting' })
+    connectionListener?.(fixture.connection)
+    await expect(api.provisionResident({
+      selectionToken: second.selectionToken,
+      projectDisplayName: second.suggestedName,
+      threadTitle: 'Stale connection must not start',
+    })).rejects.toMatchObject({ durableOperationPossible: false })
+    expect(bridge.provisionResident).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('keeps exact SSH status checkable after capability withdrawal while denying every new lifecycle mutation', async () => {
+    const fixture = registeredWorkspaceFixture()
+    let connectionListener: ((state: unknown) => void) | undefined
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      residentLifecycleStatus: vi.fn(() => ok({ status: null })),
+      selectResidentWorkspace: vi.fn(() => ok(registeredWorkspaceSelection())),
+      provisionResident: vi.fn(() => ok(registeredProvisionStatus())),
+      prepareResidentEnd: vi.fn(),
+      endResident: vi.fn(),
+      onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+        connectionListener = listener
+        return () => undefined
+      }),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    const initial = await api.loadWorkbench()
+    expect(initial.operations.provisionResident).toBe(true)
+    expect(initial.operations.endResident).toBeUndefined()
+
+    connectionListener?.(registeredWorkspaceConnection(['prime_agent_commands_v2']))
+    expect(published.at(-1)?.operations.provisionResident).toBeUndefined()
+    expect(published.at(-1)?.operations.endResident).toBeUndefined()
+    await expect(api.residentLifecycleStatus({
+      expectedHostId: 'host-b',
+      operationId: 'registered-operation-one',
+    })).resolves.toBeNull()
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toThrow(/not ready on this verified host/i)
+    await expect(api.prepareResidentEnd({
+      expectedHostId: 'host-b',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      threadId: fixture.thread.threadId,
+      executionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toThrow(/not ready on this verified host/i)
+    expect(bridge.residentLifecycleStatus).toHaveBeenCalledOnce()
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
+    expect(bridge.provisionResident).not.toHaveBeenCalled()
+    expect(bridge.prepareResidentEnd).not.toHaveBeenCalled()
+    expect(bridge.endResident).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it.each([
+    ['missing capability', registeredWorkspaceConnection(['prime_agent_commands_v2'])],
+    ['relay path', { ...registeredWorkspaceConnection(), path: 'relay' }],
+    ['unverified connection', { ...registeredWorkspaceConnection(), phase: 'reconnecting' }],
+  ])('does not advertise saved-workspace lifecycle on a %s', async (_label, connection) => {
+    const fixture = registeredWorkspaceFixture()
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection,
+        appVersion: '0.1.0',
+      })),
+      connect: vi.fn(),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(),
+    }
+    const api = new NativeRendererApi(bridge, { allowConnectionInitiation: false })
+    const snapshot = await api.loadWorkbench()
+    expect(snapshot.operations.provisionResident).toBeUndefined()
+    expect(snapshot.operations.endResident).toBeUndefined()
+    await expect(api.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    })).rejects.toThrow()
+    expect(bridge.selectResidentWorkspace).not.toHaveBeenCalled()
   })
 
   it('consumes one exact resident end confirmation before the mutation and never retries it', async () => {
@@ -925,7 +1826,9 @@ describe('NativeRendererApi', () => {
       projectDisplayName: 'Prime GUI',
       threadTitle: 'Prime GUI thread',
     }
-    await expect(api.provisionResident(request)).rejects.toThrow(/durable outcome must be checked/i)
+    await expect(api.provisionResident(request)).rejects.toMatchObject({
+      durableOperationPossible: true,
+    })
     await vi.waitFor(() => {
       expect(published.at(-1)?.residentLifecycleOperations).toEqual([
         expect.objectContaining({
@@ -940,6 +1843,91 @@ describe('NativeRendererApi', () => {
     await expect(api.provisionResident(request)).rejects.toThrow(/choose the workspace folder again/i)
     expect(provisionResident).toHaveBeenCalledTimes(1)
     unsubscribe()
+  })
+
+  it('mints a fresh local operation after an exact completed pre-effect setup', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Completed local resident retry.')
+    const operation = {
+      ...residentLifecycleOperation('terminal'),
+      kind: 'provision' as const,
+      lastStatus: {
+        ...committedResidentLifecycleStatus(),
+        phase: 'completed' as const,
+        completionReason: 'owned_create_cleaned' as const,
+      },
+    }
+    const freshOperationId = 'resident-operation-safe-retry'
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [operation],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok({ ...residentSelection(), operationId: freshOperationId })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.selectResidentWorkspace({
+      resumeOperationId: operation.operationId,
+    })).resolves.toMatchObject({ operationId: freshOperationId, kind: 'local_path' })
+    expect(freshOperationId).not.toBe(operation.operationId)
+  })
+
+  it('honors only an explicit native pre-record durability result after invoking main', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Definitive resident rejection.')
+    const provisionResident = vi.fn(() => Promise.resolve({
+      ok: false as const,
+      error: {
+        code: 'resident.provision_label_invalid',
+        message: 'The project display name is invalid.',
+        retryable: false,
+        details: { durableOperationPossible: false },
+      },
+    }))
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      selectResidentWorkspace: vi.fn(() => ok(residentSelection())),
+      provisionResident,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+    const selection = await api.selectResidentWorkspace()
+
+    await expect(api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Prime GUI',
+      threadTitle: 'Prime GUI thread',
+    })).rejects.toMatchObject({
+      code: 'resident.provision_label_invalid',
+      durableOperationPossible: false,
+      retryable: false,
+    })
+    expect(provisionResident).toHaveBeenCalledOnce()
   })
 
   it('rejects a completed provision when authority changes during ledger rehydration', async () => {

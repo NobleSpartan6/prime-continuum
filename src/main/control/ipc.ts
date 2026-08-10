@@ -56,8 +56,24 @@ const residentProvision = z
   })
   .strict()
 const residentWorkspaceSelection = z
-  .object({ resumeOperationId: id.optional() })
-  .strict()
+  .union([
+    z
+      .object({
+        kind: z.literal('registered_workspace'),
+        projectId: id,
+        workspaceId: id,
+        referenceThreadId: id,
+        referenceExecutionGenerationId: id,
+        resumeOperationId: id.optional(),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal('local_path').optional(),
+        resumeOperationId: id.optional(),
+      })
+      .strict(),
+  ])
   .optional()
 const residentEndPreparation = z
   .object({
@@ -217,11 +233,21 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     residentWorkspaceSelection,
     (input: z.infer<typeof residentWorkspaceSelection>) => service.selectResidentWorkspace(input)
   )
-  handle(
-    IPC.provisionResident,
-    residentProvision,
-    (input: z.infer<typeof residentProvision>) => service.provisionResident(input)
-  )
+  channels.push(IPC.provisionResident)
+  ipcMain.handle(IPC.provisionResident, async (event, rawInput): Promise<Result<Awaited<ReturnType<DesktopControlService['provisionResident']>>>> => {
+    let serviceInvoked = false
+    try {
+      if (!isTrustedSender(event)) {
+        throw new ControlError('ipc.untrusted_sender', 'The native request did not come from the app UI.')
+      }
+      assertBoundedIpcInput(rawInput)
+      const input = residentProvision.parse(rawInput)
+      serviceInvoked = true
+      return { ok: true, value: await service.provisionResident(input) }
+    } catch (error) {
+      return { ok: false, error: structuredResidentProvisionError(error, serviceInvoked) }
+    }
+  })
   handle(
     IPC.prepareResidentEnd,
     residentEndPreparation,
@@ -327,5 +353,31 @@ function assertBoundedIpcInput(value: unknown): void {
   }
   if (Buffer.byteLength(serialized, 'utf8') > 512 * 1024) {
     throw new ControlError('ipc.payload_limit', 'The native request payload is too large.')
+  }
+}
+
+function structuredResidentProvisionError(error: unknown, serviceInvoked: boolean) {
+  const normalizedError = !serviceInvoked && !(error instanceof ControlError)
+    ? new ControlError('ipc.invalid_payload', 'The native request payload is invalid.', { cause: error })
+    : error
+  const structured = toStructuredError(normalizedError)
+  const explicitDurability = normalizedError instanceof ControlError &&
+    typeof normalizedError.details?.durableOperationPossible === 'boolean'
+    ? normalizedError.details.durableOperationPossible
+    : undefined
+  const durableOperationPossible = serviceInvoked
+    ? explicitDurability ?? true
+    : false
+  const details = Object.fromEntries(
+    Object.entries(structured.details ?? {})
+      .filter(([key]) => key !== 'durableOperationPossible')
+      .slice(0, 31),
+  )
+  return {
+    ...structured,
+    details: {
+      durableOperationPossible,
+      ...details,
+    },
   }
 }

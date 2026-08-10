@@ -116,6 +116,25 @@ const targets = [
     expectedText: 'Choose workspace folder',
   },
   {
+    name: 'ssh-registered-workspace-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'ssh-registered-workspace',
+    expectedText: 'New resident thread in this workspace',
+    expectedRegisteredProject: 'Prime Continuim',
+    openRegisteredResidentDialog: true,
+  },
+  {
+    name: 'ssh-registered-workspace-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'ssh-registered-workspace',
+    expectedText: 'New resident thread in this workspace',
+    expectedRegisteredProject: 'Prime Continuim',
+    openRegisteredResidentDialog: true,
+    expectShortRegisteredResidentDialog: true,
+  },
+  {
     name: 'resident-dialog-390',
     width: 390,
     height: 844,
@@ -284,6 +303,7 @@ async function capture(target, rendererOrigin) {
     },
   })
   try {
+    let registeredWorkspaceTriggerEvidence
     browserWindow.setContentSize(target.width, target.height, false)
     browserWindow.webContents.setUserAgent(visualQaUserAgent)
     const rendererUrl = new URL('/', rendererOrigin)
@@ -379,6 +399,177 @@ async function capture(target, rendererOrigin) {
         invariant(shortModelScrollEvidence.ready, `${target.name} did not expose an enabled model action to its catalog scroller`)
         await delay(75)
       }
+    }
+    if (target.openRegisteredResidentDialog) {
+      // Exercise the compact workbench exactly as a person would: open the
+      // mobile sidebar, use the visible saved-workspace action, and stop once
+      // the non-executing visual fixture has opened the confirmation dialog.
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+      const sidebarToggleEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = document.querySelector('button[aria-label="Open sidebar"]')
+        const rect = button?.getBoundingClientRect()
+        const style = button ? window.getComputedStyle(button) : undefined
+        const visible = Boolean(
+          button instanceof HTMLButtonElement &&
+          !button.disabled &&
+          style &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.left >= 0 &&
+          rect.right <= window.innerWidth &&
+          rect.top >= 0 &&
+          rect.bottom <= window.innerHeight
+        )
+        if (button instanceof HTMLButtonElement && visible) button.click()
+        return { found: button instanceof HTMLButtonElement, enabled: !button?.disabled, visible }
+      })()`)
+      invariant(
+        sidebarToggleEvidence.visible,
+        `${target.name} did not expose the visible Open sidebar control: ${JSON.stringify(sidebarToggleEvidence)}`,
+      )
+      const sidebarDeadline = Date.now() + 10_000
+      while (Date.now() < sidebarDeadline) {
+        const open = await browserWindow.webContents.executeJavaScript(
+          `document.querySelector('.app-shell')?.getAttribute('data-sidebar-open') === 'true'`,
+        )
+        if (open) break
+        await delay(25)
+      }
+      await delay(250)
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const button = [...(document.querySelector('#project-sidebar')?.querySelectorAll('button') ?? [])]
+          .find((candidate) => candidate.textContent?.trim() === 'New resident thread in this workspace')
+        if (!(button instanceof HTMLButtonElement)) return false
+        button.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+        return true
+      })()`)
+      await delay(75)
+      registeredWorkspaceTriggerEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
+        const sidebar = document.querySelector('#project-sidebar')
+        const catalog = sidebar?.querySelector('.sidebar__scroll')
+        const workbench = document.querySelector('.transcript__scroller')
+        const button = [...(sidebar?.querySelectorAll('button') ?? [])]
+          .find((candidate) => candidate.textContent?.trim() === 'New resident thread in this workspace')
+        const helper = sidebar?.querySelector('#registered-resident-action-description')
+        const sidebarRect = sidebar?.getBoundingClientRect()
+        const catalogRect = catalog?.getBoundingClientRect()
+        const workbenchRect = workbench?.getBoundingClientRect()
+        const buttonRect = button?.getBoundingClientRect()
+        const buttonStyle = button ? window.getComputedStyle(button) : undefined
+        const catalogStyle = catalog ? window.getComputedStyle(catalog) : undefined
+        const workbenchStyle = workbench ? window.getComputedStyle(workbench) : undefined
+        const actionCopy = [button?.textContent?.trim(), helper?.textContent?.trim()].filter(Boolean).join(' ')
+        const actionVisible = Boolean(
+          button instanceof HTMLButtonElement &&
+          !button.disabled &&
+          buttonStyle &&
+          buttonStyle.display !== 'none' &&
+          buttonStyle.visibility !== 'hidden' &&
+          buttonRect &&
+          catalogRect &&
+          buttonRect.width > 0 &&
+          buttonRect.height > 0 &&
+          buttonRect.left >= Math.max(0, catalogRect.left) - 1 &&
+          buttonRect.right <= Math.min(window.innerWidth, catalogRect.right) + 1 &&
+          buttonRect.top >= Math.max(0, catalogRect.top) - 1 &&
+          buttonRect.bottom <= Math.min(window.innerHeight, catalogRect.bottom) + 1
+        )
+        const bounded = (rect) => Boolean(
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.left >= 0 &&
+          rect.right <= window.innerWidth &&
+          rect.top >= 0 &&
+          rect.bottom <= window.innerHeight
+        )
+        if (button instanceof HTMLButtonElement && actionVisible) button.click()
+        return {
+          actionVisible,
+          actionEnabled: button instanceof HTMLButtonElement && !button.disabled,
+          actionText: button?.textContent?.trim(),
+          helperText: helper?.textContent?.trim(),
+          forbiddenActionCopyPresent: /(?:\\bpath\\b|\\bfolder\\b|picker|handoff|mobile)/i.test(actionCopy),
+          sidebarBounded: bounded(sidebarRect),
+          catalogBounded: bounded(catalogRect),
+          catalogOverflowY: catalogStyle?.overflowY,
+          catalogClientHeight: catalog?.clientHeight,
+          catalogScrollHeight: catalog?.scrollHeight,
+          workbenchBounded: bounded(workbenchRect),
+          workbenchOverflowY: workbenchStyle?.overflowY,
+          workbenchClientHeight: workbench?.clientHeight,
+          workbenchScrollHeight: workbench?.scrollHeight,
+          catalogScrollTop: catalog?.scrollTop,
+          catalogRect: catalogRect ? {
+            left: catalogRect.left,
+            right: catalogRect.right,
+            top: catalogRect.top,
+            bottom: catalogRect.bottom,
+          } : undefined,
+          actionRect: buttonRect ? {
+            left: buttonRect.left,
+            right: buttonRect.right,
+            top: buttonRect.top,
+            bottom: buttonRect.bottom,
+          } : undefined,
+        }
+      })()`)
+      invariant(
+        registeredWorkspaceTriggerEvidence.actionVisible &&
+        registeredWorkspaceTriggerEvidence.actionEnabled &&
+        registeredWorkspaceTriggerEvidence.actionText === 'New resident thread in this workspace',
+        `${target.name} did not expose the exact saved-workspace action: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
+      )
+      invariant(
+        registeredWorkspaceTriggerEvidence.helperText === 'Uses this saved host-owned workspace. You’ll name only the new thread.' &&
+        !registeredWorkspaceTriggerEvidence.forbiddenActionCopyPresent,
+        `${target.name} did not preserve the exact path-free saved-workspace helper: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
+      )
+      invariant(
+        registeredWorkspaceTriggerEvidence.sidebarBounded &&
+        registeredWorkspaceTriggerEvidence.catalogBounded &&
+        ['auto', 'scroll'].includes(registeredWorkspaceTriggerEvidence.catalogOverflowY) &&
+        registeredWorkspaceTriggerEvidence.workbenchBounded &&
+        ['auto', 'scroll'].includes(registeredWorkspaceTriggerEvidence.workbenchOverflowY),
+        `${target.name} did not preserve bounded catalog and workbench scrollers: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
+      )
+      if (target.expectShortRegisteredResidentDialog) {
+        invariant(
+          registeredWorkspaceTriggerEvidence.catalogScrollHeight > registeredWorkspaceTriggerEvidence.catalogClientHeight,
+          `${target.name} did not exercise real short-height catalog overflow: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
+        )
+      }
+      const dialogDeadline = Date.now() + 10_000
+      while (Date.now() < dialogDeadline) {
+        const open = await browserWindow.webContents.executeJavaScript(
+          `Boolean(document.querySelector('dialog[open][aria-labelledby="resident-provision-title"]'))`,
+        )
+        if (open) break
+        await delay(25)
+      }
+      // Wait past the sheet transition so the real Electron compositor captures
+      // the final focused-field and scroll positions without submitting.
+      await delay(300)
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const dialog = document.querySelector('dialog[open][aria-labelledby="resident-provision-title"]')
+        const scroller = dialog?.querySelector('.sheet__scroll')
+        const fixedProject = dialog?.querySelector('.form-field__fixed-value')
+        const threadTitle = dialog?.querySelector('#resident-thread-title')
+        if (!(scroller instanceof HTMLElement) || !fixedProject || !threadTitle) return false
+        const scrollerRect = scroller.getBoundingClientRect()
+        const fixedRect = fixedProject.getBoundingClientRect()
+        const titleRect = threadTitle.getBoundingClientRect()
+        const fixedTop = fixedRect.top - scrollerRect.top + scroller.scrollTop
+        const titleBottom = titleRect.bottom - scrollerRect.top + scroller.scrollTop
+        const minimumScrollTop = Math.max(0, titleBottom - scroller.clientHeight)
+        if (minimumScrollTop <= fixedTop) scroller.scrollTop = minimumScrollTop
+        return true
+      })()`)
+      await delay(75)
     }
     if (target.openResidentDialog) {
       // Chromium does not composite top-layer dialogs into capturePage() for
@@ -507,8 +698,41 @@ async function capture(target, rendererOrigin) {
       const residentDialogRect = residentDialog?.getBoundingClientRect()
       const residentDialogScroll = residentDialog?.querySelector('.sheet__scroll')
       const residentDialogScrollStyle = residentDialogScroll ? window.getComputedStyle(residentDialogScroll) : undefined
+      const residentDialogScrollRect = residentDialogScroll?.getBoundingClientRect()
       const residentDialogFooter = residentDialog?.querySelector('.sheet__footer')
       const residentDialogFooterRect = residentDialogFooter?.getBoundingClientRect()
+      const residentDialogForm = residentDialog?.querySelector('form')
+      const residentDialogInputs = [...(residentDialog?.querySelectorAll('input:not([type="hidden"])') ?? [])]
+      const residentThreadTitle = residentDialog?.querySelector('#resident-thread-title')
+      const residentThreadTitleRect = residentThreadTitle?.getBoundingClientRect()
+      const residentFixedProject = residentDialog?.querySelector('.form-field__fixed-value')
+      const residentFixedProjectRect = residentFixedProject?.getBoundingClientRect()
+      const residentProvisionAction = [...(residentDialog?.querySelectorAll('.sheet__footer button') ?? [])]
+        .find((candidate) => candidate.textContent?.trim() === 'Create resident thread')
+      const residentProvisionActionRect = residentProvisionAction?.getBoundingClientRect()
+      const residentDialogError = residentDialog?.querySelector('#resident-provision-error')
+      const residentDialogDescription = residentDialog?.querySelector('#resident-provision-description')
+      const residentPrivacy = residentDialog?.querySelector('.resident-provision__privacy')
+      const residentSavedProjectLabel = residentDialog?.querySelector('.form-field__label')
+      const residentThreadTitleLabel = residentDialog?.querySelector('label[for="resident-thread-title"]')
+      const backgroundCatalog = document.querySelector('.sidebar__scroll')
+      const backgroundWorkbench = document.querySelector('.transcript__scroller')
+      const backgroundCatalogStyle = backgroundCatalog ? window.getComputedStyle(backgroundCatalog) : undefined
+      const backgroundWorkbenchStyle = backgroundWorkbench ? window.getComputedStyle(backgroundWorkbench) : undefined
+      const relevantRegisteredCopy = [
+        document.querySelector('.sidebar__registered-resident')?.textContent,
+        residentDialog?.textContent,
+      ].filter(Boolean).join(' ')
+      const visibleWithin = (rect, containerRect) => Boolean(
+        rect &&
+        containerRect &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.left >= Math.max(0, containerRect.left) &&
+        rect.right <= Math.min(window.innerWidth, containerRect.right) &&
+        rect.top >= Math.max(0, containerRect.top) &&
+        rect.bottom <= Math.min(window.innerHeight, containerRect.bottom)
+      )
       const residentEndDialog = document.querySelector('dialog[aria-labelledby="resident-end-title"]')
       const residentEndDialogScroll = residentEndDialog?.querySelector('.sheet__scroll')
       const residentEndDialogScrollStyle = residentEndDialogScroll ? window.getComputedStyle(residentEndDialogScroll) : undefined
@@ -557,6 +781,45 @@ async function capture(target, rendererOrigin) {
           height: residentDialogRect.height,
         } : undefined,
         residentDialogText: residentDialog?.textContent?.trim(),
+        registeredResidentDialogExactCopy: Boolean(
+          residentDialogDescription?.textContent?.trim() ===
+            'Prime Agent will start this thread in the saved host-owned workspace. Only the new thread title can be changed here.' &&
+          residentSavedProjectLabel?.textContent?.trim() === 'Saved project' &&
+          residentThreadTitleLabel?.textContent?.trim() === 'Thread title' &&
+          residentPrivacy?.textContent?.trim() ===
+            'Prime Continuim uses the saved project and workspace identity reported by this verified SSH host. No filesystem location is selected or shown.'
+        ),
+        registeredResidentForbiddenCopyPresent: /(?:\\bpath\\b|\\bfolder\\b|picker|handoff|mobile)/i.test(relevantRegisteredCopy),
+        residentFixedProjectText: residentFixedProject?.textContent?.trim(),
+        residentFixedProjectVisible: visibleWithin(residentFixedProjectRect, residentDialogScrollRect),
+        residentThreadInputCount: residentDialogInputs.length,
+        residentThreadTitleOnlyInput: Boolean(
+          residentDialogInputs.length === 1 &&
+          residentThreadTitle instanceof HTMLInputElement &&
+          residentDialogInputs[0] === residentThreadTitle &&
+          !residentThreadTitle.disabled
+        ),
+        residentThreadTitleVisible: visibleWithin(residentThreadTitleRect, residentDialogScrollRect),
+        residentProvisionActionText: residentProvisionAction?.textContent?.trim(),
+        residentProvisionActionEnabled: Boolean(
+          residentProvisionAction instanceof HTMLButtonElement && !residentProvisionAction.disabled
+        ),
+        residentProvisionActionVisible: visibleWithin(residentProvisionActionRect, residentDialogFooterRect),
+        residentProvisionUnsubmitted: Boolean(
+          residentDialogForm?.getAttribute('aria-busy') === 'false' &&
+          !residentDialogError?.textContent?.trim() &&
+          residentProvisionAction instanceof HTMLButtonElement &&
+          !residentProvisionAction.disabled
+        ),
+        residentDialogScrollBounded: visibleWithin(residentDialogScrollRect, residentDialogRect),
+        residentDialogScrollOverflowY: residentDialogScrollStyle?.overflowY,
+        residentDialogScrollClientHeight: residentDialogScroll?.clientHeight,
+        residentDialogScrollHeight: residentDialogScroll?.scrollHeight,
+        residentDialogScrollTop: residentDialogScroll?.scrollTop,
+        residentDialogOuterScrollTop: residentDialog?.scrollTop,
+        residentDialogFormScrollTop: residentDialogForm?.scrollTop,
+        residentBackgroundCatalogLocked: backgroundCatalogStyle?.overflowY === 'hidden',
+        residentBackgroundWorkbenchLocked: backgroundWorkbenchStyle?.overflowY === 'hidden',
         residentDialogContentReachable: Boolean(
           residentDialogScroll &&
           residentDialogScrollStyle &&
@@ -622,6 +885,9 @@ async function capture(target, rendererOrigin) {
         hudHostTransparent: bodyStyle.backgroundColor === 'rgba(0, 0, 0, 0)' && rootStyle.backgroundColor === 'rgba(0, 0, 0, 0)',
       }
     })()`)
+    if (registeredWorkspaceTriggerEvidence) {
+      stateEvidence.registeredWorkspaceTriggerEvidence = registeredWorkspaceTriggerEvidence
+    }
     invariant(
       stateEvidence.expectedTextPresent,
       `${target.name} did not render its expected resident-state copy: ${JSON.stringify(stateEvidence)}`,
@@ -634,6 +900,45 @@ async function capture(target, rendererOrigin) {
     }
     if (target.openResidentDialog) {
       invariant(stateEvidence.residentDialogOpen, `${target.name} did not open the resident setup dialog`)
+    }
+    if (target.openRegisteredResidentDialog) {
+      invariant(
+        stateEvidence.residentDialogOpen &&
+        stateEvidence.residentDialogModal &&
+        stateEvidence.registeredResidentDialogExactCopy &&
+        !stateEvidence.registeredResidentForbiddenCopyPresent,
+        `${target.name} did not preserve the exact path-free registered-workspace dialog: ${JSON.stringify(stateEvidence)}`,
+      )
+      invariant(
+        stateEvidence.residentFixedProjectText === target.expectedRegisteredProject &&
+        stateEvidence.residentFixedProjectVisible &&
+        stateEvidence.residentThreadTitleOnlyInput &&
+        stateEvidence.residentThreadTitleVisible,
+        `${target.name} did not keep the fixed project and sole thread-title field visible: ${JSON.stringify(stateEvidence)}`,
+      )
+      invariant(
+        stateEvidence.residentProvisionActionText === 'Create resident thread' &&
+        stateEvidence.residentProvisionActionEnabled &&
+        stateEvidence.residentProvisionActionVisible &&
+        stateEvidence.residentProvisionUnsubmitted,
+        `${target.name} hid, disabled, or invoked the registered-workspace footer action: ${JSON.stringify(stateEvidence)}`,
+      )
+      invariant(
+        stateEvidence.residentDialogContentReachable &&
+        stateEvidence.residentDialogScrollBounded &&
+        ['auto', 'scroll'].includes(stateEvidence.residentDialogScrollOverflowY) &&
+        stateEvidence.residentDialogOuterScrollTop === 0 &&
+        stateEvidence.residentDialogFormScrollTop === 0 &&
+        stateEvidence.residentBackgroundCatalogLocked &&
+        stateEvidence.residentBackgroundWorkbenchLocked,
+        `${target.name} did not keep dialog scrolling bounded and background scrolling locked: ${JSON.stringify(stateEvidence)}`,
+      )
+    }
+    if (target.expectShortRegisteredResidentDialog) {
+      invariant(
+        stateEvidence.residentDialogScrollHeight > stateEvidence.residentDialogScrollClientHeight,
+        `${target.name} did not exercise real short-height dialog overflow: ${JSON.stringify(stateEvidence)}`,
+      )
     }
     if (target.expectShortResidentDialog) {
       invariant(stateEvidence.residentDialogContentReachable, `${target.name} did not keep the resident form and actions reachable`)
@@ -695,7 +1000,16 @@ async function main() {
   const keeperWindow = new BrowserWindow({ show: false, width: 1, height: 1 })
   try {
     const results = []
-    for (const target of targets) results.push(await capture(target, rendererServer.origin))
+    for (const target of targets) {
+      try {
+        results.push(await capture(target, rendererServer.origin))
+      } catch (error) {
+        throw new Error(
+          `Visual capture target ${target.name} failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+          { cause: error },
+        )
+      }
+    }
     return results
   } finally {
     if (!keeperWindow.isDestroyed()) keeperWindow.destroy()

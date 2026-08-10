@@ -8,6 +8,7 @@ import App from '../../src/renderer/src/App'
 import {
   createPreviewRendererApi,
   previewSnapshot,
+  ResidentProvisionError,
   StaleHostAuthorityError,
   type HostRuntimeReadiness,
   type LocalSetupSummary,
@@ -601,6 +602,199 @@ function createResidentProvisioningApi(operation?: ResidentLifecycleOperationSum
   return api
 }
 
+function createRegisteredWorkspaceHarness(options: {
+  provisionEnabled?: boolean
+  endEnabled?: boolean
+  activationRequired?: boolean
+  connection?: 'online' | 'reconnecting'
+  connectionPath?: 'SSH' | 'Relay'
+  residentActive?: boolean
+} = {}) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  let snapshot = structuredClone(previewSnapshot)
+  const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-seamless')!
+  const host = snapshot.hosts.find((candidate) => candidate.id === 'host-devbox')!
+  thread.status = 'idle'
+  thread.workspaceId = 'workspace-prime-ssh'
+  thread.executionGenerationId = 'generation-prime-ssh'
+  host.connection = options.connection ?? 'online'
+  host.connectionPath = options.connectionPath ?? 'SSH'
+  host.activationRequired = options.activationRequired
+  snapshot.selectedThreadId = thread.id
+  snapshot.selectedProjectId = thread.projectId
+  snapshot.runtime.session = {
+    ...snapshot.runtime.session!,
+    residency: options.residentActive ? 'resident' : 'client_owned',
+    ...(options.residentActive
+      ? {
+          activeSessionId: 'active-prime-ssh',
+          sessionId: 'session-prime-ssh',
+        }
+      : {
+          activeSessionId: undefined,
+          sessionId: undefined,
+        }),
+    isStreaming: false,
+    isCompacting: false,
+    isBashRunning: false,
+    queuedActionCount: 0,
+  }
+  snapshot.runtime.queue = { pendingCount: 0, paused: false }
+  snapshot.residentLifecycleOperations = []
+  snapshot.operations = {
+    ...snapshot.operations,
+    submitCommands: true,
+    startResidentTurn: true,
+    stopResidentTurn: false,
+    provisionResident: options.provisionEnabled === false ? undefined : true,
+    endResident: options.endEnabled === false ? undefined : true,
+  }
+  snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+  const listeners = new Set<(next: WorkbenchSnapshot) => void>()
+  api.loadWorkbench = vi.fn(async () => snapshot)
+  api.subscribe = (listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  }
+  api.selectResidentWorkspace = vi.fn(async (input) => {
+    if (input?.kind !== 'registered_workspace') throw new Error('Expected one saved-workspace reference')
+    return {
+      selectionToken: 'registered-selection-one',
+      operationId: 'registered-operation-one',
+      expectedHostId: 'host-devbox',
+      suggestedName: 'Prime Continuim',
+      expiresAt: '2099-08-05T20:05:00.000Z',
+      ...input,
+    }
+  })
+  api.provisionResident = vi.fn(async () => ({
+    version: 1 as const,
+    kind: 'provision' as const,
+    operationId: 'registered-operation-one',
+    phase: 'prepared' as const,
+    expectedHostId: 'host-devbox',
+    projectId: thread.projectId,
+    workspaceId: thread.workspaceId!,
+    threadId: 'registered-new-thread',
+    executionGenerationId: 'registered-new-generation',
+    preparedAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+  }))
+  api.prepareResidentEnd = vi.fn(async (input) => ({
+    confirmationToken: 'registered-end-confirmation-one',
+    operationId: 'registered-end-operation-one',
+    expectedHostId: input.expectedHostId,
+    threadId: input.threadId,
+    executionGenerationId: input.executionGenerationId,
+    expiresAt: '2099-08-05T20:05:00.000Z',
+  }))
+  api.endResident = vi.fn(async () => ({
+    version: 1 as const,
+    kind: 'end' as const,
+    operationId: 'registered-end-operation-one',
+    phase: 'ending' as const,
+    expectedHostId: 'host-devbox',
+    projectId: thread.projectId,
+    workspaceId: thread.workspaceId!,
+    threadId: thread.remoteId ?? thread.id,
+    executionGenerationId: thread.executionGenerationId!,
+    preparedAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:01.000Z',
+  }))
+  api.residentLifecycleStatus = vi.fn(async () => null)
+  return {
+    api: api as RendererApi,
+    getSnapshot: () => snapshot,
+    publish(next: WorkbenchSnapshot) {
+      snapshot = next
+      listeners.forEach((listener) => listener(next))
+    },
+  }
+}
+
+function registeredSiblingProvisionOperation(
+  phase: 'prepared' | 'committed' | 'none' = 'committed',
+  state: ResidentLifecycleOperationSummary['state'] = phase === 'committed' ? 'terminal' : 'submitted',
+): ResidentLifecycleOperationSummary {
+  return {
+    kind: 'provision',
+    provisionMode: 'registered_workspace',
+    operationId: 'registered-sibling-operation',
+    expectedHostId: 'host-devbox',
+    projectId: 'project-prime',
+    workspaceId: 'workspace-prime-ssh',
+    referenceThreadId: 'thread-seamless',
+    referenceExecutionGenerationId: 'generation-prime-ssh',
+    threadId: 'registered-sibling-thread',
+    executionGenerationId: 'registered-sibling-generation',
+    projectDisplayName: 'Prime Continuim',
+    threadTitle: 'Sibling resident',
+    createdAt: '2026-08-05T20:00:00.000Z',
+    updatedAt: '2026-08-05T20:00:02.000Z',
+    state,
+    ...(phase === 'none'
+      ? {}
+      : {
+          lastStatus: {
+            version: 1,
+            kind: 'provision',
+            operationId: 'registered-sibling-operation',
+            phase,
+            expectedHostId: 'host-devbox',
+            projectId: 'project-prime',
+            workspaceId: 'workspace-prime-ssh',
+            threadId: 'registered-sibling-thread',
+            executionGenerationId: 'registered-sibling-generation',
+            preparedAt: '2026-08-05T20:00:00.000Z',
+            updatedAt: '2026-08-05T20:00:02.000Z',
+            ...(phase === 'committed' ? { terminalAt: '2026-08-05T20:00:02.000Z' } : {}),
+          },
+        }),
+  }
+}
+
+function registeredWorkspaceEndOperation(
+  phase: 'ending' | 'completed',
+  target: 'selected' | 'sibling' = 'sibling',
+): ResidentLifecycleOperationSummary {
+  const threadId = target === 'selected' ? 'thread-seamless' : 'registered-sibling-thread'
+  const executionGenerationId = target === 'selected'
+    ? 'generation-prime-ssh'
+    : 'registered-sibling-generation'
+  return {
+    kind: 'end',
+    operationId: target === 'selected' ? 'registered-end-operation-one' : 'registered-sibling-end-operation',
+    expectedHostId: 'host-devbox',
+    projectId: 'project-prime',
+    workspaceId: 'workspace-prime-ssh',
+    threadId,
+    executionGenerationId,
+    sourceCursor: {
+      threadId,
+      executionGenerationId,
+      generation: 'registered-end-daemon-generation',
+      sequence: 7,
+    },
+    createdAt: '2026-08-05T20:00:03.000Z',
+    updatedAt: '2026-08-05T20:00:04.000Z',
+    state: phase === 'completed' ? 'terminal' : 'submitted',
+    lastStatus: {
+      version: 1,
+      kind: 'end',
+      operationId: target === 'selected' ? 'registered-end-operation-one' : 'registered-sibling-end-operation',
+      phase,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId,
+      executionGenerationId,
+      preparedAt: '2026-08-05T20:00:03.000Z',
+      updatedAt: '2026-08-05T20:00:04.000Z',
+      ...(phase === 'completed' ? { terminalAt: '2026-08-05T20:00:04.000Z' } : {}),
+    },
+  }
+}
+
 function createLocalSetupHarness(
   initialSetup: LocalSetupSummary,
   options: { lifecycleOperations?: ResidentLifecycleOperationSummary[] } = {},
@@ -721,6 +915,7 @@ function createResidentEndApi(operation?: ResidentLifecycleOperationSummary) {
       startResidentTurn: !operation,
       stopResidentTurn: false,
       provisionResident: true,
+      endResident: true,
     }
     snapshot.composerReceipt = operation
       ? operation.lastStatus?.phase === 'quarantined'
@@ -768,6 +963,7 @@ afterEach(() => {
   cleanup()
   window.history.replaceState({}, '', '/')
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1_024 })
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined })
 })
@@ -1122,8 +1318,15 @@ describe('Prime Continuim renderer', () => {
     expect(api.endResident).not.toHaveBeenCalled()
   })
 
-  it('keeps a quarantined resident end check-only with a copyable path-free diagnostic', async () => {
+  it('keeps a quarantined resident end check-only and exposes a keyboard-copy fallback when clipboard access fails', async () => {
     const user = userEvent.setup()
+    const writeText = vi.fn(async () => {
+      throw new Error('Clipboard denied')
+    })
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
     const operation = {
       ...residentEndOperation('terminal'),
       updatedAt: '2026-08-05T20:00:02.000Z',
@@ -1142,10 +1345,626 @@ describe('Prime Continuim renderer', () => {
     expect(within(card).getByText(/will not send another kill/i)).toBeVisible()
     expect(within(card).queryByRole('button', { name: /review end/i })).not.toBeInTheDocument()
     const copy = within(card).getByRole('button', { name: 'Copy diagnostic' })
-    await user.click(copy)
+    copy.focus()
+    await user.keyboard('{Enter}')
+    expect(await within(card).findByRole('alert')).toHaveTextContent(/Unable to copy the diagnostic.*copy it manually.*Prime Continuim support/i)
+    const diagnostic = within(card).getByRole('textbox', { name: 'Resident end diagnostic' })
+    await waitFor(() => expect(diagnostic).toHaveFocus())
+    expect((diagnostic as HTMLTextAreaElement).value).toContain('Quarantined from: kill_dispatching')
+    expect((diagnostic as HTMLTextAreaElement).selectionStart).toBe(0)
+    expect((diagnostic as HTMLTextAreaElement).selectionEnd).toBe((diagnostic as HTMLTextAreaElement).value.length)
+    expect(writeText).toHaveBeenCalledOnce()
     expect(api.prepareResidentEnd).not.toHaveBeenCalled()
     expect(api.endResident).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: /outcome unknown/i })).toBeDisabled()
+  })
+
+  it('creates a resident thread from the exact saved SSH workspace with one editable field at 320x256', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 256 })
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    render(<App api={harness.api} />)
+
+    const create = await screen.findByRole('button', { name: 'New resident thread in this workspace' })
+    expect(screen.getByText(/uses this saved host-owned workspace/i)).toBeVisible()
+    create.focus()
+    await user.keyboard('{Enter}')
+    expect(harness.api.selectResidentWorkspace).toHaveBeenCalledWith({
+      kind: 'registered_workspace',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      referenceThreadId: 'thread-seamless',
+      referenceExecutionGenerationId: 'generation-prime-ssh',
+    })
+
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await waitFor(() => expect(within(dialog).getByRole('textbox', { name: 'Thread title' })).toHaveFocus())
+    expect(within(dialog).getByText('Saved project')).toBeVisible()
+    expect(within(dialog).getByText('Prime Continuim', { selector: '.form-field__fixed-value bdi' })).toBeVisible()
+    expect(within(dialog).queryByRole('textbox', { name: 'Project name' })).not.toBeInTheDocument()
+    expect(within(dialog).getAllByRole('textbox')).toHaveLength(1)
+    expect(dialog.textContent).not.toMatch(/folder picker|handoff|mobile/i)
+
+    const title = within(dialog).getByRole('textbox', { name: 'Thread title' })
+    await user.clear(title)
+    await user.type(title, 'Overnight verification')
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    expect(harness.api.provisionResident).toHaveBeenCalledWith({
+      selectionToken: 'registered-selection-one',
+      projectDisplayName: 'Prime Continuim',
+      threadTitle: 'Overnight verification',
+    })
+    expect(within(dialog).getByRole('status')).toHaveTextContent(/durably recorded/i)
+    expect(within(dialog).queryByText(/folder/i)).not.toBeInTheDocument()
+  })
+
+  it('shows End-first guidance instead of saved-workspace create while its exact resident authority is active', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness({ residentActive: true })
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
+    expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    expect(screen.getByRole('button', { name: 'End resident session…' })).toBeEnabled()
+  })
+
+  it('keeps status available while a committed sibling resident suppresses create in the same saved workspace', async () => {
+    const harness = createRegisteredWorkspaceHarness()
+    const occupied = structuredClone(harness.getSnapshot())
+    occupied.residentLifecycleOperations = [registeredSiblingProvisionOperation()]
+    harness.publish(occupied)
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
+    expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled()
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unresolved no-status saved-workspace setup status-only and suppresses fresh create', async () => {
+    const harness = createRegisteredWorkspaceHarness()
+    const occupied = structuredClone(harness.getSnapshot())
+    occupied.residentLifecycleOperations = [registeredSiblingProvisionOperation('none', 'outcome_unknown')]
+    harness.publish(occupied)
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByText(/earlier resident setup still holds this workspace/i)).toBeVisible()
+    expect(screen.getByText(/continue or inspect that setup below/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    const card = screen.getByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+  })
+
+  it.each(['prepared', 'quarantined'] as const)(
+    'keeps a %s saved-workspace setup ahead of fresh create with setup-recovery copy',
+    async (phase) => {
+      const harness = createRegisteredWorkspaceHarness()
+      const operation = registeredSiblingProvisionOperation('prepared', 'outcome_unknown')
+      if (phase === 'quarantined') {
+        operation.lastStatus = {
+          ...operation.lastStatus!,
+          phase,
+          quarantinedFrom: 'promotion_dispatching',
+          quarantineReason: 'external_outcome_unknown',
+        }
+      }
+      const occupied = structuredClone(harness.getSnapshot())
+      occupied.residentLifecycleOperations = [operation]
+      harness.publish(occupied)
+      render(<App api={harness.api} />)
+
+      expect(await screen.findByText(/earlier resident setup still holds this workspace/i)).toBeVisible()
+      expect(screen.getByText(/continue or inspect that setup below/i)).toBeVisible()
+      expect(screen.queryByText(/resident session already owns this workspace/i)).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+      expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['promoted_observed', 'projection_committed'] as const)(
+    'uses active-resident guidance after a saved-workspace setup reaches %s',
+    async (phase) => {
+      const harness = createRegisteredWorkspaceHarness()
+      const operation = registeredSiblingProvisionOperation('prepared', 'submitted')
+      operation.lastStatus = { ...operation.lastStatus!, phase }
+      const occupied = structuredClone(harness.getSnapshot())
+      occupied.residentLifecycleOperations = [operation]
+      harness.publish(occupied)
+      render(<App api={harness.api} />)
+
+      expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
+      expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+      expect(screen.queryByText(/earlier resident setup still holds this workspace/i)).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    },
+  )
+
+  it('releases saved-workspace create only after an exact completed sibling End is projected', async () => {
+    const harness = createRegisteredWorkspaceHarness()
+    const released = structuredClone(harness.getSnapshot())
+    released.residentLifecycleOperations = [
+      registeredSiblingProvisionOperation(),
+      registeredWorkspaceEndOperation('completed'),
+    ]
+    harness.publish(released)
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByRole('button', { name: 'New resident thread in this workspace' })).toBeEnabled()
+    expect(screen.queryByText(/owns this workspace|still holds this workspace/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps registered fresh create suppressed while exact pre-effect End review remains usable', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness({ residentActive: true })
+    const ending = structuredClone(harness.getSnapshot())
+    const operation = registeredWorkspaceEndOperation('ending', 'selected')
+    ending.residentLifecycleOperations = [operation]
+    ending.operations.provisionResident = undefined
+    ending.operations.endResident = true
+    harness.publish(ending)
+    render(<App api={harness.api} />)
+
+    expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    const review = screen.getByRole('button', { name: 'Review end again' })
+    expect(review).toBeEnabled()
+    await user.click(review)
+    expect(harness.api.prepareResidentEnd).toHaveBeenCalledWith(expect.objectContaining({
+      resumeOperationId: operation.operationId,
+      expectedHostId: operation.expectedHostId,
+      threadId: operation.threadId,
+      executionGenerationId: operation.executionGenerationId,
+    }))
+    expect(await screen.findByRole('dialog', { name: 'End resident session?' })).toBeVisible()
+  })
+
+  it('keeps a remote End recovery status-only until its exact resident thread is selected', async () => {
+    const harness = createRegisteredWorkspaceHarness({ provisionEnabled: false })
+    const changed = structuredClone(harness.getSnapshot())
+    const donor = changed.threads.find((thread) => thread.id === 'thread-seamless')!
+    changed.threads.push({
+      ...donor,
+      id: 'thread-other-remote',
+      remoteId: 'thread-other-remote',
+      workspaceId: 'workspace-other-remote',
+      executionGenerationId: 'generation-other-remote',
+      title: 'Other remote thread',
+    })
+    changed.selectedThreadId = 'thread-other-remote'
+    changed.residentLifecycleOperations = [registeredWorkspaceEndOperation('ending', 'selected')]
+    harness.publish(changed)
+    render(<App api={harness.api} />)
+
+    const card = await screen.findByRole('region', { name: 'End review required' })
+    expect(within(card).getByText(/open or select the resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(within(card).queryByRole('button', { name: 'Review end again' })).not.toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
+  })
+
+  it('reviews and submits permanent end for the exact saved SSH resident lineage', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness({ residentActive: true })
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    expect(harness.api.prepareResidentEnd).toHaveBeenCalledWith({
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'thread-seamless',
+      executionGenerationId: 'generation-prime-ssh',
+    })
+    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
+    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
+    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    expect(harness.api.endResident).toHaveBeenCalledWith({
+      confirmationToken: 'registered-end-confirmation-one',
+      consent: true,
+    })
+    expect(within(dialog).getByRole('status')).toHaveTextContent(/durably recorded/i)
+  })
+
+  it('closes a saved-workspace authorization when the selected source generation changes', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    render(<App api={harness.api} />)
+
+    const create = await screen.findByRole('button', { name: 'New resident thread in this workspace' })
+    await user.click(create)
+    expect(await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })).toBeVisible()
+    const changed = structuredClone(harness.getSnapshot())
+    changed.threads.find((thread) => thread.id === 'thread-seamless')!.executionGenerationId = 'generation-prime-ssh-next'
+    act(() => harness.publish(changed))
+    await waitFor(() => expect(screen.queryByRole('dialog', {
+      name: 'New resident thread in this workspace',
+    })).not.toBeInTheDocument())
+    expect(harness.api.provisionResident).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveFocus())
+  })
+
+  it.each([
+    ['missing capability', { provisionEnabled: false, endEnabled: false }],
+    ['relay path', { provisionEnabled: false, endEnabled: false, connectionPath: 'Relay' as const }],
+    ['unverified host', { provisionEnabled: false, endEnabled: false, activationRequired: true }],
+  ])('withholds saved-workspace create and end actions for a %s', async (_label, options) => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness(options)
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    expect(screen.queryByRole('button', { name: 'End resident session…' })).not.toBeInTheDocument()
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+    expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unknown remote setup status-first and hides workspace retry after capability withdrawal', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    expect(await within(dialog).findByText(/check the durable recovery state/i)).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+
+    const card = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(within(card).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
+    expect(card.textContent).not.toMatch(/folder|picker/i)
+
+    await user.click(within(card).getByRole('button', { name: 'Check status' }))
+    const retainedCard = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(within(retainedCard).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(harness.api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: 'host-devbox',
+      operationId: 'registered-operation-one',
+    })
+
+    const withdrawn = structuredClone(harness.getSnapshot())
+    withdrawn.operations.provisionResident = undefined
+    withdrawn.operations.endResident = undefined
+    act(() => harness.publish(withdrawn))
+    expect(within(retainedCard).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
+    expect(harness.api.provisionResident).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves exact saved-workspace lineage when fallback status becomes safely resumable', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    harness.api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-operation-one',
+      phase: 'prepared' as const,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+    }))
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+
+    const fallback = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    vi.mocked(harness.api.selectResidentWorkspace).mockClear()
+    await user.click(within(fallback).getByRole('button', { name: 'Check status' }))
+
+    const resumable = await screen.findByRole('region', { name: 'Setup paused safely' })
+    expect(within(resumable).getByText(/continue in the saved host-owned workspace/i)).toBeVisible()
+    expect(resumable.textContent).not.toMatch(/folder|picker|handoff|mobile/i)
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    await user.click(within(resumable).getByRole('button', { name: 'Use saved workspace' }))
+    expect(harness.api.selectResidentWorkspace).toHaveBeenCalledWith({
+      kind: 'registered_workspace',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      referenceThreadId: 'thread-seamless',
+      referenceExecutionGenerationId: 'generation-prime-ssh',
+      resumeOperationId: 'registered-operation-one',
+    })
+    expect(await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })).toBeVisible()
+    expect(harness.api.provisionResident).toHaveBeenCalledTimes(1)
+  })
+
+  it('retains ledger-missing saved-workspace recovery through Relay reconnecting authority and resumes the same lineage on SSH', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    harness.api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-operation-one',
+      phase: 'prepared' as const,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+    }))
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+    expect(await screen.findByRole('region', { name: 'Setup outcome needs inspection' })).toBeVisible()
+    vi.mocked(harness.api.selectResidentWorkspace).mockClear()
+
+    const reconnecting = structuredClone(harness.getSnapshot())
+    const reconnectingHost = reconnecting.hosts.find((host) => host.id === 'host-devbox')!
+    reconnectingHost.connection = 'reconnecting'
+    reconnectingHost.connectionPath = 'Relay'
+    reconnecting.operations.provisionResident = undefined
+    reconnecting.operations.endResident = undefined
+    act(() => harness.publish(reconnecting))
+
+    const retainedDuringMismatch = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(within(retainedDuringMismatch).getByRole('button', { name: 'Check status' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    expect(harness.api.residentLifecycleStatus).not.toHaveBeenCalled()
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+
+    const restored = structuredClone(harness.getSnapshot())
+    const restoredHost = restored.hosts.find((host) => host.id === 'host-devbox')!
+    restoredHost.connection = 'online'
+    restoredHost.connectionPath = 'SSH'
+    restored.operations.provisionResident = true
+    restored.operations.endResident = true
+    act(() => harness.publish(restored))
+
+    const restoredFallback = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    await user.click(within(restoredFallback).getByRole('button', { name: 'Check status' }))
+    expect(harness.api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: 'host-devbox',
+      operationId: 'registered-operation-one',
+    })
+    const resumable = await screen.findByRole('region', { name: 'Setup paused safely' })
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+    await user.click(within(resumable).getByRole('button', { name: 'Use saved workspace' }))
+    expect(harness.api.selectResidentWorkspace).toHaveBeenCalledWith({
+      kind: 'registered_workspace',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      referenceThreadId: 'thread-seamless',
+      referenceExecutionGenerationId: 'generation-prime-ssh',
+      resumeOperationId: 'registered-operation-one',
+    })
+  })
+
+  it('releases fresh create after a ledger-missing fallback proves exact clean completion', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    harness.api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-operation-one',
+      phase: 'completed' as const,
+      completionReason: 'owned_create_cleaned' as const,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      terminalAt: '2026-08-05T20:00:02.000Z',
+    }))
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+    const unresolved = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
+
+    await user.click(within(unresolved).getByRole('button', { name: 'Check status' }))
+
+    expect(await screen.findByRole('region', { name: 'Resident setup ended safely' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New resident thread in this workspace' })).toBeEnabled()
+  })
+
+  it('keeps fallback recovery status-only after selection moves away from its exact saved-workspace donor', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    harness.api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-operation-one',
+      phase: 'prepared' as const,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+    }))
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+
+    const changed = structuredClone(harness.getSnapshot())
+    const donor = changed.threads.find((thread) => thread.id === 'thread-seamless')!
+    const sibling = {
+      ...donor,
+      id: 'thread-sibling-fallback',
+      remoteId: 'thread-sibling-fallback',
+      workspaceId: 'workspace-sibling-fallback',
+      executionGenerationId: 'generation-sibling-fallback',
+      title: 'Sibling fallback workspace',
+    }
+    changed.threads.push(sibling)
+    changed.selectedThreadId = sibling.id
+    act(() => harness.publish(changed))
+
+    const fallback = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    await user.click(within(fallback).getByRole('button', { name: 'Check status' }))
+    const statusOnly = await screen.findByRole('region', { name: 'Setup paused safely' })
+    expect(within(statusOnly).getByText(/open the saved workspace and its original source thread/i)).toBeVisible()
+    expect(within(statusOnly).queryByRole('button', { name: 'Use saved workspace' })).not.toBeInTheDocument()
+    expect(within(statusOnly).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(harness.api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('explains a foreign workspace hold without misreporting lifecycle capability on fallback recovery', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    harness.api.provisionResident = vi.fn(async () => {
+      throw new Error('The remote resident setup outcome is not proven.')
+    })
+    harness.api.residentLifecycleStatus = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'registered-operation-one',
+      phase: 'prepared' as const,
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+    }))
+    render(<App api={harness.api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
+    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+    const unresolved = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    await user.click(within(unresolved).getByRole('button', { name: 'Check status' }))
+
+    const occupied = structuredClone(harness.getSnapshot())
+    occupied.residentLifecycleOperations = [registeredSiblingProvisionOperation()]
+    act(() => harness.publish(occupied))
+
+    const fallback = await screen.findByRole('region', { name: 'Setup paused safely' })
+    expect(within(fallback).getByText(/another resident session owns this workspace/i)).toBeVisible()
+    expect(within(fallback).getByText(/open or select the resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(fallback).not.toHaveTextContent(/lifecycle control is unavailable/i)
+    expect(within(fallback).queryByRole('button', { name: 'Use saved workspace' })).not.toBeInTheDocument()
+    expect(within(fallback).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(harness.api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('turns a safe remote recovery into status-only UI while the lifecycle capability is withdrawn', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness({ provisionEnabled: false, endEnabled: false })
+    const withdrawn = structuredClone(harness.getSnapshot())
+    withdrawn.residentLifecycleOperations = [{
+      kind: 'provision',
+      provisionMode: 'registered_workspace',
+      operationId: 'registered-recovery-one',
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      referenceThreadId: 'thread-seamless',
+      referenceExecutionGenerationId: 'generation-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      projectDisplayName: 'Prime Continuim',
+      threadTitle: 'Recovered remote thread',
+      createdAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+      state: 'requires_reselection',
+    }]
+    harness.publish(withdrawn)
+    render(<App api={harness.api} />)
+
+    const card = await screen.findByRole('region', { name: 'Workspace confirmation needed' })
+    expect(within(card).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
+    await user.click(within(card).getByRole('button', { name: 'Check status' }))
+    expect(harness.api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: 'host-devbox',
+      operationId: 'registered-recovery-one',
+    })
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
+    expect(harness.api.provisionResident).not.toHaveBeenCalled()
+  })
+
+  it('scopes a saved-workspace recovery action to its exact donor thread and generation', async () => {
+    const user = userEvent.setup()
+    const harness = createRegisteredWorkspaceHarness()
+    const changed = structuredClone(harness.getSnapshot())
+    const donor = changed.threads.find((thread) => thread.id === 'thread-seamless')!
+    const sibling = {
+      ...donor,
+      id: 'thread-sibling-workspace',
+      remoteId: 'thread-sibling-workspace',
+      workspaceId: 'workspace-sibling-ssh',
+      executionGenerationId: 'generation-sibling-ssh',
+      title: 'Sibling workspace',
+    }
+    changed.threads.push(sibling)
+    changed.selectedThreadId = sibling.id
+    changed.residentLifecycleOperations = [{
+      kind: 'provision',
+      provisionMode: 'registered_workspace',
+      operationId: 'registered-recovery-one',
+      expectedHostId: 'host-devbox',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-ssh',
+      referenceThreadId: 'thread-seamless',
+      referenceExecutionGenerationId: 'generation-prime-ssh',
+      threadId: 'registered-new-thread',
+      executionGenerationId: 'registered-new-generation',
+      projectDisplayName: 'Prime Continuim',
+      threadTitle: 'Recovered remote thread',
+      createdAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+      state: 'requires_reselection',
+    }]
+    harness.publish(changed)
+    render(<App api={harness.api} />)
+
+    const card = await screen.findByRole('region', { name: 'Workspace confirmation needed' })
+    expect(within(card).getByText(/open the saved workspace and its original source thread/i)).toBeVisible()
+    expect(within(card).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
+    await user.click(within(card).getByRole('button', { name: 'Check status' }))
+    expect(harness.api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: 'host-devbox',
+      operationId: 'registered-recovery-one',
+    })
+    expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
   })
 
   it('resumes only the exact lifecycle operation selected from a recovery card', async () => {
@@ -1756,8 +2575,10 @@ describe('Prime Continuim renderer', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
     await screen.findByRole('heading', { name: 'Setup outcome needs inspection' })
     await user.click(screen.getByRole('button', { name: 'Check status' }))
-    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Setup outcome needs inspection' })).not.toBeInTheDocument())
-    expect(screen.getByText('No durable setup was found. You can start a new resident thread.')).toBeInTheDocument()
+    const retainedFallback = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
+    expect(within(retainedFallback).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(within(retainedFallback).queryByRole('button', { name: 'Choose original folder' })).not.toBeInTheDocument()
+    expect(screen.getByText('No durable setup record was returned. Prime Continuim will not retry it; check this host again before starting another resident thread.')).toBeInTheDocument()
     expect(api.residentLifecycleStatus).toHaveBeenCalledTimes(1)
   })
 
@@ -1765,7 +2586,8 @@ describe('Prime Continuim renderer', () => {
     const user = userEvent.setup()
     const api = createResidentProvisioningApi()
     api.provisionResident = vi.fn(async () => {
-      throw Object.assign(new Error('Enter a project name between 1 and 255 characters.'), {
+      throw new ResidentProvisionError('Enter a project name between 1 and 255 characters.', {
+        durableOperationPossible: false,
         code: 'resident.provision_label_invalid',
       })
     })
@@ -1818,6 +2640,52 @@ describe('Prime Continuim renderer', () => {
     expect(writeText.mock.calls[0]?.[0]).toContain('RESIDENT_LIFECYCLE_QUARANTINED')
     expect(writeText.mock.calls[0]?.[0]).toContain('Operation ID: resident-operation-one')
     expect(writeText.mock.calls[0]?.[0]).not.toMatch(/[A-Z]:\\|\/Users\//)
+  })
+
+  it('announces and selects a fallback diagnostic when quarantined setup clipboard access fails', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn(async () => {
+      throw new Error('Clipboard denied')
+    })
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+    const api = createResidentProvisioningApi()
+    api.provisionResident = vi.fn(async () => ({
+      version: 1 as const,
+      kind: 'provision' as const,
+      operationId: 'resident-operation-one',
+      phase: 'quarantined' as const,
+      expectedHostId: 'host-local',
+      projectId: 'resident-project-one',
+      workspaceId: 'resident-workspace-one',
+      threadId: 'resident-thread-one',
+      executionGenerationId: 'resident-generation-one',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+      quarantinedFrom: 'promotion_dispatching' as const,
+      quarantineReason: 'external_outcome_unknown' as const,
+    }))
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
+
+    const card = await screen.findByRole('region', { name: 'Setup needs manual recovery' })
+    const copy = within(card).getByRole('button', { name: 'Copy diagnostic' })
+    copy.focus()
+    await user.keyboard('{Enter}')
+
+    expect(await within(card).findByRole('alert')).toHaveTextContent(/Unable to copy the diagnostic.*copy it manually.*Prime Continuim support/i)
+    const diagnostic = within(card).getByRole('textbox', { name: 'Resident setup diagnostic' })
+    await waitFor(() => expect(diagnostic).toHaveFocus())
+    expect((diagnostic as HTMLTextAreaElement).value).toContain('RESIDENT_LIFECYCLE_QUARANTINED')
+    expect((diagnostic as HTMLTextAreaElement).selectionStart).toBe(0)
+    expect((diagnostic as HTMLTextAreaElement).selectionEnd).toBe((diagnostic as HTMLTextAreaElement).value.length)
+    expect(writeText).toHaveBeenCalledOnce()
   })
 
   it('shows a copyable durable diagnostic with explicit no-retry guidance', async () => {

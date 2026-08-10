@@ -813,6 +813,28 @@ code,
   margin-block: 0.15rem 0.75rem;
 }
 
+.sidebar__registered-resident {
+  display: grid;
+  gap: 0.4rem;
+  margin-block: 0.15rem 0.8rem;
+}
+
+.sidebar__registered-resident .sidebar__create-resident {
+  min-block-size: 2.75rem;
+  margin: 0;
+  padding-block: 0.55rem;
+  text-align: start;
+  white-space: normal;
+}
+
+.sidebar__registered-resident > small {
+  padding-inline: 0.25rem;
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
 .sidebar .resident-recovery {
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0.55rem;
@@ -3256,6 +3278,25 @@ dialog.sheet--candidate-evaluation {
 .form-field input[aria-invalid="true"] {
   border-color: var(--color-danger);
   box-shadow: 0 0 0 2px var(--color-danger-soft);
+}
+
+.form-field__label {
+  color: var(--color-text-secondary);
+}
+
+.form-field__fixed-value {
+  display: flex;
+  align-items: center;
+  min-block-size: 2.75rem;
+  min-inline-size: 0;
+  padding-inline: 0.7rem;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 1rem;
+  font-weight: 520;
 }
 
 .form-field small {
@@ -6302,6 +6343,20 @@ body[data-surface="hud"] {
     line-clamp: 1;
   }
 
+  .sheet--resident .sheet__title-group p,
+  .sheet--resident .form-field small {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .sheet--resident .sheet__scroll,
   .sheet--resident-end .sheet__scroll,
   .sheet--candidate-evaluation .sheet__scroll {
@@ -6315,6 +6370,10 @@ body[data-surface="hud"] {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.5rem;
+  }
+
+  .sheet--resident .sheet__footer {
+    grid-template-columns: minmax(5.5rem, 2fr) minmax(10rem, 3fr);
   }
 
   .sheet--resident .sheet__footer .button,

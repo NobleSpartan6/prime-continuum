@@ -68,8 +68,8 @@ Agent 0.7.1, protocol 7, schema revision 13, schema ID
 capability. Normal disposal detaches. Only an explicit end-session operation may
 complete or kill the session.
 
-An explicit `resident.end` is a path-free trusted-local lifecycle request bound
-to the exact host, thread, execution generation, and reviewed
+An explicit `resident.end` is a path-free trusted-desktop or verified-SSH
+lifecycle request bound to the exact host, thread, execution generation, and reviewed
 `expectedSourceCursor`. Cursor drift rejects the request before the ending WAL,
 binding revocation, adapter acquisition, or daemon kill. Once admitted,
 HostStore durably records `ending`, revokes resident command authority, and
@@ -89,6 +89,30 @@ ended.`; and publishes only
 as the public resident disposition. No raw daemon identity is exposed. Restart
 and exact request replay return the same completed result without restoring a
 binding or session or invoking kill again.
+
+The local `resident.provision` method remains trusted-desktop only because its
+validated envelope contains a native-picker path. A verified SSH bridge instead
+uses `resident.provision.registered`: a strict path-free envelope naming one
+saved project/workspace and an exact reference thread/execution generation.
+HostStore resolves the private canonical path from its durable authority,
+reuses the exact saved project artifact, and durably reserves that workspace
+before lifecycle admission. A competing operation cannot create a second
+resident in the same canonical workspace. Relay callers remain denied, and the
+contract is not remote folder selection, installation, or cross-host handoff.
+The committed bootstrap and exact `prepared` lifecycle are separate atomic
+records written by one serialized Store operation. If the process stops between
+those writes, initialization settles any pending lifecycle retirement first and
+then reconstructs only the exact local `prepared` record; it never invokes the
+gateway or provider. Compaction releases a saved-workspace reservation only by
+an add-only marker bound to its exact retirement transaction. After that marker
+and the lifecycle-operation removals are durable, the still-pending retirement
+transaction deletes only its fully revalidated registered bootstrap record;
+restart converges on either side of that deletion. Local bootstrap records are
+not compacted. If the bootstrap registry is full, only admission of another
+registered workspace may synchronously finish one eligible exact registered
+terminal retirement and recheck capacity; local bootstrap admission never
+triggers that path. The Bloom-style retired-ID fence remains a conservative
+replay denial after bootstrap removal and is never release authority.
 
 Resident `prompt` and `abort` use a store-minted opaque dispatch lease. The
 exact command and binding are journaled before the lease becomes dispatchable,

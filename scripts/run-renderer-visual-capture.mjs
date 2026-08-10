@@ -22,6 +22,8 @@ const expectedTargets = [
   ['desktop-uncertain-320', 320, 704, 'nonretryable-uncertainty', undefined],
   ['desktop-end-pending-390', 390, 844, 'resident-end-pending', undefined],
   ['resident-start-1600', 1600, 1000, 'resident-start', undefined],
+  ['ssh-registered-workspace-dialog-390', 390, 844, 'ssh-registered-workspace', undefined],
+  ['ssh-registered-workspace-dialog-short-320', 320, 256, 'ssh-registered-workspace', undefined],
   ['resident-dialog-390', 390, 844, 'resident-start', undefined],
   ['resident-dialog-short-320', 320, 256, 'resident-start', undefined],
   ['resident-end-dialog-390', 390, 844, 'resident-end-review', undefined],
@@ -55,6 +57,7 @@ delete environment.ELECTRON_RUN_AS_NODE
 await Promise.all([
   rm(resultPath, { force: true }),
   rm(errorPath, { force: true }),
+  ...expectedTargets.map(([name]) => rm(join(outputDirectory, `${name}.png`), { force: true })),
   ...obsoleteCaptures.map((name) => rm(join(outputDirectory, name), { force: true })),
 ])
 
@@ -99,6 +102,40 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     (name.startsWith('desktop-') && name !== 'desktop-idle' && result.stateEvidence?.composerStatusVisible !== true) ||
     ((name === 'resident-dialog-390' || name === 'resident-dialog-short-320') && result.stateEvidence?.residentDialogOpen !== true) ||
     (name === 'resident-dialog-short-320' && result.stateEvidence?.residentDialogContentReachable !== true) ||
+    (name.startsWith('ssh-registered-workspace-dialog-') && (
+      result.stateEvidence?.residentDialogOpen !== true ||
+      result.stateEvidence?.residentDialogModal !== true ||
+      result.stateEvidence?.registeredResidentDialogExactCopy !== true ||
+      result.stateEvidence?.registeredResidentForbiddenCopyPresent !== false ||
+      result.stateEvidence?.residentFixedProjectText !== 'Prime Continuim' ||
+      result.stateEvidence?.residentFixedProjectVisible !== true ||
+      result.stateEvidence?.residentThreadInputCount !== 1 ||
+      result.stateEvidence?.residentThreadTitleOnlyInput !== true ||
+      result.stateEvidence?.residentThreadTitleVisible !== true ||
+      result.stateEvidence?.residentProvisionActionText !== 'Create resident thread' ||
+      result.stateEvidence?.residentProvisionActionEnabled !== true ||
+      result.stateEvidence?.residentProvisionActionVisible !== true ||
+      result.stateEvidence?.residentProvisionUnsubmitted !== true ||
+      result.stateEvidence?.residentDialogContentReachable !== true ||
+      result.stateEvidence?.residentDialogScrollBounded !== true ||
+      result.stateEvidence?.residentDialogOuterScrollTop !== 0 ||
+      result.stateEvidence?.residentDialogFormScrollTop !== 0 ||
+      result.stateEvidence?.residentBackgroundCatalogLocked !== true ||
+      result.stateEvidence?.residentBackgroundWorkbenchLocked !== true ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionVisible !== true ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionEnabled !== true ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionText !== 'New resident thread in this workspace' ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.helperText !== 'Uses this saved host-owned workspace. You’ll name only the new thread.' ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.forbiddenActionCopyPresent !== false ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.sidebarBounded !== true ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogBounded !== true ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.workbenchBounded !== true
+    )) ||
+    (name === 'ssh-registered-workspace-dialog-short-320' && (
+      !(result.stateEvidence?.residentDialogScrollHeight > result.stateEvidence?.residentDialogScrollClientHeight) ||
+      !(result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogScrollHeight >
+        result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogClientHeight)
+    )) ||
     ((name === 'resident-end-dialog-390' || name === 'resident-end-dialog-short-320') && result.stateEvidence?.residentEndDialogOpen !== true) ||
     (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
     ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||

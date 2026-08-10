@@ -233,6 +233,58 @@ describe('browser preview evidence labels', () => {
     expect(reconnectSnapshot.composerReceipt.message).toBe(`${previewPrefix} waiting for a fixture connection`)
   })
 
+  it('scopes the non-executing SSH registered-workspace fixture to one exact saved source', async () => {
+    const api = createPreviewRendererApi('ssh-registered-workspace')
+    expect(api.environment).toBe('native')
+
+    const load = api.loadWorkbench()
+    await vi.advanceTimersByTimeAsync(120)
+    const snapshot = await load
+    const project = snapshot.projects.find((candidate) => candidate.id === snapshot.selectedProjectId)
+    const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+    const host = snapshot.hosts.find((candidate) => candidate.id === thread?.hostId)
+
+    expect(project).toMatchObject({ id: 'project-prime', name: 'Prime Continuim' })
+    expect(thread).toMatchObject({
+      id: 'thread-seamless',
+      remoteId: 'thread-seamless-remote',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-devbox',
+      executionGenerationId: 'execution-registered-workspace-preview',
+      status: 'idle',
+    })
+    expect(host).toMatchObject({ id: 'host-devbox', kind: 'ssh', connection: 'online', connectionPath: 'SSH' })
+    expect(snapshot.operations).toMatchObject({ provisionResident: true, endResident: true })
+
+    const input = {
+      kind: 'registered_workspace' as const,
+      projectId: 'project-prime',
+      workspaceId: 'workspace-prime-devbox',
+      referenceThreadId: 'thread-seamless-remote',
+      referenceExecutionGenerationId: 'execution-registered-workspace-preview',
+    }
+    const selection = await api.selectResidentWorkspace(input)
+    expect(selection).toEqual({
+      ...input,
+      selectionToken: 'preview-registered-workspace-selection-token',
+      operationId: 'resident-preview-registered-create',
+      expectedHostId: 'host-devbox',
+      suggestedName: project?.name,
+      expiresAt: '2099-08-07T12:05:00.000Z',
+    })
+    expect(selection).not.toHaveProperty('path')
+
+    await expect(api.selectResidentWorkspace({
+      ...input,
+      referenceExecutionGenerationId: 'execution-stale-preview',
+    })).rejects.toThrow('exact internal visual-QA authority')
+    await expect(api.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: selection.suggestedName,
+      threadTitle: 'Visual QA resident thread',
+    })).rejects.toThrow('unavailable in the browser preview')
+  })
+
   it('scopes the non-executing candidate review fixture to its exact visual-QA authority', async () => {
     const api = createPreviewRendererApi('candidate-evaluation-review')
     expect(api.environment).toBe('native')
