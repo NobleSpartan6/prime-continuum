@@ -182,6 +182,11 @@ describe('source-only Windows AppContainer probe contract', () => {
   })
 
   it('binds admission status to the exact state prefix and rejects the stale provider claim key', () => {
+    const retiredV1 = functionalReceipt()
+    retiredV1.schemaVersion = 1
+    retiredV1.kind = 'prime_continuim_appcontainer_probe_v1'
+    expect(() => validateAppContainerProbeReceipt(retiredV1)).toThrow()
+
     const deniedWithProgress = failureReceipt()
     deniedWithProgress.state = { phases: ['prepared', 'admitted'], finalPhase: 'admitted' }
     expect(() => validateAppContainerProbeReceipt(deniedWithProgress)).toThrow()
@@ -231,6 +236,29 @@ describe('source-only Windows AppContainer probe contract', () => {
     const candidateAsProbe = functionalReceipt()
     candidateAsProbe.provenance.probePayload.sha256 = candidateAsProbe.provenance.installedCandidate.sha256
     expect(() => validateAppContainerProbeReceipt(candidateAsProbe)).toThrow(/probe_payload_not_distinct/)
+
+    const profileCreationFailed = functionalReceipt()
+    profileCreationFailed.outcome = 'failed_vm_disposal_required'
+    profileCreationFailed.state = {
+      phases: ['prepared', 'admitted'],
+      finalPhase: 'admitted',
+    }
+    profileCreationFailed.supervisorEvidence = null
+    profileCreationFailed.gates = []
+    profileCreationFailed.cleanup = {
+      status: 'unconfirmed',
+      treeRetired: false,
+      profileDeleted: false,
+      operationRootDeleted: false,
+      publicationMode: 'host_no_replace',
+      externalVmDisposalRequired: true,
+      externalVmDisposalConfirmed: false,
+    }
+    profileCreationFailed.failure = { stage: 'admitted', code: 'profile_creation_failed' }
+    expect((validateAppContainerProbeReceipt(profileCreationFailed) as any).provenance.probePayload.role)
+      .toBe('dedicated_probe_payload_launch_target')
+    profileCreationFailed.provenance.probePayload.role = 'dedicated_probe_payload_executed'
+    expect(() => validateAppContainerProbeReceipt(profileCreationFailed)).toThrow()
 
     const staleAdmissionFailure = functionalReceipt()
     staleAdmissionFailure.outcome = 'failed_vm_disposal_required'
@@ -306,8 +334,8 @@ function provenance(character: string, bytes: number) {
 
 function functionalReceipt(): any {
   return {
-    schemaVersion: 1,
-    kind: 'prime_continuim_appcontainer_probe_v1',
+    schemaVersion: 2,
+    kind: 'prime_continuim_appcontainer_probe_v2',
     outcome: 'functional_passed_vm_disposal_required',
     correlationId: '4'.repeat(32),
     platform: 'win32',
@@ -315,7 +343,7 @@ function functionalReceipt(): any {
     admission: admittedFacts(),
     provenance: {
       installedCandidate: { role: 'correlation_only_not_executed', sha256: '1'.repeat(64), bytes: 4096 },
-      probePayload: { role: 'dedicated_probe_payload_executed', sha256: '2'.repeat(64), bytes: 8192 },
+      probePayload: { role: 'dedicated_probe_payload_launch_target', sha256: '2'.repeat(64), bytes: 8192 },
     },
     launchPolicy: launchPolicy(),
     state: { phases: [...APPCONTAINER_PROBE_PHASES], finalPhase: 'settled' },

@@ -1,6 +1,6 @@
 # Windows AppContainer evaluation probe
 
-`prime_continuim_appcontainer_probe_v1` is a source-only contract for a future,
+`prime_continuim_appcontainer_probe_v2` is a source-only contract for a future,
 explicitly operator-run Windows x64 AppContainer boundary probe. This phase
 contains pure admission and receipt validators. It does **not** contain a live
 runner, create or delete an AppContainer profile, change an ACL, launch a child,
@@ -36,6 +36,12 @@ There is no package script or ordinary-workflow command for a live probe. A
 PowerShell operator harness, native supervisor, dedicated probe payload,
 no-replace receipt publisher, and disposable-machine evidence run are Phase B
 work. Source tests cannot establish any Windows security property.
+
+The pre-live v1 schema had no producer or accepted disposable-machine receipt.
+V2 deliberately replaces it so the payload provenance says only `launch_target`
+and the supervisor gate says only that launch-handle inheritance was disabled;
+neither field can imply that a child executed or that every kernel handle was
+enumerated.
 
 The live boundary is blocked until the repository contains a separately
 reviewed reproducible native x64 payload with a pinned build/provenance path and
@@ -105,7 +111,10 @@ tree and grant the exact AppContainer SID read/execute only. Only the operation
 scratch and AppContainer profile may be read/write. There must be no writable
 executable or tool closure. The host must create the child suspended, publish
 the exact supervisor/process identity to a host-private no-replace record, and
-resume only after token, Job-membership, and no-handle-inheritance probes pass.
+resume only after token and Job-membership probes pass and the fixed launch
+plan proves handle inheritance was disabled. A separate controlled inherited-
+handle sentinel remains child-observed; neither fact claims an exhaustive scan
+of every possible kernel handle.
 
 ## Monotonic state and evidence admission
 
@@ -140,8 +149,8 @@ The fixed receipt matrix verifies intended facts without accepting arbitrary
 gate names. It covers:
 
 - exact AppContainer SID, Low integrity, zero capability SIDs, LPAC policy,
-  in-Job-at-creation, no inherited handles, and an exact sanitized child
-  environment with no credential-shaped entry;
+  in-Job-at-creation, disabled launch-handle inheritance, and an exact sanitized
+  child environment with no credential-shaped entry;
 - read/execute access to the sealed tool tree, read/write access to scratch and
   profile, and absence of a writable executable closure;
 - read and write denial for bounded main-workspace, user-profile,
@@ -181,7 +190,10 @@ package/user SIDs, process/thread IDs, command lines, argv, environment, URLs,
 stdout/stderr, or raw child output. The trusted host producer remains
 responsible for ensuring that digest/correlation fields contain only their
 declared provenance rather than credential-shaped bytes. Private supervisor
-evidence is represented only by its SHA-256 and byte count.
+evidence is represented only by its SHA-256 and byte count. The probe-payload
+provenance role means only that those bytes were the dedicated launch target.
+It does not claim that the child started or executed; only exact
+post-retirement evidence can establish that narrower fact.
 
 Every valid receipt keeps these seven fields literally `false`:
 

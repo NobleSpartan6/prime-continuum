@@ -1,6 +1,6 @@
-export const APPCONTAINER_PROBE_SCHEMA_VERSION: 1
-export const APPCONTAINER_PROBE_KIND: 'prime_continuim_appcontainer_probe_v1'
-export const APPCONTAINER_PROBE_ENVELOPE_KIND: 'prime_continuim_appcontainer_probe_envelope_v1'
+export const APPCONTAINER_PROBE_SCHEMA_VERSION: 2
+export const APPCONTAINER_PROBE_KIND: 'prime_continuim_appcontainer_probe_v2'
+export const APPCONTAINER_PROBE_ENVELOPE_KIND: 'prime_continuim_appcontainer_probe_envelope_v2'
 export const APPCONTAINER_PROBE_MAX_RECEIPT_BYTES: number
 export const APPCONTAINER_PROBE_CONFIRMATION_PHRASE: string
 export const APPCONTAINER_PROBE_PHASES: readonly [
@@ -89,8 +89,8 @@ export function validateAppContainerProbeReceipt(
 export function createAppContainerProbeReceiptEnvelope(
   receipt: Readonly<Record<string, unknown>>,
 ): Readonly<{
-  schemaVersion: 1
-  kind: 'prime_continuim_appcontainer_probe_envelope_v1'
+  schemaVersion: 2
+  kind: 'prime_continuim_appcontainer_probe_envelope_v2'
   receiptSha256: string
   receipt: Readonly<Record<string, unknown>>
 }>

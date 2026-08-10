@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
-export const APPCONTAINER_PROBE_SCHEMA_VERSION = 1
-export const APPCONTAINER_PROBE_KIND = 'prime_continuim_appcontainer_probe_v1'
-export const APPCONTAINER_PROBE_ENVELOPE_KIND = 'prime_continuim_appcontainer_probe_envelope_v1'
+export const APPCONTAINER_PROBE_SCHEMA_VERSION = 2
+export const APPCONTAINER_PROBE_KIND = 'prime_continuim_appcontainer_probe_v2'
+export const APPCONTAINER_PROBE_ENVELOPE_KIND = 'prime_continuim_appcontainer_probe_envelope_v2'
 export const APPCONTAINER_PROBE_MAX_RECEIPT_BYTES = 64 * 1024
 export const APPCONTAINER_PROBE_CONFIRMATION_PHRASE =
   'DISPOSE THIS VM AFTER PRIME APPCONTAINER PROBE'
@@ -42,7 +42,7 @@ export const APPCONTAINER_PROBE_GATE_SPECS = Object.freeze([
   gate('child_zero_capability_sids', 'present'),
   gate('child_lpac_policy', 'present'),
   gate('job_membership_at_process_creation', 'present'),
-  gate('no_inherited_handles', 'present'),
+  gate('launch_handle_inheritance_disabled', 'present'),
   gate('child_exact_environment_allowlist', 'present'),
   gate('child_credential_shaped_environment', 'denied'),
   gate('sealed_tool_tree_read_execute', 'allowed'),
@@ -384,7 +384,7 @@ function validateReceiptProvenance(value, admissionStatus) {
   if (admissionStatus === 'denied') fail()
   exactObject(value, PROVENANCE_KEYS)
   validateReceiptProvenanceRecord(value.installedCandidate, 'correlation_only_not_executed', 2 * 1024 * 1024 * 1024)
-  validateReceiptProvenanceRecord(value.probePayload, 'dedicated_probe_payload_executed', 64 * 1024 * 1024)
+  validateReceiptProvenanceRecord(value.probePayload, 'dedicated_probe_payload_launch_target', 64 * 1024 * 1024)
   if (value.installedCandidate.sha256 === value.probePayload.sha256) {
     fail('probe_payload_not_distinct')
   }

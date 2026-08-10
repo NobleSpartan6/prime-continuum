@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { link, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -26,7 +26,7 @@ describe('Windows AppContainer static receipt verifier', () => {
     const verified = await verifyWindowsAppContainerProbeReceiptFile(receiptPath)
 
     expect(verified).toMatchObject({
-      verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v1',
+      verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v2',
       receiptBytes: bytes.byteLength,
       staticVerifierExitCode: 0,
       liveProbeExitCode: 2,
@@ -42,7 +42,7 @@ describe('Windows AppContainer static receipt verifier', () => {
     const output = JSON.parse(stdout)
     expect(stderr).toBe('')
     expect(output).toMatchObject({
-      kind: 'prime_continuim_appcontainer_probe_static_verifier_v1',
+      kind: 'prime_continuim_appcontainer_probe_static_verifier_v2',
       outcome: 'functional_passed_vm_disposal_required',
       staticVerifierExitCode: 0,
       liveProbeExitCode: 2,
@@ -70,6 +70,32 @@ describe('Windows AppContainer static receipt verifier', () => {
     await link(secondReceipt, join(root, 'second-link.json'))
     await expect(verifyWindowsAppContainerProbeReceiptFile(secondReceipt)).rejects.toThrow(/receipt_file_invalid/)
   })
+
+  it('rejects a parent that is replaced by an alias after the receipt was read', async () => {
+    const lexicalBase = await mkdtemp(join(tmpdir(), 'prime-appcontainer-verifier-swap-'))
+    const base = await realpath(lexicalBase)
+    temporaryRoots.push(base)
+    const receiptParent = join(base, 'receipt-parent')
+    const replacementParent = join(base, 'replacement-parent')
+    const movedParent = join(base, 'receipt-parent-moved')
+    await Promise.all([mkdir(receiptParent), mkdir(replacementParent)])
+    const receiptPath = join(receiptParent, 'receipt.json')
+    const replacementPath = join(replacementParent, 'receipt.json')
+    const bytes = serializeAppContainerProbeReceiptEnvelope(
+      createAppContainerProbeReceiptEnvelope(functionalReceipt()),
+    )
+    await Promise.all([
+      writeFile(receiptPath, bytes, { flag: 'wx' }),
+      writeFile(replacementPath, bytes, { flag: 'wx' }),
+    ])
+
+    await expect((verifyWindowsAppContainerProbeReceiptFile as any)(receiptPath, {
+      beforeFinalPathCheck: async () => {
+        await rename(receiptParent, movedParent)
+        await symlink(replacementParent, receiptParent, process.platform === 'win32' ? 'junction' : 'dir')
+      },
+    })).rejects.toThrow(/receipt_path_replaced/)
+  })
 })
 
 async function writeReceipt() {
@@ -86,8 +112,8 @@ async function writeReceipt() {
 
 function functionalReceipt(): any {
   return {
-    schemaVersion: 1,
-    kind: 'prime_continuim_appcontainer_probe_v1',
+    schemaVersion: 2,
+    kind: 'prime_continuim_appcontainer_probe_v2',
     outcome: 'functional_passed_vm_disposal_required',
     correlationId: '4'.repeat(32),
     platform: 'win32',
@@ -108,7 +134,7 @@ function functionalReceipt(): any {
     },
     provenance: {
       installedCandidate: { role: 'correlation_only_not_executed', sha256: '1'.repeat(64), bytes: 4096 },
-      probePayload: { role: 'dedicated_probe_payload_executed', sha256: '2'.repeat(64), bytes: 8192 },
+      probePayload: { role: 'dedicated_probe_payload_launch_target', sha256: '2'.repeat(64), bytes: 8192 },
     },
     launchPolicy: {
       stableProfileApisOnly: true,

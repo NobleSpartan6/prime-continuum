@@ -8,12 +8,13 @@ import {
   verifyAppContainerProbeReceiptBytes,
 } from './windows-appcontainer-probe-lib.mjs'
 
-const RECEIPT_VERIFIER_KIND = 'prime_continuim_appcontainer_probe_static_verifier_v1'
+const RECEIPT_VERIFIER_KIND = 'prime_continuim_appcontainer_probe_static_verifier_v2'
 
-export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath) {
+export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath, testHooks) {
   if (typeof receiptPath !== 'string' || receiptPath.length < 1 || receiptPath.includes('\0')) {
     fail('receipt_path_invalid')
   }
+  validateTestHooks(testHooks)
 
   const lexicalPath = resolve(receiptPath)
   const physicalPath = await realpath(lexicalPath).catch(() => fail('receipt_path_invalid'))
@@ -30,6 +31,7 @@ export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath) {
     opened = await handle.stat({ bigint: true })
     validateReceiptFileStat(opened)
     requireSameIdentity(before, opened)
+    await requireCanonicalPath(lexicalPath, physicalPath, 'receipt_path_changed')
     bytes = await readBoundedReceipt(handle, opened.size)
     afterRead = await handle.stat({ bigint: true })
     validateReceiptFileStat(afterRead)
@@ -40,7 +42,9 @@ export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath) {
   }
 
   if (bytes.byteLength !== Number(opened.size)) fail('receipt_changed_during_read')
-  const afterPath = await lstat(physicalPath, { bigint: true }).catch(() => fail('receipt_path_replaced'))
+  if (testHooks !== undefined) await testHooks.beforeFinalPathCheck()
+  await requireCanonicalPath(lexicalPath, physicalPath, 'receipt_path_replaced')
+  const afterPath = await lstat(lexicalPath, { bigint: true }).catch(() => fail('receipt_path_replaced'))
   validateReceiptFileStat(afterPath)
   requireSameIdentity(opened, afterPath, 'receipt_path_replaced')
   if (opened.size !== afterPath.size || opened.mtimeNs !== afterPath.mtimeNs) {
@@ -53,6 +57,27 @@ export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath) {
     verifierKind: RECEIPT_VERIFIER_KIND,
     receiptBytes: bytes.byteLength,
   })
+}
+
+async function requireCanonicalPath(lexicalPath, expectedPhysicalPath, code) {
+  const currentPhysicalPath = await realpath(lexicalPath).catch(() => fail(code))
+  if (!samePath(lexicalPath, currentPhysicalPath) || !samePath(expectedPhysicalPath, currentPhysicalPath)) {
+    fail(code)
+  }
+}
+
+function validateTestHooks(value) {
+  if (value === undefined) return
+  if (
+    process.env.VITEST !== 'true' ||
+    value === null ||
+    typeof value !== 'object' ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.keys(value).length !== 1 ||
+    typeof value.beforeFinalPathCheck !== 'function'
+  ) {
+    fail('test_hooks_forbidden')
+  }
 }
 
 async function readBoundedReceipt(handle, expectedSize) {
