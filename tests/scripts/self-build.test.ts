@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawnSync, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -372,6 +372,7 @@ setInterval(() => undefined, 1000)
 `, 'utf8')
     const lockPath = join(root, 'workflow.lock')
     const lock = await acquireWorkflowLock({ workflow: 'self-build', projectRoot: root, lockPath })
+    let firstExitCheckObservedClosedIpc: boolean | undefined
     try {
       const result = await runCommandSequence({
         commands: [{
@@ -397,6 +398,10 @@ setInterval(() => undefined, 1000)
           teardownTimeoutMs: process.platform === 'win32'
             ? WINDOWS_TIMEOUT_FIXTURE_TEARDOWN_MS
             : undefined,
+          awaitSupervisorExit: async (supervisor: ChildProcess, timeoutMs: number) => {
+            firstExitCheckObservedClosedIpc ??= !supervisor.connected
+            return await waitForChildProcessExit(supervisor, timeoutMs)
+          },
           createLease: async (leaseOptions: Parameters<typeof createWorkflowChildLease>[0]) => {
             const lease = await createWorkflowChildLease(leaseOptions)
             let descendantPublication: Promise<void> | undefined
@@ -434,6 +439,7 @@ setInterval(() => undefined, 1000)
         collateralState: record.collateralState,
       })
       expect(result.passed, diagnostic).toBe(false)
+      expect(firstExitCheckObservedClosedIpc, diagnostic).toBe(true)
       expect(record.supervisorError, diagnostic).toBeNull()
       expect(record.collateralState, diagnostic).toBe('supervised_tree_settled')
       expect(record.timedOut, diagnostic).toBe(true)
@@ -689,6 +695,21 @@ async function waitForProcessesToExit(pids: number[]) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50))
   }
   expect(pids.filter(isProcessAlive)).toEqual([])
+}
+
+function waitForChildProcessExit(child: ChildProcess, timeoutMs: number) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise<boolean>((resolveExit) => {
+    const timer = setTimeout(() => {
+      child.off('exit', onExit)
+      resolveExit(false)
+    }, timeoutMs)
+    const onExit = () => {
+      clearTimeout(timer)
+      resolveExit(true)
+    }
+    child.once('exit', onExit)
+  })
 }
 
 async function waitForReadableFile(path: string, timeoutMs: number) {

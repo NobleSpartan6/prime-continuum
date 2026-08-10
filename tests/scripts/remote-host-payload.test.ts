@@ -82,14 +82,26 @@ describe('remote host payload pure source contract', () => {
   })
 
   it('pins the checked-in Prime Agent policy, sources, lock, hostd, and daemon protocol constants', async () => {
-    const [policyBytes, sourcesBytes, lockBytes, hostdPaths] = await Promise.all([
+    const [policyBytes, sourcesBytes, lockBytes, hostdPaths, attributesBytes] = await Promise.all([
       readFile(resolve('runtime/prime-agent/runtime-policy.json')),
       readFile(resolve('runtime/prime-agent/sources.json')),
       readFile(resolve('runtime/prime-agent/package-lock.json')),
       readFile(resolve('src/hostd/paths.ts'), 'utf8'),
+      readFile(resolve('.gitattributes')),
     ])
     const policy = JSON.parse(policyBytes.toString('utf8'))
     const sources = JSON.parse(sourcesBytes.toString('utf8'))
+    const attributeLines = attributesBytes.toString('utf8').replaceAll('\r\n', '\n').split('\n')
+
+    expect(attributeLines).toEqual(expect.arrayContaining([
+      'runtime/prime-agent/runtime-policy.json text eol=lf',
+      'runtime/prime-agent/sources.json text eol=lf',
+      'runtime/prime-agent/package-lock.json text eol=lf',
+    ]))
+    for (const bytes of [policyBytes, sourcesBytes, lockBytes]) {
+      expect(bytes.at(-1)).toBe(0x0a)
+      expect(bytes.includes(0x0d)).toBe(false)
+    }
 
     expect(sha256(policyBytes)).toBe(REMOTE_HOST_PAYLOAD_PRIME_AGENT.runtimePolicySha256)
     expect(sha256(sourcesBytes)).toBe(REMOTE_HOST_PAYLOAD_PRIME_AGENT.sourcesSha256)

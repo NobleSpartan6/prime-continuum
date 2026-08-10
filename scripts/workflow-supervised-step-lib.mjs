@@ -76,6 +76,12 @@ export async function runSupervisedWorkflowStep({
     if (result.supervisorExitedWithoutChildConfirmation) {
       throw new Error('Workflow supervisor exited without confirming child-tree completion.')
     }
+    // The confirmed result is the final IPC payload. Close our side of the
+    // channel before waiting for process exit so the supervisor cannot remain
+    // alive solely because its send callback is delayed after delivery.
+    if (supervisor.connected) {
+      try { supervisor.disconnect() } catch {}
+    }
     if (!(await awaitSupervisorExit(supervisor, teardownTimeoutMs))) {
       throw new Error('Workflow supervisor did not confirm process-tree exit before the teardown deadline.')
     }

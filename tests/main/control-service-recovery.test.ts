@@ -2027,9 +2027,13 @@ describe('DesktopControlService recovery', () => {
   it('persists a newer event generation and rejects a delayed older refresh across restart', async () => {
     const directory = await createUserData({})
     const delayedCatalog = deferred<unknown>()
+    const refreshRequested = deferred<void>()
     const connection = new TestConnection((method) => {
       if (method === 'health.get') return health('host-a')
-      if (method === 'catalog.snapshot') return delayedCatalog.promise
+      if (method === 'catalog.snapshot') {
+        refreshRequested.resolve()
+        return delayedCatalog.promise
+      }
       throw new Error(`Unexpected request: ${method}`)
     })
     connectLocalHostd.mockResolvedValue(connection)
@@ -2040,12 +2044,18 @@ describe('DesktopControlService recovery', () => {
 
     const catalogG1 = catalogWithThread('host-a', 'execution-1', '2026-08-05T12:00:01.000Z')
     const catalogG2 = catalogWithThread('host-a', 'execution-2', '2026-08-05T12:00:02.000Z')
+    const publishedG1 = deferred<unknown>()
+    service.once('snapshot', publishedG1.resolve)
     connection.emit('event', { type: 'snapshot.update', payload: catalogG1 })
-    await vi.waitFor(() => expect(published).toHaveLength(1))
+    await expect(publishedG1.promise).resolves.toEqual(catalogG1)
+    expect(published).toEqual([catalogG1])
     const refresh = service.requestSnapshot({})
-    await vi.waitFor(() => expect(connection.requests.some(({ method }) => method === 'catalog.snapshot')).toBe(true))
+    await refreshRequested.promise
+    const publishedG2 = deferred<unknown>()
+    service.once('snapshot', publishedG2.resolve)
     connection.emit('event', { type: 'snapshot.update', payload: catalogG2 })
-    await vi.waitFor(() => expect(published).toHaveLength(2))
+    await expect(publishedG2.promise).resolves.toEqual(catalogG2)
+    expect(published).toEqual([catalogG1, catalogG2])
     delayedCatalog.resolve(catalogWithThread('host-a', 'execution-1', '2026-08-05T12:00:03.000Z'))
     await refresh
 

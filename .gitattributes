@@ -1,2 +1,5 @@
 tools/windows-appcontainer-probe/native/payload/* text eol=lf
 scripts/remote-host-payload/* text eol=lf
+runtime/prime-agent/runtime-policy.json text eol=lf
+runtime/prime-agent/sources.json text eol=lf
+runtime/prime-agent/package-lock.json text eol=lf

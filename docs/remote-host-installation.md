@@ -88,6 +88,10 @@ The exact canonical `remote-host-payload-inputs/v1` document pins:
   Electron `v43.3.0` Linux x64; and
 - four package/staging namespace declarations with fixed modes.
 
+The three Prime Agent source digests bind the exact checked-in LF-terminated
+bytes. Narrow `.gitattributes` rules force LF checkout for those files on
+Windows as well; the contract does not normalize or accept CRLF alternatives.
+
 The Electron source pin names
 `electron-v43.3.0-linux-x64.zip`, 125,603,646 bytes, SHA-256
 `f4987e9f045e46b117f0805d6ba4dc524e2abb2c2e33660f175bb39564bd3dae`.
