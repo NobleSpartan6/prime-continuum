@@ -254,6 +254,9 @@ describe('DesktopControlService runtime readiness', () => {
     })
     connectLocalHostd.mockResolvedValue(connection)
     const service = await serviceForTest()
+    const pollHealth = vi.spyOn(service as unknown as {
+      pollHealth(...args: unknown[]): Promise<void>
+    }, 'pollHealth')
     await service.connect({ kind: 'local' })
     const states: ReturnType<typeof service.getConnectionState>[] = []
     service.on('connection-state', (state) => states.push(state))
@@ -273,9 +276,13 @@ describe('DesktopControlService runtime readiness', () => {
       capabilities: expect.arrayContaining(['prime_agent_commands_v2', ...WARMED_RUNTIME_CAPABILITIES]),
       runtimeReadiness: { kind: 'reported', snapshot: { status: 'ready' } },
     })
+    expect(pollHealth).toHaveBeenCalledTimes(2)
+    await pollHealth.mock.results[1]!.value
 
     states.length = 0
     await vi.advanceTimersByTimeAsync(15_000)
+    expect(pollHealth).toHaveBeenCalledTimes(3)
+    await pollHealth.mock.results[2]!.value
     expect(states).toEqual([])
     expect(service.getConnectionState().runtimeReadiness?.observedAt).toBe('2026-08-07T12:00:16.000Z')
     await service.disconnect()

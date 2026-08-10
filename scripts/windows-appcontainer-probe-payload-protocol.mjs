@@ -3,16 +3,16 @@ import { win32 } from 'node:path'
 
 import { APPCONTAINER_PROBE_GATE_SPECS } from './windows-appcontainer-probe-lib.mjs'
 
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC = 'PCAPM001'
-export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC = 'PCAPE001'
-export const APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION = 1
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC = 'PCAPM002'
+export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC = 'PCAPE002'
+export const APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION = 2
 
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAX_BYTES = 32 * 1024
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_HEADER_BYTES = 160
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_OFFSET = 160
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_ENTRY_BYTES = 16
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_COUNT = 17
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_BODY_OFFSET = 432
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_COUNT = 18
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_BODY_OFFSET = 448
 
 export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_BYTES = 192
 export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_HEADER_BYTES = 128
@@ -44,8 +44,13 @@ export const APPCONTAINER_PROBE_PAYLOAD_RESULT_CODES = Object.freeze({
   incomplete_internal: 2,
 })
 
-export const APPCONTAINER_PROBE_PAYLOAD_PIPE_PREFIX =
-  String.raw`\\.\pipe\LOCAL\PrimeContinuim.AppContainerProbe.v1.`
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_FILENAME =
+  'PrimeContinuim.AppContainerProbe.PCAPM002.bin'
+export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_FILENAME_PREFIX =
+  'PrimeContinuim.AppContainerProbe.PCAPE002.'
+// This is a denial sentinel only. It is never an evidence transport.
+export const APPCONTAINER_PROBE_PAYLOAD_PARENT_NAMED_PIPE_SENTINEL_PREFIX =
+  String.raw`\\.\pipe\LOCAL\PrimeContinuim.AppContainerProbe.DenialSentinel.v2.`
 
 export const APPCONTAINER_PROBE_PAYLOAD_NETWORK_SENTINELS = deepFreeze([
   { id: 'loopback_network_sentinel', address: '127.0.0.1', port: 9 },
@@ -75,20 +80,21 @@ export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_SPECS = deepFreeze([
   recordSpec(1, 'package_sid', 'binarySid'),
   recordSpec(2, 'environment', 'emptyUtf16leEnvironment'),
   recordSpec(3, 'profile_path', 'utf16leNullTerminated'),
-  recordSpec(4, 'main_workspace_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(5, 'user_profile_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(6, 'credential_store_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(7, 'runtime_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(8, 'out_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(9, 'release_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(10, 'programdata_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(11, 'sibling_temp_sentinel_path', 'utf16leNullTerminated'),
-  recordSpec(12, 'parent_named_pipe_sentinel', 'utf16leNullTerminated'),
-  recordSpec(13, 'parent_process_sentinel', 'uint32LittleEndian'),
-  recordSpec(14, 'inherited_handle_sentinel', 'handleAndRandom'),
-  recordSpec(15, 'loopback_network_sentinel', 'sockaddrIn'),
-  recordSpec(16, 'lan_network_sentinel', 'sockaddrIn'),
-  recordSpec(17, 'internet_network_sentinel', 'sockaddrIn'),
+  recordSpec(4, 'scratch_root_path', 'utf16leNullTerminated'),
+  recordSpec(5, 'main_workspace_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(6, 'user_profile_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(7, 'credential_store_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(8, 'runtime_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(9, 'out_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(10, 'release_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(11, 'programdata_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(12, 'sibling_temp_sentinel_path', 'utf16leNullTerminated'),
+  recordSpec(13, 'parent_named_pipe_sentinel', 'utf16leNullTerminated'),
+  recordSpec(14, 'parent_process_sentinel', 'uint32LittleEndian'),
+  recordSpec(15, 'inherited_handle_sentinel', 'handleAndRandom'),
+  recordSpec(16, 'loopback_network_sentinel', 'sockaddrIn'),
+  recordSpec(17, 'lan_network_sentinel', 'sockaddrIn'),
+  recordSpec(18, 'internet_network_sentinel', 'sockaddrIn'),
 ])
 
 const MANIFEST_MAGIC_BYTES = Buffer.from(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC, 'ascii')
@@ -109,6 +115,7 @@ const MANIFEST_INPUT_KEYS = [
   'payloadBytes',
   'packageSid',
   'profilePath',
+  'scratchRoot',
   'controlledFileSentinelPaths',
   'parentProcessId',
   'inheritedHandleSentinel',
@@ -157,18 +164,43 @@ export class AppContainerProbePayloadProtocolError extends Error {
   }
 }
 
-export function createAppContainerProbePayloadManifest(input) {
-  validateManifestInput(input)
+// The payload finds the manifest by this fixed sibling name relative to its own
+// executable. Evidence uses one correlation-bound CREATE_NEW leaf under the
+// manifest's scratch root; neither channel needs argv, environment, or an
+// inherited handle.
+export function deriveAppContainerProbePayloadEvidenceFilename(correlationId) {
+  validateCorrelationId(correlationId, 'evidence_filename_invalid')
+  return `${APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_FILENAME_PREFIX}${correlationId}.bin`
+}
 
-  const sentinelPaths = input.controlledFileSentinelPaths
+export function deriveAppContainerProbePayloadEvidencePath(scratchRoot, correlationId) {
+  validateCanonicalWindowsPath(scratchRoot)
+  const evidencePath = win32.join(
+    scratchRoot,
+    deriveAppContainerProbePayloadEvidenceFilename(correlationId),
+  )
+  validateCanonicalWindowsPath(evidencePath)
+  return evidencePath
+}
+
+export function deriveAppContainerProbePayloadParentNamedPipeSentinel(correlationId) {
+  validateCorrelationId(correlationId, 'manifest_pipe_invalid')
+  return `${APPCONTAINER_PROBE_PAYLOAD_PARENT_NAMED_PIPE_SENTINEL_PREFIX}${correlationId}`
+}
+
+export function createAppContainerProbePayloadManifest(input) {
+  const manifestInput = validateManifestInput(input)
+
+  const sentinelPaths = manifestInput.controlledFileSentinelPaths
   const records = [
-    encodePackageSid(input.packageSid),
+    encodePackageSid(manifestInput.packageSid),
     EMPTY_ENVIRONMENT,
-    encodeUtf16leNullTerminated(input.profilePath),
+    encodeUtf16leNullTerminated(manifestInput.profilePath),
+    encodeUtf16leNullTerminated(manifestInput.scratchRoot),
     ...SENTINEL_PATH_KEYS.map((key) => encodeUtf16leNullTerminated(sentinelPaths[key])),
-    encodeUtf16leNullTerminated(pipeName(input.correlationId)),
-    encodeUint32(input.parentProcessId),
-    encodeHandleSentinel(input.inheritedHandleSentinel),
+    encodeUtf16leNullTerminated(deriveAppContainerProbePayloadParentNamedPipeSentinel(manifestInput.correlationId)),
+    encodeUint32(manifestInput.parentProcessId),
+    encodeHandleSentinel(manifestInput.inheritedHandleSentinel),
     ...FIXED_SOCKADDR_BYTES,
   ]
 
@@ -188,9 +220,9 @@ export function createAppContainerProbePayloadManifest(input) {
   manifest.writeUInt32LE(cursor, 0x0c)
   manifest.writeUInt32LE(0, 0x10)
   manifest.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_COUNT, 0x14)
-  correlationBytes(input.correlationId).copy(manifest, 0x18)
-  digestBytes(input.payloadSha256).copy(manifest, 0x28)
-  manifest.writeBigUInt64LE(BigInt(input.payloadBytes), 0x48)
+  correlationBytes(manifestInput.correlationId).copy(manifest, 0x18)
+  digestBytes(manifestInput.payloadSha256).copy(manifest, 0x28)
+  manifest.writeBigUInt64LE(BigInt(manifestInput.payloadBytes), 0x48)
   CHILD_GATE_CONTRACT_DIGEST.copy(manifest, 0x50)
   manifest.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_OFFSET, 0x70)
   manifest.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_ENTRY_BYTES, 0x74)
@@ -213,15 +245,16 @@ export function createAppContainerProbePayloadManifest(input) {
   }
 
   validateAppContainerProbePayloadManifest(manifest, {
-    correlationId: input.correlationId,
-    payloadSha256: input.payloadSha256,
-    payloadBytes: input.payloadBytes,
+    correlationId: manifestInput.correlationId,
+    payloadSha256: manifestInput.payloadSha256,
+    payloadBytes: manifestInput.payloadBytes,
   })
   return manifest
 }
 
 export function validateAppContainerProbePayloadManifest(input, expected) {
   const manifest = snapshotBytes(input, 'manifest_invalid')
+  const expectation = expected === undefined ? undefined : validateManifestExpectation(expected)
   if (
     manifest.byteLength < APPCONTAINER_PROBE_PAYLOAD_MANIFEST_BODY_OFFSET
     || manifest.byteLength > APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAX_BYTES
@@ -276,20 +309,19 @@ export function validateAppContainerProbePayloadManifest(input, expected) {
     cursor = recordOffset + recordBytes
   }
   exactInteger(cursor, manifest.byteLength, 'manifest_extension_forbidden')
-  validateDecodedRecordRelationships(decoded)
+  validateDecodedRecordRelationships(decoded, correlationId)
 
-  if (expected !== undefined) {
-    validateManifestExpectation(expected)
+  if (expectation !== undefined) {
     if (
-      correlationId !== expected.correlationId
-      || payloadSha256 !== expected.payloadSha256
-      || payloadBytes !== expected.payloadBytes
+      correlationId !== expectation.correlationId
+      || payloadSha256 !== expectation.payloadSha256
+      || payloadBytes !== expectation.payloadBytes
     ) fail('manifest_cross_feed')
   }
 
   return deepFreeze({
     schemaVersion: APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION,
-    kind: 'prime_continuim_appcontainer_probe_payload_manifest_v1',
+    kind: 'prime_continuim_appcontainer_probe_payload_manifest_v2',
     sha256: sha256Hex(manifest),
     bytes: manifest.byteLength,
     correlationId,
@@ -301,9 +333,9 @@ export function validateAppContainerProbePayloadManifest(input, expected) {
 }
 
 export function createAppContainerProbePayloadEvidence(input) {
-  validateEvidenceInput(input)
-  const expectedResult = coherentResult(input.observations)
-  if (input.result !== expectedResult) fail('evidence_result_mismatch')
+  const evidenceInput = validateEvidenceInput(input)
+  const expectedResult = coherentResult(evidenceInput.observations)
+  if (evidenceInput.result !== expectedResult) fail('evidence_result_mismatch')
 
   const evidence = Buffer.alloc(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_BYTES)
   EVIDENCE_MAGIC_BYTES.copy(evidence, 0x00)
@@ -312,15 +344,15 @@ export function createAppContainerProbePayloadEvidence(input) {
   evidence.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_BYTES, 0x0c)
   evidence.writeUInt32LE(0, 0x10)
   evidence.writeUInt32LE(APPCONTAINER_PROBE_CHILD_GATE_SPECS.length, 0x14)
-  correlationBytes(input.correlationId).copy(evidence, 0x18)
-  digestBytes(input.manifestSha256).copy(evidence, 0x28)
-  digestBytes(input.payloadSha256).copy(evidence, 0x48)
-  evidence.writeBigUInt64LE(BigInt(input.payloadBytes), 0x68)
-  evidence.writeUInt32LE(input.manifestBytes, 0x70)
-  evidence.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_RESULT_CODES[input.result], 0x74)
+  correlationBytes(evidenceInput.correlationId).copy(evidence, 0x18)
+  digestBytes(evidenceInput.manifestSha256).copy(evidence, 0x28)
+  digestBytes(evidenceInput.payloadSha256).copy(evidence, 0x48)
+  evidence.writeBigUInt64LE(BigInt(evidenceInput.payloadBytes), 0x68)
+  evidence.writeUInt32LE(evidenceInput.manifestBytes, 0x70)
+  evidence.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_RESULT_CODES[evidenceInput.result], 0x74)
   evidence.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_GATE_OFFSET, 0x78)
   evidence.writeUInt32LE(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_GATE_BYTES, 0x7c)
-  for (const [index, observation] of input.observations.entries()) {
+  for (const [index, observation] of evidenceInput.observations.entries()) {
     evidence[APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_GATE_OFFSET + index] =
       APPCONTAINER_PROBE_PAYLOAD_OBSERVATION_CODES[observation]
   }
@@ -328,17 +360,17 @@ export function createAppContainerProbePayloadEvidence(input) {
     .copy(evidence, APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_DIGEST_OFFSET)
 
   validateAppContainerProbePayloadEvidence(evidence, {
-    correlationId: input.correlationId,
-    manifestSha256: input.manifestSha256,
-    manifestBytes: input.manifestBytes,
-    payloadSha256: input.payloadSha256,
-    payloadBytes: input.payloadBytes,
+    correlationId: evidenceInput.correlationId,
+    manifestSha256: evidenceInput.manifestSha256,
+    manifestBytes: evidenceInput.manifestBytes,
+    payloadSha256: evidenceInput.payloadSha256,
+    payloadBytes: evidenceInput.payloadBytes,
   })
   return evidence
 }
 
 export function validateAppContainerProbePayloadEvidence(input, expected) {
-  validateEvidenceExpectation(expected)
+  const expectation = validateEvidenceExpectation(expected)
   const evidence = snapshotBytes(input, 'evidence_invalid')
   exactInteger(evidence.byteLength, APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_BYTES, 'evidence_size_invalid')
 
@@ -378,16 +410,16 @@ export function validateAppContainerProbePayloadEvidence(input, expected) {
   if (result !== coherentResult(observations)) fail('evidence_result_mismatch')
 
   if (
-    correlationId !== expected.correlationId
-    || manifestSha256 !== expected.manifestSha256
-    || manifestBytes !== expected.manifestBytes
-    || payloadSha256 !== expected.payloadSha256
-    || payloadBytes !== expected.payloadBytes
+    correlationId !== expectation.correlationId
+    || manifestSha256 !== expectation.manifestSha256
+    || manifestBytes !== expectation.manifestBytes
+    || payloadSha256 !== expectation.payloadSha256
+    || payloadBytes !== expectation.payloadBytes
   ) fail('evidence_cross_feed')
 
   return deepFreeze({
     schemaVersion: APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION,
-    kind: 'prime_continuim_appcontainer_probe_payload_evidence_v1',
+    kind: 'prime_continuim_appcontainer_probe_payload_evidence_v2',
     sha256: sha256Hex(evidence),
     bytes: evidence.byteLength,
     correlationId,
@@ -405,44 +437,76 @@ export function validateAppContainerProbePayloadEvidence(input, expected) {
 }
 
 function validateManifestInput(input) {
-  exactPlainObject(input, MANIFEST_INPUT_KEYS, 'manifest_input_invalid')
-  validateCorrelationId(input.correlationId, 'manifest_input_invalid')
-  validateSha256(input.payloadSha256, 'manifest_input_invalid')
-  boundedInteger(input.payloadBytes, 1, MAX_PAYLOAD_BYTES, 'manifest_input_invalid')
-  validatePackageSid(input.packageSid)
-  validateCanonicalWindowsPath(input.profilePath)
-  exactPlainObject(input.controlledFileSentinelPaths, SENTINEL_PATH_KEYS, 'manifest_input_invalid')
-  for (const key of SENTINEL_PATH_KEYS) validateCanonicalWindowsPath(input.controlledFileSentinelPaths[key])
-  const paths = [input.profilePath, ...SENTINEL_PATH_KEYS.map((key) => input.controlledFileSentinelPaths[key])]
+  const topLevel = snapshotPlainObject(input, MANIFEST_INPUT_KEYS, 'manifest_input_invalid')
+  const controlledFileSentinelPaths = snapshotPlainObject(
+    topLevel.controlledFileSentinelPaths,
+    SENTINEL_PATH_KEYS,
+    'manifest_input_invalid',
+  )
+  const inheritedHandleFields = snapshotPlainObject(
+    topLevel.inheritedHandleSentinel,
+    HANDLE_SENTINEL_KEYS,
+    'manifest_input_invalid',
+  )
+  const inheritedHandleSentinel = {
+    handle: inheritedHandleFields.handle,
+    random: snapshotBytes(inheritedHandleFields.random, 'manifest_input_invalid'),
+  }
+  const snapshot = {
+    ...topLevel,
+    controlledFileSentinelPaths,
+    inheritedHandleSentinel,
+  }
+
+  validateCorrelationId(snapshot.correlationId, 'manifest_input_invalid')
+  validateSha256(snapshot.payloadSha256, 'manifest_input_invalid')
+  boundedInteger(snapshot.payloadBytes, 1, MAX_PAYLOAD_BYTES, 'manifest_input_invalid')
+  validatePackageSid(snapshot.packageSid)
+  validateCanonicalWindowsPath(snapshot.profilePath)
+  validateCanonicalWindowsPath(snapshot.scratchRoot)
+  deriveAppContainerProbePayloadEvidencePath(snapshot.scratchRoot, snapshot.correlationId)
+  for (const key of SENTINEL_PATH_KEYS) validateCanonicalWindowsPath(controlledFileSentinelPaths[key])
+  const paths = [
+    snapshot.profilePath,
+    snapshot.scratchRoot,
+    ...SENTINEL_PATH_KEYS.map((key) => controlledFileSentinelPaths[key]),
+  ]
   if (pathsOverlap(paths)) fail('manifest_input_invalid')
-  boundedInteger(input.parentProcessId, 1, UINT32_MAX, 'manifest_input_invalid')
-  exactPlainObject(input.inheritedHandleSentinel, HANDLE_SENTINEL_KEYS, 'manifest_input_invalid')
+  boundedInteger(snapshot.parentProcessId, 1, UINT32_MAX, 'manifest_input_invalid')
   if (
-    typeof input.inheritedHandleSentinel.handle !== 'bigint'
-    || input.inheritedHandleSentinel.handle < 1n
-    || input.inheritedHandleSentinel.handle > CONCRETE_HANDLE_MAX
+    typeof inheritedHandleSentinel.handle !== 'bigint'
+    || inheritedHandleSentinel.handle < 1n
+    || inheritedHandleSentinel.handle > CONCRETE_HANDLE_MAX
   ) fail('manifest_input_invalid')
-  const random = snapshotBytes(input.inheritedHandleSentinel.random, 'manifest_input_invalid')
-  if (random.byteLength !== 32 || isAllZero(random)) fail('manifest_input_invalid')
+  if (inheritedHandleSentinel.random.byteLength !== 32 || isAllZero(inheritedHandleSentinel.random)) {
+    fail('manifest_input_invalid')
+  }
+  return snapshot
 }
 
 function validateManifestExpectation(expected) {
-  exactPlainObject(expected, MANIFEST_EXPECTATION_KEYS, 'manifest_expectation_invalid')
-  validateCorrelationId(expected.correlationId, 'manifest_expectation_invalid')
-  validateSha256(expected.payloadSha256, 'manifest_expectation_invalid')
-  boundedInteger(expected.payloadBytes, 1, MAX_PAYLOAD_BYTES, 'manifest_expectation_invalid')
+  const snapshot = snapshotPlainObject(expected, MANIFEST_EXPECTATION_KEYS, 'manifest_expectation_invalid')
+  validateCorrelationId(snapshot.correlationId, 'manifest_expectation_invalid')
+  validateSha256(snapshot.payloadSha256, 'manifest_expectation_invalid')
+  boundedInteger(snapshot.payloadBytes, 1, MAX_PAYLOAD_BYTES, 'manifest_expectation_invalid')
+  return snapshot
 }
 
 function validateEvidenceInput(input) {
-  exactPlainObject(input, EVIDENCE_INPUT_KEYS, 'evidence_input_invalid')
-  validateEvidenceBindingFields(input, 'evidence_input_invalid')
-  if (!RESULT_SET.has(input.result)) fail('evidence_input_invalid')
-  validateObservationArray(input.observations, 'evidence_input_invalid')
+  const topLevel = snapshotPlainObject(input, EVIDENCE_INPUT_KEYS, 'evidence_input_invalid')
+  const snapshot = {
+    ...topLevel,
+    observations: snapshotObservationArray(topLevel.observations, 'evidence_input_invalid'),
+  }
+  validateEvidenceBindingFields(snapshot, 'evidence_input_invalid')
+  if (!RESULT_SET.has(snapshot.result)) fail('evidence_input_invalid')
+  return snapshot
 }
 
 function validateEvidenceExpectation(expected) {
-  exactPlainObject(expected, EVIDENCE_EXPECTATION_KEYS, 'evidence_expectation_invalid')
-  validateEvidenceBindingFields(expected, 'evidence_expectation_invalid')
+  const snapshot = snapshotPlainObject(expected, EVIDENCE_EXPECTATION_KEYS, 'evidence_expectation_invalid')
+  validateEvidenceBindingFields(snapshot, 'evidence_expectation_invalid')
+  return snapshot
 }
 
 function validateEvidenceBindingFields(expected, code) {
@@ -458,17 +522,27 @@ function validateEvidenceBindingFields(expected, code) {
   boundedInteger(expected.payloadBytes, 1, MAX_PAYLOAD_BYTES, code)
 }
 
-function validateObservationArray(value, code) {
+function snapshotObservationArray(value, code) {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) fail(code)
-  if (value.length !== APPCONTAINER_PROBE_CHILD_GATE_SPECS.length) fail(code)
+  const expectedLength = APPCONTAINER_PROBE_CHILD_GATE_SPECS.length
   const keys = Reflect.ownKeys(value)
-  const expectedKeys = [...Array.from({ length: value.length }, (_, index) => String(index)), 'length']
+  const expectedKeys = [...Array.from({ length: expectedLength }, (_, index) => String(index)), 'length']
   if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) fail(code)
-  for (let index = 0; index < value.length; index += 1) {
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
+  if (
+    lengthDescriptor === undefined
+    || lengthDescriptor.enumerable
+    || !('value' in lengthDescriptor)
+    || lengthDescriptor.value !== expectedLength
+  ) fail(code)
+  const snapshot = []
+  for (let index = 0; index < expectedLength; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) fail(code)
+    snapshot.push(descriptor.value)
   }
-  for (const observation of value) if (!OBSERVATION_SET.has(observation)) fail(code)
+  for (const observation of snapshot) if (!OBSERVATION_SET.has(observation)) fail(code)
+  return snapshot
 }
 
 function validateRecord(spec, record, correlationId) {
@@ -481,6 +555,7 @@ function validateRecord(spec, record, correlationId) {
       exactInteger(record.byteLength, EMPTY_ENVIRONMENT.byteLength, 'manifest_environment_invalid')
       return null
     case 'profile_path':
+    case 'scratch_root_path':
     case 'main_workspace_sentinel_path':
     case 'user_profile_sentinel_path':
     case 'credential_store_sentinel_path':
@@ -494,7 +569,7 @@ function validateRecord(spec, record, correlationId) {
       return path
     }
     case 'parent_named_pipe_sentinel': {
-      const expectedPipe = pipeName(correlationId)
+      const expectedPipe = deriveAppContainerProbePayloadParentNamedPipeSentinel(correlationId)
       const actualPipe = decodeUtf16leNullTerminated(record, 'manifest_pipe_invalid')
       if (actualPipe !== expectedPipe) fail('manifest_pipe_invalid')
       return true
@@ -514,7 +589,7 @@ function validateRecord(spec, record, correlationId) {
     case 'loopback_network_sentinel':
     case 'lan_network_sentinel':
     case 'internet_network_sentinel': {
-      const networkIndex = spec.type - 15
+      const networkIndex = spec.type - 16
       const expected = FIXED_SOCKADDR_BYTES[networkIndex]
       if (expected === undefined) fail('manifest_record_invalid')
       requireBytes(record, 0, expected, 'manifest_sockaddr_invalid')
@@ -526,14 +601,24 @@ function validateRecord(spec, record, correlationId) {
   }
 }
 
-function validateDecodedRecordRelationships(decoded) {
-  const pathNames = APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_SPECS
-    .slice(3, 11)
-    .map(({ name }) => name)
-  const paths = [decoded.profile_path, ...pathNames.map((name) => decoded[name])]
+function validateDecodedRecordRelationships(decoded, correlationId) {
+  const pathNames = [
+    'profile_path',
+    'scratch_root_path',
+    'main_workspace_sentinel_path',
+    'user_profile_sentinel_path',
+    'credential_store_sentinel_path',
+    'runtime_sentinel_path',
+    'out_sentinel_path',
+    'release_sentinel_path',
+    'programdata_sentinel_path',
+    'sibling_temp_sentinel_path',
+  ]
+  const paths = pathNames.map((name) => decoded[name])
   if (paths.some((path) => typeof path !== 'string') || pathsOverlap(paths)) {
     fail('manifest_path_invalid')
   }
+  deriveAppContainerProbePayloadEvidencePath(decoded.scratch_root_path, correlationId)
 }
 
 function validateBinaryPackageSid(record) {
@@ -568,13 +653,8 @@ function encodePackageSid(value) {
   return encoded
 }
 
-function pipeName(correlationId) {
-  validateCorrelationId(correlationId, 'manifest_pipe_invalid')
-  return `${APPCONTAINER_PROBE_PAYLOAD_PIPE_PREFIX}${correlationId}`
-}
-
 function pathsOverlap(paths) {
-  const folded = paths.map((path) => path.toLocaleLowerCase('en-US'))
+  const folded = paths.map(foldAsciiWindowsPath)
   for (let left = 0; left < folded.length; left += 1) {
     for (let right = left + 1; right < folded.length; right += 1) {
       const leftPath = folded[left]
@@ -606,13 +686,19 @@ function validateCanonicalWindowsPath(value) {
   const segments = value.slice(3).split('\\')
   if (
     segments.some((segment) => !segment || segment === '.' || segment === '..' || /[ .]$/u.test(segment))
+    || segments.some((segment) => !/^[A-Za-z0-9 _.\-]+$/u.test(segment))
     || segments.some(isReservedWindowsSegment)
   ) fail('manifest_path_invalid')
 }
 
 function isReservedWindowsSegment(segment) {
-  const basename = segment.split('.')[0]
-  return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/iu.test(basename ?? '')
+  const basename = (segment.split('.')[0] ?? '').replace(/[ .]+$/u, '')
+  return /^(?:CON|PRN|AUX|NUL|COM(?:[1-9]|\u00b9|\u00b2|\u00b3)|LPT(?:[1-9]|\u00b9|\u00b2|\u00b3))$/iu
+    .test(basename)
+}
+
+function foldAsciiWindowsPath(value) {
+  return value.replace(/[A-Z]/gu, (character) => String.fromCharCode(character.charCodeAt(0) + 0x20))
 }
 
 function encodeUtf16leNullTerminated(value) {
@@ -640,7 +726,7 @@ function encodeUint32(value) {
 function encodeHandleSentinel(value) {
   const encoded = Buffer.alloc(40)
   encoded.writeBigUInt64LE(value.handle, 0)
-  snapshotBytes(value.random, 'manifest_input_invalid').copy(encoded, 8)
+  value.random.copy(encoded, 8)
   return encoded
 }
 
@@ -685,7 +771,7 @@ function validateSha256(value, code) {
   if (typeof value !== 'string' || !SHA256.test(value) || /^0+$/u.test(value)) fail(code)
 }
 
-function exactPlainObject(value, keys, code) {
+function snapshotPlainObject(value, keys, code) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(code)
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) fail(code)
@@ -694,10 +780,18 @@ function exactPlainObject(value, keys, code) {
   const actual = ownKeys.map(String).sort(compareUtf8)
   const expected = [...keys].sort(compareUtf8)
   if (actual.some((key, index) => key !== expected[index])) fail(code)
+  const snapshot = Object.create(null)
   for (const key of ownKeys) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) fail(code)
+    Object.defineProperty(snapshot, key, {
+      value: descriptor.value,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    })
   }
+  return snapshot
 }
 
 function snapshotBytes(value, code) {

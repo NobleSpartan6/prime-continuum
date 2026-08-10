@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,12 +10,21 @@ import {
   APPCONTAINER_PROBE_GATE_SPECS,
   APPCONTAINER_PROBE_MAX_RECEIPT_BYTES,
   APPCONTAINER_PROBE_PHASES,
+  canonicalAppContainerProbeJson,
   createAppContainerProbeReceiptEnvelope,
   serializeAppContainerProbeReceiptEnvelope,
   validateAppContainerProbeAdmission,
   validateAppContainerProbeReceipt,
   verifyAppContainerProbeReceiptBytes,
+  type AppContainerProbeAdmissionInput,
+  type AppContainerProbeAdmissionProvenance,
 } from '../../scripts/windows-appcontainer-probe-lib.mjs'
+import {
+  APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_FILENAME_PREFIX,
+  APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC,
+  APPCONTAINER_PROBE_PAYLOAD_MANIFEST_FILENAME,
+  APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC,
+} from '../../scripts/windows-appcontainer-probe-payload-protocol.mjs'
 
 const temporaryRoots: string[] = []
 
@@ -23,12 +33,14 @@ afterEach(async () => {
 })
 
 describe('source-only Windows AppContainer probe contract', () => {
-  it('admits only an interactive disposable x64 VM under a dedicated standard medium-integrity operator', () => {
+  it('admits only an interactive disposable x64 VM with four exact, distinct provenance inputs', () => {
     const admitted = validateAppContainerProbeAdmission(admissionFixture())
     expect(admitted).toEqual({
       status: 'admitted',
       installedCandidate: { sha256: '1'.repeat(64), bytes: 4096 },
-      probePayload: { sha256: '2'.repeat(64), bytes: 8192 },
+      nativeSupervisor: { sha256: '2'.repeat(64), bytes: 8192, machine: 'x64' },
+      probePayload: { sha256: '3'.repeat(64), bytes: 12288, machine: 'x64' },
+      nativeBuildManifest: { sha256: '4'.repeat(64), bytes: 1024, machine: 'x64' },
     })
 
     const absentCiEnvironment = {
@@ -45,7 +57,14 @@ describe('source-only Windows AppContainer probe contract', () => {
       (value: any) => { value.operator.administratorsGroupAbsent = false },
       (value: any) => { value.operator.elevated = true },
       (value: any) => { value.operator.integrity = 'high' },
+      (value: any) => { value.nativeSupervisor.reparsePoint = true },
+      (value: any) => { value.nativeSupervisor.regularFile = false },
+      (value: any) => { value.nativeSupervisor.bytes = 64 * 1024 * 1024 + 1 },
       (value: any) => { value.probePayload.reparsePoint = true },
+      (value: any) => { value.nativeBuildManifest.preexisting = false },
+      (value: any) => { value.nativeBuildManifest.machine = 'arm64' },
+      (value: any) => { value.nativeBuildManifest.bytes = 64 * 1024 + 1 },
+      (value: any) => { value.nativeBuildManifest.sha256 = '0'.repeat(64) },
       (value: any) => { value.probePayload.sha256 = value.installedCandidate.sha256 },
       (value: any) => { value.confirmationPhrase = 'close enough' },
       (value: any) => { value.storage.boundedControlledSentinels = false },
@@ -55,6 +74,59 @@ describe('source-only Windows AppContainer probe contract', () => {
       mutate(value)
       expect(() => validateAppContainerProbeAdmission(value)).toThrow()
     }
+  })
+
+  it('rejects every provenance cross-feed and enforces native role, x64, and byte bounds', () => {
+    const keys = ['installedCandidate', 'nativeSupervisor', 'probePayload', 'nativeBuildManifest'] as const
+    for (let targetIndex = 1; targetIndex < keys.length; targetIndex += 1) {
+      for (let sourceIndex = 0; sourceIndex < targetIndex; sourceIndex += 1) {
+        const targetKey = keys[targetIndex]!
+        const sourceKey = keys[sourceIndex]!
+        const admission = admissionFixture() as any
+        admission[targetKey].sha256 = admission[sourceKey].sha256
+        expect(() => validateAppContainerProbeAdmission(admission)).toThrow(/provenance_not_distinct/)
+
+        const receipt = functionalReceipt()
+        receipt.provenance[targetKey].sha256 = receipt.provenance[sourceKey].sha256
+        expect(() => validateAppContainerProbeReceipt(receipt)).toThrow(/provenance_not_distinct/)
+      }
+    }
+
+    const wrongSupervisorRole = functionalReceipt()
+    wrongSupervisorRole.provenance.nativeSupervisor.role = 'launch_target'
+    expect(() => validateAppContainerProbeReceipt(wrongSupervisorRole)).toThrow()
+
+    const wrongPayloadMachine = functionalReceipt()
+    wrongPayloadMachine.provenance.probePayload.machine = 'arm64'
+    expect(() => validateAppContainerProbeReceipt(wrongPayloadMachine)).toThrow()
+
+    const oversizedSupervisor = functionalReceipt()
+    oversizedSupervisor.provenance.nativeSupervisor.bytes = 64 * 1024 * 1024 + 1
+    expect(() => validateAppContainerProbeReceipt(oversizedSupervisor)).toThrow()
+
+    const oversizedBuildManifest = functionalReceipt()
+    oversizedBuildManifest.provenance.nativeBuildManifest.bytes = 64 * 1024 + 1
+    expect(() => validateAppContainerProbeReceipt(oversizedBuildManifest)).toThrow()
+
+    const zeroCorrelation = functionalReceipt()
+    zeroCorrelation.correlationId = '0'.repeat(32)
+    expect(() => validateAppContainerProbeReceipt(zeroCorrelation)).toThrow()
+
+    const zeroSupervisorDigest = functionalReceipt()
+    zeroSupervisorDigest.provenance.nativeSupervisor.sha256 = '0'.repeat(64)
+    expect(() => validateAppContainerProbeReceipt(zeroSupervisorDigest)).toThrow()
+
+    const zeroEvidenceDigest = functionalReceipt()
+    zeroEvidenceDigest.supervisorEvidence.sha256 = '0'.repeat(64)
+    expect(() => validateAppContainerProbeReceipt(zeroEvidenceDigest)).toThrow()
+
+    const candidateExecutionClaim = functionalReceipt()
+    candidateExecutionClaim.provenance.installedCandidate.role = 'launch_target'
+    expect(() => validateAppContainerProbeReceipt(candidateExecutionClaim)).toThrow()
+
+    const candidateMachineExtension = functionalReceipt()
+    candidateMachineExtension.provenance.installedCandidate.machine = 'x64'
+    expect(() => validateAppContainerProbeReceipt(candidateMachineExtension)).toThrow()
   })
 
   it('round-trips only canonical bounded correlation evidence and preserves distinct exit semantics', async () => {
@@ -181,11 +253,32 @@ describe('source-only Windows AppContainer probe contract', () => {
     })
   })
 
-  it('binds admission status to the exact state prefix and rejects the stale provider claim key', () => {
-    const retiredV1 = functionalReceipt()
-    retiredV1.schemaVersion = 1
-    retiredV1.kind = 'prime_continuim_appcontainer_probe_v1'
-    expect(() => validateAppContainerProbeReceipt(retiredV1)).toThrow()
+  it('rejects the never-live v2 receipt and envelope and stale provider claim key', () => {
+    const retiredV2 = functionalReceipt()
+    retiredV2.schemaVersion = 2
+    retiredV2.kind = 'prime_continuim_appcontainer_probe_v2'
+    expect(() => validateAppContainerProbeReceipt(retiredV2)).toThrow()
+
+    delete retiredV2.admission.dedicatedNativeSupervisor
+    delete retiredV2.admission.pinnedNativeBuildManifest
+    retiredV2.provenance = {
+      installedCandidate: { role: 'correlation_only_not_executed', sha256: '1'.repeat(64), bytes: 4096 },
+      probePayload: { role: 'dedicated_probe_payload_launch_target', sha256: '3'.repeat(64), bytes: 12288 },
+    }
+    delete retiredV2.launchPolicy.payloadManifestProtocol
+    delete retiredV2.launchPolicy.payloadEvidenceProtocol
+    delete retiredV2.launchPolicy.payloadEvidenceTransport
+    const retiredV2ReceiptJson = canonicalAppContainerProbeJson(retiredV2)
+
+    const retiredV2Envelope = {
+      schemaVersion: 2,
+      kind: 'prime_continuim_appcontainer_probe_envelope_v2',
+      receiptSha256: createHash('sha256').update(retiredV2ReceiptJson, 'utf8').digest('hex'),
+      receipt: retiredV2,
+    }
+    expect(() => verifyAppContainerProbeReceiptBytes(
+      Buffer.from(`${canonicalAppContainerProbeJson(retiredV2Envelope)}\n`, 'utf8'),
+    )).toThrow()
 
     const deniedWithProgress = failureReceipt()
     deniedWithProgress.state = { phases: ['prepared', 'admitted'], finalPhase: 'admitted' }
@@ -200,6 +293,33 @@ describe('source-only Windows AppContainer probe contract', () => {
     staleClaim.claims.providerBacked = false
     delete staleClaim.claims.providerBackedEvaluation
     expect(() => validateAppContainerProbeReceipt(staleClaim)).toThrow()
+  })
+
+  it('requires PCAP wire v2 sealed-manifest/create-new-file binding and rejects legacy wire values', () => {
+    const legacyManifest = functionalReceipt()
+    legacyManifest.launchPolicy.payloadManifestProtocol = 'PCAPM001'
+    expect(() => validateAppContainerProbeReceipt(legacyManifest)).toThrow()
+
+    const legacyEvidence = functionalReceipt()
+    legacyEvidence.launchPolicy.payloadEvidenceProtocol = 'PCAPE001'
+    expect(() => validateAppContainerProbeReceipt(legacyEvidence)).toThrow()
+
+    const legacyPipe = functionalReceipt()
+    legacyPipe.launchPolicy.payloadEvidenceTransport = 'correlation_scoped_pipe'
+    expect(() => validateAppContainerProbeReceipt(legacyPipe)).toThrow()
+  })
+
+  it('keeps JSON launch-policy literals pinned to the wire module in a test-only canary', () => {
+    const policy = functionalReceipt().launchPolicy
+    expect(policy.payloadManifestProtocol).toBe(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC)
+    expect(policy.payloadEvidenceProtocol).toBe(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC)
+    expect(APPCONTAINER_PROBE_PAYLOAD_MANIFEST_FILENAME).toContain(
+      APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC,
+    )
+    expect(APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_FILENAME_PREFIX).toContain(
+      APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC,
+    )
+    expect(policy.payloadEvidenceTransport).toBe('sealed_tool_manifest_plus_scratch_create_new_file')
   })
 
   it('snapshots ordinary enumerable data and rejects accessors, hidden fields, symbols, and prototype keys', () => {
@@ -235,7 +355,7 @@ describe('source-only Windows AppContainer probe contract', () => {
 
     const candidateAsProbe = functionalReceipt()
     candidateAsProbe.provenance.probePayload.sha256 = candidateAsProbe.provenance.installedCandidate.sha256
-    expect(() => validateAppContainerProbeReceipt(candidateAsProbe)).toThrow(/probe_payload_not_distinct/)
+    expect(() => validateAppContainerProbeReceipt(candidateAsProbe)).toThrow(/provenance_not_distinct/)
 
     const profileCreationFailed = functionalReceipt()
     profileCreationFailed.outcome = 'failed_vm_disposal_required'
@@ -256,7 +376,7 @@ describe('source-only Windows AppContainer probe contract', () => {
     }
     profileCreationFailed.failure = { stage: 'admitted', code: 'profile_creation_failed' }
     expect((validateAppContainerProbeReceipt(profileCreationFailed) as any).provenance.probePayload.role)
-      .toBe('dedicated_probe_payload_launch_target')
+      .toBe('launch_target')
     profileCreationFailed.provenance.probePayload.role = 'dedicated_probe_payload_executed'
     expect(() => validateAppContainerProbeReceipt(profileCreationFailed)).toThrow()
 
@@ -291,7 +411,7 @@ describe('source-only Windows AppContainer probe contract', () => {
   })
 })
 
-function admissionFixture() {
+function admissionFixture(): AppContainerProbeAdmissionInput {
   return {
     platform: 'win32',
     arch: 'x64',
@@ -310,7 +430,9 @@ function admissionFixture() {
       integrity: 'medium',
     },
     installedCandidate: provenance('1', 4096),
-    probePayload: provenance('2', 8192),
+    nativeSupervisor: provenance('2', 8192),
+    probePayload: provenance('3', 12288),
+    nativeBuildManifest: provenance('4', 1024),
     storage: {
       boundedPrivateRoot: true,
       freshOperationRoot: true,
@@ -321,7 +443,7 @@ function admissionFixture() {
   }
 }
 
-function provenance(character: string, bytes: number) {
+function provenance(character: string, bytes: number): AppContainerProbeAdmissionProvenance {
   return {
     sha256: character.repeat(64),
     bytes,
@@ -334,16 +456,18 @@ function provenance(character: string, bytes: number) {
 
 function functionalReceipt(): any {
   return {
-    schemaVersion: 2,
-    kind: 'prime_continuim_appcontainer_probe_v2',
+    schemaVersion: 3,
+    kind: 'prime_continuim_appcontainer_probe_v3',
     outcome: 'functional_passed_vm_disposal_required',
     correlationId: '4'.repeat(32),
     platform: 'win32',
     arch: 'x64',
     admission: admittedFacts(),
     provenance: {
-      installedCandidate: { role: 'correlation_only_not_executed', sha256: '1'.repeat(64), bytes: 4096 },
-      probePayload: { role: 'dedicated_probe_payload_launch_target', sha256: '2'.repeat(64), bytes: 8192 },
+      installedCandidate: { role: 'installed_candidate_correlation', sha256: '1'.repeat(64), bytes: 4096 },
+      nativeSupervisor: { role: 'native_supervisor', sha256: '2'.repeat(64), bytes: 8192, machine: 'x64' },
+      probePayload: { role: 'launch_target', sha256: '3'.repeat(64), bytes: 12288, machine: 'x64' },
+      nativeBuildManifest: { role: 'native_build_manifest', sha256: '4'.repeat(64), bytes: 1024, machine: 'x64' },
     },
     launchPolicy: launchPolicy(),
     state: { phases: [...APPCONTAINER_PROBE_PHASES], finalPhase: 'settled' },
@@ -402,7 +526,9 @@ function admittedFacts(): any {
     operatorMediumIntegrity: true,
     operatorNotElevated: true,
     preexistingProvenanceMatched: true,
+    dedicatedNativeSupervisor: true,
     dedicatedProbePayload: true,
+    pinnedNativeBuildManifest: true,
   }
 }
 
@@ -419,6 +545,9 @@ function launchPolicy() {
     sealedToolTreeReadExecuteOnly: true,
     scratchAndProfileReadWriteOnly: true,
     noWritableExecutableClosure: true,
+    payloadManifestProtocol: 'PCAPM002',
+    payloadEvidenceProtocol: 'PCAPE002',
+    payloadEvidenceTransport: 'sealed_tool_manifest_plus_scratch_create_new_file',
     experimentalApi: false,
     fallback: false,
   }

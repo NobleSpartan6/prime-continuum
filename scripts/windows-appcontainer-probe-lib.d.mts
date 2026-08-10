@@ -1,6 +1,6 @@
-export const APPCONTAINER_PROBE_SCHEMA_VERSION: 2
-export const APPCONTAINER_PROBE_KIND: 'prime_continuim_appcontainer_probe_v2'
-export const APPCONTAINER_PROBE_ENVELOPE_KIND: 'prime_continuim_appcontainer_probe_envelope_v2'
+export const APPCONTAINER_PROBE_SCHEMA_VERSION: 3
+export const APPCONTAINER_PROBE_KIND: 'prime_continuim_appcontainer_probe_v3'
+export const APPCONTAINER_PROBE_ENVELOPE_KIND: 'prime_continuim_appcontainer_probe_envelope_v3'
 export const APPCONTAINER_PROBE_MAX_RECEIPT_BYTES: number
 export const APPCONTAINER_PROBE_CONFIRMATION_PHRASE: string
 export const APPCONTAINER_PROBE_PHASES: readonly [
@@ -40,8 +40,8 @@ export class AppContainerProbeContractError extends Error {
 }
 
 export interface AppContainerProbeAdmissionInput {
-  readonly platform: string
-  readonly arch: string
+  readonly platform: 'win32'
+  readonly arch: 'x64'
   readonly stdinIsTTY: boolean
   readonly stdoutIsTTY: boolean
   readonly ci: string | boolean | undefined
@@ -54,10 +54,12 @@ export interface AppContainerProbeAdmissionInput {
     standardUser: boolean
     administratorsGroupAbsent: boolean
     elevated: boolean
-    integrity: string
+    integrity: 'medium'
   }>
   readonly installedCandidate: AppContainerProbeAdmissionProvenance
+  readonly nativeSupervisor: AppContainerProbeAdmissionProvenance
   readonly probePayload: AppContainerProbeAdmissionProvenance
+  readonly nativeBuildManifest: AppContainerProbeAdmissionProvenance
   readonly storage: Readonly<{
     boundedPrivateRoot: boolean
     freshOperationRoot: boolean
@@ -73,13 +75,15 @@ export interface AppContainerProbeAdmissionProvenance {
   readonly preexisting: boolean
   readonly regularFile: boolean
   readonly reparsePoint: boolean
-  readonly machine: string
+  readonly machine: 'x64'
 }
 
 export function validateAppContainerProbeAdmission(input: AppContainerProbeAdmissionInput): Readonly<{
   status: 'admitted'
   installedCandidate: Readonly<{ sha256: string; bytes: number }>
-  probePayload: Readonly<{ sha256: string; bytes: number }>
+  nativeSupervisor: Readonly<{ sha256: string; bytes: number; machine: 'x64' }>
+  probePayload: Readonly<{ sha256: string; bytes: number; machine: 'x64' }>
+  nativeBuildManifest: Readonly<{ sha256: string; bytes: number; machine: 'x64' }>
 }>
 
 export function validateAppContainerProbeReceipt(
@@ -89,8 +93,8 @@ export function validateAppContainerProbeReceipt(
 export function createAppContainerProbeReceiptEnvelope(
   receipt: Readonly<Record<string, unknown>>,
 ): Readonly<{
-  schemaVersion: 2
-  kind: 'prime_continuim_appcontainer_probe_envelope_v2'
+  schemaVersion: 3
+  kind: 'prime_continuim_appcontainer_probe_envelope_v3'
   receiptSha256: string
   receipt: Readonly<Record<string, unknown>>
 }>

@@ -102,13 +102,22 @@ evaluator, malicious-candidate filesystem isolation, security sandbox,
 autonomous promotion, installer/package gate, or cross-platform release proof.
 See `docs/self-build-evidence.md`.
 
-The repository also contains a source-only Windows AppContainer probe contract
-and a read-only receipt verifier. Run
+The repository also contains a source-only Windows AppContainer probe-v3
+contract, its `PCAPM002`/`PCAPE002` byte grammar, a memory-only C17 codec
+reference, a non-live operation-state reference, and a read-only receipt
+verifier. The codec can only parse a supplied manifest and emit an
+all-`not_attempted`, `incomplete_internal` evidence buffer; it has no OS or
+probe actions. Run
 `pnpm verify:windows-appcontainer-probe:receipt -- --receipt <path>` only to
 check one canonical, bounded, link-free correlation receipt. It does not create
 an AppContainer profile, change an ACL, launch a payload, evaluate the current
-candidate, or prove sandboxing. A live launcher and reviewed reproducible native
-x64 probe payload remain absent; see `docs/windows-appcontainer-evaluation.md`.
+candidate, or prove sandboxing. Normal Windows construction of the reference
+journal is mechanically unavailable outside its explicit Vitest seam because
+Windows write-through publication and supervisor owner/lease recovery fencing
+are not implemented. Its opt-in x64 static-library recipe was not compiled or
+executed here and is not live build provenance. A live launcher and reviewed
+reproducible native x64 supervisor/executing payload remain absent; see
+`docs/windows-appcontainer-evaluation.md`.
 
 On a verified local Windows host, the native **Evidence** panel can admit that
 same canonical self-build as an explicit **Evaluate candidate** operation. Its

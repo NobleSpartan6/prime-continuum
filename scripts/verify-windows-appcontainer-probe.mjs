@@ -8,16 +8,20 @@ import {
   verifyAppContainerProbeReceiptBytes,
 } from './windows-appcontainer-probe-lib.mjs'
 
-const RECEIPT_VERIFIER_KIND = 'prime_continuim_appcontainer_probe_static_verifier_v2'
+const RECEIPT_VERIFIER_KIND = 'prime_continuim_appcontainer_probe_static_verifier_v3'
+const CONSERVATIVE_RECEIPT_PATH = /^[\x20-\x7e]+$/u
 
 export async function verifyWindowsAppContainerProbeReceiptFile(receiptPath, testHooks) {
   if (typeof receiptPath !== 'string' || receiptPath.length < 1 || receiptPath.includes('\0')) {
     fail('receipt_path_invalid')
   }
+  requireConservativeReceiptPath(receiptPath, false)
   validateTestHooks(testHooks)
 
   const lexicalPath = resolve(receiptPath)
+  requireConservativeReceiptPath(lexicalPath, true)
   const physicalPath = await realpath(lexicalPath).catch(() => fail('receipt_path_invalid'))
+  requireConservativeReceiptPath(physicalPath, true)
   if (!samePath(lexicalPath, physicalPath)) fail('receipt_path_alias')
 
   const before = await lstat(lexicalPath, { bigint: true }).catch(() => fail('receipt_path_invalid'))
@@ -113,9 +117,26 @@ function requireSameIdentity(left, right, code = 'receipt_identity_changed') {
 }
 
 function samePath(left, right) {
-  return process.platform === 'win32'
-    ? left.toLocaleLowerCase('en-US') === right.toLocaleLowerCase('en-US')
-    : left === right
+  if (process.platform !== 'win32') return left === right
+  if (!CONSERVATIVE_RECEIPT_PATH.test(left) || !CONSERVATIVE_RECEIPT_PATH.test(right)) return false
+  return left.toLowerCase() === right.toLowerCase()
+}
+
+function requireConservativeReceiptPath(value, requireAbsoluteLocalDrive = false) {
+  if (!CONSERVATIVE_RECEIPT_PATH.test(value)) fail('receipt_path_non_ascii')
+  if (process.platform !== 'win32') return
+  // Receipt custody accepts only an ordinary local Win32 path. A colon after
+  // the drive designator names an NTFS alternate data stream; device and UNC
+  // spellings also bypass the intended single regular-file namespace.
+  const absoluteLocalDrive = /^[A-Za-z]:[\\/]/u.test(value)
+  const colon = value.indexOf(':')
+  if (
+    value.startsWith('\\\\') ||
+    (colon >= 0 && !(absoluteLocalDrive && colon === 1 && !value.slice(2).includes(':'))) ||
+    (requireAbsoluteLocalDrive && !absoluteLocalDrive)
+  ) {
+    fail('receipt_path_invalid')
+  }
 }
 
 function fail(code) {
@@ -146,7 +167,7 @@ async function isMainModule() {
     realpath(resolve(process.argv[1])).catch(() => resolve(process.argv[1])),
     realpath(fileURLToPath(import.meta.url)).catch(() => fileURLToPath(import.meta.url)),
   ])
-  return samePath(entryPhysicalPath, modulePhysicalPath)
+  return entryPhysicalPath === modulePhysicalPath
 }
 
 if (await isMainModule()) await main()

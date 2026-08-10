@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "kind": "prime_continuim_appcontainer_payload_codec_reference_build_v1",
+  "artifact": {
+    "name": "prime-continuim-appcontainer-payload-codec-reference-x64.lib",
+    "format": "coff_static_library",
+    "machine": "x64"
+  },
+  "toolchain": {
+    "family": "msvc",
+    "toolsetVersion": "14.44.35207",
+    "compilerFileVersion": "19.44.35219.0",
+    "archiverFileVersion": "14.44.35219.0",
+    "windowsSdkVersion": "10.0.26100.0",
+    "host": "x64",
+    "target": "x64",
+    "language": "c17"
+  },
+  "inputs": [
+    {
+      "path": "payload_codec_reference.c",
+      "sha256": "de5c3af47dd8e358d944f92bd5c948e8b5e9dec18b4d928bdc4a4023ff24df67",
+      "bytes": 25974
+    },
+    {
+      "path": "payload_codec_reference.h",
+      "sha256": "154342948071282f30f3a31aa9e801e75b9cc78bad3b79bed792cbf8433e8745",
+      "bytes": 1742
+    },
+    {
+      "path": "payload_contract.h",
+      "sha256": "037cf5f8408c4db6df3fc6433c803a28878d381f5db355e412b1d1f518e6cb43",
+      "bytes": 10584
+    }
+  ],
+  "compileFlags": [
+    "/nologo",
+    "/c",
+    "/TC",
+    "/std:c17",
+    "/O2",
+    "/Oi",
+    "/GL",
+    "/GS",
+    "/guard:cf",
+    "/sdl",
+    "/W4",
+    "/WX",
+    "/MT",
+    "/ZH:SHA_256",
+    "/Brepro",
+    "/volatile:iso",
+    "/Zc:inline",
+    "/diagnostics:caret",
+    "/D_CRT_SECURE_NO_WARNINGS"
+  ],
+  "archiveFlags": [
+    "/NOLOGO",
+    "/MACHINE:X64",
+    "/LTCG",
+    "/BREPRO",
+    "/WX"
+  ],
+  "sourceStatus": {
+    "classification": "source_only_codec_reference",
+    "compiledLocally": false,
+    "executedLocally": false,
+    "liveProbeActions": false,
+    "productIntegrated": false
+  },
+  "limitations": [
+    "No cl.exe, clang-cl.exe, clang.exe, or gcc.exe was found in the authoring workspace; this recipe was not executed or cited as build evidence in this tranche.",
+    "This static library parses and emits bytes only; it contains no child-gate probes, launcher, supervisor, operation journal, profile, ACL, token, process, filesystem, or network action.",
+    "The caller supplies toolchain roots, and the recipe checks directory and forgeable file-version strings rather than authenticating compiler, archiver, DLL, header, or library digests.",
+    "Inputs are hash-checked before cl.exe reopens them, so the recipe retains a check-to-use race and is a deterministic reference recipe, not reviewed reproducible-build provenance.",
+    "The recipe does not establish reparse-safe custody for source-root, toolchain-root, SDK-root, or output-directory ancestors.",
+    "No PE executable is produced; executable ASLR, NX, CFG, CET, dependency-load policy, and recursive import closure have not been inspected or claimed.",
+    "This declaration is not acceptable as live nativeBuildManifest provenance; the installed candidate remains untouched and is not evaluated."
+  ],
+  "recipeSha256": "d35f6689574e1bc324fb0e5983555023a1d8bc77a38b5415bebfcdda22dd609c"
+}

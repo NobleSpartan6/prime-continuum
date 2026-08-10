@@ -1,13 +1,13 @@
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC: 'PCAPM001'
-export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC: 'PCAPE001'
-export const APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION: 1
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAGIC: 'PCAPM002'
+export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_MAGIC: 'PCAPE002'
+export const APPCONTAINER_PROBE_PAYLOAD_PROTOCOL_VERSION: 2
 
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_MAX_BYTES: number
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_HEADER_BYTES: 160
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_OFFSET: 160
 export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_TABLE_ENTRY_BYTES: 16
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_COUNT: 17
-export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_BODY_OFFSET: 432
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_RECORD_COUNT: 18
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_BODY_OFFSET: 448
 
 export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_BYTES: 192
 export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_HEADER_BYTES: 128
@@ -52,7 +52,18 @@ export const APPCONTAINER_PROBE_PAYLOAD_RESULT_CODES: Readonly<{
   incomplete_internal: 2
 }>
 
-export const APPCONTAINER_PROBE_PAYLOAD_PIPE_PREFIX: string
+export const APPCONTAINER_PROBE_PAYLOAD_MANIFEST_FILENAME:
+  'PrimeContinuim.AppContainerProbe.PCAPM002.bin'
+export const APPCONTAINER_PROBE_PAYLOAD_EVIDENCE_FILENAME_PREFIX:
+  'PrimeContinuim.AppContainerProbe.PCAPE002.'
+export const APPCONTAINER_PROBE_PAYLOAD_PARENT_NAMED_PIPE_SENTINEL_PREFIX: string
+
+export function deriveAppContainerProbePayloadEvidenceFilename(correlationId: string): string
+export function deriveAppContainerProbePayloadEvidencePath(
+  scratchRoot: string,
+  correlationId: string,
+): string
+export function deriveAppContainerProbePayloadParentNamedPipeSentinel(correlationId: string): string
 
 export const APPCONTAINER_PROBE_PAYLOAD_NETWORK_SENTINELS: readonly Readonly<{
   id: 'loopback_network_sentinel' | 'lan_network_sentinel' | 'internet_network_sentinel'
@@ -108,6 +119,7 @@ export interface AppContainerProbePayloadManifestInput
   extends AppContainerProbePayloadManifestExpectation {
   readonly packageSid: string
   readonly profilePath: string
+  readonly scratchRoot: string
   readonly controlledFileSentinelPaths: AppContainerProbeControlledFileSentinelPaths
   readonly parentProcessId: number
   readonly inheritedHandleSentinel: AppContainerProbeInheritedHandleSentinel
@@ -115,12 +127,12 @@ export interface AppContainerProbePayloadManifestInput
 
 export interface AppContainerProbePayloadManifestSummary
   extends AppContainerProbePayloadManifestExpectation {
-  readonly schemaVersion: 1
-  readonly kind: 'prime_continuim_appcontainer_probe_payload_manifest_v1'
+  readonly schemaVersion: 2
+  readonly kind: 'prime_continuim_appcontainer_probe_payload_manifest_v2'
   readonly sha256: string
   readonly bytes: number
   readonly childGateContractSha256: string
-  readonly recordCount: 17
+  readonly recordCount: 18
 }
 
 export function createAppContainerProbePayloadManifest(
@@ -154,8 +166,8 @@ export interface AppContainerProbePayloadEvidenceGateSummary {
 
 export interface AppContainerProbePayloadEvidenceSummary
   extends AppContainerProbePayloadEvidenceExpectation {
-  readonly schemaVersion: 1
-  readonly kind: 'prime_continuim_appcontainer_probe_payload_evidence_v1'
+  readonly schemaVersion: 2
+  readonly kind: 'prime_continuim_appcontainer_probe_payload_evidence_v2'
   readonly sha256: string
   readonly bytes: 192
   readonly result: AppContainerProbePayloadResult

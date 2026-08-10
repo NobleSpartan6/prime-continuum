@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { link, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -26,12 +26,17 @@ describe('Windows AppContainer static receipt verifier', () => {
     const verified = await verifyWindowsAppContainerProbeReceiptFile(receiptPath)
 
     expect(verified).toMatchObject({
-      verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v2',
+      verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v3',
       receiptBytes: bytes.byteLength,
       staticVerifierExitCode: 0,
       liveProbeExitCode: 2,
     })
     expect(verified.receiptSha256).toMatch(/^[a-f0-9]{64}$/)
+
+    const verifiedRelative = await verifyWindowsAppContainerProbeReceiptFile(
+      relative(process.cwd(), receiptPath),
+    )
+    expect(verifiedRelative.receiptSha256).toBe(verified.receiptSha256)
   })
 
   it('prints only bounded correlation facts and accepts no live-probe arguments', async () => {
@@ -42,7 +47,7 @@ describe('Windows AppContainer static receipt verifier', () => {
     const output = JSON.parse(stdout)
     expect(stderr).toBe('')
     expect(output).toMatchObject({
-      kind: 'prime_continuim_appcontainer_probe_static_verifier_v2',
+      kind: 'prime_continuim_appcontainer_probe_static_verifier_v3',
       outcome: 'functional_passed_vm_disposal_required',
       staticVerifierExitCode: 0,
       liveProbeExitCode: 2,
@@ -69,6 +74,38 @@ describe('Windows AppContainer static receipt verifier', () => {
     )
     await link(secondReceipt, join(root, 'second-link.json'))
     await expect(verifyWindowsAppContainerProbeReceiptFile(secondReceipt)).rejects.toThrow(/receipt_file_invalid/)
+  })
+
+  it('rejects Unicode path spellings instead of approximating Windows path equality', async () => {
+    const lexicalRoot = await mkdtemp(join(tmpdir(), 'prime-appcontainer-verifier-ascii-'))
+    const root = await realpath(lexicalRoot)
+    temporaryRoots.push(root)
+    const bytes = serializeAppContainerProbeReceiptEnvelope(
+      createAppContainerProbeReceiptEnvelope(functionalReceipt()),
+    )
+
+    for (const leaf of ['receipt-Σ.json', 'receipt-ς.json', 'receipt-COM¹.json']) {
+      const receiptPath = join(root, leaf)
+      await writeFile(receiptPath, bytes, { flag: 'wx' })
+      await expect(verifyWindowsAppContainerProbeReceiptFile(receiptPath))
+        .rejects.toThrow(/receipt_path_non_ascii/)
+    }
+  })
+
+  it.skipIf(process.platform !== 'win32')('rejects NTFS alternate data streams before receipt parsing', async () => {
+    const lexicalRoot = await mkdtemp(join(tmpdir(), 'prime-appcontainer-verifier-ads-'))
+    const root = await realpath(lexicalRoot)
+    temporaryRoots.push(root)
+    const carrier = join(root, 'carrier.txt')
+    const streamPath = `${carrier}:receipt.json`
+    const bytes = serializeAppContainerProbeReceiptEnvelope(
+      createAppContainerProbeReceiptEnvelope(functionalReceipt()),
+    )
+    await writeFile(carrier, 'carrier', { flag: 'wx' })
+    await writeFile(streamPath, bytes, { flag: 'wx' })
+
+    await expect(verifyWindowsAppContainerProbeReceiptFile(streamPath))
+      .rejects.toThrow(/receipt_path_invalid/)
   })
 
   it('rejects a parent that is replaced by an alias after the receipt was read', async () => {
@@ -112,8 +149,8 @@ async function writeReceipt() {
 
 function functionalReceipt(): any {
   return {
-    schemaVersion: 2,
-    kind: 'prime_continuim_appcontainer_probe_v2',
+    schemaVersion: 3,
+    kind: 'prime_continuim_appcontainer_probe_v3',
     outcome: 'functional_passed_vm_disposal_required',
     correlationId: '4'.repeat(32),
     platform: 'win32',
@@ -130,11 +167,15 @@ function functionalReceipt(): any {
       operatorMediumIntegrity: true,
       operatorNotElevated: true,
       preexistingProvenanceMatched: true,
+      dedicatedNativeSupervisor: true,
       dedicatedProbePayload: true,
+      pinnedNativeBuildManifest: true,
     },
     provenance: {
-      installedCandidate: { role: 'correlation_only_not_executed', sha256: '1'.repeat(64), bytes: 4096 },
-      probePayload: { role: 'dedicated_probe_payload_launch_target', sha256: '2'.repeat(64), bytes: 8192 },
+      installedCandidate: { role: 'installed_candidate_correlation', sha256: '1'.repeat(64), bytes: 4096 },
+      nativeSupervisor: { role: 'native_supervisor', sha256: '2'.repeat(64), bytes: 8192, machine: 'x64' },
+      probePayload: { role: 'launch_target', sha256: '3'.repeat(64), bytes: 12288, machine: 'x64' },
+      nativeBuildManifest: { role: 'native_build_manifest', sha256: '4'.repeat(64), bytes: 1024, machine: 'x64' },
     },
     launchPolicy: {
       stableProfileApisOnly: true,
@@ -148,6 +189,9 @@ function functionalReceipt(): any {
       sealedToolTreeReadExecuteOnly: true,
       scratchAndProfileReadWriteOnly: true,
       noWritableExecutableClosure: true,
+      payloadManifestProtocol: 'PCAPM002',
+      payloadEvidenceProtocol: 'PCAPE002',
+      payloadEvidenceTransport: 'sealed_tool_manifest_plus_scratch_create_new_file',
       experimentalApi: false,
       fallback: false,
     },

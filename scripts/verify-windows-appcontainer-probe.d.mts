@@ -3,7 +3,7 @@ export interface VerifiedWindowsAppContainerProbeReceiptFile {
   readonly receiptSha256: string
   readonly staticVerifierExitCode: 0
   readonly liveProbeExitCode: 1 | 2
-  readonly verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v2'
+  readonly verifierKind: 'prime_continuim_appcontainer_probe_static_verifier_v3'
   readonly receiptBytes: number
 }
 

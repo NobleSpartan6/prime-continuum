@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
-export const APPCONTAINER_PROBE_SCHEMA_VERSION = 2
-export const APPCONTAINER_PROBE_KIND = 'prime_continuim_appcontainer_probe_v2'
-export const APPCONTAINER_PROBE_ENVELOPE_KIND = 'prime_continuim_appcontainer_probe_envelope_v2'
+export const APPCONTAINER_PROBE_SCHEMA_VERSION = 3
+export const APPCONTAINER_PROBE_KIND = 'prime_continuim_appcontainer_probe_v3'
+export const APPCONTAINER_PROBE_ENVELOPE_KIND = 'prime_continuim_appcontainer_probe_envelope_v3'
 export const APPCONTAINER_PROBE_MAX_RECEIPT_BYTES = 64 * 1024
 export const APPCONTAINER_PROBE_CONFIRMATION_PHRASE =
   'DISPOSE THIS VM AFTER PRIME APPCONTAINER PROBE'
@@ -141,7 +141,9 @@ const ADMISSION_KEYS = [
   'operatorMediumIntegrity',
   'operatorNotElevated',
   'preexistingProvenanceMatched',
+  'dedicatedNativeSupervisor',
   'dedicatedProbePayload',
+  'pinnedNativeBuildManifest',
 ]
 const ADMISSION_INPUT_KEYS = [
   'platform',
@@ -155,7 +157,9 @@ const ADMISSION_INPUT_KEYS = [
   'confirmationPhrase',
   'operator',
   'installedCandidate',
+  'nativeSupervisor',
   'probePayload',
+  'nativeBuildManifest',
   'storage',
 ]
 const OPERATOR_KEYS = [
@@ -173,8 +177,9 @@ const STORAGE_KEYS = [
   'sealedToolCopyPlanned',
   'boundedControlledSentinels',
 ]
-const PROVENANCE_KEYS = ['installedCandidate', 'probePayload']
-const PROVENANCE_RECORD_KEYS = ['role', 'sha256', 'bytes']
+const PROVENANCE_KEYS = ['installedCandidate', 'nativeSupervisor', 'probePayload', 'nativeBuildManifest']
+const CORRELATION_RECORD_KEYS = ['role', 'sha256', 'bytes']
+const NATIVE_PROVENANCE_RECORD_KEYS = ['role', 'sha256', 'bytes', 'machine']
 const LAUNCH_POLICY_KEYS = [
   'stableProfileApisOnly',
   'startupInfoEx',
@@ -187,6 +192,9 @@ const LAUNCH_POLICY_KEYS = [
   'sealedToolTreeReadExecuteOnly',
   'scratchAndProfileReadWriteOnly',
   'noWritableExecutableClosure',
+  'payloadManifestProtocol',
+  'payloadEvidenceProtocol',
+  'payloadEvidenceTransport',
   'experimentalApi',
   'fallback',
 ]
@@ -242,17 +250,19 @@ export function validateAppContainerProbeAdmission(input) {
   exactValue(input.operator.integrity, 'medium', 'medium_integrity_required')
 
   validateAdmissionProvenance(input.installedCandidate, 2 * 1024 * 1024 * 1024)
+  validateAdmissionProvenance(input.nativeSupervisor, 64 * 1024 * 1024)
   validateAdmissionProvenance(input.probePayload, 64 * 1024 * 1024)
-  if (input.installedCandidate.sha256 === input.probePayload.sha256) {
-    fail('probe_payload_not_distinct')
-  }
+  validateAdmissionProvenance(input.nativeBuildManifest, 64 * 1024)
+  validateDistinctProvenance(input)
   exactObject(input.storage, STORAGE_KEYS, 'storage_invalid')
   for (const key of STORAGE_KEYS) requireTrue(input.storage[key], 'storage_invalid')
 
   return Object.freeze({
     status: 'admitted',
     installedCandidate: Object.freeze({ sha256: input.installedCandidate.sha256, bytes: input.installedCandidate.bytes }),
-    probePayload: Object.freeze({ sha256: input.probePayload.sha256, bytes: input.probePayload.bytes }),
+    nativeSupervisor: admittedNativeProvenance(input.nativeSupervisor),
+    probePayload: admittedNativeProvenance(input.probePayload),
+    nativeBuildManifest: admittedNativeProvenance(input.nativeBuildManifest),
   })
 }
 
@@ -265,7 +275,7 @@ function validateAppContainerProbeReceiptSnapshot(receipt) {
   exactValue(receipt.schemaVersion, APPCONTAINER_PROBE_SCHEMA_VERSION)
   exactValue(receipt.kind, APPCONTAINER_PROBE_KIND)
   if (!OUTCOMES.has(receipt.outcome)) fail()
-  if (!CORRELATION_ID.test(receipt.correlationId ?? '')) fail()
+  if (!isNonzeroCorrelationId(receipt.correlationId)) fail()
   exactValue(receipt.platform, 'win32')
   exactValue(receipt.arch, 'x64')
 
@@ -351,7 +361,7 @@ function validateEnvelope(envelope) {
   exactObject(envelope, ENVELOPE_KEYS)
   exactValue(envelope.schemaVersion, APPCONTAINER_PROBE_SCHEMA_VERSION)
   exactValue(envelope.kind, APPCONTAINER_PROBE_ENVELOPE_KIND)
-  if (!SHA256.test(envelope.receiptSha256 ?? '')) fail()
+  if (!isNonzeroSha256(envelope.receiptSha256)) fail()
   const receipt = validateAppContainerProbeReceiptSnapshot(envelope.receipt)
   if (sha256(canonicalJson(receipt)) !== envelope.receiptSha256) fail('receipt_digest_mismatch')
   return deepFreeze({ ...envelope, receipt })
@@ -359,7 +369,7 @@ function validateEnvelope(envelope) {
 
 function validateAdmissionProvenance(value, maxBytes) {
   exactObject(value, PROVENANCE_INPUT_KEYS, 'provenance_invalid')
-  if (!SHA256.test(value.sha256 ?? '')) fail('provenance_invalid')
+  if (!isNonzeroSha256(value.sha256)) fail('provenance_invalid')
   if (!Number.isSafeInteger(value.bytes) || value.bytes < 1 || value.bytes > maxBytes) fail('provenance_invalid')
   requireTrue(value.preexisting, 'provenance_invalid')
   requireTrue(value.regularFile, 'provenance_invalid')
@@ -383,23 +393,47 @@ function validateReceiptProvenance(value, admissionStatus) {
   }
   if (admissionStatus === 'denied') fail()
   exactObject(value, PROVENANCE_KEYS)
-  validateReceiptProvenanceRecord(value.installedCandidate, 'correlation_only_not_executed', 2 * 1024 * 1024 * 1024)
-  validateReceiptProvenanceRecord(value.probePayload, 'dedicated_probe_payload_launch_target', 64 * 1024 * 1024)
-  if (value.installedCandidate.sha256 === value.probePayload.sha256) {
-    fail('probe_payload_not_distinct')
-  }
+  validateReceiptCorrelationRecord(
+    value.installedCandidate,
+    'installed_candidate_correlation',
+    2 * 1024 * 1024 * 1024,
+  )
+  validateReceiptNativeProvenanceRecord(value.nativeSupervisor, 'native_supervisor', 64 * 1024 * 1024)
+  validateReceiptNativeProvenanceRecord(value.probePayload, 'launch_target', 64 * 1024 * 1024)
+  validateReceiptNativeProvenanceRecord(value.nativeBuildManifest, 'native_build_manifest', 64 * 1024)
+  validateDistinctProvenance(value)
 }
 
-function validateReceiptProvenanceRecord(value, role, maxBytes) {
-  exactObject(value, PROVENANCE_RECORD_KEYS)
+function validateReceiptCorrelationRecord(value, role, maxBytes) {
+  exactObject(value, CORRELATION_RECORD_KEYS)
   exactValue(value.role, role)
-  if (!SHA256.test(value.sha256 ?? '')) fail()
+  if (!isNonzeroSha256(value.sha256)) fail()
   if (!Number.isSafeInteger(value.bytes) || value.bytes < 1 || value.bytes > maxBytes) fail()
+}
+
+function validateReceiptNativeProvenanceRecord(value, role, maxBytes) {
+  exactObject(value, NATIVE_PROVENANCE_RECORD_KEYS)
+  exactValue(value.role, role)
+  exactValue(value.machine, 'x64')
+  if (!isNonzeroSha256(value.sha256)) fail()
+  if (!Number.isSafeInteger(value.bytes) || value.bytes < 1 || value.bytes > maxBytes) fail()
+}
+
+function validateDistinctProvenance(value) {
+  const digests = PROVENANCE_KEYS.map((key) => value[key].sha256)
+  if (new Set(digests).size !== digests.length) fail('provenance_not_distinct')
+}
+
+function admittedNativeProvenance(value) {
+  return Object.freeze({ sha256: value.sha256, bytes: value.bytes, machine: 'x64' })
 }
 
 function validateLaunchPolicy(value) {
   exactObject(value, LAUNCH_POLICY_KEYS)
-  for (const key of LAUNCH_POLICY_KEYS) {
+  exactValue(value.payloadManifestProtocol, 'PCAPM002')
+  exactValue(value.payloadEvidenceProtocol, 'PCAPE002')
+  exactValue(value.payloadEvidenceTransport, 'sealed_tool_manifest_plus_scratch_create_new_file')
+  for (const key of LAUNCH_POLICY_KEYS.filter((key) => !key.startsWith('payload'))) {
     const expected = ['inheritHandles', 'experimentalApi', 'fallback'].includes(key) ? false : true
     exactValue(value[key], expected)
   }
@@ -424,7 +458,7 @@ function validateSupervisorEvidence(value, published) {
   }
   if (!published) fail()
   exactObject(value, EVIDENCE_KEYS)
-  if (!SHA256.test(value.sha256 ?? '')) fail()
+  if (!isNonzeroSha256(value.sha256)) fail()
   if (!Number.isSafeInteger(value.bytes) || value.bytes < 1 || value.bytes > 1024 * 1024) fail()
 }
 
@@ -603,6 +637,14 @@ function isPlainObject(value) {
 
 function sha256(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function isNonzeroSha256(value) {
+  return typeof value === 'string' && SHA256.test(value) && !/^0+$/u.test(value)
+}
+
+function isNonzeroCorrelationId(value) {
+  return typeof value === 'string' && CORRELATION_ID.test(value) && !/^0+$/u.test(value)
 }
 
 function gate(id, expected) {
