@@ -24,6 +24,7 @@ export interface HostDataPaths {
   residentLifecycleRetiredFence: string;
   residentLifecycleRetirement: string;
   workspaceThreadBootstrapOperations: string;
+  oauthAttempts: string;
   candidateEvaluationOperations: string;
   candidateEvaluationReceipts: string;
   receipts: string;
@@ -94,6 +95,7 @@ export function getHostDataPaths(dataDir: string): HostDataPaths {
     residentLifecycleRetiredFence: join(root, "resident-lifecycle-retired-fence.json"),
     residentLifecycleRetirement: join(root, "resident-lifecycle-retirement.json"),
     workspaceThreadBootstrapOperations: join(root, "workspace-thread-bootstrap-operations"),
+    oauthAttempts: join(root, "oauth-attempts"),
     candidateEvaluationOperations: join(root, "candidate-evaluation-operations"),
     candidateEvaluationReceipts: join(root, "candidate-evaluation-receipts"),
     receipts: join(root, "receipts"),
