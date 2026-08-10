@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
-import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -455,7 +455,7 @@ describe('verified remote host install coordinator', () => {
 type SignedKit = ReturnType<typeof signedKit>
 
 async function temporaryDirectory() {
-  const directory = await mkdtemp(join(tmpdir(), 'prime-remote-host-coordinator-test-'))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'prime-remote-host-coordinator-test-')))
   temporaryDirectories.push(directory)
   return directory
 }

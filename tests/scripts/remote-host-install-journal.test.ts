@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   writeFile,
@@ -311,7 +312,7 @@ describe('remote host install append-only journal', () => {
 })
 
 async function temporaryDirectory() {
-  const directory = await mkdtemp(join(tmpdir(), 'prime-remote-host-journal-test-'))
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'prime-remote-host-journal-test-')))
   temporaryDirectories.push(directory)
   return directory
 }
