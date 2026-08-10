@@ -104,20 +104,62 @@ describe('remote-host-kit/v1 signed static contract', () => {
         launcher: { ...value.artifacts.launcher, sha256: value.artifacts.runtime.sha256 },
       },
     } as any)).toThrow(/artifact_digests_not_distinct/)
+
+    expect(() => verifyRemoteHostKitArtifactBytes(value, {
+      ...artifactBytes(),
+      service: new Uint8Array((1024 * 1024) + 1),
+    })).toThrow(/artifact_size_invalid/)
+
+    let hostileGetterRan = false
+    class HostileUint8Array extends Uint8Array {
+      override get byteLength(): number {
+        hostileGetterRan = true
+        throw new Error('overridable byteLength must not run')
+      }
+
+      override get length(): number {
+        hostileGetterRan = true
+        throw new Error('overridable length must not run')
+      }
+    }
+    const safeServiceSnapshot = new HostileUint8Array(artifactBytes().service)
+    expect(verifyRemoteHostKitArtifactBytes(value, {
+      ...artifactBytes(),
+      service: safeServiceSnapshot,
+    }).artifactBytesCorrelated).toBe(true)
+    expect(hostileGetterRan).toBe(false)
   })
 
   it('verifies a domain-separated detached Ed25519 signature against independently derived trust', () => {
     const keys = generateKeyPairSync('ed25519')
     const value = manifest(keys.publicKey)
     const signature = sign(null, createRemoteHostKitSignaturePreimage(value), keys.privateKey)
-    const envelope = createRemoteHostKitSignatureEnvelope(value, signature)
-    const manifestBytes = serializeRemoteHostKitManifest(value)
-    const envelopeBytes = serializeRemoteHostKitSignatureEnvelope(envelope)
     const trust = {
       trustAnchorId: value.trustAnchorId,
       signerKeyId: value.signerKeyId,
       publicKey: keys.publicKey,
     }
+    const attackerKeys = generateKeyPairSync('ed25519')
+    let hostileGetterRan = false
+    class HostileUint8Array extends Uint8Array {
+      override get byteLength(): number {
+        hostileGetterRan = true
+        trust.publicKey = attackerKeys.publicKey
+        throw new Error('hostile byteLength getter must not run')
+      }
+
+      override get length(): number {
+        hostileGetterRan = true
+        trust.signerKeyId = 'test-only-attacker-signer'
+        throw new Error('hostile length getter must not run')
+      }
+    }
+    const envelope = createRemoteHostKitSignatureEnvelope(
+      value,
+      new HostileUint8Array(signature),
+    )
+    const manifestBytes = serializeRemoteHostKitManifest(value)
+    const envelopeBytes = serializeRemoteHostKitSignatureEnvelope(envelope)
 
     expect(envelope.signature).toMatchObject({ algorithm: 'Ed25519', encoding: 'base64url' })
     expect(envelope.signature.value).toHaveLength(86)
@@ -125,7 +167,11 @@ describe('remote-host-kit/v1 signed static contract', () => {
     expect(envelope).not.toHaveProperty('manifest')
     expect(manifestBytes.at(-1)).toBe(0x0a)
     expect(envelopeBytes.at(-1)).toBe(0x0a)
-    expect(verifyRemoteHostKitEnvelopeBytes(manifestBytes, envelopeBytes, trust)).toMatchObject({
+    expect(verifyRemoteHostKitEnvelopeBytes(
+      new HostileUint8Array(manifestBytes),
+      new HostileUint8Array(envelopeBytes),
+      trust,
+    )).toMatchObject({
       packageId: value.packageId,
       trustAnchorId: createRemoteHostKitTrustAnchorId(keys.publicKey),
       verification: {
@@ -136,6 +182,9 @@ describe('remote-host-kit/v1 signed static contract', () => {
         artifactBytesCorrelated: false,
       },
     })
+    expect(hostileGetterRan).toBe(false)
+    expect(trust.publicKey).toBe(keys.publicKey)
+    expect(trust.signerKeyId).toBe(value.signerKeyId)
 
     const combined = verifyRemoteHostKitBytes(manifestBytes, envelopeBytes, artifactBytes(), trust)
     expect(combined.verification.artifactBytesCorrelated).toBe(true)

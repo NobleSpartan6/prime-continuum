@@ -98,6 +98,10 @@ const KEY_IDENTIFIER = /^[a-z][a-z0-9._-]{2,63}$/u
 const SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]{1,32})?(?:\+[0-9A-Za-z.-]{1,32})?$/u
 const TRUST_ANCHOR_ID = /^ed25519-spki-sha256-[a-f0-9]{64}$/u
 const CANONICAL_BASE64URL = /^(?:[A-Za-z0-9_-]{4}){21}[A-Za-z0-9_-][AQgw]$/u
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype)
+const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, 'buffer').get
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, 'byteOffset').get
+const TYPED_ARRAY_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, 'byteLength').get
 
 export class RemoteHostKitContractError extends Error {
   constructor(code = 'remote_host_kit_invalid', message = code) {
@@ -217,11 +221,11 @@ export function serializeRemoteHostKitSignatureEnvelope(input) {
 }
 
 export function verifyRemoteHostKitEnvelopeBytes(manifestInput, envelopeInput, independentTrust) {
+  const trust = validateIndependentTrust(independentTrust)
   const manifestBytes = boundedBytes(manifestInput, REMOTE_HOST_KIT_MAX_MANIFEST_BYTES, 'manifest')
   const manifest = parseRemoteHostKitManifestBytes(manifestBytes)
   const envelopeBytes = boundedBytes(envelopeInput, REMOTE_HOST_KIT_MAX_ENVELOPE_BYTES, 'envelope')
   const envelope = parseCanonicalEnvelope(envelopeBytes)
-  const trust = validateIndependentTrust(independentTrust)
 
   exactValue(envelope.trustAnchorId, manifest.trustAnchorId, 'trust_anchor_mismatch')
   exactValue(envelope.signerKeyId, manifest.signerKeyId, 'signer_key_mismatch')
@@ -400,9 +404,13 @@ function snapshotArtifactBytes(input) {
     if (typeof key !== 'string') fail('artifact_bytes_shape_invalid')
     const descriptor = Object.getOwnPropertyDescriptor(input, key)
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) fail('artifact_bytes_shape_invalid')
-    const value = descriptor.value
-    if (utilTypes.isProxy(value) || !(value instanceof Uint8Array)) fail('artifact_bytes_shape_invalid')
-    result[key] = Buffer.from(value)
+    result[key] = copyBoundedUint8Array(descriptor.value, {
+      minimum: 1,
+      maximum: ARTIFACT_MAX_BYTES[key],
+      invalidCode: 'artifact_bytes_shape_invalid',
+      belowMinimumCode: 'artifact_size_invalid',
+      aboveMaximumCode: 'artifact_size_invalid',
+    })
   }
   return result
 }
@@ -462,9 +470,15 @@ function canonicalize(value) {
 }
 
 function canonicalSignatureValue(value) {
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    if (value.byteLength !== 64) fail('signature_length_invalid')
-    return Buffer.from(value).toString('base64url')
+  if (utilTypes.isProxy(value)) fail('signature_length_invalid')
+  if (utilTypes.isUint8Array(value)) {
+    return copyBoundedUint8Array(value, {
+      minimum: 64,
+      maximum: 64,
+      invalidCode: 'signature_length_invalid',
+      belowMinimumCode: 'signature_length_invalid',
+      aboveMaximumCode: 'signature_length_invalid',
+    }).toString('base64url')
   }
   if (typeof value !== 'string' || !CANONICAL_BASE64URL.test(value)) fail('signature_base64url_invalid')
   const bytes = Buffer.from(value, 'base64url')
@@ -485,11 +499,37 @@ function validateEd25519PublicKey(value) {
 }
 
 function boundedBytes(input, maximum, label) {
-  if (utilTypes.isProxy(input) || !(input instanceof Uint8Array)) fail(`${label}_bytes_invalid`)
-  if (input.byteLength < 2 || input.byteLength > maximum) {
-    fail(input.byteLength > maximum ? `${label}_oversize` : `${label}_bytes_invalid`)
+  return copyBoundedUint8Array(input, {
+    minimum: 2,
+    maximum,
+    invalidCode: `${label}_bytes_invalid`,
+    belowMinimumCode: `${label}_bytes_invalid`,
+    aboveMaximumCode: `${label}_oversize`,
+  })
+}
+
+function copyBoundedUint8Array(input, bounds) {
+  if (utilTypes.isProxy(input) || !utilTypes.isUint8Array(input)) fail(bounds.invalidCode)
+  let buffer
+  let byteOffset
+  let byteLength
+  try {
+    buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, input, [])
+    byteOffset = Reflect.apply(TYPED_ARRAY_BYTE_OFFSET_GETTER, input, [])
+    byteLength = Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, input, [])
+  } catch {
+    fail(bounds.invalidCode)
   }
-  return Buffer.from(input)
+  if (!Number.isSafeInteger(byteOffset) || !Number.isSafeInteger(byteLength) || byteOffset < 0) {
+    fail(bounds.invalidCode)
+  }
+  if (byteLength < bounds.minimum) fail(bounds.belowMinimumCode)
+  if (byteLength > bounds.maximum) fail(bounds.aboveMaximumCode)
+  try {
+    return Buffer.from(new Uint8Array(buffer, byteOffset, byteLength))
+  } catch {
+    fail(bounds.invalidCode)
+  }
 }
 
 function exactObject(value, keys, code) {

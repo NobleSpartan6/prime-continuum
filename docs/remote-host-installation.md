@@ -1,10 +1,12 @@
 # Remote host installation source contract
 
-This repository contains a bounded, source-only prerequisite for a possible
-future remote host installer. It does not install, upgrade, repair, start, or
-inspect a remote service. No product runtime, build, release, packaging, SSH,
-or installation entrypoint imports the contract or invokes the static CLI.
-Ordinary source tests do import the pure validators and reducer.
+This repository contains bounded, source-only prerequisites for a possible
+future remote host installer. They do not contain SSH, remote filesystem,
+process, launcher, or service-manager logic. No product runtime, build,
+release, packaging, SSH, or installation entrypoint imports these modules or
+invokes the static CLI or coordinator. Ordinary source tests import the pure
+validators and reducer and exercise the journal/coordinator with temporary
+files and injected test callbacks.
 
 ## Signed kit format
 
@@ -111,40 +113,120 @@ and a digest of their complete identity and state. Every transition is an
 exact compare-and-swap on both revision and current record digest.
 
 The reducer deliberately returns `effectAuthority: null` when it creates the
-`dispatching` record. No exported API turns a fresh or recovered record into an
-effect authority or dispatch advisory. A future reviewed coordinator must
-derive admission from a fully signature- and artifact-correlated verified kit,
-durably persist the exact `dispatching` record, and mint and consume an
-unforgeable process-local one-shot persistence capability. That capability must
-not be serialized or reconstructible after restart.
+`dispatching` record. No reducer API turns a fresh or recovered record into an
+effect authority or dispatch advisory. The separate source-only coordinator
+described below owns kit verification, journal publication, and a private
+process-local capability boundary; the reducer itself remains permanently
+non-dispatching.
 
 `assertRemoteHostInstallKitCorrelation` checks only structural parity between
 an admitted identity and caller-supplied kit correlation facts. It explicitly
 does not claim that those facts were verified and returns no effect authority.
 
-This module cannot prove persistence, mint or consume a durable token, or
-enforce one-shot behavior. It therefore keeps its durability and no-replay
+This pure module cannot prove persistence, mint or consume a persistence token,
+or enforce one-shot behavior. It therefore keeps its durability and no-replay
 capability claims false. Recovering `dispatching`,
 `outcome_unknown`, `remote_prepared`, `package_published`, `service_starting`,
 or `ready_verified` returns only `query_status_only`, with dispatch and replay
 both false. A restarted coordinator must not retry the installation effect,
 even when it cannot determine whether the original dispatch occurred.
 
+## Append-only source journal
+
+`scripts/remote-host-install-journal.mjs` is an isolated local-filesystem
+reference journal. It stores each existing operation record as exact canonical
+newline-terminated JSON in one deterministic revision slot: `r0000.json`,
+`r0001.json`, and so on. The filename never contains a phase or hash. Every
+legal branch at one revision therefore contends on the same destination.
+
+Opening a journal enumerates through a bounded iterator and rejects unknown or
+temporary entries, gaps, forks, tested link/symlink cases, non-regular files,
+multiple-link files, unsafe permissions or ownership on POSIX, noncanonical or
+oversized bytes, identity drift, and an invalid predecessor chain. It rebuilds
+the initial record and every successor through the existing reducer rather
+than trusting individually valid records.
+
+Append is an exact compare-and-swap on revision and record hash. Publication
+uses a same-directory create-new staging file, a complete bounded write, file
+sync, and a hard-link into the revision-only final name as the no-replace
+operation. It then orders parent sync, removal of only its staging name, a
+second parent sync, an exact O_RDWR final-file reopen and BigInt inode/device/
+size/link verification, final-file sync, another parent sync, and a complete
+rescan. EEXIST is never successful, including when bytes match. Any uncertain
+create, write, link, sync, unlink, close, or rescan returns no confirmation and
+requires a new journal instance. Final records are never replaced, compacted,
+or deleted.
+
+On Linux and macOS this reference uses Node's file and directory sync
+primitives. Those calls establish only the tested source-level ordering; they
+do not prove power-loss behavior for a filesystem, storage controller, or
+machine. Node exposes no reviewed parent-directory durability primitive for
+Windows, so ordinary win32 construction rejects before filesystem I/O. Tests
+can reach the same reference mechanics only when Vitest supplies an exact
+hidden source reference. Ordinary source tests do reach and supply that
+reference. Its absence from product/runtime/build/release/install entrypoints
+is not a security boundary, production guard, or Windows durability
+implementation.
+
+The point-in-time path, owner, mode, link, and inode checks are not race-free
+filesystem custody against a hostile same-user process. No multi-process lease
+or authorization claim is made. Concurrent writers are conservatively fenced
+by revision-slot no-replace/CAS, but availability and hostile overlap remain
+outside this contract.
+
+## Verified source coordinator
+
+`scripts/remote-host-install-coordinator.mjs` accepts independent manifest and
+detached-envelope bytes, all four role-indexed artifact byte strings, a
+caller-pinned real Ed25519 `KeyObject`, and a nonzero
+`targetAuthoritySha256`. Before journal I/O it calls
+`verifyRemoteHostKitBytes` itself. The verifier owns bounded input snapshots;
+the coordinator retains only path-free digest and artifact metadata, derives
+the exact fresh-install operation identity, and requires that identity on
+every journal reopen. It never accepts a caller-declared "verified" result,
+journal receipt, or capability.
+
+Only an instance that newly publishes and fully rechecks the exact
+`dispatching` revision may mint its private one-shot capability. The frozen
+function object is registered in a per-instance `WeakMap`, synchronously
+deleted and recorded in a `WeakSet` before the injected callback is invoked,
+and is never returned, serialized, cloned, or passed to that callback. There is
+no await between capability consumption and synchronous callback invocation.
+The callback receives no manifest, signature, key, artifact, target, path, or
+capability data. Its return value is ignored.
+
+A callback throw or rejection is reduced to `outcome_unknown`; its value,
+message, cause, and stack are neither returned nor persisted. Caller-supplied
+evidence SHA-256 values are opaque correlation identifiers only, not proof of
+callback success, remote state, authentication, or authorization. If outcome
+publication is uncertain, the persisted state remains at least `dispatching`.
+
+Every newly opened coordinator has empty capability registries. Nonterminal
+post-dispatch recovery is status-only. Later terminal states remain terminal;
+both categories are effect-free and non-dispatching. Reconciliation can append
+only reducer-legal observations and can never invoke the injected callback.
+This deliberately prefers a possibly incomplete fresh install over replay
+after an ambiguous effect.
+
 ## Explicit nonclaims
 
-All claim booleans in both contracts are fixed to false. In particular, this
+All claim booleans in the source contracts are fixed to false. In particular, this
 source tranche does not claim or provide:
 
-- an implemented installer, service manager, remote status API, or durable
-  operation journal;
+- an implemented remote installer, service manager, remote status API, or
+  production-authorized operation journal/coordinator;
+- power-loss durability, production Windows journal durability, hostile
+  same-user protection, race-free path custody, or a multi-process ownership
+  lease;
 - Linux execution or glibc compatibility evidence;
 - live host verification, SSH transport, SSH host-key custody, authentication,
   authorization, credential handling, or secret custody;
 - upgrade, repair, downgrade, rollback, uninstall, or destination discovery;
-- IPC, preload, renderer, hostd, browser, package, release, or installation
-  entrypoint reachability (the source-test runner does reach the pure modules);
-- filesystem installation, process launch, network effects, or autonomous
-  promotion; or
+- IPC, preload, renderer, hostd, browser, package, build, release, or
+  installation-entrypoint reachability (the source-test runner reaches the
+  source modules and injected callback seam);
+- SSH, remote filesystem installation, remote process launch, network effects,
+  service control, signing/publication, or autonomous promotion; or
 - provider-backed evaluation or an independently evaluated security boundary.
 
 The static verifier proves only the canonical bytes and schema it read, the
