@@ -43,6 +43,8 @@ export const APPCONTAINER_PROBE_GATE_SPECS = Object.freeze([
   gate('child_lpac_policy', 'present'),
   gate('job_membership_at_process_creation', 'present'),
   gate('no_inherited_handles', 'present'),
+  gate('child_exact_environment_allowlist', 'present'),
+  gate('child_credential_shaped_environment', 'denied'),
   gate('sealed_tool_tree_read_execute', 'allowed'),
   gate('scratch_read_write', 'allowed'),
   gate('profile_read_write', 'allowed'),
@@ -179,6 +181,7 @@ const LAUNCH_POLICY_KEYS = [
   'securityCapabilitiesAttribute',
   'jobListAtCreateProcess',
   'inheritHandles',
+  'explicitSanitizedUnicodeEnvironment',
   'allApplicationPackagesOptOut',
   'zeroCapabilities',
   'sealedToolTreeReadExecuteOnly',
@@ -310,6 +313,9 @@ export function verifyAppContainerProbeReceiptBytes(input) {
   const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input)
   if (bytes.byteLength < 2 || bytes.byteLength > APPCONTAINER_PROBE_MAX_RECEIPT_BYTES) {
     fail(bytes.byteLength > APPCONTAINER_PROBE_MAX_RECEIPT_BYTES ? 'receipt_oversize' : 'receipt_invalid')
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    fail('receipt_bom_forbidden')
   }
   let text
   try {

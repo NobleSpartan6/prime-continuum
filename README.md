@@ -102,6 +102,14 @@ evaluator, malicious-candidate filesystem isolation, security sandbox,
 autonomous promotion, installer/package gate, or cross-platform release proof.
 See `docs/self-build-evidence.md`.
 
+The repository also contains a source-only Windows AppContainer probe contract
+and a read-only receipt verifier. Run
+`pnpm verify:windows-appcontainer-probe:receipt -- --receipt <path>` only to
+check one canonical, bounded, link-free correlation receipt. It does not create
+an AppContainer profile, change an ACL, launch a payload, evaluate the current
+candidate, or prove sandboxing. A live launcher and reviewed reproducible native
+x64 probe payload remain absent; see `docs/windows-appcontainer-evaluation.md`.
+
 On a verified local Windows host, the native **Evidence** panel can admit that
 same canonical self-build as an explicit **Evaluate candidate** operation. Its
 automatic check is passive: it reads and fingerprints a bounded launcher and

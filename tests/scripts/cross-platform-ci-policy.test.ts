@@ -55,6 +55,19 @@ describe('cross-platform source CI policy', () => {
     expect(selfBuildSource).toContain("'run', 'build:release',")
   })
 
+  it('keeps the live AppContainer probe absent from unattended source workflows', () => {
+    expect(rootPackage.scripts['verify:windows-appcontainer-probe:receipt']).toBe(
+      'node scripts/verify-windows-appcontainer-probe.mjs',
+    )
+    expect(workflow).not.toContain('windows-appcontainer-probe')
+    expect(selfBuildSource).not.toContain('windows-appcontainer-probe')
+    expect(workflowRunnerSource).not.toContain('windows-appcontainer-probe')
+    const rootScripts = Object.values(rootPackage.scripts).join('\n')
+    expect(rootScripts).not.toContain('windows-appcontainer-probe.ps1')
+    expect(rootScripts).not.toContain('--live')
+    expect(rootScripts).not.toContain('CreateAppContainerProfile')
+  })
+
   it('pins every external action and grants no mutation or secret-bearing authority', () => {
     expect(workflow).toContain('permissions:\n  contents: read')
     expect(workflow).toContain('persist-credentials: false')

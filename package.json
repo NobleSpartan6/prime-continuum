@@ -30,6 +30,7 @@
     "verify:hostd-runtime:smoke": "node scripts/verify-hostd-runtime-initialization.mjs",
     "verify:hostd-resident-lifecycle:smoke": "node scripts/verify-hostd-resident-lifecycle.mjs",
     "verify:prime-agent-provider:e2e": "node scripts/verify-prime-agent-provider-e2e.mjs",
+    "verify:windows-appcontainer-probe:receipt": "node scripts/verify-windows-appcontainer-probe.mjs",
     "verify:renderer-visual": "node scripts/run-workflow.mjs verify:renderer-visual",
     "self-build": "node scripts/self-build.mjs",
     "verify:self-build-receipt": "node scripts/self-build.mjs --verify-receipt",

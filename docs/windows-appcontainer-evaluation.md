@@ -20,12 +20,29 @@ The implemented Phase A files are:
   canonicalization, and receipt verifier;
 - `scripts/windows-appcontainer-probe-lib.d.mts`, its TypeScript declarations;
 - `tests/scripts/windows-appcontainer-probe.test.ts`, parser/static/temp-file
-  tests only.
+  tests only;
+- `scripts/verify-windows-appcontainer-probe.mjs`, a read-only verifier for one
+  canonical, link-free, bounded receipt file under a stable physical identity;
+- `scripts/verify-windows-appcontainer-probe.d.mts` and
+  `tests/scripts/windows-appcontainer-probe-verifier.test.ts`, the verifier's
+  declaration and source-only custody/CLI tests.
+
+`pnpm verify:windows-appcontainer-probe:receipt -- --receipt <path>` performs
+only that static verification. It accepts no live-probe flag, creates no files,
+and prints only bounded correlation facts. Its exit `0` retains the narrow
+meaning described below.
 
 There is no package script or ordinary-workflow command for a live probe. A
 PowerShell operator harness, native supervisor, dedicated probe payload,
 no-replace receipt publisher, and disposable-machine evidence run are Phase B
 work. Source tests cannot establish any Windows security property.
+
+The live boundary is blocked until the repository contains a separately
+reviewed reproducible native x64 payload with a pinned build/provenance path and
+a static/system-only dependency closure. An arbitrary external executable,
+PowerShell, Node.js, or .NET payload cannot establish reproducible probe
+evidence for a zero-capability LPAC. Until that payload and the native
+supervisor exist, there is deliberately no live flag.
 
 ## Admission contract
 
@@ -66,6 +83,14 @@ AppContainers:
   non-breakaway, kill-on-close Job at `CreateProcess` time;
 - `bInheritHandles=FALSE`, zero capabilities, and no fallback or experimental
   sandbox API.
+
+The child must receive an explicitly constructed, alphabetically sorted,
+double-NUL-terminated UTF-16 environment block with
+`CREATE_UNICODE_ENVIRONMENT`. It may contain only the reviewed probe variables
+needed for its sealed tool, scratch, profile, and Windows loader. Passing a null
+environment pointer or copying the operator environment is forbidden. The gate
+matrix separately requires the exact allowlist and denial of any
+credential-shaped child environment entry.
 
 Microsoft documents the profile lifecycle and AppContainer dual-principal
 access model in [CreateAppContainerProfile](https://learn.microsoft.com/windows/win32/api/userenv/nf-userenv-createappcontainerprofile)
@@ -115,7 +140,8 @@ The fixed receipt matrix verifies intended facts without accepting arbitrary
 gate names. It covers:
 
 - exact AppContainer SID, Low integrity, zero capability SIDs, LPAC policy,
-  in-Job-at-creation, and no inherited handles;
+  in-Job-at-creation, no inherited handles, and an exact sanitized child
+  environment with no credential-shaped entry;
 - read/execute access to the sealed tool tree, read/write access to scratch and
   profile, and absence of a writable executable closure;
 - read and write denial for bounded main-workspace, user-profile,

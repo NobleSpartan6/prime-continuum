@@ -129,6 +129,9 @@ describe('source-only Windows AppContainer probe contract', () => {
     ])
     expect(() => verifyAppContainerProbeReceiptBytes(oversized)).toThrow(/receipt_oversize/)
 
+    const bomPrefixed = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), encoded])
+    expect(() => verifyAppContainerProbeReceiptBytes(bomPrefixed)).toThrow(/receipt_bom_forbidden/)
+
     const pretty = Buffer.from(`${JSON.stringify(envelope, null, 2)}\n`, 'utf8')
     expect(() => verifyAppContainerProbeReceiptBytes(pretty)).toThrow(/receipt_not_canonical/)
 
@@ -382,6 +385,7 @@ function launchPolicy() {
     securityCapabilitiesAttribute: true,
     jobListAtCreateProcess: true,
     inheritHandles: false,
+    explicitSanitizedUnicodeEnvironment: true,
     allApplicationPackagesOptOut: true,
     zeroCapabilities: true,
     sealedToolTreeReadExecuteOnly: true,
