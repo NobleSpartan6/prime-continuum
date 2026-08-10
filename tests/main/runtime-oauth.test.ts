@@ -402,8 +402,10 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
       throw new Error(`Replacement must remain status-only, received ${method}`);
     });
 
-    const replacement = await connectedService(replacementConnection, async () => undefined, directory);
-    await waitFor(async () => (await readAttemptLedger(directory)).attempts[0]?.phase === "failed");
+    const replacement = await bootstrappedService(replacementConnection, async () => undefined, directory);
+    const absenceAccepted = observeNextRuntimeOAuthAcceptance(replacement.service, "failed");
+    await replacement.service.connect({ kind: "local" });
+    await absenceAccepted;
     expect((await readAttemptLedger(directory)).attempts[0]).toMatchObject({
       phase: "failed",
       terminal: {
