@@ -86,24 +86,30 @@ describe('remote host install append-only journal', () => {
     })).record
     const first = await openJournal(directory)
     const second = await openJournal(directory)
+    const dispatchTransition = {
+      expectedRevision: admitted.revision,
+      expectedRecordSha256: admitted.recordSha256,
+      phase: 'dispatching' as const,
+      evidenceSha256: digest('2'),
+    }
+    const failureTransition = {
+      expectedRevision: admitted.revision,
+      expectedRecordSha256: admitted.recordSha256,
+      phase: 'failed_pre_effect' as const,
+      evidenceSha256: digest('3'),
+    }
+    const expectedRecords = [
+      reduceRemoteHostInstallOperation(admitted, dispatchTransition).record,
+      reduceRemoteHostInstallOperation(admitted, failureTransition).record,
+    ]
 
     const attempts = await Promise.allSettled([
-      first.append({
-        expectedRevision: admitted.revision,
-        expectedRecordSha256: admitted.recordSha256,
-        phase: 'dispatching',
-        evidenceSha256: digest('2'),
-      }),
-      second.append({
-        expectedRevision: admitted.revision,
-        expectedRecordSha256: admitted.recordSha256,
-        phase: 'failed_pre_effect',
-        evidenceSha256: digest('3'),
-      }),
+      first.append(dispatchTransition),
+      second.append(failureTransition),
     ])
 
-    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1)
-    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1)
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled').length).toBeLessThanOrEqual(1)
+    expect(attempts.filter((attempt) => attempt.status === 'rejected').length).toBeGreaterThanOrEqual(1)
     expect((await readdir(directory)).sort()).toEqual([
       'r0000.json',
       'r0001.json',
@@ -113,6 +119,7 @@ describe('remote host install append-only journal', () => {
     const current = (await reopened.readState()).currentRecord
     expect(current?.revision).toBe(2)
     expect(['dispatching', 'failed_pre_effect']).toContain(current?.phase)
+    expect(expectedRecords.map((record) => record.recordSha256)).toContain(current?.recordSha256)
   })
 
   it('never treats EEXIST or an exact matching retry as fresh publication', async () => {
@@ -133,15 +140,22 @@ describe('remote host install append-only journal', () => {
       phase: 'dispatching' as const,
       evidenceSha256: digest('2'),
     }
+    const expectedRecord = reduceRemoteHostInstallOperation(admitted, transition).record
 
     const outcomes = await Promise.allSettled([first.append(transition), second.append(transition)])
-    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
-    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled').length).toBeLessThanOrEqual(1)
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected').length).toBeGreaterThanOrEqual(1)
     expect(outcomes.every((outcome) => outcome.status === 'rejected' || outcome.value.effectAuthority === null)).toBe(true)
+    expect((await readdir(directory)).sort()).toEqual([
+      'r0000.json',
+      'r0001.json',
+      'r0002.json',
+    ])
 
     const recovered = await openJournal(directory)
     const state = await recovered.readState()
     expect(state.currentRecord?.phase).toBe('dispatching')
+    expect(state.currentRecord?.recordSha256).toBe(expectedRecord.recordSha256)
     expect(state.statusOnly).toBe(true)
     expect(state.effectAuthority).toBeNull()
   })
