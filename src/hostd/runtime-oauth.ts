@@ -91,6 +91,7 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
   getProvider(providerId: string): HostOAuthProvider | undefined {
     if (
       this.closed ||
+      this.terminalHelperFailure !== undefined ||
       !this.securityReady ||
       this.credentialSecurity?.capabilityAvailable?.() === false ||
       providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID
@@ -125,21 +126,36 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
       throw error;
     }
     this.activeStorage = storage;
-    await storage.set(providerId, auth);
-    await this.assertCredentialSecurity(true);
+    try {
+      await storage.set(providerId, auth);
+      await this.assertCredentialSecurity(true);
+    } catch (error) {
+      this.rememberTerminalHelperFailure(error);
+      throw error;
+    }
   }
 
   async drainErrors(): Promise<readonly unknown[]> {
-    await this.assertCredentialSecurity(true);
-    const errors = await this.requireStorage().drainErrors();
-    await this.assertCredentialSecurity(true);
-    return errors;
+    try {
+      await this.assertCredentialSecurity(true);
+      const errors = await this.requireStorage().drainErrors();
+      await this.assertCredentialSecurity(true);
+      return errors;
+    } catch (error) {
+      this.rememberTerminalHelperFailure(error);
+      throw error;
+    }
   }
 
   async reload(): Promise<void> {
-    await this.assertCredentialSecurity(true);
-    await this.requireStorage().reload();
-    await this.assertCredentialSecurity(true);
+    try {
+      await this.assertCredentialSecurity(true);
+      await this.requireStorage().reload();
+      await this.assertCredentialSecurity(true);
+    } catch (error) {
+      this.rememberTerminalHelperFailure(error);
+      throw error;
+    }
   }
 
   async getAuthStatus(providerId: string): Promise<{ readonly configured: unknown }> {
@@ -152,6 +168,9 @@ export class VerifiedRuntimeOAuthComposition implements HostOAuthComposition {
       const status = await storage.getAuthStatus(providerId);
       await this.assertCredentialSecurity(true);
       return status;
+    } catch (error) {
+      this.rememberTerminalHelperFailure(error);
+      throw error;
     } finally {
       try {
         await storage.close();

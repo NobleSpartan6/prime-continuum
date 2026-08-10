@@ -3,6 +3,12 @@ import {
   CODEX_SUBSCRIPTION_PROVIDER_ID,
   isPinnedCodexAuthorizationUrl,
 } from "./codex-oauth";
+import {
+  parseRuntimeOAuthAttemptTerminalV1,
+  parseRuntimeOAuthAttemptV1,
+  type RuntimeOAuthAttemptTerminalV1,
+  type RuntimeOAuthAttemptV1,
+} from "./runtime-oauth-attempt";
 
 /**
  * Public host protocol version. This is intentionally distinct from Prime
@@ -52,6 +58,7 @@ export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" a
 export const RUNTIME_INTEGRITY_REPAIR_CAPABILITY = "runtime_integrity_repair_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
+export const RUNTIME_OAUTH_ATTEMPT_CAPABILITY = "runtime_oauth_attempt_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
 export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
 export const RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY =
@@ -1265,6 +1272,352 @@ export const RuntimeOAuthSessionSnapshotSchema = z
   });
 export type RuntimeOAuthSessionSnapshot = z.infer<typeof RuntimeOAuthSessionSnapshotSchema>;
 
+const RuntimeOAuthCanonicalTimestampSchema = z
+  .string()
+  .length(24)
+  .regex(
+    /^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$/,
+  )
+  .refine(
+    (value) => {
+      const timestamp = Date.parse(value);
+      return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+    },
+    "Must be a real canonical UTC ISO timestamp with milliseconds",
+  );
+const RuntimeOAuthDigestSchema = z
+  .string()
+  .length(64)
+  .regex(/^[a-f0-9]{64}$/)
+  .refine((value) => value !== "0".repeat(64), "Must be a canonical nonzero lowercase SHA-256");
+
+/** Strict wire adapter around the shared, digest-checking OAuth attempt parser. */
+export const RuntimeOAuthAttemptV1Schema = z.unknown().transform(
+  (value, context): RuntimeOAuthAttemptV1 => {
+    try {
+      return parseRuntimeOAuthAttemptV1(value);
+    } catch {
+      context.addIssue({ code: "custom", message: "Runtime OAuth attempt is invalid" });
+      return z.NEVER;
+    }
+  },
+);
+
+/** Strict wire adapter around the shared terminal-evidence parser. */
+export const RuntimeOAuthAttemptTerminalV1Schema = z.unknown().transform(
+  (value, context): RuntimeOAuthAttemptTerminalV1 => {
+    try {
+      return parseRuntimeOAuthAttemptTerminalV1(value);
+    } catch {
+      context.addIssue({ code: "custom", message: "Runtime OAuth terminal evidence is invalid" });
+      return z.NEVER;
+    }
+  },
+);
+
+export const RuntimeOAuthAttemptRecordPhaseSchema = z.enum([
+  "prepared",
+  "login_dispatching",
+  "credentials_ready",
+  "persistence_dispatching",
+  "cancelling",
+  "recovery_required",
+  "completed",
+  "cancelled",
+  "failed",
+  "outcome_unknown",
+]);
+export type RuntimeOAuthAttemptRecordPhase = z.infer<typeof RuntimeOAuthAttemptRecordPhaseSchema>;
+
+const RuntimeOAuthAttemptTerminalPhases = new Set<RuntimeOAuthAttemptRecordPhase>([
+  "completed",
+  "cancelled",
+  "failed",
+  "outcome_unknown",
+]);
+
+/**
+ * Secret-free public projection of the host's durable OAuth attempt record.
+ * Initial authority, cancellation/recovery internals, paths, and credentials
+ * deliberately have no wire fields.
+ */
+export const RuntimeOAuthAttemptRecordSchema = z
+  .object({
+    recordVersion: z.literal(1),
+    attempt: RuntimeOAuthAttemptV1Schema,
+    revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    sessionId: IdSchema,
+    phase: RuntimeOAuthAttemptRecordPhaseSchema,
+    createdAt: RuntimeOAuthCanonicalTimestampSchema,
+    updatedAt: RuntimeOAuthCanonicalTimestampSchema,
+    expiresAt: RuntimeOAuthCanonicalTimestampSchema,
+    terminal: RuntimeOAuthAttemptTerminalV1Schema.optional(),
+    desktopAcknowledgedAt: RuntimeOAuthCanonicalTimestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((record, context) => {
+    const terminalPhase = RuntimeOAuthAttemptTerminalPhases.has(record.phase);
+    if (!runtimeOAuthAttemptRevisionIsReachable(record)) {
+      context.addIssue({
+        code: "custom",
+        path: ["revision"],
+        message: "OAuth record revision cannot reach its projected phase",
+      });
+    }
+    if (record.createdAt !== record.attempt.identity.requestedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["createdAt"],
+        message: "OAuth record creation must equal the attempt request time",
+      });
+    }
+    if (Date.parse(record.updatedAt) < Date.parse(record.createdAt)) {
+      context.addIssue({ code: "custom", path: ["updatedAt"], message: "OAuth record time moved backwards" });
+    }
+    if (Date.parse(record.expiresAt) <= Date.parse(record.createdAt)) {
+      context.addIssue({ code: "custom", path: ["expiresAt"], message: "OAuth record expiry is invalid" });
+    }
+    if (terminalPhase !== (record.terminal !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminal"],
+        message: "OAuth record phase and terminal evidence disagree",
+      });
+    }
+    if (!record.terminal) {
+      if (record.desktopAcknowledgedAt !== undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["desktopAcknowledgedAt"],
+          message: "A nonterminal OAuth record cannot be acknowledged",
+        });
+      }
+      return;
+    }
+    if (
+      record.terminal.body.attemptDigest !== record.attempt.attemptDigest ||
+      record.terminal.body.phase !== record.phase
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminal"],
+        message: "OAuth terminal evidence is cross-fed or phase-incoherent",
+      });
+    }
+    if (Date.parse(record.terminal.body.terminalAt) < Date.parse(record.createdAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminal", "body", "terminalAt"],
+        message: "OAuth terminal evidence predates its attempt",
+      });
+    }
+    if (record.desktopAcknowledgedAt !== undefined) {
+      if (
+        Date.parse(record.desktopAcknowledgedAt) < Date.parse(record.terminal.body.terminalAt) ||
+        record.updatedAt !== record.desktopAcknowledgedAt
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["desktopAcknowledgedAt"],
+          message: "OAuth acknowledgement is not bound to the terminal record",
+        });
+      }
+    } else if (record.updatedAt !== record.terminal.body.terminalAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["updatedAt"],
+        message: "Unacknowledged OAuth terminal time must be the latest record time",
+      });
+    }
+  });
+export type RuntimeOAuthAttemptRecord = z.infer<typeof RuntimeOAuthAttemptRecordSchema>;
+
+function runtimeOAuthAttemptRevisionIsReachable(record: {
+  phase: RuntimeOAuthAttemptRecordPhase;
+  revision: number;
+  terminal?: RuntimeOAuthAttemptTerminalV1;
+  desktopAcknowledgedAt?: string;
+}): boolean {
+  let baseRevisions: readonly number[];
+  if (!record.terminal) {
+    switch (record.phase) {
+      case "prepared": baseRevisions = [0]; break;
+      case "login_dispatching": baseRevisions = [1]; break;
+      case "credentials_ready":
+      case "cancelling": baseRevisions = [2]; break;
+      case "persistence_dispatching": baseRevisions = [3]; break;
+      case "recovery_required": baseRevisions = [2, 3, 4]; break;
+      case "completed":
+      case "cancelled":
+      case "failed":
+      case "outcome_unknown": return false;
+    }
+  } else {
+    switch (record.terminal.body.resolution) {
+      case "interrupted_before_login_dispatch": baseRevisions = [1]; break;
+      case "provider_login_failed": baseRevisions = [2]; break;
+      case "interrupted_during_login": baseRevisions = [2, 3]; break;
+      case "credentials_discarded_before_persistence": baseRevisions = [3]; break;
+      case "persistence_confirmed":
+      case "persistence_failed": baseRevisions = [4]; break;
+      case "configured_observed_after_recovery":
+      case "not_configured_observed_after_recovery": baseRevisions = [5]; break;
+      case "user_cancelled":
+      case "expired":
+      case "host_shutdown": baseRevisions = [1, 3, 4]; break;
+    }
+  }
+  const acknowledgementIncrement = record.desktopAcknowledgedAt === undefined ? 0 : 1;
+  return baseRevisions.some((revision) => record.revision === revision + acknowledgementIncrement);
+}
+
+const RuntimeOAuthAttemptResultFields = {
+  attemptDigest: RuntimeOAuthDigestSchema,
+  live: RuntimeOAuthSessionSnapshotSchema.optional(),
+};
+
+/** Read-only reconciliation result; a digest-bound null proves the attempt is absent. */
+export const RuntimeOAuthAttemptStatusResultSchema = z
+  .object({
+    ...RuntimeOAuthAttemptResultFields,
+    record: RuntimeOAuthAttemptRecordSchema.nullable(),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    for (const issue of runtimeOAuthAttemptResultIssues(result)) {
+      context.addIssue({ code: "custom", ...issue });
+    }
+  });
+export type RuntimeOAuthAttemptStatusResult = z.infer<typeof RuntimeOAuthAttemptStatusResultSchema>;
+
+/** Effect result; start, cancel, and acknowledge must return a durable record. */
+export const RuntimeOAuthAttemptEffectResultSchema = z
+  .object({
+    ...RuntimeOAuthAttemptResultFields,
+    record: RuntimeOAuthAttemptRecordSchema,
+  })
+  .strict()
+  .superRefine((result, context) => {
+    for (const issue of runtimeOAuthAttemptResultIssues(result)) {
+      context.addIssue({ code: "custom", ...issue });
+    }
+  });
+export type RuntimeOAuthAttemptEffectResult = z.infer<typeof RuntimeOAuthAttemptEffectResultSchema>;
+
+/** A successful new start has crossed exactly the durable login-dispatch boundary. */
+export const RuntimeOAuthAttemptStartResultSchema = RuntimeOAuthAttemptEffectResultSchema
+  .superRefine((result, context) => {
+    if (result.record.phase !== "login_dispatching") {
+      context.addIssue({
+        code: "custom",
+        path: ["record", "phase"],
+        message: "OAuth start must return the exact login-dispatching record",
+      });
+    }
+  });
+export type RuntimeOAuthAttemptStartResult = z.infer<typeof RuntimeOAuthAttemptStartResultSchema>;
+
+/** Cancellation returns only after one terminal outcome is durably known. */
+export const RuntimeOAuthAttemptCancelResultSchema = RuntimeOAuthAttemptEffectResultSchema
+  .superRefine((result, context) => {
+    if (!RuntimeOAuthAttemptTerminalPhases.has(result.record.phase)) {
+      context.addIssue({
+        code: "custom",
+        path: ["record", "phase"],
+        message: "OAuth cancellation must return a terminal durable record",
+      });
+    }
+  });
+export type RuntimeOAuthAttemptCancelResult = z.infer<typeof RuntimeOAuthAttemptCancelResultSchema>;
+
+/** Acknowledgement returns only the exact terminal successor carrying its receipt time. */
+export const RuntimeOAuthAttemptAcknowledgeResultSchema = RuntimeOAuthAttemptEffectResultSchema
+  .superRefine((result, context) => {
+    if (!RuntimeOAuthAttemptTerminalPhases.has(result.record.phase) || !result.record.desktopAcknowledgedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["record", "desktopAcknowledgedAt"],
+        message: "OAuth acknowledgement must return an acknowledged terminal record",
+      });
+    }
+  });
+export type RuntimeOAuthAttemptAcknowledgeResult = z.infer<
+  typeof RuntimeOAuthAttemptAcknowledgeResultSchema
+>;
+
+function runtimeOAuthAttemptResultIssues(result: {
+  attemptDigest: string;
+  record: RuntimeOAuthAttemptRecord | null;
+  live?: RuntimeOAuthSessionSnapshot;
+}): Array<{ path: Array<string | number>; message: string }> {
+  const issues: Array<{ path: Array<string | number>; message: string }> = [];
+  if (!result.record) {
+    if (result.live !== undefined) {
+      issues.push({ path: ["live"], message: "An absent OAuth attempt cannot expose a live session" });
+    }
+    return issues;
+  }
+  if (result.attemptDigest !== result.record.attempt.attemptDigest) {
+    issues.push({ path: ["attemptDigest"], message: "OAuth result digest does not bind its record" });
+  }
+  if (!result.live) return issues;
+  if (
+    result.live.sessionId !== result.record.sessionId ||
+    result.live.providerId !== result.record.attempt.identity.providerId ||
+    result.live.expiresAt !== result.record.expiresAt
+  ) {
+    issues.push({ path: ["live"], message: "Live OAuth session is cross-fed from another durable record" });
+  }
+  if (!runtimeOAuthLivePhaseMatchesRecord(result.record.phase, result.live.phase)) {
+    issues.push({ path: ["live", "phase"], message: "Live OAuth phase contradicts the durable record" });
+  }
+  if (!runtimeOAuthLiveShapeMatchesPhase(result.live)) {
+    issues.push({ path: ["live"], message: "Live OAuth fields contradict its session phase" });
+  }
+  return issues;
+}
+
+function runtimeOAuthLivePhaseMatchesRecord(
+  recordPhase: RuntimeOAuthAttemptRecordPhase,
+  livePhase: RuntimeOAuthSessionSnapshot["phase"],
+): boolean {
+  switch (recordPhase) {
+    case "login_dispatching":
+      return livePhase === "starting" || livePhase === "awaiting_user";
+    case "credentials_ready":
+    case "persistence_dispatching":
+      return livePhase === "committing";
+    case "cancelling":
+      return livePhase === "starting" || livePhase === "awaiting_user";
+    case "completed":
+    case "cancelled":
+    case "failed":
+      return livePhase === recordPhase;
+    case "prepared":
+    case "recovery_required":
+    case "outcome_unknown":
+      return false;
+  }
+}
+
+function runtimeOAuthLiveShapeMatchesPhase(live: RuntimeOAuthSessionSnapshot): boolean {
+  const hasInteractiveState =
+    live.authorization !== undefined || live.challenge !== undefined || live.progress !== undefined;
+  switch (live.phase) {
+    case "starting":
+    case "awaiting_user":
+      return live.configured === undefined && live.error === undefined;
+    case "committing":
+      return live.configured === undefined && live.error === undefined && live.challenge === undefined;
+    case "completed":
+      return live.configured === true && live.error === undefined && !hasInteractiveState;
+    case "cancelled":
+      return live.configured === undefined && live.error === undefined && !hasInteractiveState;
+    case "failed":
+      return live.configured === undefined && live.error !== undefined && !hasInteractiveState;
+  }
+}
+
 export const SnapshotTransferBeginSchema = z
   .object({
     kind: z.literal("snapshot.begin"),
@@ -2053,6 +2406,31 @@ export const ResidentLifecycleLookupResultSchema = z
   .strict();
 export type ResidentLifecycleLookupResult = z.infer<typeof ResidentLifecycleLookupResultSchema>;
 
+export const RuntimeOAuthAttemptStartRequestSchema = z
+  .object({
+    authorityId: IdSchema,
+    attempt: RuntimeOAuthAttemptV1Schema,
+  })
+  .strict();
+export type RuntimeOAuthAttemptStartRequest = z.infer<typeof RuntimeOAuthAttemptStartRequestSchema>;
+
+export const RuntimeOAuthAttemptReadRequestSchema = z
+  .object({ attempt: RuntimeOAuthAttemptV1Schema })
+  .strict();
+export type RuntimeOAuthAttemptReadRequest = z.infer<typeof RuntimeOAuthAttemptReadRequestSchema>;
+
+export const RuntimeOAuthAttemptAcknowledgeRequestSchema = z
+  .object({
+    attempt: RuntimeOAuthAttemptV1Schema,
+    expectedRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1),
+    terminalDigest: RuntimeOAuthDigestSchema,
+    acknowledgedAt: RuntimeOAuthCanonicalTimestampSchema,
+  })
+  .strict();
+export type RuntimeOAuthAttemptAcknowledgeRequest = z.infer<
+  typeof RuntimeOAuthAttemptAcknowledgeRequestSchema
+>;
+
 const RequestBase = {
   protocolVersion: z.literal(PROTOCOL_VERSION),
   requestId: IdSchema,
@@ -2112,6 +2490,34 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
     method: z.literal("oauth.session.cancel"),
     payload: z.object({ expectedHostId: IdSchema, authorityId: IdSchema, sessionId: IdSchema }).strict(),
   }),
+  z
+    .object({
+      ...RequestBase,
+      method: z.literal("oauth.attempt.start"),
+      payload: RuntimeOAuthAttemptStartRequestSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...RequestBase,
+      method: z.literal("oauth.attempt.status"),
+      payload: RuntimeOAuthAttemptReadRequestSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...RequestBase,
+      method: z.literal("oauth.attempt.cancel"),
+      payload: RuntimeOAuthAttemptReadRequestSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...RequestBase,
+      method: z.literal("oauth.attempt.acknowledge"),
+      payload: RuntimeOAuthAttemptAcknowledgeRequestSchema,
+    })
+    .strict(),
   z.object({
     ...RequestBase,
     method: z.literal("catalog.snapshot"),
@@ -2257,6 +2663,34 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("oauth.session.start"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.status"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.cancel"), result: RuntimeOAuthSessionSnapshotSchema }),
+  z
+    .object({
+      ...SuccessBase,
+      method: z.literal("oauth.attempt.start"),
+      result: RuntimeOAuthAttemptStartResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...SuccessBase,
+      method: z.literal("oauth.attempt.status"),
+      result: RuntimeOAuthAttemptStatusResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...SuccessBase,
+      method: z.literal("oauth.attempt.cancel"),
+      result: RuntimeOAuthAttemptCancelResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...SuccessBase,
+      method: z.literal("oauth.attempt.acknowledge"),
+      result: RuntimeOAuthAttemptAcknowledgeResultSchema,
+    })
+    .strict(),
   z.object({ ...SuccessBase, method: z.literal("catalog.snapshot"), result: CatalogProjectionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("thread.snapshot"), result: ThreadProjectionSnapshotSchema }),
   z.object({
@@ -2297,6 +2731,10 @@ export const HostIpcErrorResponseSchema = z.object({
     "oauth.session.start",
     "oauth.session.status",
     "oauth.session.cancel",
+    "oauth.attempt.start",
+    "oauth.attempt.status",
+    "oauth.attempt.cancel",
+    "oauth.attempt.acknowledge",
     "catalog.snapshot",
     "thread.snapshot",
     "thread.control.snapshot",

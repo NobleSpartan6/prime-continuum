@@ -12,7 +12,6 @@ import { encodeJsonFrame, LengthPrefixedJsonDecoder } from "../../src/shared/fra
 import {
   PROTOCOL_VERSION,
   RUNTIME_OAUTH_CAPABILITY,
-  type RuntimeIntegritySnapshot,
 } from "../../src/shared/protocol";
 
 const temporaryDirectories: string[] = [];
@@ -69,12 +68,16 @@ describe("HostService runtime OAuth boundary", () => {
     }
   });
 
-  it("does not hold core host readiness behind optional OAuth custody verification", async () => {
+  it("does not hold core readiness behind optional OAuth custody verification or advertise without a journal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-warming-"));
     temporaryDirectories.push(directory);
     const composition = oauthComposition();
     const initialization = deferred<void>();
-    composition.initialize = vi.fn(async () => await initialization.promise);
+    const initialized = vi.fn();
+    composition.initialize = vi.fn(async () => {
+      await initialization.promise;
+      initialized();
+    });
     const service = new HostService(new HostStore(directory), undefined, undefined, {
       runtimeOAuthComposition: composition,
     });
@@ -91,46 +94,23 @@ describe("HostService runtime OAuth boundary", () => {
       expect(warming.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
 
       initialization.resolve();
-      await vi.waitFor(async () => {
-        const ready = await service.handle({
-          protocolVersion: PROTOCOL_VERSION,
-          requestId: "oauth-ready-health",
-          method: "health.get",
-          payload: {},
-        }, TRUSTED_USER_SESSION);
-        expect(ready).toMatchObject({
-          ok: true,
-          result: { capabilities: expect.arrayContaining([RUNTIME_OAUTH_CAPABILITY]) },
-        });
-      });
+      await vi.waitFor(() => expect(initialized).toHaveBeenCalledOnce());
+      const initializedHealth = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "oauth-initialized-without-journal-health",
+        method: "health.get",
+        payload: {},
+      }, TRUSTED_USER_SESSION);
+      expect(initializedHealth).toMatchObject({ ok: true, result: { serviceState: "ready" } });
+      if (!initializedHealth.ok || initializedHealth.method !== "health.get") {
+        throw new Error("health response was not successful");
+      }
+      expect(initializedHealth.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
+      expect(composition.getProvider).not.toHaveBeenCalled();
+      expect(composition.login).not.toHaveBeenCalled();
+      expect(composition.set).not.toHaveBeenCalled();
     } finally {
       initialization.resolve();
-      await service.close();
-    }
-  });
-
-  it("removes the OAuth capability when credential custody revokes the provider", async () => {
-    const { service, composition } = await temporaryService();
-    try {
-      const ready = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-before-revocation",
-        method: "health.get",
-        payload: {},
-      }, TRUSTED_USER_SESSION);
-      if (!ready.ok || ready.method !== "health.get") throw new Error("health response was not successful");
-      expect(ready.result.capabilities).toContain(RUNTIME_OAUTH_CAPABILITY);
-
-      composition.getProvider.mockReturnValue(undefined);
-      const revoked = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-after-revocation",
-        method: "health.get",
-        payload: {},
-      }, TRUSTED_USER_SESSION);
-      if (!revoked.ok || revoked.method !== "health.get") throw new Error("health response was not successful");
-      expect(revoked.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
-    } finally {
       await service.close();
     }
   });
@@ -155,97 +135,110 @@ describe("HostService runtime OAuth boundary", () => {
     expect(composition.getProvider).not.toHaveBeenCalled();
   });
 
-  it("advertises only the trusted-local capability, binds host/authority, and never projects credentials", async () => {
-    const { service, hostId } = await temporaryService();
+  it("keeps legacy methods schema-known but fixed-rejected without provider, storage, or browser effects", async () => {
+    const { service, hostId, composition } = await temporaryService();
     try {
       const health = await service.handle({
         protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-health",
+        requestId: "oauth-health-without-journal",
         method: "health.get",
         payload: {},
       }, TRUSTED_USER_SESSION);
-      expect(health).toMatchObject({
-        ok: true,
-        result: { capabilities: expect.arrayContaining([RUNTIME_OAUTH_CAPABILITY]) },
-      });
+      expect(health).toMatchObject({ ok: true });
+      if (!health.ok || health.method !== "health.get") throw new Error("Health failed");
+      expect(health.result.capabilities).not.toContain(RUNTIME_OAUTH_CAPABILITY);
 
-      const started = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-start",
-        method: "oauth.session.start",
-        payload: {
-          expectedHostId: hostId,
-          authorityId: "desktop-authority-1",
-          providerId: "openai-codex",
-          operationId: "oauth-start-operation",
+      const requests = [
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "legacy-oauth-start",
+          method: "oauth.session.start",
+          payload: {
+            expectedHostId: hostId,
+            authorityId: "desktop-authority-1",
+            providerId: "openai-codex",
+            operationId: "legacy-oauth-start-operation",
+          },
         },
-      }, TRUSTED_USER_SESSION);
-      expect(started).toMatchObject({
-        ok: true,
-        result: {
-          providerId: "openai-codex",
-          phase: "awaiting_user",
-          authorization: { url: validAuthorizationUrl() },
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "legacy-oauth-status",
+          method: "oauth.session.status",
+          payload: {
+            expectedHostId: hostId,
+            authorityId: "desktop-authority-1",
+            sessionId: "oauth-session-1",
+          },
         },
-      });
-      expect(JSON.stringify(started)).not.toMatch(/private-access|private-refresh|accessToken|refreshToken/i);
-      if (!started.ok || started.method !== "oauth.session.start") throw new Error("OAuth did not start");
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "legacy-oauth-cancel",
+          method: "oauth.session.cancel",
+          payload: {
+            expectedHostId: hostId,
+            authorityId: "desktop-authority-1",
+            sessionId: "oauth-session-1",
+          },
+        },
+      ] as const;
+      for (const request of requests) {
+        await expect(service.handle(request, TRUSTED_USER_SESSION)).resolves.toMatchObject({
+          ok: false,
+          error: { code: "RUNTIME_OAUTH_LEGACY_UNAVAILABLE", retryable: false },
+        });
+      }
 
-      const foreignAuthority = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-foreign-authority",
-        method: "oauth.session.status",
-        payload: {
-          expectedHostId: hostId,
-          authorityId: "desktop-authority-2",
-          sessionId: started.result.sessionId,
-        },
-      }, TRUSTED_USER_SESSION);
-      expect(foreignAuthority).toMatchObject({
-        ok: false,
-        error: { code: "OAUTH_SESSION_FORBIDDEN" },
-      });
-
-      const staleHost = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "oauth-stale-host",
-        method: "oauth.session.status",
-        payload: {
-          expectedHostId: "replaced-host",
-          authorityId: "desktop-authority-1",
-          sessionId: started.result.sessionId,
-        },
-      }, TRUSTED_USER_SESSION);
-      expect(staleHost).toMatchObject({
-        ok: false,
-        error: { code: "HOST_AUTHORITY_MISMATCH" },
-      });
+      expect(composition.getProvider).not.toHaveBeenCalled();
+      expect(composition.login).not.toHaveBeenCalled();
+      expect(composition.set).not.toHaveBeenCalled();
+      expect(composition.drainErrors).not.toHaveBeenCalled();
+      expect(composition.reload).not.toHaveBeenCalled();
+      expect(composition.getAuthStatus).not.toHaveBeenCalled();
     } finally {
       await service.close();
     }
   });
 
   it("rejects every OAuth method over relay before considering remote scopes", async () => {
-    const { service, hostId } = await temporaryService();
+    const { service, hostId, composition } = await temporaryService();
     try {
-      const response = await service.handle({
-        protocolVersion: PROTOCOL_VERSION,
-        requestId: "remote-oauth",
-        method: "oauth.session.start",
-        payload: {
-          expectedHostId: hostId,
-          authorityId: "remote-authority",
-          providerId: "openai-codex",
-          operationId: "oauth-remote-operation",
+      const requests = [
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "remote-oauth-start",
+          method: "oauth.session.start",
+          payload: {
+            expectedHostId: hostId,
+            authorityId: "remote-authority",
+            providerId: "openai-codex",
+            operationId: "oauth-remote-operation",
+          },
         },
-      }, {
-        transport: "relay",
-        channel: { leaseId: "A".repeat(43), channelId: "0".repeat(32) },
-      });
-      expect(response).toMatchObject({
-        ok: false,
-        error: { code: "REMOTE_OAUTH_FORBIDDEN", retryable: false },
-      });
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "remote-oauth-status",
+          method: "oauth.session.status",
+          payload: { expectedHostId: hostId, authorityId: "remote-authority", sessionId: "oauth-session-1" },
+        },
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: "remote-oauth-cancel",
+          method: "oauth.session.cancel",
+          payload: { expectedHostId: hostId, authorityId: "remote-authority", sessionId: "oauth-session-1" },
+        },
+      ] as const;
+      for (const request of requests) {
+        await expect(service.handle(request, {
+          transport: "relay",
+          channel: { leaseId: "A".repeat(43), channelId: "0".repeat(32) },
+        })).resolves.toMatchObject({
+          ok: false,
+          error: { code: "REMOTE_OAUTH_FORBIDDEN", retryable: false },
+        });
+      }
+      expect(composition.getProvider).not.toHaveBeenCalled();
+      expect(composition.login).not.toHaveBeenCalled();
+      expect(composition.set).not.toHaveBeenCalled();
     } finally {
       await service.close();
     }
@@ -296,13 +289,15 @@ describe("HostService runtime OAuth boundary", () => {
         });
       }
       expect(composition.getProvider).not.toHaveBeenCalled();
+      expect(composition.login).not.toHaveBeenCalled();
+      expect(composition.set).not.toHaveBeenCalled();
     } finally {
       await service.close();
     }
   });
 
   it("marks the official stdio bridge before remote frames reach health or OAuth dispatch", async () => {
-    const { service, hostId, directory } = await temporaryService();
+    const { service, hostId, directory, composition } = await temporaryService();
     const target = await resolveCanonicalLocalHostTarget(directory, { create: true });
     const server = await serveLocalSocket({ endpoint: target.endpoint, dataDir: directory, service });
     const input = new PassThrough();
@@ -343,6 +338,9 @@ describe("HostService runtime OAuth boundary", () => {
         method: "oauth.session.start",
         error: { code: "REMOTE_OAUTH_FORBIDDEN" },
       });
+      expect(composition.getProvider).not.toHaveBeenCalled();
+      expect(composition.login).not.toHaveBeenCalled();
+      expect(composition.set).not.toHaveBeenCalled();
       await server.close();
       await bridge;
     } finally {
@@ -351,69 +349,6 @@ describe("HostService runtime OAuth boundary", () => {
     }
   });
 
-  it("waits for abort-triggered login teardown and never releases runtime authority after unknown helper liveness", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-close-order-"));
-    temporaryDirectories.push(directory);
-    const store = new HostStore(directory);
-    const helperExit = deferred<void>();
-    const abortObserved = deferred<void>();
-    let terminalFailure: Error | undefined;
-    const composition: HostOAuthComposition = {
-      getProvider: () => ({
-        id: "openai-codex",
-        name: "ChatGPT Plus/Pro",
-        login: async (callbacks) => {
-          await new Promise<void>((resolve) => {
-            callbacks.signal?.addEventListener("abort", () => {
-              abortObserved.resolve();
-              resolve();
-            }, { once: true });
-          });
-          await helperExit.promise;
-          terminalFailure = new Error("helper termination was not observed");
-          throw terminalFailure;
-        },
-      }),
-      set: vi.fn(),
-      drainErrors: vi.fn(() => []),
-      reload: vi.fn(),
-      getAuthStatus: vi.fn(() => ({ configured: false })),
-      close: vi.fn(async () => {
-        if (terminalFailure) throw terminalFailure;
-      }),
-    };
-    const integrityClose = vi.fn(async () => undefined);
-    const service = new HostService(store, undefined, undefined, {
-      runtimeOAuthComposition: composition,
-      runtimeIntegrityProvider: {
-        snapshot: () => readyRuntimeIntegritySnapshot(),
-        close: integrityClose,
-      },
-    });
-    await service.initialize();
-    const hostId = (await store.getHost()).hostId;
-    await service.handle({
-      protocolVersion: PROTOCOL_VERSION,
-      requestId: "close-order-start",
-      method: "oauth.session.start",
-      payload: {
-        expectedHostId: hostId,
-        authorityId: "desktop",
-        providerId: "openai-codex",
-        operationId: "oauth-close-operation",
-      },
-    }, TRUSTED_USER_SESSION);
-
-    const closing = service.close();
-    await abortObserved.promise;
-    expect(composition.close).not.toHaveBeenCalled();
-    expect(integrityClose).not.toHaveBeenCalled();
-    helperExit.resolve();
-    await expect(closing).rejects.toThrow("helper termination was not observed");
-    expect(terminalFailure).toBeInstanceOf(Error);
-    expect(composition.close).toHaveBeenCalledOnce();
-    expect(integrityClose).not.toHaveBeenCalled();
-  });
 });
 
 async function temporaryService(): Promise<{
@@ -433,19 +368,21 @@ async function temporaryService(): Promise<{
   return { service, hostId: (await store.getHost()).hostId, directory, composition };
 }
 
-function oauthComposition(): HostOAuthComposition & { getProvider: ReturnType<typeof vi.fn> } {
+function oauthComposition(): HostOAuthComposition & {
+  getProvider: ReturnType<typeof vi.fn>;
+  login: ReturnType<typeof vi.fn>;
+} {
+  const login = vi.fn(async (_callbacks: OAuthLoginCallbacks) => {
+    throw new Error("Legacy OAuth login must not run");
+  });
   return {
+    login,
     getProvider: vi.fn((providerId) => providerId === "openai-codex"
       ? {
           id: "openai-codex",
           name: "ChatGPT Plus/Pro (Codex Subscription)",
           usesCallbackServer: true,
-          login: async (callbacks: OAuthLoginCallbacks) => {
-            callbacks.onAuth({ url: validAuthorizationUrl() });
-            return await new Promise<never>((_resolve, reject) => {
-              callbacks.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-            });
-          },
+          login,
         }
       : undefined),
     set: vi.fn(),
@@ -456,21 +393,6 @@ function oauthComposition(): HostOAuthComposition & { getProvider: ReturnType<ty
   };
 }
 
-function validAuthorizationUrl(): string {
-  const url = new URL("https://auth.openai.com/oauth/authorize");
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("client_id", "app_EMoamEEZ73f0CkXaXp7hrann");
-  url.searchParams.set("redirect_uri", "http://localhost:1455/auth/callback");
-  url.searchParams.set("scope", "openid profile email offline_access");
-  url.searchParams.set("code_challenge", "A".repeat(43));
-  url.searchParams.set("code_challenge_method", "S256");
-  url.searchParams.set("state", "a".repeat(32));
-  url.searchParams.set("id_token_add_organizations", "true");
-  url.searchParams.set("codex_cli_simplified_flow", "true");
-  url.searchParams.set("originator", "pi");
-  return url.toString();
-}
-
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -479,24 +401,4 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
-}
-
-function readyRuntimeIntegritySnapshot(): RuntimeIntegritySnapshot {
-  return {
-    contractVersion: 1,
-    changedAt: "2026-08-07T00:00:00.000Z",
-    trustAnchorId: "1".repeat(64),
-    target: {
-      runtime: "prime-agent",
-      releaseVersion: "0.7.0",
-      runtimeBuildId: "oauth-close-test",
-      platform: "win32",
-      arch: "x64",
-      manifestSha256: "2".repeat(64),
-      treeSha256: "3".repeat(64),
-      filesSha256: "4".repeat(64),
-    },
-    status: "ready",
-    assurance: "development-integrity",
-  };
 }

@@ -336,6 +336,7 @@ describe("verified Prime Agent runtime OAuth composition", () => {
     });
     await composition.set(CODEX_SUBSCRIPTION_PROVIDER_ID, { type: "oauth", ...SECRET_CREDENTIALS });
     await expect(composition.getAuthStatus(CODEX_SUBSCRIPTION_PROVIDER_ID)).rejects.toBe(terminationError);
+    expect(composition.getProvider(CODEX_SUBSCRIPTION_PROVIDER_ID)).toBeUndefined();
     await expect(composition.close()).rejects.toBe(terminationError);
     expect(storage.close).toHaveBeenCalledTimes(2);
   });

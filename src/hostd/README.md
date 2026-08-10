@@ -13,6 +13,20 @@ never becomes a second authority. There is no TCP listener.
 Both paths carry protocol v1 frames: a 4-byte unsigned big-endian payload length
 followed by one UTF-8 JSON document. The default maximum frame payload is 1 MiB.
 
+Local Prime Agent browser OAuth uses the additive `oauth.attempt.*` family. The
+endpoint owner initializes the private attempt journal under its publication
+lease before advertising `runtime_oauth_attempt_v1`. That capability keeps the
+strict read-only status and exact cancel/acknowledgement surface available while
+the journal is healthy. The separate `runtime_oauth_v1` capability means a new
+durable start is eligible at that moment; admission requires both capabilities
+and rechecks journal, provider, runtime-integrity, and helper-liveness state.
+Hostd persists `login_dispatching` before the sole provider-login call. Unknown
+outcomes and restarts reconcile by exact attempt digest through status only;
+they do not replay login. SSH and relay are denied, and store-backed hosts
+fixed-reject the former `oauth.session.*` effect methods. The journal contains
+only bounded correlation/state data, never authorization URLs, credentials,
+account identifiers, provider causes, filesystem paths, or helper output.
+
 `runtime.integrity.repair` is a trusted-local, path-free recovery boundary, not
 an installer repair. Hostd advertises it only for an eligible nonretryable
 installed-runtime failure in a generation that has issued no verified handle

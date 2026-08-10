@@ -11,6 +11,7 @@ import {
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
@@ -3448,6 +3449,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     activePhase === 'online' &&
     asString(activeTarget?.kind) === 'local' &&
     asString(rawConnection?.path) === 'local_socket' &&
+    advertisedCapabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY) &&
     advertisedCapabilities.includes(RUNTIME_OAUTH_CAPABILITY),
   )
   return {
@@ -5233,7 +5235,7 @@ export class NativeRendererApi implements RendererApi {
       asString(target?.kind) !== 'local' ||
       asString(connection?.path) !== 'local_socket' ||
       this.mutationAuthorityReadyHostId !== expectedHostId ||
-      !capabilities.includes(RUNTIME_OAUTH_CAPABILITY)
+      !capabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY)
     ) return undefined
     return canonicalRendererJson([
       expectedHostId,
@@ -5270,6 +5272,7 @@ export class NativeRendererApi implements RendererApi {
       asString(target?.kind) !== 'local' ||
       asString(connection?.path) !== 'local_socket' ||
       this.mutationAuthorityReadyHostId !== expectedHostId ||
+      !capabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY) ||
       !capabilities.includes(RUNTIME_OAUTH_CAPABILITY) ||
       !capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY)
     ) throw new StaleHostAuthorityError()
@@ -5293,7 +5296,7 @@ export class NativeRendererApi implements RendererApi {
       asString(target?.kind) === 'local' &&
       asString(connection?.path) === 'local_socket' &&
       this.mutationAuthorityReadyHostId === authority.expectedHostId &&
-      capabilities.includes(RUNTIME_OAUTH_CAPABILITY)
+      capabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY)
     )
   }
 

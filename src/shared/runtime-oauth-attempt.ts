@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { CODEX_SUBSCRIPTION_PROVIDER_ID } from "./codex-oauth";
+import { sha256Utf8Hex } from "./sha256";
 
 export const RUNTIME_OAUTH_ATTEMPT_VERSION = 1 as const;
 export const RUNTIME_OAUTH_ATTEMPT_DIGEST_DOMAIN = "prime-continuim.runtime-oauth-attempt.v1\n" as const;
@@ -134,7 +134,7 @@ export function assertRuntimeOAuthAttemptFreshV1(
 
 export function computeRuntimeOAuthAttemptDigestV1(value: unknown): string {
   const identity = parseRuntimeOAuthAttemptIdentityV1(value);
-  return sha256(
+  return sha256Utf8Hex(
     RUNTIME_OAUTH_ATTEMPT_DIGEST_DOMAIN +
       JSON.stringify({
         expectedHostId: identity.expectedHostId,
@@ -193,7 +193,7 @@ export function parseRuntimeOAuthAttemptTerminalBodyV1(
 
 export function computeRuntimeOAuthAttemptTerminalDigestV1(value: unknown): string {
   const body = parseRuntimeOAuthAttemptTerminalBodyV1(value);
-  return sha256(
+  return sha256Utf8Hex(
     RUNTIME_OAUTH_TERMINAL_DIGEST_DOMAIN +
       JSON.stringify({
         attemptDigest: body.attemptDigest,
@@ -345,10 +345,6 @@ function readExactPlainRecord<const K extends string>(
     result[key as K] = descriptor.value;
   }
   return result;
-}
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function invalid(message: string): never {

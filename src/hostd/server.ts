@@ -56,6 +56,7 @@ const UNIX_OWNERSHIP_RETRY_DELAY_MS = 25;
 const MAX_OWNERSHIP_MARKER_BYTES = 4_096;
 const OWNERSHIP_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const OWNERSHIP_MARKER_PATTERN = /^owner-([0-9a-f]{64})\.json$/;
+let nextTrustedFramedSessionGeneration = 0n;
 
 export interface HostServer {
   readonly endpoint: string;
@@ -329,9 +330,11 @@ export async function runFramedSession(
   context: HostSessionContext,
   assertRequestOwnership?: () => Promise<void>,
 ): Promise<void> {
-  let sessionContext = context;
+  const framedAdmission = openFramedSessionAdmission(context);
+  let sessionContext = framedAdmission.context;
   let firstFrame = true;
   let stopped = false;
+  let inputClosed = false;
   let nextRequestOrdinal = 0;
   let nextSignalOrdinal = 0;
   let writeTail = Promise.resolve();
@@ -353,12 +356,18 @@ export async function runFramedSession(
   const pendingThreadChanges = new Map<string, PendingSignal<ThreadChange>>();
   const pendingPromptIdleSignals = new Map<string, PendingSignal<ResidentPromptIdleObservedSignal>>();
   const pendingAbortIdleSignals = new Map<string, PendingSignal<ResidentAbortIdleObservedSignal>>();
+  const closeInputAdmission = (): void => {
+    if (inputClosed) return;
+    inputClosed = true;
+    framedAdmission.close();
+  };
   const serializeWrite = <T>(work: () => Promise<T>): Promise<T> => {
     const result = writeTail.then(work);
     writeTail = result.then(() => undefined, () => undefined);
     return result;
   };
   const terminateSession = (error: Error): void => {
+    closeInputAdmission();
     if (stopped) return;
     stopped = true;
     pendingPromptIdleSignals.clear();
@@ -450,6 +459,10 @@ export async function runFramedSession(
     // There is no await between the completed physical ownership proof and
     // HostService admission, so shutdown/loss cannot interleave this edge.
     await assertRequestOwnership?.();
+    // Clean EOF is distinct from response teardown: the session still drains
+    // entered reads, but an effect that never entered HostService forfeits this
+    // connection's authority immediately.
+    if (inputClosed && isOAuthAttemptStartRequest(request)) return;
     const response = await service.handle(request, requestContext);
     if (stopped) return;
     // A signal waits only for responses that were already admitted when the
@@ -497,6 +510,7 @@ export async function runFramedSession(
     // older unsent hint for that same thread.
     const key = change.threadId;
     if (!pendingThreadChanges.has(key) && pendingThreadChanges.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS) {
+      closeInputAdmission();
       stopped = true;
       pendingPromptIdleSignals.clear();
       pendingAbortIdleSignals.clear();
@@ -526,6 +540,7 @@ export async function runFramedSession(
       !pendingPromptIdleSignals.has(signal.attemptId) &&
       pendingPromptIdleSignals.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS
     ) {
+      closeInputAdmission();
       stopped = true;
       pendingPromptIdleSignals.clear();
       pendingAbortIdleSignals.clear();
@@ -555,6 +570,7 @@ export async function runFramedSession(
       !pendingAbortIdleSignals.has(signal.attemptId) &&
       pendingAbortIdleSignals.size >= MAX_PENDING_THREAD_CHANGE_SIGNALS
     ) {
+      closeInputAdmission();
       stopped = true;
       pendingPromptIdleSignals.clear();
       pendingAbortIdleSignals.clear();
@@ -580,6 +596,7 @@ export async function runFramedSession(
         if (context.transport !== "trusted_user") {
           throw new FrameCodecError("INVALID_PAYLOAD", "Only a trusted local socket can establish an SSH bridge session");
         }
+        framedAdmission.close();
         sessionContext = SSH_BRIDGE_SESSION;
         firstFrame = false;
         continue;
@@ -587,6 +604,7 @@ export async function runFramedSession(
       firstFrame = false;
       admitRequest(request);
     }
+    closeInputAdmission();
     await Promise.allSettled([...inFlightRequests]);
     while (eventPumpPromise) await eventPumpPromise.catch(() => undefined);
   } catch (error) {
@@ -599,6 +617,7 @@ export async function runFramedSession(
     }
     await Promise.allSettled([...inFlightRequests]);
   } finally {
+    closeInputAdmission();
     stopped = true;
     unsubscribeProjectionChanges();
     unsubscribePromptIdleObserved();
@@ -608,6 +627,36 @@ export async function runFramedSession(
     pendingThreadChanges.clear();
     await writeTail.catch(() => undefined);
   }
+}
+
+function openFramedSessionAdmission(context: HostSessionContext): {
+  readonly context: HostSessionContext;
+  close(): void;
+} {
+  if (context.transport !== "trusted_user") return { context, close() {} };
+  let inputOpen = true;
+  const generation = ++nextTrustedFramedSessionGeneration;
+  const admittedContext: HostSessionContext = Object.freeze({
+    transport: "trusted_user",
+    scopes: "*",
+    oauthAttemptAdmission: Object.freeze({
+      generation,
+      isInputOpen: () => inputOpen,
+    }),
+  });
+  return {
+    context: admittedContext,
+    close() {
+      inputOpen = false;
+    },
+  };
+}
+
+function isOAuthAttemptStartRequest(value: unknown): boolean {
+  return typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { method?: unknown }).method === "oauth.attempt.start";
 }
 
 function isUrgentFramedControlRequest(value: unknown): boolean {

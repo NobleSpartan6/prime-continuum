@@ -166,6 +166,91 @@ describe('desktop runtime OAuth attempt store', () => {
     })).rejects.toMatchObject({ code: 'OAUTH_ATTEMPT_ID_CONFLICT' })
   })
 
+  it('keeps local update time monotonic across earlier terminal evidence and exact acknowledgement retries', async () => {
+    const { file, store } = await createStore()
+    const attempt = attemptFixture(1)
+    await store.prepare(attempt, attempt.identity.requestedAt)
+    const dispatching = await store.transition({
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: 1,
+      phase: 'start_dispatching',
+      updatedAt: timestamp(1),
+    })
+    const admitted = await store.transition({
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: dispatching.revision,
+      phase: 'host_admitted',
+      updatedAt: timestamp(2),
+      hostSessionId: 'oauth-session-1',
+      hostPhase: 'login_dispatching',
+    })
+    const browserDispatching = await store.transition({
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: admitted.revision,
+      phase: 'browser_dispatching',
+      updatedAt: timestamp(3),
+      hostSessionId: 'oauth-session-1',
+      hostPhase: 'login_dispatching',
+    })
+    const browserOpened = await store.transition({
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: browserDispatching.revision,
+      phase: 'browser_opened',
+      updatedAt: timestamp(8),
+      hostSessionId: 'oauth-session-1',
+      hostPhase: 'login_dispatching',
+    })
+    const observing = await store.transition({
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: browserOpened.revision,
+      phase: 'observing',
+      updatedAt: timestamp(9),
+      hostSessionId: 'oauth-session-1',
+      hostPhase: 'login_dispatching',
+    })
+    const terminal = createRuntimeOAuthAttemptTerminalV1({
+      version: 1,
+      attemptDigest: attempt.attemptDigest,
+      phase: 'completed',
+      resolution: 'persistence_confirmed',
+      configuredObserved: true,
+      terminalAt: timestamp(6),
+    })
+    const terminalInput = {
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: observing.revision,
+      phase: 'completed' as const,
+      updatedAt: observing.updatedAt,
+      hostSessionId: 'oauth-session-1',
+      hostPhase: 'completed' as const,
+      terminal,
+    }
+    const completed = await store.transition(terminalInput)
+    expect(completed).toMatchObject({
+      updatedAt: timestamp(9),
+      terminal: { body: { terminalAt: timestamp(6) } },
+    })
+    expect(await store.transition(terminalInput)).toEqual(completed)
+
+    const acknowledgeInput = {
+      attemptDigest: attempt.attemptDigest,
+      expectedRevision: completed.revision,
+      terminalDigest: terminal.terminalDigest,
+      acknowledgedAt: timestamp(6),
+    }
+    const acknowledged = await store.acknowledgeTerminal(acknowledgeInput)
+    expect(acknowledged).toMatchObject({
+      revision: completed.revision + 1,
+      updatedAt: timestamp(9),
+      hostAckConfirmedAt: timestamp(6),
+    })
+    expect(await store.acknowledgeTerminal(acknowledgeInput)).toEqual(acknowledged)
+
+    const restarted = new RuntimeOAuthDesktopAttemptStore(file)
+    await restarted.initialize()
+    expect(await restarted.find(attempt.attemptDigest)).toEqual(acknowledged)
+  })
+
   it('allows only exact monotonic transitions and terminal association', async () => {
     const { store } = await createStore()
     const attempt = attemptFixture(1)

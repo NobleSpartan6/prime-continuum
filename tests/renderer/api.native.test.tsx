@@ -4201,9 +4201,49 @@ describe('NativeRendererApi', () => {
     expect(runtimeModelCatalog).toHaveBeenCalledOnce()
   })
 
-  it('runs one sequential Prime OAuth poll chain on the exact local resident authority and refreshes the catalog', async () => {
+  it.each([
+    {
+      label: 'legacy start eligibility without the durable family',
+      capabilities: ['runtime_model_catalog_v1', 'runtime_oauth_v1'],
+    },
+    {
+      label: 'durable reconciliation without new-start eligibility',
+      capabilities: ['runtime_model_catalog_v1', 'runtime_oauth_attempt_v1'],
+    },
+  ])('withholds a new Prime OAuth start for $label', async ({ capabilities }) => {
+    const catalog = recoveryCatalog()
+    const startRuntimeOAuth = vi.fn()
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: {
+          version: 2,
+          projectionHostId: 'host-local',
+          catalog,
+          lastSnapshot: recoverySnapshot(catalog.threads[0], 'OAuth capability split.'),
+        },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: { ...onlineConnection(), capabilities },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      startRuntimeOAuth,
+    })
+
+    const projection = await api.loadWorkbench()
+    expect(projection.operations.runtimeOAuth).toBeUndefined()
+    expect(() => api.startRuntimeOAuth({
+      hostId: 'host-local',
+      providerId: 'openai-codex',
+    }, () => undefined)).toThrow(StaleHostAuthorityError)
+    expect(startRuntimeOAuth).not.toHaveBeenCalled()
+  })
+
+  it('runs one sequential Prime OAuth poll chain after new-start eligibility withdraws and refreshes the catalog', async () => {
     vi.useFakeTimers()
     try {
+      let connectionListener: ((state: unknown) => void) | undefined
       const catalog = recoveryCatalog()
       catalog.threads[0].status = 'idle'
       const snapshot = recoverySnapshot(catalog.threads[0], 'Prime OAuth authority.')
@@ -4281,7 +4321,7 @@ describe('NativeRendererApi', () => {
           quarantinedOutboxCount: 0,
           connection: {
             ...onlineConnection(),
-            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
           },
           appVersion: '0.1.0',
         })),
@@ -4291,8 +4331,14 @@ describe('NativeRendererApi', () => {
         startRuntimeOAuth,
         runtimeOAuthStatus,
         cancelRuntimeOAuth: vi.fn(),
+        onConnectionState: vi.fn((listener: (state: unknown) => void) => {
+          connectionListener = listener
+          return () => undefined
+        }),
       })
 
+      const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+      const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
       const projection = await api.loadWorkbench()
       expect(projection.operations.runtimeOAuth).toBe(true)
       const progress: string[] = []
@@ -4300,6 +4346,14 @@ describe('NativeRendererApi', () => {
         hostId: 'host-local',
         providerId: 'openai-codex',
       }, (update) => progress.push(`${update.phase}:${update.message}`))
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(startRuntimeOAuth).toHaveBeenCalledOnce()
+      connectionListener?.({
+        ...onlineConnection(),
+        capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1'],
+      })
+      expect(published.at(-1)?.operations.runtimeOAuth).toBeUndefined()
       await vi.advanceTimersByTimeAsync(1_000)
 
       await expect(pending).resolves.toEqual({
@@ -4322,6 +4376,7 @@ describe('NativeRendererApi', () => {
       expect(runtimeModelCatalog).toHaveBeenCalledWith({ expectedHostId: 'host-local' })
       expect(progress.join(' ')).toMatch(/awaiting_user:Finish signing in in your browser/)
       expect(progress.join(' ')).toMatch(/committing:Saving the Prime Agent account/)
+      unsubscribe()
     } finally {
       vi.useRealTimers()
     }
@@ -4354,7 +4409,7 @@ describe('NativeRendererApi', () => {
         quarantinedOutboxCount: 0,
         connection: {
           ...onlineConnection(),
-          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
         },
         appVersion: '0.1.0',
       })),
@@ -4416,7 +4471,7 @@ describe('NativeRendererApi', () => {
           quarantinedOutboxCount: 0,
           connection: {
             ...onlineConnection(),
-            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
           },
           appVersion: '0.1.0',
         })),
@@ -4478,7 +4533,7 @@ describe('NativeRendererApi', () => {
         quarantinedOutboxCount: 0,
         connection: {
           ...onlineConnection(),
-          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
         },
         appVersion: '0.1.0',
       })),
@@ -4521,7 +4576,7 @@ describe('NativeRendererApi', () => {
         quarantinedOutboxCount: 0,
         connection: {
           ...onlineConnection(),
-          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
         },
         appVersion: '0.1.0',
       })),
@@ -4561,7 +4616,7 @@ describe('NativeRendererApi', () => {
           ...onlineConnection(),
           target: { kind: 'ssh', alias: 'host-local-over-ssh' },
           path: 'ssh',
-          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_v1'],
+          capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1', 'runtime_oauth_attempt_v1', 'runtime_oauth_v1'],
         },
         appVersion: '0.1.0',
       })),

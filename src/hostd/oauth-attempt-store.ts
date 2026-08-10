@@ -13,6 +13,7 @@ import {
   type RuntimeOAuthAttemptV1,
 } from "../shared/runtime-oauth-attempt";
 import {
+  AtomicWriteAmbiguousCommitError,
   atomicWriteJson,
   atomicWriteJsonIfAbsent,
   ensurePrivateDirectory,
@@ -97,6 +98,8 @@ export interface OAuthAttemptStoreOptions {
   readonly faultInjector?: (point: OAuthAttemptStoreFaultPoint) => void | Promise<void>;
   /** Test/fault boundary for the no-replace atomic creator. */
   readonly atomicCreateFaultInjector?: (point: AtomicCreateFaultPoint) => void | Promise<void>;
+  /** Test-only atomic replacement seam. Production uses atomicWriteJson. */
+  readonly writeJson?: typeof atomicWriteJson;
 }
 
 export class OAuthAttemptStoreError extends Error {
@@ -104,7 +107,8 @@ export class OAuthAttemptStoreError extends Error {
     | "OAUTH_ATTEMPT_ID_CONFLICT"
     | "OAUTH_ATTEMPT_STORAGE_FULL"
     | "OAUTH_ATTEMPT_STORE_INVALID"
-    | "OAUTH_ATTEMPT_CAS_CONFLICT";
+    | "OAUTH_ATTEMPT_CAS_CONFLICT"
+    | "OAUTH_ATTEMPT_COMMIT_UNCERTAIN";
 
   constructor(code: OAuthAttemptStoreError["code"], message: string, options: ErrorOptions = {}) {
     super(message, options);
@@ -209,6 +213,7 @@ export class OAuthAttemptStore {
   private readonly options: OAuthAttemptStoreOptions;
   private initialized = false;
   private compactionUncertain = false;
+  private recordCommitUncertain = false;
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(paths: Pick<HostDataPaths, "oauthAttempts">, options: OAuthAttemptStoreOptions = {}) {
@@ -253,7 +258,7 @@ export class OAuthAttemptStore {
         assertSamePrepareInput(existing, input);
         // Reusing the no-replace publisher confirms both the existing inode and
         // its directory entry before an ambiguous prior creator can be trusted.
-        await atomicWriteJsonIfAbsent(path, existing, OAUTH_ATTEMPT_MAX_FILE_BYTES);
+        await this.confirmOrCreatePrepare(path, existing);
         const confirmed = await readSafeRecordFile(path);
         if (!isDeepStrictEqual(confirmed, existing)) {
           throw invalidStore("OAuth attempt changed while confirming an exact duplicate");
@@ -299,12 +304,7 @@ export class OAuthAttemptStore {
         updatedAt: input.attempt.identity.requestedAt,
         expiresAt: input.expiresAt,
       });
-      const created = await atomicWriteJsonIfAbsent(
-        path,
-        record,
-        OAUTH_ATTEMPT_MAX_FILE_BYTES,
-        { faultInjector: this.options.atomicCreateFaultInjector },
-      );
+      const created = await this.confirmOrCreatePrepare(path, record, true);
       if (!created) {
         const winner = await readSafeRecordFile(path);
         assertSamePrepareInput(winner!, input);
@@ -451,9 +451,87 @@ export class OAuthAttemptStore {
     });
   }
 
+  /**
+   * Wire-safe acknowledgement keyed by the durable attempt identity and the
+   * exact predecessor revision. This survives a process restart without
+   * asking callers to reconstruct the full pre-ack record object.
+   */
+  async acknowledgeAttempt(
+    attemptValue: unknown,
+    expectedRevisionValue: unknown,
+    terminalDigestValue: unknown,
+    acknowledgedAtValue: unknown,
+  ): Promise<OAuthAttemptRecord> {
+    return await this.exclusive(async () => {
+      this.assertMutationWritable();
+      const attempt = parseAttempt(attemptValue);
+      if (
+        !Number.isSafeInteger(expectedRevisionValue) ||
+        (expectedRevisionValue as number) < 0 ||
+        (expectedRevisionValue as number) >= Number.MAX_SAFE_INTEGER
+      ) {
+        throw invalidStore("OAuth terminal acknowledgement revision is invalid");
+      }
+      const expectedRevision = expectedRevisionValue as number;
+      if (
+        typeof terminalDigestValue !== "string" ||
+        !/^[a-f0-9]{64}$/.test(terminalDigestValue) ||
+        terminalDigestValue === "0".repeat(64)
+      ) {
+        throw invalidStore("OAuth terminal acknowledgement digest is invalid");
+      }
+      const acknowledgedAt = parseTimestamp(
+        acknowledgedAtValue,
+        "OAuth terminal acknowledgement timestamp",
+      );
+      const current = await readSafeRecordFile(this.recordPath(attempt.attemptDigest), true);
+      if (!current || !isDeepStrictEqual(current.attempt, attempt)) {
+        throw new OAuthAttemptStoreError(
+          "OAUTH_ATTEMPT_ID_CONFLICT",
+          "OAuth attempt identity no longer matches durable state",
+        );
+      }
+      if (!current.terminal || current.terminal.terminalDigest !== terminalDigestValue) {
+        throw new OAuthAttemptStoreError(
+          "OAUTH_ATTEMPT_CAS_CONFLICT",
+          "OAuth terminal acknowledgement digest does not match",
+        );
+      }
+
+      if (current.desktopAcknowledgedAt) {
+        if (
+          current.revision !== expectedRevision + 1 ||
+          current.desktopAcknowledgedAt !== acknowledgedAt
+        ) {
+          throw new OAuthAttemptStoreError(
+            "OAUTH_ATTEMPT_CAS_CONFLICT",
+            "OAuth terminal acknowledgement changed after commit",
+          );
+        }
+        await this.confirmExactRecordDurability(current);
+        return current;
+      }
+      if (current.revision !== expectedRevision) {
+        throw new OAuthAttemptStoreError(
+          "OAUTH_ATTEMPT_CAS_CONFLICT",
+          "OAuth terminal acknowledgement predecessor changed",
+        );
+      }
+      if (Date.parse(acknowledgedAt) < Date.parse(current.terminal.body.terminalAt)) {
+        throw invalidStore("OAuth desktop acknowledgement predates terminal evidence");
+      }
+      return await this.replaceUnlocked(current, parseRecord({
+        ...current,
+        revision: nextRevision(current),
+        updatedAt: acknowledgedAt,
+        desktopAcknowledgedAt: acknowledgedAt,
+      }));
+    });
+  }
+
   async get(attemptValue: unknown): Promise<OAuthAttemptRecord | undefined> {
     return await this.exclusive(async () => {
-      this.assertInitialized();
+      this.assertReadable();
       const attempt = parseAttempt(attemptValue);
       const record = await readSafeRecordFile(this.recordPath(attempt.attemptDigest), true);
       if (record && !isDeepStrictEqual(record.attempt, attempt)) {
@@ -468,7 +546,7 @@ export class OAuthAttemptStore {
 
   async list(): Promise<OAuthAttemptRecord[]> {
     return await this.exclusive(async () => {
-      this.assertInitialized();
+      this.assertReadable();
       return await listRecordsFromDisk(this.paths.oauthAttempts);
     });
   }
@@ -546,11 +624,42 @@ export class OAuthAttemptStore {
 
   private async writeVerified(previous: OAuthAttemptRecord, next: OAuthAttemptRecord): Promise<void> {
     const path = this.recordPath(previous.attempt.attemptDigest);
-    await atomicWriteJson(path, next, OAUTH_ATTEMPT_MAX_FILE_BYTES);
+    try {
+      await (this.options.writeJson ?? atomicWriteJson)(path, next, OAUTH_ATTEMPT_MAX_FILE_BYTES);
+    } catch (error) {
+      if (error instanceof AtomicWriteAmbiguousCommitError) {
+        // A visible rename without a confirmed parent-directory sync cannot
+        // authorize login, persistence, cancellation, acknowledgement, or a
+        // status projection. Preserve the bytes and require a fresh Store
+        // initialization to confirm/classify them before public use.
+        this.recordCommitUncertain = true;
+      }
+      throw error;
+    }
     await this.options.faultInjector?.("after_transition_publish");
     const reread = await readSafeRecordFile(path);
     if (!isDeepStrictEqual(reread, next)) {
       throw invalidStore("OAuth attempt transition was not reread exactly");
+    }
+  }
+
+  private async confirmOrCreatePrepare(
+    path: string,
+    record: OAuthAttemptRecord,
+    useFaultInjector = false,
+  ): Promise<boolean> {
+    try {
+      return await atomicWriteJsonIfAbsent(
+        path,
+        record,
+        OAUTH_ATTEMPT_MAX_FILE_BYTES,
+        useFaultInjector ? { faultInjector: this.options.atomicCreateFaultInjector } : {},
+      );
+    } catch (error) {
+      if (error instanceof AtomicWriteAmbiguousCommitError) {
+        this.recordCommitUncertain = true;
+      }
+      throw error;
     }
   }
 
@@ -629,9 +738,19 @@ export class OAuthAttemptStore {
   }
 
   private assertMutationWritable(): void {
+    this.assertReadable();
+  }
+
+  private assertReadable(): void {
     this.assertInitialized();
     if (this.compactionUncertain) {
       throw invalidStore("OAuth attempt store requires restart after uncertain compaction");
+    }
+    if (this.recordCommitUncertain) {
+      throw new OAuthAttemptStoreError(
+        "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+        "OAuth attempt durability is uncertain; restart recovery is required",
+      );
     }
   }
 
@@ -733,6 +852,7 @@ function assertRecordCoherence(record: OAuthAttemptRecord): void {
   if (!terminalPhase && record.desktopAcknowledgedAt) {
     throw invalidStore("A nonterminal OAuth attempt cannot be acknowledged");
   }
+  assertRecordRevisionReachable(record);
 
   if (record.phase === "cancelling") {
     if (!record.cancelIntent || record.recoveryReason) {
@@ -768,6 +888,55 @@ function assertRecordCoherence(record: OAuthAttemptRecord): void {
     throw invalidStore("Unacknowledged OAuth terminal time must equal its record update time");
   }
   assertTerminalProvenance(record);
+}
+
+function assertRecordRevisionReachable(record: OAuthAttemptRecord): void {
+  let baseRevisions: readonly number[];
+  if (!record.terminal) {
+    switch (record.phase) {
+      case "prepared": baseRevisions = [0]; break;
+      case "login_dispatching": baseRevisions = [1]; break;
+      case "credentials_ready":
+      case "cancelling": baseRevisions = [2]; break;
+      case "persistence_dispatching": baseRevisions = [3]; break;
+      case "recovery_required":
+        baseRevisions = record.recoveryReason === "login_helper_liveness_unconfirmed"
+          ? [2]
+          : record.recoveryReason === "cancelling_helper_liveness_unconfirmed"
+            ? [3]
+            : [4];
+        break;
+      case "completed":
+      case "cancelled":
+      case "failed":
+      case "outcome_unknown":
+        throw invalidStore("OAuth terminal revision is missing terminal evidence");
+    }
+  } else {
+    switch (record.terminal.body.resolution) {
+      case "interrupted_before_login_dispatch": baseRevisions = [1]; break;
+      case "provider_login_failed": baseRevisions = [2]; break;
+      case "interrupted_during_login":
+        baseRevisions = record.recoveryReason === "login_helper_liveness_unconfirmed" ? [3] : [2];
+        break;
+      case "credentials_discarded_before_persistence": baseRevisions = [3]; break;
+      case "persistence_confirmed":
+      case "persistence_failed": baseRevisions = [4]; break;
+      case "configured_observed_after_recovery":
+      case "not_configured_observed_after_recovery": baseRevisions = [5]; break;
+      case "user_cancelled":
+      case "expired":
+      case "host_shutdown":
+        baseRevisions = record.recoveryReason === "cancelling_helper_liveness_unconfirmed"
+          ? [4]
+          : [1, 3];
+        break;
+    }
+  }
+  const acknowledgementIncrement = record.desktopAcknowledgedAt === undefined ? 0 : 1;
+  if (!baseRevisions.some((revision) => record.revision === revision + acknowledgementIncrement)) {
+    throw invalidStore("OAuth attempt revision cannot reach its durable phase");
+  }
 }
 
 function assertTerminalProvenance(record: OAuthAttemptRecord): void {

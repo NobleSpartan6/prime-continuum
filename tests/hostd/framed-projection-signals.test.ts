@@ -443,6 +443,83 @@ describe("hostd framed resident projection signals", () => {
     expect(service.handle).toHaveBeenCalledOnce();
   });
 
+  it("forfeits a queued OAuth start immediately on clean input EOF before draining entered work", async () => {
+    const readable = new PassThrough();
+    const writable = new PassThrough();
+    const blockerEntered = deferred<void>();
+    const releaseBlocker = deferred<void>();
+    const inputEnded = deferred<void>();
+    const handled: string[] = [];
+    readable.once("end", () => inputEnded.resolve(undefined));
+    const service = framedService(async (request) => {
+      const requestId = stringField(request, "requestId");
+      handled.push(requestId);
+      if (requestId === "eof-blocker") {
+        blockerEntered.resolve(undefined);
+        await releaseBlocker.promise;
+      }
+      return response(requestId, "health.get", {});
+    });
+    const session = runFramedSession(service, readable, writable, TRUSTED_USER_SESSION);
+
+    readable.write(encodeJsonFrame({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "eof-blocker",
+      method: "health.get",
+      payload: {},
+    }));
+    await blockerEntered.promise;
+    readable.write(encodeJsonFrame({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "eof-forfeited-oauth-start",
+      method: "oauth.attempt.start",
+      payload: {},
+    }));
+    readable.end();
+    await inputEnded.promise;
+    await Promise.resolve();
+    releaseBlocker.resolve(undefined);
+
+    await session;
+    expect(handled).toEqual(["eof-blocker"]);
+  });
+
+  it("forfeits an OAuth start paused in ownership proof when its input closes", async () => {
+    const readable = new PassThrough();
+    const writable = new PassThrough();
+    const ownershipEntered = deferred<void>();
+    const releaseOwnership = deferred<void>();
+    const inputEnded = deferred<void>();
+    readable.once("end", () => inputEnded.resolve(undefined));
+    const service = framedService(async (request) =>
+      response(stringField(request, "requestId"), "health.get", {}));
+    const session = runFramedSession(
+      service,
+      readable,
+      writable,
+      TRUSTED_USER_SESSION,
+      async () => {
+        ownershipEntered.resolve(undefined);
+        await releaseOwnership.promise;
+      },
+    );
+
+    readable.write(encodeJsonFrame({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "ownership-forfeited-oauth-start",
+      method: "oauth.attempt.start",
+      payload: {},
+    }));
+    await ownershipEntered.promise;
+    readable.end();
+    await inputEnded.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseOwnership.resolve(undefined);
+
+    await session;
+    expect(service.handle).not.toHaveBeenCalled();
+  });
+
   it("does not infer urgency from an abort-shaped request that fails the exact IPC schema", async () => {
     const releaseNormal = deferred<void>();
     const normalEntered = deferred<void>();

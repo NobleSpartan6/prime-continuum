@@ -16,6 +16,7 @@ import {
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RuntimeIntegritySnapshotSchema,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ThreadProjectionSnapshotSchema,
   ThreadSummarySchema,
@@ -52,7 +53,13 @@ import {
   HostOAuthSessionBroker,
   OAuthBrokerError,
   type HostOAuthComposition,
+  type OAuthAttemptSessionAdmission,
 } from "./oauth-session-broker";
+import {
+  OAuthAttemptStore,
+  OAuthAttemptStoreError,
+} from "./oauth-attempt-store";
+import type { HostOwnershipLease } from "./ownership-lease";
 import {
   HostStore,
   HostStoreError,
@@ -87,6 +94,10 @@ const KNOWN_METHODS = new Set([
   "oauth.session.start",
   "oauth.session.status",
   "oauth.session.cancel",
+  "oauth.attempt.start",
+  "oauth.attempt.status",
+  "oauth.attempt.cancel",
+  "oauth.attempt.acknowledge",
   "catalog.snapshot",
   "thread.snapshot",
   "thread.control.snapshot",
@@ -104,7 +115,12 @@ const KNOWN_METHODS = new Set([
 ]);
 
 export type HostSessionContext =
-  | { transport: "trusted_user"; scopes: "*" }
+  | {
+      transport: "trusted_user";
+      scopes: "*";
+      /** Host-issued connection authority. It is never parsed from client bytes. */
+      oauthAttemptAdmission?: OAuthAttemptSessionAdmission;
+    }
   | { transport: "ssh_bridge"; scopes: "*" }
   | {
       transport: "relay";
@@ -121,14 +137,13 @@ export const SSH_BRIDGE_SESSION: HostSessionContext = Object.freeze({
 });
 
 const DEFAULT_IDENTITY_LOAD_TIMEOUT_MS = 5_000;
-const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = "openai-codex";
-
 export interface HostServiceOptions {
   hostIdentityProvider?: HostIdentityKeyProvider;
   identityLoadTimeoutMs?: number;
   runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
   runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
   runtimeOAuthComposition?: HostOAuthComposition;
+  runtimeOAuthAttemptStore?: OAuthAttemptStore;
   candidateEvaluationCoordinator?: CandidateEvaluationCoordinator;
 }
 
@@ -166,6 +181,7 @@ export class HostService {
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
   private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
+  private readonly runtimeOAuthAttemptStore: OAuthAttemptStore | undefined;
   private readonly candidateEvaluationCoordinator: CandidateEvaluationCoordinator | undefined;
   private candidateEvaluationInitializationPromise: Promise<void> | undefined;
   private readonly projectionChangeListeners = new Set<(change: PrimeAgentProjectionChange) => void>();
@@ -176,6 +192,8 @@ export class HostService {
   private readonly unsubscribeGatewayAbortIdle: () => void;
   private oauthSessionBroker: HostOAuthSessionBroker | undefined;
   private oauthInitializationPromise: Promise<void> | undefined;
+  private runtimeOAuthAttemptAdmissionTail: Promise<void> = Promise.resolve();
+  private oauthAttemptStoreReady = false;
   private closing = false;
   private hostIdentityProviderUsed = false;
   private pairingIdentity: HostIdentityReadiness = Object.freeze({ state: "not_configured" });
@@ -195,6 +213,7 @@ export class HostService {
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
     this.runtimeOAuthComposition = options.runtimeOAuthComposition;
+    this.runtimeOAuthAttemptStore = options.runtimeOAuthAttemptStore;
     this.candidateEvaluationCoordinator = options.candidateEvaluationCoordinator;
     this.unsubscribeGatewayProjection = this.gateway.subscribeProjectionChanges?.((change) => {
       for (const listener of this.projectionChangeListeners) {
@@ -231,9 +250,10 @@ export class HostService {
     }
   }
 
-  async initialize(): Promise<void> {
+  async initialize(ownershipLease?: HostOwnershipLease): Promise<void> {
     await this.store.initialize();
     const host = await this.store.getHost();
+    await this.initializeRuntimeOAuthAttemptStore(ownershipLease);
     this.startRuntimeOAuthInitialization(host.hostId);
     const authority = await this.pairingAuthority.initialize({ hostId: host.hostId });
     this.pairingIdentity = authority.identity
@@ -291,6 +311,7 @@ export class HostService {
   private startRuntimeOAuthInitialization(hostId: string): void {
     if (
       !this.runtimeOAuthComposition ||
+      (this.runtimeOAuthAttemptStore !== undefined && !this.oauthAttemptStoreReady) ||
       this.oauthSessionBroker ||
       this.oauthInitializationPromise ||
       this.closing
@@ -299,18 +320,50 @@ export class HostService {
     this.oauthInitializationPromise = (async () => {
       try {
         await composition.initialize?.();
-        if (this.closing) return;
-        this.oauthSessionBroker = new HostOAuthSessionBroker({
-          hostId,
-          providers: composition,
-          storage: composition,
-        });
       } catch {
-        // Cached host/thread projections remain readable, but the same sticky
-        // custody guard also withholds OAuth, catalog, and resident execution.
-        this.oauthSessionBroker = undefined;
+        // The durable coordinator is still useful for read-only status and
+        // exact acknowledgement while provider/custody readiness is absent.
+        // getProvider() remains fail-closed, so no new effect can start.
       }
+      if (this.closing) return;
+      this.oauthSessionBroker = new HostOAuthSessionBroker({
+        hostId,
+        providers: composition,
+        storage: composition,
+        ...(this.runtimeOAuthAttemptStore
+          ? { attemptStore: this.runtimeOAuthAttemptStore }
+          : {}),
+      });
     })();
+  }
+
+  private async initializeRuntimeOAuthAttemptStore(
+    ownershipLease: HostOwnershipLease | undefined,
+  ): Promise<void> {
+    const attemptStore = this.runtimeOAuthAttemptStore;
+    if (!attemptStore) return;
+    if (!ownershipLease) {
+      throw new HostStoreError(
+        "HOST_OWNERSHIP_REQUIRED",
+        "Durable OAuth recovery requires the active endpoint ownership lease.",
+      );
+    }
+    try {
+      await ownershipLease.withPublicationPermit(async () => {
+        const recoveredAt = new Date().toISOString();
+        await attemptStore.initialize(recoveredAt);
+        await attemptStore.compact(recoveredAt);
+      });
+      if (!this.closing) this.oauthAttemptStoreReady = true;
+    } catch (error) {
+      // Preserve every journal byte and keep core host projections online only
+      // while this generation still owns the endpoint. Ownership loss or a
+      // poisoned/ambiguous publication must abort startup so no successor can
+      // overlap recovery under a different generation.
+      this.oauthAttemptStoreReady = false;
+      await ownershipLease.assertActive();
+      void error;
+    }
   }
 
   private startCandidateEvaluationInitialization(): void {
@@ -512,9 +565,28 @@ export class HostService {
         const modelCatalogCapabilities = modelCatalogReady
           ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
           : [];
-        const oauthCapabilities = context.transport === "trusted_user" && this.oauthSessionBroker &&
-          this.runtimeOAuthComposition?.getProvider(PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID) &&
+        let oauthAttemptSurfaceReady = context.transport === "trusted_user" &&
+          this.oauthAttemptStoreReady &&
+          this.oauthSessionBroker !== undefined;
+        let oauthEffectAdmissionReady = false;
+        if (
+          oauthAttemptSurfaceReady &&
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
+        ) {
+          try {
+            oauthEffectAdmissionReady = await this.oauthSessionBroker!.attemptEffectAdmissionReady();
+          } catch (error) {
+            this.observeRuntimeOAuthAttemptFailure(error);
+            oauthAttemptSurfaceReady = false;
+          }
+        }
+        // runtime_oauth_attempt_v1 identifies the durable method family;
+        // runtime_oauth_v1 is retained as the dynamic new-start eligibility
+        // bit. A durable-aware Desktop requires both before starting an effect.
+        const oauthAttemptCapabilities = oauthAttemptSurfaceReady
+          ? [RUNTIME_OAUTH_ATTEMPT_CAPABILITY]
+          : [];
+        const oauthCapabilities = oauthAttemptSurfaceReady && oauthEffectAdmissionReady
           ? [RUNTIME_OAUTH_CAPABILITY]
           : [];
         const runtimeIntegrityRetryCapabilities = context.transport === "trusted_user" &&
@@ -558,6 +630,7 @@ export class HostService {
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
+                ...oauthAttemptCapabilities,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
                 ...candidateEvaluationCapabilities,
@@ -568,6 +641,7 @@ export class HostService {
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
+                ...oauthAttemptCapabilities,
                 RUNTIME_INTEGRITY_CAPABILITY,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
@@ -682,21 +756,62 @@ export class HostService {
         }
         return this.runtimeModelCatalogProvider.read();
       }
-      case "oauth.session.start": {
-        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
-        const snapshot = await broker.start(request.payload);
-        if (snapshot.phase === "completed") this.runtimeModelCatalogProvider?.invalidate?.();
-        return snapshot;
+      case "oauth.session.start":
+      case "oauth.session.status":
+      case "oauth.session.cancel":
+        throw new HostStoreError(
+          "RUNTIME_OAUTH_LEGACY_UNAVAILABLE",
+          "Legacy OAuth session requests are disabled; use the durable OAuth attempt protocol.",
+        );
+      case "oauth.attempt.start": {
+        return await this.withRuntimeOAuthAttemptAdmission(async () => {
+          const broker = await this.requireRuntimeOAuthAttemptBroker(
+            request.payload.attempt.identity.expectedHostId,
+          );
+          const admission = context.transport === "trusted_user"
+            ? context.oauthAttemptAdmission
+            : undefined;
+          broker.assertAttemptStartAdmission(admission);
+          const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+          if (
+            (runtimeIntegrity && runtimeIntegrity.status !== "ready") ||
+            !(await this.callRuntimeOAuthAttemptBroker(() => broker.attemptEffectAdmissionReady()))
+          ) {
+            throw new HostStoreError(
+              "RUNTIME_OAUTH_UNAVAILABLE",
+              "A new durable OAuth attempt is not currently eligible on this host.",
+            );
+          }
+          return await this.callRuntimeOAuthAttemptBroker(() =>
+            broker.startAttempt(
+              request.payload,
+              admission,
+            ));
+        });
       }
-      case "oauth.session.status": {
-        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
-        const snapshot = await broker.status(request.payload);
-        if (snapshot.phase === "completed") this.runtimeModelCatalogProvider?.invalidate?.();
-        return snapshot;
+      case "oauth.attempt.status": {
+        return await this.withRuntimeOAuthAttemptAdmission(async () => {
+          const broker = await this.requireRuntimeOAuthAttemptBroker(
+            request.payload.attempt.identity.expectedHostId,
+          );
+          return await this.callRuntimeOAuthAttemptBroker(() =>
+            broker.statusAttempt(
+              request.payload,
+              context.transport === "trusted_user" ? context.oauthAttemptAdmission : undefined,
+            ));
+        });
       }
-      case "oauth.session.cancel": {
-        const broker = await this.requireRuntimeOAuthBroker(request.payload.expectedHostId);
-        return broker.cancel(request.payload);
+      case "oauth.attempt.cancel": {
+        const broker = await this.requireRuntimeOAuthAttemptBroker(
+          request.payload.attempt.identity.expectedHostId,
+        );
+        return await this.callRuntimeOAuthAttemptBroker(() => broker.cancelAttempt(request.payload));
+      }
+      case "oauth.attempt.acknowledge": {
+        const broker = await this.requireRuntimeOAuthAttemptBroker(
+          request.payload.attempt.identity.expectedHostId,
+        );
+        return await this.callRuntimeOAuthAttemptBroker(() => broker.acknowledgeAttempt(request.payload));
       }
       case "candidate.evaluation.preflight": {
         return (await this.requireCandidateEvaluationCoordinator()).preflight(request.payload);
@@ -1120,7 +1235,23 @@ export class HostService {
     }
   }
 
-  private async requireRuntimeOAuthBroker(expectedHostId: string): Promise<HostOAuthSessionBroker> {
+  private withRuntimeOAuthAttemptAdmission<T>(action: () => Promise<T>): Promise<T> {
+    const prior = this.runtimeOAuthAttemptAdmissionTail;
+    let release!: () => void;
+    this.runtimeOAuthAttemptAdmissionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return (async () => {
+      await prior;
+      try {
+        return await action();
+      } finally {
+        release();
+      }
+    })();
+  }
+
+  private async requireRuntimeOAuthAttemptBroker(expectedHostId: string): Promise<HostOAuthSessionBroker> {
     const host = await this.store.getHost();
     if (expectedHostId !== host.hostId) {
       throw new HostStoreError(
@@ -1128,14 +1259,34 @@ export class HostService {
         "The OAuth session targets a different host authority.",
       );
     }
-    const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
-    if (!this.oauthSessionBroker || (runtimeIntegrity && runtimeIntegrity.status !== "ready")) {
+    if (!this.oauthSessionBroker || !this.oauthAttemptStoreReady) {
       throw new HostStoreError(
-        "RUNTIME_OAUTH_UNAVAILABLE",
-        "The verified Prime Agent OAuth runtime is not available on this host.",
+        "RUNTIME_OAUTH_ATTEMPT_UNAVAILABLE",
+        "The durable Prime Agent OAuth coordinator is not available on this host.",
       );
     }
     return this.oauthSessionBroker;
+  }
+
+  private async callRuntimeOAuthAttemptBroker<T>(action: () => Promise<T>): Promise<T> {
+    try {
+      return await action();
+    } catch (error) {
+      this.observeRuntimeOAuthAttemptFailure(error);
+      throw error;
+    }
+  }
+
+  private observeRuntimeOAuthAttemptFailure(error: unknown): void {
+    const expectedBrokerFailure = error instanceof OAuthBrokerError;
+    const expectedStoreConflict = error instanceof OAuthAttemptStoreError &&
+      error.code !== "OAUTH_ATTEMPT_STORE_INVALID" &&
+      error.code !== "OAUTH_ATTEMPT_COMMIT_UNCERTAIN";
+    if (!expectedBrokerFailure && !expectedStoreConflict) {
+      // Once journal readability/durability is uncertain, neither status nor
+      // a new effect may be advertised again in this ownership generation.
+      this.oauthAttemptStoreReady = false;
+    }
   }
 
   private async requireCandidateEvaluationCoordinator(): Promise<CandidateEvaluationCoordinator> {
@@ -1281,6 +1432,10 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
     case "oauth.session.start":
     case "oauth.session.status":
     case "oauth.session.cancel":
+    case "oauth.attempt.start":
+    case "oauth.attempt.status":
+    case "oauth.attempt.cancel":
+    case "oauth.attempt.acknowledge":
       // Relay requests are rejected before scope evaluation. This branch keeps
       // the protocol switch exhaustive without granting remote account access.
       return "host.admin";
@@ -1539,6 +1694,9 @@ function toStructuredError(error: unknown): StructuredError {
   if (error instanceof OAuthBrokerError) {
     return { code: error.code, message: error.message, retryable: error.code === "OAUTH_PROVIDER_BUSY" };
   }
+  if (error instanceof OAuthAttemptStoreError) {
+    return { code: error.code, message: error.message, retryable: false };
+  }
   if (error instanceof ResidentProvisionCoordinatorError) {
     return { code: error.code, message: error.message, retryable: error.retryable };
   }
@@ -1566,7 +1724,11 @@ function toStructuredError(error: unknown): StructuredError {
 function isOAuthRequest(request: HostIpcRequest): boolean {
   return request.method === "oauth.session.start" ||
     request.method === "oauth.session.status" ||
-    request.method === "oauth.session.cancel";
+    request.method === "oauth.session.cancel" ||
+    request.method === "oauth.attempt.start" ||
+    request.method === "oauth.attempt.status" ||
+    request.method === "oauth.attempt.cancel" ||
+    request.method === "oauth.attempt.acknowledge";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

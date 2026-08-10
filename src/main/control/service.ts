@@ -20,6 +20,7 @@ import {
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
@@ -27,7 +28,10 @@ import {
   ResidentPromptIdleObservedSignalSchema,
   RuntimeIntegritySnapshotSchema,
   RuntimeModelCatalogSnapshotSchema,
-  RuntimeOAuthSessionSnapshotSchema,
+  RuntimeOAuthAttemptAcknowledgeResultSchema,
+  RuntimeOAuthAttemptCancelResultSchema,
+  RuntimeOAuthAttemptStartResultSchema,
+  RuntimeOAuthAttemptStatusResultSchema,
   StructuredErrorSchema,
   ThreadProjectionSnapshotSchema,
   ThreadChangedEventPayloadSchema,
@@ -40,6 +44,11 @@ import {
   type CommandEnvelope,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
+  type RuntimeOAuthAttemptAcknowledgeResult,
+  type RuntimeOAuthAttemptCancelResult,
+  type RuntimeOAuthAttemptRecord,
+  type RuntimeOAuthAttemptStartResult,
+  type RuntimeOAuthAttemptStatusResult,
   type RuntimeOAuthSessionSnapshot,
   type ResidentLifecycleLookupResult,
   type ResidentLifecycleStatus,
@@ -50,6 +59,11 @@ import {
   CODEX_SUBSCRIPTION_PROVIDER_ID,
   isPinnedCodexAuthorizationUrl
 } from '../../shared/codex-oauth'
+import {
+  createRuntimeOAuthAttemptTerminalV1,
+  createRuntimeOAuthAttemptV1,
+  type RuntimeOAuthAttemptV1,
+} from '../../shared/runtime-oauth-attempt'
 import type {
   ApprovalResolution,
   BootstrapPayload,
@@ -87,6 +101,13 @@ import {
   type IndexedProjectionEntry,
   type IndexedProjectionEnvelope,
 } from './projection-cache'
+import {
+  RuntimeOAuthDesktopAttemptStore,
+  RuntimeOAuthDesktopAttemptStoreError,
+  type RuntimeOAuthDesktopAttemptRecordV1,
+  type RuntimeOAuthDesktopRecoveryReason,
+  type RuntimeOAuthHostDurablePhase,
+} from './runtime-oauth-attempt-store'
 import { discoverSshHosts, parseSshConfigAliases, probeSshHost, resolveSshHost } from './ssh'
 import { AtomicJsonStore, LatencyRecorder } from './storage'
 
@@ -162,23 +183,17 @@ interface CapturedProjectionAuthority {
   generation: number
 }
 
-interface ActiveRuntimeOAuthSession {
-  readonly authority: CapturedProjectionAuthority
-  readonly sessionId: string
-  readonly providerId: string
-  closing: boolean
-  cancellationPromise?: Promise<RuntimeOAuthSessionSnapshot>
+interface AcceptedRuntimeOAuthAttempt {
+  readonly desktop: RuntimeOAuthDesktopAttemptRecordV1
+  readonly host: RuntimeOAuthAttemptRecord | null
+  readonly live?: RuntimeOAuthSessionSnapshot
 }
 
-interface OpeningRuntimeOAuthSession {
-  readonly url: string
-  readonly promise: Promise<void>
-}
-
-interface AmbiguousRuntimeOAuthStart {
-  readonly authority: CapturedProjectionAuthority
-  readonly providerId: string
-}
+type RuntimeOAuthAttemptBoundResult =
+  | RuntimeOAuthAttemptStatusResult
+  | RuntimeOAuthAttemptStartResult
+  | RuntimeOAuthAttemptCancelResult
+  | RuntimeOAuthAttemptAcknowledgeResult
 
 interface HealthLineage {
   hostId: string
@@ -287,7 +302,6 @@ interface ServiceOptions {
 
 const RECONNECT_DELAYS_MS = [500, 1_500, 3_500, 8_000, 15_000, 30_000] as const
 const OAUTH_START_REGISTRATION_TIMEOUT_MS = 35_000
-const OAUTH_DRAIN_TIMEOUT_MS = 15_000
 const HEALTH_POLL_INITIALIZING_MS = 500
 const HEALTH_POLL_STEADY_MS = 15_000
 const HEALTH_CAPABILITY_WARMUP_POLLS = 60
@@ -332,14 +346,16 @@ export class DesktopControlService extends EventEmitter {
   private readonly selectDirectory: (() => Promise<string | undefined>) | undefined
   private readonly platform: NodeJS.Platform
   private readonly oauthAuthorityId = `desktop-oauth-${randomUUID()}`
-  private readonly openedOAuthSessions = new Set<string>()
-  private readonly activeOAuthSessions = new Map<string, ActiveRuntimeOAuthSession>()
-  private readonly openingOAuthSessions = new Map<string, OpeningRuntimeOAuthSession>()
   private readonly oauthStartRegistrations = new Set<Promise<void>>()
-  private readonly ambiguousOAuthStarts = new Map<string, AmbiguousRuntimeOAuthStart>()
+  private readonly oauthAttemptOperationTails = new Map<string, Promise<void>>()
+  private readonly runtimeOAuthBrowserEligibleAttempts = new Set<string>()
   private oauthTransitionBlockCount = 0
   private oauthTransitionGeneration = 0
   private oauthDrainPromise: Promise<void> | undefined
+  private readonly runtimeOAuthAttemptStorePath: string
+  private runtimeOAuthAttempts?: RuntimeOAuthDesktopAttemptStore
+  private runtimeOAuthAttemptInitialization?: Promise<void>
+  private runtimeOAuthAttemptInitializationFailed = false
   private readonly cache: IndexedProjectionCacheStore<CacheEnvelope>
   private readonly outbox: AtomicJsonStore<unknown[]>
   private readonly commandIdentities: AtomicJsonStore<CommandIdentityLedger>
@@ -394,6 +410,7 @@ export class DesktopControlService extends EventEmitter {
     this.selectDirectory = options.selectDirectory
     this.platform = options.platform ?? process.platform
     const stateDirectory = path.join(this.app.getPath('userData'), 'control')
+    this.runtimeOAuthAttemptStorePath = path.join(stateDirectory, 'runtime-oauth-attempts.json')
     const emptyCache = (): CacheEnvelope => ({ version: 3, entries: {}, targetHostBindings: [] })
     this.cache = new IndexedProjectionCacheStore(
       path.join(stateDirectory, 'projection-cache.json'),
@@ -439,12 +456,14 @@ export class DesktopControlService extends EventEmitter {
         initialCacheResult,
         initialRawOutboxResult,
         initialResidentLifecycleLedgerResult,
+        _runtimeOAuthAttemptInitializationResult,
       ] = await Promise.allSettled([
         this.commandIdentities.read(),
         this.durableUncertainReceipts.read(),
         this.readCache(),
         this.readRawOutbox(),
         this.residentLifecycleLedger.read(),
+        this.initializeRuntimeOAuthAttemptStore(),
       ])
       // Keep the former deterministic failure order while performing the disk
       // reads concurrently. A valid target cache is restored before a later
@@ -993,98 +1012,157 @@ export class DesktopControlService extends EventEmitter {
       }
     })
     this.oauthStartRegistrations.add(registration)
-    let active: ActiveRuntimeOAuthSession | undefined
-    const operationId = randomUUID()
     try {
-      const authority = this.captureLocalOAuthAuthority(expectedHostId)
+      const authority = this.captureLocalOAuthAuthority(expectedHostId, true)
       const transitionGeneration = this.oauthTransitionGeneration
-      const ambiguityKey = this.runtimeOAuthAmbiguityKey(authority, providerId)
-      let raw: unknown
-      try {
-        raw = await authority.connection.request(
-          'oauth.session.start',
-          { expectedHostId, authorityId: this.oauthAuthorityId, providerId, operationId },
-          { timeoutMs: 30_000 }
-        )
-      } catch (cause) {
-        // A lost response may follow provider-login admission. Never replay the
-        // effect-bearing start request; only the durable read-only attempt
-        // reconciliation vertical may clear this ambiguity.
-        this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
+      const store = await this.requireRuntimeOAuthAttemptStore()
+      this.assertProjectionAuthority(authority, 'OAuth attempt preparation')
+      await this.assertNoRuntimeOAuthAttemptBarrier(store)
+      const requestedAt = now()
+      const attempt = createRuntimeOAuthAttemptV1({
+        version: 1,
+        expectedHostId,
+        providerId: CODEX_SUBSCRIPTION_PROVIDER_ID,
+        operationId: randomUUID(),
+        requestedAt,
+      })
+      const prepared = await store.prepare(attempt, requestedAt)
+      if (!prepared.created) {
         throw new ControlError(
-          'runtime.oauth_start_ambiguous',
-          'The host may have started sign-in, but its session identity could not be recovered. Keep this host connected while Prime Continuim checks the original attempt.',
-          { retryable: true, cause }
-        )
-      }
-      // Until the returned identity is parsed and bound, treat the admitted
-      // start as ambiguous so a protocol violation cannot permit disconnect.
-      this.ambiguousOAuthStarts.set(ambiguityKey, { authority, providerId })
-      const recoveredIdentity = recoverRuntimeOAuthIdentity(raw)
-      if (recoveredIdentity) {
-        active = this.registerActiveRuntimeOAuthSession(authority, recoveredIdentity)
-        this.ambiguousOAuthStarts.delete(ambiguityKey)
-      }
-      let snapshot = parseRuntimeOAuthSnapshot(raw)
-      const sessionId = snapshot.sessionId
-      this.assertRuntimeOAuthSnapshotBinding(snapshot, sessionId, providerId)
-      active ??= this.registerActiveRuntimeOAuthSession(authority, snapshot)
-      this.ambiguousOAuthStarts.delete(ambiguityKey)
-      releaseRegistration()
-      this.assertProjectionAuthority(authority, 'OAuth session start')
-      if (
-        transitionGeneration !== this.oauthTransitionGeneration ||
-        this.oauthTransitionBlockCount > 0 ||
-        active.closing
-      ) {
-        throw new ControlError(
-          'runtime.oauth_transition_in_progress',
-          'Sign-in was cancelled because the host connection is changing.',
-          { retryable: true }
+          'runtime.oauth_attempt_conflict',
+          'The durable sign-in attempt identity was already retained.',
         )
       }
 
-      // Provider login starts asynchronously. Give the verified helper a
-      // bounded window to publish its browser URL. Every poll remains bound to
-      // the original session/provider before its result may affect main.
-      const deadline = Date.now() + 5_000
-      while (
-        !snapshot.authorization &&
-        !snapshot.challenge &&
-        (snapshot.phase === 'starting' || snapshot.phase === 'awaiting_user') &&
-        Date.now() < deadline
-      ) {
-        await delay(50)
-        if (active.closing) {
-          throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
-        }
-        this.assertProjectionAuthority(authority, 'OAuth session start')
-        let polledRaw: unknown
-        try {
-          polledRaw = await authority.connection.request(
-            'oauth.session.status',
-            { expectedHostId, authorityId: this.oauthAuthorityId, sessionId },
-            { timeoutMs: 10_000 }
-          )
-        } catch {
+      return await this.withRuntimeOAuthAttemptOperation(attempt.attemptDigest, async () => {
+        if (
+          transitionGeneration !== this.oauthTransitionGeneration ||
+          this.oauthTransitionBlockCount > 0
+        ) {
+          await this.failRuntimeOAuthAttemptBeforeHostDispatch(store, prepared.record)
           throw new ControlError(
-            'runtime.oauth_status_failed',
-            'Prime Agent sign-in status could not be read from this host.',
-            { retryable: true }
+            'runtime.oauth_transition_in_progress',
+            'Sign-in paused before its host effect was dispatched.',
+            { retryable: true },
           )
         }
-        const polledSnapshot = parseRuntimeOAuthSnapshot(polledRaw)
-        this.assertRuntimeOAuthSnapshotBinding(polledSnapshot, sessionId, providerId)
-        snapshot = polledSnapshot
-      }
-      return await this.presentRuntimeOAuthSnapshot(active, snapshot)
-    } catch (error) {
-      if (active && !active.closing) {
-        // Protocol/authority failures after the host created a session must not
-        // leave that exact helper eligible to commit credentials unnoticed.
-        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
-      }
-      throw error
+        let desktop = await store.transition({
+          attemptDigest: attempt.attemptDigest,
+          expectedRevision: prepared.record.revision,
+          phase: 'start_dispatching',
+          updatedAt: monotonicTimestamp(prepared.record.updatedAt),
+        })
+        if (
+          transitionGeneration !== this.oauthTransitionGeneration ||
+          this.oauthTransitionBlockCount > 0
+        ) {
+          await this.failRuntimeOAuthAttemptBeforeHostDispatch(store, desktop)
+          throw new ControlError(
+            'runtime.oauth_transition_in_progress',
+            'Sign-in paused before its host effect was dispatched.',
+            { retryable: true },
+          )
+        }
+        let result: RuntimeOAuthAttemptStartResult | RuntimeOAuthAttemptStatusResult | undefined
+        let startRaw: unknown
+        try {
+          startRaw = await authority.connection.request(
+            'oauth.attempt.start',
+            { authorityId: this.oauthAuthorityId, attempt },
+            { timeoutMs: 30_000 },
+          )
+        } catch (cause) {
+          // The effect is never replayed. A read-only digest lookup is the only
+          // recovery operation after the request crossed the transport.
+          try {
+            result = await this.readRuntimeOAuthAttemptStatus(authority, attempt)
+          } catch (error) {
+            if (isRuntimeOAuthProtocolFailure(error)) throw error
+            throw new ControlError(
+              'runtime.oauth_start_ambiguous',
+              'The host may have started sign-in, but the durable attempt could not yet be reconciled.',
+              { retryable: true },
+            )
+          }
+          if (result.record === null) {
+            await this.acceptRuntimeOAuthAttemptResult(store, authority, attempt, result, {
+              sameConnectionAbsenceIsTerminal: true,
+            })
+            throw new ControlError(
+              'runtime.oauth_start_failed',
+              'The host did not retain the durable sign-in attempt.',
+              { retryable: true },
+            )
+          }
+          void cause
+        }
+        if (result === undefined) {
+          this.assertProjectionAuthority(authority, 'OAuth attempt start')
+          try {
+            result = parseRuntimeOAuthAttemptStartResult(startRaw)
+          } catch (error) {
+            if (error instanceof ControlError) authority.connection.terminate(error)
+            throw error
+          }
+        }
+
+        let accepted = await this.acceptRuntimeOAuthAttemptResult(store, authority, attempt, result)
+        if (!accepted.host) {
+          throw new ControlError(
+            'runtime.oauth_start_failed',
+            'The host did not retain the durable sign-in attempt.',
+            { retryable: true },
+          )
+        }
+        desktop = accepted.desktop
+        if (
+          transitionGeneration !== this.oauthTransitionGeneration ||
+          this.oauthTransitionBlockCount > 0
+        ) {
+          throw new ControlError(
+            'runtime.oauth_transition_in_progress',
+            'Sign-in paused because the host connection is changing.',
+            { retryable: true },
+          )
+        }
+        this.runtimeOAuthBrowserEligibleAttempts.add(attempt.attemptDigest)
+
+        // Starting the provider is asynchronous. Every follow-up is the
+        // read-only attempt lookup; the effect-bearing start remains singular.
+        const deadline = Date.now() + 5_000
+        while (
+          accepted.host &&
+          !accepted.live?.authorization &&
+          !accepted.live?.challenge &&
+          !isTerminalRuntimeOAuthAttemptPhase(accepted.host.phase) &&
+          Date.now() < deadline
+        ) {
+          await delay(50)
+          const polled = await this.readRuntimeOAuthAttemptStatus(authority, attempt)
+          accepted = await this.acceptRuntimeOAuthAttemptResult(store, authority, attempt, polled)
+          if (!accepted.host) break
+          desktop = accepted.desktop
+        }
+        if (!accepted.host) {
+          throw new ControlError(
+            'runtime.oauth_start_failed',
+            'The host did not retain the durable sign-in attempt.',
+            { retryable: true },
+          )
+        }
+        if (accepted.live?.authorization) {
+          desktop = await this.dispatchRuntimeOAuthBrowser(
+            store,
+            authority,
+            desktop,
+            accepted.host,
+            accepted.live,
+            transitionGeneration,
+          )
+          accepted = { ...accepted, desktop }
+        }
+        return this.presentRuntimeOAuthAttempt(accepted)
+      })
     } finally {
       releaseRegistration()
       this.oauthStartRegistrations.delete(registration)
@@ -1093,43 +1171,116 @@ export class DesktopControlService extends EventEmitter {
 
   async runtimeOAuthStatus(expectedHostId: string, sessionId: string): Promise<RuntimeOAuthSessionView> {
     this.assertRuntimeOAuthAdmissionOpen()
-    const active = this.requireActiveRuntimeOAuthSession(expectedHostId, sessionId)
-    if (active.closing) {
-      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
-    }
-    let raw: unknown
-    try {
-      raw = await active.authority.connection.request(
-        'oauth.session.status',
-        { expectedHostId, authorityId: this.oauthAuthorityId, sessionId },
-        { timeoutMs: 10_000 }
-      )
-    } catch {
-      throw new ControlError(
-        'runtime.oauth_status_failed',
-        'Prime Agent sign-in status could not be read from this host.',
-        { retryable: true }
-      )
-    }
-    this.assertProjectionAuthority(active.authority, 'OAuth session status')
-    const snapshot = parseRuntimeOAuthSnapshot(raw)
-    this.assertRuntimeOAuthSnapshotBinding(snapshot, sessionId, active.providerId)
-    return await this.presentRuntimeOAuthSnapshot(active, snapshot)
+    const authority = this.captureLocalOAuthAuthority(expectedHostId, false)
+    const transitionGeneration = this.oauthTransitionGeneration
+    const store = await this.requireRuntimeOAuthAttemptStore()
+    const record = await this.requireRuntimeOAuthAttemptBySession(store, expectedHostId, sessionId)
+    return await this.withRuntimeOAuthAttemptOperation(record.attempt.attemptDigest, async () => {
+      let result: RuntimeOAuthAttemptStatusResult
+      try {
+        result = await this.readRuntimeOAuthAttemptStatus(authority, record.attempt)
+      } catch (error) {
+        if (isRuntimeOAuthProtocolFailure(error)) throw error
+        throw new ControlError(
+          'runtime.oauth_status_failed',
+          'Prime Agent sign-in status could not be read from this host.',
+          { retryable: true },
+        )
+      }
+      let accepted = await this.acceptRuntimeOAuthAttemptResult(store, authority, record.attempt, result)
+      if (!accepted.host || accepted.host.sessionId !== sessionId) {
+        throw new ControlError(
+          'runtime.oauth_session_untracked',
+          'The durable sign-in session is no longer available on this host.',
+          { retryable: true },
+        )
+      }
+      if (
+        accepted.live?.authorization &&
+        this.runtimeOAuthBrowserEligibleAttempts.has(record.attempt.attemptDigest)
+      ) {
+        const desktop = await this.dispatchRuntimeOAuthBrowser(
+          store,
+          authority,
+          accepted.desktop,
+          accepted.host,
+          accepted.live,
+          transitionGeneration,
+        )
+        accepted = { ...accepted, desktop }
+      }
+      return this.presentRuntimeOAuthAttempt(accepted)
+    })
   }
 
   async cancelRuntimeOAuth(expectedHostId: string, sessionId: string): Promise<RuntimeOAuthSessionView> {
-    const active = this.requireActiveRuntimeOAuthSession(expectedHostId, sessionId)
-    active.closing = true
-    try {
-      const snapshot = await this.requestActiveRuntimeOAuthCancellation(active, 15_000)
-      this.assertProjectionAuthority(active.authority, 'OAuth session cancellation')
-      return await this.presentRuntimeOAuthSnapshot(active, snapshot)
-    } catch (error) {
-      if (this.activeOAuthSessions.get(this.runtimeOAuthSessionKey(active.authority.hostId, sessionId)) === active) {
-        active.closing = false
+    this.assertRuntimeOAuthAdmissionOpen()
+    const authority = this.captureLocalOAuthAuthority(expectedHostId, false)
+    const store = await this.requireRuntimeOAuthAttemptStore()
+    const initial = await this.requireRuntimeOAuthAttemptBySession(store, expectedHostId, sessionId)
+    return await this.withRuntimeOAuthAttemptOperation(initial.attempt.attemptDigest, async () => {
+      let desktop = await this.requireRuntimeOAuthAttemptRecord(store, initial.attempt)
+      this.runtimeOAuthBrowserEligibleAttempts.delete(desktop.attempt.attemptDigest)
+      if (isTerminalRuntimeOAuthDesktopPhase(desktop.phase) || desktop.phase === 'cancel_dispatching') {
+        const status = await this.readRuntimeOAuthAttemptStatus(authority, desktop.attempt)
+        const accepted = await this.acceptRuntimeOAuthAttemptResult(store, authority, desktop.attempt, status)
+        if (!accepted.host) {
+          throw new ControlError('runtime.oauth_session_untracked', 'The durable sign-in session is no longer available.')
+        }
+        return this.presentRuntimeOAuthAttempt(accepted)
       }
-      throw error
-    }
+      if (desktop.phase === 'prepared' || desktop.phase === 'start_dispatching') {
+        throw new ControlError(
+          'runtime.oauth_start_ambiguous',
+          'The sign-in start must be reconciled before it can be cancelled.',
+          { retryable: true },
+        )
+      }
+      desktop = await store.transition({
+        attemptDigest: desktop.attempt.attemptDigest,
+        expectedRevision: desktop.revision,
+        phase: 'cancel_dispatching',
+        updatedAt: monotonicTimestamp(desktop.updatedAt),
+        hostSessionId: desktop.hostSessionId,
+        hostPhase: desktop.hostPhase,
+      })
+      let result: RuntimeOAuthAttemptCancelResult | RuntimeOAuthAttemptStatusResult | undefined
+      let cancelRaw: unknown
+      try {
+        cancelRaw = await authority.connection.request(
+          'oauth.attempt.cancel',
+          { attempt: desktop.attempt },
+          { timeoutMs: 15_000, priority: 'urgent' },
+        )
+      } catch {
+        // Cancellation is also singular. Once its dispatch barrier is durable,
+        // a retry (including after restart) is a status lookup only.
+        try {
+          result = await this.readRuntimeOAuthAttemptStatus(authority, desktop.attempt)
+        } catch (error) {
+          if (isRuntimeOAuthProtocolFailure(error)) throw error
+          throw new ControlError(
+            'runtime.oauth_cancel_failed',
+            'Prime Agent sign-in cancellation could not be confirmed by this host.',
+            { retryable: true },
+          )
+        }
+      }
+      if (result === undefined) {
+        this.assertProjectionAuthority(authority, 'OAuth attempt cancellation')
+        try {
+          result = parseRuntimeOAuthAttemptCancelResult(cancelRaw)
+        } catch (error) {
+          if (error instanceof ControlError) authority.connection.terminate(error)
+          throw error
+        }
+      }
+      const accepted = await this.acceptRuntimeOAuthAttemptResult(store, authority, desktop.attempt, result)
+      if (!accepted.host) {
+        throw new ControlError('runtime.oauth_session_untracked', 'The durable sign-in session is no longer available.')
+      }
+      return this.presentRuntimeOAuthAttempt(accepted)
+    })
   }
 
   async selectResidentWorkspace(
@@ -1474,7 +1625,10 @@ export class DesktopControlService extends EventEmitter {
     return { status: null }
   }
 
-  private captureLocalOAuthAuthority(expectedHostId: string): CapturedProjectionAuthority {
+  private captureLocalOAuthAuthority(
+    expectedHostId: string,
+    requireStartCapabilities: boolean,
+  ): CapturedProjectionAuthority {
     const authority = this.captureProjectionAuthority()
     if (authority.hostId !== expectedHostId) {
       throw new ControlError(
@@ -1489,248 +1643,713 @@ export class DesktopControlService extends EventEmitter {
         'ChatGPT sign-in currently requires Prime Continuim and Prime Agent to run on the same computer.'
       )
     }
-    if (!this.authorityCapabilities.includes(RUNTIME_OAUTH_CAPABILITY)) {
+    const hasAttemptCapability = this.authorityCapabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY)
+    const hasStartEligibilityCapability = this.authorityCapabilities.includes(RUNTIME_OAUTH_CAPABILITY)
+    if (!hasAttemptCapability || (requireStartCapabilities && !hasStartEligibilityCapability)) {
       throw new ControlError(
         'runtime.oauth_unavailable',
-        'The connected host does not expose the verified Prime Agent sign-in capability.',
+        'The connected host does not expose the durable verified Prime Agent sign-in capability.',
         { retryable: true }
       )
     }
     return authority
   }
 
-  private async presentRuntimeOAuthSnapshot(
-    active: ActiveRuntimeOAuthSession,
-    snapshot: RuntimeOAuthSessionSnapshot
-  ): Promise<RuntimeOAuthSessionView> {
-    const authority = active.authority
-    const sessionKey = this.runtimeOAuthSessionKey(authority.hostId, snapshot.sessionId)
-    if (snapshot.authorization && !this.openedOAuthSessions.has(sessionKey)) {
-      if (
-        snapshot.providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID ||
-        !isPinnedCodexAuthorizationUrl(snapshot.authorization.url)
-      ) {
-        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
-        throw new ControlError(
-          'protocol.oauth_authorization_invalid',
-          'The host returned an authorization destination outside the verified Codex provider contract.'
-        )
-      }
-      const existingOpening = this.openingOAuthSessions.get(sessionKey)
-      if (existingOpening && existingOpening.url !== snapshot.authorization.url) {
-        await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
-        throw new ControlError(
-          'protocol.oauth_authorization_changed',
-          'The host changed the authorization destination for an active sign-in session.'
-        )
-      }
-      let opening = existingOpening
-      if (!opening) {
-        const url = snapshot.authorization.url
-        let promise!: Promise<void>
-        promise = (async () => {
-          try {
-            await this.openRuntimeOAuthAuthorization(active, url)
-          } finally {
-            const retained = this.openingOAuthSessions.get(sessionKey)
-            if (retained?.promise === promise) this.openingOAuthSessions.delete(sessionKey)
-          }
-        })()
-        opening = { url, promise }
-        this.openingOAuthSessions.set(sessionKey, opening)
-      }
-      // All concurrent callers await the one opening promise. No renderer sees
-      // "opened" until the shell succeeds and the original authority remains.
-      await opening.promise
+  private initializeRuntimeOAuthAttemptStore(): Promise<void> {
+    if (this.runtimeOAuthAttemptInitializationFailed) {
+      return Promise.reject(new Error('Runtime OAuth attempt storage is unavailable'))
     }
+    this.runtimeOAuthAttemptInitialization ??= (async () => {
+      const store = new RuntimeOAuthDesktopAttemptStore(this.runtimeOAuthAttemptStorePath)
+      await store.initialize()
+      await store.compact(Date.now())
+      this.runtimeOAuthAttempts = store
+    })().catch((error) => {
+      this.runtimeOAuthAttemptInitializationFailed = true
+      throw error
+    })
+    return this.runtimeOAuthAttemptInitialization
+  }
 
-    if (isTerminalRuntimeOAuthPhase(snapshot.phase)) {
-      this.openedOAuthSessions.delete(sessionKey)
-      if (this.activeOAuthSessions.get(sessionKey) === active) this.activeOAuthSessions.delete(sessionKey)
+  private async requireRuntimeOAuthAttemptStore(): Promise<RuntimeOAuthDesktopAttemptStore> {
+    try {
+      await this.initializeRuntimeOAuthAttemptStore()
+    } catch {
+      throw new ControlError(
+        'runtime.oauth_attempt_store_unavailable',
+        'Durable sign-in recovery storage is unavailable.',
+        { retryable: true },
+      )
     }
-    const interaction: RuntimeOAuthSessionView['interaction'] = snapshot.authorization && this.openedOAuthSessions.has(sessionKey)
-      ? { kind: 'browser', state: 'opened' }
-      : snapshot.challenge?.kind === 'select'
-        ? { kind: 'selection', state: 'unavailable' }
-        : snapshot.challenge
-          ? { kind: 'manual', state: 'unavailable' }
-          : undefined
-    return Object.freeze({
-      sessionId: snapshot.sessionId,
-      providerId: snapshot.providerId,
-      phase: snapshot.phase,
-      expiresAt: snapshot.expiresAt,
-      ...(interaction ? { interaction } : {}),
-      ...(snapshot.configured ? { configured: true as const } : {}),
-      ...(snapshot.error
-        ? {
-            // Provider messages may contain redirect details or other
-            // credential-adjacent text. Only the fixed classification crosses
-            // the context-isolated preload boundary.
-            error: Object.freeze({
-              code: snapshot.error.code,
-              retryable: snapshot.error.retryable,
-            }),
-          }
-        : {})
+    if (!this.runtimeOAuthAttempts) {
+      throw new ControlError(
+        'runtime.oauth_attempt_store_unavailable',
+        'Durable sign-in recovery storage is unavailable.',
+        { retryable: true },
+      )
+    }
+    return this.runtimeOAuthAttempts
+  }
+
+  private async assertNoRuntimeOAuthAttemptBarrier(store: RuntimeOAuthDesktopAttemptStore): Promise<void> {
+    let records: readonly RuntimeOAuthDesktopAttemptRecordV1[]
+    try {
+      records = (await store.snapshot()).attempts
+    } catch {
+      throw new ControlError(
+        'runtime.oauth_attempt_store_unavailable',
+        'Durable sign-in recovery storage could not be read safely.',
+        { retryable: true },
+      )
+    }
+    if (records.some(isRuntimeOAuthDesktopBarrier)) {
+      throw new ControlError(
+        'runtime.oauth_attempt_active',
+        'Another durable sign-in attempt must be reconciled before a new one can start.',
+        { retryable: true },
+      )
+    }
+  }
+
+  private async failRuntimeOAuthAttemptBeforeHostDispatch(
+    store: RuntimeOAuthDesktopAttemptStore,
+    record: RuntimeOAuthDesktopAttemptRecordV1,
+  ): Promise<RuntimeOAuthDesktopAttemptRecordV1> {
+    const terminalAt = monotonicTimestamp(record.updatedAt)
+    const terminal = createRuntimeOAuthAttemptTerminalV1({
+      version: 1,
+      attemptDigest: record.attempt.attemptDigest,
+      phase: 'failed',
+      resolution: 'interrupted_before_login_dispatch',
+      configuredObserved: null,
+      terminalAt,
+    })
+    return await store.transition({
+      attemptDigest: record.attempt.attemptDigest,
+      expectedRevision: record.revision,
+      phase: 'failed',
+      updatedAt: terminalAt,
+      terminal,
     })
   }
 
-  private assertRuntimeOAuthSnapshotBinding(
-    snapshot: RuntimeOAuthSessionSnapshot,
-    expectedSessionId: string,
-    expectedProviderId: string
-  ): void {
-    if (snapshot.sessionId !== expectedSessionId) {
-      throw new ControlError('protocol.oauth_session_mismatch', 'The host returned a different OAuth session.')
+  private async requireRuntimeOAuthAttemptBySession(
+    store: RuntimeOAuthDesktopAttemptStore,
+    expectedHostId: string,
+    sessionId: string,
+  ): Promise<RuntimeOAuthDesktopAttemptRecordV1> {
+    let matches: RuntimeOAuthDesktopAttemptRecordV1[]
+    try {
+      matches = (await store.snapshot()).attempts.filter((record) =>
+        record.attempt.identity.expectedHostId === expectedHostId && record.hostSessionId === sessionId
+      )
+    } catch {
+      throw new ControlError(
+        'runtime.oauth_attempt_store_unavailable',
+        'Durable sign-in recovery storage could not be read safely.',
+        { retryable: true },
+      )
     }
-    if (snapshot.providerId !== expectedProviderId) {
-      throw new ControlError('protocol.oauth_provider_mismatch', 'The host returned an OAuth session for another provider.')
+    if (matches.length !== 1) {
+      throw new ControlError(
+        'runtime.oauth_session_untracked',
+        'This durable sign-in session is not retained by the desktop.',
+        { retryable: true },
+      )
+    }
+    return matches[0]!
+  }
+
+  private async requireRuntimeOAuthAttemptRecord(
+    store: RuntimeOAuthDesktopAttemptStore,
+    attempt: RuntimeOAuthAttemptV1,
+  ): Promise<RuntimeOAuthDesktopAttemptRecordV1> {
+    let record: RuntimeOAuthDesktopAttemptRecordV1 | undefined
+    try {
+      record = await store.find(attempt.attemptDigest)
+    } catch {
+      throw new ControlError(
+        'runtime.oauth_attempt_store_unavailable',
+        'Durable sign-in recovery storage could not be read safely.',
+        { retryable: true },
+      )
+    }
+    if (!record || !isDeepStrictEqual(record.attempt, attempt)) {
+      throw new ControlError(
+        'runtime.oauth_attempt_untracked',
+        'The durable sign-in attempt is no longer retained by the desktop.',
+        { retryable: true },
+      )
+    }
+    return record
+  }
+
+  private async readRuntimeOAuthAttemptStatus(
+    authority: CapturedProjectionAuthority,
+    attempt: RuntimeOAuthAttemptV1,
+  ): Promise<RuntimeOAuthAttemptStatusResult> {
+    const raw = await authority.connection.request(
+      'oauth.attempt.status',
+      { attempt },
+      { timeoutMs: 10_000 },
+    )
+    this.assertProjectionAuthority(authority, 'OAuth attempt status')
+    let result: RuntimeOAuthAttemptStatusResult
+    try {
+      result = parseRuntimeOAuthAttemptStatusResult(raw)
+    } catch (error) {
+      if (error instanceof ControlError) authority.connection.terminate(error)
+      throw error
+    }
+    this.assertRuntimeOAuthAttemptResultBinding(authority, attempt, result)
+    return result
+  }
+
+  private assertRuntimeOAuthAttemptResultBinding(
+    authority: CapturedProjectionAuthority,
+    attempt: RuntimeOAuthAttemptV1,
+    result: RuntimeOAuthAttemptBoundResult,
+  ): void {
+    if (
+      result.attemptDigest !== attempt.attemptDigest ||
+      (result.record !== null && !isDeepStrictEqual(result.record.attempt, attempt)) ||
+      attempt.identity.expectedHostId !== authority.hostId
+    ) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_attempt_mismatch',
+        'The host returned a different durable sign-in attempt.',
+      )
     }
   }
 
-  private async openRuntimeOAuthAuthorization(
-    active: ActiveRuntimeOAuthSession,
-    url: string
-  ): Promise<void> {
-    const sessionKey = this.runtimeOAuthSessionKey(active.authority.hostId, active.sessionId)
-    this.assertProjectionAuthority(active.authority, 'OAuth browser launch')
-    if (active.closing || this.activeOAuthSessions.get(sessionKey) !== active) {
-      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session is closing.', { retryable: true })
+  private rejectRuntimeOAuthAttemptResponse(
+    authority: CapturedProjectionAuthority,
+    code: string,
+    message: string,
+  ): never {
+    const error = new ControlError(code, message)
+    authority.connection.terminate(error)
+    throw error
+  }
+
+  private async acceptRuntimeOAuthAttemptResult(
+    store: RuntimeOAuthDesktopAttemptStore,
+    authority: CapturedProjectionAuthority,
+    attempt: RuntimeOAuthAttemptV1,
+    result: RuntimeOAuthAttemptBoundResult,
+    options: { readonly sameConnectionAbsenceIsTerminal?: boolean } = {},
+  ): Promise<AcceptedRuntimeOAuthAttempt> {
+    this.assertRuntimeOAuthAttemptResultBinding(authority, attempt, result)
+    let desktop = await this.requireRuntimeOAuthAttemptRecord(store, attempt)
+    const host = result.record
+    if (!host) {
+      if (
+        desktop.phase === 'prepared' ||
+        (options.sameConnectionAbsenceIsTerminal && desktop.phase === 'start_dispatching')
+      ) {
+        const terminalAt = monotonicTimestamp(desktop.updatedAt)
+        const terminal = createRuntimeOAuthAttemptTerminalV1({
+          version: 1,
+          attemptDigest: attempt.attemptDigest,
+          phase: 'failed',
+          resolution: 'interrupted_before_login_dispatch',
+          configuredObserved: null,
+          terminalAt,
+        })
+        desktop = await store.transition({
+          attemptDigest: attempt.attemptDigest,
+          expectedRevision: desktop.revision,
+          phase: 'failed',
+          updatedAt: terminalAt,
+          terminal,
+        })
+      } else if (desktop.phase === 'start_dispatching') {
+        // Replacement absence cannot retire or rewrite the transport-crossing
+        // barrier. A later exact host record must still be able to follow the
+        // ordinary start_dispatching -> host_admitted path.
+      } else if (
+        !isTerminalRuntimeOAuthDesktopPhase(desktop.phase) &&
+        desktop.phase !== 'recovery_required'
+      ) {
+        desktop = await store.transition({
+          attemptDigest: attempt.attemptDigest,
+          expectedRevision: desktop.revision,
+          phase: 'recovery_required',
+          updatedAt: monotonicTimestamp(desktop.updatedAt),
+          ...(desktop.hostSessionId ? { hostSessionId: desktop.hostSessionId } : {}),
+          ...(desktop.hostSessionId ? { hostPhase: 'recovery_required' as const } : {}),
+          recoveryReason: 'host_attempt_unavailable',
+        })
+      }
+      return { desktop, host: null }
+    }
+
+    if (desktop.phase === 'prepared') {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_attempt_predispatch_violation',
+        'The host retained an OAuth attempt that the desktop never dispatched.',
+      )
+    }
+    if (desktop.hostSessionId !== undefined && desktop.hostSessionId !== host.sessionId) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_session_mismatch',
+        'The host changed the durable OAuth session correlation.',
+      )
+    }
+    if (desktop.hostPhase !== undefined && !runtimeOAuthHostPhaseCanFollow(desktop.hostPhase, host.phase)) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_attempt_phase_regressed',
+        'The host moved a durable OAuth attempt backwards.',
+      )
+    }
+
+    if (
+      desktop.phase === 'start_dispatching' &&
+      (host.phase === 'completed' || host.phase === 'cancelled')
+    ) {
+      // A read-only recovery can observe a fast terminal after the start reply
+      // was lost. The terminal's reachable revision proves the intervening host
+      // boundary, so record that correlation before committing exact evidence.
+      desktop = await store.transition({
+        attemptDigest: attempt.attemptDigest,
+        expectedRevision: desktop.revision,
+        phase: 'host_admitted',
+        updatedAt: desktop.updatedAt,
+        hostSessionId: host.sessionId,
+        hostPhase: host.phase === 'completed' ? 'persistence_dispatching' : 'cancelling',
+      })
+    }
+
+    if (isTerminalRuntimeOAuthDesktopPhase(desktop.phase)) {
+      if (
+        !isTerminalRuntimeOAuthAttemptPhase(host.phase) ||
+        host.phase !== desktop.phase ||
+        !desktop.terminal ||
+        !host.terminal ||
+        !isDeepStrictEqual(host.terminal, desktop.terminal) ||
+        (desktop.hostAckConfirmedAt !== undefined &&
+          host.desktopAcknowledgedAt !== desktop.hostAckConfirmedAt)
+      ) {
+        this.rejectRuntimeOAuthAttemptResponse(
+          authority,
+          'protocol.oauth_terminal_mismatch',
+          'The host changed terminal OAuth evidence after the desktop persisted it.',
+        )
+      }
+    } else if (isTerminalRuntimeOAuthAttemptPhase(host.phase)) {
+      if (!host.terminal) {
+        this.rejectRuntimeOAuthAttemptResponse(
+          authority,
+          'protocol.oauth_terminal_mismatch',
+          'The host omitted terminal OAuth evidence.',
+        )
+      }
+      try {
+        desktop = await store.transition({
+          attemptDigest: attempt.attemptDigest,
+          expectedRevision: desktop.revision,
+          phase: host.phase,
+          updatedAt: latestTimestamp(desktop.updatedAt, host.terminal.body.terminalAt),
+          hostSessionId: host.sessionId,
+          hostPhase: host.phase,
+          terminal: host.terminal,
+        })
+      } catch (error) {
+        if (error instanceof RuntimeOAuthDesktopAttemptStoreError) {
+          this.rejectRuntimeOAuthAttemptResponse(
+            authority,
+            'protocol.oauth_terminal_transition_invalid',
+            'The host returned terminal OAuth evidence that contradicted the durable desktop barrier.',
+          )
+        }
+        throw error
+      }
+    } else if (host.phase === 'recovery_required') {
+      if (desktop.phase !== 'recovery_required') {
+        desktop = await store.transition({
+          attemptDigest: attempt.attemptDigest,
+          expectedRevision: desktop.revision,
+          phase: 'recovery_required',
+          updatedAt: monotonicTimestamp(desktop.updatedAt),
+          hostSessionId: host.sessionId,
+          hostPhase: 'recovery_required',
+          recoveryReason: runtimeOAuthRecoveryReason(desktop, result.live),
+        })
+      }
+    } else if (desktop.phase === 'start_dispatching') {
+      desktop = await store.transition({
+        attemptDigest: attempt.attemptDigest,
+        expectedRevision: desktop.revision,
+        phase: 'host_admitted',
+        updatedAt: monotonicTimestamp(desktop.updatedAt),
+        hostSessionId: host.sessionId,
+        hostPhase: host.phase,
+      })
+    }
+
+    if (host.terminal) {
+      this.runtimeOAuthBrowserEligibleAttempts.delete(attempt.attemptDigest)
+      desktop = await this.reconcileRuntimeOAuthTerminalAcknowledgement(
+        store,
+        authority,
+        desktop,
+        host,
+      )
+    }
+    return {
+      desktop,
+      host,
+      ...(result.live ? { live: result.live } : {}),
+    }
+  }
+
+  private async reconcileRuntimeOAuthTerminalAcknowledgement(
+    store: RuntimeOAuthDesktopAttemptStore,
+    authority: CapturedProjectionAuthority,
+    desktop: RuntimeOAuthDesktopAttemptRecordV1,
+    host: RuntimeOAuthAttemptRecord,
+  ): Promise<RuntimeOAuthDesktopAttemptRecordV1> {
+    if (!desktop.terminal || !host.terminal) return desktop
+    if (host.desktopAcknowledgedAt) {
+      const deterministicAcknowledgedAt = host.terminal.body.terminalAt
+      if (
+        host.desktopAcknowledgedAt !== deterministicAcknowledgedAt ||
+        host.revision < 1 ||
+        (desktop.hostAckConfirmedAt !== undefined &&
+          desktop.hostAckConfirmedAt !== deterministicAcknowledgedAt)
+      ) {
+        this.rejectRuntimeOAuthAttemptResponse(
+          authority,
+          'protocol.oauth_acknowledgement_invalid',
+          'The host returned an OAuth acknowledgement outside the deterministic terminal successor.',
+        )
+      }
+      if (desktop.hostAckConfirmedAt) return desktop
+      return await store.acknowledgeTerminal({
+        attemptDigest: desktop.attempt.attemptDigest,
+        expectedRevision: desktop.revision,
+        terminalDigest: desktop.terminal.terminalDigest,
+        acknowledgedAt: deterministicAcknowledgedAt,
+      })
+    }
+    if (desktop.hostAckConfirmedAt) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_acknowledgement_regressed',
+        'The host lost a confirmed OAuth acknowledgement.',
+      )
+    }
+
+    const expectedRevision = host.revision
+    // The terminal time is a deterministic, valid acknowledgement timestamp.
+    // Reconstructing it after restart makes the exact CAS request retryable
+    // without adding secret-bearing or effect-state fields to the desktop log.
+    const acknowledgedAt = host.terminal.body.terminalAt
+    let raw: unknown
+    try {
+      raw = await authority.connection.request(
+        'oauth.attempt.acknowledge',
+        {
+          attempt: desktop.attempt,
+          expectedRevision,
+          terminalDigest: host.terminal.terminalDigest,
+          acknowledgedAt,
+        },
+        { timeoutMs: 10_000, priority: 'urgent' },
+      )
+      this.assertProjectionAuthority(authority, 'OAuth attempt acknowledgement')
+    } catch {
+      // A lost acknowledgement is never guessed. Read the exact successor and
+      // confirm locally only if the host proves N -> N+1 with our timestamp.
+      let recoveredRaw: unknown
+      try {
+        recoveredRaw = await authority.connection.request(
+          'oauth.attempt.status',
+          { attempt: desktop.attempt },
+          { timeoutMs: 10_000 },
+        )
+        this.assertProjectionAuthority(authority, 'OAuth acknowledgement recovery')
+      } catch {
+        return desktop
+      }
+      let recovered: RuntimeOAuthAttemptStatusResult
+      try {
+        recovered = parseRuntimeOAuthAttemptStatusResult(recoveredRaw)
+      } catch (error) {
+        if (error instanceof ControlError) authority.connection.terminate(error)
+        throw error
+      }
+      this.assertRuntimeOAuthAttemptResultBinding(authority, desktop.attempt, recovered)
+      if (!recovered.record) return desktop
+      if (!recovered.record.desktopAcknowledgedAt) {
+        if (
+          recovered.record.revision !== expectedRevision ||
+          !recovered.record.terminal ||
+          !isDeepStrictEqual(recovered.record.terminal, host.terminal)
+        ) {
+          this.rejectRuntimeOAuthAttemptResponse(
+            authority,
+            'protocol.oauth_acknowledgement_invalid',
+            'The host changed terminal OAuth state while acknowledgement was uncertain.',
+          )
+        }
+        return desktop
+      }
+      if (
+        recovered.record.revision !== expectedRevision + 1 ||
+        recovered.record.desktopAcknowledgedAt !== acknowledgedAt ||
+        !recovered.record.terminal ||
+        !isDeepStrictEqual(recovered.record.terminal, host.terminal)
+      ) {
+        this.rejectRuntimeOAuthAttemptResponse(
+          authority,
+          'protocol.oauth_acknowledgement_invalid',
+          'The host returned a different OAuth acknowledgement after response loss.',
+        )
+      }
+      return await store.acknowledgeTerminal({
+        attemptDigest: desktop.attempt.attemptDigest,
+        expectedRevision: desktop.revision,
+        terminalDigest: desktop.terminal.terminalDigest,
+        acknowledgedAt,
+      })
+    }
+
+    let acknowledged: RuntimeOAuthAttemptAcknowledgeResult
+    try {
+      acknowledged = parseRuntimeOAuthAttemptAcknowledgeResult(raw)
+    } catch (error) {
+      if (error instanceof ControlError) authority.connection.terminate(error)
+      throw error
+    }
+    this.assertRuntimeOAuthAttemptResultBinding(authority, desktop.attempt, acknowledged)
+    if (
+      acknowledged.record.revision !== expectedRevision + 1 ||
+      acknowledged.record.desktopAcknowledgedAt !== acknowledgedAt ||
+      !acknowledged.record.terminal ||
+      !isDeepStrictEqual(acknowledged.record.terminal, host.terminal)
+    ) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_acknowledgement_invalid',
+        'The host did not return the exact acknowledged OAuth successor.',
+      )
+    }
+    return await store.acknowledgeTerminal({
+      attemptDigest: desktop.attempt.attemptDigest,
+      expectedRevision: desktop.revision,
+      terminalDigest: desktop.terminal.terminalDigest,
+      acknowledgedAt,
+    })
+  }
+
+  private async dispatchRuntimeOAuthBrowser(
+    store: RuntimeOAuthDesktopAttemptStore,
+    authority: CapturedProjectionAuthority,
+    desktop: RuntimeOAuthDesktopAttemptRecordV1,
+    host: RuntimeOAuthAttemptRecord,
+    live: RuntimeOAuthSessionSnapshot,
+    transitionGeneration: number,
+  ): Promise<RuntimeOAuthDesktopAttemptRecordV1> {
+    if (
+      !live.authorization ||
+      desktop.phase !== 'host_admitted' ||
+      !this.runtimeOAuthBrowserEligibleAttempts.has(desktop.attempt.attemptDigest)
+    ) return desktop
+    if (
+      host.phase !== 'login_dispatching' ||
+      (live.phase !== 'starting' && live.phase !== 'awaiting_user') ||
+      live.providerId !== CODEX_SUBSCRIPTION_PROVIDER_ID ||
+      !isPinnedCodexAuthorizationUrl(live.authorization.url)
+    ) {
+      this.rejectRuntimeOAuthAttemptResponse(
+        authority,
+        'protocol.oauth_authorization_invalid',
+        'The host returned an authorization destination outside the durable Codex login phase.',
+      )
     }
     if (!this.openExternal) {
       throw new ControlError('runtime.oauth_browser_unavailable', 'The system browser is unavailable for sign-in.')
     }
-    try {
-      await this.openExternal(url)
-    } catch {
-      await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
-      throw new ControlError('runtime.oauth_browser_failed', 'The system browser could not open the sign-in page.', {
-        retryable: true
-      })
-    }
-    if (active.closing || this.activeOAuthSessions.get(sessionKey) !== active) {
-      throw new ControlError('runtime.oauth_session_closing', 'The sign-in session closed while its browser opened.', {
-        retryable: true
-      })
-    }
-    try {
-      this.assertProjectionAuthority(active.authority, 'OAuth browser launch')
-    } catch (error) {
-      await this.cancelAndRetireActiveRuntimeOAuthSession(active).catch(() => undefined)
-      throw error
-    }
-    this.openedOAuthSessions.add(sessionKey)
-  }
-
-  private registerActiveRuntimeOAuthSession(
-    authority: CapturedProjectionAuthority,
-    snapshot: Pick<RuntimeOAuthSessionSnapshot, 'sessionId' | 'providerId'>
-  ): ActiveRuntimeOAuthSession {
-    const sessionKey = this.runtimeOAuthSessionKey(authority.hostId, snapshot.sessionId)
-    const existing = this.activeOAuthSessions.get(sessionKey)
-    if (existing) {
-      if (
-        existing.providerId !== snapshot.providerId ||
-        existing.authority.connection !== authority.connection ||
-        existing.authority.generation !== authority.generation ||
-        !sameTarget(existing.authority.target, authority.target)
-      ) {
-        throw new ControlError('protocol.oauth_session_ambiguous', 'The host reused an OAuth session outside its authority.')
-      }
-      return existing
-    }
-    const active: ActiveRuntimeOAuthSession = {
-      authority,
-      sessionId: snapshot.sessionId,
-      providerId: snapshot.providerId,
-      closing: false
-    }
-    this.activeOAuthSessions.set(sessionKey, active)
-    return active
-  }
-
-  private async cancelAndRetireActiveRuntimeOAuthSession(
-    active: ActiveRuntimeOAuthSession
-  ): Promise<void> {
-    active.closing = true
-    await this.requestActiveRuntimeOAuthCancellation(active, 5_000)
-    const sessionKey = this.runtimeOAuthSessionKey(active.authority.hostId, active.sessionId)
-    if (this.activeOAuthSessions.get(sessionKey) === active) this.activeOAuthSessions.delete(sessionKey)
-    this.openedOAuthSessions.delete(sessionKey)
-  }
-
-  private async requestActiveRuntimeOAuthCancellation(
-    active: ActiveRuntimeOAuthSession,
-    timeoutMs: number
-  ): Promise<RuntimeOAuthSessionSnapshot> {
-    if (!active.cancellationPromise) {
-      const cancellation = (async () => {
-        let raw: unknown
-        try {
-          raw = await active.authority.connection.request(
-            'oauth.session.cancel',
-            {
-              expectedHostId: active.authority.hostId,
-              authorityId: this.oauthAuthorityId,
-              sessionId: active.sessionId
-            },
-            { timeoutMs, priority: 'urgent' }
-          )
-        } catch {
-          throw new ControlError(
-            'runtime.oauth_cancel_failed',
-            'Prime Agent sign-in cancellation could not be confirmed by this host.',
-            { retryable: true }
-          )
-        }
-        const snapshot = parseRuntimeOAuthSnapshot(raw)
-        this.assertRuntimeOAuthSnapshotBinding(snapshot, active.sessionId, active.providerId)
-        if (!isTerminalRuntimeOAuthPhase(snapshot.phase)) {
-          throw new ControlError('protocol.oauth_cancel_not_terminal', 'The host did not confirm sign-in cancellation.')
-        }
-        return snapshot
-      })()
-      active.cancellationPromise = cancellation
-      void cancellation.catch(() => {
-        if (active.cancellationPromise === cancellation) active.cancellationPromise = undefined
-      })
-    }
-    return active.cancellationPromise
-  }
-
-  private requireActiveRuntimeOAuthSession(
-    expectedHostId: string,
-    sessionId: string
-  ): ActiveRuntimeOAuthSession {
-    const sessionKey = this.runtimeOAuthSessionKey(expectedHostId, sessionId)
-    const active = this.activeOAuthSessions.get(sessionKey)
-    if (!active) {
+    this.assertProjectionAuthority(authority, 'OAuth browser dispatch')
+    if (
+      transitionGeneration !== this.oauthTransitionGeneration ||
+      this.oauthTransitionBlockCount > 0
+    ) {
       throw new ControlError(
-        'runtime.oauth_session_untracked',
-        'This app process does not own the requested sign-in session. Start sign-in again.',
-        { retryable: true }
+        'runtime.oauth_transition_in_progress',
+        'Sign-in paused before the browser could be dispatched.',
+        { retryable: true },
       )
     }
-    const authority = this.captureLocalOAuthAuthority(expectedHostId)
+    this.runtimeOAuthBrowserEligibleAttempts.delete(desktop.attempt.attemptDigest)
+    let current = await store.transition({
+      attemptDigest: desktop.attempt.attemptDigest,
+      expectedRevision: desktop.revision,
+      phase: 'browser_dispatching',
+      updatedAt: monotonicTimestamp(desktop.updatedAt),
+      hostSessionId: host.sessionId,
+      hostPhase: host.phase,
+    })
+    this.assertProjectionAuthority(authority, 'OAuth browser dispatch')
     if (
-      authority.connection !== active.authority.connection ||
-      authority.generation !== active.authority.generation ||
-      !sameTarget(authority.target, active.authority.target)
+      transitionGeneration !== this.oauthTransitionGeneration ||
+      this.oauthTransitionBlockCount > 0
     ) {
-      throw new ControlError('runtime.oauth_authority_changed', 'The sign-in session belongs to an older host authority.', {
-        retryable: true
+      throw new ControlError(
+        'runtime.oauth_transition_in_progress',
+        'Sign-in paused after the browser dispatch barrier was persisted.',
+        { retryable: true },
+      )
+    }
+    try {
+      await this.openExternal(live.authorization.url)
+    } catch {
+      // browser_dispatching is intentionally retained: a shell rejection is
+      // not proof that no browser process observed the URL.
+      throw new ControlError('runtime.oauth_browser_failed', 'The system browser could not open the sign-in page.', {
+        retryable: true,
       })
     }
-    return active
+    this.assertProjectionAuthority(authority, 'OAuth browser dispatch')
+    if (
+      transitionGeneration !== this.oauthTransitionGeneration ||
+      this.oauthTransitionBlockCount > 0
+    ) {
+      throw new ControlError(
+        'runtime.oauth_transition_in_progress',
+        'The browser opened while the host connection was changing.',
+        { retryable: true },
+      )
+    }
+    current = await store.transition({
+      attemptDigest: current.attempt.attemptDigest,
+      expectedRevision: current.revision,
+      phase: 'browser_opened',
+      updatedAt: monotonicTimestamp(current.updatedAt),
+      hostSessionId: current.hostSessionId,
+      hostPhase: current.hostPhase,
+    })
+    return await store.transition({
+      attemptDigest: current.attempt.attemptDigest,
+      expectedRevision: current.revision,
+      phase: 'observing',
+      updatedAt: monotonicTimestamp(current.updatedAt),
+      hostSessionId: current.hostSessionId,
+      hostPhase: current.hostPhase,
+    })
   }
 
-  private runtimeOAuthSessionKey(hostId: string, sessionId: string): string {
-    return `${hostId}\u0000${sessionId}`
+  private presentRuntimeOAuthAttempt(accepted: AcceptedRuntimeOAuthAttempt): RuntimeOAuthSessionView {
+    const { desktop, host, live } = accepted
+    if (!host) {
+      throw new ControlError(
+        'runtime.oauth_attempt_untracked',
+        'The host does not retain this durable sign-in attempt.',
+        { retryable: true },
+      )
+    }
+    if (live) {
+      const interaction: RuntimeOAuthSessionView['interaction'] =
+        live.authorization && (desktop.phase === 'browser_opened' || desktop.phase === 'observing')
+          ? { kind: 'browser', state: 'opened' }
+          : live.challenge?.kind === 'select'
+            ? { kind: 'selection', state: 'unavailable' }
+            : live.challenge
+              ? { kind: 'manual', state: 'unavailable' }
+              : undefined
+      return Object.freeze({
+        sessionId: live.sessionId,
+        providerId: live.providerId,
+        phase: live.phase,
+        expiresAt: live.expiresAt,
+        ...(interaction ? { interaction } : {}),
+        ...(live.configured ? { configured: true as const } : {}),
+        ...(live.error
+          ? { error: Object.freeze({ code: live.error.code, retryable: live.error.retryable }) }
+          : {}),
+      })
+    }
+
+    const phase: RuntimeOAuthSessionView['phase'] =
+      host.phase === 'completed' ? 'completed' :
+        host.phase === 'cancelled' ? 'cancelled' :
+          host.phase === 'failed' || host.phase === 'outcome_unknown' ? 'failed' :
+            host.phase === 'credentials_ready' || host.phase === 'persistence_dispatching' ? 'committing' :
+              'starting'
+    const terminalError: RuntimeOAuthSessionView['error'] = host.phase === 'failed'
+      ? {
+          code: host.terminal?.body.resolution === 'expired'
+            ? 'OAUTH_SESSION_EXPIRED'
+            : host.terminal?.body.resolution === 'persistence_failed'
+              ? 'OAUTH_PERSISTENCE_UNCONFIRMED'
+              : 'OAUTH_PROVIDER_FAILED',
+          retryable: host.terminal?.body.resolution !== 'expired',
+        }
+      : host.phase === 'outcome_unknown'
+        ? { code: 'OAUTH_PERSISTENCE_UNCONFIRMED', retryable: true }
+        : undefined
+    return Object.freeze({
+      sessionId: host.sessionId,
+      providerId: host.attempt.identity.providerId,
+      phase,
+      expiresAt: host.expiresAt,
+      ...(host.phase === 'completed' ? { configured: true as const } : {}),
+      ...(terminalError ? { error: Object.freeze(terminalError) } : {}),
+    })
   }
 
-  private runtimeOAuthAmbiguityKey(authority: CapturedProjectionAuthority, providerId: string): string {
-    return `${authority.hostId}\u0000${providerId}`
+  private async reconcileRuntimeOAuthAttemptsAfterConnect(
+    authority: CapturedProjectionAuthority,
+  ): Promise<void> {
+    if (
+      authority.target.kind !== 'local' ||
+      !this.authorityCapabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY)
+    ) return
+    let store: RuntimeOAuthDesktopAttemptStore
+    try {
+      store = await this.requireRuntimeOAuthAttemptStore()
+    } catch {
+      return
+    }
+    let records: readonly RuntimeOAuthDesktopAttemptRecordV1[]
+    try {
+      records = (await store.snapshot()).attempts.filter((record) =>
+        record.attempt.identity.expectedHostId === authority.hostId && isRuntimeOAuthDesktopBarrier(record)
+      )
+    } catch {
+      return
+    }
+    for (const record of records) {
+      if (!this.isActiveConnection(authority.connection, authority.target, authority.hostId, authority.generation)) return
+      await this.withRuntimeOAuthAttemptOperation(record.attempt.attemptDigest, async () => {
+        const current = await this.requireRuntimeOAuthAttemptRecord(store, record.attempt)
+        if (!isRuntimeOAuthDesktopBarrier(current)) return
+        const status = await this.readRuntimeOAuthAttemptStatus(authority, current.attempt)
+        await this.acceptRuntimeOAuthAttemptResult(store, authority, current.attempt, status)
+      }).catch(() => undefined)
+    }
+  }
+
+  private async withRuntimeOAuthAttemptOperation<T>(
+    attemptDigest: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.oauthAttemptOperationTails.get(attemptDigest) ?? Promise.resolve()
+    const result = previous.catch(() => undefined).then(operation)
+    const tail = result.then(() => undefined, () => undefined)
+    this.oauthAttemptOperationTails.set(attemptDigest, tail)
+    try {
+      return await result
+    } finally {
+      if (this.oauthAttemptOperationTails.get(attemptDigest) === tail) {
+        this.oauthAttemptOperationTails.delete(attemptDigest)
+      }
+    }
   }
 
   private assertRuntimeOAuthAdmissionOpen(): void {
@@ -1744,6 +2363,7 @@ export class DesktopControlService extends EventEmitter {
   }
 
   private beginOAuthConnectionTransition(): void {
+    this.runtimeOAuthBrowserEligibleAttempts.clear()
     this.oauthTransitionBlockCount += 1
     this.oauthTransitionGeneration += 1
   }
@@ -1772,71 +2392,13 @@ export class DesktopControlService extends EventEmitter {
         )
       )
     }
-
-    if (this.ambiguousOAuthStarts.size > 0) {
-      throw new ControlError(
-        'runtime.oauth_drain_unconfirmed',
-        'A sign-in start has no confirmed session identity. Retry sign-in on the same host before changing connections.',
-        { retryable: true }
-      )
-    }
-
-    const sessions = [...this.activeOAuthSessions.values()]
-    if (sessions.length === 0) return
-    for (const session of sessions) session.closing = true
-
-    const cancellations = await Promise.allSettled(sessions.map(async (session) => {
-      await this.requestActiveRuntimeOAuthCancellation(session, 10_000)
-    }))
-    const cancellationFailures = cancellations.flatMap((result) =>
-      result.status === 'rejected' ? [result.reason] : []
-    )
-    if (cancellationFailures.length > 0) {
-      throw new ControlError(
-        'runtime.oauth_drain_unconfirmed',
-        'The host did not confirm every active sign-in session as closed.',
-        { retryable: true, cause: new AggregateError(cancellationFailures) }
-      )
-    }
-
-    const openings = sessions.flatMap((session) => {
-      const opening = this.openingOAuthSessions.get(
-        this.runtimeOAuthSessionKey(session.authority.hostId, session.sessionId)
-      )
-      return opening ? [opening.promise] : []
-    })
-    if (openings.length > 0) {
-      await withOperationBound(
-        Promise.allSettled(openings).then(() => undefined),
-        OAUTH_DRAIN_TIMEOUT_MS,
-        () => new ControlError(
-          'runtime.oauth_drain_unconfirmed',
-          'The system browser launch did not settle before the host transition.',
-          { retryable: true }
-        )
-      )
-    }
-
-    for (const session of sessions) {
-      const sessionKey = this.runtimeOAuthSessionKey(session.authority.hostId, session.sessionId)
-      if (this.activeOAuthSessions.get(sessionKey) === session) this.activeOAuthSessions.delete(sessionKey)
-      this.openedOAuthSessions.delete(sessionKey)
-    }
   }
 
-  private abandonRuntimeOAuthSessionsForConnection(connection: FramedConnection): void {
-    // An unexpected transport loss cannot be acknowledged by the host. Forget
-    // only main's local handles; hostd retains authority and expires helpers by
-    // its bounded TTL. Explicit disconnect/switch never takes this path.
-    for (const [sessionKey, session] of this.activeOAuthSessions) {
-      if (session.authority.connection !== connection) continue
-      session.closing = true
-      this.activeOAuthSessions.delete(sessionKey)
-      this.openedOAuthSessions.delete(sessionKey)
-    }
-    for (const [ambiguityKey, start] of this.ambiguousOAuthStarts) {
-      if (start.authority.connection === connection) this.ambiguousOAuthStarts.delete(ambiguityKey)
-    }
+  private abandonRuntimeOAuthSessionsForConnection(_connection: FramedConnection): void {
+    // All safety state is durable. Transport loss intentionally changes no
+    // attempt phase and authorizes no replay; reconnect reconciliation starts
+    // with oauth.attempt.status against the exact persisted identity.
+    this.runtimeOAuthBrowserEligibleAttempts.clear()
   }
 
   async threadProjection(threadId: string, cursor?: SessionCursor): Promise<unknown> {
@@ -2306,6 +2868,11 @@ export class DesktopControlService extends EventEmitter {
         since: now(),
         attempt: this.attempt
       })
+      // OAuth recovery is deliberately subordinate to core connection
+      // readiness. It is read-only until an exact terminal acknowledgement can
+      // be retried idempotently, and a poisoned OAuth journal never withholds
+      // unrelated host projections from the workbench.
+      void this.reconcileRuntimeOAuthAttemptsAfterConnect(residentAuthority).catch(() => undefined)
       this.scheduleResidentProjectionRefreshAfterConnect(residentAuthority)
       this.scheduleHealthPoll(candidate, target, hostId, generation)
       return this.getConnectionState()
@@ -6460,22 +7027,47 @@ function isHostId(value: unknown): value is string {
   )
 }
 
-function recoverRuntimeOAuthIdentity(
-  value: unknown
-): Pick<RuntimeOAuthSessionSnapshot, 'sessionId' | 'providerId'> | undefined {
-  if (!isRecord(value) || !isHostId(value.sessionId) || !isHostId(value.providerId)) return undefined
-  return { sessionId: value.sessionId, providerId: value.providerId }
+function parseRuntimeOAuthAttemptStatusResult(value: unknown): RuntimeOAuthAttemptStatusResult {
+  const parsed = RuntimeOAuthAttemptStatusResultSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new ControlError(
+      'protocol.oauth_attempt_status_invalid',
+      'The host returned an invalid durable sign-in status.',
+    )
+  }
+  return parsed.data
 }
 
-function parseRuntimeOAuthSnapshot(value: unknown): RuntimeOAuthSessionSnapshot {
-  const parsed = RuntimeOAuthSessionSnapshotSchema.safeParse(value)
+function parseRuntimeOAuthAttemptStartResult(value: unknown): RuntimeOAuthAttemptStartResult {
+  const parsed = RuntimeOAuthAttemptStartResultSchema.safeParse(value)
   if (!parsed.success) {
-    // Schema diagnostics can echo provider-controlled URLs or credential-like
-    // values. Keep malformed host responses behind one fixed renderer-facing
-    // classification and never serialize the raw payload or Zod issue text.
     throw new ControlError(
-      'protocol.oauth_snapshot_invalid',
-      'The host returned an invalid Prime Agent sign-in status.'
+      'protocol.oauth_attempt_start_invalid',
+      'The host returned an invalid durable sign-in start result.',
+    )
+  }
+  return parsed.data
+}
+
+function parseRuntimeOAuthAttemptCancelResult(value: unknown): RuntimeOAuthAttemptCancelResult {
+  const parsed = RuntimeOAuthAttemptCancelResultSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new ControlError(
+      'protocol.oauth_attempt_cancel_invalid',
+      'The host returned an invalid durable sign-in cancellation result.',
+    )
+  }
+  return parsed.data
+}
+
+function parseRuntimeOAuthAttemptAcknowledgeResult(value: unknown): RuntimeOAuthAttemptAcknowledgeResult {
+  const parsed = RuntimeOAuthAttemptAcknowledgeResultSchema.safeParse(value)
+  if (!parsed.success) {
+    // Never project Zod diagnostics: malformed provider values can contain an
+    // authorization URL or other credential-adjacent text.
+    throw new ControlError(
+      'protocol.oauth_attempt_acknowledge_invalid',
+      'The host returned an invalid durable sign-in acknowledgement result.',
     )
   }
   return parsed.data
@@ -7154,6 +7746,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function isRuntimeOAuthProtocolFailure(error: unknown): error is ControlError {
+  return error instanceof ControlError && error.code.startsWith('protocol.oauth_')
+}
+
 function now(): string {
   return new Date().toISOString()
 }
@@ -7165,8 +7761,71 @@ async function delay(milliseconds: number): Promise<void> {
   })
 }
 
-function isTerminalRuntimeOAuthPhase(phase: RuntimeOAuthSessionSnapshot['phase']): boolean {
-  return phase === 'completed' || phase === 'cancelled' || phase === 'failed'
+function monotonicTimestamp(previous: string): string {
+  const current = now()
+  return Date.parse(current) >= Date.parse(previous) ? current : previous
+}
+
+function latestTimestamp(left: string, right: string): string {
+  return Date.parse(left) >= Date.parse(right) ? left : right
+}
+
+function isTerminalRuntimeOAuthAttemptPhase(
+  phase: RuntimeOAuthAttemptRecord['phase'],
+): phase is Extract<RuntimeOAuthAttemptRecord['phase'], 'completed' | 'cancelled' | 'failed' | 'outcome_unknown'> {
+  return phase === 'completed' || phase === 'cancelled' || phase === 'failed' || phase === 'outcome_unknown'
+}
+
+function isTerminalRuntimeOAuthDesktopPhase(phase: RuntimeOAuthDesktopAttemptRecordV1['phase']): boolean {
+  return phase === 'completed' || phase === 'cancelled' || phase === 'failed' || phase === 'outcome_unknown'
+}
+
+function isRuntimeOAuthDesktopBarrier(record: RuntimeOAuthDesktopAttemptRecordV1): boolean {
+  return !isTerminalRuntimeOAuthDesktopPhase(record.phase) ||
+    (record.hostPhase !== undefined && record.hostAckConfirmedAt === undefined)
+}
+
+function runtimeOAuthRecoveryReason(
+  record: RuntimeOAuthDesktopAttemptRecordV1,
+  live: RuntimeOAuthSessionSnapshot | undefined,
+): RuntimeOAuthDesktopRecoveryReason {
+  if (record.phase === 'cancel_dispatching') return 'cancellation_outcome_unconfirmed'
+  if (
+    record.hostPhase === 'credentials_ready' ||
+    record.hostPhase === 'persistence_dispatching' ||
+    live?.phase === 'committing'
+  ) return 'storage_helper_liveness_unconfirmed'
+  return 'helper_liveness_unconfirmed'
+}
+
+function runtimeOAuthHostPhaseCanFollow(
+  current: RuntimeOAuthHostDurablePhase,
+  next: RuntimeOAuthHostDurablePhase,
+): boolean {
+  switch (current) {
+    case 'prepared':
+      return true
+    case 'login_dispatching':
+      return next !== 'prepared'
+    case 'credentials_ready':
+      return next === 'credentials_ready' || next === 'persistence_dispatching' ||
+        next === 'cancelling' || next === 'recovery_required' ||
+        next === 'completed' || next === 'cancelled' || next === 'failed' || next === 'outcome_unknown'
+    case 'persistence_dispatching':
+      return next === 'persistence_dispatching' || next === 'recovery_required' ||
+        next === 'completed' || next === 'failed' || next === 'outcome_unknown'
+    case 'cancelling':
+      return next === 'cancelling' || next === 'recovery_required' ||
+        next === 'cancelled' || next === 'failed' || next === 'outcome_unknown'
+    case 'recovery_required':
+      return next === 'recovery_required' || next === 'cancelled' ||
+        next === 'failed' || next === 'outcome_unknown'
+    case 'completed':
+    case 'cancelled':
+    case 'failed':
+    case 'outcome_unknown':
+      return next === current
+  }
 }
 
 async function withOperationBound<T>(

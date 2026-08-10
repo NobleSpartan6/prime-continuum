@@ -9,6 +9,7 @@ import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
 import { RuntimeInitializationCoordinator } from "./runtime-initialization-coordinator";
 import { VerifiedRuntimeModelCatalog } from "./runtime-model-catalog";
 import { VerifiedRuntimeOAuthComposition } from "./runtime-oauth";
+import { OAuthAttemptStore } from "./oauth-attempt-store";
 import { VerifiedResidentGateway } from "./verified-resident-gateway";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
 import { HostService } from "./service";
@@ -25,6 +26,7 @@ export * from "./gateway";
 export * from "./candidate-evaluation";
 export * from "./candidate-evaluation-store";
 export * from "./oauth-session-broker";
+export * from "./oauth-attempt-store";
 export * from "./paths";
 export * from "./probe";
 export * from "./prime-agent-resident-adapter";
@@ -129,6 +131,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
           credentialSecurity: primeAgentRuntimeSecurity,
         })
       : undefined;
+    const runtimeOAuthAttemptStore = new OAuthAttemptStore(store.paths);
     const residentGateway = runtimeInitialization
       ? new VerifiedResidentGateway({
           store,
@@ -147,6 +150,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         runtimeIntegrityProvider: runtimeInitialization,
         runtimeModelCatalogProvider: runtimeModelCatalog,
         runtimeOAuthComposition,
+        runtimeOAuthAttemptStore,
         candidateEvaluationCoordinator: candidateEvaluation,
       },
     );
@@ -162,7 +166,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         // Core authority recovery remains the bounded startup gate. Runtime
         // verification publishes an initializing snapshot synchronously, then
         // starts on the next event-loop turn without delaying health sessions.
-        await service.initialize();
+        await service.initialize(lease);
         runtimeInitialization?.start(lease, options.runtimeSeed);
       },
     });

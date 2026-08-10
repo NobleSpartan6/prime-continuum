@@ -419,9 +419,10 @@ export class RuntimeOAuthDesktopAttemptStore {
       const next = freezeRecord({
         ...current,
         revision: current.revision + 1,
-        updatedAt: parsed.acknowledgedAt,
+        updatedAt: latestTimestamp(current.updatedAt, parsed.acknowledgedAt),
         hostAckConfirmedAt: parsed.acknowledgedAt,
       })
+      assertRecordCoherence(next)
       const attempts = [...ledger.attempts]
       attempts[index] = next
       await this.writeLedger(freezeLedger(attempts))
@@ -619,13 +620,17 @@ function assertRecordCoherence(record: RuntimeOAuthDesktopAttemptRecordV1): void
       throw invalid('OAuth terminal host phase does not match its result')
     }
     const terminalLatestAt = record.hostAckConfirmedAt ?? record.terminal.body.terminalAt
-    if (record.updatedAt !== terminalLatestAt) throw invalid('OAuth terminal update timestamp is invalid')
+    if (Date.parse(record.updatedAt) < Date.parse(terminalLatestAt)) {
+      throw invalid('OAuth terminal update timestamp is invalid')
+    }
   }
   if (record.hostAckConfirmedAt !== undefined) {
     if (!record.terminal || Date.parse(record.hostAckConfirmedAt) < Date.parse(record.terminal.body.terminalAt)) {
       throw invalid('OAuth host acknowledgement is not bound to a terminal result')
     }
-    if (record.updatedAt !== record.hostAckConfirmedAt) throw invalid('OAuth acknowledgement must be the latest update')
+    if (Date.parse(record.updatedAt) < Date.parse(record.hostAckConfirmedAt)) {
+      throw invalid('OAuth acknowledgement must not move the local update time backwards')
+    }
   }
   if (record.phase === 'prepared' || record.phase === 'start_dispatching') {
     if (record.hostSessionId !== undefined || record.hostPhase !== undefined || record.recoveryReason !== undefined) {
@@ -774,6 +779,10 @@ function parseTimestamp(value: unknown, label: string): string {
   const parsed = Date.parse(value)
   if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) throw invalid(`${label} is invalid`)
   return value
+}
+
+function latestTimestamp(left: string, right: string): string {
+  return Date.parse(left) >= Date.parse(right) ? left : right
 }
 
 function parseEnum<const T extends string>(value: unknown, values: readonly T[], label: string): T {

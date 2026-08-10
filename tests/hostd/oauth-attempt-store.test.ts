@@ -14,7 +14,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AtomicWriteAmbiguousCommitError } from "../../src/hostd/atomic-files";
+import {
+  AtomicWriteAmbiguousCommitError,
+  atomicWriteJson,
+} from "../../src/hostd/atomic-files";
 import {
   OAUTH_ATTEMPT_MAX_FILES,
   OAUTH_ATTEMPT_MAX_FILE_BYTES,
@@ -268,6 +271,80 @@ describe("OAuthAttemptStore", () => {
       terminal.terminal!.terminalDigest,
       at(1_003),
     )).toEqual(acknowledged);
+    failConfirmation = true;
+    await expect(fixture.store.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_003),
+    )).rejects.toThrow(/confirmation failure/);
+    failConfirmation = false;
+    expect(await fixture.store.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_003),
+    )).toEqual(acknowledged);
+  });
+
+  it("acknowledges by exact attempt and predecessor revision across restart", async () => {
+    const fixture = await temporaryStore();
+    const prepared = (await fixture.store.prepare(prepareInput(1))).record;
+    const login = await fixture.store.markLoginDispatching(prepared, at(1_001));
+    const terminal = await fixture.store.settle(login, terminalFor(
+      login,
+      "failed",
+      "provider_login_failed",
+      null,
+      at(1_002),
+    ));
+    const acknowledged = await fixture.store.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_003),
+    );
+
+    const restarted = new OAuthAttemptStore(fixture.paths);
+    await restarted.initialize(at(1_004));
+    expect(await restarted.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_003),
+    )).toEqual(acknowledged);
+    await expect(restarted.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision + 1,
+      terminal.terminal!.terminalDigest,
+      at(1_003),
+    )).rejects.toMatchObject({ code: "OAUTH_ATTEMPT_CAS_CONFLICT" });
+    await expect(restarted.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_004),
+    )).rejects.toMatchObject({ code: "OAUTH_ATTEMPT_CAS_CONFLICT" });
+    await expect(restarted.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      "a".repeat(64),
+      at(1_003),
+    )).rejects.toMatchObject({ code: "OAUTH_ATTEMPT_CAS_CONFLICT" });
+  });
+
+  it("rejects an absent acknowledgement as an identity conflict without poisoning the store", async () => {
+    const { store } = await temporaryStore();
+    const absentAttempt = prepareInput(1).attempt;
+
+    await expect(store.acknowledgeAttempt(
+      absentAttempt,
+      0,
+      "a".repeat(64),
+      at(1_001),
+    )).rejects.toMatchObject({ code: "OAUTH_ATTEMPT_ID_CONFLICT" });
+    expect(await store.get(absentAttempt)).toBeUndefined();
+    expect(await store.list()).toEqual([]);
   });
 
   it("allows only phase-coherent cancellation and terminal outcomes", async () => {
@@ -528,6 +605,9 @@ describe("OAuthAttemptStore", () => {
     });
     await expect(createFixture.store.prepare(prepareInput(1)))
       .rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
+    await expect(createFixture.store.list()).rejects.toMatchObject({
+      code: "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+    });
     const createRestart = new OAuthAttemptStore(createFixture.paths);
     await createRestart.initialize(at(1_001));
     expect(await createRestart.list()).toMatchObject([{
@@ -553,6 +633,75 @@ describe("OAuthAttemptStore", () => {
       phase: "recovery_required",
       recoveryReason: "login_helper_liveness_unconfirmed",
     }]);
+  });
+
+  it("withholds an ambiguously published effect boundary until restart recovery classifies it", async () => {
+    let makeCommitAmbiguous = false;
+    const fixture = await temporaryStore({
+      async writeJson(path, value, maxBytes) {
+        await atomicWriteJson(path, value, maxBytes);
+        if (makeCommitAmbiguous) {
+          throw new AtomicWriteAmbiguousCommitError(path, new Error("simulated directory sync failure"));
+        }
+      },
+    });
+    const prepared = (await fixture.store.prepare(prepareInput(1))).record;
+    makeCommitAmbiguous = true;
+    await expect(fixture.store.markLoginDispatching(prepared, at(1_001)))
+      .rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
+    await expect(fixture.store.get(prepared.attempt)).rejects.toMatchObject({
+      code: "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+    });
+    await expect(fixture.store.list()).rejects.toMatchObject({
+      code: "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+    });
+    await expect(fixture.store.markLoginDispatching(prepared, at(1_001))).rejects.toMatchObject({
+      code: "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+    });
+
+    const restarted = new OAuthAttemptStore(fixture.paths);
+    await restarted.initialize(at(1_002));
+    expect(await restarted.get(prepared.attempt)).toMatchObject({
+      phase: "recovery_required",
+      recoveryReason: "login_helper_liveness_unconfirmed",
+    });
+  });
+
+  it("withholds an ambiguously published acknowledgement until restart confirms it", async () => {
+    let makeCommitAmbiguous = false;
+    const fixture = await temporaryStore({
+      async writeJson(path, value, maxBytes) {
+        await atomicWriteJson(path, value, maxBytes);
+        if (makeCommitAmbiguous) {
+          throw new AtomicWriteAmbiguousCommitError(path, new Error("simulated directory sync failure"));
+        }
+      },
+    });
+    const prepared = (await fixture.store.prepare(prepareInput(1))).record;
+    const terminal = await fixture.store.settle(prepared, terminalFor(
+      prepared,
+      "failed",
+      "interrupted_before_login_dispatch",
+      null,
+      at(1_001),
+    ));
+    makeCommitAmbiguous = true;
+    await expect(fixture.store.acknowledgeAttempt(
+      terminal.attempt,
+      terminal.revision,
+      terminal.terminal!.terminalDigest,
+      at(1_002),
+    )).rejects.toBeInstanceOf(AtomicWriteAmbiguousCommitError);
+    await expect(fixture.store.get(terminal.attempt)).rejects.toMatchObject({
+      code: "OAUTH_ATTEMPT_COMMIT_UNCERTAIN",
+    });
+
+    const restarted = new OAuthAttemptStore(fixture.paths);
+    await restarted.initialize(at(1_003));
+    expect(await restarted.get(terminal.attempt)).toMatchObject({
+      revision: terminal.revision + 1,
+      desktopAcknowledgedAt: at(1_002),
+    });
   });
 
   it("recovers exact atomic siblings and conservatively restores an interrupted deletion", async () => {
@@ -652,6 +801,14 @@ describe("OAuthAttemptStore", () => {
     })}\n`, { mode: 0o600 });
     await expect(new OAuthAttemptStore(decorated.paths).initialize(at(5_001)))
       .rejects.toThrow(/record is invalid/);
+
+    const unreachable = await isolatedPrepared(6);
+    const [unreachableName] = await readdir(unreachable.paths.oauthAttempts);
+    const unreachablePath = join(unreachable.paths.oauthAttempts, unreachableName!);
+    const unreachableRecord = JSON.parse(await readFile(unreachablePath, "utf8")) as Record<string, unknown>;
+    await writeFile(unreachablePath, `${JSON.stringify({ ...unreachableRecord, revision: 1 })}\n`, { mode: 0o600 });
+    await expect(new OAuthAttemptStore(unreachable.paths).initialize(at(6_001)))
+      .rejects.toThrow(/revision cannot reach/);
   });
 
   it("rejects multiple unresolved records recovered from conflicting authority", async () => {
@@ -731,6 +888,7 @@ describe("OAuthAttemptStore", () => {
     }
 
     await expect(fixture.store.compact(at(40 * dayMs))).rejects.toThrow(/uncertain/);
+    await expect(fixture.store.list()).rejects.toThrow(/requires restart/);
     await expect(fixture.store.prepare(prepareInput(129, at(200_000))))
       .rejects.toThrow(/requires restart/);
     expect((await readdir(fixture.paths.oauthAttempts)).some((name) => name.includes(".delete-"))).toBe(true);

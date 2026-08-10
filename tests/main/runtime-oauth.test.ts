@@ -1,9 +1,14 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { App } from "electron";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createRuntimeOAuthAttemptTerminalV1,
+  createRuntimeOAuthAttemptV1,
+  type RuntimeOAuthAttemptV1,
+} from "../../src/shared/runtime-oauth-attempt";
 
 const { connectLocalHostd, connectSshHost } = vi.hoisted(() => ({
   connectLocalHostd: vi.fn(),
@@ -17,6 +22,7 @@ vi.mock("../../src/main/control/local-hostd", () => ({
 }));
 
 import { DesktopControlService } from "../../src/main/control/service";
+import { RuntimeOAuthDesktopAttemptStore } from "../../src/main/control/runtime-oauth-attempt-store";
 
 const temporaryDirectories: string[] = [];
 
@@ -30,7 +36,7 @@ class TestConnection extends EventEmitter {
 
   async request(method: string, params: unknown): Promise<unknown> {
     this.requests.push({ method, params });
-    return this.respond(method, params);
+    return await this.respond(method, params);
   }
 
   close(): void {
@@ -53,372 +59,639 @@ afterEach(async () => {
   }
 });
 
-describe("DesktopControlService runtime OAuth ownership", () => {
-  it("opens only the pinned URL in main and returns a secret-free renderer view", async () => {
-    const authorizationUrl = validAuthorizationUrl();
-    const openExternal = vi.fn(async () => undefined);
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", authorizationUrl);
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
-      throw new Error(`Unexpected request: ${method}`);
+describe("DesktopControlService durable runtime OAuth attempts", () => {
+  it("refuses a legacy-only host before creating or dispatching an attempt", async () => {
+    const connection = connectionFor(
+      (method) => { throw new Error(`Unexpected request: ${method}`); },
+      health("host-a", ["runtime_oauth_v1"]),
+    );
+    const fixture = await connectedService(connection, async () => undefined);
+
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_unavailable",
     });
-    const service = await connectedService(connection, openExternal);
+    expect(connection.requests.some(({ method }) => method.startsWith("oauth."))).toBe(false);
+    expect(await readAttemptLedger(fixture.directory)).toEqual({ version: 1, attempts: [] });
+    await fixture.service.disconnect();
+  });
 
-    const view = await service.startRuntimeOAuth("host-a", "openai-codex");
+  it("persists pre-dispatch, sends one exact start, and opens only after browser_dispatching is durable", async () => {
+    const authorizationUrl = validAuthorizationUrl();
+    let directory = "";
+    let attempt!: RuntimeOAuthAttemptV1;
+    const connection = connectionFor(async (method, params) => {
+      if (method !== "oauth.attempt.start") throw new Error(`Unexpected request: ${method}`);
+      expect(Object.keys(params as object).sort()).toEqual(["attempt", "authorityId"]);
+      expect((params as { authorityId: string }).authorityId).toMatch(/^desktop-oauth-/);
+      attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+      const ledger = await readAttemptLedger(directory);
+      expect(ledger.attempts).toEqual([
+        expect.objectContaining({ attempt, phase: "start_dispatching", revision: 2 }),
+      ]);
+      const record = activeRecord(attempt);
+      return boundResult(record, liveSnapshot(record, authorizationUrl));
+    });
+    const openExternal = vi.fn(async (url: string) => {
+      expect(url).toBe(authorizationUrl);
+      const ledger = await readAttemptLedger(directory);
+      expect(ledger.attempts[0]).toMatchObject({
+        attempt,
+        phase: "browser_dispatching",
+        hostSessionId: "oauth-session-1",
+        hostPhase: "login_dispatching",
+      });
+    });
+    const fixture = await connectedService(connection, openExternal);
+    directory = fixture.directory;
 
-    expect(openExternal).toHaveBeenCalledWith(authorizationUrl);
+    const view = await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.start")).toHaveLength(1);
+    expect(connection.requests.some(({ method }) => method.startsWith("oauth.session."))).toBe(false);
+    expect(openExternal).toHaveBeenCalledOnce();
     expect(view).toEqual({
       sessionId: "oauth-session-1",
       providerId: "openai-codex",
       phase: "awaiting_user",
-      expiresAt: "2099-08-07T18:00:00.000Z",
+      expiresAt: expiresAt(attempt),
       interaction: { kind: "browser", state: "opened" },
     });
-    expect(JSON.stringify(view)).not.toMatch(/auth\.openai|state=|code_challenge|access|refresh|token/i);
-    await service.disconnect();
+    const ledger = await readAttemptLedger(directory);
+    expect(ledger.attempts[0]).toMatchObject({ phase: "observing", revision: 6, attempt });
+    expect(JSON.stringify({ view, ledger })).not.toMatch(/auth\.openai|code_challenge|refresh_token|access_token/i);
+    await fixture.service.disconnect();
+    expect(connection.requests.some(({ method }) => method === "oauth.attempt.cancel")).toBe(false);
   });
 
-  it("strips provider failure messages before they cross the preload boundary", async () => {
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") {
-        return {
-          sessionId: "oauth-session-failed",
-          providerId: "openai-codex",
-          phase: "failed",
-          expiresAt: "2099-08-07T18:00:00.000Z",
-          error: {
-            code: "OAUTH_PROVIDER_FAILED",
-            message: "https://secret.example/callback?token=do-not-cross",
-            retryable: true,
-          },
-        };
-      }
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    const service = await connectedService(connection, async () => undefined);
-
-    const view = await service.startRuntimeOAuth("host-a", "openai-codex");
-
-    expect(view).toEqual({
-      sessionId: "oauth-session-failed",
-      providerId: "openai-codex",
-      phase: "failed",
-      expiresAt: "2099-08-07T18:00:00.000Z",
-      error: { code: "OAUTH_PROVIDER_FAILED", retryable: true },
-    });
-    expect(JSON.stringify(view)).not.toMatch(/secret\.example|token=|do-not-cross/);
-    await service.disconnect();
-  });
-
-  it("refuses a different HTTPS authorization host before invoking the system browser", async () => {
-    const openExternal = vi.fn(async () => undefined);
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") {
-        return oauthSnapshot("oauth-session-1", validAuthorizationUrl("https://attacker.example"));
-      }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    const service = await connectedService(connection, openExternal);
-
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toBeDefined();
-    expect(openExternal).not.toHaveBeenCalled();
-    await service.disconnect();
-  });
-
-  it("binds every startup poll to the session and provider returned by start", async () => {
-    const openExternal = vi.fn(async () => undefined);
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") {
-        return {
-          sessionId: "oauth-session-1",
-          providerId: "openai-codex",
-          phase: "starting",
-          expiresAt: "2099-08-07T18:00:00.000Z",
-        };
-      }
-      if (method === "oauth.session.status") {
-        return oauthSnapshot("oauth-session-substituted", validAuthorizationUrl());
-      }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    const service = await connectedService(connection, openExternal);
-
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
-      code: "protocol.oauth_session_mismatch",
-    });
-    expect(openExternal).not.toHaveBeenCalled();
-    expect(connection.requests.find(({ method }) => method === "oauth.session.status")?.params).toMatchObject({
-      expectedHostId: "host-a",
-      sessionId: "oauth-session-1",
-    });
-    await service.disconnect();
-  });
-
-  it("cancels the exact old-host session if authority drifts while the browser is opening", async () => {
-    let service!: DesktopControlService;
-    const openExternal = vi.fn(async () => {
-      const internal = service as unknown as { reconnectGeneration: number };
-      internal.reconnectGeneration += 1;
-    });
-    let authorityId: string | undefined;
-    const connection = connectionFor((method, params) => {
-      if (method === "oauth.session.start") {
-        authorityId = (params as { authorityId: string }).authorityId;
-        return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      }
-      if (method === "oauth.session.cancel") {
-        expect(params).toEqual({
-          expectedHostId: "host-a",
-          authorityId,
-          sessionId: "oauth-session-1",
-        });
-        return {
-          ...oauthSnapshot("oauth-session-1"),
-          phase: "cancelled",
-        };
-      }
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    service = await connectedService(connection, openExternal);
-
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
-      code: "connection.superseded",
-    });
-    expect(openExternal).toHaveBeenCalledOnce();
-    expect(connection.requests.filter(({ method }) => method === "oauth.session.cancel")).toHaveLength(1);
-    await service.disconnect();
-  });
-
-  it("linearizes concurrent browser opens so no caller observes opened before shell success", async () => {
+  it("recovers a lost start response only through status and never replays start", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
     const authorizationUrl = validAuthorizationUrl();
-    const shellGate = deferred<void>();
-    const openExternal = vi.fn(() => shellGate.promise);
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start" || method === "oauth.session.status") {
-        return oauthSnapshot("oauth-session-1", authorizationUrl);
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        throw new Error("response lost after durable admission");
       }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, authorizationUrl));
+      }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, openExternal);
+    const openExternal = vi.fn(async () => undefined);
+    const fixture = await connectedService(connection, openExternal);
 
-    let startSettled = false;
-    const starting = service.startRuntimeOAuth("host-a", "openai-codex").finally(() => { startSettled = true; });
-    await waitFor(() => connection.requests.some(({ method }) => method === "oauth.session.start"));
-    const status = service.runtimeOAuthStatus("host-a", "oauth-session-1");
-    await flushMicrotasks();
-    expect(openExternal).toHaveBeenCalledOnce();
-    expect(startSettled).toBe(false);
-
-    shellGate.resolve();
-    await expect(Promise.all([starting, status])).resolves.toEqual([
-      expect.objectContaining({ interaction: { kind: "browser", state: "opened" } }),
-      expect.objectContaining({ interaction: { kind: "browser", state: "opened" } }),
-    ]);
-    await service.disconnect();
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).resolves.toMatchObject({
+      sessionId: "oauth-session-1",
+      interaction: { kind: "browser", state: "opened" },
+    });
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.start")).toHaveLength(1);
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.status")).toHaveLength(1);
+    await fixture.service.disconnect();
   });
 
-  it("shares one failing shell launch across callers and cancels the exact session once", async () => {
-    const shellGate = deferred<void>();
-    const openExternal = vi.fn(() => shellGate.promise);
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start" || method === "oauth.session.status") {
-        return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
+  it("terminalizes same-connection null after one lost start request without replay", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        throw new Error("start response lost before host retention");
       }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        return { attemptDigest: attempt.attemptDigest, record: null };
+      }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, openExternal);
-    const starting = service.startRuntimeOAuth("host-a", "openai-codex");
-    await waitFor(() => connection.requests.some(({ method }) => method === "oauth.session.start"));
-    const status = service.runtimeOAuthStatus("host-a", "oauth-session-1");
+    const fixture = await connectedService(connection, async () => undefined);
 
-    shellGate.reject(new Error("shell failed"));
-    const results = await Promise.allSettled([starting, status]);
-    expect(results.every((result) => result.status === "rejected")).toBe(true);
-    expect(openExternal).toHaveBeenCalledOnce();
-    expect(connection.requests.filter(({ method }) => method === "oauth.session.cancel")).toHaveLength(1);
-    await service.disconnect();
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_start_failed",
+    });
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.start")).toHaveLength(1);
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.status")).toHaveLength(1);
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      phase: "failed",
+      terminal: {
+        body: {
+          phase: "failed",
+          resolution: "interrupted_before_login_dispatch",
+          configuredObserved: null,
+        },
+      },
+    });
+    await fixture.service.disconnect();
   });
 
-  it("does not close the host connection until disconnect receives terminal cancellation", async () => {
-    const cancelGate = deferred<unknown>();
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.cancel") return cancelGate.promise;
+  it("allows the fresh process to dispatch a URL first observed by later status", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const authorizationUrl = validAuthorizationUrl();
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, {
+          ...liveSnapshot(record),
+          challenge: {
+            id: "manual-redirect-1",
+            kind: "manual_redirect",
+            message: "Finish sign-in in the provider window.",
+            allowEmpty: false,
+          },
+        });
+      }
+      if (method === "oauth.attempt.status") {
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, authorizationUrl));
+      }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, async () => undefined);
-    await service.startRuntimeOAuth("host-a", "openai-codex");
+    const openExternal = vi.fn(async () => undefined);
+    const fixture = await connectedService(connection, openExternal);
 
-    const disconnecting = service.disconnect();
-    await waitFor(() => connection.requests.some(({ method }) => method === "oauth.session.cancel"));
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).resolves.toMatchObject({
+      interaction: { kind: "manual", state: "unavailable" },
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
+      interaction: { kind: "browser", state: "opened" },
+    });
+    expect(openExternal).toHaveBeenCalledOnce();
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.start")).toHaveLength(1);
+    await fixture.service.disconnect();
+  });
+
+  it("keeps local browser time monotonic when the host completes while openExternal is pending", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let terminal!: ReturnType<typeof completedRecord>;
+    let releaseBrowser!: () => void;
+    const browserPending = new Promise<void>((resolve) => { releaseBrowser = resolve; });
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.status") return boundResult(terminal);
+      if (method === "oauth.attempt.acknowledge") {
+        expect(params).toMatchObject({
+          attempt,
+          expectedRevision: terminal.revision,
+          terminalDigest: terminal.terminal.terminalDigest,
+          acknowledgedAt: terminal.terminal.body.terminalAt,
+        });
+        return boundResult(acknowledgedRecord(terminal));
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const openExternal = vi.fn(async () => { await browserPending; });
+    const fixture = await connectedService(connection, openExternal);
+
+    const started = fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+    await waitFor(() => openExternal.mock.calls.length === 1);
+    const dispatchingUpdatedAt = (await readAttemptLedger(fixture.directory)).attempts[0]!.updatedAt as string;
+    await waitFor(() => Date.now() > Date.parse(dispatchingUpdatedAt));
+    terminal = completedRecord(attempt, dispatchingUpdatedAt);
+    releaseBrowser();
+    await expect(started).resolves.toMatchObject({ phase: "awaiting_user" });
+    const browserUpdatedAt = (await readAttemptLedger(fixture.directory)).attempts[0]!.updatedAt as string;
+    expect(Date.parse(browserUpdatedAt)).toBeGreaterThan(Date.parse(terminal.terminal.body.terminalAt));
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
+      phase: "completed",
+      configured: true,
+    });
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      phase: "completed",
+      updatedAt: browserUpdatedAt,
+      terminal: terminal.terminal,
+      hostAckConfirmedAt: terminal.terminal.body.terminalAt,
+    });
     expect(connection.isClosed).toBe(false);
-    cancelGate.resolve(cancelledSnapshot("oauth-session-1"));
-    await disconnecting;
-    expect(connection.isClosed).toBe(true);
+    await fixture.service.disconnect();
   });
 
-  it("drains the exact old host before a target switch closes its connection", async () => {
-    const cancelGate = deferred<unknown>();
-    const cancelRequested = deferred<void>();
-    const local = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.cancel") {
-        cancelRequested.resolve();
-        return cancelGate.promise;
+  it("restarts an ambiguous start with status only and never reopens its browser", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const firstConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        throw new Error("response lost");
       }
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    const remote = connectionFor(() => { throw new Error("Unexpected remote request"); }, health("host-b", []));
-    connectSshHost.mockReturnValue(remote);
-    const service = await connectedService(local, async () => undefined);
-    (service as unknown as { discoveredAliases: Set<string> }).discoveredAliases.add("remote");
-    await service.startRuntimeOAuth("host-a", "openai-codex");
-
-    const switching = service.connect({ kind: "ssh", alias: "remote" });
-    await cancelRequested.promise;
-    expect(local.isClosed).toBe(false);
-    expect(connectSshHost).not.toHaveBeenCalled();
-    cancelGate.resolve(cancelledSnapshot("oauth-session-1"));
-    await expect(switching).resolves.toMatchObject({ phase: "online", hostId: "host-b" });
-    expect(local.isClosed).toBe(true);
-    await service.disconnect();
-  });
-
-  it("does not adopt a pre-restart OAuth session into a fresh main authority", async () => {
-    const firstConnection = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
+      if (method === "oauth.attempt.status") throw new Error("connection lost");
       throw new Error(`Unexpected request: ${method}`);
     });
     const first = await connectedService(firstConnection, async () => undefined);
-    await first.startRuntimeOAuth("host-a", "openai-codex");
-
-    const secondConnection = connectionFor((method) => { throw new Error(`Unexpected request: ${method}`); });
-    const second = await connectedService(secondConnection, async () => undefined);
-    await expect(second.runtimeOAuthStatus("host-a", "oauth-session-1")).rejects.toMatchObject({
-      code: "runtime.oauth_session_untracked",
-    });
-    expect(secondConnection.requests.filter(({ method }) => method === "oauth.session.status")).toHaveLength(0);
-    await first.disconnect();
-    await second.disconnect();
-  });
-
-  it("never replays an effect-bearing start when the host response is lost", async () => {
-    const connection = connectionFor((method) => {
-      if (method !== "oauth.session.start") throw new Error(`Unexpected request: ${method}`);
-      throw new Error("terminal response was lost");
-    });
-    const service = await connectedService(connection, async () => undefined);
-
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+    await expect(first.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
       code: "runtime.oauth_start_ambiguous",
     });
-    const starts = connection.requests.filter(({ method }) => method === "oauth.session.start");
-    expect(starts).toHaveLength(1);
-    expect((starts[0]!.params as { operationId: string }).operationId).toMatch(/^[0-9a-f-]{36}$/);
-    await expect(service.disconnect()).rejects.toMatchObject({ code: "runtime.oauth_drain_unconfirmed" });
-  });
+    await first.service.disconnect();
 
-  it("fails closed on disconnect and target switch when an admitted start response stays ambiguous", async () => {
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") throw new Error("response lost");
+    const record = activeRecord(attempt);
+    const secondConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, async () => undefined);
-    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
-      code: "runtime.oauth_start_ambiguous",
-    });
-    expect(connection.requests.filter(({ method }) => method === "oauth.session.start")).toHaveLength(1);
-    const operationIds = connection.requests
-      .filter(({ method }) => method === "oauth.session.start")
-      .map(({ params }) => (params as { operationId: string }).operationId);
-    expect(new Set(operationIds).size).toBe(1);
+    const openExternal = vi.fn(async () => undefined);
+    const second = await connectedService(secondConnection, openExternal, first.directory);
+    await waitFor(async () =>
+      (await readAttemptLedger(first.directory)).attempts[0]?.phase === "host_admitted"
+    );
 
-    await expect(service.disconnect()).rejects.toMatchObject({ code: "runtime.oauth_drain_unconfirmed" });
-    expect(connection.isClosed).toBe(false);
-    await expect(service.connect({ kind: "local" })).rejects.toMatchObject({
-      code: "runtime.oauth_drain_unconfirmed",
+    await expect(second.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
+      phase: "awaiting_user",
     });
-    expect(connection.isClosed).toBe(false);
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(secondConnection.requests.some(({ method }) =>
+      method === "oauth.attempt.start" || method === "oauth.attempt.cancel"
+    )).toBe(false);
+    expect((await readAttemptLedger(first.directory)).attempts[0]).toMatchObject({ phase: "host_admitted" });
+    await second.service.disconnect();
   });
 
-  it("does not project malformed OAuth snapshot diagnostics or provider-controlled values", async () => {
-    const secret = "https://secret.example/callback?token=must-not-cross";
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") {
-        return {
-          sessionId: "oauth-session-1",
-          providerId: "openai-codex",
-          phase: secret,
-          expiresAt: "2099-08-07T18:00:00.000Z",
+  it("retains a start-dispatch barrier when replacement status returns null and never replays start", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const firstConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        throw new Error("start response lost on the old connection");
+      }
+      if (method === "oauth.attempt.status") throw new Error("old connection unavailable");
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const first = await connectedService(firstConnection, async () => undefined);
+    await expect(first.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_start_ambiguous",
+    });
+    expect((await readAttemptLedger(first.directory)).attempts[0]).toMatchObject({
+      phase: "start_dispatching",
+    });
+    await first.service.disconnect();
+
+    const replacementConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        return { attemptDigest: attempt.attemptDigest, record: null };
+      }
+      throw new Error(`Replacement must remain status-only, received ${method}`);
+    });
+    const replacement = await bootstrappedService(
+      replacementConnection,
+      async () => undefined,
+      first.directory,
+    );
+    const absenceAccepted = observeNextRuntimeOAuthAcceptance(replacement.service, "start_dispatching");
+    await replacement.service.connect({ kind: "local" });
+    await absenceAccepted;
+
+    expect(replacementConnection.requests.filter(({ method }) => method === "oauth.attempt.status"))
+      .toHaveLength(1);
+    const absentBarrier = (await readAttemptLedger(first.directory)).attempts[0]!;
+    expect(absentBarrier).toMatchObject({ phase: "start_dispatching" });
+    expect(absentBarrier).not.toHaveProperty("hostSessionId");
+    expect(replacementConnection.requests.some(({ method }) => method === "oauth.attempt.start")).toBe(false);
+    await expect(replacement.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_attempt_active",
+    });
+    expect(replacementConnection.requests.some(({ method }) => method === "oauth.attempt.start")).toBe(false);
+    await replacement.service.disconnect();
+
+    const retained = activeRecord(attempt);
+    const laterConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        return boundResult(retained, liveSnapshot(retained));
+      }
+      throw new Error(`Later recovery must remain status-only, received ${method}`);
+    });
+    const later = await bootstrappedService(laterConnection, async () => undefined, first.directory);
+    const retainedAccepted = observeNextRuntimeOAuthAcceptance(later.service, "host_admitted");
+    await later.service.connect({ kind: "local" });
+    await retainedAccepted;
+    expect((await readAttemptLedger(first.directory)).attempts[0]).toMatchObject({
+      phase: "host_admitted",
+      hostSessionId: retained.sessionId,
+      hostPhase: "login_dispatching",
+    });
+    expect(laterConnection.requests.some(({ method }) => method === "oauth.attempt.start")).toBe(false);
+    await later.service.disconnect();
+  });
+
+  it("terminalizes a restarted prepared attempt when replacement status confirms absence", async () => {
+    const directory = await temporaryDirectory();
+    const storePath = path.join(directory, "control", "runtime-oauth-attempts.json");
+    await mkdir(path.dirname(storePath), { recursive: true });
+    const store = new RuntimeOAuthDesktopAttemptStore(storePath);
+    await store.initialize();
+    const attempt = createRuntimeOAuthAttemptV1({
+      version: 1,
+      expectedHostId: "host-a",
+      providerId: "openai-codex",
+      operationId: "78787878-7878-4878-8878-787878787878",
+      requestedAt: "2026-08-10T12:00:00.000Z",
+    });
+    await store.prepare(attempt, attempt.identity.requestedAt);
+    const replacementConnection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.status") {
+        expect(params).toEqual({ attempt });
+        return { attemptDigest: attempt.attemptDigest, record: null };
+      }
+      throw new Error(`Replacement must remain status-only, received ${method}`);
+    });
+
+    const replacement = await connectedService(replacementConnection, async () => undefined, directory);
+    await waitFor(async () => (await readAttemptLedger(directory)).attempts[0]?.phase === "failed");
+    expect((await readAttemptLedger(directory)).attempts[0]).toMatchObject({
+      phase: "failed",
+      terminal: {
+        body: {
+          phase: "failed",
+          resolution: "interrupted_before_login_dispatch",
+          configuredObserved: null,
+        },
+      },
+    });
+    expect(replacementConnection.requests.some(({ method }) => method === "oauth.attempt.start")).toBe(false);
+    await replacement.service.disconnect();
+  });
+
+  it("retains browser_dispatching after an ambiguous shell failure and reconciles by status only", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => { throw new Error("shell failure"); });
+
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_browser_failed",
+    });
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      phase: "browser_dispatching",
+    });
+    expect(connection.requests.some(({ method }) => method === "oauth.attempt.cancel")).toBe(false);
+    await fixture.service.disconnect();
+
+    const restartedConnection = connectionFor((method) => {
+      if (method === "oauth.attempt.status") {
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const restartedOpen = vi.fn(async () => undefined);
+    const restarted = await connectedService(restartedConnection, restartedOpen, fixture.directory);
+    await waitFor(() => restartedConnection.requests.some(({ method }) => method === "oauth.attempt.status"));
+    expect(restartedOpen).not.toHaveBeenCalled();
+    expect(restartedConnection.requests.every(({ method }) =>
+      method === "health.get" || method === "oauth.attempt.status"
+    )).toBe(true);
+    await restarted.service.disconnect();
+  });
+
+  it("persists terminal evidence and acknowledges the exact host predecessor", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let terminal!: ReturnType<typeof completedRecord>;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.status") {
+        terminal = completedRecord(attempt);
+        return boundResult(terminal);
+      }
+      if (method === "oauth.attempt.acknowledge") {
+        expect(params).toEqual({
+          attempt,
+          expectedRevision: 4,
+          terminalDigest: terminal.terminal.terminalDigest,
+          acknowledgedAt: terminal.terminal.body.terminalAt,
+        });
+        return boundResult(acknowledgedRecord(terminal));
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toEqual({
+      sessionId: "oauth-session-1",
+      providerId: "openai-codex",
+      phase: "completed",
+      expiresAt: expiresAt(attempt),
+      configured: true,
+    });
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.acknowledge")).toHaveLength(1);
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      phase: "completed",
+      terminal: terminal.terminal,
+      hostAckConfirmedAt: terminal.terminal.body.terminalAt,
+    });
+    await fixture.service.disconnect();
+  });
+
+  it("recovers a lost acknowledgement from the read-only N+1 status successor", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let terminal!: ReturnType<typeof completedRecord>;
+    let statusCount = 0;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.status") {
+        terminal ??= completedRecord(attempt);
+        statusCount += 1;
+        return statusCount === 1 ? boundResult(terminal) : boundResult(acknowledgedRecord(terminal));
+      }
+      if (method === "oauth.attempt.acknowledge") {
+        expect((params as { expectedRevision: number }).expectedRevision).toBe(4);
+        throw new Error("ack response lost after commit");
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
+      phase: "completed",
+      configured: true,
+    });
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.acknowledge")).toHaveLength(1);
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.status")).toHaveLength(2);
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      hostAckConfirmedAt: terminal.terminal.body.terminalAt,
+    });
+    await fixture.service.disconnect();
+  });
+
+  it("rejects and terminates on a changed preexisting acknowledgement timestamp", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.status") {
+        const terminal = completedRecord(attempt);
+        const changedAt = shiftTimestamp(terminal.terminal.body.terminalAt, 1);
+        return boundResult({
+          ...terminal,
+          revision: 5,
+          updatedAt: changedAt,
+          desktopAcknowledgedAt: changedAt,
+        });
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).rejects.toMatchObject({
+      code: "protocol.oauth_acknowledgement_invalid",
+    });
+    expect(connection.isClosed).toBe(true);
+  });
+
+  it("rejects a false active cancel result through the method-specific parser", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.cancel") {
+        const active = {
+          ...activeRecord(attempt),
+          revision: 2,
+          phase: "cancelling" as const,
         };
+        return boundResult(active, liveSnapshot(active));
       }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, async () => undefined);
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
 
-    const error = await service.startRuntimeOAuth("host-a", "openai-codex").catch((caught) => caught);
-
-    expect(error).toMatchObject({
-      code: "protocol.oauth_snapshot_invalid",
-      message: "The host returned an invalid Prime Agent sign-in status.",
+    await expect(fixture.service.cancelRuntimeOAuth("host-a", "oauth-session-1")).rejects.toMatchObject({
+      code: "protocol.oauth_attempt_cancel_invalid",
     });
-    expect(JSON.stringify(error)).not.toContain(secret);
-    await service.disconnect();
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.cancel")).toHaveLength(1);
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.status")).toHaveLength(0);
+    await fixture.service.disconnect();
   });
 
-  it("normalizes host status failures before they can cross IPC", async () => {
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.status") {
-        throw new Error("https://secret.example/status?access_token=must-not-cross");
+  it("rejects a false terminal start result through the method-specific parser", async () => {
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        const attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        return boundResult(completedRecord(attempt));
       }
-      if (method === "oauth.session.cancel") return cancelledSnapshot("oauth-session-1");
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, async () => undefined);
-    await service.startRuntimeOAuth("host-a", "openai-codex");
+    const openExternal = vi.fn(async () => undefined);
+    const fixture = await connectedService(connection, openExternal);
 
-    const error = await service.runtimeOAuthStatus("host-a", "oauth-session-1").catch((caught) => caught);
-
-    expect(error).toMatchObject({
-      code: "runtime.oauth_status_failed",
-      message: "Prime Agent sign-in status could not be read from this host.",
-      retryable: true,
+    await expect(fixture.service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "protocol.oauth_attempt_start_invalid",
     });
-    expect(JSON.stringify(error)).not.toMatch(/secret\.example|access_token|must-not-cross/);
-    await service.disconnect();
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(connection.isClosed).toBe(true);
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.start")).toHaveLength(1);
   });
 
-  it("normalizes host cancellation failures before they can cross IPC", async () => {
-    let cancellationAttempts = 0;
-    const connection = connectionFor((method) => {
-      if (method === "oauth.session.start") return oauthSnapshot("oauth-session-1", validAuthorizationUrl());
-      if (method === "oauth.session.cancel") {
-        cancellationAttempts += 1;
-        if (cancellationAttempts === 1) {
-          throw new Error("https://secret.example/cancel?refresh_token=must-not-cross");
-        }
-        return cancelledSnapshot("oauth-session-1");
+  it("rejects a false unacknowledged ack result through the method-specific parser", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let terminal!: ReturnType<typeof completedRecord>;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.status") {
+        terminal = completedRecord(attempt);
+        return boundResult(terminal);
+      }
+      if (method === "oauth.attempt.acknowledge") return boundResult(terminal);
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).rejects.toMatchObject({
+      code: "protocol.oauth_attempt_acknowledge_invalid",
+    });
+    const retained = (await readAttemptLedger(fixture.directory)).attempts[0]!;
+    expect(retained).toMatchObject({ phase: "completed" });
+    expect(retained).not.toHaveProperty("hostAckConfirmedAt");
+    await fixture.service.disconnect();
+  });
+
+  it("never replays cancellation after its durable dispatch barrier", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let statusReads = 0;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, liveSnapshot(record, validAuthorizationUrl()));
+      }
+      if (method === "oauth.attempt.cancel") throw new Error("cancel response lost");
+      if (method === "oauth.attempt.status") {
+        statusReads += 1;
+        const cancelling = { ...activeRecord(attempt), revision: 2, phase: "cancelling" as const };
+        return boundResult(cancelling, liveSnapshot(cancelling));
       }
       throw new Error(`Unexpected request: ${method}`);
     });
-    const service = await connectedService(connection, async () => undefined);
-    await service.startRuntimeOAuth("host-a", "openai-codex");
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
 
-    const error = await service.cancelRuntimeOAuth("host-a", "oauth-session-1").catch((caught) => caught);
-
-    expect(error).toMatchObject({
-      code: "runtime.oauth_cancel_failed",
-      message: "Prime Agent sign-in cancellation could not be confirmed by this host.",
-      retryable: true,
+    await expect(fixture.service.cancelRuntimeOAuth("host-a", "oauth-session-1")).resolves.toMatchObject({
+      sessionId: "oauth-session-1",
     });
-    expect(JSON.stringify(error)).not.toMatch(/secret\.example|refresh_token|must-not-cross/);
+    await expect(fixture.service.cancelRuntimeOAuth("host-a", "oauth-session-1")).resolves.toMatchObject({
+      sessionId: "oauth-session-1",
+    });
+    expect(connection.requests.filter(({ method }) => method === "oauth.attempt.cancel")).toHaveLength(1);
+    expect(statusReads).toBe(2);
+    expect((await readAttemptLedger(fixture.directory)).attempts[0]).toMatchObject({
+      phase: "cancel_dispatching",
+    });
+    await fixture.service.disconnect();
+  });
+
+  it("keeps core bootstrap/connect online when only the OAuth journal is malformed", async () => {
+    const directory = await temporaryDirectory();
+    await mkdir(path.join(directory, "control"), { recursive: true });
+    await writeFile(
+      path.join(directory, "control", "runtime-oauth-attempts.json"),
+      JSON.stringify({ version: 1, attempts: [{ secretPath: "C:\\private\\oauth.json" }] }),
+      "utf8",
+    );
+    const connection = connectionFor((method) => { throw new Error(`Unexpected request: ${method}`); });
+    connectLocalHostd.mockResolvedValue(connection);
+    const service = new DesktopControlService({ app: testApp(directory), openExternal: async () => undefined });
+
+    await expect(service.bootstrap()).resolves.toMatchObject({ appVersion: "0.1.0" });
+    await expect(service.connect({ kind: "local" })).resolves.toMatchObject({ phase: "online", hostId: "host-a" });
+    await expect(service.startRuntimeOAuth("host-a", "openai-codex")).rejects.toMatchObject({
+      code: "runtime.oauth_attempt_store_unavailable",
+    });
+    expect(connection.requests.some(({ method }) => method.startsWith("oauth."))).toBe(false);
     await service.disconnect();
   });
 });
@@ -436,17 +709,69 @@ function connectionFor(
 async function connectedService(
   connection: TestConnection,
   openExternal: (url: string) => Promise<void>,
-): Promise<DesktopControlService> {
-  const directory = await mkdtemp(path.join(tmpdir(), "prime-main-oauth-test-"));
-  temporaryDirectories.push(directory);
+  existingDirectory?: string,
+): Promise<{ service: DesktopControlService; directory: string }> {
+  const fixture = await bootstrappedService(connection, openExternal, existingDirectory);
+  await fixture.service.connect({ kind: "local" });
+  return fixture;
+}
+
+async function bootstrappedService(
+  connection: TestConnection,
+  openExternal: (url: string) => Promise<void>,
+  existingDirectory?: string,
+): Promise<{ service: DesktopControlService; directory: string }> {
+  const directory = existingDirectory ?? await temporaryDirectory();
   await mkdir(path.join(directory, "control"), { recursive: true });
   connectLocalHostd.mockResolvedValue(connection);
   const service = new DesktopControlService({ app: testApp(directory), openExternal });
-  await service.connect({ kind: "local" });
-  return service;
+  await service.bootstrap();
+  return { service, directory };
 }
 
-function health(hostId = "host-a", capabilities = ["runtime_oauth_v1"]) {
+function observeNextRuntimeOAuthAcceptance(
+  service: DesktopControlService,
+  expectedDesktopPhase: string,
+): Promise<void> {
+  const internals = service as unknown as {
+    acceptRuntimeOAuthAttemptResult: (...args: unknown[]) => Promise<{ desktop: { phase: string } }>;
+  };
+  const original = internals.acceptRuntimeOAuthAttemptResult.bind(service);
+  let resolveObservation!: () => void;
+  let rejectObservation!: (reason?: unknown) => void;
+  const observation = new Promise<void>((resolve, reject) => {
+    resolveObservation = resolve;
+    rejectObservation = reject;
+  });
+  vi.spyOn(internals, "acceptRuntimeOAuthAttemptResult").mockImplementation(async (...args: unknown[]) => {
+    try {
+      const accepted = await original(...args);
+      if (accepted.desktop.phase !== expectedDesktopPhase) {
+        rejectObservation(new Error(
+          `Expected OAuth acceptance phase ${expectedDesktopPhase}, received ${accepted.desktop.phase}`,
+        ));
+      } else {
+        resolveObservation();
+      }
+      return accepted;
+    } catch (error) {
+      rejectObservation(error);
+      throw error;
+    }
+  });
+  return observation;
+}
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), "prime-main-oauth-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+function health(
+  hostId = "host-a",
+  capabilities = ["runtime_oauth_v1", "runtime_oauth_attempt_v1"],
+) {
   return {
     protocolVersion: 1,
     hostdVersion: "0.1.0",
@@ -458,41 +783,99 @@ function health(hostId = "host-a", capabilities = ["runtime_oauth_v1"]) {
   };
 }
 
-function cancelledSnapshot(sessionId: string) {
-  return { ...oauthSnapshot(sessionId), phase: "cancelled" };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-async function flushMicrotasks(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-}
-
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (predicate()) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  throw new Error("Timed out waiting for test state");
-}
-
-function oauthSnapshot(sessionId: string, authorizationUrl?: string) {
+function activeRecord(attempt: RuntimeOAuthAttemptV1) {
   return {
-    sessionId,
-    providerId: "openai-codex",
-    phase: "awaiting_user",
-    expiresAt: "2099-08-07T18:00:00.000Z",
+    recordVersion: 1 as const,
+    attempt,
+    revision: 1,
+    sessionId: "oauth-session-1",
+    phase: "login_dispatching" as const,
+    createdAt: attempt.identity.requestedAt,
+    updatedAt: attempt.identity.requestedAt,
+    expiresAt: expiresAt(attempt),
+  };
+}
+
+function liveSnapshot(
+  record: { sessionId: string; expiresAt: string },
+  authorizationUrl?: string,
+) {
+  return {
+    sessionId: record.sessionId,
+    providerId: "openai-codex" as const,
+    phase: "awaiting_user" as const,
+    expiresAt: record.expiresAt,
     ...(authorizationUrl ? { authorization: { url: authorizationUrl } } : {}),
   };
+}
+
+function completedRecord(
+  attempt: RuntimeOAuthAttemptV1,
+  terminalAt = shiftTimestamp(attempt.identity.requestedAt, 1_000),
+) {
+  const terminal = createRuntimeOAuthAttemptTerminalV1({
+    version: 1,
+    attemptDigest: attempt.attemptDigest,
+    phase: "completed",
+    resolution: "persistence_confirmed",
+    configuredObserved: true,
+    terminalAt,
+  });
+  return {
+    recordVersion: 1 as const,
+    attempt,
+    revision: 4,
+    sessionId: "oauth-session-1",
+    phase: "completed" as const,
+    createdAt: attempt.identity.requestedAt,
+    updatedAt: terminalAt,
+    expiresAt: expiresAt(attempt),
+    terminal,
+  };
+}
+
+function acknowledgedRecord(record: ReturnType<typeof completedRecord>) {
+  return {
+    ...record,
+    revision: record.revision + 1,
+    updatedAt: record.terminal.body.terminalAt,
+    desktopAcknowledgedAt: record.terminal.body.terminalAt,
+  };
+}
+
+function boundResult(record: object, live?: object) {
+  const attempt = (record as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+  return {
+    attemptDigest: attempt.attemptDigest,
+    record,
+    ...(live ? { live } : {}),
+  };
+}
+
+function expiresAt(attempt: RuntimeOAuthAttemptV1): string {
+  return shiftTimestamp(attempt.identity.requestedAt, 5 * 60_000);
+}
+
+function shiftTimestamp(timestamp: string, milliseconds: number): string {
+  return new Date(Date.parse(timestamp) + milliseconds).toISOString();
+}
+
+async function readAttemptLedger(directory: string): Promise<{
+  version: number;
+  attempts: Array<Record<string, unknown>>;
+}> {
+  return JSON.parse(await readFile(
+    path.join(directory, "control", "runtime-oauth-attempts.json"),
+    "utf8",
+  )) as { version: number; attempts: Array<Record<string, unknown>> };
+}
+
+async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (await predicate()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error("Timed out waiting for test state");
 }
 
 function validAuthorizationUrl(origin = "https://auth.openai.com"): string {

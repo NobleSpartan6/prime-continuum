@@ -1,4 +1,21 @@
 import { randomUUID } from "node:crypto";
+import {
+  createRuntimeOAuthAttemptTerminalV1,
+  parseRuntimeOAuthAttemptV1,
+  type RuntimeOAuthAttemptTerminalPhase,
+  type RuntimeOAuthAttemptTerminalResolution,
+  type RuntimeOAuthAttemptTerminalV1,
+  type RuntimeOAuthAttemptV1,
+} from "../shared/runtime-oauth-attempt";
+import {
+  OAUTH_ATTEMPT_MAX_FILES,
+  OAuthAttemptStore,
+  OAuthAttemptStoreError,
+  isOAuthAttemptBarrier,
+  type OAuthAttemptCancelIntent,
+  type OAuthAttemptRecord,
+  type OAuthAttemptRecoveryReason,
+} from "./oauth-attempt-store";
 
 /**
  * Prime Agent v0.7.1 integration boundary:
@@ -137,6 +154,10 @@ export type OAuthBrokerErrorCode =
   | "OAUTH_SESSION_LIMIT"
   | "OAUTH_CHALLENGE_STALE"
   | "OAUTH_RESPONSE_INVALID"
+  | "OAUTH_ATTEMPT_NOT_FOUND"
+  | "OAUTH_ATTEMPT_RECONCILE_REQUIRED"
+  | "OAUTH_ATTEMPT_CONNECTION_SUPERSEDED"
+  | "OAUTH_ATTEMPT_UNAVAILABLE"
   | "OAUTH_REQUEST_INVALID";
 
 /** Contains only fixed, IPC-safe messages; never attach provider or storage causes. */
@@ -154,6 +175,8 @@ export interface HostOAuthSessionBrokerOptions {
   readonly hostId: string;
   readonly providers: HostOAuthProviderPort;
   readonly storage: HostOAuthStorage;
+  /** Initialized durable journal. Required only for the oauth.attempt.* API. */
+  readonly attemptStore?: OAuthAttemptStore;
   readonly activeTtlMs?: number;
   readonly tombstoneTtlMs?: number;
   readonly maxSessions?: number;
@@ -181,6 +204,51 @@ export interface RespondOAuthSessionRequest extends ReadOAuthSessionRequest {
   readonly value?: string;
 }
 
+export interface StartOAuthAttemptRequest {
+  readonly authorityId: string;
+  readonly attempt: RuntimeOAuthAttemptV1;
+}
+
+export interface ReadOAuthAttemptRequest {
+  readonly attempt: RuntimeOAuthAttemptV1;
+}
+
+/** Host-internal framed-connection authority; never accepted from protocol bytes. */
+export interface OAuthAttemptSessionAdmission {
+  readonly generation: bigint;
+  isInputOpen(): boolean;
+}
+
+export interface AcknowledgeOAuthAttemptRequest extends ReadOAuthAttemptRequest {
+  readonly expectedRevision: number;
+  readonly terminalDigest: string;
+  readonly acknowledgedAt: string;
+}
+
+export interface OAuthAttemptStatusResult {
+  readonly attemptDigest: string;
+  readonly record: OAuthAttemptRecordProjection | null;
+  readonly live?: OAuthSessionSnapshot;
+}
+
+export interface OAuthAttemptEffectResult extends OAuthAttemptStatusResult {
+  readonly record: OAuthAttemptRecordProjection;
+}
+
+/** Exact public allowlist; host-only authority and recovery provenance stay private. */
+export interface OAuthAttemptRecordProjection {
+  readonly recordVersion: 1;
+  readonly attempt: RuntimeOAuthAttemptV1;
+  readonly revision: number;
+  readonly sessionId: string;
+  readonly phase: OAuthAttemptRecord["phase"];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly expiresAt: string;
+  readonly terminal?: RuntimeOAuthAttemptTerminalV1;
+  readonly desktopAcknowledgedAt?: string;
+}
+
 interface PendingChallenge {
   readonly projected: OAuthChallenge;
   readonly resolve: (value: string | undefined) => void;
@@ -194,6 +262,7 @@ interface OAuthSession {
   readonly expiresAtMs: number;
   readonly abortController: AbortController;
   readonly issuedChallengeIds: Set<string>;
+  readonly attempt?: RuntimeOAuthAttemptV1;
   phase: OAuthSessionPhase;
   authorization?: { readonly url: string; readonly instructions?: string };
   challenge?: PendingChallenge;
@@ -204,6 +273,10 @@ interface OAuthSession {
   tombstoneExpiresAtMs?: number;
   expirationTimer?: ReturnType<typeof setTimeout>;
   runPromise?: Promise<void>;
+  attemptRecord?: OAuthAttemptRecord;
+  attemptTransitionTail?: Promise<void>;
+  interactionClosed?: true;
+  retainProviderBarrier?: true;
 }
 
 class ProviderContractError extends Error {}
@@ -221,6 +294,7 @@ export class HostOAuthSessionBroker {
   private readonly hostId: string;
   private readonly providers: HostOAuthProviderPort;
   private readonly storage: HostOAuthStorage;
+  private readonly attemptStore: OAuthAttemptStore | undefined;
   private readonly activeTtlMs: number;
   private readonly tombstoneTtlMs: number;
   private readonly maxSessions: number;
@@ -230,12 +304,18 @@ export class HostOAuthSessionBroker {
   private readonly providerRuns = new Map<string, string>();
   private readonly startOperations = new Map<string, string>();
   private persistenceTail: Promise<void> = Promise.resolve();
+  private attemptAdmissionTail: Promise<void> = Promise.resolve();
+  private attemptAdmissionActive = false;
+  private latestAbsentAttemptObservationGeneration: bigint | undefined;
+  private attemptStoreFailure: unknown;
+  private closePromise: Promise<void> | undefined;
   private closed = false;
 
   constructor(options: HostOAuthSessionBrokerOptions) {
     this.hostId = boundedIdentifier(options.hostId, "Host identifier");
     this.providers = options.providers;
     this.storage = options.storage;
+    this.attemptStore = options.attemptStore;
     this.activeTtlMs = boundedInteger(
       options.activeTtlMs ?? DEFAULT_ACTIVE_TTL_MS,
       1,
@@ -253,8 +333,200 @@ export class HostOAuthSessionBroker {
     this.idFactory = options.idFactory ?? randomUUID;
   }
 
+  /**
+   * Admits one new digest-bound effect. A retained digest is never replayed;
+   * callers must reconcile it through status instead.
+   */
+  async startAttempt(
+    request: StartOAuthAttemptRequest,
+    admission?: OAuthAttemptSessionAdmission,
+  ): Promise<OAuthAttemptEffectResult> {
+    return await this.withAttemptAdmission(async () => {
+      this.requireOpen();
+      const store = this.requireAttemptStore();
+      const attempt = this.ownedAttempt(request.attempt);
+      this.assertAttemptStartAdmission(admission);
+      const authorityId = boundedIdentifier(request.authorityId, "OAuth authority identifier");
+      const nowMs = this.readNow();
+      this.collectGarbage(nowMs);
+
+      const retained = await this.attemptStoreCall(() => store.get(attempt));
+      this.requireOpen();
+      this.assertAttemptStartAdmission(admission);
+      if (retained) {
+        throw new OAuthBrokerError(
+          "OAUTH_ATTEMPT_RECONCILE_REQUIRED",
+          "The OAuth attempt is already retained; reconcile it with status",
+        );
+      }
+      if (this.providerRuns.has(attempt.identity.providerId)) {
+        throw new OAuthBrokerError("OAUTH_PROVIDER_BUSY", "An OAuth session for this provider is already active");
+      }
+      if (this.providerRuns.size >= this.maxSessions) {
+        throw new OAuthBrokerError("OAUTH_SESSION_LIMIT", "Too many OAuth sessions are retained");
+      }
+
+      let provider: HostOAuthProvider | undefined;
+      try {
+        provider = this.providers.getProvider(attempt.identity.providerId);
+        if (provider) assertProvider(provider, attempt.identity.providerId);
+      } catch {
+        throw new OAuthBrokerError("OAUTH_PROVIDER_NOT_FOUND", "OAuth provider is unavailable");
+      }
+      this.requireOpen();
+      this.assertAttemptStartAdmission(admission);
+      if (!provider) throw new OAuthBrokerError("OAUTH_PROVIDER_NOT_FOUND", "OAuth provider is unavailable");
+
+      const sessionId = this.nextSessionId();
+      this.requireOpen();
+      const requestedAtMs = Date.parse(attempt.identity.requestedAt);
+      const expiresAtMs = safeTimestamp(Math.max(nowMs, requestedAtMs), this.activeTtlMs);
+      const prepared = await this.attemptStoreCall(() => store.prepare({
+        attempt,
+        sessionId,
+        initialAuthorityId: authorityId,
+        observedAt: new Date(nowMs).toISOString(),
+        expiresAt: new Date(expiresAtMs).toISOString(),
+      }));
+      this.requireOpen();
+      this.assertAttemptStartAdmission(admission);
+      if (!prepared.created) {
+        throw new OAuthBrokerError(
+          "OAUTH_ATTEMPT_RECONCILE_REQUIRED",
+          "The OAuth attempt is already retained; reconcile it with status",
+        );
+      }
+      const loginDispatchingAt = this.transitionTimestamp(prepared.record);
+      this.requireOpen();
+      const dispatching = await this.attemptStoreCall(() => store.markLoginDispatching(
+        prepared.record,
+        loginDispatchingAt,
+      ));
+      // Once login_dispatching is durable, shutdown must leave that evidence
+      // fail-closed for reconciliation; it cannot authorize a provider helper
+      // that had not started before close took authority.
+      this.requireOpen();
+      this.assertAttemptStartAdmission(admission);
+
+      const session: OAuthSession = {
+        sessionId,
+        providerId: attempt.identity.providerId,
+        authorityId,
+        startOperationKey: `attempt:${attempt.attemptDigest}`,
+        expiresAtMs,
+        abortController: new AbortController(),
+        issuedChallengeIds: new Set(),
+        attempt,
+        attemptRecord: dispatching,
+        attemptTransitionTail: Promise.resolve(),
+        phase: "starting",
+      };
+      this.sessions.set(sessionId, session);
+      this.providerRuns.set(session.providerId, sessionId);
+      const expiresInMs = Math.max(1, expiresAtMs - nowMs);
+      session.expirationTimer = setTimeout(() => {
+        void this.cancelAttemptSession(session, "expired").catch(() => {
+          session.retainProviderBarrier = true;
+        });
+      }, expiresInMs);
+      session.expirationTimer.unref?.();
+      session.runPromise = this.runAttemptSession(session, provider);
+      return this.effectResult(dispatching);
+    });
+  }
+
+  /** Read-only health/admission projection; start still rechecks every boundary. */
+  async attemptEffectAdmissionReady(): Promise<boolean> {
+    if (
+      this.closed ||
+      !this.attemptStore ||
+      this.attemptAdmissionActive ||
+      this.providerRuns.has("openai-codex")
+    ) return false;
+    if (this.attemptStoreFailure) throw this.attemptStoreFailure;
+    const records = await this.attemptStoreCall(() => this.attemptStore!.list());
+    if (records.length >= OAUTH_ATTEMPT_MAX_FILES || records.some(isOAuthAttemptBarrier)) return false;
+    try {
+      const provider = this.providers.getProvider("openai-codex");
+      if (!provider) return false;
+      assertProvider(provider, "openai-codex");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Pure reconciliation: no clock read, provider lookup, cleanup, or write. */
+  async statusAttempt(
+    request: ReadOAuthAttemptRequest,
+    admission?: OAuthAttemptSessionAdmission,
+  ): Promise<OAuthAttemptStatusResult> {
+    return await this.withAttemptAdmission(async () => {
+      this.requireOpen();
+      const store = this.requireAttemptStore();
+      const attempt = this.ownedAttempt(request.attempt);
+      const record = await this.attemptStoreCall(() => store.get(attempt));
+      if (!record && admission?.isInputOpen()) {
+        const observed = this.latestAbsentAttemptObservationGeneration;
+        if (observed === undefined || admission.generation > observed) {
+          this.latestAbsentAttemptObservationGeneration = admission.generation;
+        }
+      }
+      return record ? this.effectResult(record) : deepFreeze({
+        attemptDigest: attempt.attemptDigest,
+        record: null,
+      });
+    }, false);
+  }
+
+  async cancelAttempt(request: ReadOAuthAttemptRequest): Promise<OAuthAttemptEffectResult> {
+    this.requireOpen();
+    const store = this.requireAttemptStore();
+    const attempt = this.ownedAttempt(request.attempt);
+    const record = await this.attemptStoreCall(() => store.get(attempt));
+    if (!record) {
+      throw new OAuthBrokerError("OAUTH_ATTEMPT_NOT_FOUND", "The OAuth attempt was not found");
+    }
+    const session = this.exactAttemptSession(record);
+    let current = record;
+    if (session) {
+      await this.cancelAttemptSession(session, "user");
+      current = await this.attemptStoreCall(() => store.get(attempt)) ?? record;
+    } else if (record.phase === "prepared") {
+      current = await this.attemptStoreCall(() => store.settle(record, createRuntimeOAuthAttemptTerminalV1({
+        version: 1,
+        attemptDigest: record.attempt.attemptDigest,
+        phase: "cancelled",
+        resolution: "user_cancelled",
+        configuredObserved: null,
+        terminalAt: this.transitionTimestamp(record),
+      })));
+    }
+    if (!isAttemptTerminal(current.phase)) {
+      throw new OAuthBrokerError(
+        "OAUTH_ATTEMPT_RECONCILE_REQUIRED",
+        "The OAuth attempt cannot be cancelled until helper retirement is reconciled",
+      );
+    }
+    return this.effectResult(current);
+  }
+
+  async acknowledgeAttempt(request: AcknowledgeOAuthAttemptRequest): Promise<OAuthAttemptEffectResult> {
+    this.requireOpen();
+    const store = this.requireAttemptStore();
+    const attempt = this.ownedAttempt(request.attempt);
+    const record = await this.attemptStoreCall(() => store.acknowledgeAttempt(
+      attempt,
+      request.expectedRevision,
+      request.terminalDigest,
+      request.acknowledgedAt,
+    ));
+    return this.effectResult(record);
+  }
+
   start(request: StartOAuthSessionRequest): OAuthSessionSnapshot {
     this.requireOpen();
+    this.requireLegacyApi();
     const nowMs = this.prepare(request);
     const providerId = boundedIdentifier(request.providerId, "OAuth provider identifier");
     const authorityId = boundedIdentifier(request.authorityId, "OAuth authority identifier");
@@ -268,16 +540,6 @@ export class HostOAuthSessionBroker {
     }
     const activeSessionId = this.providerRuns.get(providerId);
     if (activeSessionId) {
-      const activeSession = this.sessions.get(activeSessionId);
-      if (
-        activeSession &&
-        activeSession.authorityId === authorityId &&
-        (activeSession.phase === "starting" ||
-          activeSession.phase === "awaiting_user" ||
-          activeSession.phase === "committing")
-      ) {
-        return snapshotOf(activeSession);
-      }
       throw new OAuthBrokerError("OAUTH_PROVIDER_BUSY", "An OAuth session for this provider is already active");
     }
     if (this.sessions.size >= this.maxSessions || this.providerRuns.size >= this.maxSessions) {
@@ -313,11 +575,13 @@ export class HostOAuthSessionBroker {
   }
 
   status(request: ReadOAuthSessionRequest): OAuthSessionSnapshot {
+    this.requireLegacyApi();
     this.prepare(request);
     return snapshotOf(this.ownedSession(request));
   }
 
   respond(request: RespondOAuthSessionRequest): OAuthSessionSnapshot {
+    this.requireLegacyApi();
     this.prepare(request);
     const session = this.ownedSession(request);
     const challengeId = boundedIdentifier(request.challengeId, "OAuth challenge identifier");
@@ -338,6 +602,7 @@ export class HostOAuthSessionBroker {
   }
 
   async cancel(request: ReadOAuthSessionRequest): Promise<OAuthSessionSnapshot> {
+    this.requireLegacyApi();
     this.prepare(request);
     const session = this.ownedSession(request);
     if (session.phase === "committing") {
@@ -359,24 +624,106 @@ export class HostOAuthSessionBroker {
    * Revokes every in-flight provider helper and waits for the concrete adapter
    * to acknowledge the abort before host runtime ownership can be released.
    */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
+    const admitted = this.attemptAdmissionTail;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    void this.closeAfterAdmissions(admitted).then(resolveClose, rejectClose);
+    return this.closePromise;
+  }
+
+  private async closeAfterAdmissions(admitted: Promise<void>): Promise<void> {
     const nowMs = this.readNow();
-    const runs: Promise<void>[] = [];
-    for (const session of this.sessions.values()) {
-      if (session.phase === "starting" || session.phase === "awaiting_user") {
-        this.finish(session, "cancelled", nowMs);
+    const cancelled = new Set<string>();
+    const runs = new Set<Promise<void>>();
+    const collectRuns = (): void => {
+      for (const session of this.sessions.values()) {
+        if (!cancelled.has(session.sessionId)) {
+          cancelled.add(session.sessionId);
+          if (session.attemptRecord) {
+            runs.add(this.cancelAttemptSession(session, "shutdown"));
+          } else if (session.phase === "starting" || session.phase === "awaiting_user") {
+            this.finish(session, "cancelled", nowMs);
+          }
+        }
+        // A re-entrant close from provider.login can observe the session before
+        // startAttempt assigns runPromise. Re-collect after admission retires.
+        if (session.runPromise) runs.add(session.runPromise);
       }
-      if (session.runPromise) runs.push(session.runPromise);
-    }
-    await Promise.allSettled(runs);
+    };
+    collectRuns();
+    await admitted;
+    collectRuns();
+    await Promise.allSettled([...runs]);
   }
 
   private requireOpen(): void {
     if (this.closed) {
       throw new OAuthBrokerError("OAUTH_REQUEST_INVALID", "OAuth session broker is unavailable");
     }
+  }
+
+  private requireAttemptStore(): OAuthAttemptStore {
+    if (!this.attemptStore) {
+      throw new OAuthBrokerError(
+        "OAUTH_ATTEMPT_UNAVAILABLE",
+        "The durable OAuth attempt journal is unavailable",
+      );
+    }
+    return this.attemptStore;
+  }
+
+  /** Synchronous host-side preflight; startAttempt repeats it at every commit boundary. */
+  assertAttemptStartAdmission(admission: OAuthAttemptSessionAdmission | undefined): void {
+    if (!admission) return;
+    const absentObservation = this.latestAbsentAttemptObservationGeneration;
+    if (
+      !admission.isInputOpen() ||
+      (absentObservation !== undefined && admission.generation < absentObservation)
+    ) {
+      throw new OAuthBrokerError(
+        "OAUTH_ATTEMPT_CONNECTION_SUPERSEDED",
+        "The framed connection lost OAuth start authority before the attempt was admitted",
+      );
+    }
+  }
+
+  private requireLegacyApi(): void {
+    if (this.attemptStore) {
+      throw new OAuthBrokerError(
+        "OAUTH_ATTEMPT_RECONCILE_REQUIRED",
+        "Legacy OAuth sessions are disabled when durable attempts are configured",
+      );
+    }
+  }
+
+  private async attemptStoreCall<T>(action: () => Promise<T>): Promise<T> {
+    if (this.attemptStoreFailure) throw this.attemptStoreFailure;
+    try {
+      return await action();
+    } catch (error) {
+      if (isAttemptStoreHealthFailure(error)) this.attemptStoreFailure ??= error;
+      throw error;
+    }
+  }
+
+  private ownedAttempt(value: unknown): RuntimeOAuthAttemptV1 {
+    let attempt: RuntimeOAuthAttemptV1;
+    try {
+      attempt = parseRuntimeOAuthAttemptV1(value);
+    } catch {
+      throw new OAuthBrokerError("OAUTH_REQUEST_INVALID", "OAuth attempt identity is malformed");
+    }
+    if (attempt.identity.expectedHostId !== this.hostId) {
+      throw new OAuthBrokerError("HOST_AUTHORITY_MISMATCH", "OAuth request targets a different host authority");
+    }
+    return attempt;
   }
 
   private prepare(request: AuthorityBinding): number {
@@ -398,6 +745,393 @@ export class HostOAuthSessionBroker {
       throw new OAuthBrokerError("OAUTH_SESSION_FORBIDDEN", "OAuth session belongs to a different authority");
     }
     return session;
+  }
+
+  private async runAttemptSession(session: OAuthSession, provider: HostOAuthProvider): Promise<void> {
+    try {
+      const credentials = await provider.login(this.callbacksFor(session));
+      if (session.contractViolated) throw new ProviderContractError();
+      assertCredentials(credentials);
+
+      const credentialsRetained = await this.withAttemptTransition(session, async () => {
+        const record = await this.currentAttemptRecord(session);
+        if (record.phase === "cancelling") {
+          await this.settleCancellationAfterRetirement(session, record);
+          return false;
+        }
+        if (isAttemptTerminal(record.phase)) {
+          this.reflectAttemptTerminal(session, record);
+          return false;
+        }
+        if (record.phase === "login_dispatching" && this.readNow() >= session.expiresAtMs) {
+          const cancelling = await this.attemptStoreCall(() => this.requireAttemptStore().markCancelling(
+            record,
+            "expired",
+            this.transitionTimestamp(record),
+          ));
+          session.attemptRecord = cancelling;
+          this.interruptAttemptSession(session);
+          await this.settleCancellationAfterRetirement(session, cancelling);
+          return false;
+        }
+        if (record.phase !== "login_dispatching") {
+          session.retainProviderBarrier = true;
+          this.retireInteraction(session);
+          return false;
+        }
+        session.attemptRecord = await this.attemptStoreCall(() => this.requireAttemptStore().markCredentialsReady(
+          record,
+          this.transitionTimestamp(record),
+        ));
+        session.phase = "committing";
+        this.retireChallenge(session);
+        return true;
+      });
+      if (!credentialsRetained) return;
+
+      const dispatched = await this.confirmPersistence(session.providerId, credentials, async () => {
+        return await this.withAttemptTransition(session, async () => {
+          const record = await this.currentAttemptRecord(session);
+          if (isAttemptTerminal(record.phase)) {
+            this.reflectAttemptTerminal(session, record);
+            return false;
+          }
+          if (record.phase !== "credentials_ready") {
+            session.retainProviderBarrier = true;
+            this.retireInteraction(session);
+            return false;
+          }
+          session.attemptRecord = await this.attemptStoreCall(() => this.requireAttemptStore().markPersistenceDispatching(
+            record,
+            this.transitionTimestamp(record),
+          ));
+          return true;
+        });
+      });
+      if (!dispatched) return;
+
+      await this.withAttemptTransition(session, async () => {
+        const record = await this.currentAttemptRecord(session);
+        if (record.phase !== "persistence_dispatching") {
+          session.retainProviderBarrier = true;
+          this.retireInteraction(session);
+          return;
+        }
+        await this.settleAttempt(
+          session,
+          record,
+          "completed",
+          "persistence_confirmed",
+          true,
+        );
+      });
+    } catch (error) {
+      try {
+        await this.handleAttemptRunError(session, error);
+      } catch {
+        // A journal mutation/read failure cannot authorize a terminal claim or
+        // release the provider. Restart owns the next durable classification.
+        session.retainProviderBarrier = true;
+        this.retireInteraction(session);
+      }
+    } finally {
+      const record = session.attemptRecord;
+      if (!session.retainProviderBarrier && record && isAttemptTerminal(record.phase)) {
+        this.releaseProviderRun(session);
+      }
+    }
+  }
+
+  private async handleAttemptRunError(session: OAuthSession, error: unknown): Promise<void> {
+    if (error instanceof OAuthAttemptStoreError) {
+      session.retainProviderBarrier = true;
+      this.retireInteraction(session);
+      return;
+    }
+    await this.withAttemptTransition(session, async () => {
+      const record = await this.currentAttemptRecord(session);
+      if (isAttemptTerminal(record.phase)) {
+        this.reflectAttemptTerminal(session, record);
+        return;
+      }
+      if (isHelperLivenessUnconfirmed(error)) {
+        const reason = recoveryReasonFor(record);
+        if (!reason) {
+          session.retainProviderBarrier = true;
+          this.retireInteraction(session);
+          return;
+        }
+        session.attemptRecord = await this.attemptStoreCall(() => this.requireAttemptStore().markRecoveryRequired(
+          record,
+          reason,
+          this.transitionTimestamp(record),
+        ));
+        session.retainProviderBarrier = true;
+        this.retireInteraction(session);
+        return;
+      }
+      if (record.phase === "cancelling") {
+        await this.settleCancellationAfterRetirement(session, record);
+        return;
+      }
+      switch (record.phase) {
+        case "prepared":
+          await this.settleAttempt(
+            session,
+            record,
+            "failed",
+            "interrupted_before_login_dispatch",
+            null,
+            providerFailureSnapshot(error),
+          );
+          return;
+        case "login_dispatching":
+          await this.settleAttempt(
+            session,
+            record,
+            "failed",
+            "provider_login_failed",
+            null,
+            providerFailureSnapshot(error),
+          );
+          return;
+        case "credentials_ready":
+          await this.settleAttempt(
+            session,
+            record,
+            "failed",
+            "credentials_discarded_before_persistence",
+            null,
+            discardedCredentialsSnapshot(),
+          );
+          return;
+        case "persistence_dispatching":
+          await this.settleAttempt(
+            session,
+            record,
+            "failed",
+            "persistence_failed",
+            null,
+            persistenceFailureSnapshot(),
+          );
+          return;
+        case "recovery_required":
+          session.retainProviderBarrier = true;
+          this.retireInteraction(session);
+          return;
+      }
+    });
+  }
+
+  private async cancelAttemptSession(
+    session: OAuthSession,
+    intent: OAuthAttemptCancelIntent,
+  ): Promise<void> {
+    let awaitRun = false;
+    await this.withAttemptTransition(session, async () => {
+      const record = await this.currentAttemptRecord(session);
+      if (isAttemptTerminal(record.phase)) {
+        this.reflectAttemptTerminal(session, record);
+        awaitRun = session.runPromise !== undefined;
+        return;
+      }
+      switch (record.phase) {
+        case "login_dispatching":
+          session.attemptRecord = await this.attemptStoreCall(() => this.requireAttemptStore().markCancelling(
+            record,
+            intent,
+            this.transitionTimestamp(record),
+          ));
+          this.interruptAttemptSession(session);
+          awaitRun = true;
+          return;
+        case "cancelling":
+          this.interruptAttemptSession(session);
+          awaitRun = true;
+          return;
+        case "credentials_ready":
+          await this.settleAttempt(
+            session,
+            record,
+            "failed",
+            "credentials_discarded_before_persistence",
+            null,
+            discardedCredentialsSnapshot(),
+          );
+          awaitRun = session.runPromise !== undefined;
+          return;
+        case "persistence_dispatching":
+          awaitRun = true;
+          return;
+        case "prepared":
+        case "recovery_required":
+          session.retainProviderBarrier = true;
+          this.retireInteraction(session);
+          return;
+      }
+    });
+    if (awaitRun && session.runPromise) await session.runPromise;
+  }
+
+  private async settleCancellationAfterRetirement(
+    session: OAuthSession,
+    record: OAuthAttemptRecord,
+  ): Promise<void> {
+    switch (record.cancelIntent) {
+      case "user":
+        await this.settleAttempt(session, record, "cancelled", "user_cancelled", null);
+        return;
+      case "expired":
+        await this.settleAttempt(
+          session,
+          record,
+          "failed",
+          "expired",
+          null,
+          expiredSnapshot(),
+        );
+        return;
+      case "shutdown":
+        await this.settleAttempt(
+          session,
+          record,
+          "failed",
+          "host_shutdown",
+          null,
+          interruptedSnapshot(),
+        );
+        return;
+      default:
+        session.retainProviderBarrier = true;
+        this.retireInteraction(session);
+    }
+  }
+
+  private async settleAttempt(
+    session: OAuthSession,
+    record: OAuthAttemptRecord,
+    phase: RuntimeOAuthAttemptTerminalPhase,
+    resolution: RuntimeOAuthAttemptTerminalResolution,
+    configuredObserved: boolean | null,
+    error?: OAuthSessionSnapshot["error"],
+  ): Promise<void> {
+    const terminal = createRuntimeOAuthAttemptTerminalV1({
+      version: 1,
+      attemptDigest: record.attempt.attemptDigest,
+      phase,
+      resolution,
+      configuredObserved,
+      terminalAt: this.transitionTimestamp(record),
+    });
+    session.attemptRecord = await this.attemptStoreCall(() => this.requireAttemptStore().settle(record, terminal));
+    this.finish(session, phase === "outcome_unknown" ? "failed" : phase, this.readNow(), error);
+  }
+
+  private async currentAttemptRecord(session: OAuthSession): Promise<OAuthAttemptRecord> {
+    if (!session.attempt) {
+      throw new OAuthBrokerError("OAUTH_ATTEMPT_NOT_FOUND", "The OAuth attempt was not found");
+    }
+    const record = await this.attemptStoreCall(() => this.requireAttemptStore().get(session.attempt!));
+    if (!record || record.sessionId !== session.sessionId) {
+      throw new OAuthBrokerError("OAUTH_ATTEMPT_NOT_FOUND", "The OAuth attempt was not found");
+    }
+    session.attemptRecord = record;
+    return record;
+  }
+
+  private async withAttemptTransition<T>(session: OAuthSession, action: () => Promise<T>): Promise<T> {
+    const prior = session.attemptTransitionTail ?? Promise.resolve();
+    let release!: () => void;
+    session.attemptTransitionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prior;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  private async withAttemptAdmission<T>(
+    action: () => Promise<T>,
+    effectBearing = true,
+  ): Promise<T> {
+    const prior = this.attemptAdmissionTail;
+    let release!: () => void;
+    this.attemptAdmissionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prior;
+    if (effectBearing) this.attemptAdmissionActive = true;
+    try {
+      return await action();
+    } finally {
+      if (effectBearing) this.attemptAdmissionActive = false;
+      release();
+    }
+  }
+
+  private exactAttemptSession(record: OAuthAttemptRecord): OAuthSession | undefined {
+    const session = this.sessions.get(record.sessionId);
+    return session?.attempt?.attemptDigest === record.attempt.attemptDigest &&
+      session.providerId === record.attempt.identity.providerId &&
+      session.authorityId === record.initialAuthorityId
+      ? session
+      : undefined;
+  }
+
+  private effectResult(record: OAuthAttemptRecord): OAuthAttemptEffectResult {
+    const session = this.exactAttemptSession(record);
+    const live = session && liveMatchesAttemptPhase(record.phase, session.phase)
+      ? snapshotOf(session)
+      : undefined;
+    return deepFreeze({
+      attemptDigest: record.attempt.attemptDigest,
+      record: projectAttemptRecord(record),
+      ...(live ? { live } : {}),
+    });
+  }
+
+  private transitionTimestamp(record: OAuthAttemptRecord): string {
+    return new Date(Math.max(this.readNow(), Date.parse(record.updatedAt))).toISOString();
+  }
+
+  private interruptAttemptSession(session: OAuthSession): void {
+    this.retireInteraction(session);
+    session.abortController.abort();
+  }
+
+  private retireInteraction(session: OAuthSession): void {
+    session.interactionClosed = true;
+    session.authorization = undefined;
+    session.progress = undefined;
+    this.retireChallenge(session);
+    if (session.expirationTimer) {
+      clearTimeout(session.expirationTimer);
+      session.expirationTimer = undefined;
+    }
+  }
+
+  private retireChallenge(session: OAuthSession): void {
+    const pending = session.challenge;
+    session.challenge = undefined;
+    pending?.resolve(undefined);
+  }
+
+  private reflectAttemptTerminal(session: OAuthSession, record: OAuthAttemptRecord): void {
+    session.attemptRecord = record;
+    if (!record.terminal || !isAttemptTerminal(record.phase)) return;
+    const error = record.phase === "failed"
+      ? terminalFailureSnapshot(record.terminal.body.resolution)
+      : undefined;
+    this.finish(session, record.phase === "outcome_unknown" ? "failed" : record.phase, this.readNow(), error);
+  }
+
+  private releaseProviderRun(session: OAuthSession): void {
+    if (this.providerRuns.get(session.providerId) === session.sessionId) {
+      this.providerRuns.delete(session.providerId);
+    }
   }
 
   private async runSession(session: OAuthSession, provider: HostOAuthProvider): Promise<void> {
@@ -503,7 +1237,10 @@ export class HostOAuthSessionBroker {
   }
 
   private requireInteractive(session: OAuthSession): void {
-    if (session.phase !== "starting" && session.phase !== "awaiting_user") {
+    if (
+      session.interactionClosed ||
+      (session.phase !== "starting" && session.phase !== "awaiting_user")
+    ) {
       throw new SessionInterruptedError();
     }
   }
@@ -517,7 +1254,11 @@ export class HostOAuthSessionBroker {
     }
   }
 
-  private async confirmPersistence(providerId: string, credentials: OAuthCredentials): Promise<void> {
+  private async confirmPersistence(
+    providerId: string,
+    credentials: OAuthCredentials,
+    beforeDispatch: () => Awaitable<boolean> = () => true,
+  ): Promise<boolean> {
     const previous = this.persistenceTail;
     let release!: () => void;
     this.persistenceTail = new Promise<void>((resolve) => {
@@ -525,7 +1266,9 @@ export class HostOAuthSessionBroker {
     });
     await previous.catch(() => undefined);
     try {
+      if (!await beforeDispatch()) return false;
       await this.confirmPersistenceExclusive(providerId, credentials);
+      return true;
     } finally {
       release();
     }
@@ -536,27 +1279,31 @@ export class HostOAuthSessionBroker {
     let unconfirmed = false;
     try {
       await this.storage.set(providerId, { ...credentials, type: "oauth" });
-    } catch {
+    } catch (error) {
+      if (isHelperLivenessUnconfirmed(error)) throw error;
       unconfirmed = true;
     }
 
     try {
       const errors = await this.storage.drainErrors();
       if (!Array.isArray(errors) || errors.length > 0) unconfirmed = true;
-    } catch {
+    } catch (error) {
+      if (isHelperLivenessUnconfirmed(error)) throw error;
       unconfirmed = true;
     }
 
     try {
       await this.storage.reload();
-    } catch {
+    } catch (error) {
+      if (isHelperLivenessUnconfirmed(error)) throw error;
       unconfirmed = true;
     }
 
     try {
       const status = await this.storage.getAuthStatus(providerId);
       if (!isRecord(status) || status.configured !== true) unconfirmed = true;
-    } catch {
+    } catch (error) {
+      if (isHelperLivenessUnconfirmed(error)) throw error;
       unconfirmed = true;
     }
 
@@ -593,6 +1340,7 @@ export class HostOAuthSessionBroker {
   private collectGarbage(nowMs: number): void {
     for (const [sessionId, session] of this.sessions) {
       if (
+        !session.attempt &&
         (session.phase === "starting" || session.phase === "awaiting_user") &&
         nowMs >= session.expiresAtMs
       ) {
@@ -686,6 +1434,138 @@ export class HostOAuthSessionBroker {
     }
     return nowMs;
   }
+}
+
+function isAttemptTerminal(
+  phase: OAuthAttemptRecord["phase"],
+): phase is Extract<OAuthAttemptRecord["phase"], "completed" | "cancelled" | "failed" | "outcome_unknown"> {
+  return phase === "completed" || phase === "cancelled" || phase === "failed" || phase === "outcome_unknown";
+}
+
+function liveMatchesAttemptPhase(
+  recordPhase: OAuthAttemptRecord["phase"],
+  livePhase: OAuthSessionPhase,
+): boolean {
+  switch (recordPhase) {
+    case "login_dispatching":
+    case "cancelling":
+      return livePhase === "starting" || livePhase === "awaiting_user";
+    case "credentials_ready":
+    case "persistence_dispatching":
+      return livePhase === "committing";
+    case "completed":
+    case "cancelled":
+    case "failed":
+      return livePhase === recordPhase;
+    case "prepared":
+    case "recovery_required":
+    case "outcome_unknown":
+      return false;
+  }
+}
+
+function isHelperLivenessUnconfirmed(error: unknown): boolean {
+  return isRecord(error) &&
+    error.name === "RuntimeOAuthHelperTerminationError" &&
+    error.code === "RUNTIME_OAUTH_HELPER_FAILED" &&
+    error.terminationObserved === false;
+}
+
+function isAttemptStoreHealthFailure(error: unknown): boolean {
+  return !(error instanceof OAuthAttemptStoreError) ||
+    error.code === "OAUTH_ATTEMPT_STORE_INVALID" ||
+    error.code === "OAUTH_ATTEMPT_COMMIT_UNCERTAIN";
+}
+
+function recoveryReasonFor(record: OAuthAttemptRecord): OAuthAttemptRecoveryReason | undefined {
+  switch (record.phase) {
+    case "login_dispatching":
+      return "login_helper_liveness_unconfirmed";
+    case "persistence_dispatching":
+      return "storage_helper_liveness_unconfirmed";
+    case "cancelling":
+      return "cancelling_helper_liveness_unconfirmed";
+    default:
+      return undefined;
+  }
+}
+
+function providerFailureSnapshot(error: unknown): OAuthSessionSnapshot["error"] {
+  return error instanceof ProviderContractError
+    ? {
+        code: "OAUTH_PROVIDER_CONTRACT_INVALID",
+        message: "OAuth provider returned an invalid authorization contract",
+        retryable: false,
+      }
+    : {
+        code: "OAUTH_PROVIDER_FAILED",
+        message: "OAuth provider login failed",
+        retryable: true,
+      };
+}
+
+function persistenceFailureSnapshot(): OAuthSessionSnapshot["error"] {
+  return {
+    code: "OAUTH_PERSISTENCE_UNCONFIRMED",
+    message: "OAuth credentials could not be confirmed in durable host storage",
+    retryable: true,
+  };
+}
+
+function discardedCredentialsSnapshot(): OAuthSessionSnapshot["error"] {
+  return {
+    code: "OAUTH_PROVIDER_FAILED",
+    message: "OAuth credentials were discarded before persistence",
+    retryable: true,
+  };
+}
+
+function expiredSnapshot(): OAuthSessionSnapshot["error"] {
+  return {
+    code: "OAUTH_SESSION_EXPIRED",
+    message: "OAuth session expired before completion",
+    retryable: true,
+  };
+}
+
+function interruptedSnapshot(): OAuthSessionSnapshot["error"] {
+  return {
+    code: "OAUTH_PROVIDER_FAILED",
+    message: "OAuth session was interrupted before completion",
+    retryable: true,
+  };
+}
+
+function terminalFailureSnapshot(
+  resolution: RuntimeOAuthAttemptTerminalResolution,
+): OAuthSessionSnapshot["error"] {
+  switch (resolution) {
+    case "expired":
+      return expiredSnapshot();
+    case "persistence_failed":
+      return persistenceFailureSnapshot();
+    case "credentials_discarded_before_persistence":
+      return discardedCredentialsSnapshot();
+    default:
+      return interruptedSnapshot();
+  }
+}
+
+function projectAttemptRecord(record: OAuthAttemptRecord): OAuthAttemptRecordProjection {
+  return deepFreeze({
+    recordVersion: record.recordVersion,
+    attempt: record.attempt,
+    revision: record.revision,
+    sessionId: record.sessionId,
+    phase: record.phase,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    expiresAt: record.expiresAt,
+    ...(record.terminal ? { terminal: record.terminal } : {}),
+    ...(record.desktopAcknowledgedAt
+      ? { desktopAcknowledgedAt: record.desktopAcknowledgedAt }
+      : {}),
+  });
 }
 
 function snapshotOf(session: OAuthSession): OAuthSessionSnapshot {
