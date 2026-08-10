@@ -46,6 +46,29 @@ means only that the frame entered the bounded online peer socket; it is not an
 application receipt. Status `1` means unavailable and status `2` means the
 peer crossed its backpressure bound.
 
+Each accepted connection has a 60-second idle timeout by default. Operators
+may configure `limits.idleConnectionTimeoutMs` only from 1 second through 10
+minutes. The timer is refreshed only after that connection's own client data
+frame passes binary, size, rate, codec, kind, and channel-binding policy. Peer
+data, server-authored routing controls, rejected text, malformed frames,
+client-authored controls, and policy/rate violations never refresh it. A future
+secure client must send authenticated heartbeat data when otherwise silent.
+Expiry closes the WebSocket with application code
+`4000` and reason `idle_timeout`; connection close and server stop cancel the
+timer. The optional scheduler and clock injections exist for deterministic
+tests. A custom scheduler is rejected unless the explicit insecure-loopback
+test flag is set on a loopback host; ordinary TLS/production construction
+therefore always uses the default unref'ed Node timer.
+
+From the repository root, the canonical `pnpm typecheck`, `pnpm test`, and
+`pnpm build` scripts include this package exactly once. `pnpm self-build` uses
+the same relay-inclusive typecheck/test gates and its relay-inclusive
+`build:release` gate; cross-platform source CI uses the three canonical root
+commands rather than duplicating package tests in another workflow step. Relay
+builds run as a supervised step inside the shared repository workflow lock,
+including release, packaging, distribution, and visual-verification workflows;
+they do not mutate `dist/` before build admission succeeds.
+
 ## Security boundary and current non-claims
 
 - Production construction requires TLS configuration. Plain `ws://` is
@@ -57,6 +80,10 @@ peer crossed its backpressure bound.
 - The included grant store is process-local and ephemeral. This slice has no
   admin API, durable/multi-node grant database, pairing flow, key storage,
   revocation authority, secure-channel handshake, or mobile client.
+- The idle timeout is a resource bound, not peer authentication, a liveness
+  proof, a maximum session-age/rekey policy, or end-to-end delivery evidence.
+  Accepted traffic can keep a connection open until another bound or shutdown
+  applies.
 - The relay is deliberately not wired into host capabilities or the desktop
   renderer yet. Its passing tests establish an isolated transport boundary,
   not production remote control.

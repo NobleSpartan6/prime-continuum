@@ -5,6 +5,11 @@ import { describe, expect, it } from 'vitest'
 const workflowPath = resolve('.github/workflows/cross-platform-source.yml')
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n?/g, '\n')
 const vitestConfig = readFileSync(resolve('vitest.config.ts'), 'utf8').replace(/\r\n?/g, '\n')
+const rootPackage = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as {
+  scripts: Record<string, string>
+}
+const selfBuildSource = readFileSync(resolve('scripts/self-build-lib.mjs'), 'utf8').replace(/\r\n?/g, '\n')
+const workflowRunnerSource = readFileSync(resolve('scripts/run-workflow.mjs'), 'utf8').replace(/\r\n?/g, '\n')
 
 describe('cross-platform source CI policy', () => {
   it('runs the exact source gates on stable Linux, Windows, and macOS hosts', () => {
@@ -20,6 +25,34 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).toContain('run: pnpm typecheck')
     expect(workflow).toContain('run: pnpm test')
     expect(workflow).toContain('run: pnpm build')
+    expect(workflow).toContain('Typecheck Node, renderer, and relay boundaries')
+    expect(workflow).toContain('Run the complete root and relay source test suite')
+    expect(workflow).toContain('Build the desktop, host-service, and relay source')
+  })
+
+  it('composes the relay package exactly once into each canonical root source gate', () => {
+    expect(rootPackage.scripts.typecheck).toBe(
+      'tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit && pnpm --filter @prime-agent/relay-server typecheck',
+    )
+    expect(rootPackage.scripts.test).toBe('vitest run && pnpm --filter @prime-agent/relay-server test')
+    expect(rootPackage.scripts.build).toBe('node scripts/run-workflow.mjs build')
+    expect(rootPackage.scripts['build:release']).toBe('node scripts/run-workflow.mjs build:release')
+
+    for (const scriptName of ['typecheck', 'test']) {
+      expect(rootPackage.scripts[scriptName]!.match(/@prime-agent\/relay-server/g)).toHaveLength(1)
+    }
+    expect(workflow).not.toContain('@prime-agent/relay-server')
+
+    const relayBuildStep = "pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build'])"
+    expect(workflowRunnerSource.match(new RegExp(relayBuildStep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(2)
+    expect(workflowRunnerSource).toMatch(/const releaseBuildSteps = \[\n\s+pnpmStep\('Build the relay server'/)
+    expect(workflowRunnerSource).toMatch(/\bbuild: \[\n\s+pnpmStep\('Build the relay server'/)
+  })
+
+  it('keeps self-build on the same relay-inclusive canonical root gates', () => {
+    expect(selfBuildSource).toContain("pnpm('Typecheck the candidate', ['run', 'typecheck'])")
+    expect(selfBuildSource).toContain("pnpm('Run the candidate test suite', ['run', 'test'])")
+    expect(selfBuildSource).toContain("'run', 'build:release',")
   })
 
   it('pins every external action and grants no mutation or secret-bearing authority', () => {

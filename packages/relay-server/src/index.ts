@@ -9,11 +9,17 @@ export {
 } from "./grant-store";
 export {
   PrimeRelayServer,
+  MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS,
+  MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS,
   RELAY_FORWARD_STATUS,
+  RELAY_IDLE_CLOSE_CODE,
+  RELAY_IDLE_CLOSE_REASON,
   RELAY_PATH,
   RELAY_SUBPROTOCOL,
   type RelayLogEvent,
+  type RelayScheduledTask,
   type RelayServerLimits,
   type RelayServerOptions,
+  type RelayServerScheduler,
   type RelayServerStateSnapshot,
 } from "./server";

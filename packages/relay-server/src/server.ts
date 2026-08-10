@@ -21,6 +21,10 @@ import {
 
 export const RELAY_SUBPROTOCOL = "prime-relay-routing.v1" as const;
 export const RELAY_PATH = "/relay" as const;
+export const RELAY_IDLE_CLOSE_CODE = 4000 as const;
+export const RELAY_IDLE_CLOSE_REASON = "idle_timeout" as const;
+export const MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS = 1_000 as const;
+export const MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS = 10 * 60 * 1_000;
 
 export const RELAY_FORWARD_STATUS = {
   acceptedByPeerSocket: 0,
@@ -35,6 +39,19 @@ export interface RelayServerLimits {
   readonly maxBufferedBytesPerConnection: number;
   readonly maxFramesPerSecondPerConnection: number;
   readonly maxGrantRemainingLifetimeMs: number;
+  readonly idleConnectionTimeoutMs: number;
+}
+
+export interface RelayScheduledTask {
+  cancel(): void;
+}
+
+/**
+ * Injectable one-shot scheduler. Production uses unref'ed Node timers; tests
+ * can advance a deterministic clock without sleeping.
+ */
+export interface RelayServerScheduler {
+  schedule(delayMs: number, callback: () => void): RelayScheduledTask;
 }
 
 export type RelayLogEvent =
@@ -44,6 +61,7 @@ export type RelayLogEvent =
   | { readonly type: "connection_open"; readonly role: RelayEndpointRole }
   | { readonly type: "connection_close"; readonly role: RelayEndpointRole; readonly code: number }
   | { readonly type: "connection_error"; readonly role: RelayEndpointRole }
+  | { readonly type: "connection_idle_timeout"; readonly role: RelayEndpointRole }
   | { readonly type: "frame_rejected"; readonly role: RelayEndpointRole; readonly category: "binary" | "size" | "codec" | "policy" | "rate" }
   | { readonly type: "frame_forwarded"; readonly direction: "host_to_device" | "device_to_host"; readonly bytes: number }
   | { readonly type: "frame_dropped"; readonly reason: "unavailable" | "backpressure"; readonly bytes: number };
@@ -60,7 +78,13 @@ export interface RelayServerOptions {
    */
   readonly allowInsecureLoopbackForTests?: boolean;
   readonly limits?: Partial<RelayServerLimits>;
+  /** Injectable time source for deterministic policy tests. */
   readonly now?: () => number;
+  /**
+   * Test-only deterministic seam. Supplying it requires the explicit
+   * insecure-loopback test mode on a loopback host.
+   */
+  readonly scheduler?: RelayServerScheduler;
   readonly logger?: (event: RelayLogEvent) => void;
 }
 
@@ -81,6 +105,8 @@ interface ConnectionState {
   framesInWindow: number;
   acceptingFrames: boolean;
   closed: boolean;
+  idleTask: RelayScheduledTask | undefined;
+  idleToken: object | undefined;
 }
 
 interface RouteState {
@@ -96,6 +122,15 @@ const DEFAULT_LIMITS: RelayServerLimits = {
   maxBufferedBytesPerConnection: 256 * 1024,
   maxFramesPerSecondPerConnection: 128,
   maxGrantRemainingLifetimeMs: 5 * 60 * 1_000,
+  idleConnectionTimeoutMs: 60 * 1_000,
+};
+
+const DEFAULT_SCHEDULER: RelayServerScheduler = {
+  schedule(delayMs, callback) {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref();
+    return { cancel: () => clearTimeout(timer) };
+  },
 };
 
 const ZERO_CHANNEL_ID = new Uint8Array(RELAY_ROUTING_CHANNEL_ID_BYTES);
@@ -111,6 +146,7 @@ export class PrimeRelayServer {
   readonly #path: string;
   readonly #limits: RelayServerLimits;
   readonly #now: () => number;
+  readonly #scheduler: RelayServerScheduler;
   readonly #log: (event: RelayLogEvent) => void;
   readonly #secure: boolean;
   readonly #httpServer: HttpServer;
@@ -126,11 +162,15 @@ export class PrimeRelayServer {
     this.#path = validatePath(options.path ?? RELAY_PATH);
     this.#limits = mergeLimits(options.limits);
     this.#now = options.now ?? Date.now;
+    this.#scheduler = options.scheduler ?? DEFAULT_SCHEDULER;
     this.#log = options.logger ?? (() => undefined);
     this.#secure = options.tls !== undefined;
 
     if (!this.#secure && (!options.allowInsecureLoopbackForTests || !isLoopback(this.#host))) {
       throw new Error("The relay requires TLS; insecure ws:// is allowed only on loopback with the explicit test option");
+    }
+    if (options.scheduler !== undefined && (!options.allowInsecureLoopbackForTests || !isLoopback(this.#host))) {
+      throw new Error("A custom relay scheduler is allowed only on loopback with the explicit test option");
     }
 
     const requestHandler = (_request: IncomingMessage, response: import("node:http").ServerResponse) => {
@@ -192,6 +232,7 @@ export class PrimeRelayServer {
     }
     this.#started = false;
     for (const connection of [...this.#connections]) {
+      this.#clearIdleTask(connection);
       connection.ws.terminate();
     }
     await Promise.all([
@@ -337,6 +378,8 @@ export class PrimeRelayServer {
       framesInWindow: 0,
       acceptingFrames: true,
       closed: false,
+      idleTask: undefined,
+      idleToken: undefined,
     };
     if (grant.role === "host") {
       route.host = state;
@@ -353,6 +396,9 @@ export class PrimeRelayServer {
     this.#log({ type: "connection_open", role: grant.role });
 
     this.#sendControl(state, "ready", state.channelId, 0n);
+    if (!this.#resetIdleTask(state)) {
+      return;
+    }
     if (grant.role === "host") {
       for (const device of route.devices.values()) {
         this.#sendControl(state, "peer_open", device.channelId, 0n);
@@ -394,6 +440,18 @@ export class PrimeRelayServer {
       return;
     }
 
+    if (sender.grant.role === "device" && !equalChannelIds(frame.channelId, sender.channelId)) {
+      this.#rejectFrame(sender, "policy", 1008);
+      return;
+    }
+
+    // Only a frame that passed binary, size, rate, codec, kind, and
+    // channel-binding policy is accepted activity. Rejected input never keeps
+    // a connection alive.
+    if (!this.#resetIdleTask(sender)) {
+      return;
+    }
+
     const route = this.#routes.get(sender.grant.routeId);
     if (route === undefined) {
       this.#sendForwardResult(sender, frame, RELAY_FORWARD_STATUS.unavailable);
@@ -401,10 +459,6 @@ export class PrimeRelayServer {
     }
 
     if (sender.grant.role === "device") {
-      if (!equalChannelIds(frame.channelId, sender.channelId)) {
-        this.#rejectFrame(sender, "policy", 1008);
-        return;
-      }
       this.#forward(sender, route.host, frame, bytes, "device_to_host");
       return;
     }
@@ -433,7 +487,7 @@ export class PrimeRelayServer {
     try {
       recipient.ws.send(wireBytes, { binary: true, compress: false }, (error) => {
         if (error != null && !recipient.closed) {
-          recipient.ws.terminate();
+          this.#terminateConnection(recipient);
         }
       });
       // This receipt means only that the bounded peer socket accepted the
@@ -463,14 +517,14 @@ export class PrimeRelayServer {
     try {
       const wire = encodeRelayRoutingFrame({ kind, channelId, messageId, payload });
       if (recipient.ws.bufferedAmount + wire.byteLength > this.#limits.maxBufferedBytesPerConnection) {
-        recipient.ws.close(1013);
+        this.#closeConnection(recipient, 1013);
         return;
       }
       recipient.ws.send(wire, { binary: true, compress: false }, (error) => {
-        if (error != null && !recipient.closed) recipient.ws.terminate();
+        if (error != null && !recipient.closed) this.#terminateConnection(recipient);
       });
     } catch {
-      if (!recipient.closed) recipient.ws.terminate();
+      if (!recipient.closed) this.#terminateConnection(recipient);
     }
   }
 
@@ -485,12 +539,12 @@ export class PrimeRelayServer {
   }
 
   #rejectFrame(connection: ConnectionState, category: Extract<RelayLogEvent, { type: "frame_rejected" }>["category"], code: number): void {
-    connection.acceptingFrames = false;
     this.#log({ type: "frame_rejected", role: connection.grant.role, category });
-    connection.ws.close(code);
+    this.#closeConnection(connection, code);
   }
 
   #onClose(connection: ConnectionState, code: number): void {
+    this.#clearIdleTask(connection);
     if (connection.closed) {
       return;
     }
@@ -519,6 +573,70 @@ export class PrimeRelayServer {
     this.#log({ type: "connection_close", role: connection.grant.role, code });
   }
 
+  #resetIdleTask(connection: ConnectionState): boolean {
+    if (!this.#started || connection.closed || !connection.acceptingFrames || connection.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    this.#clearIdleTask(connection);
+    const idleToken = {};
+    connection.idleToken = idleToken;
+    try {
+      const task = this.#scheduler.schedule(this.#limits.idleConnectionTimeoutMs, () => {
+        if (connection.idleToken !== idleToken) {
+          return;
+        }
+        connection.idleToken = undefined;
+        connection.idleTask = undefined;
+        if (connection.closed || !connection.acceptingFrames || connection.ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        connection.acceptingFrames = false;
+        this.#log({ type: "connection_idle_timeout", role: connection.grant.role });
+        connection.ws.close(RELAY_IDLE_CLOSE_CODE, RELAY_IDLE_CLOSE_REASON);
+      });
+      // A test scheduler may invoke synchronously or race a canceled callback.
+      // Never publish a task after its generation has already expired.
+      if (connection.idleToken !== idleToken) {
+        task.cancel();
+        return false;
+      }
+      connection.idleTask = task;
+      return true;
+    } catch {
+      if (connection.idleToken === idleToken) {
+        connection.idleToken = undefined;
+      }
+      this.#terminateConnection(connection);
+      return false;
+    }
+  }
+
+  #clearIdleTask(connection: ConnectionState): void {
+    // Invalidate before cancellation so even a scheduler that delivers a
+    // canceled callback cannot close a refreshed or retired connection.
+    connection.idleToken = undefined;
+    const task = connection.idleTask;
+    connection.idleTask = undefined;
+    try {
+      task?.cancel();
+    } catch {
+      // The generation was invalidated first, so a failed cancellation cannot
+      // make the stale callback authoritative.
+    }
+  }
+
+  #closeConnection(connection: ConnectionState, code: number): void {
+    connection.acceptingFrames = false;
+    this.#clearIdleTask(connection);
+    connection.ws.close(code);
+  }
+
+  #terminateConnection(connection: ConnectionState): void {
+    connection.acceptingFrames = false;
+    this.#clearIdleTask(connection);
+    connection.ws.terminate();
+  }
+
   #newChannelId(route: RouteState): Uint8Array {
     for (;;) {
       const candidate = new Uint8Array(randomBytes(RELAY_ROUTING_CHANNEL_ID_BYTES));
@@ -538,6 +656,14 @@ function mergeLimits(overrides: Partial<RelayServerLimits> | undefined): RelaySe
   }
   if (limits.maxBufferedBytesPerConnection < MAX_RELAY_ROUTING_FRAME_BYTES) {
     throw new TypeError("maxBufferedBytesPerConnection must permit one maximum relay frame");
+  }
+  if (
+    limits.idleConnectionTimeoutMs < MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS ||
+    limits.idleConnectionTimeoutMs > MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS
+  ) {
+    throw new TypeError(
+      `idleConnectionTimeoutMs must be between ${MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS} and ${MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS}`,
+    );
   }
   return limits;
 }

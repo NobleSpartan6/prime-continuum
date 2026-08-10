@@ -54,11 +54,11 @@ jobs:
       - name: Install the frozen dependency graph
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Typecheck Node and renderer boundaries
+      - name: Typecheck Node, renderer, and relay boundaries
         run: pnpm typecheck
 
-      - name: Run the complete source test suite
+      - name: Run the complete root and relay source test suite
         run: pnpm test
 
-      - name: Build the desktop and host-service source
+      - name: Build the desktop, host-service, and relay source
         run: pnpm build

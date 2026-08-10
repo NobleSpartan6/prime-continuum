@@ -50,7 +50,7 @@ The Unix sidecar fence assumes every contender runs the lock-aware implementatio
 
 ### Phase 3B: private self-hosted relay
 
-An isolated self-hosted relay package now enforces TLS-first native WebSocket upgrades, one-shot digest-only grants, exact bounded routing frames, opaque forwarding, route/connection/rate/backpressure limits, and no offline queue. A separate `ReliableRelayByteTunnel` contract turns one already-open routing channel into a bounded, monotonic byte stream: every gap, duplicate, rejection, missing receipt, wrong channel, backpressure overflow, or disconnect is terminal, and uncertain bytes are never retried in the same session. Its relay-visible routing ID is explicitly not a secure-channel ID or principal. The adapter is conformance-tested but not yet connected to WebSocket, hostd, TLS, or a client.
+An isolated self-hosted relay package now enforces TLS-first native WebSocket upgrades, one-shot digest-only grants, exact bounded routing frames, opaque forwarding, route/connection/rate/backpressure limits, a configurable 1-second-to-10-minute idle-connection bound, and no offline queue. The idle timer resets only after that endpoint's own policy-accepted binary data; peer deliveries and server-authored routing controls cannot keep a silent endpoint alive. It closes with fixed application code `4000` and reason `idle_timeout`, clears on connection close/server stop, and emits only endpoint-role metadata. Future secure clients must supply authenticated heartbeat data when otherwise silent. This bounds inactivity; it is not a maximum session age, authenticated liveness, E2EE, rekey, or delivery proof. A separate `ReliableRelayByteTunnel` contract turns one already-open routing channel into a bounded, monotonic byte stream: every gap, duplicate, rejection, missing receipt, wrong channel, backpressure overflow, or disconnect is terminal, and uncertain bytes are never retried in the same session. Its relay-visible routing ID is explicitly not a secure-channel ID or principal. The adapter is conformance-tested but not yet connected to WebSocket, hostd, TLS, or a client.
 
 This remains a reversible transport seam, not a crypto choice. A reconnect creates a new routing channel and must create a new future TLS session. The relay's accepted status means only bounded peer-socket acceptance; it is not an end-to-end application receipt.
 
@@ -467,6 +467,7 @@ Until the relevant gates pass, Prime Agent must not claim that:
 - granting `run_location.change` implements cross-host handoff;
 - granting `approval.resolve` implements approval claims or leases;
 - a relay path survives hostd restart without fresh authentication;
+- the relay idle timeout authenticates a peer, proves endpoint liveness, or enforces cryptographic session age;
 - the reliable byte-tunnel contract authenticates a peer, provides E2EE, or makes its routing channel ID an authenticated channel ID;
 - public relay availability, anonymity, traffic-analysis resistance, or malicious-relay availability has been proven; or
 - endpoint compromise can be repaired by transport cryptography.

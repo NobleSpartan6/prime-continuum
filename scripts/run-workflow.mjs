@@ -20,6 +20,7 @@ const UNSIGNED_WINDOWS_ENV = createWindowsPackagingEnvironment(process.env)
 
 function createWorkflows(releaseOptions = {}) {
   const releaseBuildSteps = [
+    pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build']),
     pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
     nodeStep('Generate the runtime attestation', 'scripts/generate-runtime-attestation.mjs', [
       '--output', 'out/main/runtime-attestation.json',
@@ -33,6 +34,7 @@ function createWorkflows(releaseOptions = {}) {
   dev: createDevelopmentWorkflowPlan(PROJECT_ROOT).map(materializePlannedStep),
   preview: createPreviewWorkflowPlan().map(materializePlannedStep),
   build: [
+    pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build']),
     pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
     nodeStep('Build the host service', 'scripts/build-hostd.mjs'),
   ],

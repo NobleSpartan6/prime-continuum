@@ -34,8 +34,8 @@
     "self-build": "node scripts/self-build.mjs",
     "verify:self-build-receipt": "node scripts/self-build.mjs --verify-receipt",
     "preview": "node scripts/run-workflow.mjs preview",
-    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
-    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit && pnpm --filter @prime-agent/relay-server typecheck",
+    "test": "vitest run && pnpm --filter @prime-agent/relay-server test",
     "test:watch": "vitest",
     "package": "node scripts/run-workflow.mjs package",
     "dist": "node scripts/run-workflow.mjs dist"

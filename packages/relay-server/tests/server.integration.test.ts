@@ -10,11 +10,17 @@ import {
 } from "../../../src/shared/relay-routing";
 import { InMemoryRelayGrantStore } from "../src/grant-store";
 import {
+  MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS,
+  MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS,
   PrimeRelayServer,
   RELAY_FORWARD_STATUS,
+  RELAY_IDLE_CLOSE_CODE,
+  RELAY_IDLE_CLOSE_REASON,
   RELAY_SUBPROTOCOL,
   type RelayLogEvent,
+  type RelayScheduledTask,
   type RelayServerLimits,
+  type RelayServerScheduler,
 } from "../src/server";
 
 const NOW = 1_000_000;
@@ -35,6 +41,34 @@ describe("PrimeRelayServer transport policy", () => {
     expect(
       () => new PrimeRelayServer({ grantStore, host: "0.0.0.0", allowInsecureLoopbackForTests: true }),
     ).toThrow(/requires TLS/);
+    expect(
+      () => new PrimeRelayServer({ grantStore, tls: {}, scheduler: new RacyRelayScheduler() }),
+    ).toThrow(/custom relay scheduler is allowed only on loopback with the explicit test option/);
+    expect(
+      () => new PrimeRelayServer({
+        grantStore,
+        host: "0.0.0.0",
+        tls: {},
+        allowInsecureLoopbackForTests: true,
+        scheduler: new RacyRelayScheduler(),
+      }),
+    ).toThrow(/custom relay scheduler is allowed only on loopback with the explicit test option/);
+    expect(
+      () => new PrimeRelayServer({
+        grantStore,
+        host: "127.0.0.1",
+        allowInsecureLoopbackForTests: true,
+        limits: { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS - 1 },
+      }),
+    ).toThrow(/idleConnectionTimeoutMs must be between/);
+    expect(
+      () => new PrimeRelayServer({
+        grantStore,
+        host: "127.0.0.1",
+        allowInsecureLoopbackForTests: true,
+        limits: { idleConnectionTimeoutMs: MAX_RELAY_IDLE_CONNECTION_TIMEOUT_MS + 1 },
+      }),
+    ).toThrow(/idleConnectionTimeoutMs must be between/);
   });
 
   it("requires the exact binary routing subprotocol and never reads credentials from the URL", async () => {
@@ -284,6 +318,199 @@ describe("PrimeRelayServer frame policy and offline behavior", () => {
   });
 });
 
+describe("PrimeRelayServer idle connection policy", () => {
+  it("closes an idle connection with the fixed private code and metadata-only reason", async () => {
+    const scheduler = new ManualRelayScheduler();
+    const logs: RelayLogEvent[] = [];
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      logs,
+      { scheduler, now: () => scheduler.now },
+    );
+    const routeId = "idle-sensitive-route";
+    const endpointId = "idle-sensitive-endpoint";
+    const client = await connect(harness.server.url, harness.issue("host", routeId, endpointId));
+    await client.nextKind("ready");
+
+    expect(scheduler.pendingCount).toBe(1);
+    scheduler.advanceBy(MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS - 1);
+    expect(client.ws.readyState).toBe(WebSocket.OPEN);
+    scheduler.advanceBy(1);
+
+    expect(await client.closed).toEqual({ code: RELAY_IDLE_CLOSE_CODE, reason: RELAY_IDLE_CLOSE_REASON });
+    expect(scheduler.pendingCount).toBe(0);
+    expect(logs).toContainEqual({ type: "connection_idle_timeout", role: "host" });
+    const observable = JSON.stringify(logs);
+    expect(observable).not.toContain(routeId);
+    expect(observable).not.toContain(endpointId);
+  });
+
+  it("resets only after accepted routing activity and clears the timer on policy close", async () => {
+    const scheduler = new ManualRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler, now: () => scheduler.now },
+    );
+    const host = await connect(harness.server.url, harness.issue("host", "route-active", "host-active"));
+    await host.nextKind("ready");
+
+    scheduler.advanceBy(MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS - 100);
+    host.sendFrame({
+      kind: "data",
+      channelId: new Uint8Array(16).fill(0x31),
+      messageId: 1n,
+      payload: new Uint8Array([1]),
+    });
+    expect(await host.nextForwardResult(1n)).toBe(RELAY_FORWARD_STATUS.unavailable);
+
+    scheduler.advanceBy(MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS - 1);
+    expect(host.ws.readyState).toBe(WebSocket.OPEN);
+    scheduler.advanceBy(1);
+    expect(await host.closed).toEqual({ code: RELAY_IDLE_CLOSE_CODE, reason: RELAY_IDLE_CLOSE_REASON });
+
+    const rejected = await connect(
+      harness.server.url,
+      harness.issue("host", "route-rejected-activity", "host-rejected-activity"),
+    );
+    await rejected.nextKind("ready");
+    expect(scheduler.pendingCount).toBe(1);
+    rejected.sendText("not-accepted-activity");
+    expect((await rejected.closed).code).toBe(1003);
+    expect(scheduler.pendingCount).toBe(0);
+  });
+
+  it("does not let peer data or server routing controls keep a silent endpoint alive", async () => {
+    const scheduler = new ManualRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler, now: () => scheduler.now },
+    );
+    const host = await connect(harness.server.url, harness.issue("host", "route-control-idle", "host-control-idle"));
+    await host.nextKind("ready");
+
+    scheduler.advanceBy(MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS - 100);
+    const device = await connect(
+      harness.server.url,
+      harness.issue("device", "route-control-idle", "device-control-idle"),
+    );
+    const deviceReady = await device.nextKind("ready");
+    await host.nextKind("peer_open");
+    await device.nextKind("peer_open");
+    device.sendFrame({
+      kind: "data",
+      channelId: deviceReady.channelId,
+      messageId: 9n,
+      payload: new Uint8Array([9]),
+    });
+    await host.nextKind("data");
+    expect(await device.nextForwardResult(9n)).toBe(RELAY_FORWARD_STATUS.acceptedByPeerSocket);
+
+    scheduler.advanceBy(99);
+    expect(host.ws.readyState).toBe(WebSocket.OPEN);
+    scheduler.advanceBy(1);
+    expect(await host.closed).toEqual({ code: RELAY_IDLE_CLOSE_CODE, reason: RELAY_IDLE_CLOSE_REASON });
+    expect(device.ws.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it.each([
+    ["synchronous expiry", "expire", RELAY_IDLE_CLOSE_CODE],
+    ["scheduler failure", "throw", 1006],
+  ] as const)("does not forward accepted data after %s closes its sender", async (_label, mode, closeCode) => {
+    const scheduler = new FaultRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler },
+    );
+    const host = await connect(harness.server.url, harness.issue("host", `route-${mode}`, `host-${mode}`));
+    await host.nextKind("ready");
+    const device = await connect(harness.server.url, harness.issue("device", `route-${mode}`, `device-${mode}`));
+    const deviceReady = await device.nextKind("ready");
+    await host.nextKind("peer_open");
+    await device.nextKind("peer_open");
+
+    scheduler.mode = mode;
+    host.sendFrame({
+      kind: "data",
+      channelId: deviceReady.channelId,
+      messageId: 10n,
+      payload: new Uint8Array([10]),
+    });
+
+    expect((await host.closed).code).toBe(closeCode);
+    await device.expectNoKind("data");
+  });
+
+  it("does not announce a peer whose initial idle scheduling fails", async () => {
+    const scheduler = new FaultRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler },
+    );
+    const host = await connect(harness.server.url, harness.issue("host", "route-attach-failure", "host-attach-failure"));
+    await host.nextKind("ready");
+
+    scheduler.mode = "throw";
+    const device = await connect(
+      harness.server.url,
+      harness.issue("device", "route-attach-failure", "device-attach-failure"),
+    );
+    expect((await device.closed).code).toBe(1006);
+    await host.expectNoKind("peer_open");
+  });
+
+  it("ignores a canceled scheduler callback after a newer activity generation is armed even when cancellation throws", async () => {
+    const scheduler = new RacyRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler },
+    );
+    const host = await connect(harness.server.url, harness.issue("host", "route-stale-timer", "host-stale-timer"));
+    await host.nextKind("ready");
+    expect(scheduler.callbackCount).toBe(1);
+
+    host.sendFrame({
+      kind: "data",
+      channelId: new Uint8Array(16).fill(0x42),
+      messageId: 8n,
+      payload: new Uint8Array([8]),
+    });
+    expect(await host.nextForwardResult(8n)).toBe(RELAY_FORWARD_STATUS.unavailable);
+    expect(scheduler.callbackCount).toBeGreaterThan(1);
+
+    scheduler.fire(0);
+    expect(host.ws.readyState).toBe(WebSocket.OPEN);
+    scheduler.fireLatest();
+    expect(await host.closed).toEqual({ code: RELAY_IDLE_CLOSE_CODE, reason: RELAY_IDLE_CLOSE_REASON });
+  });
+
+  it("clears every scheduled idle task on connection close and server stop", async () => {
+    const scheduler = new ManualRelayScheduler();
+    const harness = await startHarness(
+      { idleConnectionTimeoutMs: MIN_RELAY_IDLE_CONNECTION_TIMEOUT_MS },
+      [],
+      { scheduler, now: () => scheduler.now },
+    );
+    const first = await connect(harness.server.url, harness.issue("host", "route-first", "host-first"));
+    const second = await connect(harness.server.url, harness.issue("host", "route-second", "host-second"));
+    await first.nextKind("ready");
+    await second.nextKind("ready");
+    expect(scheduler.pendingCount).toBe(2);
+
+    first.close();
+    await first.closed;
+    await waitForTurn(() => harness.server.snapshot().connectionCount === 1);
+    expect(scheduler.pendingCount).toBe(1);
+
+    await harness.server.stop();
+    expect(scheduler.pendingCount).toBe(0);
+  });
+});
+
 interface RelayHarness {
   readonly server: PrimeRelayServer;
   readonly store: InMemoryRelayGrantStore;
@@ -293,6 +520,7 @@ interface RelayHarness {
 async function startHarness(
   limits?: Partial<RelayServerLimits>,
   logs: RelayLogEvent[] = [],
+  timing: { readonly scheduler?: RelayServerScheduler; readonly now?: () => number } = {},
 ): Promise<RelayHarness> {
   const store = new InMemoryRelayGrantStore();
   const server = new PrimeRelayServer({
@@ -300,7 +528,8 @@ async function startHarness(
     host: "127.0.0.1",
     port: 0,
     allowInsecureLoopbackForTests: true,
-    now: () => NOW,
+    now: timing.now ?? (() => NOW),
+    scheduler: timing.scheduler,
     limits,
     logger: (event) => logs.push(event),
   });
@@ -317,6 +546,78 @@ async function startHarness(
       return store.issue({ role, routeId, endpointId, expiresAt, tokenBytes });
     },
   };
+}
+
+class ManualRelayScheduler implements RelayServerScheduler {
+  now = NOW;
+  readonly #tasks = new Map<number, { readonly dueAt: number; readonly callback: () => void }>();
+  #nextId = 0;
+
+  get pendingCount(): number {
+    return this.#tasks.size;
+  }
+
+  schedule(delayMs: number, callback: () => void): RelayScheduledTask {
+    this.#nextId += 1;
+    const id = this.#nextId;
+    this.#tasks.set(id, { dueAt: this.now + delayMs, callback });
+    return { cancel: () => this.#tasks.delete(id) };
+  }
+
+  advanceBy(durationMs: number): void {
+    this.now += durationMs;
+    for (;;) {
+      const due = [...this.#tasks.entries()]
+        .filter(([, task]) => task.dueAt <= this.now)
+        .sort((left, right) => left[1].dueAt - right[1].dueAt || left[0] - right[0])[0];
+      if (due === undefined) {
+        return;
+      }
+      this.#tasks.delete(due[0]);
+      due[1].callback();
+    }
+  }
+}
+
+class RacyRelayScheduler implements RelayServerScheduler {
+  readonly #callbacks: Array<() => void> = [];
+
+  get callbackCount(): number {
+    return this.#callbacks.length;
+  }
+
+  schedule(_delayMs: number, callback: () => void): RelayScheduledTask {
+    this.#callbacks.push(callback);
+    // Deliberately retain canceled callbacks to model a scheduler callback
+    // already queued on another turn when cancellation races it.
+    return { cancel: () => { throw new Error("simulated cancellation failure"); } };
+  }
+
+  fire(index: number): void {
+    const callback = this.#callbacks[index];
+    if (callback === undefined) {
+      throw new Error(`Missing scheduled callback ${index}`);
+    }
+    callback();
+  }
+
+  fireLatest(): void {
+    this.fire(this.#callbacks.length - 1);
+  }
+}
+
+class FaultRelayScheduler implements RelayServerScheduler {
+  mode: "hold" | "expire" | "throw" = "hold";
+
+  schedule(_delayMs: number, callback: () => void): RelayScheduledTask {
+    if (this.mode === "throw") {
+      throw new Error("simulated scheduling failure");
+    }
+    if (this.mode === "expire") {
+      callback();
+    }
+    return { cancel: () => undefined };
+  }
 }
 
 class RelayTestClient {
@@ -492,4 +793,14 @@ function rawDataBytes(data: RawData): Uint8Array {
     return new Uint8Array(Buffer.concat(data));
   }
   return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
+async function waitForTurn(predicate: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 50; turn += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Timed out waiting for relay event-loop work");
 }
