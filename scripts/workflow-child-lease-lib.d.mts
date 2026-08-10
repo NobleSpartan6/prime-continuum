@@ -15,6 +15,19 @@ export class WorkflowChildLeaseError extends Error {
   owner: WorkflowChildLeaseOwner
 }
 
+export interface WorkflowChildLeasePublicationTestHooks {
+  /** Deterministic test seam. Production callers must omit this override. */
+  platform?: NodeJS.Platform
+  /** Deterministic test seam. Production callers must omit this override. */
+  rename?: (oldPath: string, newPath: string) => Promise<void>
+  /** Deterministic test seam. Production callers must omit this override. */
+  wait?: (milliseconds: number) => Promise<void>
+  /** Deterministic test seam. Production callers must omit this callback. */
+  beforeInspection?: () => void | Promise<void>
+  /** Deterministic test seam. Production callers must omit this callback. */
+  afterFileRead?: (path: string) => void | Promise<void>
+}
+
 export function workflowChildLeasePath(lockPath: string): string
 export function rejectActiveWorkflowChild(options: {
   lockPath: string
@@ -28,6 +41,8 @@ export function createWorkflowChildLease(options: {
   lockToken: string
   parentPid: number
   supervisorPid: number
+  /** Deterministic test seam. Production callers must omit these hooks. */
+  publicationTestHooks?: WorkflowChildLeasePublicationTestHooks
 }): Promise<{
   owner: WorkflowChildLeaseOwner
   setChildPid(childPid: number): Promise<void>
