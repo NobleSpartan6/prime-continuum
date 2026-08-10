@@ -1,0 +1,20 @@
+[Unit]
+Description=Prime Continuim remote host service
+
+[Service]
+Type=simple
+Environment=HOME=%h
+UnsetEnvironment=NODE_OPTIONS NODE_PATH ELECTRON_RUN_AS_NODE LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_PROFILE GLIBC_TUNABLES ELECTRON_ENABLE_LOGGING ELECTRON_ENABLE_STACK_DUMPING PRIME_AGENT_DATA_DIR PRIME_CONTINUIM_PACKAGE_SMOKE PRIME_AGENT_BUILD_ID PRIME_AGENT_LAUNCHER_PATH
+ExecStart=%h/.local/lib/prime-continuim/remote-host/v1/prime-continuim-hostd-service
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

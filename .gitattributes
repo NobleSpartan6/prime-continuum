@@ -1,1 +1,2 @@
 tools/windows-appcontainer-probe/native/payload/* text eol=lf
+scripts/remote-host-payload/* text eol=lf

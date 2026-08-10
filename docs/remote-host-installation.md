@@ -2,11 +2,13 @@
 
 This repository contains bounded, source-only prerequisites for a possible
 future remote host installer. They do not contain SSH, remote filesystem,
-process, launcher, or service-manager logic. No product runtime, build,
-release, packaging, SSH, or installation entrypoint imports these modules or
-invokes the static CLI or coordinator. Ordinary source tests import the pure
-validators and reducer and exercise the journal/coordinator with temporary
-files and injected test callbacks.
+remote-process, package-assembly, archive, service-activation, or publication
+logic. They do include inert source bytes for one future service-only launcher
+and one candidate systemd user unit. No product runtime, build, release,
+packaging, SSH, or installation entrypoint imports these modules, templates,
+or invokes the static kit CLI or coordinator. Ordinary source tests import the
+pure validators and reducer, compare the inert template bytes, and exercise
+the journal/coordinator with temporary files and injected test callbacks.
 
 ## Signed kit format
 
@@ -62,6 +64,110 @@ Signature verification alone reports `artifactBytesCorrelated: false`.
 `verifyRemoteHostKitArtifactBytes` or the combined verifier must also hash the
 actual four role-indexed byte strings before artifact correlation is true.
 Swapping two otherwise valid artifacts therefore fails.
+
+## Linux payload source reference
+
+`scripts/remote-host-payload-contract.mjs` is a pure, non-assembling reference
+contract. It has no filesystem, archive, network, process, signing, envelope,
+publication, SSH, installation, or service-manager effect API. It exports no
+assembler or verifier. Every inputs/layout result carries
+`assemblyAuthority: null`, and all payload claim booleans are fixed false.
+
+The exact canonical `remote-host-payload-inputs/v1` document pins:
+
+- package ID `prime-continuim.remote-host`, hostd `0.1.0`, and host protocol
+  `1`;
+- Linux, x64, glibc and the exact Electron RunAsNode tuple already required by
+  the kit;
+- Prime Agent 0.7.1, runtime-policy schema 1, runtime build ID
+  `95afd31-dirty`, release commit
+  `95afd319a78ae017a41241d50b013d656a0685ce`, daemon protocol 7, schema
+  revision 13, schema ID `protocol-7-schema-13-816309b1cd50`, and the exact
+  checked-in runtime policy, sources, and package-lock SHA-256 values;
+- one checked-in `electron-release-archive-provenance/v1` value for official
+  Electron `v43.3.0` Linux x64; and
+- four package/staging namespace declarations with fixed modes.
+
+The Electron source pin names
+`electron-v43.3.0-linux-x64.zip`, 125,603,646 bytes, SHA-256
+`f4987e9f045e46b117f0805d6ba4dc524e2abb2c2e33660f175bb39564bd3dae`.
+It also pins the official 7,610-byte `SHASUMS256.txt`, SHA-256
+`43f854bd8a201a9abdf4bace97681144ec7230893462c6db7681a0f6db8cb7f9`,
+and its exact archive line. Those checked-in public values cannot be replaced
+through the API. This is reviewed provenance correlation, not proof that the
+archive was downloaded, authenticated, parsed, or executed.
+
+The paths under `destinations` are only package/staging namespaces:
+
+```text
+hostd/hostd.cjs                            0644
+runtime/runtime.zip                       0644
+launcher/prime-continuim-hostd-service    0755
+service/prime-continuim-hostd.service     0644
+```
+
+They are not installed paths, relocation instructions, or installation
+authority. In particular, they intentionally differ from the future
+HOME-relative paths named inside the launcher and systemd templates.
+
+`remote-host-payload-layout/v1` repeats the fixed inputs, binds only FINAL
+caller-declared `hostd`, `launcher`, and `service` role records to their
+package paths and modes, and requires the launcher/service records to equal
+the exact template bytes. It deliberately has no `runtime` external-artifact
+record: a layout intended to live inside `runtime.zip` cannot contain that
+archive's final digest without a self-reference. Only a separately signed
+`remote-host-kit/v1` manifest can bind the final runtime artifact record.
+
+The layout's declared payload-tree definition is
+`sha256-size-mode-path-lf/v1`. A future assembler would hash lines of the exact
+form:
+
+```text
+<sha256> <decimal bytes> <four-digit mode> <UTF-8 relative path>\n
+```
+
+Lines are ordered by raw UTF-8 path bytes. The path is the remainder after the
+third ASCII space. It must be NFC, relative, and contain no NUL, CR, or LF;
+directories, links, and special files are not entries. The tree excludes only
+`payload-layout.json`, and that path must never appear in the included list.
+This tranche validates the declaration shape and bounds; it does not traverse
+a tree, create the lines, calculate the digest, or create `runtime.zip`.
+
+The kit-reference constructor accepts the validated inputs/layout, separate
+public trust IDs, and all four caller-declared FINAL artifact records. It
+checks the three non-runtime records against the layout, checks launcher and
+service records against the exact template bytes, and delegates manifest
+shape, role bounds, distinct digests, serialization, and domain-separated
+preimage construction to the existing kit contract. It returns canonical
+manifest bytes and an unsigned signing preimage with
+`artifactBytesCorrelated: false`, `assemblyAuthority: null`, and
+`signingAuthority: null`. It never accepts artifact bytes, hashes them, emits
+a signature/envelope, or labels its output verified.
+
+The service-only launcher accepts no arguments, ignores ambient
+`XDG_STATE_HOME`, fixes state at
+`$HOME/.local/state/prime-agent/hostd`, and invokes only `serve` with a fixed
+runtime seed. The unit and launcher remove Node, Electron, and dynamic-loader
+injection variables including `LD_AUDIT`, `LD_DEBUG`, `LD_PROFILE`, and
+`GLIBC_TUNABLES`; the launcher then sets `ELECTRON_RUN_AS_NODE=1`. The unit
+also declares `UMask=0077`, `NoNewPrivileges=true`, and
+`RestrictSUIDSGID=true`. This is source hardening, not a hostile-same-user or
+credential sandbox. The launcher otherwise inherits provider/project
+environment.
+
+`KillMode` is intentionally omitted pending resident-descendant lifecycle
+evidence. If somebody manually installs and starts these inert bytes,
+systemd's default control-group semantics apply. Stop/restart continuity,
+detached Prime Agent behavior, shell compatibility, unit validity, service
+activation, and installed paths remain unproved and unsupported.
+
+Before any assembler can exist, Linux CI must safely correlate the complete
+pinned Electron archive and extracted single-link tree, execute its exact ELF
+in RunAsNode mode, verify glibc and runtime/native-addon smoke parity, verify
+the selected runtime tree and embedded hostd attestation, enforce licensing
+coverage, implement and fault-test a bounded deterministic streaming archive,
+and prove fresh-output/no-overwrite behavior. None of those actions can be
+evidenced by this Windows source checkpoint.
 
 ## Read-only static verifier
 
@@ -215,6 +321,9 @@ source tranche does not claim or provide:
 
 - an implemented remote installer, service manager, remote status API, or
   production-authorized operation journal/coordinator;
+- a payload assembler, archive encoder/parser, source-tree custodian, Electron
+  archive verifier, Linux executable probe, systemd activator, or license
+  completeness review;
 - power-loss durability, production Windows journal durability, hostile
   same-user protection, race-free path custody, or a multi-process ownership
   lease;

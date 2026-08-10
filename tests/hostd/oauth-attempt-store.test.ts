@@ -860,14 +860,16 @@ describe("OAuthAttemptStore", () => {
   });
 
   it("fails closed at 128 records and never deletes unacknowledged terminals", async () => {
-    const { store } = await temporaryStore();
-    for (let index = 1; index <= OAUTH_ATTEMPT_MAX_FILES; index += 1) {
-      await createTerminal(store, index, at(index * 1_000 + 1));
-    }
-    expect(await store.list()).toHaveLength(OAUTH_ATTEMPT_MAX_FILES);
+    const fixture = await temporaryStore();
+    await seedUnacknowledgedTerminals(fixture.paths, 1, OAUTH_ATTEMPT_MAX_FILES);
+    const store = new OAuthAttemptStore(fixture.paths);
+    await store.initialize(at(200_000));
+    const recordsBeforeCompaction = await store.list();
+    expect(recordsBeforeCompaction).toHaveLength(OAUTH_ATTEMPT_MAX_FILES);
     await expect(store.prepare(prepareInput(OAUTH_ATTEMPT_MAX_FILES + 1, at(200_000))))
       .rejects.toMatchObject({ code: "OAUTH_ATTEMPT_STORAGE_FULL" });
     expect((await store.compact(at(90 * dayMs))).deletedAttemptDigests).toEqual([]);
+    expect(await store.list()).toEqual(recordsBeforeCompaction);
     expect(await store.list()).toHaveLength(OAUTH_ATTEMPT_MAX_FILES);
   }, 30_000);
 
@@ -882,20 +884,34 @@ describe("OAuthAttemptStore", () => {
       },
     });
     const terminal = await createTerminal(fixture.store, 1, at(1_001));
-    await fixture.store.acknowledge(terminal, terminal.terminal!.terminalDigest, at(1_002));
-    for (let index = 2; index <= OAUTH_ATTEMPT_MAX_FILES; index += 1) {
-      await createTerminal(fixture.store, index, at(index * 1_000 + 1));
-    }
+    const acknowledged = await fixture.store.acknowledge(
+      terminal,
+      terminal.terminal!.terminalDigest,
+      at(1_002),
+    );
+    await seedUnacknowledgedTerminals(fixture.paths, 2, OAUTH_ATTEMPT_MAX_FILES);
 
     await expect(fixture.store.compact(at(40 * dayMs))).rejects.toThrow(/uncertain/);
     await expect(fixture.store.list()).rejects.toThrow(/requires restart/);
     await expect(fixture.store.prepare(prepareInput(129, at(200_000))))
       .rejects.toThrow(/requires restart/);
-    expect((await readdir(fixture.paths.oauthAttempts)).some((name) => name.includes(".delete-"))).toBe(true);
+    const tombstoneNames = await readdir(fixture.paths.oauthAttempts);
+    const acknowledgedName = `${acknowledged.attempt.attemptDigest}.json`;
+    const acknowledgedTombstonePattern = new RegExp(
+      `^${acknowledged.attempt.attemptDigest}\\.json\\.delete-[a-f0-9]{16}$`,
+    );
+    expect(tombstoneNames.some((name) => name.includes(".delete-"))).toBe(true);
+    expect(tombstoneNames.filter((name) => acknowledgedTombstonePattern.test(name)))
+      .toHaveLength(1);
+    expect(tombstoneNames).not.toContain(acknowledgedName);
 
     const restarted = new OAuthAttemptStore(fixture.paths);
     await restarted.initialize(at(40 * dayMs + 1));
     expect(await restarted.list()).toHaveLength(OAUTH_ATTEMPT_MAX_FILES);
+    expect(await restarted.get(acknowledged.attempt)).toEqual(acknowledged);
+    const restartedNames = await readdir(fixture.paths.oauthAttempts);
+    expect(restartedNames).toContain(acknowledgedName);
+    expect(restartedNames.some((name) => name.includes(".delete-"))).toBe(false);
     await expect(restarted.prepare(prepareInput(129, at(200_000))))
       .rejects.toMatchObject({ code: "OAUTH_ATTEMPT_STORAGE_FULL" });
   }, 30_000);
@@ -1021,6 +1037,48 @@ async function createTerminal(store: OAuthAttemptStore, index: number, terminalA
     null,
     terminalAt,
   ));
+}
+
+async function seedUnacknowledgedTerminals(
+  paths: { readonly oauthAttempts: string },
+  firstIndex: number,
+  lastIndex: number,
+): Promise<void> {
+  await Promise.all(Array.from({ length: lastIndex - firstIndex + 1 }, async (_, offset) => {
+    const index = firstIndex + offset;
+    const input = prepareInput(index);
+    const terminalAt = at(index * 1_000 + 1);
+    const prepared: OAuthAttemptRecord = {
+      recordVersion: 1,
+      attempt: input.attempt,
+      revision: 0,
+      sessionId: input.sessionId,
+      initialAuthorityId: input.initialAuthorityId,
+      phase: "prepared",
+      createdAt: input.attempt.identity.requestedAt,
+      updatedAt: input.attempt.identity.requestedAt,
+      expiresAt: input.expiresAt,
+    };
+    const terminal = terminalFor(
+      prepared,
+      "failed",
+      "interrupted_before_login_dispatch",
+      null,
+      terminalAt,
+    );
+    const record: OAuthAttemptRecord = {
+      ...prepared,
+      revision: 1,
+      phase: "failed",
+      updatedAt: terminalAt,
+      terminal,
+    };
+    await writeFile(
+      join(paths.oauthAttempts, `${record.attempt.attemptDigest}.json`),
+      `${JSON.stringify(record)}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
+  }));
 }
 
 async function expectRestartClassification(
