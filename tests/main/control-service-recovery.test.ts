@@ -1469,13 +1469,16 @@ describe('DesktopControlService recovery', () => {
     })
     connectLocalHostd.mockResolvedValue(connection)
     const service = new DesktopControlService({ app: testApp(directory) })
+    const acceptResidentPromptIdleSignal = vi.spyOn(service as unknown as {
+      acceptResidentPromptIdleSignal(...args: unknown[]): Promise<void>
+    }, 'acceptResidentPromptIdleSignal')
     const events: Array<{ type: string; payload: unknown }> = []
     service.on('host-event', (event) => events.push(event as { type: string; payload: unknown }))
     await service.connect({ kind: 'local' })
 
     await service.submitCommand(command)
-    await vi.waitFor(async () => expect(await readStoredOutbox(directory)).toEqual([]))
-    await Promise.resolve()
+    expect(acceptResidentPromptIdleSignal).toHaveBeenCalledOnce()
+    await Promise.all(acceptResidentPromptIdleSignal.mock.results.map(({ value }) => value))
 
     expect(connection.terminatedWith).toBeUndefined()
     expect(events.filter(({ type }) => type === 'resident.prompt_idle_observed')).toEqual([
@@ -1484,6 +1487,7 @@ describe('DesktopControlService recovery', () => {
       }),
     ])
     expect(await readStoredOutbox(directory)).toEqual([])
+    await service.disconnect()
   })
 
   it('supervises exact read-only cleanup when direct resident proof wins before local cleanup fails', async () => {

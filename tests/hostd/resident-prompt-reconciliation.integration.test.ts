@@ -32,9 +32,16 @@ import {
 } from "../../src/shared/protocol";
 
 const temporaryDirectories: string[] = [];
+const gatewaysForCleanup: VerifiedResidentGateway[] = [];
 
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await Promise.allSettled(gatewaysForCleanup.splice(0).map((gateway) => gateway.close()));
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 25,
+  })));
 });
 
 describe("verified resident prompt idle reconciliation", () => {
@@ -102,27 +109,43 @@ describe("verified resident prompt idle reconciliation", () => {
 
   it("autonomously retries a branded late terminal proof without replaying the prompt", async () => {
     let attempt = 0;
-    const fixture = await serviceFixture(async (lease, options) => {
-      attempt += 1;
-      if (attempt === 1) {
-        throw new ResidentRuntimeContractError(
-          "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
-          "The acknowledged prompt terminal event has not converged yet.",
-          { retryable: true },
-        );
-      }
-      const idle = projection(lease.binding, "proof-autonomous-retry-idle", 2);
-      await options.publishProjection(lease.binding, idle);
-      return evidence(lease, idle);
-    });
+    let retryCallback: (() => void) | undefined;
+    let retryDelayMs: number | undefined;
+    const retryTimer = setTimeout(() => undefined, 60_000);
+    retryTimer.unref();
+    const fixture = await serviceFixture(
+      async (lease, options) => {
+        attempt += 1;
+        if (attempt === 1) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+            "The acknowledged prompt terminal event has not converged yet.",
+            { retryable: true },
+          );
+        }
+        const idle = projection(lease.binding, "proof-autonomous-retry-idle", 2);
+        await options.publishProjection(lease.binding, idle);
+        return evidence(lease, idle);
+      },
+      {
+        schedulePromptReconciliationRetry: (callback, delayMs) => {
+          retryCallback = callback;
+          retryDelayMs = delayMs;
+          return retryTimer;
+        },
+        cancelPromptReconciliationRetry: (timer) => clearTimeout(timer),
+      },
+    );
     const command = promptCommand(fixture.hostId, "proof-autonomous-retry-prompt");
 
     await expect(submitCommand(fixture.service, command, "proof-autonomous-retry-submit")).resolves.toMatchObject({
       status: "running",
     });
-    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledTimes(2), {
-      timeout: 2_000,
-    });
+    await vi.waitFor(() => expect(retryCallback).toBeTypeOf("function"));
+    expect(retryDelayMs).toBe(250);
+    clearTimeout(retryTimer);
+    retryCallback?.();
+    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledTimes(2));
     await vi.waitFor(async () => expect(
       (await fixture.store.reconcileCommands([command])).receipts[0]?.status,
     ).toBe("completed"));
@@ -466,6 +489,7 @@ function gatewayFixture(
     moduleLoaderFactory: () => async () => ({}),
     ...gatewayOptions,
   });
+  gatewaysForCleanup.push(gateway);
   return { gateway, adapter, runtimeHandles };
 }
 
