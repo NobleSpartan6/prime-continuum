@@ -85,12 +85,14 @@ Promise.all([app.whenReady(), controlReady]).then(async () => {
   browserWindow = new BrowserWindow({
     show: false,
     webPreferences: {
-      // This window is intentionally never shown. Keep Chromium drawing and
-      // swapping frames while it is hidden so CDP screenshots cannot stall on
-      // an occluded renderer, notably under Linux/Xvfb.
+      // This window is intentionally never shown. An offscreen surface keeps
+      // CDP capture independent of native-window mapping (notably X11/Xvfb),
+      // while disabling throttling keeps its renderer responsive between
+      // browser commands.
       backgroundThrottling: false,
       contextIsolation: true,
       nodeIntegration: false,
+      offscreen: true,
       sandbox: true,
     },
   });
