@@ -80,8 +80,18 @@ describe("verified browser host environment", () => {
 
     expect(bridgeSource).toContain('join(dirname(import.meta.filename), "browser-doctor-host.cjs")');
     expect(bridgeSource).toContain("--prime-doctor-owner-pid=");
-    expect(doctorHostSource).toContain("process.ppid !== ownerPid");
+    expect(doctorHostSource).toContain('process.platform !== "win32"');
+    expect(doctorHostSource).toContain("process.kill(ownerPid, 0)");
     expect(doctorHostSource).not.toContain("requestSingleInstanceLock");
+  });
+
+  it("maps the build-smoke font marker only inside the verified CLI daemon", async () => {
+    const shimSource = await readFile(
+      join(process.cwd(), "runtime", "prime-agent", "bridge", "electron-node-shim.cjs"),
+      "utf8",
+    );
+    expect(shimSource).toContain('PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY === "1"');
+    expect(shimSource).toContain('process.env.PW_TEST_SCREENSHOT_NO_FONTS_READY = "1"');
   });
 
   it("retains only OS launch state and excludes credentials, loaders, proxies, and agent internals", () => {

@@ -386,7 +386,8 @@ describe("Prime Agent runtime tree attestation", () => {
     ): Promise<{ stdout: string; stderr: string }> => {
       expect(command).toBe(runtimeExecutable);
       expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("15000");
-      expect(options.env?.PW_TEST_SCREENSHOT_NO_FONTS_READY).toBe("1");
+      expect(options.env?.PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY).toBe("1");
+      expect(options.env?.PW_TEST_SCREENSHOT_NO_FONTS_READY).toBeUndefined();
       calls.push({ args, options });
       const operation = args[1] === "doctor" ? "doctor" : args[2];
       if (operation === "doctor") {

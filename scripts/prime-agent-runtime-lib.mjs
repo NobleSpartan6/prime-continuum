@@ -1013,9 +1013,9 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
   const environment = {
     ...cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
     PLAYWRIGHT_MCP_TIMEOUT_ACTION: String(BROWSER_SMOKE_ACTION_TIMEOUT_MS),
-    // This fixture uses only native controls and verifies PNG bytes, not font rendering.
-    // Font readiness can remain pending on minimal Linux runners with no installed fonts.
-    PW_TEST_SCREENSHOT_NO_FONTS_READY: "1",
+    // The verified daemon shim maps this smoke-only marker to Playwright's
+    // private font-readiness bypass inside the child that takes the screenshot.
+    PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY: "1",
     PRIME_CONTINUIM_BROWSER_EXECUTABLE: runtimeExecutable,
     PRIME_CONTINUIM_BROWSER_BRIDGE: entrypoints.browserBridge,
     PRIME_CONTINUIM_BROWSER_STATE_DIR: stateDirectory,

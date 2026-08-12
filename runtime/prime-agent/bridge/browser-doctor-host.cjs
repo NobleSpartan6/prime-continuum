@@ -2,7 +2,7 @@ const { app, BrowserWindow } = require("electron");
 
 const OWNER_POLL_MS = 200;
 const ownerPid = exactPositiveIntegerArgument("--prime-doctor-owner-pid=");
-if (process.ppid !== ownerPid) {
+if (!ownerIsAvailable()) {
   throw new Error("verified browser doctor owner is unavailable");
 }
 
@@ -12,8 +12,7 @@ app.commandLine.appendSwitch("no-default-browser-check");
 let browserWindow;
 let closing = false;
 const ownerWatchdog = setInterval(() => {
-  // The OS parent relationship cannot be transferred to a PID-reused process.
-  if (process.ppid !== ownerPid) initiateQuit();
+  if (!ownerIsAvailable()) initiateQuit();
 }, OWNER_POLL_MS);
 ownerWatchdog.unref();
 
@@ -39,6 +38,19 @@ function initiateQuit() {
   clearInterval(ownerWatchdog);
   if (app.isReady()) app.quit();
   else app.once("ready", () => app.quit());
+}
+
+function ownerIsAvailable() {
+  // Electron's Windows launcher does not preserve a stable parent PID in all
+  // hosted runners. This probe is short-lived and stateless, so exact owner
+  // liveness is sufficient there; POSIX keeps the stronger parent relation.
+  if (process.platform !== "win32") return process.ppid === ownerPid;
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function exactPositiveIntegerArgument(prefix) {

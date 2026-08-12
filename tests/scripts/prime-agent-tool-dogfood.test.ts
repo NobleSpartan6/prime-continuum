@@ -211,7 +211,15 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     )
     const collision: any = structuredClone(initial)
     collision.runtime.resourceInventory.diagnostics.collisions = [{ resourceType: 'skill', name: BROWSER_SURFACE }]
-    expect(() => validateInitialProjection(collision, identity)).toThrow()
+    expect(validateInitialProjection(collision, identity)).toMatchObject({
+      hostId: 'host-1',
+      threadId: 'thread-1',
+    })
+    const unverifiedWinner: any = structuredClone(collision)
+    unverifiedWinner.runtime.resourceInventory.skills[0].sourceKind = { scope: 'project', origin: 'top-level' }
+    expect(() => validateInitialProjection(unverifiedWinner, identity)).toThrowError(
+      expect.objectContaining({ code: 'PRECONDITION_NOT_PROVEN' }),
+    )
     const noOauth = modelCatalog()
     noOauth.models[0]!.usingOAuth = false
     expect(() => validateAuthenticatedCatalog(noOauth)).toThrowError(

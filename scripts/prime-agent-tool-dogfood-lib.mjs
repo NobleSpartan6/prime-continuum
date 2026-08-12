@@ -319,13 +319,15 @@ export function validateInitialProjection(snapshot, identity) {
     snapshot.residentControl?.browserExecution?.surface !== BROWSER_SURFACE
   ) fail("precondition", "PRECONDITION_NOT_PROVEN");
   const inventory = snapshot.runtime?.resourceInventory;
+  const browserSkills = Array.isArray(inventory?.skills)
+    ? inventory.skills.filter((skill) => skill?.name === BROWSER_SURFACE)
+    : [];
   if (
-    !Array.isArray(inventory?.skills) ||
-    inventory.skills.filter((skill) => skill?.name === BROWSER_SURFACE).length !== 1 ||
+    browserSkills.length !== 1 ||
+    browserSkills[0]?.sourceKind?.scope !== "temporary" ||
+    browserSkills[0]?.sourceKind?.origin !== "top-level" ||
     inventory?.diagnostics?.errorCount !== 0 ||
-    !Array.isArray(inventory?.diagnostics?.collisions) ||
-    inventory.diagnostics.collisions.some((collision) =>
-      collision?.resourceType === "skill" && collision?.name === BROWSER_SURFACE)
+    !Array.isArray(inventory?.diagnostics?.collisions)
   ) fail("precondition", "PRECONDITION_NOT_PROVEN");
   if (!identity?.goalObjective || !identity?.finalMarker) fail("precondition", "PRECONDITION_NOT_PROVEN");
   return Object.freeze({
