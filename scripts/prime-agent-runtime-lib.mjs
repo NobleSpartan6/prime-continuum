@@ -36,6 +36,8 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
 const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
+const DOWNLOAD_FETCH_ATTEMPTS = 3;
+const DOWNLOAD_RETRY_BASE_DELAY_MS = 250;
 const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 15_000;
 const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
 const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
@@ -298,12 +300,7 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts, options) 
       noProgressTimeoutMs: options.noProgressTimeoutMs ?? DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
       controller,
     };
-    const response = await awaitDownloadProgress(
-      fetchAllowed(asset.url, allowedHosts, { fetchImpl: options.fetchImpl ?? fetch, signal: controller.signal }),
-      limits,
-      asset.fileName,
-      true,
-    );
+    const response = await fetchReleaseAssetWithRetry(asset, allowedHosts, options, limits);
     if (!response.ok || !response.body) {
       throw buildError(`Could not download ${asset.fileName}: HTTP ${response.status}.`);
     }
@@ -336,6 +333,41 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts, options) 
     await rm(partial, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function fetchReleaseAssetWithRetry(asset, allowedHosts, options, limits) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const sleep = options.sleep ?? ((milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)));
+  for (let attempt = 1; attempt <= DOWNLOAD_FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      return await awaitDownloadProgress(
+        fetchAllowed(asset.url, allowedHosts, { fetchImpl, signal: limits.controller.signal }),
+        limits,
+        asset.fileName,
+        true,
+      );
+    } catch (error) {
+      if (attempt >= DOWNLOAD_FETCH_ATTEMPTS || !hasErrorCode(error, "UND_ERR_SOCKET")) throw error;
+      await awaitDownloadProgress(
+        Promise.resolve(sleep(DOWNLOAD_RETRY_BASE_DELAY_MS * attempt)),
+        limits,
+        asset.fileName,
+        true,
+      );
+    }
+  }
+  throw buildError(`Could not download ${asset.fileName}.`);
+}
+
+function hasErrorCode(error, expected) {
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    if (current.code === expected) return true;
+    seen.add(current);
+    current = current.cause;
+  }
+  return false;
 }
 
 async function fetchAllowed(url, allowedHosts, { fetchImpl, signal }) {

@@ -46,6 +46,7 @@ export function verifyReleaseAssets(inputs: RuntimeInputs, cacheDirectory: strin
   fetchImpl?: typeof fetch;
   totalTimeoutMs?: number;
   noProgressTimeoutMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
   platform?: NodeJS.Platform;
   arch?: string;
 }): Promise<readonly string[]>;

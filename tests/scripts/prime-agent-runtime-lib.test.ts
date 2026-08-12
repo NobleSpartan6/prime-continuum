@@ -152,6 +152,79 @@ describe("Prime Agent runtime build policy", () => {
 });
 
 describe("Prime Agent runtime asset download liveness", () => {
+  it("retries a bounded pre-body UND_ERR_SOCKET failure and still verifies exact bytes", async () => {
+    const cache = await temporaryDirectory("prime-runtime-fetch-retry-");
+    const bytes = Buffer.from("pinned asset");
+    const inputs = downloadInputs(bytes);
+    const delays: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls < 3) {
+        const socketError = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+        throw Object.assign(new TypeError("fetch failed"), { cause: socketError });
+      }
+      return new Response(bytes, { status: 200 });
+    }) as typeof fetch;
+
+    const verified = await verifyReleaseAssets(inputs as never, cache, {
+      fetchImpl,
+      sleep: async (milliseconds: number) => { delays.push(milliseconds); },
+    });
+
+    expect(calls).toBe(3);
+    expect(delays).toEqual([250, 500]);
+    expect(await readFile(verified[0]!)).toEqual(bytes);
+  });
+
+  it("stops after three pre-body socket attempts", async () => {
+    const cache = await temporaryDirectory("prime-runtime-fetch-retry-limit-");
+    const delays: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      const socketError = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+      throw Object.assign(new TypeError("fetch failed"), { cause: socketError });
+    }) as typeof fetch;
+
+    await expect(verifyReleaseAssets(downloadInputs(Buffer.from("pinned asset")) as never, cache, {
+      fetchImpl,
+      sleep: async (milliseconds: number) => { delays.push(milliseconds); },
+    })).rejects.toThrow("fetch failed");
+    expect(calls).toBe(3);
+    expect(delays).toEqual([250, 500]);
+    expect(await readdir(cache)).toEqual([]);
+  });
+
+  it("does not retry HTTP or integrity failures", async () => {
+    const bytes = Buffer.from("pinned asset");
+    const sleep = async () => { throw new Error("must not retry"); };
+
+    const httpCache = await temporaryDirectory("prime-runtime-fetch-http-");
+    let httpCalls = 0;
+    await expect(verifyReleaseAssets(downloadInputs(bytes) as never, httpCache, {
+      fetchImpl: (async () => {
+        httpCalls += 1;
+        return new Response("missing", { status: 404 });
+      }) as typeof fetch,
+      sleep,
+    })).rejects.toThrow("Could not download asset.tgz: HTTP 404");
+    expect(httpCalls).toBe(1);
+    expect(await readdir(httpCache)).toEqual([]);
+
+    const digestCache = await temporaryDirectory("prime-runtime-fetch-digest-");
+    let digestCalls = 0;
+    await expect(verifyReleaseAssets(downloadInputs(bytes) as never, digestCache, {
+      fetchImpl: (async () => {
+        digestCalls += 1;
+        return new Response(Buffer.from("broken asset"), { status: 200 });
+      }) as typeof fetch,
+      sleep,
+    })).rejects.toThrow("Downloaded bytes did not match the pinned asset.tgz digest");
+    expect(digestCalls).toBe(1);
+    expect(await readdir(digestCache)).toEqual([]);
+  });
+
   it("aborts a release fetch that never produces response headers", async () => {
     const cache = await temporaryDirectory("prime-runtime-fetch-timeout-");
     const inputs = downloadInputs(Buffer.from("pinned asset"));
