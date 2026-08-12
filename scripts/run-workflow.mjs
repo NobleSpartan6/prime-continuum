@@ -24,7 +24,6 @@ import {
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
 const UNSIGNED_WINDOWS_ENV = createWindowsPackagingEnvironment(process.env)
-const AD_HOC_MACOS_ENV = createMacosPackagingEnvironment(process.env)
 
 function createWorkflows(releaseOptions = {}) {
   const releaseBuildSteps = [
@@ -178,7 +177,10 @@ function materializeWindowsPackagingStep(step) {
 function materializeMacosPackagingStep(step) {
   return step.kind === 'node'
     ? nodeStep(step.label, step.script, step.args)
-    : pnpmStep(step.label, step.args, AD_HOC_MACOS_ENV, true)
+    // Keep the POSIX-only PATH policy behind the macOS package/dist branch.
+    // Importing this runner or planning `pnpm build` on Windows must never
+    // evaluate a Windows process.execPath as a macOS executable path.
+    : pnpmStep(step.label, step.args, createMacosPackagingEnvironment(process.env), true)
 }
 
 function pnpmStep(label, args, environment = {}, replaceEnvironment = false, environmentBoundary) {

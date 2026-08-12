@@ -115,7 +115,7 @@ describe('macOS directory packaging policy', () => {
     })
   })
 
-  it('keeps pnpm package platform-aware while preserving the Windows builder plan', async () => {
+  it('keeps Windows build planning/import from evaluating macOS PATH while preserving both package plans', async () => {
     const workflow = await readFile(resolve('scripts/run-workflow.mjs'), 'utf8')
     expect(workflow).toContain("process.platform === 'darwin'")
     expect(workflow).toContain('createMacosPackagingBuilderPlan({ arch: process.arch }).map(materializeMacosPackagingStep)')
@@ -123,7 +123,11 @@ describe('macOS directory packaging policy', () => {
     expect(workflow).toContain("nodeStep('Verify the macOS application directory', 'scripts/verify-macos-package.mjs')")
     expect(workflow).toContain('createMacosDmgBuilderPlan({ arch: process.arch }).map(materializeMacosPackagingStep)')
     expect(workflow).toContain("nodeStep('Verify and checksum the macOS DMG', 'scripts/verify-macos-dmg.mjs')")
-    expect(workflow).toContain('AD_HOC_MACOS_ENV')
+    expect(workflow).not.toContain('AD_HOC_MACOS_ENV')
+    expect(workflow).not.toMatch(/^const .*createMacosPackagingEnvironment/m)
+    expect(workflow).toMatch(
+      /function materializeMacosPackagingStep[\s\S]*createMacosPackagingEnvironment\(process\.env\)/,
+    )
     expect(workflow).toContain('UNSIGNED_WINDOWS_ENV')
   })
 
