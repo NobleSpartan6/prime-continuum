@@ -16,7 +16,7 @@ export interface RuntimeInputs {
 
 export interface RuntimeSmokeResult {
   runtimeExecutable: string;
-  runtimeVersions: Record<string, string>;
+  runtimeVersions: Record<string, string | boolean>;
   hello: JsonRecord;
 }
 

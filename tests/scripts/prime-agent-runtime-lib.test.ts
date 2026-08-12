@@ -287,7 +287,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs,
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     });
     await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).resolves.toMatchObject({
@@ -296,6 +296,14 @@ describe("Prime Agent runtime tree attestation", () => {
 
     const manifestPath = join(root, "runtime.json");
     const manifestText = await readFile(manifestPath, "utf8");
+    const incompleteSmokeManifest = JSON.parse(manifestText) as Record<string, any>;
+    delete incompleteSmokeManifest.smokeRuntime.bundleImportGraphComplete;
+    await writeFile(manifestPath, `${JSON.stringify(incompleteSmokeManifest, null, 2)}\n`);
+    await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).rejects.toThrow(
+      "Runtime manifest build or smoke identity is invalid",
+    );
+    await writeFile(manifestPath, manifestText);
+
     const tamperedManifest = JSON.parse(manifestText) as Record<string, any>;
     tamperedManifest.daemon.schemaId = "protocol-tampered";
     await writeFile(manifestPath, `${JSON.stringify(tamperedManifest, null, 2)}\n`);
@@ -329,7 +337,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs: fixtureInputs(),
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     })).rejects.toThrow("must not contain a companion backend");
   });
@@ -430,7 +438,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs,
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     });
     const manifestPath = join(root, "runtime.json");

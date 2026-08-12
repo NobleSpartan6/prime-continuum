@@ -1190,6 +1190,7 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
     !manifest.libc ||
     !runtimeVersionRecordIsValid(manifest.buildRuntime, { expectedNpm: options.policy?.npmVersion }) ||
     !runtimeVersionRecordIsValid(manifest.smokeRuntime, { requireNpm: false }) ||
+    manifest.smokeRuntime.bundleImportGraphComplete !== true ||
     manifest.smokeRuntime.platform !== manifest.platform ||
     manifest.smokeRuntime.arch !== manifest.arch
   ) {

@@ -29,6 +29,7 @@ import {
   compareExactDirectoryTrees,
   parseAdHocCodesignDisplay,
   readRequiredMacosFuses,
+  selectPackagedMetadata,
 } from '../../scripts/macos-package-verification-lib.mjs'
 
 const scratchRoots: string[] = []
@@ -38,6 +39,31 @@ afterEach(async () => {
 })
 
 describe('macOS directory packaging policy', () => {
+  it('binds the public package identity that electron-builder retains', () => {
+    const project = {
+      name: 'prime-continuim',
+      version: '0.1.0',
+      private: true,
+      author: 'Prime Continuim contributors',
+      license: 'MIT',
+      description: 'Prime Continuim',
+      homepage: 'https://example.test',
+      repository: { type: 'git', url: 'https://example.test/repo.git' },
+      bugs: { url: 'https://example.test/issues' },
+      keywords: ['intentionally stripped by electron-builder'],
+      main: './out/main/index.js',
+      type: 'module',
+      packageManager: 'pnpm@11.9.0',
+      engines: { node: '>=22.12.0' },
+      devEngines: { runtime: { name: 'node', version: '24.14.0' } },
+      dependencies: { react: '19.2.8' },
+    }
+
+    expect(selectPackagedMetadata(project)).toEqual(Object.fromEntries(
+      Object.entries(project).filter(([key]) => key !== 'keywords'),
+    ))
+  })
+
   it('forces an explicit local arm64 directory package without publishing', () => {
     expect(createMacosElectronBuilderArguments({ arch: 'arm64' })).toEqual([
       'exec',

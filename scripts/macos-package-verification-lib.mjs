@@ -184,7 +184,23 @@ export function parseJsonObject(bytes, label) {
 }
 
 export function selectPackagedMetadata(projectPackage) {
-  const fields = ['name', 'version', 'private', 'author', 'description', 'main', 'type', 'packageManager', 'engines', 'devEngines', 'dependencies']
+  const fields = [
+    'name',
+    'version',
+    'private',
+    'author',
+    'license',
+    'description',
+    'homepage',
+    'repository',
+    'bugs',
+    'main',
+    'type',
+    'packageManager',
+    'engines',
+    'devEngines',
+    'dependencies',
+  ]
   const selected = {}
   for (const field of fields) {
     invariant(Object.hasOwn(projectPackage, field), `The project package manifest is missing ${field}.`)

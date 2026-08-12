@@ -74,6 +74,7 @@ const RuntimeManifestSchema = z.object({
   smokeRuntime: RuntimeVersionSchema.extend({
     platform: BoundedStringSchema,
     arch: BoundedStringSchema,
+    bundleImportGraphComplete: z.literal(true),
   }).strict(),
   sourcesSha256: Sha256Schema,
   policySha256: Sha256Schema,
