@@ -17,6 +17,7 @@ import {
   type WorkbenchSnapshot,
 } from '../../src/renderer/src/api'
 import type { HudMode, HudState, HudTarget } from '../../src/shared/window-control'
+import type { NativeShellCommand } from '../../src/shared/native-shell'
 import type {
   CandidateEvaluationPreflight,
   CandidateEvaluationSnapshot,
@@ -1002,6 +1003,7 @@ afterEach(() => {
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined })
+  Reflect.deleteProperty(window, 'prime')
 })
 
 describe('Prime Continuim renderer', () => {
@@ -5078,7 +5080,7 @@ describe('Prime Continuim renderer', () => {
     expect(within(runtimePanel).getByRole('heading', { name: 'RLM delegation' })).toBeVisible()
     expect(within(runtimePanel).getByText(/delegates focused work, then folds results/i)).toBeVisible()
     expect(within(runtimePanel).getByText('Coordinator · main session')).toBeVisible()
-    expect(within(runtimePanel).getAllByText('Branch of Workbench lead')).toHaveLength(2)
+    expect(within(runtimePanel).getAllByText('Delegated by Workbench lead')).toHaveLength(2)
     const rlmSummary = within(runtimePanel).getByLabelText('RLM activity summary')
     expect(within(rlmSummary).getByText('2')).toBeVisible()
     expect(within(rlmSummary).getByText('1')).toBeVisible()
@@ -5668,6 +5670,30 @@ describe('Prime Continuim renderer', () => {
     await user.type(reopenedSearch, 'Companion')
     expect(within(reopenedPalette).getByText('No matching thread, project, or available command.')).toBeVisible()
     expect(within(reopenedPalette).queryByRole('option', { name: /companion|mobile|phone/i })).not.toBeInTheDocument()
+  })
+
+  it('routes the native macOS menu through the path-free preload command surface', async () => {
+    let listener: ((command: NativeShellCommand) => void) | undefined
+    Object.defineProperty(window, 'prime', {
+      configurable: true,
+      value: {
+        nativePlatform: 'darwin',
+        onNativeShellCommand(nextListener: (command: NativeShellCommand) => void) {
+          listener = nextListener
+          return () => {
+            if (listener === nextListener) listener = undefined
+          }
+        },
+      },
+    })
+
+    render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    expect(document.title).toBe('Seamless remote experience — Prime Continuim')
+    expect(document.documentElement).toHaveAttribute('data-native-platform', 'darwin')
+
+    act(() => listener?.('search'))
+    expect(await screen.findByRole('dialog', { name: 'Search and commands' })).toBeVisible()
   })
 
   it('does not expose deferred mobile controls or honor the retired Companion route', async () => {

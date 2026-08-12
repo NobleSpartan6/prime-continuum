@@ -29,8 +29,8 @@ describe('renderer style contracts', () => {
     expect(css).not.toContain('.empty-workbench__eyebrow')
     expect(css).toMatch(/\.empty-workbench__icon\s*{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*border-radius:\s*0;/s)
     expect(css).toMatch(/\.local-setup__steps\s*{[^}]*border:\s*1px solid var\(--color-border\);[^}]*box-shadow:\s*none;/s)
-    expect(css).toMatch(/\.agent-launchpad__tasks\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*border-block:\s*1px solid var\(--color-border\);/s)
-    expect(css).toMatch(/\.agent-launchpad__task\s*{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*border-radius:\s*0;/s)
+    expect(css).toMatch(/\.agent-launchpad__tasks\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*border:\s*0;/s)
+    expect(css).toMatch(/\.agent-launchpad__task\s*{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*border-radius:\s*var\(--radius-md\);/s)
   })
 
   it('restores text-field focus outlines in Windows forced-colors mode', async () => {
@@ -66,9 +66,9 @@ describe('renderer style contracts', () => {
   it('renders recursive sessions as a clear coordinator and child-session hierarchy', async () => {
     const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
 
-    expect(css).toMatch(/\.rlm-map\s*{[^}]*border-block:\s*1px solid var\(--color-border\);/s)
+    expect(css).toMatch(/\.rlm-map\s*{[^}]*border:\s*0;/s)
     expect(css).toMatch(/\.rlm-map__root\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\);/s)
-    expect(css).toMatch(/\.rlm-map__row\s*{[^}]*padding-inline:\s*calc\(0\.1rem \+ var\(--rlm-depth, 0\) \* 0\.75rem\) 0;[^}]*content-visibility:\s*auto;[^}]*contain-intrinsic-block-size:\s*auto 4\.1rem;/s)
+    expect(css).toMatch(/\.rlm-map__row\s*{[^}]*padding-inline:\s*calc\(0\.25rem \+ var\(--rlm-depth, 0\) \* 0\.75rem\) 0\.25rem;[^}]*border:\s*0;[^}]*content-visibility:\s*auto;[^}]*contain-intrinsic-block-size:\s*auto 4\.1rem;/s)
     expect(css).not.toContain('.rlm-map__connector')
     expect(css).not.toContain('.session-lifecycle-path')
   })
@@ -113,6 +113,17 @@ describe('renderer style contracts', () => {
     expect(compactComposer).toMatch(/\.task-starters\s*{[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*scroll-snap-type:\s*inline proximity;/s)
     expect(compactComposer).toMatch(/\.task-starters__item\s*{[^}]*flex:\s*0 0 10\.75rem;[^}]*scroll-snap-align:\s*start;/s)
     expect(css).toMatch(/\.task-starters__item > span\s*{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/s)
+  })
+
+  it('collapses the short HUD to one status and one control surface', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+    const compactHudStart = css.indexOf('@media (max-height: 18rem)')
+    const compactHud = css.slice(compactHudStart, css.indexOf('@media (max-height: 6rem)', compactHudStart))
+
+    expect(compactHud).toMatch(/\.hud-session-strip__facts,\s*\.hud-expanded__thread > \.transcript\s*{[^}]*display:\s*none;/s)
+    expect(compactHud).toMatch(/\.hud-expanded \.composer-wrap\s*{[^}]*margin-block-start:\s*auto;/s)
+    expect(css).toMatch(/\.hud-expanded \.composer:focus-within\s*{[^}]*inset 0 0 0 1px[^}]*;/s)
+    expect(css).not.toMatch(/\.hud-expanded \.composer:focus-within\s*{[^}]*inset 2px 0/s)
   })
 
   it('preserves a readable thread title and primary composer actions at 320 CSS pixels', async () => {

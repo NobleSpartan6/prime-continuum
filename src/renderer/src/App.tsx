@@ -77,6 +77,7 @@ import {
   type WorkbenchSnapshot,
 } from './api'
 import type { HudMode, HudState, HudTarget } from '../../shared/window-control'
+import type { NativePlatform, NativeShellBridge } from '../../shared/native-shell'
 import type {
   CandidateEvaluationPreflight,
   CandidateEvaluationPreflightRequest,
@@ -1315,6 +1316,15 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     [suppliedApi, surface],
   )
   const [snapshot, setSnapshot] = useState<WorkbenchSnapshot | null>(null)
+  const nativeShellBridge = useMemo(
+    () => Reflect.get(window, 'prime') as Partial<NativeShellBridge> | undefined,
+    [],
+  )
+  const nativePlatform = useMemo<NativePlatform>(() => {
+    const reported = nativeShellBridge?.nativePlatform
+    if (reported === 'darwin' || reported === 'win32' || reported === 'linux') return reported
+    return /Mac|iPhone|iPad/i.test(navigator.platform) ? 'darwin' : 'linux'
+  }, [nativeShellBridge])
   const [loadError, setLoadError] = useState('')
   const [hudState, setHudState] = useState<HudState | null>(surface === 'hud' ? null : { state: 'closed' })
   const [hudBoundaryError, setHudBoundaryError] = useState('')
@@ -1412,6 +1422,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     window.addEventListener('resize', updateViewportWidth)
     return () => window.removeEventListener('resize', updateViewportWidth)
   }, [surface])
+
+  useEffect(() => {
+    document.documentElement.dataset.nativePlatform = nativePlatform
+    return () => {
+      delete document.documentElement.dataset.nativePlatform
+    }
+  }, [nativePlatform])
 
   const maximumPanelWidth = useCallback((panel: WorkbenchPanel): number => {
     const bounds = panelWidthBounds(panel)
@@ -1730,6 +1747,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     snapshot?.projects.find((project) => project.id === selectedProjectId) ??
     snapshot?.projects[0]
   const selectedHost = snapshot?.hosts.find((host) => host.id === selectedThread?.hostId) ?? snapshot?.hosts[0]
+
+  useEffect(() => {
+    if (surface !== 'workbench') return
+    document.title = selectedThread?.title
+      ? `${selectedThread.title} — Prime Continuim`
+      : 'Prime Continuim'
+  }, [selectedThread?.title, surface])
   const selectedHostActivation = hostActivation?.hostId === selectedHost?.id ? hostActivation : null
   const hostActivationPending = selectedHostActivation?.phase === 'connecting'
   const canActivateSelectedHost = Boolean(
@@ -2683,6 +2707,61 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     }
   }
 
+  useEffect(() => {
+    if (surface !== 'workbench' || !nativeShellBridge?.onNativeShellCommand) return
+    return nativeShellBridge.onNativeShellCommand((command) => {
+      if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return
+      if (command === 'search') {
+        openCommandPalette()
+        return
+      }
+      if (command === 'toggle-sidebar') {
+        if (sidebarIsOverlay) {
+          setInspectorOpen(false)
+          setSidebarOpen((value) => !value)
+        } else {
+          setSidebarCollapsed((value) => !value)
+        }
+        return
+      }
+      if (command === 'toggle-inspector') {
+        setSidebarOpen(false)
+        setInspectorOpen((value) => !value)
+        return
+      }
+      if (command === 'models') {
+        if (!selectedHost || !canLoadModelCatalog) return
+        modelsDialogTriggerRef.current = commandPaletteTriggerRef.current ?? sidebarToggleRef.current
+        setModelsOpen(true)
+        return
+      }
+      if (command === 'add-computer') {
+        if (!canManageComputers) return
+        addComputerReturnTargetRef.current = sidebarToggleRef.current
+        setAddComputerOpen(true)
+        return
+      }
+      if (command === 'new-agent') {
+        if (!canProvisionResident) {
+          openCommandPalette()
+          return
+        }
+        void chooseResidentWorkspace(sidebarToggleRef.current ?? document.body)
+      }
+    })
+  }, [
+    canLoadModelCatalog,
+    canManageComputers,
+    canProvisionResident,
+    nativeShellBridge,
+    openCommandPalette,
+    selectedHost,
+    setInspectorOpen,
+    setSidebarCollapsed,
+    sidebarIsOverlay,
+    surface,
+  ])
+
   const copyLocalSetupDiagnostic = async () => {
     const setup = snapshot?.localSetup
     if (
@@ -3538,6 +3617,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   return (
     <div
       className="app-shell"
+      data-native-platform={nativePlatform}
       data-sidebar-open={sidebarOpen}
       data-sidebar-collapsed={!sidebarIsOverlay && sidebarCollapsed}
       data-inspector-open={inspectorOpen}

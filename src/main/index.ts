@@ -11,9 +11,11 @@ import {
   registerHudIpc,
 } from './hud-window'
 import { installOrderlyQuitDrain } from './orderly-quit'
+import { installNativeMenu } from './native-menu'
 import { resolvePreloadEntry } from './window-paths'
 import { secureWebPreferences } from './window-security'
 import { RESIDENT_LIFECYCLE_CAPABILITY } from '../shared/protocol'
+import { NATIVE_SHELL_IPC, type NativeShellCommand } from '../shared/native-shell'
 
 let mainWindow: BrowserWindow | undefined
 let trustedRendererUrl = ''
@@ -31,11 +33,17 @@ function createWindow(loadImmediately = true, showWhenReady = true): BrowserWind
   const window = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 960,
-    minHeight: 640,
+    minWidth: 720,
+    minHeight: 520,
     show: false,
     backgroundColor: '#0c0d0e',
     autoHideMenuBar: true,
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset' as const,
+          trafficLightPosition: { x: 16, y: 18 },
+        }
+      : {}),
     webPreferences: secureWebPreferences(resolvePreloadEntry(__dirname))
   })
 
@@ -58,11 +66,25 @@ function ensureMainWindow(): BrowserWindow {
 }
 
 function showMainWindow(): BrowserWindow {
+  const existing = mainWindow
   const window = ensureMainWindow()
   if (window.isMinimized()) window.restore()
-  if (!window.isVisible()) window.show()
-  window.focus()
+  if (!existing || existing.isDestroyed()) {
+    window.once('ready-to-show', () => window.focus())
+  } else {
+    if (!window.isVisible()) window.show()
+    window.focus()
+  }
   return window
+}
+
+function dispatchNativeShellCommand(command: NativeShellCommand): void {
+  const window = showMainWindow()
+  const send = () => {
+    if (!window.isDestroyed()) window.webContents.send(NATIVE_SHELL_IPC.command, command)
+  }
+  if (window.webContents.isLoadingMainFrame()) window.webContents.once('did-finish-load', send)
+  else send()
 }
 
 function trustedRendererWindows(): BrowserWindow[] {
@@ -358,6 +380,7 @@ function initializePrimaryInstance(): void {
     }
   })
   mainWindow = createWindow(false, !packageSmoke)
+  installNativeMenu({ dispatch: dispatchNativeShellCommand })
   hudWindowController = new HudWindowController({
     preloadPath: resolvePreloadEntry(__dirname),
     store: createHudWindowPreferencesStore(path.join(app.getPath('userData'), 'hud-window.json')),

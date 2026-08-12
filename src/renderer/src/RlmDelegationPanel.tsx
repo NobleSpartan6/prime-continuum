@@ -156,6 +156,9 @@ function AgentBranchRow({ branch, isFresh }: { branch: AgentBranch; isFresh: boo
   return (
     <li
       className="rlm-map__branch"
+      aria-label={parent
+        ? `${agentDisplayName(agent)}, delegated by ${agentDisplayName(parent)}`
+        : `${agentDisplayName(agent)}, delegated branch`}
       data-runtime-agent
       data-rlm-depth={depth}
       data-rlm-parent={parent?.id}
@@ -170,8 +173,8 @@ function AgentBranchRow({ branch, isFresh }: { branch: AgentBranch; isFresh: boo
             <strong>{agentDisplayName(agent)}</strong>
             <span>{statusCopy}</span>
           </span>
-          <span className="rlm-map__role">
-            {parent ? `Branch of ${agentDisplayName(parent)}` : 'RLM branch'}
+          <span className="sr-only">
+            {parent ? `Delegated by ${agentDisplayName(parent)}` : 'Delegated RLM branch'}
           </span>
           <span>{agent.activity ?? (resultPreview ? agent.role : agent.recap ?? agent.role)}</span>
           <small>

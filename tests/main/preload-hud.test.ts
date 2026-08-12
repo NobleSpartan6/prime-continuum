@@ -14,6 +14,11 @@ vi.mock('electron', () => ({
 
 import '../../src/preload/index'
 import { HUD_IPC, type HudBridge, type HudState, type HudTarget } from '../../src/shared/window-control'
+import {
+  NATIVE_SHELL_IPC,
+  type NativeShellBridge,
+  type NativeShellCommand,
+} from '../../src/shared/native-shell'
 
 describe('preload HUD bridge', () => {
   it('exposes only narrow path-free HUD operations on the frozen Prime bridge', async () => {
@@ -69,5 +74,19 @@ describe('preload HUD bridge', () => {
 
     unsubscribe()
     expect(removeListener).toHaveBeenCalledWith(HUD_IPC.stateChanged, nativeHandler)
+  })
+
+  it('exposes the native platform and a removable path-free menu command listener', () => {
+    const exposed = exposeInMainWorld.mock.calls[0]?.[1] as NativeShellBridge
+    expect(['darwin', 'win32', 'linux']).toContain(exposed.nativePlatform)
+    const listener = vi.fn<(command: NativeShellCommand) => void>()
+    const unsubscribe = exposed.onNativeShellCommand(listener)
+    const nativeHandler = on.mock.calls.find(([channel]) => channel === NATIVE_SHELL_IPC.command)?.[1] as
+      | ((event: unknown, command: NativeShellCommand) => void)
+      | undefined
+    nativeHandler?.({}, 'toggle-inspector')
+    expect(listener).toHaveBeenCalledWith('toggle-inspector')
+    unsubscribe()
+    expect(removeListener).toHaveBeenCalledWith(NATIVE_SHELL_IPC.command, nativeHandler)
   })
 })

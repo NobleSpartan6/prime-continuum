@@ -65,6 +65,7 @@
   --radius-md: 0.5rem;
   --radius-lg: 0.625rem;
   --radius-xl: 0.75rem;
+  --toolbar-height: 3.625rem;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
 }
@@ -438,7 +439,7 @@ code,
   position: relative;
   display: grid;
   grid-template-columns: 16rem minmax(25rem, 1fr);
-  grid-template-rows: 3.5rem minmax(0, 1fr);
+  grid-template-rows: var(--toolbar-height) minmax(0, 1fr);
   grid-template-areas:
     "topbar topbar"
     "sidebar thread";
@@ -486,6 +487,10 @@ code,
   align-self: stretch;
   padding-inline: 0.75rem;
   border-inline-end: 1px solid var(--color-border);
+}
+
+:root[data-native-platform="darwin"] .topbar__leading {
+  padding-inline-start: 5rem;
 }
 
 .topbar__controls {
@@ -1525,8 +1530,8 @@ code,
 .agent-launchpad__tasks {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 0;
-  border-block: 1px solid var(--color-border);
+  gap: 0.25rem;
+  border: 0;
 }
 
 .agent-launchpad__task {
@@ -1535,12 +1540,12 @@ code,
   align-items: center;
   min-block-size: 3.75rem;
   gap: 0.75rem;
-  padding: 0.65rem 0.25rem;
+  padding: 0.65rem 0.55rem;
   color: var(--color-text);
   text-align: start;
   background: transparent;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--radius-md);
   box-shadow: none;
   transition-property: color, background-color;
   transition-duration: 100ms;
@@ -1548,7 +1553,7 @@ code,
 }
 
 .agent-launchpad__task + .agent-launchpad__task {
-  border-block-start: 1px solid var(--color-border);
+  border-block-start: 0;
 }
 
 .agent-launchpad__task:hover:not(:disabled) {
@@ -3175,7 +3180,7 @@ code,
 
 .rlm-map {
   min-inline-size: 0;
-  border-block: 1px solid var(--color-border);
+  border: 0;
 }
 
 .rlm-map__root {
@@ -3199,13 +3204,15 @@ code,
 
 .rlm-map > .runtime-empty {
   padding: 0.65rem 0 0.7rem 2.4rem;
-  border-block-start: 1px solid var(--color-border);
+  border-block-start: 0;
 }
 
 .rlm-map__children {
-  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.25rem 0 0;
   margin: 0;
-  border-block-start: 1px solid var(--color-border);
+  border: 0;
   list-style: none;
 }
 
@@ -3223,7 +3230,7 @@ code,
 }
 
 .runtime-section .rlm-map__children > li + li {
-  border-block-start: 1px solid var(--color-border);
+  border-block-start: 0;
 }
 
 .rlm-map__body {
@@ -3273,7 +3280,7 @@ code,
 .rlm-map__result {
   min-inline-size: 0;
   margin-block-start: 0.25rem;
-  border-block-start: 1px solid var(--color-border);
+  border-block-start: 0;
 }
 
 .rlm-map__result summary {
@@ -3396,7 +3403,7 @@ code,
 .empty-workbench {
   position: relative;
   display: grid;
-  grid-template-rows: 3.5rem minmax(0, 1fr);
+  grid-template-rows: var(--toolbar-height) minmax(0, 1fr);
   block-size: 100%;
   min-block-size: 0;
   overflow: hidden;
@@ -3408,7 +3415,7 @@ code,
   content: "";
   position: absolute;
   z-index: 0;
-  inset: 3.5rem 0 0;
+  inset: var(--toolbar-height) 0 0;
   background-image:
     linear-gradient(to right, color-mix(in oklch, var(--color-border) 32%, transparent) 1px, transparent 1px),
     linear-gradient(to bottom, color-mix(in oklch, var(--color-border) 32%, transparent) 1px, transparent 1px),
@@ -3434,6 +3441,10 @@ code,
   background: var(--color-canvas);
   border-block-end: 1px solid var(--color-border);
   font-size: var(--font-ui);
+}
+
+:root[data-native-platform="darwin"] .empty-workbench__topbar {
+  padding-inline-start: 5rem;
 }
 
 .empty-workbench__main {
@@ -6185,9 +6196,7 @@ body[data-surface="hud"] {
 }
 
 .hud-expanded .composer:focus-within {
-  box-shadow:
-    inset 2px 0 var(--color-accent),
-    inset 0 0 0 1px var(--color-control-border);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--color-focus) 72%, var(--color-control-border));
 }
 
 .hud-expanded .composer__hint {
@@ -6370,8 +6379,18 @@ body[data-surface="hud"] {
   }
 
   .hud-session-strip {
+    grid-template-columns: minmax(0, 1fr);
     gap: 0.35rem;
     padding-block: 0.3rem;
+  }
+
+  .hud-session-strip__facts,
+  .hud-expanded__thread > .transcript {
+    display: none;
+  }
+
+  .hud-expanded .composer-wrap {
+    margin-block-start: auto;
   }
 
   .hud-expanded .composer textarea {
@@ -6702,7 +6721,7 @@ body[data-surface="hud"] {
   .inspector {
     position: fixed;
     z-index: 40;
-    inset-block: 3.5rem 0;
+    inset-block: var(--toolbar-height) 0;
     inset-inline-end: 0;
     inline-size: min(22rem, calc(100% - 3rem));
     box-shadow: -10px 0 30px oklch(0 0 0 / 0.16);
@@ -6774,7 +6793,7 @@ body[data-surface="hud"] {
   .sidebar {
     position: fixed;
     z-index: 42;
-    inset-block: 3.5rem 0;
+    inset-block: var(--toolbar-height) 0;
     inset-inline-start: 0;
     inline-size: min(18rem, calc(100% - 3rem));
     box-shadow: 10px 0 30px oklch(0 0 0 / 0.16);
@@ -8805,7 +8824,7 @@ dialog.sheet::backdrop {
 .panel-resizer {
   position: absolute;
   z-index: 28;
-  inset-block: 3.5rem 0;
+  inset-block: var(--toolbar-height) 0;
   inline-size: 0.75rem;
   padding: 0;
   cursor: col-resize;
@@ -9272,20 +9291,20 @@ dialog.sheet::backdrop {
 }
 
 .agent-launchpad__tasks {
-  gap: 0;
-  border-block: 1px solid color-mix(in oklch, var(--color-border) 72%, transparent);
+  gap: 0.25rem;
+  border: 0;
 }
 
 .agent-launchpad__task {
   min-block-size: 3.75rem;
-  padding: 0.65rem 0.25rem;
+  padding: 0.65rem 0.55rem;
   background: transparent;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--radius-md);
 }
 
 .agent-launchpad__task + .agent-launchpad__task {
-  border-block-start: 1px solid color-mix(in oklch, var(--color-border) 72%, transparent);
+  border-block-start: 0;
 }
 
 .agent-launchpad__task:hover:not(:disabled) {
@@ -9326,11 +9345,6 @@ dialog.sheet::backdrop {
   font-weight: 620;
 }
 
-.rlm-map,
-.rlm-map__children {
-  border-block-color: color-mix(in oklch, var(--color-border) 72%, transparent);
-}
-
 .rlm-map__root,
 .runtime-section .rlm-map__children > li {
   padding-block: 0.85rem;
@@ -9361,9 +9375,10 @@ dialog.sheet::backdrop {
   align-items: start;
   min-block-size: 4.1rem;
   gap: 0.65rem;
-  padding-block: 0.75rem;
-  padding-inline: calc(0.1rem + var(--rlm-depth, 0) * 0.75rem) 0;
-  border-block-start: 1px solid color-mix(in oklch, var(--color-border) 72%, transparent);
+  padding-block: 0.65rem;
+  padding-inline: calc(0.25rem + var(--rlm-depth, 0) * 0.75rem) 0.25rem;
+  border: 0;
+  border-radius: var(--radius-md);
   content-visibility: auto;
   contain-intrinsic-block-size: auto 4.1rem;
 }

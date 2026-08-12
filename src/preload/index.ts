@@ -10,6 +10,11 @@ import {
   type SshProbe
 } from '../main/control/contracts'
 import { HUD_IPC, type HudBridge } from '../shared/window-control'
+import {
+  NATIVE_SHELL_IPC,
+  type NativePlatform,
+  type NativeShellBridge,
+} from '../shared/native-shell'
 
 async function invoke<T>(channel: string, input?: unknown): Promise<Result<T>> {
   try {
@@ -90,6 +95,11 @@ const hudBridge: HudBridge = {
   onHudState: (listener) => subscribe(HUD_IPC.stateChanged, listener)
 }
 
+const nativeShellBridge: NativeShellBridge = {
+  nativePlatform: process.platform as NativePlatform,
+  onNativeShellCommand: (listener) => subscribe(NATIVE_SHELL_IPC.command, listener),
+}
+
 type CompatibilityBridge = {
   loadWorkbench: PrimeBridge['bootstrap']
   getWorkbenchSnapshot(input?: Parameters<PrimeBridge['requestSnapshot']>[0]): ReturnType<PrimeBridge['requestSnapshot']>
@@ -122,7 +132,12 @@ const compatibility: CompatibilityBridge = {
   subscribeWorkbench: (listener) => bridge.onSnapshot(listener)
 }
 
-contextBridge.exposeInMainWorld('prime', Object.freeze({ ...bridge, ...hudBridge, ...compatibility }))
+contextBridge.exposeInMainWorld('prime', Object.freeze({
+  ...bridge,
+  ...hudBridge,
+  ...nativeShellBridge,
+  ...compatibility,
+}))
 
-export type RendererPrimeBridge = PrimeBridge & HudBridge & CompatibilityBridge
+export type RendererPrimeBridge = PrimeBridge & HudBridge & NativeShellBridge & CompatibilityBridge
 export type { ClientCommand, ConnectionTarget, HandoffCommitRequest, HandoffPlanRequest }

@@ -38,7 +38,8 @@ const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
 const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
 const DOWNLOAD_FETCH_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 250;
-const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 15_000;
+const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 30_000;
+const BROWSER_SMOKE_SCREENSHOT_TIMEOUT_MS = 40_000;
 const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
 const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
 const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
@@ -1066,7 +1067,10 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
     await invoke(["click", reference]);
     const read = await invoke(["eval", "document.querySelector('button')?.textContent"]);
     if (!String(read.stdout).includes("After")) throw buildError("Browser smoke interaction was not observable.");
-    await invoke(["screenshot", `--filename=${screenshotPath}`]);
+    // Screenshot capture is the only smoke operation that waits on the
+    // compositor. Keep its outer custody deadline above Playwright's bounded
+    // action deadline without slowing any production browser interaction.
+    await invoke(["screenshot", `--filename=${screenshotPath}`], BROWSER_SMOKE_SCREENSHOT_TIMEOUT_MS);
     const screenshot = await readFile(screenshotPath);
     if (screenshot.byteLength < 8 || !screenshot.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
       throw buildError("Browser smoke screenshot is not a PNG.");

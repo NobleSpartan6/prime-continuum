@@ -385,7 +385,7 @@ describe("Prime Agent runtime tree attestation", () => {
       options: SmokeRunnerOptions,
     ): Promise<{ stdout: string; stderr: string }> => {
       expect(command).toBe(runtimeExecutable);
-      expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("15000");
+      expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("30000");
       expect(options.env?.PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY).toBe("1");
       expect(options.env?.PW_TEST_SCREENSHOT_NO_FONTS_READY).toBeUndefined();
       calls.push({ args, options });
@@ -422,6 +422,8 @@ describe("Prime Agent runtime tree attestation", () => {
       operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
     });
     expect(calls).toHaveLength(8);
+    const screenshotCall = calls.find(({ args }) => args[2] === "screenshot");
+    expect(screenshotCall?.options.timeoutMs).toBe(40_000);
   });
 
   it("retains bounded stdout and stderr when a runtime command fails", async () => {
