@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 const SAFE_EXACT_KEYS = new Set([
   "APPDATA",
   "COMSPEC",
@@ -43,4 +45,27 @@ export function createBrowserHostEnvironment(source) {
     output[key] = value;
   }
   return Object.freeze(output);
+}
+
+export function browserProcessStatus(pid, options = {}) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return "unknown";
+  const signal = options.signal ?? ((processId) => process.kill(processId, 0));
+  try {
+    signal(pid);
+  } catch (error) {
+    return error?.code === "ESRCH" ? "dead" : "unknown";
+  }
+
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") return "live";
+  const readProcStat = options.readProcStat ?? ((processId) => readFileSync(`/proc/${processId}/stat`, "utf8"));
+  try {
+    const stat = readProcStat(pid);
+    const commandEnd = typeof stat === "string" ? stat.lastIndexOf(") ") : -1;
+    const state = commandEnd >= 0 ? stat[commandEnd + 2] : undefined;
+    if (state === "Z" || state === "X" || state === "x") return "dead";
+    return typeof state === "string" && state.length === 1 ? "live" : "unknown";
+  } catch (error) {
+    return error?.code === "ENOENT" ? "dead" : "unknown";
+  }
 }

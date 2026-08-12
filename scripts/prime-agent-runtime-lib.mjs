@@ -36,6 +36,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
 const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
+const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 15_000;
 const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
 const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
 const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
@@ -44,7 +45,7 @@ const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
   Object.freeze({ relativePath: "node_modules/openai/src", package: "openai", version: "6.47.0", packageJsonSha256: "58936a8b912670945aff7e72a2c5cf435a36448215c7a3ed06569816198be88b", fileCount: 305, totalBytes: 2701229, treeSha256: "d113ee08904222ce6566aa83dab146f9a32a23ff29eb0c80eeb98bb6f1691253" }),
   Object.freeze({ relativePath: "node_modules/zod/src", package: "zod", version: "4.4.3", packageJsonSha256: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e", fileCount: 286, totalBytes: 2237613, treeSha256: "69c0cc8db91a7c1072e20f4843863510c86a57975f86f46f2f927aa756111965" }),
   Object.freeze({ relativePath: "node_modules/@anthropic-ai/sdk/src", package: "@anthropic-ai/sdk", version: "0.91.1", packageJsonSha256: "28aaef57dd52864476e417dac7b0b389ca65b9e4f3ee42631e450a9c1a654f82", fileCount: 108, totalBytes: 849702, treeSha256: "196379af890a46c70704840e2eda7dbb9a4d341e45fe9892dbd7034eb9bfec35" }),
-  Object.freeze({ relativePath: "node_modules/prime-agent/examples", package: "prime-agent", version: "0.7.1", packageJsonSha256: "0bf756952f21542fa814acf301e0e868745b095eaf190b3457c729b41239a900", fileCount: 120, totalBytes: 920809, treeSha256: "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849" }),
+  Object.freeze({ relativePath: "node_modules/prime-agent/examples", package: "prime-agent", version: "0.7.2", packageJsonSha256: "0b45bc86527fcdb73dae76d319f6f50f6d40827a63614303664a57e8fe41c8cf", fileCount: 120, totalBytes: 920809, treeSha256: "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849" }),
   Object.freeze({ relativePath: "node_modules/cmake-ts/src", package: "cmake-ts", version: "1.0.2", packageJsonSha256: "a351b1724f7c219bbe3abaf6e8557558565953464b760e4dbe0694d2165d0db6", fileCount: 26, totalBytes: 71551, treeSha256: "f1de2a37e85c5dbade19d727f177c9ec3e3d42c50952862dba98d12fd7b535a3" }),
   Object.freeze({ relativePath: "node_modules/zeromq/src", package: "zeromq", version: "6.5.0", packageJsonSha256: "9fa3e9fd40a74cdace0c4fbed3821ab5fff68e91340f16b39e567edbcbab435e", fileCount: 47, totalBytes: 229916, treeSha256: "b78dc3f71311e1bddefad17fe0db0694abadee66641a53ac5e62a1f3b9b684e2" }),
   Object.freeze({ relativePath: "node_modules/data-uri-to-buffer/src", package: "data-uri-to-buffer", version: "4.0.1", packageJsonSha256: "ad4f90a737ab5d8af4dad265e9218456e3779ca5beb70df38dd5feecf80121dd", fileCount: 1, totalBytes: 1785, treeSha256: "dbb9f6843ac7532c491c3b7d53bdf3f356c2432a4e5f2c2310509e155623a199" }),
@@ -54,14 +55,14 @@ const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
   Object.freeze({ relativePath: "node_modules/highlight.js/styles", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "88ccb109d9fbd658b000acfdd7372215d909d7f7519b650b3406585832e2ff20" }),
 ]);
 const REVIEWED_RUNTIME_PROVIDER_CHUNKS = Object.freeze([
-  "anthropic-JSWLCBSK.js",
-  "azure-openai-responses-MKUC6IUK.js",
-  "google-KPIDA2AM.js",
-  "google-vertex-6B27OGDI.js",
-  "mistral-H3PDU4M4.js",
-  "openai-codex-responses-AMLRMEWM.js",
-  "openai-completions-T2XCYCXY.js",
-  "openai-responses-V7TBT7NU.js",
+  "anthropic-6NOSCFKS.js",
+  "azure-openai-responses-FMGB2C5I.js",
+  "google-ESBRCJKR.js",
+  "google-vertex-HHNXIE5P.js",
+  "mistral-F4QFN323.js",
+  "openai-codex-responses-MURTF24R.js",
+  "openai-completions-7BADVXTD.js",
+  "openai-responses-2NOQQGMV.js",
 ]);
 const REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS = Object.freeze([
   "openai",
@@ -781,6 +782,8 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   const daemonClientPath = join(scratchDirectory, "runtime-daemon-client.mjs");
   const probeSource = [
     'import { createRequire } from "node:module";',
+    'import { readdir, readFile } from "node:fs/promises";',
+    'import { fileURLToPath } from "node:url";',
     "const [moduleUrl, packageJsonPath] = process.argv.slice(2);",
     "const runtime = await import(moduleUrl);",
     'if (typeof runtime.DaemonClient !== "function" || typeof runtime.DaemonAgentConnection?.attach !== "function") throw new Error("missing daemon exports");',
@@ -793,7 +796,16 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     '  const loaded = await import(new URL(`./bundle/${fileName}`, moduleUrl));',
     '  if (!loaded || Object.keys(loaded).length < 1) throw new Error(`provider chunk did not load: ${fileName}`);',
     "}",
-    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
+    'const bundleDirectory = fileURLToPath(new URL("./bundle/", moduleUrl));',
+    'const bundleFiles = new Set((await readdir(bundleDirectory)).filter((fileName) => fileName.endsWith(".js")));',
+    'for (const fileName of bundleFiles) {',
+    '  const source = await readFile(new URL(`./bundle/${fileName}`, moduleUrl), "utf8");',
+    '  for (const match of source.matchAll(/(?:from\\s*|import\\s*\\()\\s*["\'](\\.\\/[^"\']+\\.js)["\']/g)) {',
+    '    const dependency = match[1].slice(2);',
+    '    if (!bundleFiles.has(dependency)) throw new Error(`missing local bundle import: ${fileName} -> ${dependency}`);',
+    '  }',
+    '}',
+    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, bundleImportGraphComplete: true, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
   ].join("\n");
   const retryWorkerProbeSource = [
     'import { resolve } from "node:path";',
@@ -813,7 +825,17 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     'const expected = JSON.stringify([{ kind: "persist", intentionalStop: false, lifecycle: "recovering", consecutiveFailures: 0 }, { kind: "recover", lifecycle: "recovering" }]);',
     'if (JSON.stringify(events) !== expected) throw new Error(`retry_worker ordering changed: ${JSON.stringify(events)}`);',
     'if (response?.type !== "response" || response.command !== "retry_worker" || response.success !== true) throw new Error("retry_worker response changed");',
-    'process.stdout.write(JSON.stringify({ retryWorkerOrdering: true }));',
+    'const disconnectedWorker = { descriptor: { lifecycle: "ready" }, client: undefined, intentionalStop: false };',
+    'if (supervisor.effectiveWorkerState(disconnectedWorker) !== "recovering") throw new Error("disconnected ready worker still reports ready");',
+    'const stoppingWorker = { descriptor: { lifecycle: "ready", stopRequestedAt: "2026-08-11T00:00:00.000Z" }, client: undefined, intentionalStop: false };',
+    'if (supervisor.effectiveWorkerState(stoppingWorker) !== "stopping") throw new Error("stopping worker state changed");',
+    'const staleDescriptor = { workerId: "worker-stale", rootActiveSessionId: "active-stale", rootSessionId: "session-stale", lifecycle: "stopping", stopRequestedAt: "2026-08-11T00:00:00.000Z", pid: 424242, processStartId: "dead-generation" };',
+    'const staleWorker = { descriptor: staleDescriptor, client: undefined, recovery: undefined, intentionalStop: true, summaries: new Map() };',
+    'supervisor.workers.set(staleDescriptor.workerId, staleWorker);',
+    'supervisor.processIdentity = () => "gone";',
+    'supervisor.scheduleWorkerStopFinalization = (candidate) => { supervisor.workers.delete(candidate.descriptor.workerId); candidate.stopFinalization = Promise.resolve(); };',
+    'if ((await supervisor.reclaimStaleWorkerRegistration(staleWorker)) !== true || supervisor.workers.has(staleDescriptor.workerId)) throw new Error("stale worker registration was not reclaimed");',
+    'process.stdout.write(JSON.stringify({ retryWorkerOrdering: true, disconnectedWorkerState: true, staleWorkerReclaimed: true }));',
   ].join("\n");
   const daemonClientSource = [
     "const [moduleUrl, socketPath] = process.argv.slice(2);",
@@ -867,6 +889,9 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
       throw buildError("Runtime smoke process target does not match the build target.");
     }
     assertMinimumNodeVersion(runtimeVersions.node, options.policy.minimumNodeVersion);
+    if (runtimeVersions.bundleImportGraphComplete !== true) {
+      throw buildError("Prime Agent runtime bundle import graph was not proven complete.");
+    }
 
     const retryWorkerProbe = await commandRunner(
       runtimeExecutable,
@@ -883,8 +908,12 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     } catch (error) {
       throw buildError("Prime Agent retry_worker smoke helper returned invalid JSON.", error);
     }
-    if (retryWorkerResult?.retryWorkerOrdering !== true) {
-      throw buildError("Prime Agent retry_worker smoke did not prove tombstone clearing before recovery.");
+    if (
+      retryWorkerResult?.retryWorkerOrdering !== true ||
+      retryWorkerResult?.disconnectedWorkerState !== true ||
+      retryWorkerResult?.staleWorkerReclaimed !== true
+    ) {
+      throw buildError("Prime Agent worker recovery smoke did not prove current self-healing semantics.");
     }
 
     const smokeAgentDirectory = join(scratchDirectory, "agent");
@@ -951,6 +980,7 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
   await mkdir(stateDirectory, { mode: 0o700 });
   const environment = {
     ...cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
+    PLAYWRIGHT_MCP_TIMEOUT_ACTION: String(BROWSER_SMOKE_ACTION_TIMEOUT_MS),
     PRIME_CONTINUIM_BROWSER_EXECUTABLE: runtimeExecutable,
     PRIME_CONTINUIM_BROWSER_BRIDGE: entrypoints.browserBridge,
     PRIME_CONTINUIM_BROWSER_STATE_DIR: stateDirectory,

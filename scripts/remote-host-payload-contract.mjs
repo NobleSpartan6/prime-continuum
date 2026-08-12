@@ -21,16 +21,16 @@ export const REMOTE_HOST_PAYLOAD_MAX_INPUT_BYTES = 64 * 1024
 export const REMOTE_HOST_PAYLOAD_MAX_LAYOUT_BYTES = 64 * 1024
 
 export const REMOTE_HOST_PAYLOAD_PRIME_AGENT = deepFreeze({
-  releaseVersion: '0.7.1',
+  releaseVersion: '0.7.2',
   runtimePolicySchemaVersion: 1,
   daemonProtocolVersion: 7,
-  daemonSchemaRevision: 13,
-  daemonSchemaId: 'protocol-7-schema-13-816309b1cd50',
-  runtimeBuildId: '95afd31-dirty',
-  releaseCommit: '95afd319a78ae017a41241d50b013d656a0685ce',
-  runtimePolicySha256: 'da9cc49e6feacc870ef4fbce35e9db395927abd52777fa8517426c97560437d1',
-  sourcesSha256: '070af8b8f591240b27d33e8f9606ddc11ec6712906cfed2766c89244beebf7ea',
-  packageLockSha256: 'c1c39408ed8daeced4b2bbe5a7d491af6e4c2497d83adc3525c4d88586ce4eca',
+  daemonSchemaRevision: 16,
+  daemonSchemaId: 'protocol-7-schema-16-1bcb9e7f1a49',
+  runtimeBuildId: '83a0f9f-dirty',
+  releaseCommit: '83a0f9f9566219551fcb6ffaf7f519a815749a58',
+  runtimePolicySha256: '570ad339d58762baf42454cc492d51941cc71f277bc260359683e03f7baf644a',
+  sourcesSha256: '8d1d2207ff27bcc264386f7e4c2fa693d76e7b1b1fd6d4848ffcb94da1b45704',
+  packageLockSha256: '7eb5fd87f89abbf12f5e82f9a4ac50f4db2c2a281d73347460a4b08c295cdae3',
 })
 
 export const REMOTE_HOST_ELECTRON_PROVENANCE = deepFreeze({

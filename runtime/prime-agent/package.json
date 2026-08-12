@@ -1,6 +1,6 @@
 {
   "name": "@prime-continuim/prime-agent-runtime",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "description": "Locked, build-only Prime Agent runtime seed for Prime Continuim",
   "engines": {
@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "playwright-core": "1.63.0-alpha-2026-08-05",
-    "prime-agent": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz"
+    "prime-agent": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz"
   }
 }

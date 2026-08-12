@@ -21,7 +21,7 @@ export interface AgentLaunchpadStarter {
 export interface AgentLaunchpadProps {
   hostName: string
   model?: string
-  sessionState: 'ready' | 'preparing' | 'needs-input' | 'needs-recovery' | 'end-ready' | 'end-paused' | 'ending' | 'end-uncertain' | 'ended'
+  sessionState: 'ready' | 'preparing' | 'needs-input' | 'needs-recovery'
   browserReady: boolean
   skillCount?: number
   diagnosticCount?: number
@@ -70,65 +70,35 @@ export default function AgentLaunchpad({
   const setupReady = modelReady && residentCapabilityReady
   const showWorkflows = sessionState === 'ready' || sessionState === 'preparing'
   const showSetup = !setupReady || !showWorkflows
-  const sessionPresentation = sessionState === 'end-ready'
+  const sessionPresentation = sessionState === 'needs-recovery'
     ? {
-        title: 'Ready to close',
-        detail: 'Finish this session to start a new task.',
-        icon: ArrowRight,
+        title: 'Session needs a restart',
+        detail: 'The model is connected, but Prime Agent no longer reports this runtime.',
+        icon: AlertCircle,
       }
-    : sessionState === 'end-paused'
+    : sessionState === 'needs-input'
       ? {
-          title: 'End saved',
-          detail: `Waiting for resident controls on ${hostName}.`,
-          icon: Circle,
+          title: 'Session needs your input',
+          detail: 'Open Session to review the current question, approval, or failure.',
+          icon: AlertCircle,
         }
-      : sessionState === 'ending'
+      : sessionState === 'preparing'
         ? {
-            title: 'Finishing session',
-            detail: 'Prime Agent received the End request. Completion is checked automatically.',
+            title: 'Preparing agent session',
+            detail: `${hostName} is verifying this resident workspace before it accepts a task.`,
             icon: Circle,
           }
-        : sessionState === 'end-uncertain'
+        : modelReady
           ? {
-              title: 'End outcome needs review',
-              detail: 'Prime Continuim will not send another End. Check the retained lifecycle status in Session.',
-              icon: AlertCircle,
+              title: 'Ready to delegate',
+              detail: `${shortModelName(model)} is selected for this exact resident session.`,
+              icon: Check,
             }
-          : sessionState === 'ended'
-            ? {
-                title: 'Session ended',
-                detail: 'The saved thread remains available. Choose New agent to continue in this workspace.',
-                icon: Check,
-              }
-            : sessionState === 'needs-recovery'
-              ? {
-                  title: 'Session needs a restart',
-                  detail: 'The model is connected, but Prime Agent no longer reports this runtime.',
-                  icon: AlertCircle,
-                }
-              : sessionState === 'needs-input'
-                ? {
-                    title: 'Session needs your input',
-                    detail: 'Open Session to review the current question, approval, or failure.',
-                    icon: AlertCircle,
-                  }
-                : sessionState === 'preparing'
-                  ? {
-                      title: 'Preparing agent session',
-                      detail: `${hostName} is verifying this resident workspace before it accepts a task.`,
-                      icon: Circle,
-                    }
-                  : modelReady
-                    ? {
-                        title: 'Ready to delegate',
-                        detail: `${shortModelName(model)} is selected for this exact resident session.`,
-                        icon: Check,
-                      }
-                    : {
-                        title: 'Connect a model to begin',
-                        detail: 'ChatGPT setup is guided in-app; credentials remain on this computer.',
-                        icon: Bot,
-                      }
+          : {
+              title: 'Connect a model to begin',
+              detail: 'ChatGPT setup is guided in-app; credentials remain on this computer.',
+              icon: Bot,
+            }
   const modelActionAvailable = canOpenModels && (
     sessionState === 'ready' || sessionState === 'preparing'
   )

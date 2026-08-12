@@ -55,7 +55,7 @@ export interface VerifiedRuntimeOAuthCompositionOptions {
 }
 
 /**
- * Prime Agent v0.7.1 registers process handlers while its public module loads.
+ * Prime Agent v0.7.2 registers process handlers while its public module loads.
  * This composition therefore never imports third-party code into long-lived
  * hostd. Login and AuthStorage run in identity-checked, short-lived helpers;
  * credentials cross only their private stdio pipes and this host-only object.
@@ -330,7 +330,7 @@ export function sanitizeRuntimeOAuthHelperEnvironment(
     ["TEMP", "TEMP"],
     ["TMP", "TMP"],
     ["TMPDIR", "TMPDIR"],
-    // Pinned Prime Agent v0.7.1 getAgentDir() reads this exact key before
+    // Pinned Prime Agent v0.7.2 getAgentDir() reads this exact key before
     // falling back to os.homedir(). PI_CODING_AGENT_DIR is not consumed.
     ["PRIME_AGENT_CODING_AGENT_DIR", "PRIME_AGENT_CODING_AGENT_DIR"],
   ]);

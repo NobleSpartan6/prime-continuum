@@ -72,11 +72,11 @@ function validHello(overrides: Record<string, unknown> = {}): Record<string, unk
     type: "daemon_hello",
     socketPath: DAEMON_SOCKET,
     protocol: { name: "prime-agent.daemon", version: 7 },
-    schemaId: "protocol-7-schema-13-816309b1cd50",
-    schemaRevision: 13,
-    appVersion: "0.7.1",
+    schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+    schemaRevision: 16,
+    appVersion: "0.7.2",
     runtime: {
-      buildId: "95afd31-dirty",
+      buildId: "83a0f9f-dirty",
       executablePath: RUNTIME_NODE,
       entrypointPath: RUNTIME_CLI,
     },
@@ -274,6 +274,7 @@ interface HarnessState {
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
   }>;
+  resourceSnapshotCalls: number;
   modelProjectionCalls: Array<{
     command: CommandEnvelope;
     binding: ResidentSessionBinding;
@@ -344,6 +345,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     launcherUnrefs: 0,
     persistCalls: [],
     projectionCalls: [],
+    resourceSnapshotCalls: 0,
     modelProjectionCalls: [],
     waitForIdleCalls: 0,
     authoritativeRoundCalls: 0,
@@ -453,7 +455,10 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             ? state.snapshotHandler(attachmentOrdinal)
             : validSnapshot();
         },
-        getResourceSnapshot: async () => validResourceSnapshot(),
+        getResourceSnapshot: async () => {
+          state.resourceSnapshotCalls += 1;
+          return validResourceSnapshot();
+        },
         waitForIdle: async () => {
           state.waitForIdleCalls += 1;
           state.chronology.push("wait:idle");
@@ -750,7 +755,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     const { adapter, state } = createHarness();
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
 
     expect(state.spawnCalls).toHaveLength(0);
     expect(state.chronology).toEqual(["connect", "client:close"]);
@@ -783,6 +788,8 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
             Path: "C:\\Windows",
             ELECTRON_RUN_AS_NODE: "1",
             PYTHONDONTWRITEBYTECODE: "1",
+            PRIME_AGENT_TELEMETRY: "0",
+            DO_NOT_TRACK: "1",
           },
           stdio: "ignore",
         },
@@ -821,8 +828,8 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     ]);
 
     expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ appVersion: "0.7.1" });
-    expect(results[1]).toMatchObject({ appVersion: "0.7.1" });
+    expect(results[0]).toMatchObject({ appVersion: "0.7.2" });
+    expect(results[1]).toMatchObject({ appVersion: "0.7.2" });
     expect(state.requests).toEqual([
       { type: "list", includeClientOwned: true },
       { type: "shutdown" },
@@ -996,7 +1003,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     state = harness.state;
     const invocation = buildHarnessInvocation();
 
-    await expect(harness.adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
+    await expect(harness.adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
 
     expect(state.requests).toEqual([
       { type: "list", includeClientOwned: true },
@@ -1087,7 +1094,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     });
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
 
     expect(state.spawnCalls).toHaveLength(1);
     expect(adapter.getLifecycle().state).toBe("ready");
@@ -1115,7 +1122,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
 
     expect(state.requests).toEqual([{
       type: "create",
-      config: { cwd: WORKSPACE_DIRECTORY },
+      config: { cwd: WORKSPACE_DIRECTORY, telemetryDisabled: true },
       lifecycle: "client_owned",
       noSession: false,
       name: "Prime Continuim",
@@ -1128,6 +1135,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
         sendClientEnv: false,
         supportsExtensionUi: false,
         ownedSession: true,
+        telemetryDisabled: true,
       },
     });
     expect(candidate).toMatchObject({
@@ -1139,7 +1147,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       sessionId: "session-1",
       sessionFile: SESSION_FILE,
       boundAt: "2026-08-06T17:00:00.000Z",
-      runtime: { runtimeBuildId: "95afd31-dirty" },
+      runtime: { runtimeBuildId: "83a0f9f-dirty" },
     });
     expect(Object.isFrozen(candidate)).toBe(true);
     expect(Object.isFrozen(candidate.runtime)).toBe(true);
@@ -1887,7 +1895,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(state.requests).toEqual([{ type: "list" }]);
     expect(state.attachCalls).toEqual([{
       activeSessionId: "active-1",
-      options: expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
+      options: expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
     }]);
     expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
     expect(state.disposeCalls).toBe(1);
@@ -1921,7 +1929,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
 
     expect(state.requests[0]).toEqual({
       type: "create",
-      config: { cwd: WORKSPACE_DIRECTORY },
+      config: { cwd: WORKSPACE_DIRECTORY, telemetryDisabled: true },
       lifecycle: "resident",
       noSession: false,
       name: "Prime Continuim",
@@ -1945,6 +1953,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
         sendClientEnv: false,
         supportsExtensionUi: false,
         ownedSession: false,
+        telemetryDisabled: true,
       },
     });
     expect(state.persistCalls[0]).toMatchObject({
@@ -3087,7 +3096,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     projectionPhase = "active";
     await emit({ type: "session_event", event: { type: "message_update" } });
     await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
       cursor: { generation: "events-1", sequence: 5 },
       runtime: { isStreaming: true },
@@ -3213,7 +3222,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     projectionPhase = "active";
     await emit({ type: "session_event", event: { type: "agent_end" } });
     await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     await expect(
       connection.abort(
@@ -3509,7 +3518,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     await adapter.close();
   });
 
-  it("publishes the latest active observation with live goal and RLM child state", async () => {
+  it("publishes live RLM child state without rediscovering attachment resources", async () => {
     let phase: "initial" | "active" = "initial";
     let activeReads = 0;
     const { adapter, state, emit } = createHarness({
@@ -3541,6 +3550,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
       },
     });
     const connection = await adapter.createResident(createInput());
+    expect(state.resourceSnapshotCalls).toBe(1);
     phase = "active";
     await emit({
       type: "session_event",
@@ -3561,6 +3571,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
 
     expect(activeReads).toBe(4);
+    expect(state.resourceSnapshotCalls).toBe(1);
     expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
       cursor: { generation: "events-1", sequence: 8 },
       runtime: { isStreaming: true },

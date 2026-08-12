@@ -15,19 +15,19 @@ const PRIME_AGENT_RELEASE_BASE_URL = "https://github.com/PrimeIntellect-ai/prime
  */
 export const PINNED_PRIME_AGENT_RUNTIME = Object.freeze({
   repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-  releaseTag: "v0.7.1",
-  releaseVersion: "0.7.1",
+  releaseTag: "v0.7.2",
+  releaseVersion: "0.7.2",
   packageName: "prime-agent",
-  assetFileName: "prime-agent-0.7.1.tgz",
-  assetUrl: `${PRIME_AGENT_RELEASE_BASE_URL}/v0.7.1/prime-agent-0.7.1.tgz`,
-  sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
-  expectedAppVersion: "0.7.1",
-  runtimeBuildId: "95afd31-dirty",
+  assetFileName: "prime-agent-0.7.2.tgz",
+  assetUrl: `${PRIME_AGENT_RELEASE_BASE_URL}/v0.7.2/prime-agent-0.7.2.tgz`,
+  sha256: "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
+  expectedAppVersion: "0.7.2",
+  runtimeBuildId: "83a0f9f-dirty",
   daemon: Object.freeze({
     protocolName: "prime-agent.daemon",
     protocolVersion: 7,
-    schemaRevision: 13,
-    schemaId: "protocol-7-schema-13-816309b1cd50",
+    schemaRevision: 16,
+    schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
   }),
 } as const);
 
@@ -42,7 +42,7 @@ export const REQUIRED_RESIDENT_DAEMON_CAPABILITIES = Object.freeze([
 
 /**
  * The published package exposes DaemonClient and DaemonAgentConnection but not
- * its daemon launcher. In v0.7.1 the old `daemon` command is explicitly
+ * its daemon launcher. In v0.7.2 the old `daemon` command is explicitly
  * rejected; the documented `--mode daemon --daemon-socket` CLI mode is the
  * launch boundary. The adapter validates daemon_hello and performs
  * create/attach via DaemonClient. A resident session is never created through
@@ -149,7 +149,7 @@ const DaemonRuntimeIdentitySchema = z
   })
   .strict();
 
-/** Exact daemon_hello shape emitted by the pinned v0.7.1 runtime. */
+/** Exact daemon_hello shape emitted by the pinned v0.7.2 runtime. */
 const PinnedDaemonHelloSchema = z
   .object({
     type: z.literal("daemon_hello"),
@@ -520,6 +520,10 @@ export function sanitizeResidentDaemonEnvironment(
   // beside bundled RLM skills on first import, which invalidates the next
   // exact-tree verification and withdraws models and resident capabilities.
   sanitized.PYTHONDONTWRITEBYTECODE = "1";
+  // Continuim owns the resident invocation and keeps provider usage private by
+  // default. Prime Agent v0.7.2 treats both values as monotonic opt-outs.
+  sanitized.PRIME_AGENT_TELEMETRY = "0";
+  sanitized.DO_NOT_TRACK = "1";
   return Object.freeze(sanitized);
 }
 
@@ -565,7 +569,7 @@ export type ResidentOwnedSessionCreateInput =
 /** Narrow adapter-private command passed to the pinned package's DaemonClient. */
 export interface ResidentDaemonCreateRequest {
   readonly type: "create";
-  readonly config: Readonly<{ cwd: string }>;
+  readonly config: Readonly<{ cwd: string; telemetryDisabled: true }>;
   readonly lifecycle: "resident";
   readonly noSession: false;
   readonly sessionPath?: string;
@@ -576,7 +580,7 @@ export interface ResidentDaemonCreateRequest {
 /** Exact client-owned escrow mutation sent only after durable intent exists. */
 export interface ResidentOwnedDaemonCreateRequest {
   readonly type: "create";
-  readonly config: Readonly<{ cwd: string }>;
+  readonly config: Readonly<{ cwd: string; telemetryDisabled: true }>;
   readonly lifecycle: "client_owned";
   readonly noSession: false;
   readonly sessionPath?: string;
@@ -622,7 +626,7 @@ export function buildResidentOwnedDaemonCreateRequest(
 
   return Object.freeze({
     type: "create",
-    config: Object.freeze({ cwd: validated.workspaceDirectory }),
+    config: Object.freeze({ cwd: validated.workspaceDirectory, telemetryDisabled: true }),
     lifecycle: "client_owned",
     noSession: false,
     ...(sessionPath ? { sessionPath } : {}),
@@ -691,7 +695,7 @@ export function buildResidentDaemonCreateRequest(input: ResidentSessionCreateInp
 
   return Object.freeze({
     type: "create",
-    config: Object.freeze({ cwd: workspaceDirectory }),
+    config: Object.freeze({ cwd: workspaceDirectory, telemetryDisabled: true }),
     lifecycle: "resident",
     noSession: false,
     ...(session.kind === "resume" ? { sessionPath: boundedArgument(session.sessionPath, "sessionPath") } : {}),

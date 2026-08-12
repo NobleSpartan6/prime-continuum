@@ -132,7 +132,8 @@ class SharedFakePrimeDaemon {
           closeClientOnDispose: true;
           sendClientEnv: false;
           supportsExtensionUi: false;
-          ownedSession: false;
+          ownedSession: boolean;
+          telemetryDisabled: true;
           recoverDaemon: () => Promise<void>;
         }>,
       ): Promise<PrimeDaemonAgentConnectionPublic> => {
@@ -371,11 +372,11 @@ describe("resident continuity across hostd/store relaunch", () => {
         name: "prime-agent.daemon",
         version: 7,
       },
-      schemaId: "protocol-7-schema-13-816309b1cd50",
-      schemaRevision: 13,
-      appVersion: "0.7.1",
+      schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+      schemaRevision: 16,
+      appVersion: "0.7.2",
       runtime: {
-        buildId: "95afd31-dirty",
+        buildId: "83a0f9f-dirty",
         executablePath: paths.executable,
         entrypointPath: paths.cliEntrypoint,
       },
@@ -491,8 +492,8 @@ describe("resident continuity across hostd/store relaunch", () => {
     }).toEqual(firstPublishedProjection);
     expect(daemon.attachActiveSessionIds).toEqual([ACTIVE_SESSION_ID, exactBinding.activeSessionId]);
     expect(daemon.attachOptions).toEqual([
-      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
-      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
+      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
+      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
     ]);
     expect(daemon.createCount).toBe(1);
     expect(daemon.listCount).toBe(1);

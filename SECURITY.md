@@ -24,6 +24,6 @@ The maintainers will acknowledge a complete report as soon as practical, keep th
 
 Prime Continuim runs Prime Agent and model-generated commands with the selected host user's permissions. Worker and kernel lifecycle isolation is not a security sandbox. Use an external sandbox for untrusted code.
 
-The renderer receives bounded, secret-free projections. Runtime credentials remain host-only, but Prime Agent v0.7.1 stores OAuth material as plaintext in a private directory rather than a platform keychain. Software running as the same operating-system user or an administrator remains in the trust boundary.
+The renderer receives bounded, secret-free projections. Runtime credentials remain host-only, but Prime Agent v0.7.2 stores OAuth material as plaintext in a private directory rather than a platform keychain. Software running as the same operating-system user or an administrator remains in the trust boundary.
 
 The current artifacts are unsigned development builds. Checksums and self-build receipts detect correlated byte changes; they do not authenticate a publisher or replace platform signing.

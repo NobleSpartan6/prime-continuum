@@ -89,6 +89,15 @@ describe('browser preview evidence labels', () => {
         canStop: false,
       },
       {
+        visualState: 'rlm-activity' as const,
+        threadState: 'idle',
+        receiptState: 'idle',
+        operation: undefined,
+        message: 'Ready for a new prompt',
+        canStart: true,
+        canStop: false,
+      },
+      {
         visualState: 'model-selection' as const,
         threadState: 'idle',
         receiptState: 'idle',
@@ -182,6 +191,10 @@ describe('browser preview evidence labels', () => {
         expected.visualState === 'model-selection' ? true : undefined,
       )
       if (expected.visualState === 'model-selection') expect(snapshot.operations.modelCatalog).toBe(true)
+      if (expected.visualState === 'idle') expect(snapshot.agents).toEqual([])
+      if (expected.visualState === 'rlm-activity') {
+        expect(snapshot.agents.some((agent) => agent.status === 'running' || agent.status === 'waiting')).toBe(true)
+      }
       if (expected.visualState === 'prime-oauth') {
         expect(snapshot.operations.modelCatalog).toBe(true)
         expect(snapshot.operations.runtimeOAuth).toBe(true)

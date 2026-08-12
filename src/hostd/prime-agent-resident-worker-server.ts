@@ -65,6 +65,7 @@ export interface ResidentWorkerRuntimeModule {
         sendClientEnv: false;
         supportsExtensionUi: false;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<WorkerDaemonConnection>;
@@ -357,6 +358,7 @@ export class ResidentRuntimeWorkerServer {
           "sendClientEnv",
           "supportsExtensionUi",
           "ownedSession",
+          "telemetryDisabled",
         ], operation);
         const connectionId = boundedIdentifier(input.connectionId, "worker connection ID");
         this.lastConnectionOrdinal = requireNextOrdinal(
@@ -374,7 +376,8 @@ export class ResidentRuntimeWorkerServer {
           input.closeClientOnDispose !== true ||
           input.sendClientEnv !== false ||
           input.supportsExtensionUi !== false ||
-          typeof input.ownedSession !== "boolean"
+          typeof input.ownedSession !== "boolean" ||
+          input.telemetryDisabled !== true
         ) {
           throw new ResidentWorkerProtocolError("Resident worker attach options differ from the fixed public contract");
         }
@@ -396,6 +399,7 @@ export class ResidentRuntimeWorkerServer {
             sendClientEnv: false,
             supportsExtensionUi: false,
             ownedSession: input.ownedSession,
+            telemetryDisabled: true,
             recoverDaemon: () => this.requestHostRecovery(connectionId),
           });
           if (attaching.abandoned) {

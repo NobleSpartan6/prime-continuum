@@ -16,6 +16,7 @@ import {
   NONCLAIMS,
   OPT_IN_FLAG,
   POST_RESTART_OBSERVATION_INTERVAL_MS,
+  PRIME_AGENT_RELEASE_VERSION,
   PROOF_DIRECTORY,
   PROVIDER_ID,
   ROOT_PREFIX,
@@ -42,6 +43,7 @@ import {
   validateDisposableLayout,
   validateEndedControlProjection,
   validateEndedProjection,
+  validateInFlightProjection,
   validateInitialProjection,
   validateLoopbackEvidence,
   validateReceipt,
@@ -139,8 +141,16 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     expect(endpoint).toBe('/private/tmp/prime-continuim-tool-dogfood-run/host-data/hostd.sock')
     expect(resolveDogfoodHostEndpoint({
       platform: 'win32',
-      dataDirectory: '/dogfood/host-data',
+      dataDirectory: 'C:\\dogfood\\host-data',
     })).toMatch(/^\\\\\.\\pipe\\prime-agent-hostd-[a-f0-9]{16}$/u)
+    expect(() => resolveDogfoodHostEndpoint({
+      platform: 'win32',
+      dataDirectory: '/drive-relative/host-data',
+    })).toThrowError(expect.objectContaining({ code: 'FIXTURE_INVALID' }))
+    expect(() => resolveDogfoodHostEndpoint({
+      platform: 'darwin',
+      dataDirectory: 'C:\\dogfood\\host-data',
+    })).toThrowError(expect.objectContaining({ code: 'FIXTURE_INVALID' }))
     const resident = resolveDogfoodResidentDaemonEndpoint({
       platform: 'darwin',
       dataDirectory: '/private/tmp/prime-continuim-tool-dogfood-run/host-data',
@@ -158,6 +168,7 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     })
     expect(prompt).toContain(`exact objective: ${identity.goalObjective}`)
     expect(prompt).toContain(`exactly one native RLM child with name ${CHILD_NAME}`)
+    expect(prompt).toContain('Keep the root turn and that child active')
     expect(prompt).toContain(`agent_message with the exact token ${identity.childToken}`)
     expect(prompt).toContain(`model is exactly ${RUNTIME_MODEL_ID}`)
     expect(prompt).toContain(`${BROWSER_SURFACE} surface`)
@@ -208,11 +219,41 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     )
   })
 
-  it('accepts only one completed browser-auditor child with agent_message, completed goal, exact model, and transcript proof', () => {
+  it('requires an observable live root turn and active child before accepting their exact completion', () => {
     const identity = dogfoodIdentity()
     const baseline = validateInitialProjection(initialProjection(identity), identity)
+    const live = inFlightProjection(identity)
+    const inFlight = validateInFlightProjection(live, { initial: baseline, identity })
+    expect(inFlight).toMatchObject({
+      child: { sessionName: CHILD_NAME, state: 'running', repliedSinceTask: false },
+      goal: { objective: identity.goalObjective, state: 'active' },
+      rootActivity: 'runtime_stream',
+      sequence: 12,
+      projectionSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+
+    for (const mutate of [
+      (value: any) => { value.thread.status = 'idle' },
+      (value: any) => {
+        value.runtime.isStreaming = false
+        value.runtime.isCompacting = false
+        value.runtime.isBashRunning = false
+        value.runtime.activeToolNames = []
+      },
+      (value: any) => { value.childAgents[0].state = 'complete' },
+      (value: any) => { value.childAgents[0].repliedSinceTask = true },
+      (value: any) => { value.goals[0].state = 'complete' },
+      (value: any) => { value.latestCursor.sequence = baseline.initialSequence },
+    ]) {
+      const invalid = structuredClone(live)
+      mutate(invalid)
+      expect(() => validateInFlightProjection(invalid, { initial: baseline, identity })).toThrowError(
+        expect.objectContaining({ code: 'IN_FLIGHT_NOT_PROVEN' }),
+      )
+    }
+
     const completed = completedProjection(identity)
-    expect(validateCompletedProjection(completed, { initial: baseline, identity })).toMatchObject({
+    expect(validateCompletedProjection(completed, { initial: baseline, identity, inFlight })).toMatchObject({
       child: {
         sessionName: CHILD_NAME,
         model: RUNTIME_MODEL_ID,
@@ -234,15 +275,19 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     for (const mutate of cases) {
       const invalid = structuredClone(completed)
       mutate(invalid)
-      expect(() => validateCompletedProjection(invalid, { initial: baseline, identity })).toThrowError(
+      expect(() => validateCompletedProjection(invalid, { initial: baseline, identity, inFlight })).toThrowError(
         expect.objectContaining({ code: 'PROJECTION_NOT_PROVEN' }),
       )
     }
+    expect(() => validateCompletedProjection(completed, { initial: baseline, identity } as any)).toThrowError(
+      expect.objectContaining({ code: 'PROJECTION_NOT_PROVEN' }),
+    )
   })
 
   it('requires a changed host and desktop, exact resident reattachment, stable idle projections, and no durable replay evidence', () => {
     const identity = dogfoodIdentity()
     const initial = validateInitialProjection(initialProjection(identity), identity)
+    const inFlight = validateInFlightProjection(inFlightProjection(identity), { initial, identity })
     const completed = completedProjection(identity)
     const observations = Array.from({ length: MIN_POST_RESTART_OBSERVATIONS }, (_, index) => ({
       snapshot: structuredClone(completed),
@@ -251,6 +296,7 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     const exact = {
       initial,
       identity,
+      inFlight,
       beforeRestart: completed,
       observations,
       hostProcessBefore: 'hostd:00000000-0000-4000-8000-000000000001',
@@ -391,7 +437,7 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
       candidate: {
         artifact: 'macos-directory-package',
         runtime: 'prime-agent',
-        releaseVersion: '0.7.1',
+        releaseVersion: PRIME_AGENT_RELEASE_VERSION,
         runtimeTreeSha256: 'a'.repeat(64),
         attestationSha256: 'b'.repeat(64),
         appAsarSha256: '1'.repeat(64),
@@ -408,6 +454,11 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
       },
       proof: {
         runtimeModel: RUNTIME_MODEL_ID,
+        inFlightObserved: true,
+        inFlightProjectionSha256: '7'.repeat(64),
+        inFlightRootActivity: 'runtime_stream',
+        inFlightChildState: 'running',
+        inFlightSequence: 12,
         childName: CHILD_NAME,
         childAgentId: completed.childAgents[0]!.agentId,
         childReplied: true,
@@ -446,7 +497,7 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     })
     expect(validateReceipt(functional)).toBe(functional)
     expect(JSON.parse(serializeReceipt(functional).toString('utf8'))).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       kind: EVIDENCE_KIND,
       outcome: 'functional_passed_external_disposal_required',
       cleanup: {
@@ -513,17 +564,25 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
         residentDaemonRetiredProcessGroupCount: 2,
       },
     })).toThrowError(expect.objectContaining({ code: 'RECEIPT_INVALID' }))
+    expect(() => validateReceipt({
+      ...functional,
+      candidate: { ...functional.candidate, releaseVersion: '0.7.1' },
+    })).toThrowError(expect.objectContaining({ code: 'RECEIPT_INVALID' }))
+    expect(() => validateReceipt({ ...functional, schemaVersion: 3 })).toThrowError(
+      expect.objectContaining({ code: 'RECEIPT_INVALID' }),
+    )
     expect(() => validateReceipt({ ...functional, receiptPath: '/Users/operator/secret' })).toThrowError(
       expect.objectContaining({ code: 'RECEIPT_INVALID' }),
     )
   })
 
   it('keeps the live lane operator-driven, credential-opaque, separate from the no-tools lane, and outside normal workflows', async () => {
-    const [source, daemonCleanup, existingLane, packageManifest, workflow, readme, runbook] = await Promise.all([
+    const [source, daemonCleanup, existingLane, packageManifest, runtimePolicy, workflow, readme, runbook] = await Promise.all([
       readFile(resolve('scripts/verify-prime-agent-tool-dogfood.mjs'), 'utf8'),
       readFile(resolve('scripts/prime-agent-tool-dogfood-daemon-cleanup.mjs'), 'utf8'),
       readFile(resolve('scripts/verify-prime-agent-provider-e2e.mjs'), 'utf8'),
       readFile(resolve('package.json'), 'utf8'),
+      readFile(resolve('runtime/prime-agent/runtime-policy.json'), 'utf8'),
       readFile(resolve('scripts/run-workflow.mjs'), 'utf8'),
       readFile(resolve('README.md'), 'utf8'),
       readFile(resolve('docs/prime-agent-journey-gate.md'), 'utf8'),
@@ -537,6 +596,9 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     expect(source).not.toContain('auth.json')
     expect(source).not.toContain('oauth.json')
     expect(source).toContain('validateCompletedProjection')
+    expect(source).toContain('validateInFlightProjection')
+    expect(source).toContain('waitForInFlightProjection')
+    expect(source).toContain('attestation.runtime.releaseVersion !== PRIME_AGENT_RELEASE_VERSION')
     expect(source).toContain('validateRestartNoReplay')
     expect(source).toContain('observeStableRestart')
     expect(source).toContain('inspectReplayState')
@@ -567,9 +629,16 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     expect(JSON.parse(packageManifest).scripts['verify:prime-agent-tool-dogfood']).toBe(
       'node scripts/verify-prime-agent-tool-dogfood.mjs',
     )
+    expect(PRIME_AGENT_RELEASE_VERSION).toBe('0.7.2')
+    expect(JSON.parse(runtimePolicy).releaseVersion).toBe(PRIME_AGENT_RELEASE_VERSION)
     expect(workflow).not.toContain('verify:prime-agent-tool-dogfood')
     expect(readme).toContain('verify:prime-agent-tool-dogfood')
     expect(runbook).toContain('three interval-separated production snapshots')
+    expect(runbook).toContain('observable in-flight root turn')
+    expect(runbook).toContain('Prime Agent v0.7.2')
+    expect(runbook).toContain('arm64) DOGFOOD_APP_DIR=mac-arm64')
+    expect(runbook).toContain('x86_64) DOGFOOD_APP_DIR=mac')
+    expect(runbook).toContain('release/$DOGFOOD_APP_DIR/Prime Continuim.app')
     expect(runbook).toContain('never reads credential files')
     expect(runbook).toContain('never')
     expect(runbook).toContain('submits a resident command')
@@ -686,6 +755,32 @@ function completedProjection(identity: ReturnType<typeof dogfoodIdentity>) {
         identity.finalMarker,
       ].join('\n'),
     }],
+  }
+}
+
+function inFlightProjection(identity: ReturnType<typeof dogfoodIdentity>) {
+  const value = initialProjection(identity)
+  return {
+    ...value,
+    thread: { ...value.thread, status: 'running' },
+    runtime: {
+      ...value.runtime,
+      isStreaming: true,
+      isCompacting: false,
+      isBashRunning: false,
+      activeToolNames: ['rlm'],
+    },
+    childAgents: [{
+      agentId: 'child-1',
+      sessionName: CHILD_NAME,
+      title: 'Browser auditor',
+      state: 'running',
+      model: RUNTIME_MODEL_ID,
+      repliedSinceTask: false,
+      activity: { kind: 'executing', toolName: BROWSER_SURFACE },
+    }],
+    goals: [{ goalId: 'goal-1', objective: identity.goalObjective, state: 'active' }],
+    latestCursor: { ...value.latestCursor, sequence: 12 },
   }
 }
 

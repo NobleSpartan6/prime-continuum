@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "releaseVersion": "0.7.1",
-  "runtimeBuildId": "95afd31-dirty",
+  "releaseVersion": "0.7.2",
+  "runtimeBuildId": "83a0f9f-dirty",
   "minimumNodeVersion": "22.8.0",
   "npmVersion": "10.9.8",
   "lockfileVersion": 3,
-  "lockPackageEntries": 203,
+  "lockPackageEntries": 202,
   "install": {
     "ignoreScripts": true,
     "omitDev": true,
@@ -72,8 +72,8 @@
       {
         "relativePath": "node_modules/prime-agent/examples",
         "package": "prime-agent",
-        "version": "0.7.1",
-        "packageJsonSha256": "0bf756952f21542fa814acf301e0e868745b095eaf190b3457c729b41239a900",
+        "version": "0.7.2",
+        "packageJsonSha256": "0b45bc86527fcdb73dae76d319f6f50f6d40827a63614303664a57e8fe41c8cf",
         "fileCount": 120,
         "totalBytes": 920809,
         "treeSha256": "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849"
@@ -160,8 +160,8 @@
   "daemon": {
     "protocolName": "prime-agent.daemon",
     "protocolVersion": 7,
-    "schemaRevision": 13,
-    "schemaId": "protocol-7-schema-13-816309b1cd50",
+    "schemaRevision": 16,
+    "schemaId": "protocol-7-schema-16-1bcb9e7f1a49",
     "requiredCapabilities": [
       "attach_snapshot",
       "event_sequence",
@@ -176,8 +176,8 @@
       "integrity": "sha512-YussvUybTfBtyYbGXWh43f+5kNP03wg98M6mu4DphYET7PSbNVajsdLGjWE1xrsjqOw32i2wFlRP7U5mcOpMZg=="
     },
     "prime-agent": {
-      "version": "0.7.1",
-      "integrity": "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ=="
+      "version": "0.7.2",
+      "integrity": "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg=="
     },
     "zeromq": {
       "version": "6.5.0",

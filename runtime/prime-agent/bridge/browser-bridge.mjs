@@ -16,7 +16,10 @@ import {
   rewriteBrowserCommand,
   rewriteBrowserSessionName,
 } from "./browser-bridge-arguments.mjs";
-import { createBrowserHostEnvironment } from "./browser-bridge-environment.mjs";
+import {
+  browserProcessStatus,
+  createBrowserHostEnvironment,
+} from "./browser-bridge-environment.mjs";
 import { withBrowserSessionLock } from "./browser-bridge-session-lock.mjs";
 import { browserSessionStateKeys, residentBrowserAuthority } from "./browser-bridge-state.mjs";
 
@@ -285,15 +288,6 @@ async function closeEndpoint(metadata, launch, launchPath) {
     throw new BridgeError("BROWSER_IDENTITY_CHANGED", "Browser endpoint identity changed; recovery evidence was retained.");
   }
   await requestHostRetirement(launch, launchPath);
-}
-
-function browserProcessStatus(pid) {
-  try {
-    process.kill(pid, 0);
-    return "live";
-  } catch (error) {
-    return error?.code === "ESRCH" ? "dead" : "unknown";
-  }
 }
 
 async function retireBrowserState(state, removeProfile) {

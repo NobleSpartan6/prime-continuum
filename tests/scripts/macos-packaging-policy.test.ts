@@ -140,9 +140,9 @@ describe('macOS directory packaging policy', () => {
     for (const [index, key] of MACOS_PACKAGING_DENIED_ENVIRONMENT_KEYS.entries()) {
       source[toMixedCase(key)] = `poison-${index}`
     }
-    const environment = createMacosPackagingEnvironment(source)
+    const environment = createMacosPackagingEnvironment(source, '/reviewed/node/bin/node')
     expect(environment).toMatchObject({
-      PATH: createMacosReviewedPath(),
+      PATH: createMacosReviewedPath('/reviewed/node/bin/node'),
       npm_execpath: '/reviewed/pnpm.cjs',
       PRIME_CONTINUIM_SAFE_INPUT: 'preserved',
       PRIME_CONTINUIM_INTERNAL_PNPM_CLI: '/reviewed/pnpm.cjs',
@@ -184,13 +184,15 @@ describe('macOS directory packaging policy', () => {
 })
 
 describe('macOS package verification primitives', () => {
-  it('accepts only a UDIF trailer and the reviewed mounted DMG surface', async () => {
+  it('accepts only a complete UDIF trailer', () => {
     const trailer = Buffer.alloc(512)
     trailer.write('koly', 0, 'ascii')
     expect(assertDmgTrailer(trailer)).toBe(true)
     expect(() => assertDmgTrailer(Buffer.alloc(511))).toThrow('truncated')
     expect(() => assertDmgTrailer(Buffer.alloc(512))).toThrow('no UDIF trailer')
+  })
 
+  it.runIf(process.platform !== 'win32')('accepts only the reviewed mounted DMG surface', async () => {
     const root = await mkdtemp(join(tmpdir(), 'prime-macos-dmg-policy-'))
     scratchRoots.push(root)
     const mountRoot = join(root, 'mount')

@@ -52,7 +52,7 @@ describe("verified browser doctor", () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
-  it("cancels timeout escalation after SIGTERM retires the doctor", async () => {
+  it.runIf(process.platform !== "win32")("cancels timeout escalation after SIGTERM retires the doctor", async () => {
     const kill = vi.spyOn(process, "kill");
     try {
       await expect(probeScript(`

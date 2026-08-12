@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 
@@ -14,6 +14,7 @@ export const CONFIRMATION_PHRASE =
 export const PROVIDER_ID = "openai-codex";
 export const MODEL_ID = "gpt-5.6-sol";
 export const RUNTIME_MODEL_ID = `${PROVIDER_ID}/${MODEL_ID}`;
+export const PRIME_AGENT_RELEASE_VERSION = "0.7.2";
 export const CHILD_NAME = "browser-auditor";
 export const BROWSER_SURFACE = "playwright-cli";
 export const ROOT_PREFIX = "prime-continuim-tool-dogfood-";
@@ -50,6 +51,7 @@ const STAGES = new Set([
   "host",
   "precondition",
   "operator",
+  "in_flight",
   "projection",
   "browser",
   "restart",
@@ -71,6 +73,7 @@ const CODES = new Set([
   "HOST_UNAVAILABLE",
   "PRECONDITION_NOT_PROVEN",
   "OPERATOR_DEADLINE_EXCEEDED",
+  "IN_FLIGHT_NOT_PROVEN",
   "PROJECTION_NOT_PROVEN",
   "BROWSER_PROOF_INVALID",
   "BROWSER_RESIDUE_RETAINED",
@@ -203,12 +206,13 @@ export async function validateDisposableLayout(input) {
 }
 
 export function resolveDogfoodHostEndpoint(input) {
-  const dataDirectory = requireAbsolutePath(input?.dataDirectory);
-  if (input?.platform === "win32") {
-    const digest = createHash("sha256").update(resolve(dataDirectory).toLowerCase()).digest("hex").slice(0, 16);
+  const platform = input?.platform;
+  const dataDirectory = requireAbsolutePathForPlatform(input?.dataDirectory, platform);
+  if (platform === "win32") {
+    const digest = createHash("sha256").update(win32.resolve(dataDirectory).toLowerCase()).digest("hex").slice(0, 16);
     return `\\\\.\\pipe\\prime-agent-hostd-${digest}`;
   }
-  const endpoint = join(dataDirectory, "hostd.sock");
+  const endpoint = posix.join(dataDirectory, "hostd.sock");
   if (Buffer.byteLength(endpoint, "utf8") > MAX_UNIX_SOCKET_PATH_BYTES) {
     fail("fixture", "FIXTURE_INVALID");
   }
@@ -216,15 +220,15 @@ export function resolveDogfoodHostEndpoint(input) {
 }
 
 export function resolveDogfoodResidentDaemonEndpoint(input) {
-  const dataDirectory = requireAbsolutePath(input?.dataDirectory);
   const platform = input?.platform;
+  const dataDirectory = requireAbsolutePathForPlatform(input?.dataDirectory, platform);
   const identity = createHash("sha256")
-    .update(platform === "win32" ? dataDirectory.toLowerCase() : dataDirectory)
+    .update(platform === "win32" ? win32.resolve(dataDirectory).toLowerCase() : dataDirectory)
     .digest("hex")
     .slice(0, 16);
   if (platform === "win32") return `\\\\.\\pipe\\prime-continuim-resident-${identity}`;
-  const temporaryDirectory = requireAbsolutePath(input?.physicalTemporaryDirectory);
-  const endpoint = join(temporaryDirectory, `pc-${identity}`, "d.sock");
+  const temporaryDirectory = requireAbsolutePathForPlatform(input?.physicalTemporaryDirectory, platform);
+  const endpoint = posix.join(temporaryDirectory, `pc-${identity}`, "d.sock");
   if (Buffer.byteLength(endpoint, "utf8") > MAX_UNIX_SOCKET_PATH_BYTES) {
     fail("fixture", "FIXTURE_INVALID");
   }
@@ -259,6 +263,7 @@ export function createDogfoodPrompt(input) {
     `This is an explicitly authorized disposable dogfood run ${identity.runId}.`,
     `Create exactly one goal with the exact objective: ${identity.goalObjective}`,
     `Spawn exactly one native RLM child with name ${CHILD_NAME}. Give it a bounded read-only review of this task contract.`,
+    `Keep the root turn and that child active until the child has begun the verified browser sequence; do not complete the child immediately after spawning it.`,
     `Require that child to reply to its parent through agent_message with the exact token ${identity.childToken}.`,
     `Confirm that the root and child runtime model is exactly ${RUNTIME_MODEL_ID}; do not use a fallback model.`,
     `Do not accept an rlm() return value as the child result; wait for the explicit agent_message reply.`,
@@ -346,10 +351,23 @@ export function validateAuthenticatedCatalog(catalog) {
   return Object.freeze({ provider: provider[0], model: model[0] });
 }
 
-export function validateCompletedProjection(snapshot, input) {
-  const authority = exactProjectionAuthority(snapshot, "projection", "PROJECTION_NOT_PROVEN");
+export function validateInFlightProjection(snapshot, input) {
+  const authority = exactProjectionAuthority(snapshot, "in_flight", "IN_FLIGHT_NOT_PROVEN");
   const initial = input?.initial;
   const identity = input?.identity;
+  const runtime = snapshot?.runtime;
+  const activeToolNames = Array.isArray(runtime?.activeToolNames) ? runtime.activeToolNames : [];
+  const rootActivity = snapshot?.inProgressStream !== undefined
+    ? "stream"
+    : runtime?.isStreaming === true
+      ? "runtime_stream"
+      : runtime?.isCompacting === true
+        ? "compaction"
+        : runtime?.isBashRunning === true
+          ? "shell"
+          : activeToolNames.length > 0
+            ? "tool"
+            : undefined;
   if (
     !initial || !identity ||
     authority.hostId !== initial.hostId ||
@@ -357,6 +375,57 @@ export function validateCompletedProjection(snapshot, input) {
     authority.executionGenerationId !== initial.executionGenerationId ||
     snapshot.latestCursor.generation !== initial.initialGeneration ||
     snapshot.latestCursor.sequence <= initial.initialSequence ||
+    snapshot.thread.status !== "running" ||
+    runtime?.runtime !== "prime_agent" ||
+    runtime?.residency !== "resident" ||
+    runtime?.activeSessionId !== initial.activeSessionId ||
+    runtime?.sessionId !== initial.sessionId ||
+    runtime?.model !== RUNTIME_MODEL_ID ||
+    rootActivity === undefined ||
+    snapshot.queueState?.paused !== false ||
+    snapshot.residentControl?.browserExecution?.readiness !== "ready" ||
+    snapshot.residentControl?.browserExecution?.surface !== BROWSER_SURFACE
+  ) fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+
+  const children = Array.isArray(snapshot.childAgents) ? snapshot.childAgents : [];
+  if (children.length !== 1) fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+  const child = children[0];
+  if (
+    child?.sessionName !== CHILD_NAME ||
+    !["running", "waiting"].includes(child.state) ||
+    child.model !== RUNTIME_MODEL_ID ||
+    child.repliedSinceTask === true ||
+    !ID.test(child.agentId)
+  ) fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+
+  const goals = Array.isArray(snapshot.goals) ? snapshot.goals : [];
+  if (goals.length !== 1) fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+  const goal = goals[0];
+  if (goal?.objective !== identity.goalObjective || goal.state !== "active" || !ID.test(goal.goalId)) {
+    fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+  }
+  return Object.freeze({
+    authority,
+    child,
+    goal,
+    rootActivity,
+    sequence: snapshot.latestCursor.sequence,
+    projectionSha256: sha256Json(snapshot),
+  });
+}
+
+export function validateCompletedProjection(snapshot, input) {
+  const authority = exactProjectionAuthority(snapshot, "projection", "PROJECTION_NOT_PROVEN");
+  const initial = input?.initial;
+  const identity = input?.identity;
+  const inFlight = input?.inFlight;
+  if (
+    !initial || !identity || !inFlight ||
+    authority.hostId !== initial.hostId ||
+    authority.threadId !== initial.threadId ||
+    authority.executionGenerationId !== initial.executionGenerationId ||
+    snapshot.latestCursor.generation !== initial.initialGeneration ||
+    snapshot.latestCursor.sequence <= inFlight.sequence ||
     snapshot.thread.status !== "idle" ||
     snapshot.runtime?.runtime !== "prime_agent" ||
     snapshot.runtime?.residency !== "resident" ||
@@ -375,6 +444,7 @@ export function validateCompletedProjection(snapshot, input) {
   const child = children[0];
   if (
     child?.sessionName !== CHILD_NAME ||
+    child.agentId !== inFlight.child.agentId ||
     child.state !== "complete" ||
     child.model !== RUNTIME_MODEL_ID ||
     child.repliedSinceTask !== true ||
@@ -384,7 +454,10 @@ export function validateCompletedProjection(snapshot, input) {
   const goals = Array.isArray(snapshot.goals) ? snapshot.goals : [];
   if (goals.length !== 1) fail("projection", "PROJECTION_NOT_PROVEN");
   const goal = goals[0];
-  if (goal?.objective !== identity.goalObjective || goal.state !== "complete" || !ID.test(goal.goalId)) {
+  if (
+    goal?.objective !== identity.goalObjective || goal.state !== "complete" ||
+    goal.goalId !== inFlight.goal.goalId || !ID.test(goal.goalId)
+  ) {
     fail("projection", "PROJECTION_NOT_PROVEN");
   }
 
@@ -421,7 +494,7 @@ export function validateRestartNoReplay(input) {
     input.observations.length > 128
   ) fail("restart", "RESTART_NOT_PROVEN");
 
-  validateCompletedProjection(beforeRestart, { initial, identity });
+  validateCompletedProjection(beforeRestart, { initial, identity, inFlight: input?.inFlight });
   const expected = durableCompletedProjection(beforeRestart);
   let previousTime;
   let minimumGap = Number.MAX_SAFE_INTEGER;
@@ -434,7 +507,7 @@ export function validateRestartNoReplay(input) {
       if (gap < POST_RESTART_OBSERVATION_INTERVAL_MS) fail("restart", "RESTART_NOT_PROVEN");
       minimumGap = Math.min(minimumGap, gap);
     }
-    validateCompletedProjection(observation.snapshot, { initial, identity });
+    validateCompletedProjection(observation.snapshot, { initial, identity, inFlight: input?.inFlight });
     if (!isDeepStrictEqual(durableCompletedProjection(observation.snapshot), expected)) {
       fail("restart", "RESTART_NOT_PROVEN");
     }
@@ -685,7 +758,7 @@ export async function assertBrowserStateRetired(stateDirectory) {
 
 export function createFunctionalReceipt(input) {
   const receipt = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     kind: EVIDENCE_KIND,
     outcome: "functional_passed_external_disposal_required",
     platform: input.platform,
@@ -716,7 +789,7 @@ export function createFunctionalReceipt(input) {
 
 export function createFailureReceipt(input) {
   const receipt = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     kind: EVIDENCE_KIND,
     outcome: "failed_fixture_retained",
     platform: input.platform,
@@ -757,7 +830,7 @@ export function serializeReceipt(receipt) {
 export function validateReceipt(receipt) {
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) fail("receipt", "RECEIPT_INVALID");
   if (
-    receipt.schemaVersion !== 3 || receipt.kind !== EVIDENCE_KIND ||
+    receipt.schemaVersion !== 4 || receipt.kind !== EVIDENCE_KIND ||
     !["darwin", "linux", "win32"].includes(receipt.platform) ||
     typeof receipt.arch !== "string" || receipt.arch.length < 1 || receipt.arch.length > 32 ||
     !ID.test(receipt.runId) ||
@@ -792,6 +865,7 @@ export function validateReceipt(receipt) {
     assertExactKeys(receipt.proof, [
       "browserOperations", "browserStateEntriesInspected", "browserSurface", "childAgentId", "childName",
       "childReplied", "completionProjectionSha256", "goalId", "goalState", "loopbackEventCount",
+      "inFlightChildState", "inFlightObserved", "inFlightProjectionSha256", "inFlightRootActivity", "inFlightSequence",
       "desktopOutboxEmpty", "desktopRestarted", "exactJournalIdsUnchanged", "exactProjectionStable",
       "hostdRestarted", "minimumPostRestartObservationSeparationMs", "postRestartObservationCount",
       "residentDaemonEndpointRetired", "residentDaemonIdentityCount", "residentDaemonOwnerRetired",
@@ -854,7 +928,7 @@ function validateFunctionalReceiptRecords(receipt) {
   return (
     candidate?.runtime === "prime-agent" &&
     candidate?.artifact === "macos-directory-package" &&
-    typeof candidate.releaseVersion === "string" && candidate.releaseVersion.length > 0 &&
+    candidate.releaseVersion === PRIME_AGENT_RELEASE_VERSION &&
     SHA256.test(candidate.runtimeTreeSha256) &&
     SHA256.test(candidate.attestationSha256) &&
     SHA256.test(candidate.appAsarSha256) &&
@@ -870,6 +944,11 @@ function validateFunctionalReceiptRecords(receipt) {
     checkpoint?.detachedHead === true && checkpoint?.initiallyClean === true && SHA256.test(checkpoint.head) &&
     ID.test(authority?.hostId) && ID.test(authority?.threadId) && ID.test(authority?.executionGenerationId) &&
     proof?.runtimeModel === RUNTIME_MODEL_ID &&
+    proof?.inFlightObserved === true &&
+    SHA256.test(proof?.inFlightProjectionSha256) &&
+    ["stream", "runtime_stream", "compaction", "shell", "tool"].includes(proof?.inFlightRootActivity) &&
+    ["running", "waiting"].includes(proof?.inFlightChildState) &&
+    Number.isSafeInteger(proof?.inFlightSequence) && proof.inFlightSequence >= 0 &&
     proof?.childName === CHILD_NAME && ID.test(proof?.childAgentId) && proof?.childReplied === true &&
     proof?.goalState === "complete" && ID.test(proof?.goalId) &&
     proof?.browserSurface === BROWSER_SURFACE &&
@@ -939,6 +1018,23 @@ function sameIdSet(left, right) {
   ) return false;
   return left.length === new Set(left).size && right.length === new Set(right).size &&
     isDeepStrictEqual([...left].sort(), [...right].sort());
+}
+
+function requireAbsolutePathForPlatform(value, platform) {
+  if (typeof value !== "string" || /[\0\r\n]/u.test(value)) fail("fixture", "FIXTURE_INVALID");
+  if (platform === "win32") {
+    // Root-relative paths depend on the caller's current drive. Require an
+    // explicit drive or UNC authority so endpoint identity is deterministic
+    // even when this pure target contract is tested off Windows.
+    if (!/^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$))/u.test(value)) {
+      fail("fixture", "FIXTURE_INVALID");
+    }
+    return value;
+  }
+  if ((platform !== "darwin" && platform !== "linux") || !posix.isAbsolute(value)) {
+    fail("fixture", "FIXTURE_INVALID");
+  }
+  return value;
 }
 
 function exactProjectionAuthority(snapshot, stage, code) {

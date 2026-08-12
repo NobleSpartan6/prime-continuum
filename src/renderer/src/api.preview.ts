@@ -369,6 +369,7 @@ export const previewSnapshot: WorkbenchSnapshot = {
 export type PreviewVisualState =
   | 'reconnecting'
   | 'idle'
+  | 'rlm-activity'
   | 'launchpad'
   | 'model-selection'
   | 'prime-oauth'
@@ -388,6 +389,7 @@ export type PreviewVisualState =
 const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
   'idle',
+  'rlm-activity',
   'launchpad',
   'model-selection',
   'prime-oauth',
@@ -679,6 +681,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
 
   if (
     visualState === 'idle' ||
+    visualState === 'rlm-activity' ||
     visualState === 'launchpad' ||
     visualState === 'model-selection' ||
     visualState === 'hud-expanded' ||
@@ -691,6 +694,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     }
     selectedThread.status = hudActive ? 'running' : 'idle'
     session.isStreaming = hudActive
+    if (!hudActive && visualState !== 'rlm-activity') snapshot.agents = []
     if (visualState === 'launchpad') {
       selectedThread.transcript = []
       session.messageCount = 0
@@ -708,10 +712,12 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
           message: 'Prime Agent owns this prompt · monitoring exact live activity',
         }
       : { state: 'idle', message: 'Ready for a new prompt' }
-    if (hudActive) {
+    if (hudActive || visualState === 'rlm-activity') {
       setPreviewUpdate(
         'fixture resident session is actively working with retained child agents',
-        'the HUD is rendering bounded host-projected activity',
+        hudActive
+          ? 'the HUD is rendering bounded host-projected activity'
+          : 'the root is idle while retained RLM branches continue independently',
       )
     } else {
       setPreviewUpdate(
@@ -801,7 +807,7 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '186 GB free',
     gitVersion: 'Git 2.45.2',
     pythonStatus: 'Python 3.12 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.1',
+    agentVersion: 'Prime Agent 0.7.2',
     hostServiceVersion: 'Not installed',
     requiresInstall: true,
     installCommand: 'No signed host-service installer is available in this build.',
@@ -820,7 +826,7 @@ const discoveredComputers: DiscoveredComputer[] = [
     diskFree: '92 GB free',
     gitVersion: 'Git 2.47.1',
     pythonStatus: 'Python 3.13 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.1',
+    agentVersion: 'Prime Agent 0.7.2',
     hostServiceVersion: 'Host service 0.1.0 · running',
     requiresInstall: false,
     installCommand:
@@ -833,7 +839,7 @@ const discoveredComputers: DiscoveredComputer[] = [
 
 const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCatalogSnapshotSchema.parse({
   runtime: 'prime_agent',
-  releaseVersion: '0.7.1',
+  releaseVersion: '0.7.2',
   observedAt: '2026-08-07T12:00:00.000Z',
   providers: [
     {

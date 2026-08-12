@@ -67,7 +67,7 @@ const END_DEADLINE_MS = 5 * 60_000;
 const HELPER_DEADLINE_MS = 60_000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_JOURNAL_RECORDS = 20_000;
-// The pinned v0.7.1 image currently contains 20,764 files. Preserve room for
+// The pinned v0.7.2 image currently contains 20,764 files. Preserve room for
 // bounded runtime growth without weakening exact per-file/tree equality.
 const MAX_TREE_FILES = 25_000;
 const MAX_TREE_BYTES = 2 * 1024 * 1024 * 1024;

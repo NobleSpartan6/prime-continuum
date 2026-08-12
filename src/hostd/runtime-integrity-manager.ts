@@ -1474,7 +1474,10 @@ async function normalizeAndSyncClonedRuntimeTree(
     const absolute = join(directory, ...path.split("/"));
     await chmod(absolute, isBrowserLauncherPath(absolute) ? 0o700 : 0o600);
     const pathBefore = await requirePlainRegularFile(absolute, "cloned runtime file", signal);
-    const handle = await open(absolute, "r");
+    // Windows rejects fsync on a read-only file handle with EPERM. The cloned
+    // staging image is private and has already been normalized writable for
+    // its owner, so request write access for durability without mutating it.
+    const handle = await open(absolute, process.platform === "win32" ? "r+" : "r");
     try {
       const opened = await handle.stat({ bigint: true });
       assertSameRuntimeFileIdentity(pathBefore, opened, "Cloned runtime file changed before sync");

@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway, PrimeAgentProjectionChange } from "../../src/hostd/gateway";
 import type {
@@ -477,7 +477,7 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     expect(firstUnix).toBe(secondUnix);
     expect(Buffer.byteLength(firstUnix, "utf8")).toBeLessThanOrEqual(100);
     expect(firstUnix).toMatch(/[\\/]pc-[0-9a-f]{16}[\\/]d\.sock$/);
-    expect(firstUnix.startsWith(`${realpathSync.native(tmpdir())}/`)).toBe(true);
+    expect(dirname(dirname(firstUnix))).toBe(realpathSync.native(resolve(tmpdir())));
     expect(residentDaemonWorkingDirectory("/var/lib/prime-continuim/hostd")).toMatch(
       /[\\/]resident-daemon$/,
     );

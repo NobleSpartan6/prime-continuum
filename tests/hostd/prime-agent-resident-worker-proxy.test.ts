@@ -36,6 +36,7 @@ interface ProxyModule {
         sendClientEnv: false;
         supportsExtensionUi: false;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<PrimeDaemonAgentConnectionPublic & { promoteToResident(): Promise<void> }>;
@@ -382,6 +383,7 @@ async function attach(
     sendClientEnv: false,
     supportsExtensionUi: false,
     ownedSession,
+    telemetryDisabled: true,
     recoverDaemon,
   });
   return { client, connection };
@@ -437,6 +439,7 @@ describe("Prime Agent resident Worker proxy", () => {
         sendClientEnv: false,
         supportsExtensionUi: false,
         ownedSession: true,
+        telemetryDisabled: true,
       },
     });
     await connection.promoteToResident();

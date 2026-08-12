@@ -244,6 +244,7 @@ class ResidentWorkerBridge {
             sendClientEnv: false;
             supportsExtensionUi: false;
             ownedSession: boolean;
+            telemetryDisabled: true;
             recoverDaemon: () => Promise<void>;
           }>,
         ): Promise<PrimeDaemonAgentConnectionPublic> {
@@ -283,6 +284,7 @@ class ResidentWorkerBridge {
       sendClientEnv: false;
       supportsExtensionUi: false;
       ownedSession: boolean;
+      telemetryDisabled: true;
       recoverDaemon: () => Promise<void>;
     }>,
   ): Promise<WorkerDaemonConnectionProxy> {
@@ -291,6 +293,7 @@ class ResidentWorkerBridge {
       options.sendClientEnv !== false ||
       options.supportsExtensionUi !== false ||
       typeof options.ownedSession !== "boolean" ||
+      options.telemetryDisabled !== true ||
       typeof options.recoverDaemon !== "function"
     ) {
       throw new TypeError("Resident worker attach options differ from the fixed public contract");
@@ -316,6 +319,7 @@ class ResidentWorkerBridge {
           sendClientEnv: false,
           supportsExtensionUi: false,
           ownedSession: options.ownedSession,
+          telemetryDisabled: true,
         },
         {
           timeoutMs: ATTACH_OPERATION_TIMEOUT_MS,

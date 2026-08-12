@@ -20,6 +20,14 @@ export interface RuntimeSmokeResult {
   hello: JsonRecord;
 }
 
+export interface BrowserBridgeSmokeResult {
+  verified: true;
+  protocol: string;
+  controller: string;
+  engine: string;
+  operations: readonly string[];
+}
+
 export const REPO_ROOT: string;
 export const RUNTIME_TEMPLATE_DIRECTORY: string;
 
@@ -54,6 +62,10 @@ export function smokeRuntime(
   runtimeDirectory: string,
   options?: JsonRecord,
 ): Promise<Readonly<RuntimeSmokeResult>>;
+export function smokeBrowserBridge(
+  runtimeDirectory: string,
+  options?: JsonRecord,
+): Promise<Readonly<BrowserBridgeSmokeResult>>;
 export function createRuntimeManifest(options: {
   runtimeDirectory: string;
   inputs: JsonRecord;

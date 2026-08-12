@@ -51,6 +51,7 @@ export function createMacosPackagingBuilderPlan(options?: {
 
 export function createMacosPackagingEnvironment(
   source?: NodeJS.ProcessEnv,
+  nodeExecutable?: string,
 ): NodeJS.ProcessEnv
 
 export function resolveMacosPackageDirectory(

@@ -132,6 +132,7 @@ describe('renderer style contracts', () => {
     expect(minimumLayout).toMatch(/\.topbar__leading \.brand-mark\s*{[^}]*display:\s*none;/s)
     expect(minimumLayout).toMatch(/\.composer__hint\s*{[^}]*display:\s*none;/s)
     expect(compactMinimumLayout).toMatch(/\.composer--compact \.composer__connection\s*{[^}]*display:\s*inline-flex;/s)
+    expect(compactMinimumLayout).toMatch(/\.composer--compact\.composer--ending \.composer__connection:not\(\.composer__connection--validation\)\s*{[^}]*display:\s*none;/s)
     expect(compactMinimumLayout).toMatch(/\.composer__connection--validation\s*{[^}]*display:\s*inline-flex;/s)
     expect(css).toMatch(/\.composer--compact\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;/s)
     expect(css).toMatch(/\.composer-wrap--compact \.session-continuity\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/s)

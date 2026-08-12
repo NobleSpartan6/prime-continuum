@@ -6,6 +6,7 @@ export const CONFIRMATION_PHRASE: string;
 export const PROVIDER_ID: "openai-codex";
 export const MODEL_ID: "gpt-5.6-sol";
 export const RUNTIME_MODEL_ID: "openai-codex/gpt-5.6-sol";
+export const PRIME_AGENT_RELEASE_VERSION: "0.7.2";
 export const CHILD_NAME: "browser-auditor";
 export const BROWSER_SURFACE: "playwright-cli";
 export const ROOT_PREFIX: "prime-continuim-tool-dogfood-";
@@ -71,9 +72,21 @@ export function createDogfoodPrompt(input: Readonly<{ identity: DogfoodIdentity;
 export function createDogfoodPage(identity: DogfoodIdentity): string;
 export function validateInitialProjection(snapshot: unknown, identity: DogfoodIdentity): InitialProjectionEvidence;
 export function validateAuthenticatedCatalog(catalog: unknown): Readonly<{ provider: any; model: any }>;
+export function validateInFlightProjection(snapshot: unknown, input: Readonly<{
+  initial: InitialProjectionEvidence;
+  identity: DogfoodIdentity;
+}>): Readonly<{
+  authority: Readonly<{ hostId: string; threadId: string; executionGenerationId: string }>;
+  child: any;
+  goal: any;
+  rootActivity: "stream" | "runtime_stream" | "compaction" | "shell" | "tool";
+  sequence: number;
+  projectionSha256: string;
+}>;
 export function validateCompletedProjection(snapshot: unknown, input: Readonly<{
   initial: InitialProjectionEvidence;
   identity: DogfoodIdentity;
+  inFlight: Readonly<{ child: any; goal: any; sequence: number }>;
 }>): Readonly<{
   authority: Readonly<{ hostId: string; threadId: string; executionGenerationId: string }>;
   child: any;

@@ -10,9 +10,9 @@ Prime Continuim gives Prime Agent a focused desktop surface: choose a workspace,
 
 ## What works today
 
-- Real provider-backed Prime Agent turns through the pinned Prime Agent v0.7.1 runtime.
+- Real provider-backed Prime Agent turns through the pinned Prime Agent v0.7.2 runtime.
 - ChatGPT Plus/Pro sign-in for the `openai-codex` provider, including GPT-5.6 Sol when the account reports it as available.
-- Model discovery and switching across providers configured in Prime Agent. The pinned runtime currently reports 1,173 routes across 32 providers; availability depends on your credentials and account.
+- Model discovery and switching across providers configured in Prime Agent. The pinned runtime currently reports 1,177 routes across 32 providers; availability depends on your credentials and account.
 - Native RLM child visibility with parent/child status, model, tool-use, token, and result projections.
 - A verified, isolated browser-tool path for resident agents.
 - Durable local sessions with Stop, End, restart recovery, and saved-workspace reconnection.
@@ -68,7 +68,7 @@ open "release/mac-arm64/Prime Continuim.app"
 
 Intel macOS uses `release/mac/Prime Continuim.app`. To create the development DMG, run `corepack pnpm dist`. The current app is ad-hoc signed; the DMG is unsigned and not notarized. See [macOS development packaging](docs/macos-development-package.md).
 
-The explicit packaged Prime Agent journey gate is `corepack pnpm verify:prime-agent-tool-dogfood`. It is interactive, opt-in, excluded from normal tests and workflows, and consumes real provider quota only after an exact typed authorization. It proves exact Sol selection, one native RLM child and `agent_message`, verified browser work, idle completion, host/desktop restart with stable no-replay observations, visible End, and owned process/browser retirement. See the [operator runbook](docs/prime-agent-journey-gate.md); the lane has not been run or cited for this candidate.
+The explicit packaged Prime Agent journey gate is `corepack pnpm verify:prime-agent-tool-dogfood`. It is interactive, opt-in, excluded from normal tests and workflows, and consumes real provider quota only after an exact typed authorization. It proves exact Sol selection, an observable in-flight root turn and active native RLM child before that same child returns its `agent_message`, verified browser work, idle completion, host/desktop restart with stable no-replay observations, visible End, and owned process/browser retirement. See the [operator runbook](docs/prime-agent-journey-gate.md); the lane has not been run or cited for this candidate.
 
 ### Windows development package
 
@@ -108,7 +108,7 @@ Packaging has been verified as a Windows x64 development artifact and an ad-hoc 
 
 - Treat every agent-selected command as code you authorized to run on the selected host.
 - Use an external sandbox for untrusted repositories or tasks.
-- Prime Agent v0.7.1 stores OAuth material as plaintext in a private host-only directory; it is not keychain-backed.
+- Prime Agent v0.7.2 stores OAuth material as plaintext in a private host-only directory; it is not keychain-backed.
 - Never paste credentials into an issue, transcript, diagnostic, or build receipt.
 
 Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).

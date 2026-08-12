@@ -20,6 +20,7 @@ import {
   MODEL_ID,
   OPT_IN_FLAG,
   POST_RESTART_OBSERVATION_INTERVAL_MS,
+  PRIME_AGENT_RELEASE_VERSION,
   PROOF_DIRECTORY,
   PROOF_NAME,
   PROVIDER_ID,
@@ -48,6 +49,7 @@ import {
   validateDisposableLayout,
   validateEndedControlProjection,
   validateEndedProjection,
+  validateInFlightProjection,
   validateInitialProjection,
   validateLoopbackEvidence,
   validateRestartNoReplay,
@@ -179,12 +181,19 @@ try {
   stderr.write(
     "\nThe isolated host, exact Sol model, native resident, verified browser readiness, and OAuth-backed catalog are proven.\n" +
     "Paste the task below into this resident's visible composer and choose Delegate task. Do not edit it.\n\n" +
-    `${prompt}\n\nWaiting for exact completion evidence…\n`,
+    `${prompt}\n\nWaiting for the required live root/child observation before completion…\n`,
   );
 
-  const completedSnapshot = await waitForCompletedProjection(endpoint, threadId, initial, identity);
+  runState.stage = "in_flight";
+  const inFlightSnapshot = await waitForInFlightProjection(endpoint, threadId, initial, identity);
+  const inFlight = validateInFlightProjection(inFlightSnapshot, { initial, identity });
+  stderr.write(
+    `Observed the live root turn and active ${CHILD_NAME} child (${inFlight.child.state}); waiting for exact completion evidence…\n`,
+  );
+
+  const completedSnapshot = await waitForCompletedProjection(endpoint, threadId, initial, identity, inFlight);
   runState.stage = "projection";
-  const projection = validateCompletedProjection(completedSnapshot, { initial, identity });
+  const projection = validateCompletedProjection(completedSnapshot, { initial, identity, inFlight });
 
   runState.stage = "browser";
   const loopbackEvidence = validateLoopbackEvidence(loopback.events, identity);
@@ -220,12 +229,13 @@ try {
   desktop = await startOwnedDesktop(candidate, userDataDirectory, layout.dataDirectory);
   runState.desktop = desktop;
   runState.desktopStopped = false;
-  const observations = await observeStableRestart(endpoint, threadId, initial, identity);
+  const observations = await observeStableRestart(endpoint, threadId, initial, identity, inFlight);
   runState.stage = "no_replay";
   const replayAfter = await inspectReplayState(layout.dataDirectory, userDataDirectory, threadId);
   const restartProof = validateRestartNoReplay({
     initial,
     identity,
+    inFlight,
     beforeRestart: completedSnapshot,
     observations,
     hostProcessBefore,
@@ -288,6 +298,11 @@ try {
     authority: projection.authority,
     proof: {
       runtimeModel: RUNTIME_MODEL_ID,
+      inFlightObserved: true,
+      inFlightProjectionSha256: inFlight.projectionSha256,
+      inFlightRootActivity: inFlight.rootActivity,
+      inFlightChildState: inFlight.child.state,
+      inFlightSequence: inFlight.sequence,
       childName: CHILD_NAME,
       childAgentId: projection.child.agentId,
       childReplied: projection.child.repliedSinceTask,
@@ -707,7 +722,7 @@ async function readPackagedCandidate() {
       attestation.assurance !== "development-integrity" ||
       attestation.runtime.platform !== process.platform ||
       attestation.runtime.arch !== process.arch ||
-      attestation.runtime.releaseVersion !== "0.7.1" ||
+      attestation.runtime.releaseVersion !== PRIME_AGENT_RELEASE_VERSION ||
       attestation.browserBridge?.protocol !== "prime-continuim.browser.v1" ||
       attestation.browserBridge?.engine !== "verified-electron-host" ||
       attestation.browserBridge?.smoke?.verified !== true ||
@@ -827,7 +842,36 @@ function minimalGitEnvironment(environment) {
   return result;
 }
 
-async function waitForCompletedProjection(endpoint, threadId, initial, identity) {
+async function waitForInFlightProjection(endpoint, threadId, initial, identity) {
+  const deadline = Date.now() + OPERATOR_DEADLINE_MS;
+  while (Date.now() < deadline) {
+    assertOwnedAlive(runState.hostd, "host", "HOST_UNAVAILABLE");
+    assertOwnedAlive(runState.desktop, "host", "HOST_UNAVAILABLE");
+    const snapshot = (await requestHost(
+      endpoint,
+      "thread.snapshot",
+      { threadId },
+      HOST_REQUEST_TIMEOUT_MS,
+    )).result;
+    if (snapshot?.childAgents?.some((child) => ["failed", "cancelled"].includes(child?.state))) {
+      fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+    }
+    try {
+      validateInFlightProjection(snapshot, { initial, identity });
+      return snapshot;
+    } catch (error) {
+      if (!(error instanceof ToolDogfoodContractError) || error.code !== "IN_FLIGHT_NOT_PROVEN") throw error;
+    }
+    if (
+      snapshot?.childAgents?.some((child) => child?.sessionName === CHILD_NAME && child?.state === "complete") ||
+      snapshot?.goals?.some((goal) => goal?.objective === identity.goalObjective && goal?.state === "complete")
+    ) fail("in_flight", "IN_FLIGHT_NOT_PROVEN");
+    await delay(100);
+  }
+  fail("operator", "OPERATOR_DEADLINE_EXCEEDED");
+}
+
+async function waitForCompletedProjection(endpoint, threadId, initial, identity, inFlight) {
   const deadline = Date.now() + OPERATOR_DEADLINE_MS;
   while (Date.now() < deadline) {
     assertOwnedAlive(runState.hostd, "host", "HOST_UNAVAILABLE");
@@ -843,7 +887,7 @@ async function waitForCompletedProjection(endpoint, threadId, initial, identity)
         fail("projection", "PROJECTION_NOT_PROVEN");
       }
       try {
-        validateCompletedProjection(snapshot, { initial, identity });
+        validateCompletedProjection(snapshot, { initial, identity, inFlight });
         return snapshot;
       } catch (error) {
         if (!(error instanceof ToolDogfoodContractError) || error.code !== "PROJECTION_NOT_PROVEN") throw error;
@@ -856,8 +900,8 @@ async function waitForCompletedProjection(endpoint, threadId, initial, identity)
   fail("operator", "OPERATOR_DEADLINE_EXCEEDED");
 }
 
-async function observeStableRestart(endpoint, threadId, initial, identity) {
-  const first = await waitForCompletedProjection(endpoint, threadId, initial, identity);
+async function observeStableRestart(endpoint, threadId, initial, identity, inFlight) {
+  const first = await waitForCompletedProjection(endpoint, threadId, initial, identity, inFlight);
   const observations = [{ snapshot: first, observedAtMonotonicMs: Math.floor(performance.now()) }];
   while (observations.length < MIN_POST_RESTART_OBSERVATIONS) {
     await delay(POST_RESTART_OBSERVATION_INTERVAL_MS + 25);
@@ -869,7 +913,7 @@ async function observeStableRestart(endpoint, threadId, initial, identity) {
       { threadId },
       HOST_REQUEST_TIMEOUT_MS,
     )).result;
-    validateCompletedProjection(snapshot, { initial, identity });
+    validateCompletedProjection(snapshot, { initial, identity, inFlight });
     observations.push({ snapshot, observedAtMonotonicMs: Math.floor(performance.now()) });
   }
   return Object.freeze(observations);

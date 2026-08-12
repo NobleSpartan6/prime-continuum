@@ -52,7 +52,7 @@ const targets = [
     name: 'desktop-rlm-activity',
     width: 1200,
     height: 800,
-    visualState: 'idle',
+    visualState: 'rlm-activity',
     expectedText: 'RLM delegation',
     openInspector: true,
     selectRuntimeTab: true,
@@ -147,7 +147,7 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'stop-awaiting-idle-proof',
-    expectedText: 'Stop accepted · waiting for authoritative idle proof',
+    expectedText: 'Waiting for authoritative idle proof',
     expectStatusVisible: true,
     expectCompactStatus: true,
   },
@@ -320,7 +320,13 @@ async function waitForSurface(browserWindow, target) {
     }
     await delay(25)
   }
-  throw new Error(`Timed out waiting for ${selector}`)
+  const diagnostics = await browserWindow.webContents.executeJavaScript(`(() => ({
+    readyState: document.readyState,
+    bodyText: document.body?.innerText?.slice(0, 500) ?? '',
+    bodyHtml: document.body?.innerHTML?.slice(0, 1_000) ?? '',
+    scripts: [...document.scripts].map((script) => script.src || 'inline').slice(0, 8),
+  }))()`)
+  throw new Error(`Timed out waiting for ${selector}: ${JSON.stringify(diagnostics)}`)
 }
 
 async function startRendererServer() {
@@ -885,7 +891,7 @@ async function capture(target, rendererOrigin) {
       const residentProvisionActionRect = residentProvisionAction?.getBoundingClientRect()
       const residentDialogError = residentDialog?.querySelector('#resident-provision-error')
       const residentDialogDescription = residentDialog?.querySelector('#resident-provision-description')
-      const residentPrivacy = residentDialog?.querySelector('.resident-provision__privacy')
+      const residentPrivacy = residentDialog?.querySelector('.resident-provision__workspace div > span')
       const residentSavedProjectLabel = residentDialog?.querySelector('.resident-provision__workspace small')
       const residentThreadTitleLabel = residentDialog?.querySelector('label[for="resident-thread-title"]')
       const backgroundCatalog = document.querySelector('.sidebar__scroll')
@@ -974,10 +980,10 @@ async function capture(target, rendererOrigin) {
         registeredResidentDialogExactCopy: Boolean(
           residentDialogDescription?.textContent?.trim() ===
             'Name the task. Prime Agent runs it here.' &&
-          residentSavedProjectLabel?.textContent?.trim() === 'Workspace' &&
+          residentSavedProjectLabel?.textContent?.trim() === 'Runs in' &&
           residentThreadTitleLabel?.textContent?.trim() === 'Task name' &&
           residentPrivacy?.textContent?.trim() ===
-            'Workspace access stays on the verified host.'
+            'Access stays on the verified host'
         ),
         registeredResidentForbiddenCopyPresent: /(?:\\bpath\\b|\\bfolder\\b|picker|handoff|mobile)/i.test(relevantRegisteredCopy),
         residentFixedProjectText: residentFixedProject?.textContent?.trim(),

@@ -79,10 +79,10 @@ The exact canonical `remote-host-payload-inputs/v1` document pins:
   `1`;
 - Linux, x64, glibc and the exact Electron RunAsNode tuple already required by
   the kit;
-- Prime Agent 0.7.1, runtime-policy schema 1, runtime build ID
-  `95afd31-dirty`, release commit
-  `95afd319a78ae017a41241d50b013d656a0685ce`, daemon protocol 7, schema
-  revision 13, schema ID `protocol-7-schema-13-816309b1cd50`, and the exact
+- Prime Agent 0.7.2, runtime-policy schema 1, runtime build ID
+  `83a0f9f-dirty`, release commit
+  `83a0f9f9566219551fcb6ffaf7f519a815749a58`, daemon protocol 7, schema
+  revision 16, schema ID `protocol-7-schema-16-1bcb9e7f1a49`, and the exact
   checked-in runtime policy, sources, and package-lock SHA-256 values;
 - one checked-in `electron-release-archive-provenance/v1` value for official
   Electron `v43.3.0` Linux x64; and

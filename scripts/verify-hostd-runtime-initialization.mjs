@@ -41,9 +41,9 @@ const WARMED_CAPABILITIES = Object.freeze([
   RUNTIME_OAUTH_CAPABILITY,
 ].sort());
 const EXPECTED_MODEL_CATALOG = Object.freeze({
-  releaseVersion: "0.7.1",
+  releaseVersion: "0.7.2",
   providers: 32,
-  models: 1_173,
+  models: 1_177,
   requiredModels: Object.freeze([
     "gpt-5.6-sol",
     "claude-opus-5",

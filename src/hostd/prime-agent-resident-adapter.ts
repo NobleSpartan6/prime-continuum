@@ -330,19 +330,19 @@ export interface PrimeDaemonAgentConnectionPublic {
   getInitialSnapshot(): Promise<unknown>;
   /** Read-only resource discovery for this exact attached resident session. */
   getResourceSnapshot(): Promise<unknown>;
-  /** v0.7.1 waits for the action pump, agent, and server-side event queue to become idle. */
+  /** v0.7.2 waits for the action pump, agent, and server-side event queue to become idle. */
   waitForIdle?(): Promise<void>;
   /** Pinned public AgentConnection methods; guarded at the mutation boundary. */
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
-  /** v0.7.1 resolves prompt when the worker accepts/owns it, not at turn completion. */
+  /** v0.7.2 resolves prompt when the worker accepts/owns it, not at turn completion. */
   prompt?(
     message: string,
     options?: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ): Promise<void>;
-  /** v0.7.1 resolves abort when requestAbort() is accepted, not when stopping completes. */
+  /** v0.7.2 resolves abort when requestAbort() is accepted, not when stopping completes. */
   abort?(): Promise<void>;
-  /** v0.7.1 promotes one client-owned worker to ordinary resident lifetime. */
+  /** v0.7.2 promotes one client-owned worker to ordinary resident lifetime. */
   promoteToResident(): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
@@ -359,6 +359,7 @@ export interface PrimeAgentPublicModule {
         sendClientEnv: false;
         supportsExtensionUi: false;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<PrimeDaemonAgentConnectionPublic>;
@@ -384,7 +385,7 @@ export interface PrimeAgentResidentAdapterOptions {
   readonly socketPath: string;
   /** Absolute, verified Node-compatible executable for the pinned runtime. */
   readonly executable: string;
-  /** Absolute, verified v0.7.1 dist/bundle/cli.js entrypoint. */
+  /** Absolute, verified v0.7.2 dist/bundle/cli.js entrypoint. */
   readonly cliEntrypoint: string;
   /** Absolute, writable host-owned directory used instead of ambient cwd. */
   readonly daemonWorkingDirectory: string;
@@ -1872,6 +1873,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       sendClientEnv: false,
       supportsExtensionUi: false,
       ownedSession,
+      telemetryDisabled: true,
       // Do not re-enter the adapter operation queue: recovery may be invoked
       // by static attach while create/attach itself owns that queue.
       recoverDaemon: async () => void (await this.ensureDaemonSingleFlight()),
@@ -2932,6 +2934,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     const observation = await readStableOrLatestActiveResidentProjection(
       this.options.attached,
       expectedBinding,
+      this.authoritativeProjectionValue,
     );
     if (!observation) {
       // A continuously advancing cursor is normal while a model streams. Do
@@ -4049,8 +4052,13 @@ async function readStableResidentProjection(
 async function readStableOrLatestActiveResidentProjection(
   connection: PrimeDaemonAgentConnectionPublic,
   binding: ResidentSessionBinding,
+  previousProjection?: ResidentProjectionSnapshot,
 ): Promise<Readonly<{ projection: ResidentProjectionSnapshot; stable: boolean }> | undefined> {
-  const observations = await readResidentProjectionSeriesWithStability(connection, binding);
+  const observations = await readResidentProjectionSeriesWithStability(
+    connection,
+    binding,
+    previousProjection,
+  );
   if (!observations) return undefined;
   if (observations.stable || residentProjectionProvesActiveOwnership(observations.projection)) {
     return observations;
@@ -4073,20 +4081,40 @@ async function readResidentProjectionSeries(
 async function readResidentProjectionSeriesWithStability(
   connection: PrimeDaemonAgentConnectionPublic,
   binding: ResidentSessionBinding,
+  previousProjection?: ResidentProjectionSnapshot,
 ): Promise<Readonly<{ projection: ResidentProjectionSnapshot; stable: boolean }> | undefined> {
   let previous: ResidentProjectionSnapshot | undefined;
+  let latestSnapshot: unknown;
+  let stable = false;
   for (let read = 0; read < MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS; read += 1) {
-    const [snapshot, resources] = await Promise.all([
-      connection.getInitialSnapshot(),
-      connection.getResourceSnapshot(),
-    ]);
-    const projection = normalizeProjection(snapshot, binding, resources);
+    latestSnapshot = await connection.getInitialSnapshot();
+    const projection = carryForwardResourceInventory(
+      normalizeProjection(latestSnapshot, binding),
+      previousProjection,
+    );
     if (previous && isDeepStrictEqual(previous, projection)) {
-      return Object.freeze({ projection, stable: true });
+      previous = projection;
+      stable = true;
+      break;
     }
     previous = projection;
   }
-  return previous ? Object.freeze({ projection: previous, stable: false }) : undefined;
+  if (!previous || latestSnapshot === undefined) return undefined;
+
+  // Skills, prompts, and extensions are attachment-scoped but can be costly to
+  // enumerate. A live active observation carries the already validated
+  // inventory so streaming and RLM child events are not held behind discovery.
+  // Stable (quiet) observations still refresh it once, preserving eventual
+  // resource accuracy without repeating the read for every cursor sample.
+  if (
+    previousProjection?.runtime.resourceInventory &&
+    residentProjectionProvesActiveOwnership(previous)
+  ) {
+    return Object.freeze({ projection: previous, stable });
+  }
+  const resources = await connection.getResourceSnapshot();
+  const projection = normalizeProjection(latestSnapshot, binding, resources);
+  return Object.freeze({ projection, stable });
 }
 
 function normalizeProjection(

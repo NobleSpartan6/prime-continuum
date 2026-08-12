@@ -44,25 +44,25 @@ describe("Prime Agent runtime build policy", () => {
     const inputs = await loadRuntimeInputs();
     expect(inputs.sources.release).toEqual({
       repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-      tag: "v0.7.1",
-      version: "0.7.1",
-      commit: "95afd319a78ae017a41241d50b013d656a0685ce",
+      tag: "v0.7.2",
+      version: "0.7.2",
+      commit: "83a0f9f9566219551fcb6ffaf7f519a815749a58",
     });
     expect(inputs.policy).toMatchObject({
-      releaseVersion: "0.7.1",
-      runtimeBuildId: "95afd31-dirty",
+      releaseVersion: "0.7.2",
+      runtimeBuildId: "83a0f9f-dirty",
       criticalPackages: {
         "prime-agent": {
-          version: "0.7.1",
-          integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+          version: "0.7.2",
+          integrity: "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg==",
         },
       },
     });
     expect(inputs.packageJson).toMatchObject({
-      version: "0.7.1",
+      version: "0.7.2",
       dependencies: {
         "prime-agent":
-          "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+          "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
       },
     });
     expect(inputs.sources).not.toHaveProperty("codexAppServer");
@@ -70,16 +70,16 @@ describe("Prime Agent runtime build policy", () => {
     expect(inputs.sources.assets).toHaveLength(4);
     expect(inputs.sources.assets[0]).toEqual({
       packageName: "prime-agent",
-      fileName: "prime-agent-0.7.1.tgz",
-      url: "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
-      size: 9_323_519,
-      sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
-      integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+      fileName: "prime-agent-0.7.2.tgz",
+      url: "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
+      size: 9_387_295,
+      sha256: "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
+      integrity: "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg==",
     });
     expect(inputs.sources.assets.every((asset: { url: string }) => !asset.url.includes("openai/codex"))).toBe(true);
     expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
-    expect(Object.keys(inputs.lockfile.packages)).toHaveLength(203);
+    expect(Object.keys(inputs.lockfile.packages)).toHaveLength(202);
     const zeromq = inputs.lockfile.packages["node_modules/zeromq"];
     expect(zeromq).toMatchObject({ version: "6.5.0" });
     if (!zeromq) throw new Error("The pinned zeromq package is missing from the runtime lock.");
@@ -294,6 +294,53 @@ describe("Prime Agent runtime tree attestation", () => {
     );
   });
 
+  it("gives the verified browser smoke a bounded action timeout for slower Linux hosts", async () => {
+    const root = await makeRuntimeFixture("runtime-browser-smoke-timeout");
+    const runtimeExecutable = await realpath(process.execPath);
+    const calls: Array<{ args: string[]; options: SmokeRunnerOptions }> = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options: SmokeRunnerOptions,
+    ): Promise<{ stdout: string; stderr: string }> => {
+      expect(command).toBe(runtimeExecutable);
+      expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("15000");
+      calls.push({ args, options });
+      const operation = args[1] === "doctor" ? "doctor" : args[2];
+      if (operation === "doctor") {
+        return {
+          stdout: JSON.stringify({
+            bridgeVersion: 1,
+            controller: "playwright-core/1.63.0-alpha-2026-08-05",
+            engine: "verified-electron-host",
+            protocol: "prime-continuim.browser.v1",
+            ready: true,
+          }),
+          stderr: "",
+        };
+      }
+      if (operation === "snapshot") return { stdout: '- button "Before" [ref=e1]\n', stderr: "" };
+      if (operation === "find") return { stdout: 'button "Before"\n', stderr: "" };
+      if (operation === "eval") return { stdout: '"After"\n', stderr: "" };
+      if (operation === "screenshot") {
+        const filename = args.find((argument) => argument.startsWith("--filename="))?.slice("--filename=".length);
+        if (!filename) throw new Error("browser smoke screenshot filename missing");
+        await writeFile(filename, Buffer.from("89504e470d0a1a0a", "hex"));
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await expect(runtimeLib.smokeBrowserBridge(root, {
+      runtimeExecutable,
+      policy: fixtureInputs().policy,
+      commandRunner,
+    })).resolves.toMatchObject({
+      verified: true,
+      operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
+    });
+    expect(calls).toHaveLength(8);
+  });
+
   it("rejects unattested empty directories and converges without changing attested bytes", async () => {
     const root = await makeRuntimeFixture("runtime-empty-namespace");
     const inputs = fixtureInputs();
@@ -339,6 +386,16 @@ describe("Prime Agent runtime tree attestation", () => {
       [
         "export class DaemonSupervisor {",
         "  workers = new Map();",
+        "  isWorkerStopping(worker) { return worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined; }",
+        "  effectiveWorkerState(worker) { if (this.isWorkerStopping(worker)) return \"stopping\"; if (worker.descriptor.lifecycle === \"ready\" && worker.client === undefined) return \"recovering\"; return worker.descriptor.lifecycle; }",
+        "  async reclaimStaleWorkerRegistration(worker) {",
+        "    if (worker.client !== undefined || worker.recovery !== undefined || worker.descriptor.stopRequestedAt === undefined) return false;",
+        "    if (!['gone', 'replaced'].includes(this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId))) return false;",
+        "    this.scheduleWorkerStopFinalization(worker);",
+        "    if (worker.stopFinalization) await worker.stopFinalization;",
+        "    if (this.workers.get(worker.descriptor.workerId) === worker) throw new Error('still cleaning');",
+        "    return true;",
+        "  }",
         "  async handleCommand(client, command) {",
         "    const worker = [...this.workers.values()].find((candidate) => candidate.descriptor.rootActiveSessionId === command.activeSessionId);",
         "    this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);",
@@ -402,7 +459,7 @@ describe("Prime Agent runtime tree attestation", () => {
         expect(args[1]).toBe(entrypoints.moduleUrl);
         expect(helperSource).toContain("await import(moduleUrl)");
         expect(helperSource).toContain('"@mistralai/mistralai"');
-        expect(helperSource).toContain('"openai-codex-responses-AMLRMEWM.js"');
+        expect(helperSource).toContain('"openai-codex-responses-MURTF24R.js"');
         return {
           stdout: JSON.stringify({
             node: "22.22.3",
@@ -410,6 +467,7 @@ describe("Prime Agent runtime tree attestation", () => {
             napi: "10",
             platform: process.platform,
             arch: process.arch,
+            bundleImportGraphComplete: true,
           }),
           stderr: "",
         };
@@ -418,6 +476,8 @@ describe("Prime Agent runtime tree attestation", () => {
         expect(args[1]).toBe(pathToFileURL(await realpath(daemonSupervisorPath)).href);
         expect(helperSource).toContain('type: "retry_worker"');
         expect(helperSource).toContain('stopRequestedAt: candidate.descriptor.stopRequestedAt');
+        expect(helperSource).toContain('effectiveWorkerState(disconnectedWorker)');
+        expect(helperSource).toContain('reclaimStaleWorkerRegistration(staleWorker)');
         const result = await execFileAsync(command, args, {
           cwd: options.cwd,
           env: options.env,
@@ -466,7 +526,14 @@ describe("Prime Agent runtime tree attestation", () => {
       ): Promise<{ stdout: string; stderr: string }> => {
         const result = await commandRunner(command, args, options);
         if (basename(args[0] ?? "") !== "runtime-retry-worker-probe.mjs") return result;
-        return { ...result, stdout: JSON.stringify({ retryWorkerOrdering: false }) };
+        return {
+          ...result,
+          stdout: JSON.stringify({
+            retryWorkerOrdering: false,
+            disconnectedWorkerState: true,
+            staleWorkerReclaimed: true,
+          }),
+        };
       };
       await expect(
         smokeRuntime(root, {
@@ -475,7 +542,7 @@ describe("Prime Agent runtime tree attestation", () => {
           policy: inputs.policy,
           commandRunner: invalidRetryRunner,
         }),
-      ).rejects.toThrow("did not prove tombstone clearing before recovery");
+      ).rejects.toThrow("did not prove current self-healing semantics");
 
       const invalidHelloRunner = async (
         command: string,

@@ -97,7 +97,7 @@ export function createMacosPackagingBuilderPlan({ arch = process.arch } = {}) {
   ])
 }
 
-export function createMacosPackagingEnvironment(source = process.env) {
+export function createMacosPackagingEnvironment(source = process.env, nodeExecutable = process.execPath) {
   const pnpmCli = source.npm_execpath
   invariant(
     typeof pnpmCli === 'string' && isAbsolute(pnpmCli) && basename(pnpmCli).toLowerCase().includes('pnpm') && !/[\0\r\n]/.test(pnpmCli),
@@ -115,7 +115,7 @@ export function createMacosPackagingEnvironment(source = process.env) {
   }
   return {
     ...result,
-    PATH: createMacosReviewedPath(),
+    PATH: createMacosReviewedPath(nodeExecutable),
     PRIME_CONTINUIM_INTERNAL_PNPM_CLI: pnpmCli,
     ...REVIEWED_AD_HOC_ENVIRONMENT,
   }

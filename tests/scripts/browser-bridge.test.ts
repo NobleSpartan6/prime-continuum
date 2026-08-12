@@ -6,7 +6,10 @@ import {
   rewriteBrowserCommand,
   rewriteBrowserSessionName,
 } from "../../runtime/prime-agent/bridge/browser-bridge-arguments.mjs";
-import { createBrowserHostEnvironment } from "../../runtime/prime-agent/bridge/browser-bridge-environment.mjs";
+import {
+  browserProcessStatus,
+  createBrowserHostEnvironment,
+} from "../../runtime/prime-agent/bridge/browser-bridge-environment.mjs";
 import { withBrowserSessionLock } from "../../runtime/prime-agent/bridge/browser-bridge-session-lock.mjs";
 import { retireBrowserEvidence } from "../../runtime/prime-agent/bridge/browser-bridge-evidence.mjs";
 import { browserSessionStateKeys, residentBrowserAuthority } from "../../runtime/prime-agent/bridge/browser-bridge-state.mjs";
@@ -113,6 +116,41 @@ describe("verified browser host environment", () => {
 
   it("drops values containing control characters", () => {
     expect(createBrowserHostEnvironment({ PATH: "/usr/bin\nOPENAI_API_KEY=secret" })).toEqual({});
+  });
+});
+
+describe("verified browser process evidence", () => {
+  it("treats a Linux zombie as retired even while kill(0) still observes its PID", () => {
+    expect(browserProcessStatus(4242, {
+      platform: "linux",
+      signal: () => undefined,
+      readProcStat: () => "4242 (electron) Z 1 4242 4242 0 -1 0",
+    })).toBe("dead");
+  });
+
+  it("keeps live and unreadable Linux process identities fail-closed", () => {
+    expect(browserProcessStatus(4242, {
+      platform: "linux",
+      signal: () => undefined,
+      readProcStat: () => "4242 (electron renderer) S 1 4242 4242 0 -1 0",
+    })).toBe("live");
+    expect(browserProcessStatus(4242, {
+      platform: "linux",
+      signal: () => undefined,
+      readProcStat: () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); },
+    })).toBe("unknown");
+  });
+
+  it("preserves the portable kill probe outside Linux", () => {
+    expect(browserProcessStatus(4242, {
+      platform: "darwin",
+      signal: () => undefined,
+      readProcStat: () => { throw new Error("must not read procfs"); },
+    })).toBe("live");
+    expect(browserProcessStatus(4242, {
+      platform: "win32",
+      signal: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+    })).toBe("dead");
   });
 });
 

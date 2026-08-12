@@ -104,7 +104,7 @@ export interface ResidentTerminalAssistantMarker {
 }
 
 /**
- * Private host-owned projection of a pinned Prime Agent v0.7.1 snapshot.
+ * Private host-owned projection of a pinned Prime Agent v0.7.2 snapshot.
  * It is deliberately not a public IPC DTO: session paths remain host-private.
  */
 export interface ResidentProjectionSnapshot {

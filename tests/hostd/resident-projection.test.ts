@@ -326,7 +326,7 @@ describe("resident authoritative snapshot normalization", () => {
     });
   });
 
-  it("produces a frozen, bounded host-owned projection from a representative v0.7.1 snapshot", () => {
+  it("produces a frozen, bounded host-owned projection from a representative v0.7.2 snapshot", () => {
     const projection = normalizeResidentProjectionSnapshot(validSnapshot(), validBinding());
 
     expect(projection).toMatchObject({
@@ -342,7 +342,7 @@ describe("resident authoritative snapshot normalization", () => {
       runtime: {
         runtime: "prime_agent",
         residency: "resident",
-        appVersion: "0.7.1",
+        appVersion: "0.7.2",
         activeSessionId: "active-session-1",
         sessionId: "session-1",
         sessionName: "Continuim build",

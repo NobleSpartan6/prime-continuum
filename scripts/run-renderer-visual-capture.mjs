@@ -15,7 +15,7 @@ const expectedTargets = [
   ['mobile-agent-launchpad-390', 390, 844, 'launchpad', undefined],
   ['desktop-idle', 1600, 1000, 'idle', undefined],
   ['desktop-investigation', 1600, 1000, 'idle', undefined],
-  ['desktop-rlm-activity', 1200, 800, 'idle', undefined],
+  ['desktop-rlm-activity', 1200, 800, 'rlm-activity', undefined],
   ['mobile-idle-390', 390, 844, 'idle', undefined],
   ['compact-idle-320', 320, 704, 'idle', undefined],
   ['mobile-inspector-390', 390, 844, 'idle', undefined],

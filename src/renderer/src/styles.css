@@ -2280,7 +2280,7 @@ code,
   display: none;
 }
 
-.composer--compact.composer--end-ready .composer__connection {
+.composer--compact.composer--ending .composer__connection:not(.composer__connection--validation) {
   display: none;
 }
 
@@ -7097,6 +7097,10 @@ body[data-surface="hud"] {
     padding-inline: 0;
   }
 
+  .composer--compact.composer--ending .composer__connection:not(.composer__connection--validation) {
+    display: none;
+  }
+
   .composer--compact .composer__connection > span {
     display: -webkit-box;
     overflow: hidden;
@@ -7436,6 +7440,10 @@ body[data-surface="hud"] {
 
   .composer--compact .composer__connection {
     display: inline-flex;
+  }
+
+  .composer--compact.composer--ending .composer__connection:not(.composer__connection--validation) {
+    display: none;
   }
 
   .composer__connection--validation {

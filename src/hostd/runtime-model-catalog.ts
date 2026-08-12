@@ -151,7 +151,7 @@ export class RuntimeModelCatalogContractError extends Error {
 /**
  * Reads model compatibility from an identity-checked Prime Agent tree without
  * ever importing third-party runtime code into long-lived hostd. Prime Agent
- * v0.7.1 registers process signal handlers during module evaluation, so the
+ * v0.7.2 registers process signal handlers during module evaluation, so the
  * exact verified Electron RunAsNode executable performs discovery in a
  * short-lived child and returns one bounded, secret-free JSON projection.
  */

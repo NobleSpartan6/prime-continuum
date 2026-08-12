@@ -21,16 +21,16 @@ Prime Agent's local daemon protocol is not a hosted or mobile gateway. Remote co
 
 ## Upstream runtime pin
 
-The current supported integration target is the official Prime Agent v0.7.1 release asset:
+The current supported integration target is the official Prime Agent v0.7.2 release asset:
 
-- release target: `95afd319a78ae017a41241d50b013d656a0685ce`
-- asset: `prime-agent-0.7.1.tgz`
-- SHA-256: `d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb`
-- app version: `0.7.1`
-- runtime build ID: `95afd31-dirty`
+- release target: `83a0f9f9566219551fcb6ffaf7f519a815749a58`
+- asset: `prime-agent-0.7.2.tgz`
+- SHA-256: `bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e`
+- app version: `0.7.2`
+- runtime build ID: `83a0f9f-dirty`
 - daemon protocol: `prime-agent.daemon` version `7`
-- schema revision: `13`
-- schema ID: `protocol-7-schema-13-816309b1cd50`
+- schema revision: `16`
+- schema ID: `protocol-7-schema-16-1bcb9e7f1a49`
 
 The npm registry does not contain this version. Install and upgrade work must consume the official release asset, verify the published checksum before extraction, and never depend on a mutable source checkout. The runtime package remains host-only and must not enter renderer bundles.
 
@@ -60,4 +60,4 @@ Screen readers receive summarized lifecycle/attention announcements, never token
 
 Keeping the stack does not make the current build production-ready. The local development checkpoint now uses the pinned public resident surface for crash-safe client-owned creation/promotion, exact projection-gated activation, detach/relaunch, hostd restart, and operation-specific Prompt/Stop idle proof. Lost external mutation outcomes quarantine instead of replaying. The legacy RPC path remains a foreground diagnostic path because it owns the session it creates.
 
-Production still requires a packaged desktop-to-coordinator escrow E2E, an authorized provider-backed Prompt/Stop/end/restart E2E, recovery through verified session rotation for genuinely uncertain or quarantined mutations, an explicit end-session UI/coordinator whose runtime call consumes Store authority, ledger compaction, and signed release integrity. Until those pass, the UI must not promise production background continuity, phone control, pairing, relay, handoff, or production-authorized local Windows execution.
+Production still requires a packaged desktop-to-coordinator escrow E2E, an authorized provider-backed Prompt/Stop/End/restart E2E, recovery through verified session rotation for genuinely uncertain or quarantined mutations, ledger compaction, and signed release integrity. The explicit End UI/coordinator and its one-use Store authority are implemented and source-tested; an actually run installed-provider journey remains the release evidence gap. Until those gates pass, the UI must not promise production background continuity, phone control, pairing, relay, handoff, or production-authorized local Windows execution.

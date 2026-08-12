@@ -14,7 +14,7 @@ export const CHECKPOINT_ASSERTION = "DISPOSABLE_WINDOWS_CHECKPOINT_READY";
 export const CONFIRMATION_PHRASE = "I AUTHORIZE LIVE PRIME AGENT OAUTH AND PROVIDER USE, TOOL AUTHORITY, PLAINTEXT AUTH CLEANUP, FIXTURE RETENTION ON UNCERTAINTY, AND DISPOSABLE VM DESTRUCTION";
 export const MAX_CDP_MESSAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_RECEIPT_BYTES = 12 * 1024;
-// The retained verified v0.7.1 runtime root has 20,771 files and 1,699
+// The retained verified v0.7.2 runtime root has 20,771 files and 1,699
 // directories; the isolated root also contains bounded host/desktop journals.
 export const MAX_ISOLATED_TEMP_TREE_ENTRIES = 50_000;
 export const POST_RESTART_OBSERVATION_INTERVAL_MS = 4_000;
