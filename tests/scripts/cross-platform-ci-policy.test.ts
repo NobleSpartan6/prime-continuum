@@ -24,7 +24,7 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).toContain('node-version-file: .node-version')
     expect(workflow).toContain('version: 11.9.0')
     expect(workflow).toContain('pnpm install --frozen-lockfile --ignore-scripts')
-    expect(workflow).toContain("if: runner.os == 'Linux'\n        run: |\n          sudo chown root:root node_modules/electron/dist/chrome-sandbox\n          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox")
+    expect(workflow).toContain("if: runner.os == 'Linux'\n        run: |\n          node scripts/ensure-electron-runtime.mjs\n          sudo chown root:root node_modules/electron/dist/chrome-sandbox\n          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox")
     expect(workflow).toContain('run: pnpm typecheck')
     expect(workflow).toContain('run: pnpm test')
     expect(workflow).toContain('run: pnpm build')

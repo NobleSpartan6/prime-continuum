@@ -57,6 +57,7 @@ jobs:
       - name: Prepare the verified Electron sandbox on Linux
         if: runner.os == 'Linux'
         run: |
+          node scripts/ensure-electron-runtime.mjs
           sudo chown root:root node_modules/electron/dist/chrome-sandbox
           sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
 
