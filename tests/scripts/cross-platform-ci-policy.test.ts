@@ -24,6 +24,7 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).toContain('node-version-file: .node-version')
     expect(workflow).toContain('version: 11.9.0')
     expect(workflow).toContain('pnpm install --frozen-lockfile --ignore-scripts')
+    expect(workflow).toContain("if: runner.os == 'Linux'\n        run: |\n          sudo chown root:root node_modules/electron/dist/chrome-sandbox\n          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox")
     expect(workflow).toContain('run: pnpm typecheck')
     expect(workflow).toContain('run: pnpm test')
     expect(workflow).toContain('run: pnpm build')
@@ -87,6 +88,7 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).not.toContain('pull_request_target')
     expect(workflow).not.toMatch(/\b(?:write-all|id-token|packages|actions):\s+write\b/)
     expect(workflow).not.toMatch(/\bsecrets\s*\./)
+    expect(workflow).not.toContain('--no-sandbox')
 
     const actionReferences = [...workflow.matchAll(/^\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)]
     expect(actionReferences.map((match) => [match[1], match[2]])).toEqual([
