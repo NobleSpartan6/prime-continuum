@@ -305,6 +305,7 @@ describe("Prime Agent runtime tree attestation", () => {
     ): Promise<{ stdout: string; stderr: string }> => {
       expect(command).toBe(runtimeExecutable);
       expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("15000");
+      expect(options.env?.PW_TEST_SCREENSHOT_NO_FONTS_READY).toBe("1");
       calls.push({ args, options });
       const operation = args[1] === "doctor" ? "doctor" : args[2];
       if (operation === "doctor") {
@@ -339,6 +340,13 @@ describe("Prime Agent runtime tree attestation", () => {
       operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
     });
     expect(calls).toHaveLength(8);
+  });
+
+  it("retains bounded stdout and stderr when a runtime command fails", async () => {
+    await expect(runtimeLib.runCommand(process.execPath, [
+      "--eval",
+      "process.stderr.write('visible stderr'); process.stdout.write('visible stdout'); process.exit(7)",
+    ], { timeoutMs: 5_000 })).rejects.toThrow(/visible stderr[\s\S]*visible stdout/);
   });
 
   it("rejects unattested empty directories and converges without changing attested bytes", async () => {

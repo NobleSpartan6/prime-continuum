@@ -981,6 +981,9 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
   const environment = {
     ...cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
     PLAYWRIGHT_MCP_TIMEOUT_ACTION: String(BROWSER_SMOKE_ACTION_TIMEOUT_MS),
+    // This fixture uses only native controls and verifies PNG bytes, not font rendering.
+    // Font readiness can remain pending on minimal Linux runners with no installed fonts.
+    PW_TEST_SCREENSHOT_NO_FONTS_READY: "1",
     PRIME_CONTINUIM_BROWSER_EXECUTABLE: runtimeExecutable,
     PRIME_CONTINUIM_BROWSER_BRIDGE: entrypoints.browserBridge,
     PRIME_CONTINUIM_BROWSER_STATE_DIR: stateDirectory,
@@ -1407,7 +1410,8 @@ export async function runCommand(command, args, options = {}) {
       if (timedOut) return rejectRun(buildError(`${basename(command)} timed out.`));
       if (outputBytes > MAX_COMMAND_OUTPUT_BYTES) return rejectRun(buildError(`${basename(command)} output exceeded its limit.`));
       if (code !== 0) {
-        return rejectRun(buildError(`${basename(command)} failed (${code ?? signal ?? "unknown"}): ${stderr.trim().slice(-4_096)}`));
+        const diagnostic = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n").slice(-4_096);
+        return rejectRun(buildError(`${basename(command)} failed (${code ?? signal ?? "unknown"}): ${diagnostic}`));
       }
       resolveRun({ stdout, stderr });
     });
