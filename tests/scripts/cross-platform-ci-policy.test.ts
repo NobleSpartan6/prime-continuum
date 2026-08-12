@@ -27,6 +27,8 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).toContain('run: pnpm typecheck')
     expect(workflow).toContain('run: pnpm test')
     expect(workflow).toContain('run: pnpm build')
+    expect(workflow).toContain("if: runner.os == 'Linux'\n        run: xvfb-run --auto-servernum pnpm build")
+    expect(workflow).toContain("if: runner.os != 'Linux'\n        run: pnpm build")
     expect(workflow).toContain('Typecheck Node, renderer, and relay boundaries')
     expect(workflow).toContain('Run the complete root and relay source test suite')
     expect(workflow).toContain('Build the desktop, host-service, and relay source')

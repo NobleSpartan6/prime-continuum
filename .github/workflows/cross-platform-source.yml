@@ -60,5 +60,10 @@ jobs:
       - name: Run the complete root and relay source test suite
         run: pnpm test
 
+      - name: Build the desktop, host-service, and relay source on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum pnpm build
+
       - name: Build the desktop, host-service, and relay source
+        if: runner.os != 'Linux'
         run: pnpm build
