@@ -85,6 +85,15 @@ describe("verified browser host environment", () => {
     expect(doctorHostSource).not.toContain("requestSingleInstanceLock");
   });
 
+  it("keeps the hidden verified browser host paintable for CDP screenshots", async () => {
+    const hostSource = await readFile(
+      join(process.cwd(), "runtime", "prime-agent", "bridge", "browser-host.cjs"),
+      "utf8",
+    );
+    expect(hostSource).toContain("show: false");
+    expect(hostSource).toContain("backgroundThrottling: false");
+  });
+
   it("maps the build-smoke font marker only inside the verified CLI daemon", async () => {
     const shimSource = await readFile(
       join(process.cwd(), "runtime", "prime-agent", "bridge", "electron-node-shim.cjs"),

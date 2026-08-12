@@ -159,6 +159,8 @@ describe('renderer style contracts', () => {
     )
 
     expect(css).not.toMatch(/\.thread-row--selected::before/)
+    expect(css).not.toMatch(/\.model-row(?:--current|--selected)?\s*{[^}]*border-inline-start/s)
+    expect(css).toMatch(/\.model-row--selected\s*{[^}]*background:\s*var\(--color-success-soft\);/s)
     expect(phoneDrawer).toMatch(/\.sidebar,\s*\.inspector\s*{[^}]*inline-size:\s*100%;/s)
   })
 

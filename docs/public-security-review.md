@@ -15,15 +15,14 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 
 ## Findings
 
-### PUB-SEC-001 — Private vulnerability reporting must be enabled
+### PUB-SEC-001 — Private vulnerability reporting enabled
 
 - **Severity:** Medium
 - **Location:** `SECURITY.md:7-11` and repository settings
-- **Evidence:** GitHub reported private vulnerability reporting as disabled on 2026-08-12. The source now directs sensitive reports to that channel when available.
-- **Impact:** If the GitHub feature is disabled, a reporter has no direct repository-owned private intake channel and may disclose sensitive details publicly.
-- **Fix:** Enable **Security → Private vulnerability reporting** before announcing the repository.
-- **Mitigation:** `SECURITY.md` tells reporters to publish only a minimal request for a private channel when the feature is unavailable.
-- **False-positive notes:** None. Close this item after the repository API reports private vulnerability reporting enabled.
+- **Status:** Closed.
+- **Evidence:** GitHub reports private vulnerability reporting enabled as of 2026-08-12. Dependabot security updates, secret scanning, and push protection are also enabled.
+- **Impact:** Sensitive reports have a repository-owned private intake path.
+- **Residual:** `SECURITY.md` retains a safe fallback for GitHub outages or feature changes.
 
 ### PUB-SEC-002 — Release signing is not configured
 
@@ -43,15 +42,15 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 - Common local environment, private-key, certificate, OAuth, Playwright, and generated design-concept files are ignored by `.gitignore:15-31`.
 - The GitHub workflow uses frozen dependencies, pinned action commits, read-only contents permission, typechecking, tests, and a source build on Linux, Windows, and macOS.
 - Copied development skills now have an attribution index and the Apache 2.0 text required by the Playwright CLI skill.
-- GitHub reports the repository as public, with secret scanning and push protection enabled. The latest source-gate run for committed `HEAD` succeeded; the current dirty candidate still requires a new CI run.
+- GitHub reports the repository as public, with private vulnerability reporting, Dependabot security updates, secret scanning, and push protection enabled.
+- The repository has a public description and focused `ai-agents`, `coding-agent`, `electron`, `local-first`, and `rlm` topics.
 
 ## Publication checks still requiring an owner
 
-1. Enable GitHub private vulnerability reporting and Dependabot security updates. Secret scanning and push protection are already enabled.
-2. Configure branch protection or a repository ruleset for the source gates; GitHub currently reports none.
-3. Add a concise GitHub description, topics, and social preview; the repository currently has no description, homepage, or topics.
-4. Run an organization-approved secret and license scan over full Git history and the final release artifacts.
-5. Do not publish binary releases until the signing findings above are closed.
+1. Configure branch protection or a repository ruleset for the source gates; GitHub currently reports none.
+2. Add a current, real-product social preview after the authenticated packaged journey is proven. Do not use simulation fixtures as launch evidence.
+3. Run an organization-approved secret and license scan over full Git history and the final release artifacts.
+4. Do not publish binary releases until the signing findings above are closed.
 
 ## Verification performed
 
@@ -64,4 +63,4 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 
 ## Verdict
 
-**Needs changes for a binary release.** Source publication is acceptable after review and commit of this public-repository slice. Private vulnerability reporting, repository rules, public metadata, full-history scanning, and signed distribution remain owner-controlled launch work.
+**Needs changes for a binary release.** Source publication is active. Repository rules, a real-product social preview, full-history scanning, and signed distribution remain owner-controlled launch work.

@@ -109,6 +109,7 @@ export default function ModelsDialog({
   const [loadAttempt, setLoadAttempt] = useState(0)
   const providerNavRef = useRef<HTMLDivElement>(null)
   const contentRootRef = useRef<HTMLDivElement>(null)
+  const completedSelectionActionRef = useRef<HTMLButtonElement>(null)
   const selectionRequestRef = useRef(0)
   const oauthRequestRef = useRef(0)
   const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
@@ -251,11 +252,21 @@ export default function ModelsDialog({
   const selectionMatchesCurrentModel = Boolean(
     selection && modelMatchesCurrent(selection.providerId, selection.modelId, selection.modelName, currentModel),
   )
+  const selectionCompletedOnHost = Boolean(
+    selection?.state === 'completed' && !selectionMatchesCurrentModel,
+  )
   const selectionLocksActions = Boolean(
     selection?.state === 'selecting'
       || selection?.state === 'uncertain'
       || (selection?.state === 'completed' && !selectionMatchesCurrentModel),
   )
+
+  useLayoutEffect(() => {
+    if (!selectionCompletedOnHost) return
+    const activeElement = document.activeElement
+    if (activeElement && activeElement !== document.body && activeElement.isConnected) return
+    completedSelectionActionRef.current?.focus()
+  }, [selectionCompletedOnHost])
   const selectionStatusMessage = !selection
     ? ''
     : selection.state === 'selecting'
@@ -263,9 +274,7 @@ export default function ModelsDialog({
       : selection.state === 'completed'
         ? selectionMatchesCurrentModel
           ? `${selection.message} ${selection.modelName} is now shown as current for this thread.`
-          : selection.projected
-            ? `${selection.message} Refreshing this dialog's current-model label. Continuim will not resend the selection.`
-            : `${selection.message} Selected on host · refreshing current model. Continuim will not resend the selection.`
+          : `${selection.modelName} is selected on Prime Agent. The next thread refresh will update the current-model label; Continuim will not resend the selection.`
         : ''
   const selectionErrorMessage = !selection
     ? ''
@@ -723,18 +732,19 @@ export default function ModelsDialog({
                   const current = modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
                   const selectionTargeted = selection?.providerId === model.providerId && selection.modelId === model.modelId
                   const selectingTarget = selectionTargeted && selection?.state === 'selecting'
-                  const refreshingTarget = selectionTargeted && selection?.state === 'completed' && !selectionMatchesCurrentModel
+                  const completedTarget = selectionTargeted && selectionCompletedOnHost
                   const rejectedWithoutRetry = selectionTargeted && selection?.state === 'rejected' && !selection.retryable
                   const rlmRecommended = model.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && model.modelId === 'gpt-5.6-sol'
-                  const selectionButtonLabel = selectingTarget ? 'Selecting…' : refreshingTarget ? 'Refreshing…' : 'Use model'
-                  const showSelectionAction = model.available && !current && canSelectResidentModel
+                  const selectionButtonLabel = selectingTarget ? 'Selecting…' : 'Use model'
+                  const showSelectionAction = model.available && !current && canSelectResidentModel && !completedTarget
                   const showAvailabilityStatus = !model.available || (!canSelectResidentModel && !current)
                   return (
-                    <article className={cx('model-row', current && 'model-row--current')} key={`${model.providerId}:${model.modelId}`}>
+                    <article className={cx('model-row', current && 'model-row--current', completedTarget && 'model-row--selected')} key={`${model.providerId}:${model.modelId}`}>
                       <div className="model-row__body">
                         <div className="model-row__title">
                           <strong>{model.name}</strong>
                           {current && <span className="model-badge model-badge--current">Current</span>}
+                          {completedTarget && <span className="model-badge model-badge--selected">Selected on host</span>}
                           {rlmRecommended && <span className="model-badge model-badge--recommended">RLM recommended</span>}
                           {model.usingOAuth && <span className="model-badge">OAuth</span>}
                         </div>
@@ -754,7 +764,7 @@ export default function ModelsDialog({
                             disabled={selectionLocksActions || rejectedWithoutRetry}
                             onClick={() => void selectModel(model)}
                           >
-                            {(selectingTarget || refreshingTarget) && <Icon icon={Loader2} size={14} />}
+                            {selectingTarget && <Icon icon={Loader2} size={14} />}
                             {selectionButtonLabel}
                           </button>
                         )}
@@ -780,14 +790,14 @@ export default function ModelsDialog({
                   </button>
                 </div>
               )}
-              <div className="model-selection-feedback">
+              <div className={cx('model-selection-feedback', selectionCompletedOnHost && 'model-selection-feedback--complete')}>
                 <p
                   className={cx('model-selection-feedback__message', !selectionStatusMessage && 'sr-only')}
                   role="status"
                   aria-live="polite"
                   aria-atomic="true"
                 >
-                  {selectionStatusMessage && <Icon icon={selectionMatchesCurrentModel ? CheckCircle2 : Loader2} size={14} />}
+                  {selectionStatusMessage && <Icon icon={selection?.state === 'completed' ? CheckCircle2 : Loader2} size={14} />}
                   {selectionStatusMessage}
                 </p>
                 <p
@@ -797,6 +807,11 @@ export default function ModelsDialog({
                   {selectionErrorMessage && <Icon icon={AlertCircle} size={14} />}
                   {selectionErrorMessage}
                 </p>
+                {selectionCompletedOnHost && (
+                  <button ref={completedSelectionActionRef} className="button button--secondary" type="button" onClick={closeDialog}>
+                    Done
+                  </button>
+                )}
               </div>
               <footer className="model-catalog__footer">
                 <Icon icon={Info} size={14} />

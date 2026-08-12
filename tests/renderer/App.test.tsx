@@ -4550,7 +4550,7 @@ describe('Prime Continuim renderer', () => {
     expect(dialog.querySelector('.runtime-oauth-feedback__message--error')).toHaveTextContent('')
   })
 
-  it('selects only available non-current models and waits for the authoritative current-model projection', async () => {
+  it('turns completed host model proof into one clear Done action while awaiting the current-model projection', async () => {
     const user = userEvent.setup()
     const harness = createModelSelectionHarness()
     const completion = deferred<{
@@ -4603,18 +4603,46 @@ describe('Prime Continuim renderer', () => {
       await completion.promise
     })
     expect(within(feedback as HTMLElement).getByRole('status')).toHaveTextContent(
-      /Selected on host · refreshing current model.*will not resend/i,
+      /GPT-5\.6 Terra is selected on Prime Agent.*next thread refresh.*will not resend/i,
     )
     expect(within(targetRow as HTMLElement).queryByText('Current')).not.toBeInTheDocument()
-    expect(within(targetRow as HTMLElement).getByRole('button', { name: 'Refreshing GPT-5.6 Terra' })).toBeDisabled()
+    expect(within(targetRow as HTMLElement).getByText('Selected on host')).toBeVisible()
+    expect(within(targetRow as HTMLElement).queryByRole('button', { name: /GPT-5\.6 Terra/ })).not.toBeInTheDocument()
+    expect(within(feedback as HTMLElement).getByRole('button', { name: 'Done' })).toBeEnabled()
 
     act(() => harness.publishCurrentModel('openai-codex/gpt-5.6-terra'))
     await waitFor(() => expect(within(targetRow as HTMLElement).getByText('Current')).toBeVisible())
     expect(within(feedback as HTMLElement).getByRole('status')).toHaveTextContent(
       /GPT-5\.6 Terra is now shown as current for this thread/,
     )
+    expect(within(feedback as HTMLElement).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
     expect(within(dialog).getByRole('button', { name: 'Use model GPT-5.6 Luna' })).toBeEnabled()
     expect(within(dialog).getByText(/changes the resident session only; it does not send a prompt/i)).toBeVisible()
+  })
+
+  it('closes a host-completed model selection without waiting indefinitely for a label refresh', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    harness.api.selectResidentModel = vi.fn(async () => ({
+      state: 'completed' as const,
+      projected: false,
+      message: 'Prime Agent selected this model.',
+    }))
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
+    await user.click(trigger)
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: 'Use model GPT-5.6 Terra' }))
+    const done = await within(dialog).findByRole('button', { name: 'Done' })
+
+    expect(done).toBeEnabled()
+    expect(done).toHaveFocus()
+    expect(within(dialog).getByText('Selected on host')).toBeVisible()
+    await user.click(done)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Models & accounts' })).not.toBeInTheDocument())
+    expect(trigger).toHaveFocus()
   })
 
   it('surfaces definitive rejection and permits only an explicitly retryable selection', async () => {

@@ -5666,6 +5666,10 @@ dialog.sheet.models-sheet {
   background: var(--color-surface-accent);
 }
 
+.model-row--selected {
+  background: var(--color-success-soft);
+}
+
 .model-row__body {
   display: grid;
   min-inline-size: 0;
@@ -5711,6 +5715,11 @@ dialog.sheet.models-sheet {
   background: var(--color-surface-raised);
 }
 
+.model-badge--selected {
+  color: var(--color-success);
+  background: var(--color-success-soft);
+}
+
 .model-badge--recommended {
   color: var(--color-success);
   background: var(--color-success-soft);
@@ -5745,6 +5754,15 @@ dialog.sheet.models-sheet {
   margin-block-start: 0.55rem;
 }
 
+.model-selection-feedback--complete {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.model-selection-feedback--complete > .button {
+  min-block-size: 2.25rem;
+}
+
 .model-selection-feedback__message {
   display: flex;
   align-items: flex-start;
@@ -5774,6 +5792,10 @@ dialog.sheet.models-sheet {
 
 .model-selection-feedback__message--error svg {
   color: var(--color-danger);
+}
+
+.model-selection-feedback--complete .model-selection-feedback__message--error {
+  grid-column: 1 / -1;
 }
 
 .model-list__empty {
@@ -8716,7 +8738,6 @@ dialog.sheet::backdrop {
 
 .model-row {
   padding-inline: 0.55rem;
-  border-inline-start: 2px solid transparent;
 }
 
 .model-row:hover {
@@ -8724,8 +8745,11 @@ dialog.sheet::backdrop {
 }
 
 .model-row--current {
-  background: transparent;
-  border-inline-start-color: var(--color-accent);
+  background: var(--color-surface-accent);
+}
+
+.model-row--selected {
+  background: var(--color-success-soft);
 }
 
 .model-badge,
@@ -8738,6 +8762,10 @@ dialog.sheet::backdrop {
 
 .model-row--current .model-badge--current,
 .model-row--current .model-badge--recommended {
+  background: transparent;
+}
+
+.model-row--selected .model-badge--selected {
   background: transparent;
 }
 
@@ -8788,6 +8816,14 @@ dialog.sheet::backdrop {
   .resident-end-dialog__impact > div {
     grid-template-columns: 1fr;
     gap: 0.2rem;
+  }
+
+  .model-selection-feedback--complete {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .model-selection-feedback--complete > .button {
+    justify-self: start;
   }
 }
 
