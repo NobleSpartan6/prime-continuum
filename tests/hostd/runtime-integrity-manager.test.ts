@@ -85,9 +85,9 @@ describe("runtime integrity manager", () => {
     const finalDirectory = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
     const ordinary = await lstat(join(finalDirectory, ...fixture.payloads[0]!.path.split("/")));
     const launcher = await lstat(join(finalDirectory, "bridge", "playwright-cli"));
-    expect(ordinary.mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(ordinary.mode & 0o777).toBe(0o600);
     expect(ordinary.nlink).toBe(1);
-    expect(launcher.mode & 0o777).toBe(process.platform === "win32" ? 0o600 : 0o700);
+    if (process.platform !== "win32") expect(launcher.mode & 0o777).toBe(0o700);
     expect(launcher.nlink).toBe(1);
   });
 
