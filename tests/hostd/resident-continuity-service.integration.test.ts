@@ -1,6 +1,6 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -219,6 +219,35 @@ describe("HostService resident continuity dispatch integration", () => {
     await fixture.service.close();
   });
 
+  it("publishes path-free browser execution only for the exact live resident binding", async () => {
+    const gateway = residentGateway(() => {
+      throw new Error("browser readiness discovery must never dispatch a mutation");
+    }, { browserReady: true });
+    const fixture = await serviceFixture(gateway);
+    await publishIdleResidentProjection(fixture, "resident-browser-exact-live");
+
+    const ready = await controlSnapshot(fixture.service, fixture.hostId, "resident-browser-ready");
+    expect(ready.browserExecution).toEqual({
+      readiness: "ready",
+      protocol: "prime-continuim.browser.v1",
+      surface: "playwright-cli",
+      controller: "playwright-core/1.63.0-alpha-2026-08-05",
+      engine: "verified-electron-host",
+    });
+    expect(gateway.isResidentBrowserExecutionReady).toHaveBeenCalledWith(fixture.binding);
+    expect(JSON.stringify(ready)).not.toContain(fixture.binding.workspaceDirectory);
+    expect(JSON.stringify(ready)).not.toContain("PRIME_CONTINUIM_BROWSER");
+
+    gateway.isResidentBindingLive.mockResolvedValue(false);
+    const unavailable = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-browser-stale-binding",
+    );
+    expect(unavailable.browserExecution).toEqual({ readiness: "unavailable" });
+    await fixture.service.close();
+  });
+
   it("stays uncertain after restart until the exact resident binding is prepared again", async () => {
     const firstGateway = residentGateway(() => {
       throw new Error("resident control discovery must never dispatch a mutation");
@@ -256,6 +285,73 @@ describe("HostService resident continuity dispatch integration", () => {
     expect(reattached).toMatchObject({
       controlSequence: reconnecting.controlSequence + 1,
       quiescence: { state: "idle_proven" },
+    });
+    expect(restartedGateway.submit).not.toHaveBeenCalled();
+    await restartedService.close();
+  });
+
+  it("migrates pre-readiness control bytes to unavailable before exact live authority can return", async () => {
+    const firstGateway = residentGateway(() => {
+      throw new Error("legacy migration must remain read-only");
+    });
+    const fixture = await serviceFixture(firstGateway);
+    await publishIdleResidentProjection(fixture, "resident-control-legacy-migration");
+    const current = await controlSnapshot(
+      fixture.service,
+      fixture.hostId,
+      "resident-control-before-legacy-migration",
+    );
+    expect(current.commandReadiness).toBe("ready");
+    await fixture.service.close();
+
+    const files = await readdir(fixture.store.paths.residentControlProjections);
+    expect(files).toHaveLength(1);
+    const projectionPath = join(fixture.store.paths.residentControlProjections, files[0]!);
+    const legacy = JSON.parse(await readFile(projectionPath, "utf8")) as Record<string, unknown>;
+    delete legacy.commandReadiness;
+    delete legacy.browserExecution;
+    await writeFile(projectionPath, `${JSON.stringify(legacy)}\n`, "utf8");
+
+    const restartedStore = new HostStore(fixture.directory);
+    const restartedGateway = residentGateway(() => {
+      throw new Error("control migration and readiness must never dispatch");
+    }, { bindingLive: false, browserReady: true });
+    const restartedService = new HostService(restartedStore, restartedGateway);
+    await restartedService.initialize();
+
+    const migrated = JSON.parse(await readFile(projectionPath, "utf8")) as Record<string, unknown>;
+    expect(migrated).toMatchObject({
+      commandReadiness: "unavailable",
+      browserExecution: { readiness: "unavailable" },
+      controlSequence: current.controlSequence + 1,
+    });
+    expect(Date.parse(String(migrated.changedAt))).toBeGreaterThanOrEqual(Date.parse(current.changedAt));
+
+    const unavailable = await controlSnapshot(
+      restartedService,
+      fixture.hostId,
+      "resident-control-after-legacy-migration",
+    );
+    expect(unavailable).toMatchObject({
+      commandReadiness: "unavailable",
+      browserExecution: { readiness: "unavailable" },
+      quiescence: { state: "uncertain", reason: "lifecycle_transition" },
+    });
+    expect(restartedGateway.submit).not.toHaveBeenCalled();
+
+    restartedGateway.isResidentBindingLive.mockResolvedValue(true);
+    const reproved = await controlSnapshot(
+      restartedService,
+      fixture.hostId,
+      "resident-control-after-exact-reproof",
+    );
+    expect(reproved).toMatchObject({
+      commandReadiness: "ready",
+      browserExecution: {
+        readiness: "ready",
+        protocol: "prime-continuim.browser.v1",
+      },
+      controlSequence: unavailable.controlSequence + 1,
     });
     expect(restartedGateway.submit).not.toHaveBeenCalled();
     await restartedService.close();
@@ -775,6 +871,7 @@ async function serviceFixture(gateway: PrimeAgentGateway, storeOptions: HostStor
 type FakeResidentGateway = PrimeAgentGateway & {
   isLive: ReturnType<typeof vi.fn>;
   isResidentBindingLive: ReturnType<typeof vi.fn>;
+  isResidentBrowserExecutionReady: ReturnType<typeof vi.fn>;
   submit: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
 };
@@ -784,12 +881,13 @@ function residentGateway(
     command: CommandEnvelope,
     context?: GatewayDispatchContext,
   ) => GatewayAdmission | Promise<GatewayAdmission>,
-  options: { bindingLive?: boolean } = {},
+  options: { bindingLive?: boolean; browserReady?: boolean } = {},
 ): FakeResidentGateway {
   return {
     continuity: "resident",
     isLive: vi.fn(async () => true),
     isResidentBindingLive: vi.fn(async () => options.bindingLive ?? true),
+    isResidentBrowserExecutionReady: vi.fn(async () => options.browserReady ?? false),
     submit: vi.fn(async (command: CommandEnvelope, context?: GatewayDispatchContext) =>
       handler(command, context)),
     close: vi.fn(async () => undefined),

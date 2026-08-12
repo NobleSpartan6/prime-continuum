@@ -514,6 +514,51 @@ describe("DesktopControlService durable runtime OAuth attempts", () => {
     await fixture.service.disconnect();
   });
 
+  it("keeps a durably expired sign-in retryable after live broker state is gone", async () => {
+    let attempt!: RuntimeOAuthAttemptV1;
+    let expired!: ReturnType<typeof expiredRecord>;
+    const connection = connectionFor((method, params) => {
+      if (method === "oauth.attempt.start") {
+        attempt = (params as { attempt: RuntimeOAuthAttemptV1 }).attempt;
+        const record = activeRecord(attempt);
+        return boundResult(record, {
+          ...liveSnapshot(record),
+          challenge: {
+            id: "manual-expiry-wait",
+            kind: "manual_redirect",
+            message: "Finish sign-in in the provider window.",
+            allowEmpty: false,
+          },
+        });
+      }
+      if (method === "oauth.attempt.status") {
+        expired = expiredRecord(attempt);
+        return boundResult(expired);
+      }
+      if (method === "oauth.attempt.acknowledge") {
+        return boundResult({
+          ...expired,
+          revision: expired.revision + 1,
+          desktopAcknowledgedAt: expired.terminal.body.terminalAt,
+        });
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const fixture = await connectedService(connection, async () => undefined);
+    await fixture.service.startRuntimeOAuth("host-a", "openai-codex");
+    const healthReadsBeforeTerminal = connection.requests.filter(({ method }) => method === "health.get").length;
+
+    await expect(fixture.service.runtimeOAuthStatus("host-a", "oauth-session-1")).resolves.toMatchObject({
+      phase: "failed",
+      error: { code: "OAUTH_SESSION_EXPIRED", retryable: true },
+    });
+    await vi.waitFor(() => {
+      expect(connection.requests.filter(({ method }) => method === "health.get").length)
+        .toBeGreaterThan(healthReadsBeforeTerminal);
+    });
+    await fixture.service.disconnect();
+  });
+
   it("recovers a lost acknowledgement from the read-only N+1 status successor", async () => {
     let attempt!: RuntimeOAuthAttemptV1;
     let terminal!: ReturnType<typeof completedRecord>;
@@ -842,6 +887,31 @@ function completedRecord(
     revision: 4,
     sessionId: "oauth-session-1",
     phase: "completed" as const,
+    createdAt: attempt.identity.requestedAt,
+    updatedAt: terminalAt,
+    expiresAt: expiresAt(attempt),
+    terminal,
+  };
+}
+
+function expiredRecord(
+  attempt: RuntimeOAuthAttemptV1,
+  terminalAt = shiftTimestamp(attempt.identity.requestedAt, 1_000),
+) {
+  const terminal = createRuntimeOAuthAttemptTerminalV1({
+    version: 1,
+    attemptDigest: attempt.attemptDigest,
+    phase: "failed",
+    resolution: "expired",
+    configuredObserved: null,
+    terminalAt,
+  });
+  return {
+    recordVersion: 1 as const,
+    attempt,
+    revision: 3,
+    sessionId: "oauth-session-1",
+    phase: "failed" as const,
     createdAt: attempt.identity.requestedAt,
     updatedAt: terminalAt,
     expiresAt: expiresAt(attempt),

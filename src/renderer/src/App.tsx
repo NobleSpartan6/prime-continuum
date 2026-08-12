@@ -16,6 +16,7 @@ import {
   Copy,
   FileCode2,
   FolderGit2,
+  GitFork,
   GitBranch,
   HardDrive,
   Inbox,
@@ -23,15 +24,16 @@ import {
   Laptop,
   ListChecks,
   Loader2,
-  LockKeyhole,
   Maximize2,
   Menu,
   MessageSquare,
   Minimize2,
   Monitor,
+  MoreHorizontal,
   Network,
   PanelLeftClose,
   PanelRightClose,
+  Plus,
   RefreshCw,
   Search,
   Server,
@@ -48,6 +50,7 @@ import {
   isDefinitiveCandidateEvaluationStartError,
   isStaleHostAuthorityError,
   registeredWorkspaceProvisionHoldsAuthority,
+  ResidentProvisionError,
   residentProvisionMayHaveDurableOperation,
   type ComposerReceiptState,
   type ConnectionState,
@@ -61,6 +64,7 @@ import {
   type RendererApi,
   type ResidentEndPreparation,
   type ResidentLifecycleOperationSummary,
+  type ResidentWorkspacePreselection,
   type ResidentWorkspaceSelection,
   type ResidentWorkspaceSelectionInput,
   type RuntimeModelCatalog,
@@ -83,9 +87,12 @@ import type {
 } from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
-import { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { RlmDelegationPanel } from './RlmDelegationPanel'
+import { DeferredModelsDialog } from './DeferredModelsDialog'
+import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, Suspense, lazy, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
+import type { AgentLaunchpadProps } from './AgentLaunchpad'
 
-const INSPECTOR_TABS = ['Changes', 'Runtime', 'Evidence', 'Context'] as const
+const INSPECTOR_TABS = ['Changes', 'Session', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type ComposerReceiptView = {
   state: ComposerReceiptState
@@ -103,6 +110,11 @@ type HostActivationView = {
   message: string
 }
 type LocalSetupDiagnosticCopyState = 'idle' | 'copying' | 'copied' | 'failed'
+type ResidentProvisioningDetails = {
+  projectDisplayName: string
+  threadTitle: string
+  sessionName?: string
+}
 type ResidentLifecycleRecoveryReference = {
   kind: 'provision'
   operationId: string
@@ -116,6 +128,7 @@ type ResidentLifecycleRecoveryReference = {
   threadId?: string
   executionGenerationId?: string
   status?: ResidentLifecycleStatusResult
+  provisioningDetails?: ResidentProvisioningDetails
 }
 type ResidentLifecycleStatusResult = NonNullable<Awaited<ReturnType<RendererApi['residentLifecycleStatus']>>>
 type ResidentThreadFocusTarget = Pick<
@@ -126,14 +139,123 @@ type ResidentEndDialogContext = {
   preparation: ResidentEndPreparation
   threadTitle: string
   hostName: string
+  inactiveRecovery: boolean
 }
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Describe the task before delegating to Prime Agent.'
 const MAX_COMPOSER_DRAFTS = 128
-const MODEL_REVEAL_INCREMENT = 80
-const PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID = 'openai-codex'
 const CANDIDATE_PREFLIGHT_REFRESH_MS = 25_000
 const CANDIDATE_EVALUATION_POLL_MS = 1_500
+const WORKBENCH_LAYOUT_STORAGE_KEY = 'prime.renderer.workbench-layout.v1'
+const SIDEBAR_MIN_WIDTH = 224
+const SIDEBAR_DEFAULT_WIDTH = 280
+const SIDEBAR_MAX_WIDTH = 420
+const INSPECTOR_MIN_WIDTH = 288
+const INSPECTOR_DEFAULT_WIDTH = 376
+const INSPECTOR_MAX_WIDTH = 560
+const PANEL_KEYBOARD_RESIZE_STEP = 12
+const THREAD_MIN_WIDTH = 400
+
+type WorkbenchPanel = 'sidebar' | 'inspector'
+type WorkbenchLayout = {
+  sidebarWidth: number
+  inspectorWidth: number
+  sidebarCollapsed: boolean
+  inspectorOpen: boolean
+}
+
+const DEFAULT_WORKBENCH_LAYOUT: WorkbenchLayout = {
+  sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
+  inspectorWidth: INSPECTOR_DEFAULT_WIDTH,
+  sidebarCollapsed: false,
+  inspectorOpen: false,
+}
+
+function clampPanelWidth(panel: WorkbenchPanel, value: number, maximumOverride?: number): number {
+  const minimum = panel === 'sidebar' ? SIDEBAR_MIN_WIDTH : INSPECTOR_MIN_WIDTH
+  const configuredMaximum = panel === 'sidebar' ? SIDEBAR_MAX_WIDTH : INSPECTOR_MAX_WIDTH
+  const maximum = Math.max(minimum, Math.min(configuredMaximum, maximumOverride ?? configuredMaximum))
+  return Math.min(maximum, Math.max(minimum, Math.round(value)))
+}
+
+function readWorkbenchLayout(): WorkbenchLayout {
+  if (typeof window === 'undefined') return DEFAULT_WORKBENCH_LAYOUT
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(WORKBENCH_LAYOUT_STORAGE_KEY) ?? '') as Partial<WorkbenchLayout>
+    const inspectorStartsAsOverlay = typeof window.matchMedia === 'function'
+      && window.matchMedia('(max-width: 66rem)').matches
+    return {
+      sidebarWidth: clampPanelWidth(
+        'sidebar',
+        typeof stored.sidebarWidth === 'number' ? stored.sidebarWidth : SIDEBAR_DEFAULT_WIDTH,
+      ),
+      inspectorWidth: clampPanelWidth(
+        'inspector',
+        typeof stored.inspectorWidth === 'number' ? stored.inspectorWidth : INSPECTOR_DEFAULT_WIDTH,
+      ),
+      sidebarCollapsed: stored.sidebarCollapsed === true,
+      // A persisted desktop inspector should not unexpectedly cover the thread on a small screen.
+      inspectorOpen: stored.inspectorOpen === true && !inspectorStartsAsOverlay,
+    }
+  } catch {
+    return DEFAULT_WORKBENCH_LAYOUT
+  }
+}
+
+function panelWidthBounds(panel: WorkbenchPanel): { minimum: number; maximum: number } {
+  return panel === 'sidebar'
+    ? { minimum: SIDEBAR_MIN_WIDTH, maximum: SIDEBAR_MAX_WIDTH }
+    : { minimum: INSPECTOR_MIN_WIDTH, maximum: INSPECTOR_MAX_WIDTH }
+}
+
+const TASK_STARTERS = [
+  {
+    id: 'delegate',
+    label: 'Delegate a task',
+    description: 'Coordinate bounded RLM workers',
+    icon: Network,
+    prompt: 'Delegate and complete this task: [describe the outcome, constraints, and done criteria]. First define a concrete goal. Use RLM orchestration where it improves speed or quality: delegate only bounded, independent subtasks to child agents; keep dependent or tightly coupled work with the parent; integrate their findings and resolve conflicts; verify the complete result; and persist concise reusable lessons in the workspace’s established instruction or knowledge files when appropriate. Do not add concurrency for its own sake. Report changed files, checks, and any remaining risks.',
+  },
+  {
+    id: 'feature',
+    label: 'Build a feature',
+    description: 'Inspect, implement, and verify',
+    icon: FileCode2,
+    prompt: 'Build the requested feature in this workspace. Start by inspecting the relevant code and AGENTS.md, state a concise plan, and implement the smallest complete change. Delegate bounded independent work through native RLM only when it improves speed or quality. Use the verified browser when visual or web behavior needs proof. Integrate all findings, run the most relevant checks, and report the changed files plus any remaining risks.',
+  },
+  {
+    id: 'review',
+    label: 'Review the codebase',
+    description: 'Audit and fix high-impact issues',
+    icon: Search,
+    prompt: 'Review this codebase for the highest-impact correctness, performance, accessibility, and maintainability issues. Ground every finding in concrete files and rank the work by severity. Use native RLM child agents for independent audit lanes when useful, then reconcile their evidence before changing code. Fix the issues that are safe and well-scoped, use the verified browser for UI proof when applicable, run relevant checks, and report what remains.',
+  },
+  {
+    id: 'investigate',
+    label: 'Investigate an issue',
+    description: 'Reproduce and resolve root cause',
+    icon: Activity,
+    prompt: 'Investigate the reported issue in this workspace. Reproduce it if possible, using the verified browser when the issue is visual or web-facing. Inspect the relevant code and AGENTS.md, identify the root cause, delegate only independent evidence gathering through native RLM when helpful, implement the smallest complete fix, run the most relevant regression checks, and report the cause, changed files, verification, and any remaining uncertainty.',
+  },
+] as const
+
+function AgentLaunchpadFallback(_props: Partial<AgentLaunchpadProps> = {}) {
+  return (
+    <section className="agent-launchpad agent-launchpad--loading" aria-label="Preparing coding workflows" role="status">
+      <span className="agent-launchpad__mark" aria-hidden="true"><Icon icon={Loader2} size={18} /></span>
+      <strong>Preparing coding workflows…</strong>
+      <small>The resident composer remains available below.</small>
+    </section>
+  )
+}
+
+const DeferredAgentLaunchpad = lazy(async () => {
+  try {
+    return await import('./AgentLaunchpad')
+  } catch {
+    return { default: AgentLaunchpadFallback }
+  }
+})
 
 const HANDOFF_PHASES: Array<{ phase: HandoffPhase; label: string }> = [
   { phase: 'quiescing', label: 'Prepare source' },
@@ -188,7 +310,8 @@ function registeredWorkspaceRecoveryDonorIsSelected(
     workspaceId &&
     referenceThreadId &&
     referenceExecutionGenerationId &&
-    selectedHost?.kind === 'ssh' &&
+    selectedHost &&
+    residentLifecycleHostIsCheckable(selectedHost) &&
     selectedHost.id === source.expectedHostId &&
     selectedThread &&
     snapshot.selectedProjectId === projectId &&
@@ -225,6 +348,39 @@ function residentEndRecoveryIsSelected(
   )
 }
 
+function residentEndOperationForThread(
+  operations: readonly ResidentLifecycleOperationSummary[],
+  thread: ThreadSummary | undefined,
+): ResidentLifecycleOperationSummary | undefined {
+  if (!thread?.executionGenerationId) return undefined
+  return operations.find((operation) =>
+    operation.kind === 'end' &&
+    operation.expectedHostId === thread.hostId &&
+    operation.threadId === (thread.remoteId ?? thread.id) &&
+    operation.executionGenerationId === thread.executionGenerationId,
+  )
+}
+
+function residentEndTaskPresentation(
+  operation: ResidentLifecycleOperationSummary | undefined,
+  thread: ThreadSummary | undefined,
+  readyToFinish = false,
+): { label: 'Ending' | 'End saved' | 'Finish ending' | 'Needs you' | 'Ended'; state: TaskState; icon: LucideIcon } | undefined {
+  if (!operation) return undefined
+  if (operation.lastStatus?.phase === 'completed' || thread?.residentLifecycle?.state === 'ended') {
+    return { label: 'Ended', state: 'complete', icon: CheckCircle2 }
+  }
+  if (operation.state === 'outcome_unknown' || operation.lastStatus?.phase === 'quarantined') {
+    return { label: 'Needs you', state: 'needs_approval', icon: AlertCircle }
+  }
+  if (operation.lastStatus?.phase === 'ending') {
+    return readyToFinish
+      ? { label: 'Finish ending', state: 'needs_approval', icon: ArrowRight }
+      : { label: 'End saved', state: 'waiting', icon: Clock3 }
+  }
+  return { label: 'Ending', state: 'waiting', icon: Clock3 }
+}
+
 type RegisteredWorkspaceCreateBlock = 'active_resident' | 'setup_recovery'
 type ResidentLifecycleMutationBlock =
   | RegisteredWorkspaceCreateBlock
@@ -241,7 +397,8 @@ function selectedRegisteredWorkspaceCreateBlock(
 ): RegisteredWorkspaceCreateBlock | null {
   if (
     !snapshot ||
-    selectedHost?.kind !== 'ssh' ||
+    !selectedHost ||
+    !residentLifecycleHostIsCheckable(selectedHost) ||
     !selectedThread ||
     snapshot.selectedThreadId !== selectedThread.id ||
     !selectedThread.workspaceId ||
@@ -354,13 +511,13 @@ function residentLifecycleMutationBlockedDetail(
     return 'Open the saved workspace and its original source thread to continue. You can still check the exact setup status here.'
   }
   if (block === 'active_resident') {
-    return 'Another resident session owns this workspace. Open or select the resident thread, then choose End resident session in Runtime. You can still check this exact status here.'
+    return 'Another resident session owns this workspace. Open or select the resident thread, then choose End resident session in Session. You can still check this exact status here.'
   }
   if (block === 'setup_recovery') {
     return 'Another resident setup holds this workspace. Continue or inspect that setup before resuming this one. You can still check this exact status here.'
   }
   if (block === 'target_not_selected') {
-    return 'Open or select the resident thread, then choose End resident session in Runtime. You can still check this exact end status here.'
+    return 'Open or select the resident thread, then choose End resident session in Session. You can still check this exact end status here.'
   }
   return operationKind === 'end'
     ? 'Resident end control is unavailable for this verified host. You can still check the exact end status here.'
@@ -474,15 +631,22 @@ function actionableResidentLifecycleOperations(
 ): ResidentLifecycleOperationSummary[] {
   return operations.filter((operation, index) => {
     if (operation.lastStatus?.phase === 'quarantined') return true
+    if (operation.kind === 'end' && threads.some((thread) =>
+      thread.hostId === operation.expectedHostId &&
+      (thread.remoteId ?? thread.id) === operation.threadId &&
+      thread.executionGenerationId === operation.executionGenerationId &&
+      thread.residentLifecycle?.state === 'ended'
+    )) {
+      // The authoritative thread projection is the terminal user-facing fact.
+      // A stale desktop recovery ledger must not keep asking the user to check
+      // an End that the host has already completed.
+      return false
+    }
     if (operation.state !== 'terminal') return true
     if (operation.kind === 'end') {
-      if (operation.lastStatus?.phase !== 'completed') return false
-      return !threads.some((thread) =>
-        thread.hostId === operation.expectedHostId &&
-        (thread.remoteId ?? thread.id) === operation.threadId &&
-        thread.executionGenerationId === operation.executionGenerationId &&
-        thread.residentLifecycle?.operationId === operation.operationId,
-      )
+      // A completed End is historical evidence, not an action item. The saved
+      // thread remains in the thread list and carries its terminal recap.
+      return false
     }
     if (operation.lastStatus?.phase === 'committed') {
       return !threads.some((thread) =>
@@ -560,8 +724,8 @@ function localSetupPresentation(setup: LocalSetupSummary): {
 } {
   if (setup.stage === 'choose_workspace') {
     return {
-      heading: 'Choose a workspace',
-      description: 'Choose a folder and Prime Continuim will create a durable resident thread for it.',
+      heading: 'Start an agent',
+      description: 'Choose a workspace. You’ll name the task next.',
       status: 'The bundled Prime Agent runtime is verified.',
       icon: FolderGit2,
     }
@@ -576,10 +740,13 @@ function localSetupPresentation(setup: LocalSetupSummary): {
   }
   if (setup.stage === 'preparing_runtime') {
     const readiness = runtimeReadinessCopy(setup.runtimeReadiness)
+    const runtimeVerified = setup.runtimeReadiness?.kind === 'reported' && setup.runtimeReadiness.status === 'ready'
     return {
       heading: 'Getting Prime Continuim ready',
-      description: 'Prime Continuim is verifying its bundled Prime Agent runtime. This can take a moment the first time.',
-      status: setup.runtimeReadiness?.kind === 'reported' && setup.runtimeReadiness.status === 'ready'
+      description: runtimeVerified
+        ? 'The runtime is verified. Prime Continuim is starting the resident agent service.'
+        : 'Prime Continuim is verifying its bundled Prime Agent runtime. This can take a moment the first time.',
+      status: runtimeVerified
         ? 'Finishing local setup…'
         : readiness?.summary ?? 'Checking the bundled Prime Agent runtime…',
       icon: ShieldCheck,
@@ -604,8 +771,23 @@ function localSetupStepStates(setup: LocalSetupSummary): [LocalSetupStepState, L
   return ['current', 'pending', 'pending']
 }
 
-function LocalSetupProgress({ setup }: { setup: LocalSetupSummary }) {
+function canPreselectLocalWorkspace(setup: LocalSetupSummary | undefined): boolean {
+  return setup?.stage === 'preparing_runtime' &&
+    setup.runtimeReadiness?.kind === 'reported' &&
+    setup.runtimeReadiness.freshness === 'live' &&
+    setup.runtimeReadiness.status === 'initializing' &&
+    ['validating_seed', 'copying', 'verifying', 'publishing'].includes(setup.runtimeReadiness.phase ?? '')
+}
+
+function LocalSetupProgress({
+  setup,
+  workspacePreselected = false,
+}: {
+  setup: LocalSetupSummary
+  workspacePreselected?: boolean
+}) {
   const states = localSetupStepStates(setup)
+  if (workspacePreselected && setup.stage === 'preparing_runtime') states[2] = 'complete'
   const readiness = runtimeReadinessCopy(setup.runtimeReadiness)
   const steps: Array<{ label: string; detail: string; state: LocalSetupStepState }> = [
     {
@@ -626,7 +808,9 @@ function LocalSetupProgress({ setup }: { setup: LocalSetupSummary }) {
     },
     {
       label: 'Choose a workspace',
-      detail: states[2] === 'action' ? 'Ready for your folder' : 'Available after verification',
+      detail: workspacePreselected
+        ? 'Folder chosen · name it while Prime finishes'
+        : states[2] === 'action' ? 'Ready for your folder' : 'Available after verification',
       state: states[2],
     },
   ]
@@ -784,6 +968,136 @@ function hudStatusPresentation(
     icon: Circle,
     tone: 'ready',
     needsWorkbench: false,
+  }
+}
+
+interface HudSessionPresentation {
+  activity: string
+  model?: string
+  activeAgentCount: number
+  browserReadiness?: 'ready' | 'unavailable'
+}
+
+type AgentActivityTone = 'ready' | 'thinking' | 'tool' | 'delegating' | 'compacting'
+
+interface AgentActivityPresentation {
+  label: string
+  detail: string
+  tone: AgentActivityTone
+}
+
+function agentDisplayName(agent: WorkbenchSnapshot['agents'][number]): string {
+  return agent.sessionName?.trim() || agent.name
+}
+
+function agentActivityPresentation(
+  runtime: RuntimeSummary,
+  agents: WorkbenchSnapshot['agents'],
+): AgentActivityPresentation {
+  const session = runtime.session
+  if (session?.isBashRunning) {
+    return {
+      label: 'Using tool',
+      detail: 'Running a shell task',
+      tone: 'tool',
+    }
+  }
+  if (session?.isCompacting) {
+    return {
+      label: 'Folding context',
+      detail: 'Keeping the main context focused',
+      tone: 'compacting',
+    }
+  }
+
+  const activeAgent = agents.find((agent) =>
+    agent.status === 'pending' ||
+    agent.status === 'queued' ||
+    agent.status === 'running' ||
+    agent.status === 'waiting',
+  )
+  if (activeAgent) {
+    const name = agentDisplayName(activeAgent)
+    return {
+      label: 'Delegating',
+      detail: activeAgent.activity
+        ? `${name} · ${activeAgent.activity}`
+        : `${name} is working in a child session`,
+      tone: 'delegating',
+    }
+  }
+  if (session?.isStreaming) {
+    const activeTool = session.activeToolNames[0]
+    if (activeTool) {
+      return {
+        label: 'Using tool',
+        detail: `Using ${activeTool}`,
+        tone: 'tool',
+      }
+    }
+    return {
+      label: 'Thinking',
+      detail: 'Preparing the next visible update',
+      tone: 'thinking',
+    }
+  }
+  return {
+    label: 'Ready',
+    detail: 'Prime Agent is ready for another task',
+    tone: 'ready',
+  }
+}
+
+function readableModelName(model: string | undefined): string | undefined {
+  if (!model || model === 'unknown/unknown' || model.startsWith('unknown/')) return undefined
+  const shortName = model.split('/').at(-1) ?? model
+  return shortName.toLocaleLowerCase() === 'gpt-5.6-sol' ? 'GPT-5.6 Sol' : shortName
+}
+
+function hudSessionPresentation(
+  status: HudStatusPresentation,
+  runtime: RuntimeSummary,
+  agents: WorkbenchSnapshot['agents'],
+): HudSessionPresentation {
+  let activeAgentCount = 0
+  let firstActiveAgent: WorkbenchSnapshot['agents'][number] | undefined
+  for (const agent of agents) {
+    if (
+      agent.status !== 'pending' &&
+      agent.status !== 'queued' &&
+      agent.status !== 'running' &&
+      agent.status !== 'waiting'
+    ) continue
+    activeAgentCount += 1
+    firstActiveAgent ??= agent
+  }
+
+  const activeTool = runtime.session?.activeToolNames[0]
+  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
+  const inactiveActivity = status.tone === 'ready'
+    ? 'Ready for another task'
+    : status.tone === 'done'
+      ? 'Latest task complete'
+      : status.tone === 'offline'
+        ? 'Cached transcript · reconnect in workbench'
+        : status.tone === 'failed'
+          ? 'Review the failed turn in workbench'
+          : 'Review needed in workbench'
+  const activity = status.tone === 'working'
+    ? activeTool
+      ? `Using ${activeTool}`
+      : firstActiveAgent?.activity
+        ? `${agentDisplayName(firstActiveAgent)} · ${firstActiveAgent.activity}`
+        : firstActiveAgent
+          ? `${agentDisplayName(firstActiveAgent)} is working`
+          : activeGoal?.objective ?? status.detail
+    : inactiveActivity
+
+  return {
+    activity,
+    model: readableModelName(runtime.session?.model),
+    activeAgentCount,
+    browserReadiness: runtime.browserExecution?.readiness,
   }
 }
 
@@ -993,10 +1307,29 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [selectedThreadId, setSelectedThreadId] = useState(initialThreadId)
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Changes')
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [inspectorOpen, setInspectorOpen] = useState(false)
+  const [workbenchLayout, setWorkbenchLayout] = useState(readWorkbenchLayout)
+  const inspectorOpen = workbenchLayout.inspectorOpen
+  const sidebarCollapsed = workbenchLayout.sidebarCollapsed
+  const setInspectorOpen = useCallback((value: boolean | ((current: boolean) => boolean)) => {
+    setWorkbenchLayout((current) => ({
+      ...current,
+      inspectorOpen: typeof value === 'function' ? value(current.inspectorOpen) : value,
+    }))
+  }, [])
+  const setSidebarCollapsed = useCallback((value: boolean | ((current: boolean) => boolean)) => {
+    setWorkbenchLayout((current) => ({
+      ...current,
+      sidebarCollapsed: typeof value === 'function' ? value(current.sidebarCollapsed) : value,
+    }))
+  }, [])
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [addComputerOpen, setAddComputerOpen] = useState(false)
+  const [residentWorkspacePreselection, setResidentWorkspacePreselection] = useState<ResidentWorkspacePreselection | null>(null)
+  const [residentWorkspacePreselectionName, setResidentWorkspacePreselectionName] = useState('')
+  const [residentPreselectionCompleting, setResidentPreselectionCompleting] = useState(false)
   const [residentWorkspaceSelection, setResidentWorkspaceSelection] = useState<ResidentWorkspaceSelection | null>(null)
+  const [residentProvisionInitialProjectName, setResidentProvisionInitialProjectName] = useState<string | undefined>(undefined)
+  const [residentProvisioningDetails, setResidentProvisioningDetails] = useState<ResidentProvisioningDetails | undefined>(undefined)
   const [residentProvisionOrigin, setResidentProvisionOrigin] = useState<'empty' | 'workbench' | 'recovery' | null>(null)
   const [residentWorkspacePicking, setResidentWorkspacePicking] = useState(false)
   const [residentStatusChecking, setResidentStatusChecking] = useState(false)
@@ -1015,7 +1348,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [moveDestinationId, setMoveDestinationId] = useState('')
-  const [composerText, setComposerText] = useState('')
   const [composerValidationError, setComposerValidationError] = useState('')
   const [composerReceipt, setComposerReceipt] = useState<ComposerReceiptView>({
     state: 'idle',
@@ -1028,28 +1360,175 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const localSetupIssueRef = useRef<HTMLDivElement>(null)
   const localSetupDiagnosticFallbackRef = useRef<HTMLTextAreaElement>(null)
   const localSetupDiagnosticRequestRef = useRef(0)
+  const residentPreselectionAttemptedRef = useRef(new Set<string>())
   const previousLocalSetupStageRef = useRef<LocalSetupStage | undefined>(undefined)
   const residentEndReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
+  const inspectorReturnTargetRef = useRef<HTMLElement | null>(null)
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
   const sidebarPanelRef = useRef<HTMLElement>(null)
   const inspectorPanelRef = useRef<HTMLElement>(null)
+  const panelResizeRef = useRef<{
+    panel: WorkbenchPanel
+    pointerId: number
+    startClientX: number
+    startWidth: number
+    maximumWidth: number
+  } | null>(null)
+  const [resizingPanel, setResizingPanel] = useState<WorkbenchPanel | null>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
   const closeInspector = useCallback(() => setInspectorOpen(false), [])
   const sidebarIsOverlay = useMediaQueryMatch('(max-width: 50rem)')
   const inspectorIsOverlay = useMediaQueryMatch('(max-width: 66rem)')
   const sidebarIsModal = sidebarOpen && sidebarIsOverlay
   const inspectorIsModal = inspectorOpen && inspectorIsOverlay
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
+
+  useEffect(() => {
+    if (surface !== 'workbench') return
+    const updateViewportWidth = () => setViewportWidth(window.innerWidth)
+    window.addEventListener('resize', updateViewportWidth)
+    return () => window.removeEventListener('resize', updateViewportWidth)
+  }, [surface])
+
+  const maximumPanelWidth = useCallback((panel: WorkbenchPanel): number => {
+    const bounds = panelWidthBounds(panel)
+    const otherDockedWidth = panel === 'sidebar'
+      ? inspectorOpen && !inspectorIsOverlay ? workbenchLayout.inspectorWidth : 0
+      : !sidebarCollapsed && !sidebarIsOverlay ? workbenchLayout.sidebarWidth : 0
+    return Math.max(bounds.minimum, Math.min(bounds.maximum, viewportWidth - THREAD_MIN_WIDTH - otherDockedWidth))
+  }, [inspectorIsOverlay, inspectorOpen, sidebarCollapsed, sidebarIsOverlay, viewportWidth, workbenchLayout.inspectorWidth, workbenchLayout.sidebarWidth])
+
+  useEffect(() => {
+    if (surface !== 'workbench') return
+    setWorkbenchLayout((current) => {
+      let sidebarWidth = current.sidebarWidth
+      let inspectorWidth = current.inspectorWidth
+      const availablePanelWidth = Math.max(
+        SIDEBAR_MIN_WIDTH,
+        viewportWidth - THREAD_MIN_WIDTH,
+      )
+      if (!sidebarIsOverlay && !current.sidebarCollapsed && !inspectorIsOverlay && current.inspectorOpen) {
+        inspectorWidth = clampPanelWidth(
+          'inspector',
+          inspectorWidth,
+          availablePanelWidth - sidebarWidth,
+        )
+        sidebarWidth = clampPanelWidth(
+          'sidebar',
+          sidebarWidth,
+          availablePanelWidth - inspectorWidth,
+        )
+      } else if (!sidebarIsOverlay && !current.sidebarCollapsed) {
+        sidebarWidth = clampPanelWidth('sidebar', sidebarWidth, availablePanelWidth)
+      } else if (!inspectorIsOverlay && current.inspectorOpen) {
+        inspectorWidth = clampPanelWidth('inspector', inspectorWidth, availablePanelWidth)
+      }
+      return sidebarWidth === current.sidebarWidth && inspectorWidth === current.inspectorWidth
+        ? current
+        : { ...current, sidebarWidth, inspectorWidth }
+    })
+  }, [inspectorIsOverlay, inspectorOpen, sidebarCollapsed, sidebarIsOverlay, surface, viewportWidth])
+
+  useEffect(() => {
+    if (surface !== 'workbench') return
+    const timeout = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(WORKBENCH_LAYOUT_STORAGE_KEY, JSON.stringify(workbenchLayout))
+      } catch {
+        // Layout preferences are optional; storage denial must not block the workbench.
+      }
+    }, 120)
+    return () => window.clearTimeout(timeout)
+  }, [surface, workbenchLayout])
+
+  useEffect(() => {
+    if (!resizingPanel) return
+    const resize = panelResizeRef.current
+    if (!resize || resize.panel !== resizingPanel) return
+    const direction = document.documentElement.dir === 'rtl' ? -1 : 1
+    const handlePointerMove = (event: globalThis.PointerEvent) => {
+      if (event.pointerId !== resize.pointerId) return
+      const physicalDelta = event.clientX - resize.startClientX
+      const panelDelta = resize.panel === 'sidebar'
+        ? physicalDelta * direction
+        : physicalDelta * -direction
+      const width = clampPanelWidth(resize.panel, resize.startWidth + panelDelta, resize.maximumWidth)
+      setWorkbenchLayout((current) => resize.panel === 'sidebar'
+        ? { ...current, sidebarWidth: width }
+        : { ...current, inspectorWidth: width })
+    }
+    const finishResize = () => {
+      panelResizeRef.current = null
+      setResizingPanel(null)
+    }
+    const finishPointerResize = (event: globalThis.PointerEvent) => {
+      if (event.pointerId !== resize.pointerId) return
+      finishResize()
+    }
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', finishPointerResize)
+    window.addEventListener('pointercancel', finishPointerResize)
+    window.addEventListener('blur', finishResize)
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', finishPointerResize)
+      window.removeEventListener('pointercancel', finishPointerResize)
+      window.removeEventListener('blur', finishResize)
+    }
+  }, [resizingPanel])
+
+  const startPanelResize = useCallback((panel: WorkbenchPanel, event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    panelResizeRef.current = {
+      panel,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startWidth: panel === 'sidebar' ? workbenchLayout.sidebarWidth : workbenchLayout.inspectorWidth,
+      maximumWidth: maximumPanelWidth(panel),
+    }
+    setResizingPanel(panel)
+  }, [maximumPanelWidth, workbenchLayout.inspectorWidth, workbenchLayout.sidebarWidth])
+
+  const resizePanelFromKeyboard = useCallback((panel: WorkbenchPanel, event: KeyboardEvent<HTMLButtonElement>) => {
+    const bounds = {
+      minimum: panelWidthBounds(panel).minimum,
+      maximum: maximumPanelWidth(panel),
+    }
+    const direction = document.documentElement.dir === 'rtl' ? -1 : 1
+    const currentWidth = panel === 'sidebar' ? workbenchLayout.sidebarWidth : workbenchLayout.inspectorWidth
+    let nextWidth = currentWidth
+    if (event.key === 'Home') nextWidth = bounds.minimum
+    else if (event.key === 'End') nextWidth = bounds.maximum
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      const physicalDirection = event.key === 'ArrowRight' ? 1 : -1
+      const panelDirection = panel === 'sidebar' ? direction : -direction
+      nextWidth += physicalDirection * panelDirection * PANEL_KEYBOARD_RESIZE_STEP * (event.shiftKey ? 4 : 1)
+    } else return
+    event.preventDefault()
+    const width = clampPanelWidth(panel, nextWidth, bounds.maximum)
+    setWorkbenchLayout((current) => panel === 'sidebar'
+      ? { ...current, sidebarWidth: width }
+      : { ...current, inspectorWidth: width })
+  }, [maximumPanelWidth, workbenchLayout.inspectorWidth, workbenchLayout.sidebarWidth])
 
   const openCommandPalette = useCallback(() => {
     if (sidebarIsOverlay) setSidebarOpen(false)
     if (inspectorIsOverlay) setInspectorOpen(false)
     setCommandPaletteOpen(true)
   }, [inspectorIsOverlay, sidebarIsOverlay])
+
+  const openSessionManager = useCallback((trigger: HTMLElement) => {
+    inspectorReturnTargetRef.current = trigger
+    if (sidebarIsOverlay) setSidebarOpen(false)
+    setInspectorTab('Session')
+    setInspectorOpen(true)
+  }, [sidebarIsOverlay])
 
   useEffect(() => {
     if (surface === 'hud') return
@@ -1076,7 +1555,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     open: inspectorOpen,
     mediaQuery: '(max-width: 66rem)',
     panelRef: inspectorPanelRef,
-    triggerRef: inspectorToggleRef,
+    triggerRef: inspectorReturnTargetRef,
     onClose: closeInspector,
   })
   const threadSelectionRequestRef = useRef(0)
@@ -1088,6 +1567,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const latestComposerActionsRef = useRef(new Map<string, ComposerLocalAction>())
   const composerDraftsRef = useRef(new Map<string, string>())
   const composerDraftAuthorityKeyRef = useRef('')
+  const composerHandleRef = useRef<ComposerHandle | null>(null)
   const hudSelectionRequestRef = useRef('')
   const previousHudTargetKeyRef = useRef('')
   const hudFocusKeyRef = useRef('')
@@ -1237,7 +1717,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const canActivateSelectedHost = Boolean(
     surface === 'workbench' &&
     api.environment === 'native' &&
-    selectedHost?.kind === 'ssh' &&
+    selectedHost !== undefined &&
+    selectedHost.kind === 'ssh' &&
+    selectedHost.connectionPath === 'SSH' &&
     (selectedHost.connection === 'offline' || selectedHost.activationRequired === true),
   )
   const activeResidentLifecycleHost = residentLifecycleHostIsCheckable(selectedHost)
@@ -1246,7 +1728,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const activeResidentLifecycleHostId = activeResidentLifecycleHost?.id
   const selectedRuntime: RuntimeSummary =
     snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id ? snapshot.runtime : {}
+  const selectedAgentActivity = agentActivityPresentation(selectedRuntime, snapshot?.agents ?? [])
   const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
+  const selectedThreadIsEmpty = selectedThread?.transcript.length === 0
   const composerDraftAuthorityKey = selectedHost && selectedThread
     ? composerActionAuthorityKey(selectedHost.id, selectedThread)
     : ''
@@ -1255,17 +1739,28 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     if (composerDraftAuthorityKeyRef.current === composerDraftAuthorityKey) return
     composerDraftAuthorityKeyRef.current = composerDraftAuthorityKey
     composerAuthorityGenerationRef.current += 1
-    setComposerText(composerDraftAuthorityKey ? composerDraftsRef.current.get(composerDraftAuthorityKey) ?? '' : '')
     setComposerValidationError('')
   }, [composerDraftAuthorityKey])
 
-  const updateComposerText = (nextText: string) => {
-    setComposerText(nextText)
-    if (composerDraftAuthorityKey) {
-      rememberComposerDraft(composerDraftsRef.current, composerDraftAuthorityKey, nextText)
-    }
-    if (composerValidationError) setComposerValidationError('')
-  }
+  const rememberComposerText = useCallback((authorityKey: string, nextText: string) => {
+    if (authorityKey) rememberComposerDraft(composerDraftsRef.current, authorityKey, nextText)
+  }, [])
+
+  const clearComposerValidation = useCallback(() => {
+    setComposerValidationError((current) => current ? '' : current)
+  }, [])
+
+  const selectTaskStarterFromPalette = useCallback((prompt: string) => {
+    if (!composerDraftAuthorityKey) return
+    rememberComposerDraft(composerDraftsRef.current, composerDraftAuthorityKey, prompt)
+    clearComposerValidation()
+    composerHandleRef.current?.prefill(composerDraftAuthorityKey, prompt)
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLTextAreaElement>('#thread-composer')?.focus()
+      })
+    })
+  }, [clearComposerValidation, composerDraftAuthorityKey])
 
   const canStartResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.startResidentTurn ?? false)
   const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
@@ -1292,14 +1787,68 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const residentLifecycleOperations = snapshot
     ? actionableResidentLifecycleOperations(snapshot.residentLifecycleOperations, snapshot.threads)
     : []
-  const selectedResidentEnd = selectedThread?.executionGenerationId
-    ? snapshot?.residentLifecycleOperations.find((operation) =>
-        operation.kind === 'end' &&
-        operation.expectedHostId === selectedThread.hostId &&
-        operation.threadId === (selectedThread.remoteId ?? selectedThread.id) &&
-        operation.executionGenerationId === selectedThread.executionGenerationId,
-      )
-    : undefined
+  const selectedResidentEnd = residentEndOperationForThread(
+    snapshot?.residentLifecycleOperations ?? [],
+    selectedThread,
+  )
+  const selectedResidentEndPhase = selectedResidentEnd?.lastStatus?.phase
+  const selectedResidentEndReadyForOneAction = Boolean(
+    (selectedResidentEndPhase === 'ending' || selectedResidentEnd?.state === 'outcome_unknown') &&
+    snapshot?.operations.endResident === true &&
+    composerReceipt.operation === 'end' &&
+    composerReceipt.state !== 'idle' &&
+    (composerReceipt.retryable === true || selectedResidentEnd?.state === 'outcome_unknown') &&
+    selectedHost?.connection === 'online' &&
+    selectedHost.activationRequired !== true &&
+    !residentEndError,
+  )
+
+  useEffect(() => {
+    if (
+      surface !== 'workbench' ||
+      api.environment !== 'native' ||
+      selectedHost?.connection !== 'online' ||
+      !selectedResidentEnd ||
+      (selectedResidentEndPhase !== 'kill_dispatching' && selectedResidentEndPhase !== 'kill_acknowledged')
+    ) return
+
+    let cancelled = false
+    let timer: number | undefined
+    const delays = [400, 800, 1_500, 3_000, 5_000, 5_000]
+    const poll = async (attempt: number) => {
+      if (cancelled) return
+      try {
+        const status = await api.residentLifecycleStatus({
+          expectedHostId: selectedResidentEnd.expectedHostId,
+          operationId: selectedResidentEnd.operationId,
+        })
+        if (!status || status.phase === 'completed' || status.phase === 'quarantined') return
+      } catch {
+        // Exact authority and connection errors remain visible through the
+        // subscribed workbench snapshot. A status read never replays End.
+      }
+      if (cancelled || attempt + 1 >= delays.length) return
+      timer = window.setTimeout(() => void poll(attempt + 1), delays[attempt + 1])
+    }
+    timer = window.setTimeout(() => void poll(0), delays[0])
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [
+    api,
+    selectedHost?.connection,
+    selectedResidentEnd?.expectedHostId,
+    selectedResidentEnd?.operationId,
+    selectedResidentEndPhase,
+    surface,
+  ])
+
+  const selectedResidentEndTask = residentEndTaskPresentation(
+    selectedResidentEnd,
+    selectedThread,
+    selectedResidentEndReadyForOneAction,
+  )
   const canEndResident = Boolean(
     snapshot?.operations.endResident === true &&
     selectedThreadIsMaterialized &&
@@ -1310,6 +1859,29 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     !selectedResidentEnd &&
     selectedThread.residentLifecycle?.state !== 'ended',
   )
+  const selectedSessionNeedsRecovery = Boolean(
+    canEndResident &&
+    selectedRuntime.residentControlReadiness === 'unavailable' &&
+    selectedThread?.status !== 'running' &&
+    !canStopResidentTurn,
+  )
+  const launchpadSessionState: AgentLaunchpadProps['sessionState'] = selectedResidentEnd
+    ? selectedResidentEnd.lastStatus?.phase === 'completed' || selectedThread?.residentLifecycle?.state === 'ended'
+      ? 'ended'
+      : selectedResidentEnd.state === 'outcome_unknown' || selectedResidentEnd.lastStatus?.phase === 'quarantined'
+        ? 'end-uncertain'
+        : selectedResidentEndPhase === 'ending'
+          ? selectedResidentEndReadyForOneAction
+            ? 'end-ready'
+            : 'end-paused'
+          : 'ending'
+    : selectedSessionNeedsRecovery
+      ? 'needs-recovery'
+      : selectedThread?.status === 'waiting' || selectedThread?.status === 'needs_approval' || selectedThread?.status === 'failed'
+        ? 'needs-input'
+        : canStartResidentTurn
+          ? 'ready'
+          : 'preparing'
   const activeHudTarget = hudState && hudState.state !== 'closed' ? hudState.target : undefined
   const activeHudTargetKey = activeHudTarget
     ? [
@@ -1393,7 +1965,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       residentWorkspaceSelection?.kind === 'registered_workspace' &&
       (
         selectedHost?.id !== residentWorkspaceSelection.expectedHostId ||
-        selectedHost.kind !== 'ssh' ||
+        !residentLifecycleHostIsCheckable(selectedHost) ||
         !selectedThread ||
         snapshot?.selectedThreadId !== selectedThread.id ||
         selectedThread.projectId !== residentWorkspaceSelection.projectId ||
@@ -1440,6 +2012,82 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     selectedHost,
     selectedThread,
     snapshot,
+  ])
+
+  useEffect(() => {
+    const preselection = residentWorkspacePreselection
+    if (!preselection) return
+    const remaining = Date.parse(preselection.expiresAt) - Date.now()
+    if (remaining <= 0) {
+      residentPreselectionAttemptedRef.current.add(preselection.preselectionToken)
+      setResidentWorkspacePreselection(null)
+      setResidentWorkspacePreselectionName('')
+      void api.cancelResidentWorkspacePreselection(preselection.preselectionToken).catch(() => undefined)
+      return
+    }
+    const timer = window.setTimeout(() => {
+      residentPreselectionAttemptedRef.current.add(preselection.preselectionToken)
+      setResidentWorkspacePreselection((current) =>
+        current?.preselectionToken === preselection.preselectionToken ? null : current
+      )
+      setResidentWorkspacePreselectionName('')
+      void api.cancelResidentWorkspacePreselection(preselection.preselectionToken).catch(() => undefined)
+    }, Math.min(remaining, 2_147_000_000))
+    return () => window.clearTimeout(timer)
+  }, [api, residentWorkspacePreselection])
+
+  useEffect(() => {
+    const preselection = residentWorkspacePreselection
+    const setup = snapshot?.localSetup
+    if (!preselection || !setup) return
+    if (setup.stage === 'needs_attention' || setup.stage === 'starting_local_service') {
+      residentPreselectionAttemptedRef.current.add(preselection.preselectionToken)
+      setResidentWorkspacePreselection(null)
+      setResidentWorkspacePreselectionName('')
+      void api.cancelResidentWorkspacePreselection(preselection.preselectionToken).catch(() => undefined)
+    }
+  }, [api, residentWorkspacePreselection, snapshot?.localSetup])
+
+  useEffect(() => {
+    const preselection = residentWorkspacePreselection
+    if (
+      !preselection ||
+      snapshot?.localSetup?.stage !== 'choose_workspace' ||
+      !canProvisionResident ||
+      residentPreselectionAttemptedRef.current.has(preselection.preselectionToken)
+    ) return
+    residentPreselectionAttemptedRef.current.add(preselection.preselectionToken)
+    setResidentPreselectionCompleting(true)
+    setResidentWorkspaceError('')
+    const initialProjectName = residentWorkspacePreselectionName.trim() || preselection.suggestedName
+    void api.completeResidentWorkspacePreselection(preselection.preselectionToken).then((selection) => {
+      // The early chooser unmounted when setup became ready. Restore dialog
+      // focus to the live ready-state chooser, never its detached predecessor.
+      residentProvisionReturnTargetRef.current = localSetupWorkspaceButtonRef.current
+      setResidentWorkspacePreselection(null)
+      setResidentWorkspacePreselectionName('')
+      setResidentProvisionInitialProjectName(initialProjectName)
+      setResidentProvisioningDetails(undefined)
+      setResidentProvisionOrigin('empty')
+      setResidentWorkspaceSelection(selection)
+    }).catch((error) => {
+      setResidentWorkspacePreselection(null)
+      setResidentWorkspacePreselectionName('')
+      setResidentProvisionInitialProjectName(undefined)
+      setResidentProvisioningDetails(undefined)
+      setResidentProvisionOrigin(null)
+      setResidentWorkspaceError(error instanceof Error
+        ? error.message
+        : 'Prime finished preparing, but this early workspace choice could not be continued. Choose it again.')
+    }).finally(() => {
+      setResidentPreselectionCompleting(false)
+    })
+  }, [
+    api,
+    canProvisionResident,
+    residentWorkspacePreselection,
+    residentWorkspacePreselectionName,
+    snapshot?.localSetup?.stage,
   ])
 
   useEffect(() => {
@@ -1555,8 +2203,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     snapshot?.selectedThreadId,
     surface,
   ])
-  activeHostIdRef.current = selectedHost?.id
-  activeThreadIdRef.current = selectedThread?.id
+  useLayoutEffect(() => {
+    activeHostIdRef.current = selectedHost?.id
+    activeThreadIdRef.current = selectedThread?.id
+  }, [selectedHost?.id, selectedThread?.id])
 
   useEffect(() => {
     if (!hostActivation || hostActivation.hostId === selectedHost?.id) return
@@ -1584,6 +2234,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     setHostActivation(null)
     composerAuthorityGenerationRef.current += 1
     setThreadSelectionError('')
+    setResidentEndError('')
     setSelectedThreadId(thread.id)
     setSelectedProjectId(thread.projectId)
     const host = snapshot?.hosts.find((candidate) => candidate.id === thread.hostId)
@@ -1684,9 +2335,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     })
   }
 
-  const submitComposer = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!snapshot || !selectedThread || !selectedHost) return
+  const submitComposerText = async (submittedDraft: string, form: HTMLFormElement): Promise<boolean> => {
+    if (!snapshot || !selectedThread || !selectedHost) return false
     if (!canStartResidentTurn || selectedHost.connection !== 'online') {
       setComposerReceipt({
         state: 'rejected',
@@ -1695,22 +2345,21 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           ? 'This resident session is not ready for a new prompt. Refresh the thread and try again.'
           : `Reconnect to ${selectedHost.name} before running a prompt.`,
       })
-      return
+      return false
     }
-    const text = composerText.trim()
+    const text = submittedDraft.trim()
     if (!text) {
-      const messageField = event.currentTarget.elements.namedItem('message')
+      const messageField = form.elements.namedItem('message')
       setComposerValidationError(EMPTY_COMPOSER_ERROR)
       window.requestAnimationFrame(() => {
         if (messageField instanceof HTMLTextAreaElement) messageField.focus()
       })
-      return
+      return false
     }
     setComposerValidationError('')
     const submissionHostId = selectedHost.id
     const submissionThreadId = selectedThread.id
     const submissionAuthorityGeneration = composerAuthorityGenerationRef.current
-    const submittedDraft = composerText
     const actionKey = composerActionAuthorityKey(submissionHostId, selectedThread)
     const actionSequence = ++composerActionSequenceRef.current
     latestComposerActionsRef.current.set(actionKey, { sequence: actionSequence, operation: 'prompt' })
@@ -1729,15 +2378,16 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         activeHostIdRef.current !== submissionHostId ||
         activeThreadIdRef.current !== submissionThreadId ||
         composerAuthorityGenerationRef.current !== submissionAuthorityGeneration
-      ) return
+      ) return false
+      const clearExactDraft = receipt.state !== 'rejected'
       if (receipt.state !== 'rejected') {
         if (composerDraftsRef.current.get(actionKey) === submittedDraft) {
           composerDraftsRef.current.delete(actionKey)
         }
-        setComposerText((current) => current === submittedDraft ? '' : current)
       }
-      if (latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence) return
+      if (latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence) return clearExactDraft
       setComposerReceipt({ ...receipt, operation: 'prompt' })
+      return clearExactDraft
     } catch (error) {
       if (
         isStaleHostAuthorityError(error) ||
@@ -1745,7 +2395,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         activeThreadIdRef.current !== submissionThreadId ||
         composerAuthorityGenerationRef.current !== submissionAuthorityGeneration ||
         latestComposerActionsRef.current.get(actionKey)?.sequence !== actionSequence
-      ) return
+      ) return false
       setComposerReceipt({
         state: 'uncertain',
         operation: 'prompt',
@@ -1753,6 +2403,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           ? `${error.message} Prime Agent will not replay this prompt without proof.`
           : 'Prompt outcome unknown · Prime Agent will not replay it without proof.',
       })
+      return false
     }
   }
 
@@ -1858,8 +2509,29 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     const recoveryReference = recoverySource && !('state' in recoverySource)
       ? recoverySource
       : undefined
+    const recoveryDetails = recoveryOperation
+      ? {
+          projectDisplayName: recoveryOperation.projectDisplayName,
+          threadTitle: recoveryOperation.threadTitle,
+          ...(recoveryOperation.sessionName === undefined ? {} : { sessionName: recoveryOperation.sessionName }),
+        }
+      : recoveryReference?.provisioningDetails
+    const selectedSavedWorkspace = Boolean(
+      selectedProject &&
+      selectedThread &&
+      selectedHost &&
+      residentLifecycleHostIsCheckable(selectedHost) &&
+      snapshot?.selectedProjectId === selectedProject.id &&
+      snapshot.selectedThreadId === selectedThread.id &&
+      selectedThread.workspaceId &&
+      selectedThread.executionGenerationId &&
+      (
+        selectedHost.kind === 'ssh' ||
+        selectedThread.residentLifecycle?.state === 'ended'
+      )
+    )
     const workspaceKind = recoveryOperation?.provisionMode ?? recoveryReference?.workspaceKind ??
-      (selectedHost?.kind === 'ssh' ? 'registered_workspace' : 'local_path')
+      (selectedSavedWorkspace ? 'registered_workspace' : 'local_path')
     let selectionInput: ResidentWorkspaceSelectionInput | undefined
     if (workspaceKind === 'registered_workspace') {
       const conflictingAuthority = selectedRegisteredWorkspaceCreateBlock(
@@ -1871,7 +2543,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       )
       if (conflictingAuthority) {
         setResidentWorkspaceError(conflictingAuthority === 'active_resident'
-          ? 'Open or select the resident thread that owns this workspace, then choose End resident session in Runtime before creating another thread.'
+          ? 'Open or select the resident thread that owns this workspace, then choose End resident session in Session before creating another thread.'
           : 'Continue or inspect the earlier resident setup for this workspace before starting another thread.')
         window.requestAnimationFrame(() => trigger.focus())
         return
@@ -1889,7 +2561,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         workspaceId &&
         referenceThreadId &&
         referenceExecutionGenerationId &&
-        selectedHost?.kind === 'ssh' &&
+        residentLifecycleHostIsCheckable(selectedHost) &&
         residentLifecycleHostIsCheckable(selectedHost) &&
         selectedThread &&
         snapshot?.selectedThreadId === selectedThread.id &&
@@ -1915,6 +2587,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       selectionInput = { resumeOperationId }
     }
     residentProvisionReturnTargetRef.current = trigger
+    setResidentProvisionInitialProjectName(undefined)
+    setResidentProvisioningDetails(recoveryDetails)
     setResidentProvisionOrigin(resumeOperationId
       ? 'recovery'
       : !selectedThread || !selectedProject || !selectedHost ? 'empty' : 'workbench')
@@ -1924,6 +2598,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       const selection = await api.selectResidentWorkspace(selectionInput)
       setResidentWorkspaceSelection(selection)
     } catch (error) {
+      setResidentProvisioningDetails(undefined)
       setResidentProvisionOrigin(null)
       if ((error as { code?: string })?.code !== 'resident.workspace_selection_cancelled') {
         setResidentWorkspaceError(error instanceof Error
@@ -1936,6 +2611,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     } finally {
       setResidentWorkspacePicking(false)
     }
+  }
+
+  const chooseResidentWorkspaceWhilePreparing = async (trigger: HTMLElement) => {
+    residentProvisionReturnTargetRef.current = trigger
+    setResidentWorkspaceError('')
+    setResidentWorkspacePicking(true)
+    try {
+      const preselection = await api.preselectResidentWorkspace()
+      setResidentWorkspacePreselection(preselection)
+      setResidentWorkspacePreselectionName(preselection.suggestedName)
+      residentPreselectionAttemptedRef.current.delete(preselection.preselectionToken)
+    } catch (error) {
+      if ((error as { code?: string })?.code !== 'resident.workspace_preselection_cancelled') {
+        setResidentWorkspaceError(error instanceof Error
+          ? error.message
+          : 'The workspace picker could not be opened.')
+      }
+      window.requestAnimationFrame(() => trigger.focus())
+    } finally {
+      setResidentWorkspacePicking(false)
+    }
+  }
+
+  const cancelResidentWorkspacePreselection = async () => {
+    const preselection = residentWorkspacePreselection
+    if (!preselection) return
+    setResidentWorkspacePreselection(null)
+    setResidentWorkspacePreselectionName('')
+    residentPreselectionAttemptedRef.current.add(preselection.preselectionToken)
+    try {
+      await api.cancelResidentWorkspacePreselection(preselection.preselectionToken)
+    } catch {
+      // Main also revokes on connection change, expiry, and app shutdown.
+    }
+    window.requestAnimationFrame(() => residentProvisionReturnTargetRef.current?.focus())
   }
 
   const retryLocalSetup = async () => {
@@ -2028,16 +2738,42 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         executionGenerationId,
         ...(recoveryEnd ? { resumeOperationId: recoveryEnd.operationId } : {}),
       })
+      if (recoveryEnd?.lastStatus?.phase === 'ending' || recoveryEnd?.state === 'outcome_unknown') {
+        const status = await api.endResident({
+          confirmationToken: preparation.confirmationToken,
+          consent: true,
+        })
+        setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+        if (status.phase === 'completed') {
+          setResidentThreadFocusTarget({
+            expectedHostId: status.expectedHostId,
+            threadId: status.threadId,
+            executionGenerationId: status.executionGenerationId,
+          })
+        } else {
+          window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
+        }
+        return
+      }
       setResidentEndContext({
         preparation,
         threadTitle: thread?.title ?? 'Resident thread',
         hostName: host?.name ?? 'this computer',
+        inactiveRecovery: Boolean(
+          !recoveryEnd &&
+          thread?.id === selectedThread?.id &&
+          canEndResident &&
+          !canStartResidentTurn &&
+          selectedRuntime.session?.residency === 'resident'
+        ),
       })
     } catch (error) {
       setResidentEndError(error instanceof Error
         ? error.message
-        : 'The resident session could not be prepared for review.')
-      window.requestAnimationFrame(() => trigger.focus())
+        : recoveryEnd
+          ? 'The saved End request could not be finished.'
+          : 'The resident session could not be prepared for review.')
+      window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
     } finally {
       setResidentEndPreparing(false)
     }
@@ -2057,6 +2793,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       setResidentLifecycleFeedback(status === null && operation.kind === 'end'
         ? 'No durable end record was returned. No permanent action was retried.'
         : residentLifecycleAnnouncement(status))
+      try {
+        applySnapshot(await api.loadWorkbench())
+      } catch {
+        setResidentWorkspaceError('Status checked, but this view could not refresh. Reopen the task to load the latest state.')
+      }
       if (status && (
         (status.kind === 'provision' && status.phase === 'committed') ||
         (status.kind === 'end' && status.phase === 'completed')
@@ -2174,6 +2915,22 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     }
 
     const status = hudStatusPresentation(selectedThread, selectedHost.connection, composerReceipt)
+    const sessionPresentation = hudSessionPresentation(status, selectedRuntime, snapshot.agents)
+    const hasSessionFacts = Boolean(
+      sessionPresentation.model ||
+      sessionPresentation.activeAgentCount > 0 ||
+      sessionPresentation.browserReadiness,
+    )
+    const reviewActionLabel = selectedThread.status === 'needs_approval'
+      ? 'Review approval'
+      : selectedThread.status === 'waiting'
+        ? 'Reply in workbench'
+        : status.tone === 'failed'
+          ? 'Review failure'
+          : 'Review in workbench'
+    const buddyDetail = status.tone === 'ready' || status.tone === 'done'
+      ? selectedThread.title
+      : sessionPresentation.activity
     if (hudState.state === 'buddy') {
       return (
         <main
@@ -2188,7 +2945,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 <Icon icon={status.icon} size={14} />
                 <span>
                   <strong>{status.label}</strong>
-                  <small title={selectedThread.title}>{selectedThread.title}</small>
+                  <small title={buddyDetail}>{buddyDetail}</small>
                 </span>
               </span>
             </div>
@@ -2196,8 +2953,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               id="hud-buddy-open"
               className="hud-buddy__open"
               type="button"
-              aria-label={`${status.label}: ${selectedThread.title}. Open conversation`}
-              title="Open conversation"
+              aria-label={`${status.label}: ${selectedThread.title}. ${sessionPresentation.activity}. Open session HUD`}
+              title="Open session HUD"
               onClick={() => void setNativeHudMode('expanded')}
             >
               <Icon icon={Maximize2} size={15} />
@@ -2214,23 +2971,21 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         data-hud-click-through="transparent"
         aria-labelledby="hud-thread-heading"
       >
-        <section className="hud-expanded" data-hud-interactive="true">
+        <section className="hud-expanded" data-tone={status.tone} data-hud-interactive="true">
           <header className="hud-expanded__header">
             <div className="hud-expanded__identity">
               <BrandMark />
               <div>
                 <h1 id="hud-thread-heading" tabIndex={-1}>{selectedThread.title}</h1>
-                <span className={cx('hud-status', `hud-status--${status.tone}`)} role="status" aria-live="polite">
-                  <Icon icon={status.icon} size={13} />
-                  <span>{status.label}</span>
-                </span>
+                <span>Prime Agent</span>
               </div>
             </div>
             <div className="hud-expanded__controls">
               <button
                 className="button button--quiet hud-expanded__return"
                 type="button"
-                title="Return to workbench"
+                aria-label={`Open ${selectedThread.title} in the workbench`}
+                title="Open in workbench"
                 onClick={() => void returnToWorkbench()}
               >
                 <Icon icon={ArrowRight} size={14} /> <span>Workbench</span>
@@ -2238,8 +2993,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               <button
                 className="icon-button"
                 type="button"
-                aria-label="Keep as desktop buddy"
-                title="Keep as desktop buddy"
+                aria-label="Collapse to desktop buddy"
+                title="Collapse to desktop buddy"
                 onClick={() => void setNativeHudMode('buddy')}
               >
                 <Icon icon={Minimize2} size={15} />
@@ -2255,6 +3010,40 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               </button>
             </div>
           </header>
+          <section className="hud-session-strip" aria-label="Live agent session">
+            <div className="hud-session-strip__activity">
+              <span className={cx('hud-status', `hud-status--${status.tone}`)} role="status" aria-live="polite" aria-atomic="true">
+                <Icon icon={status.icon} size={13} />
+                <strong>{status.label}</strong>
+              </span>
+              <span className="hud-session-strip__divider" aria-hidden="true" />
+              <p title={sessionPresentation.activity}>{sessionPresentation.activity}</p>
+            </div>
+            {hasSessionFacts && (
+              <dl className="hud-session-strip__facts" aria-label="Session capabilities">
+                {sessionPresentation.model && (
+                  <div>
+                    <dt>Model</dt>
+                    <dd>{sessionPresentation.model}</dd>
+                  </div>
+                )}
+                {sessionPresentation.activeAgentCount > 0 && (
+                  <div>
+                    <dt>Agents</dt>
+                    <dd className="tabular">{sessionPresentation.activeAgentCount} active</dd>
+                  </div>
+                )}
+                {sessionPresentation.browserReadiness && (
+                  <div>
+                    <dt>Browser</dt>
+                    <dd className={cx(sessionPresentation.browserReadiness === 'ready' && 'hud-session-strip__ready')}>
+                      {sessionPresentation.browserReadiness === 'ready' ? 'Ready' : 'Unavailable'}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            )}
+          </section>
           <div className="hud-expanded__thread">
             {hudActionError && (
               <div className="hud-notice hud-notice--error" role="alert">
@@ -2266,27 +3055,36 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 <Icon icon={status.icon} size={14} />
                 <span>{status.detail}</span>
                 <button className="button button--quiet" type="button" onClick={() => void returnToWorkbench()}>
-                  Review in workbench
+                  {reviewActionLabel}
                 </button>
               </div>
             )}
-            <Transcript thread={selectedThread} />
+            <Transcript thread={selectedThread} streamingActivity={selectedAgentActivity} />
             <Composer
+              authorityKey={composerDraftAuthorityKey}
+              initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
+              handleRef={composerHandleRef}
               connection={selectedHost.connection}
               authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
               runtime={selectedRuntime}
-              text={composerText}
-              onTextChange={updateComposerText}
+              agents={snapshot.agents}
+              onDraftChange={rememberComposerText}
+              onClearValidation={clearComposerValidation}
               validationError={composerValidationError}
               receipt={composerReceipt}
               canStartTurn={canStartResidentTurn}
               canStopTurn={canStopResidentTurn}
+              canEndResident={false}
+              canResumeResidentEnd={false}
+              sessionNeedsRecovery={selectedSessionNeedsRecovery}
+              residentEndPreparing={false}
               modelCatalogAvailable={false}
               onOpenModelCatalog={() => undefined}
-              onSubmit={submitComposer}
+              onSubmitText={submitComposerText}
               onStop={() => void stopResidentTurn()}
+              onEndResident={() => undefined}
             />
           </div>
         </section>
@@ -2369,19 +3167,19 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           </span>
           <h1>
             {recoveryFirst && localSetup
-              ? 'Finish resident setup'
-              : setupPresentation?.heading ?? (canProvisionResident ? 'Start a resident thread' : snapshot.projects.length > 0 ? 'No threads yet' : 'No projects yet')}
+              ? 'Finish agent setup'
+              : setupPresentation?.heading ?? (canProvisionResident ? 'Start an agent' : snapshot.projects.length > 0 ? 'No tasks yet' : 'No workspaces yet')}
           </h1>
           <p>
             {recoveryFirst && localSetup
-              ? 'Review the durable setup state first. Prime Continuim will not replay a resident create automatically.'
+              ? 'Review the saved setup first. Prime will not create a duplicate agent or task.'
               : setupPresentation?.description ?? (canProvisionResident
-              ? 'Choose a workspace folder, confirm its names, and Prime Agent will keep the thread available after this window closes.'
+              ? 'Choose a folder and name the first task. Prime Agent stays available after this window closes.'
               : snapshot.projects.length > 0
-                ? 'Reconnect the verified local host to start a resident thread, or open a durable thread that is already available.'
-                : 'Connect a verified local host to start a resident thread from one of your workspace folders.')}
+                ? 'Reconnect the verified local host to start a task, or open one that is already available.'
+                : 'Connect a verified local host to start Prime Agent in one of your workspace folders.')}
           </p>
-          {setupPresentation && (
+          {setupPresentation && localSetup?.stage !== 'choose_workspace' && (
             <p className="local-setup__status" role="status" aria-live="polite" aria-atomic="true">
               {setupPresentation.status}
             </p>
@@ -2427,7 +3225,53 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               onCheck={(operation) => void checkResidentLifecycle(operation)}
             />
           )}
-          {localSetup && <LocalSetupProgress setup={localSetup} />}
+          {localSetup && localSetup.stage !== 'choose_workspace' && (
+            <LocalSetupProgress
+              setup={localSetup}
+              workspacePreselected={residentWorkspacePreselection !== null}
+            />
+          )}
+          {residentWorkspacePreselection && localSetup?.stage === 'preparing_runtime' && (
+            <section
+              className="local-setup__preselection"
+              aria-labelledby="local-workspace-preselection-title"
+              aria-describedby="local-workspace-preselection-detail"
+            >
+              <span className="local-setup__preselection-icon"><Icon icon={FolderGit2} size={17} /></span>
+              <div className="local-setup__preselection-copy">
+                <strong id="local-workspace-preselection-title">Workspace chosen</strong>
+                <p id="local-workspace-preselection-detail">
+                  Name it now. Prime is still verifying the runtime; no workspace access or agent has started.
+                </p>
+                <label htmlFor="local-workspace-preselection-name">Workspace name</label>
+                <input
+                  id="local-workspace-preselection-name"
+                  type="text"
+                  value={residentWorkspacePreselectionName}
+                  maxLength={255}
+                  autoComplete="off"
+                  onChange={(event) => setResidentWorkspacePreselectionName(event.currentTarget.value)}
+                />
+              </div>
+              <div className="local-setup__preselection-actions">
+                <button
+                  className="button button--secondary button--small"
+                  type="button"
+                  disabled={residentWorkspacePicking}
+                  onClick={(event) => void chooseResidentWorkspaceWhilePreparing(event.currentTarget)}
+                >
+                  {residentWorkspacePicking ? 'Opening…' : 'Change folder'}
+                </button>
+                <button
+                  className="button button--quiet button--small"
+                  type="button"
+                  onClick={() => void cancelResidentWorkspacePreselection()}
+                >
+                  Remove
+                </button>
+              </div>
+            </section>
+          )}
           {localSetup?.stage === 'needs_attention' && localSetup.issue && (
             <div className="local-setup__issue" role="alert" tabIndex={-1} ref={localSetupIssueRef}>
               <span><Icon icon={AlertCircle} size={16} /></span>
@@ -2442,6 +3286,22 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             </div>
           )}
           <div className="empty-workbench__actions">
+            {localSetup?.stage === 'preparing_runtime' &&
+              !recoveryFirst &&
+              !residentWorkspacePreselection &&
+              canPreselectLocalWorkspace(localSetup) && (
+                <button
+                  ref={localSetupWorkspaceButtonRef}
+                  className="button button--primary"
+                  type="button"
+                  disabled={residentWorkspacePicking}
+                  aria-busy={residentWorkspacePicking}
+                  onClick={(event) => void chooseResidentWorkspaceWhilePreparing(event.currentTarget)}
+                >
+                  <Icon icon={residentWorkspacePicking ? Loader2 : FolderGit2} />
+                  {residentWorkspacePicking ? 'Opening folder picker…' : 'Choose workspace while Prime finishes'}
+                </button>
+              )}
             {(!localSetup || (localSetup.stage === 'choose_workspace' && !recoveryFirst)) && canProvisionResident && (
               <button
                 ref={localSetup ? localSetupWorkspaceButtonRef : undefined}
@@ -2449,10 +3309,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 type="button"
                 disabled={residentWorkspacePicking}
                 aria-busy={residentWorkspacePicking}
-                onClick={(event) => void chooseResidentWorkspace(event.currentTarget)}
+                aria-label={residentWorkspacePicking ? 'Opening workspace folder picker' : 'Choose workspace folder'}
+              onClick={(event) => void chooseResidentWorkspace(event.currentTarget)}
               >
                 <Icon icon={residentWorkspacePicking ? Loader2 : FolderGit2} />
-                {residentWorkspacePicking ? 'Opening folder picker…' : 'Choose workspace folder'}
+                {residentWorkspacePicking ? 'Opening…' : 'Choose folder'}
               </button>
             )}
             {selectedHost && canLoadModelCatalog && (
@@ -2553,17 +3414,23 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           <small>
             {localSetup
               ? localSetup.stage === 'choose_workspace'
-                ? 'The folder path stays with the verified local host. Prime Continuim does not display it or send it to another computer.'
-                : 'Workspace access remains disabled until the bundled runtime and local authority are verified.'
-              : 'Your verified local host uses this folder for the workspace. Prime Continuim does not display its location or send it to another computer.'}
+                ? 'Folder access stays on this computer.'
+                : residentWorkspacePreselection
+                  ? 'Your folder choice stays private in this app process. Workspace access remains disabled until the runtime is verified and you confirm setup.'
+                  : 'Workspace access remains disabled until the bundled runtime and local authority are verified.'
+              : 'Folder access stays on the selected computer.'}
           </small>
         </main>
         <ResidentProvisionDialog
           api={api}
           selection={residentWorkspaceSelection}
+          initialProjectName={residentProvisionInitialProjectName}
+          recoveryDetails={residentProvisioningDetails}
           triggerRef={residentProvisionReturnTargetRef}
           onClose={() => {
             setResidentWorkspaceSelection(null)
+            setResidentProvisionInitialProjectName(undefined)
+            setResidentProvisioningDetails(undefined)
             setResidentProvisionOrigin(null)
           }}
           onRecoveryRequired={setResidentRecoveryReference}
@@ -2576,7 +3443,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           triggerRef={addComputerReturnTargetRef}
         />
         {selectedHost && (
-          <ModelsDialog
+          <DeferredModelsDialog
             api={api}
             open={modelsOpen}
             host={selectedHost}
@@ -2625,12 +3492,34 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         : ''
   )
   const taskStateIsStale = isDisconnected && !['complete', 'failed'].includes(selectedThread.status)
-  const visibleTaskState = taskStateIsStale
+  const visibleTaskState = selectedResidentEndTask?.label ?? (selectedSessionNeedsRecovery
+    ? 'Needs you'
+    : taskStateIsStale
     ? `Last seen ${taskLabel(selectedThread.status).toLowerCase()}`
-    : taskLabel(selectedThread.status)
+    : taskLabel(selectedThread.status))
+  const visibleTaskStateClass = selectedResidentEndTask?.state ?? (selectedSessionNeedsRecovery
+    ? 'needs_approval'
+    : taskStateIsStale
+      ? 'stale'
+      : selectedThread.status)
+  const VisibleTaskStateIcon = selectedResidentEndTask?.icon ?? (selectedSessionNeedsRecovery
+    ? AlertCircle
+    : taskIcon(selectedThread.status))
+  const sidebarExpanded = sidebarIsOverlay ? sidebarOpen : !sidebarCollapsed
+  const shellStyle = {
+    '--sidebar-width': `${workbenchLayout.sidebarWidth}px`,
+    '--inspector-width': `${workbenchLayout.inspectorWidth}px`,
+  } as CSSProperties
 
   return (
-    <div className="app-shell" data-sidebar-open={sidebarOpen} data-inspector-open={inspectorOpen}>
+    <div
+      className="app-shell"
+      data-sidebar-open={sidebarOpen}
+      data-sidebar-collapsed={!sidebarIsOverlay && sidebarCollapsed}
+      data-inspector-open={inspectorOpen}
+      data-resizing-panel={resizingPanel ?? undefined}
+      style={shellStyle}
+    >
       <a className="skip-link" href="#main">Skip to thread</a>
       <div id="connection-status" className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {connectionStatusAnnouncement}
@@ -2643,21 +3532,29 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         <div className="topbar__leading">
           <button
             ref={sidebarToggleRef}
-            className="icon-button topbar__mobile-control"
+            className="icon-button topbar__mobile-control topbar__sidebar-control"
             type="button"
-            aria-label={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
-            title={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
-            aria-expanded={sidebarOpen}
+            aria-label={sidebarIsOverlay
+              ? sidebarOpen ? 'Close sidebar' : 'Open sidebar'
+              : sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={sidebarIsOverlay
+              ? sidebarOpen ? 'Close sidebar' : 'Open sidebar'
+              : sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={sidebarExpanded}
             aria-controls="project-sidebar"
             onClick={() => {
-              setInspectorOpen(false)
-              setSidebarOpen((value) => !value)
+              if (sidebarIsOverlay) {
+                setInspectorOpen(false)
+                setSidebarOpen((value) => !value)
+              } else {
+                setSidebarCollapsed((value) => !value)
+              }
             }}
           >
-            <Icon icon={sidebarOpen ? PanelLeftClose : Menu} size={18} />
+            <Icon icon={sidebarExpanded ? PanelLeftClose : Menu} size={18} />
           </button>
           <BrandMark />
-          <strong className="topbar__brand-name">Prime Continuim</strong>
+          <strong className="topbar__brand-name"><span>Prime</span> <em>Continuim</em></strong>
         </div>
 
         <div className="topbar__thread">
@@ -2670,11 +3567,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
 
         <div className="topbar__controls">
           <div
-            className={cx('task-state', taskStateIsStale ? 'task-state--stale' : `task-state--${selectedThread.status}`)}
+            className={cx('task-state', `task-state--${visibleTaskStateClass}`)}
             aria-hidden="true"
             title={`Task state: ${visibleTaskState}`}
           >
-            <Icon icon={taskIcon(selectedThread.status)} size={14} />
+            <Icon icon={VisibleTaskStateIcon} size={14} />
             <span className="task-state__label">{visibleTaskState}</span>
           </div>
           <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
@@ -2685,8 +3582,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 <button
                   className="icon-button topbar__hud-control"
                   type="button"
-                  aria-label="Show desktop HUD"
-                  title="Show desktop HUD"
+                  aria-label="Open floating session HUD"
+                  title="Open floating session HUD"
                   onClick={() => void showDesktopHud()}
                 >
                   <Icon icon={MessageSquare} size={17} />
@@ -2743,7 +3640,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 title={inspectorOpen ? 'Close inspector' : 'Open inspector'}
                 aria-expanded={inspectorOpen}
                 aria-controls="thread-inspector"
-                onClick={() => {
+                onClick={(event) => {
+                  inspectorReturnTargetRef.current = event.currentTarget
                   setSidebarOpen(false)
                   setInspectorOpen((value) => !value)
                 }}
@@ -2757,6 +3655,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         snapshot={snapshot}
         selectedProjectId={selectedProject.id}
         selectedThreadId={selectedThread.id}
+        selectedSessionNeedsRecovery={selectedSessionNeedsRecovery}
+        selectedResidentEndReadyForOneAction={selectedResidentEndReadyForOneAction}
         onSelectProject={selectProject}
         onSelectThread={selectThread}
         onSearch={openCommandPalette}
@@ -2795,7 +3695,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         canMoveThread={canMoveThreads}
         canLoadModelCatalog={canLoadModelCatalog}
         canManageComputers={canManageComputers}
-        canProvisionResident={canProvisionResident}
+        canProvisionResident={canProvisionResident && !(
+          selectedResidentEnd &&
+          selectedResidentEnd.lastStatus?.phase !== 'completed' &&
+          selectedThread.residentLifecycle?.state !== 'ended'
+        )}
         registeredWorkspaceCreateBlock={registeredWorkspaceCreateBlock}
         residentLifecycleOperations={residentLifecycleOperations}
         residentRecoveryReference={residentRecoveryReference}
@@ -2806,7 +3710,37 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         inert={inspectorIsModal}
       />
 
-      <main className="thread-view" id="main" tabIndex={-1} inert={sidebarIsModal || inspectorIsModal ? true : undefined}>
+      {!sidebarIsOverlay && !sidebarCollapsed && (
+        <button
+          className="panel-resizer panel-resizer--sidebar"
+          type="button"
+          role="separator"
+          aria-label="Resize project sidebar"
+          aria-orientation="vertical"
+          aria-controls="project-sidebar"
+          aria-valuemin={SIDEBAR_MIN_WIDTH}
+          aria-valuemax={maximumPanelWidth('sidebar')}
+          aria-valuenow={workbenchLayout.sidebarWidth}
+          aria-valuetext={`${workbenchLayout.sidebarWidth} pixels wide`}
+          title="Drag to resize. Use arrow keys for precise resizing."
+          onDoubleClick={() => setWorkbenchLayout((current) => ({
+            ...current,
+            sidebarWidth: clampPanelWidth('sidebar', SIDEBAR_DEFAULT_WIDTH, maximumPanelWidth('sidebar')),
+          }))}
+          onPointerDown={(event) => startPanelResize('sidebar', event)}
+          onKeyDown={(event) => resizePanelFromKeyboard('sidebar', event)}
+        />
+      )}
+
+      <main
+        className={cx(
+          'thread-view',
+          selectedThreadIsEmpty && 'thread-view--launchpad',
+        )}
+        id="main"
+        tabIndex={-1}
+        inert={sidebarIsModal || inspectorIsModal ? true : undefined}
+      >
         <div className="thread-notices">
           {showConnectionNotice && (
             <div className={cx('connection-notice', `connection-notice--${selectedHost.connection}`)}>
@@ -2863,29 +3797,73 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               <span className="connection-notice__detail">{residentWorkspaceError}</span>
             </div>
           )}
+
+          {residentEndError && (
+            <div className="connection-notice connection-notice--offline" role="alert">
+              <span className="connection-notice__icon"><Icon icon={AlertCircle} size={14} /></span>
+              <span>Unable to end session</span>
+              <span className="connection-notice__detail">{residentEndError}</span>
+            </div>
+          )}
         </div>
 
-        <Transcript thread={selectedThread} />
+        <Transcript
+          thread={selectedThread}
+          streamingActivity={selectedAgentActivity}
+          emptyState={selectedThreadIsEmpty ? (
+            <Suspense fallback={<AgentLaunchpadFallback />}>
+              <DeferredAgentLaunchpad
+                hostName={selectedHost.name}
+                model={selectedRuntime.session?.model}
+                sessionState={launchpadSessionState}
+                browserReady={selectedRuntime.browserExecution?.readiness === 'ready'}
+                skillCount={selectedRuntime.session?.resourceInventory?.skills.length}
+                diagnosticCount={selectedRuntime.session?.resourceInventory
+                  ? selectedRuntime.session.resourceInventory.diagnostics.errorCount + selectedRuntime.session.resourceInventory.diagnostics.warningCount
+                  : undefined}
+                canStartTurn={canStartResidentTurn}
+                canOpenModels={canLoadModelCatalog}
+                starters={TASK_STARTERS}
+                onSelectStarter={selectTaskStarterFromPalette}
+                onOpenModels={(trigger) => {
+                  modelsDialogTriggerRef.current = trigger
+                  setModelsOpen(true)
+                }}
+              />
+            </Suspense>
+          ) : undefined}
+        />
 
         <Composer
+              authorityKey={composerDraftAuthorityKey}
+              initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
+              handleRef={composerHandleRef}
               connection={selectedHost.connection}
               authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
               runtime={selectedRuntime}
-              text={composerText}
-              onTextChange={updateComposerText}
+              agents={snapshot.agents}
+              onDraftChange={rememberComposerText}
+              onClearValidation={clearComposerValidation}
+              showTaskStarters={!selectedThreadIsEmpty}
               validationError={composerValidationError}
               receipt={composerReceipt}
               canStartTurn={canStartResidentTurn}
               canStopTurn={canStopResidentTurn}
+              canEndResident={canEndResident}
+              canResumeResidentEnd={selectedResidentEndReadyForOneAction}
+              sessionNeedsRecovery={selectedSessionNeedsRecovery}
+              residentEndPreparing={residentEndPreparing}
               modelCatalogAvailable={canLoadModelCatalog}
               onOpenModelCatalog={(trigger) => {
                 modelsDialogTriggerRef.current = trigger
                 setModelsOpen(true)
               }}
-              onSubmit={submitComposer}
+              onManageSession={openSessionManager}
+              onSubmitText={submitComposerText}
               onStop={() => void stopResidentTurn()}
+              onEndResident={(trigger) => void reviewResidentEnd(trigger, selectedResidentEnd)}
         />
       </main>
 
@@ -2897,16 +3875,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           selectedHost={selectedHost}
           runtime={selectedRuntime}
           activeTab={inspectorTab}
+          open={inspectorOpen}
           onTabChange={setInspectorTab}
           onClose={closeInspector}
           containerRef={inspectorPanelRef}
           modal={inspectorIsModal}
           inert={sidebarIsModal}
           canEndResident={canEndResident}
+          residentLifecycleBusy={residentStatusChecking}
           residentEndPreparing={residentEndPreparing}
           residentEndError={residentEndError}
-          onEndResident={(trigger) => void reviewResidentEnd(trigger)}
+          onCheckResident={(operation) => void checkResidentLifecycle(operation)}
+          onEndResident={(trigger, recovery) => void reviewResidentEnd(trigger, recovery)}
       />
+
+      {inspectorOpen && !inspectorIsOverlay && (
+        <button
+          className="panel-resizer panel-resizer--inspector"
+          type="button"
+          role="separator"
+          aria-label="Resize thread inspector"
+          aria-orientation="vertical"
+          aria-controls="thread-inspector"
+          aria-valuemin={INSPECTOR_MIN_WIDTH}
+          aria-valuemax={maximumPanelWidth('inspector')}
+          aria-valuenow={workbenchLayout.inspectorWidth}
+          aria-valuetext={`${workbenchLayout.inspectorWidth} pixels wide`}
+          title="Drag to resize. Use arrow keys for precise resizing."
+          onDoubleClick={() => setWorkbenchLayout((current) => ({
+            ...current,
+            inspectorWidth: clampPanelWidth('inspector', INSPECTOR_DEFAULT_WIDTH, maximumPanelWidth('inspector')),
+          }))}
+          onPointerDown={(event) => startPanelResize('inspector', event)}
+          onKeyDown={(event) => resizePanelFromKeyboard('inspector', event)}
+        />
+      )}
 
       {(sidebarOpen || inspectorOpen) && (
         <button
@@ -2930,9 +3933,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       <ResidentProvisionDialog
         api={api}
         selection={residentWorkspaceSelection}
+        initialProjectName={residentProvisionInitialProjectName}
+        recoveryDetails={residentProvisioningDetails}
         triggerRef={residentProvisionReturnTargetRef}
         onClose={() => {
           setResidentWorkspaceSelection(null)
+          setResidentProvisionInitialProjectName(undefined)
+          setResidentProvisioningDetails(undefined)
           setResidentProvisionOrigin(null)
         }}
         onRecoveryRequired={setResidentRecoveryReference}
@@ -2972,8 +3979,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           setAddComputerOpen(true)
         }}
         onOpenInspector={() => {
+          inspectorReturnTargetRef.current = commandPaletteTriggerRef.current
           setCommandPaletteOpen(false)
           setSidebarOpen(false)
+          setInspectorTab('Session')
           setInspectorOpen(true)
         }}
         onOpenModels={() => {
@@ -2989,6 +3998,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             else document.querySelector<HTMLButtonElement>('#resident-turn-primary')?.focus()
           })
         }}
+        onSelectTaskStarter={selectTaskStarterFromPalette}
         onEndResident={() => {
           const trigger = commandPaletteTriggerRef.current
           setCommandPaletteOpen(false)
@@ -2996,7 +4006,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         }}
       />
 
-      <ModelsDialog
+      <DeferredModelsDialog
         api={api}
         open={modelsOpen}
         host={selectedHost}
@@ -3027,6 +4037,8 @@ interface SidebarProps {
   snapshot: WorkbenchSnapshot
   selectedProjectId: string
   selectedThreadId: string
+  selectedSessionNeedsRecovery: boolean
+  selectedResidentEndReadyForOneAction: boolean
   onSelectProject: (projectId: string) => void
   onSelectThread: (thread: ThreadSummary) => void
   onSearch: () => void
@@ -3058,6 +4070,8 @@ function Sidebar({
   snapshot,
   selectedProjectId,
   selectedThreadId,
+  selectedSessionNeedsRecovery,
+  selectedResidentEndReadyForOneAction,
   onSelectProject,
   onSelectThread,
   onSearch,
@@ -3112,7 +4126,7 @@ function Sidebar({
           <div className="sidebar__registered-resident">
             <small>
               {registeredWorkspaceCreateBlock === 'active_resident'
-                ? 'A resident session already owns this workspace. Open or select that resident thread, then choose End resident session in Runtime before creating another.'
+                ? 'A resident session already owns this workspace. Open or select that resident thread, then choose End resident session in Session before creating another.'
                 : 'An earlier resident setup still holds this workspace. Continue or inspect that setup below before starting another thread.'}
             </small>
           </div>
@@ -3123,14 +4137,15 @@ function Sidebar({
               type="button"
               disabled={residentLifecycleBusy}
               aria-busy={residentLifecycleBusy}
+              aria-label="New resident thread in this workspace"
               aria-describedby="registered-resident-action-description"
               onClick={(event) => onProvisionResident(event.currentTarget)}
             >
-              <Icon icon={residentLifecycleBusy ? Loader2 : FolderGit2} size={16} />
-              {residentLifecycleBusy ? 'Preparing…' : 'New resident thread in this workspace'}
+              <Icon icon={residentLifecycleBusy ? Loader2 : Plus} size={16} />
+              {residentLifecycleBusy ? 'Preparing…' : 'New agent'}
             </button>
             <small id="registered-resident-action-description">
-              Uses this saved host-owned workspace. You’ll name only the new thread.
+              Uses this saved workspace.
             </small>
           </div>
         ) : (
@@ -3141,8 +4156,8 @@ function Sidebar({
             aria-busy={residentLifecycleBusy}
             onClick={(event) => onProvisionResident(event.currentTarget)}
           >
-            <Icon icon={residentLifecycleBusy ? Loader2 : FolderGit2} size={16} />
-            {residentLifecycleBusy ? 'Working…' : 'New resident thread'}
+            <Icon icon={residentLifecycleBusy ? Loader2 : Plus} size={16} />
+            {residentLifecycleBusy ? 'Working…' : 'New agent'}
           </button>
         ))}
         {residentRecoveryReference && (
@@ -3165,6 +4180,8 @@ function Sidebar({
         {residentLifecycleOperations.length > 0 && (
           <ResidentLifecycleRecoveryList
             operations={residentLifecycleOperations}
+            deferOperationId={residentEndOperationForThread(residentLifecycleOperations, selectedThread)?.operationId}
+            primaryProjectId={selectedProjectId}
             mutationBlock={(operation) => residentLifecycleMutationBlock(
               operation,
               snapshot,
@@ -3230,6 +4247,14 @@ function Sidebar({
             {projectThreads.length > 0 ? (
               projectThreads.map((thread) => {
                 const host = snapshot.hosts.find((item) => item.id === thread.hostId)
+                const needsRecovery = selectedSessionNeedsRecovery && thread.id === selectedThreadId
+                const endTask = residentEndTaskPresentation(
+                  residentEndOperationForThread(snapshot.residentLifecycleOperations, thread),
+                  thread,
+                  thread.id === selectedThreadId && selectedResidentEndReadyForOneAction,
+                )
+                const visibleState = endTask?.label ?? (needsRecovery ? 'Needs you' : taskLabel(thread.status))
+                const stateClass = endTask?.state ?? (needsRecovery ? 'needs_approval' : thread.status)
                 return (
                   <li key={thread.id}>
                     <button
@@ -3238,8 +4263,8 @@ function Sidebar({
                       aria-current={thread.id === selectedThreadId ? 'page' : undefined}
                       onClick={() => onSelectThread(thread)}
                     >
-                      <span className={cx('thread-row__state', `thread-row__state--${thread.status}`)} aria-hidden="true" />
-                      <span className="sr-only">{taskLabel(thread.status)}. </span>
+                      <span className={cx('thread-row__state', `thread-row__state--${stateClass}`)} aria-hidden="true" />
+                      <span className="sr-only">{visibleState}. </span>
                       <span className="thread-row__content">
                         <span className="thread-row__title">
                           {thread.title}
@@ -3261,8 +4286,8 @@ function Sidebar({
                 <span>No threads in this project</span>
                 <small>{canProvisionResident
                   ? selectedHost?.kind === 'ssh'
-                    ? 'Use New resident thread in this workspace to add one.'
-                    : 'Choose New resident thread to add one.'
+                    ? 'Use New agent to start one in this workspace.'
+                    : 'Choose New agent to add one.'
                   : `Reconnect the verified ${selectedHost?.kind === 'ssh' ? 'SSH' : 'local'} host to add one.`}
                 </small>
               </li>
@@ -3352,8 +4377,22 @@ function Sidebar({
 }
 
 const TRANSCRIPT_BLOCK_INCREMENT = 200
+const EMPTY_STREAM_BODY = /^\(no display text\)$/i
 
-function Transcript({ thread }: { thread: ThreadSummary }) {
+function streamHasVisibleText(body: string): boolean {
+  const text = body.trim()
+  return text.length > 0 && !EMPTY_STREAM_BODY.test(text)
+}
+
+const Transcript = memo(function Transcript({
+  thread,
+  emptyState,
+  streamingActivity,
+}: {
+  thread: ThreadSummary
+  emptyState?: ReactNode
+  streamingActivity: AgentActivityPresentation
+}) {
   const scrollRef = useRef<HTMLElement>(null)
   const previousThreadIdRef = useRef('')
   const shouldFollowRef = useRef(true)
@@ -3419,7 +4458,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
   }, [historyWindow.count, historyWindow.threadId, lastBlock?.body, lastBlock?.id, thread.id, thread.transcript.length])
 
   return (
-    <div className="transcript">
+    <div className={cx('transcript', thread.transcript.length === 0 && 'transcript--empty')}>
       <section
         ref={scrollRef}
         id="thread-transcript"
@@ -3434,6 +4473,7 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
         }}
       >
         <div className="transcript__inner">
+          {thread.transcript.length === 0 && emptyState}
           {hasProgressiveHistory && (
             <div className="history-loader">
               <button
@@ -3483,10 +4523,14 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
               )
             }
 
+            const hasVisibleStreamText = !block.streaming || streamHasVisibleText(block.body)
+            const streamLabel = hasVisibleStreamText ? 'Streaming' : streamingActivity.label
+
             return (
               <article
                 className={cx('message', `message--${block.kind}`, block.streaming && 'message--streaming')}
                 data-transcript-block
+                data-stream-tone={block.streaming ? streamingActivity.tone : undefined}
                 aria-busy={block.streaming ? true : undefined}
                 key={block.id}
               >
@@ -3499,14 +4543,27 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
                     {block.streaming && (
                       <span className="message__streaming-indicator" aria-hidden="true">
                         <span className="message__streaming-dot" aria-hidden="true" />
-                        <span>Live</span>
+                        <span>{streamLabel}</span>
                       </span>
                     )}
                   </span>
                   <time>{block.time}</time>
                 </header>
                 <div className="message__body">
-                  <TranscriptBody body={block.body} kind={block.kind} />
+                  {block.streaming && !hasVisibleStreamText ? (
+                    <div className="message__thinking" aria-hidden="true">
+                      <span className="message__thinking-copy">
+                        <strong>{streamingActivity.label}</strong>
+                        <small>{streamingActivity.detail}</small>
+                      </span>
+                      <span className="message__thinking-track" aria-hidden="true" />
+                    </div>
+                  ) : (
+                    <>
+                      <TranscriptBody body={block.body} kind={block.kind} />
+                      {block.streaming && <span className="message__streaming-caret" aria-hidden="true" />}
+                    </>
+                  )}
                   {block.detail && <p className="message__detail">{block.detail}</p>}
                   {block.receipt && (
                     <details className="message__receipt">
@@ -3548,27 +4605,42 @@ function Transcript({ thread }: { thread: ThreadSummary }) {
       )}
     </div>
   )
+})
+
+interface ComposerHandle {
+  prefill: (expectedAuthorityKey: string, text: string) => boolean
 }
 
 interface ComposerProps {
+  authorityKey: string
+  initialText: string
+  handleRef: RefObject<ComposerHandle | null>
   connection: ConnectionState
   authorityVerified: boolean
   hostName: string
   taskState: TaskState
   runtime: RuntimeSummary
-  text: string
-  onTextChange: (value: string) => void
+  agents: WorkbenchSnapshot['agents']
+  onDraftChange: (authorityKey: string, value: string) => void
+  onClearValidation: () => void
+  showTaskStarters?: boolean
   validationError: string
   receipt: ComposerReceiptView
   canStartTurn: boolean
   canStopTurn: boolean
+  canEndResident: boolean
+  canResumeResidentEnd: boolean
+  sessionNeedsRecovery: boolean
+  residentEndPreparing: boolean
   modelCatalogAvailable: boolean
   onOpenModelCatalog: (trigger: HTMLElement) => void
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+  onManageSession?: (trigger: HTMLElement) => void
+  onSubmitText: (text: string, form: HTMLFormElement) => Promise<boolean>
   onStop: () => void
+  onEndResident: (trigger: HTMLElement) => void
 }
 
-type SessionContinuityTone = 'ready' | 'working' | 'needs-you' | 'reconnecting'
+type SessionContinuityTone = 'ready' | 'working' | 'needs-you' | 'reconnecting' | 'ended'
 
 function sessionContinuityPresentation(
   connection: ConnectionState,
@@ -3577,13 +4649,48 @@ function sessionContinuityPresentation(
   taskState: TaskState,
   runtime: RuntimeSummary,
   receipt: ComposerReceiptView,
-): { label: 'Ready' | 'Working' | 'Needs you' | 'Reconnecting'; detail: string; icon: LucideIcon; tone: SessionContinuityTone } {
+  canStartTurn: boolean,
+  sessionNeedsRecovery: boolean,
+): { label: 'Ready' | 'Starting' | 'Working' | 'Needs you' | 'Reconnecting' | 'Ending' | 'Ended'; detail: string; icon: LucideIcon; tone: SessionContinuityTone } {
   if (connection !== 'online' || !authorityVerified) {
     return {
       label: 'Reconnecting',
       detail: `Reconnecting to ${hostName}. Saved activity is available; current status is unverified.`,
       icon: RefreshCw,
       tone: 'reconnecting',
+    }
+  }
+
+  if (receipt.operation === 'end') {
+    if (receipt.state === 'uncertain' || receipt.state === 'rejected') {
+      return {
+        label: 'Needs you',
+        detail: `The resident End outcome on ${hostName} is unknown. Prime Continuim will not send another End; review its retained status.`,
+        icon: AlertCircle,
+        tone: 'needs-you',
+      }
+    }
+    if (receipt.state === 'idle') {
+      return {
+        label: 'Ended',
+        detail: `The resident session on ${hostName} ended. The saved thread and workspace remain available.`,
+        icon: CheckCircle2,
+        tone: 'ended',
+      }
+    }
+    if (receipt.retryable === true) {
+      return {
+        label: 'Needs you',
+        detail: 'One action left.',
+        icon: AlertCircle,
+        tone: 'needs-you',
+      }
+    }
+    return {
+      label: 'Ending',
+      detail: receipt.message || `Finishing the resident session on ${hostName}.`,
+      icon: Clock3,
+      tone: 'working',
     }
   }
 
@@ -3600,17 +4707,27 @@ function sessionContinuityPresentation(
     }
   }
 
-  if (residentControlOperation && (receipt.state === 'sending' || receipt.state === 'sent')) {
-    const detail = receipt.operation === 'abort'
-      ? receipt.state === 'sending'
-        ? `Requesting a safe stop on ${hostName}.`
-        : `Stop was accepted on ${hostName}; waiting for authoritative idle proof.`
-      : receipt.state === 'sending'
+  if (
+    receipt.operation === 'prompt'
+    && (receipt.state === 'sending' || receipt.state === 'sent')
+    && taskState !== 'running'
+  ) {
+    return {
+      label: 'Starting',
+      detail: receipt.state === 'sending'
         ? `Delegating this task to Prime Agent on ${hostName}.`
-        : `Prime Agent owns this task on ${hostName}; waiting for authoritative activity.`
+        : `Prime Agent owns this task on ${hostName}; waiting for authoritative activity.`,
+      icon: Activity,
+      tone: 'working',
+    }
+  }
+
+  if (receipt.operation === 'abort' && (receipt.state === 'sending' || receipt.state === 'sent')) {
     return {
       label: 'Working',
-      detail,
+      detail: receipt.state === 'sending'
+        ? `Requesting a safe stop on ${hostName}.`
+        : `Stop was accepted on ${hostName}; waiting for authoritative idle proof.`,
       icon: Activity,
       tone: 'working',
     }
@@ -3647,6 +4764,17 @@ function sessionContinuityPresentation(
     }
   }
 
+  if (verifiedResident && !canStartTurn) {
+    return {
+      label: 'Needs you',
+      detail: sessionNeedsRecovery
+        ? `Prime Agent could not attach this saved session on ${hostName}. End it, then start a new agent in this workspace.`
+        : `This resident session is not ready for a new prompt on ${hostName}.`,
+      icon: AlertCircle,
+      tone: 'needs-you',
+    }
+  }
+
   return {
     label: 'Ready',
     detail: verifiedResident
@@ -3665,20 +4793,86 @@ function SessionContinuity({
   hostName,
   taskState,
   runtime,
+  agents,
   receipt,
-}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'hostName' | 'taskState' | 'runtime' | 'receipt'>) {
+  canStartTurn,
+  sessionNeedsRecovery,
+  onManageSession,
+}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'hostName' | 'taskState' | 'runtime' | 'agents' | 'receipt' | 'canStartTurn' | 'sessionNeedsRecovery' | 'onManageSession'>) {
   const isFresh = connection === 'online' && authorityVerified
   const reportedGoals = runtime.goals
   const activeGoal = reportedGoals?.find((goal) => goal.state === 'active')
   const interruptedGoal = reportedGoals?.find((goal) => goal.state !== 'complete')
   const displayedGoal = activeGoal ?? interruptedGoal
-  const goalCopy = displayedGoal?.objective ?? (reportedGoals ? 'No active goal' : 'Goal state unavailable')
-  const queuedActions = runtime.session?.queuedActionCount
+  const baseContinuity = sessionContinuityPresentation(connection, authorityVerified, hostName, taskState, runtime, receipt, canStartTurn, sessionNeedsRecovery)
+  const activeAgents = agents.filter((agent) =>
+    agent.status === 'pending' ||
+    agent.status === 'queued' ||
+    agent.status === 'running' ||
+    agent.status === 'waiting'
+  )
+  const activity = agentActivityPresentation(runtime, agents)
+  const sessionReportsActivity = Boolean(
+    isFresh &&
+    (baseContinuity.label === 'Ready' || baseContinuity.label === 'Starting' || baseContinuity.label === 'Working') && (
+    taskState === 'running' ||
+    ((taskState === 'idle' || taskState === 'complete') && (
+      activeAgents.length > 0 ||
+      runtime.session?.isStreaming ||
+      runtime.session?.isBashRunning ||
+      runtime.session?.isCompacting
+    ))
+    ),
+  )
+  const attentionCopy = sessionNeedsRecovery
+    ? 'Restart session'
+    : taskState === 'needs_approval'
+      ? 'Approval required'
+      : taskState === 'waiting'
+        ? 'Input required'
+        : taskState === 'failed'
+          ? 'Review session'
+          : 'Review status'
+  const goalCopy = receipt.operation === 'end'
+    ? receipt.state === 'idle'
+      ? 'Session ended'
+      : receipt.retryable === true
+        ? 'End ready'
+        : receipt.state === 'uncertain' || receipt.state === 'rejected'
+          ? 'Review required'
+          : 'Finishing session'
+    : baseContinuity.label === 'Needs you'
+      ? attentionCopy
+      : sessionReportsActivity
+        ? activity.detail
+        : displayedGoal?.objective ?? (reportedGoals ? 'No active goal' : 'Goal state unavailable')
+  const session = runtime.session
+  const queuedActions = session?.queuedActionCount
   const hostCommands = runtime.queue?.pendingCount
+  const exactResidentBinding = Boolean(
+    isFresh &&
+    session?.residency === 'resident' &&
+    session.activeSessionId &&
+    session.sessionId,
+  )
+  const modelCopy = readableModelName(session?.model) ?? 'Model unavailable'
+  const exactBindingCopy = exactResidentBinding
+    ? `${modelCopy} · ${runtime.browserExecution?.readiness === 'ready' ? 'Browser ready' : 'Browser off'}`
+    : undefined
+  const queueShowsExactBinding = Boolean(
+    exactBindingCopy &&
+    !runtime.queue?.paused &&
+    (hostCommands ?? 0) === 0 &&
+    (queuedActions ?? 0) === 0,
+  )
   const queueStateCopy = runtime.queue?.paused
     ? `Host queue paused · ${hostCommands ?? 0} pending`
     : hostCommands !== undefined && hostCommands > 0
       ? `${hostCommands} host ${hostCommands === 1 ? 'command' : 'commands'} queued${queuedActions ? ` · ${queuedActions} session ${queuedActions === 1 ? 'action' : 'actions'}` : ''}`
+      : taskState === 'running' && activeAgents.length > 0
+        ? `${activeAgents.length} ${activeAgents.length === 1 ? 'branch' : 'branches'} active`
+      : queueShowsExactBinding
+        ? exactBindingCopy
       : queuedActions !== undefined
         ? queuedActions === 0
           ? 'No actions queued'
@@ -3686,10 +4880,25 @@ function SessionContinuity({
         : runtime.queue
           ? 'No host commands queued'
           : 'Queue state unavailable'
-  const queueCopy = isFresh || queueStateCopy === 'Queue state unavailable'
-    ? queueStateCopy
-    : `Cached · ${queueStateCopy}`
-  const continuity = sessionContinuityPresentation(connection, authorityVerified, hostName, taskState, runtime, receipt)
+  const queueCopy = receipt.operation === 'end'
+    ? receipt.state === 'idle'
+      ? 'Saved thread retained'
+      : receipt.retryable === true
+        ? 'No End request sent'
+        : receipt.state === 'uncertain' || receipt.state === 'rejected'
+          ? 'Status needs review'
+          : 'Checking completion'
+    : isFresh || queueStateCopy === 'Queue state unavailable'
+      ? queueStateCopy
+      : `Cached · ${queueStateCopy}`
+  const continuity = sessionReportsActivity && baseContinuity.label === 'Ready'
+    ? {
+        label: 'Working' as const,
+        detail: activity.detail,
+        icon: Activity,
+        tone: 'working' as const,
+      }
+    : baseContinuity
 
   return (
     <section className="session-continuity" aria-label="Session status">
@@ -3709,15 +4918,89 @@ function SessionContinuity({
         </span>
         <small>{continuity.detail}</small>
       </span>
-      <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
-        <Icon icon={runtime.queue?.paused ? Clock3 : ListChecks} size={13} />
-        <span title={queueCopy}>{queueCopy}</span>
+      <span className="session-continuity__actions">
+        <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
+          <Icon icon={runtime.queue?.paused ? Clock3 : taskState === 'running' && activeAgents.length > 0 ? GitFork : queueShowsExactBinding ? ShieldCheck : ListChecks} size={13} />
+          <span title={queueCopy}>{queueCopy}</span>
+        </span>
+        {onManageSession && (
+          <button
+            className="session-continuity__manage"
+            type="button"
+            onClick={(event) => onManageSession(event.currentTarget)}
+          >
+            <span className="session-continuity__manage-icon"><Icon icon={MoreHorizontal} size={16} /></span>
+            <span className="session-continuity__manage-label">
+            {receipt.operation === 'end'
+              ? receipt.retryable === true
+                ? 'Session details'
+                : receipt.state === 'uncertain' || receipt.state === 'rejected'
+                  ? 'Review ending'
+                  : 'View status'
+              : 'Session'}
+            </span>
+          </button>
+        )}
       </span>
     </section>
   )
 }
 
-function Composer({ connection, authorityVerified, hostName, taskState, runtime, text, onTextChange, validationError, receipt, canStartTurn, canStopTurn, modelCatalogAvailable, onOpenModelCatalog, onSubmit, onStop }: ComposerProps) {
+function TaskStarters({
+  disabled,
+  text,
+  onSelect,
+}: {
+  disabled: boolean
+  text: string
+  onSelect: (prompt: string) => void
+}) {
+  return (
+    <div className="task-starters" role="group" aria-label="Start with a task template">
+      {TASK_STARTERS.map((starter) => (
+        <button
+          className="task-starters__item"
+          type="button"
+          key={starter.id}
+          disabled={disabled}
+          aria-pressed={text === starter.prompt}
+          title={`${starter.label}. Prefills an editable task and never sends automatically.`}
+          onClick={() => onSelect(starter.prompt)}
+        >
+          <Icon icon={starter.icon} size={14} />
+          <span>{starter.label}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, hostName, taskState, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, sessionNeedsRecovery, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
+  const [text, setText] = useState(initialText)
+  const submissionInFlightRef = useRef(false)
+  const committedAuthorityKeyRef = useRef(authorityKey)
+
+  useLayoutEffect(() => {
+    if (committedAuthorityKeyRef.current === authorityKey) return
+    committedAuthorityKeyRef.current = authorityKey
+    submissionInFlightRef.current = false
+    setText(initialText)
+  }, [authorityKey, initialText])
+
+  const replaceDraft = useCallback((nextText: string) => {
+    setText(nextText)
+    onDraftChange(authorityKey, nextText)
+    onClearValidation()
+  }, [authorityKey, onClearValidation, onDraftChange])
+
+  useImperativeHandle(handleRef, () => ({
+    prefill(expectedAuthorityKey, nextText) {
+      if (expectedAuthorityKey !== authorityKey) return false
+      replaceDraft(nextText)
+      return true
+    },
+  }), [authorityKey, replaceDraft])
+
   const disconnected = connection !== 'online'
   const projectionReportsRunning = taskState === 'running'
   const promptSending = receipt.operation === 'prompt' && receipt.state === 'sending'
@@ -3729,6 +5012,18 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
   const endCompleted = endLifecyclePresent && receipt.state === 'idle'
   const endOutcomeUnknown = endLifecyclePresent && receipt.state === 'uncertain'
   const endPending = endLifecyclePresent && !endCompleted
+  const endReadyToFinish = Boolean(
+    endPending &&
+    (receipt.retryable === true || endOutcomeUnknown) &&
+    canResumeResidentEnd &&
+    !disconnected &&
+    authorityVerified,
+  )
+  const endWaitingForControls = Boolean(
+    endPending &&
+    receipt.retryable === true &&
+    !endReadyToFinish,
+  )
   const abortControlPending = Boolean(
     receipt.operation === 'abort' &&
     (receipt.state === 'sending' || receipt.state === 'sent' || receipt.state === 'uncertain'),
@@ -3743,6 +5038,16 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
   const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
   const controlMode = running || endLifecyclePresent
   const canAct = endLifecyclePresent ? false : running ? canStopNow : canStartNow
+  const sessionRecoveryAvailable = Boolean(
+    sessionNeedsRecovery &&
+    !disconnected &&
+    authorityVerified &&
+    residentAttached &&
+    !running &&
+    !endLifecyclePresent &&
+    !canStartNow &&
+    canEndResident,
+  )
   const unavailableCopy = disconnected
     ? residentControlPending
       ? `Resident control is retained locally. Reconnect to ${hostName} for authoritative status.`
@@ -3751,7 +5056,9 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
       ? 'Resident control is unavailable until this host reports an existing attached Prime Agent session.'
       : running
         ? 'Prime Agent does not report a stoppable active turn.'
-        : 'This resident session is not ready for a new prompt.'
+        : sessionNeedsRecovery
+          ? 'Prime Agent could not attach this saved session. End it, then start a new agent.'
+          : 'This resident session is not ready for a new prompt. Refresh the thread or reconnect its host.'
   const defaultStatus = disconnected
     ? residentControlPending
       ? `Resident control retained · reconnect to ${hostName} for authoritative status`
@@ -3767,11 +5074,17 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
     : canStartTurn
       ? 'Ready to delegate a task'
       : unavailableCopy
-  const receiptStatusCopy = receipt.operation && receipt.state !== 'idle'
-    ? receipt.message || defaultStatus
-    : disconnected
+  const receiptStatusCopy = endWaitingForControls
+    ? 'Waiting for resident controls'
+    : endReadyToFinish
+      ? 'No End request sent'
+    : !canAct && !running && !endLifecyclePresent
       ? defaultStatus
-      : receipt.message || defaultStatus
+    : receipt.operation && receipt.state !== 'idle'
+      ? receipt.message || defaultStatus
+      : disconnected
+        ? defaultStatus
+        : receipt.message || defaultStatus
   const statusCopy = validationError || receiptStatusCopy
   const statusState = validationError || receipt.state === 'rejected'
     ? 'rejected'
@@ -3781,9 +5094,13 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
   const primaryLabel = endLifecyclePresent
     ? endCompleted
       ? 'Session ended'
-      : endOutcomeUnknown
-        ? 'End outcome unknown'
-        : 'End pending'
+      : endReadyToFinish
+        ? residentEndPreparing ? 'Finishing…' : endOutcomeUnknown ? 'Try ending again' : 'Finish ending'
+        : endOutcomeUnknown
+          ? 'End outcome unknown'
+          : endWaitingForControls
+            ? 'End saved'
+          : 'Finishing session'
     : running
     ? stopOutcomeUnknown
       ? 'Outcome unknown'
@@ -3806,9 +5123,13 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
   const intentCopy = endLifecyclePresent
     ? endCompleted
       ? 'Resident session ended'
-      : endOutcomeUnknown
-        ? 'End outcome unknown'
-        : 'Ending resident session'
+      : endReadyToFinish
+        ? endOutcomeUnknown ? 'End needs one retry' : 'Ready to close'
+        : endOutcomeUnknown
+          ? 'End outcome unknown'
+          : endWaitingForControls
+            ? 'End saved'
+          : 'Finishing resident session'
     : stopOutcomeUnknown
     ? 'Stop outcome unknown'
     : retryingStop
@@ -3829,23 +5150,56 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
                     : projectionReportsRunning
                       ? 'Active resident turn'
                       : 'Resident turn owned'
-                  : 'Delegate a task'
+                  : sessionNeedsRecovery
+                    ? 'Session needs a restart'
+                    : 'Delegate a task'
 
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
-      <SessionContinuity connection={connection} authorityVerified={authorityVerified} hostName={hostName} taskState={taskState} runtime={runtime} receipt={receipt} />
+      {!endReadyToFinish && (
+        <SessionContinuity connection={connection} authorityVerified={authorityVerified} hostName={hostName} taskState={taskState} runtime={runtime} agents={agents} receipt={receipt} canStartTurn={canStartTurn} sessionNeedsRecovery={sessionNeedsRecovery} onManageSession={onManageSession} />
+      )}
+      {!compactComposer && showTaskStarters && (
+        <TaskStarters
+          disabled={!canStartNow || promptSending}
+          text={text}
+          onSelect={replaceDraft}
+        />
+      )}
       <form
-        className={cx('composer', compactComposer && 'composer--compact', controlMode && 'composer--running')}
+        className={cx(
+          'composer',
+          compactComposer && 'composer--compact',
+          controlMode && 'composer--running',
+          endReadyToFinish && 'composer--end-ready',
+        )}
         onSubmit={(event) => {
-          if (promptSending) {
-            event.preventDefault()
-            return
-          }
-          onSubmit(event)
+          event.preventDefault()
+          if (promptSending || submissionInFlightRef.current) return
+          const submittedText = text
+          const submittedAuthorityKey = authorityKey
+          const form = event.currentTarget
+          submissionInFlightRef.current = true
+          void onSubmitText(submittedText, form).then((clearExactDraft) => {
+            if (clearExactDraft && committedAuthorityKeyRef.current === submittedAuthorityKey) {
+              setText((current) => current === submittedText ? '' : current)
+            }
+          }).catch(() => {
+            // The root submit path turns expected failures into an explicit
+            // receipt. Contain an unexpected rejection here so it cannot
+            // escape React or strand the exact submission guard.
+          }).finally(() => {
+            if (committedAuthorityKeyRef.current === submittedAuthorityKey) {
+              submissionInFlightRef.current = false
+            }
+          })
         }}
-        aria-label="Prime Agent prompt"
-        aria-disabled={!canAct || promptSending}
-        aria-busy={promptSending || stopSending ? true : undefined}
+        aria-label={endLifecyclePresent
+          ? 'Resident session ending'
+          : running
+            ? 'Prime Agent controls'
+            : 'Prime Agent prompt'}
+        aria-busy={promptSending || stopSending || residentEndPreparing ? true : undefined}
       >
         <div className="composer__toolbar">
           <span className="composer__intent">
@@ -3866,6 +5220,26 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
           </span>
         </div>
 
+        {sessionRecoveryAvailable && (
+          <div className="composer-recovery" role="note">
+            <span className="composer-recovery__icon"><Icon icon={RefreshCw} size={15} /></span>
+            <span className="composer-recovery__copy">
+              <strong>End this inactive session</strong>
+              <small>Your saved thread stays in this project. Start a new agent afterward.</small>
+            </span>
+            <button
+              className="button button--secondary composer-recovery__action"
+              type="button"
+              disabled={residentEndPreparing}
+              aria-busy={residentEndPreparing || undefined}
+              onClick={(event) => onEndResident(event.currentTarget)}
+            >
+              <Icon icon={residentEndPreparing ? Loader2 : Square} size={13} />
+              {residentEndPreparing ? 'Preparing…' : 'End session…'}
+            </button>
+          </div>
+        )}
+
         {!compactComposer && (
           <>
             <label className="sr-only" htmlFor="thread-composer">Task brief</label>
@@ -3880,7 +5254,7 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
                   ? 'Describe the outcome, constraints, and done criteria…'
                   : 'Resident prompt unavailable'}
               disabled={textareaDisabled}
-              onChange={(event) => onTextChange(event.target.value)}
+              onChange={(event) => replaceDraft(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
                 if (!promptSending && (event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                   event.preventDefault()
@@ -3895,7 +5269,7 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
 
         <div className="composer__actions">
           <div className="composer__secondary-actions">
-            {modelCatalogAvailable && (
+            {modelCatalogAvailable && !endLifecyclePresent && (
               <button
                 className="model-chip"
                 type="button"
@@ -3911,7 +5285,11 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
               {endLifecyclePresent
                 ? endCompleted
                   ? 'The saved thread and workspace remain available'
-                  : 'Resident mutations stay locked while the durable end outcome settles'
+                  : endReadyToFinish
+                    ? 'One action left'
+                    : endWaitingForControls
+                      ? 'Waiting for resident controls'
+                    : 'Prime Continuim is checking for completion automatically'
                 : running
                 ? disconnected
                   ? unavailableCopy
@@ -3926,17 +5304,26 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
               id="resident-turn-primary"
               className={cx(
                 'button',
-                controlMode ? 'button--stop' : 'button--primary',
+                endReadyToFinish ? 'button--primary' : controlMode ? 'button--stop' : 'button--primary',
                 !controlMode && !text.trim() && 'button--empty',
               )}
               type={controlMode ? 'button' : 'submit'}
-              disabled={endLifecyclePresent || (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending)}
+              disabled={(endLifecyclePresent && (!endReadyToFinish || residentEndPreparing)) || (!endLifecyclePresent && (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending))}
+              aria-busy={endLifecyclePresent && residentEndPreparing ? true : undefined}
               aria-label={endLifecyclePresent
                 ? endCompleted
                   ? 'Resident session ended; the saved thread and workspace remain available'
-                  : endOutcomeUnknown
-                    ? 'Resident end outcome unknown; inspect the durable lifecycle status'
-                    : 'Resident session end is durably pending'
+                  : endReadyToFinish
+                    ? residentEndPreparing
+                      ? 'Finishing this resident session'
+                      : endOutcomeUnknown
+                        ? 'Try ending this resident session again'
+                        : 'Finish ending this resident session'
+                    : endOutcomeUnknown
+                      ? 'Resident end outcome unknown; inspect the durable lifecycle status'
+                      : endWaitingForControls
+                        ? 'End saved; waiting for resident controls'
+                      : 'Resident session is finishing'
                 : running
                 ? disconnected
                   ? 'Reconnect to verify and control this resident turn'
@@ -3952,14 +5339,18 @@ function Composer({ connection, authorityVerified, hostName, taskState, runtime,
                 : promptSending
                   ? 'Prompt is awaiting durable host admission'
                   : undefined}
-              onClick={!endLifecyclePresent && running ? onStop : undefined}
+              onClick={endReadyToFinish
+                ? (event) => onEndResident(event.currentTarget)
+                : !endLifecyclePresent && running ? onStop : undefined}
             >
               {endLifecyclePresent
                 ? endCompleted
                   ? <Icon icon={Check} size={15} />
-                  : endOutcomeUnknown
-                    ? <Icon icon={AlertCircle} size={15} />
-                    : <Icon icon={Clock3} size={15} />
+                  : endReadyToFinish
+                    ? <Icon icon={residentEndPreparing ? Loader2 : ArrowRight} size={15} strokeWidth={2} />
+                    : endOutcomeUnknown
+                      ? <Icon icon={AlertCircle} size={15} />
+                      : <Icon icon={Clock3} size={15} />
                 : stopSending || promptSending
                 ? <Icon icon={Loader2} size={15} />
                 : stopAwaitingProof
@@ -3987,18 +5378,21 @@ interface InspectorProps {
   selectedHost: HostSummary
   runtime: RuntimeSummary
   activeTab: InspectorTab
+  open: boolean
   onTabChange: (tab: InspectorTab) => void
   onClose: () => void
   containerRef: RefObject<HTMLElement | null>
   modal: boolean
   inert: boolean
   canEndResident: boolean
+  residentLifecycleBusy: boolean
   residentEndPreparing: boolean
   residentEndError: string
-  onEndResident: (trigger: HTMLElement) => void
+  onCheckResident: (operation: ResidentLifecycleOperationSummary) => void
+  onEndResident: (trigger: HTMLElement, recovery?: ResidentLifecycleOperationSummary) => void
 }
 
-function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentEndPreparing, residentEndError, onEndResident }: InspectorProps) {
+function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, open, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentLifecycleBusy, residentEndPreparing, residentEndError, onCheckResident, onEndResident }: InspectorProps) {
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const activateRelativeTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex = index
@@ -4055,36 +5449,95 @@ function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHos
         tabIndex={0}
         aria-labelledby={`inspector-tab-${activeTab.toLowerCase()}`}
       >
-        {activeTab === 'Changes' && <ChangesPanel snapshot={snapshot} />}
-        {activeTab === 'Runtime' && (
-          <RuntimePanel
-            key={selectedThread.id}
-            snapshot={snapshot}
-            thread={selectedThread}
-            host={selectedHost}
-            runtime={runtime}
-            canEndResident={canEndResident}
-            endPreparing={residentEndPreparing}
-            endError={residentEndError}
-            onEndResident={onEndResident}
-          />
-        )}
-        {activeTab === 'Evidence' && (
-          <EvidencePanel
-            key={`${selectedHost.id}\u0000${selectedThread.remoteId ?? selectedThread.id}\u0000${selectedThread.executionGenerationId ?? ''}`}
-            api={api}
-            snapshot={snapshot}
-            thread={selectedThread}
-            host={selectedHost}
-          />
-        )}
-        {activeTab === 'Context' && (
-          <ContextPanel project={selectedProject} host={selectedHost} />
-        )}
+        <InspectorPanelContent
+          api={api}
+          snapshot={snapshot}
+          selectedThread={selectedThread}
+          selectedProject={selectedProject}
+          selectedHost={selectedHost}
+          runtime={runtime}
+          activeTab={activeTab}
+          open={open}
+          canEndResident={canEndResident}
+          residentLifecycleBusy={residentLifecycleBusy}
+          residentEndPreparing={residentEndPreparing}
+          residentEndError={residentEndError}
+          onCheckResident={onCheckResident}
+          onEndResident={onEndResident}
+        />
       </div>
     </aside>
   )
 }
+
+type InspectorPanelContentProps = Pick<
+  InspectorProps,
+  | 'api'
+  | 'snapshot'
+  | 'selectedThread'
+  | 'selectedProject'
+  | 'selectedHost'
+  | 'runtime'
+  | 'activeTab'
+  | 'open'
+  | 'canEndResident'
+  | 'residentLifecycleBusy'
+  | 'residentEndPreparing'
+  | 'residentEndError'
+  | 'onCheckResident'
+  | 'onEndResident'
+>
+
+const InspectorPanelContent = memo(function InspectorPanelContent({
+  api,
+  snapshot,
+  selectedThread,
+  selectedProject,
+  selectedHost,
+  runtime,
+  activeTab,
+  canEndResident,
+  residentLifecycleBusy,
+  residentEndPreparing,
+  residentEndError,
+  onCheckResident,
+  onEndResident,
+}: InspectorPanelContentProps) {
+  if (activeTab === 'Changes') return <ChangesPanel snapshot={snapshot} />
+  if (activeTab === 'Session') {
+    return (
+      <RuntimePanel
+        key={selectedThread.id}
+        snapshot={snapshot}
+        thread={selectedThread}
+        host={selectedHost}
+        runtime={runtime}
+        canEndResident={canEndResident}
+        residentLifecycleBusy={residentLifecycleBusy}
+        endPreparing={residentEndPreparing}
+        endError={residentEndError}
+        onCheckResident={onCheckResident}
+        onEndResident={onEndResident}
+      />
+    )
+  }
+  if (activeTab === 'Evidence') {
+    return (
+      <EvidencePanel
+        key={`${selectedHost.id}\u0000${selectedThread.remoteId ?? selectedThread.id}\u0000${selectedThread.executionGenerationId ?? ''}`}
+        api={api}
+        snapshot={snapshot}
+        thread={selectedThread}
+        host={selectedHost}
+      />
+    )
+  }
+  return <ContextPanel project={selectedProject} host={selectedHost} />
+}, (previous, next) => (
+  !previous.open
+  && !next.open
+  && previous.activeTab === next.activeTab
+))
 
 function PanelHeading({ icon, title, meta }: { icon: LucideIcon; title: string; meta: string }) {
   return (
@@ -4127,14 +5580,6 @@ function runtimeStateLabel(state: string): string {
   return state.replaceAll('_', ' ').replace(/^./, (character) => character.toUpperCase())
 }
 
-function compactDuration(milliseconds: number): string {
-  const seconds = Math.round(milliseconds / 1_000)
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.round(seconds / 60)
-  if (minutes < 60) return `${minutes}m`
-  return `${Math.round(minutes / 60)}h`
-}
-
 const SCHEDULE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   month: 'short',
   day: 'numeric',
@@ -4147,55 +5592,7 @@ function scheduleTime(value?: string): string | undefined {
   return SCHEDULE_TIME_FORMATTER.format(new Date(value))
 }
 
-function agentHierarchy(
-  agent: WorkbenchSnapshot['agents'][number],
-  byId: ReadonlyMap<string, WorkbenchSnapshot['agents'][number]>,
-): {
-  depth: number
-  parent?: WorkbenchSnapshot['agents'][number]
-} {
-  const parent = agent.parentId && agent.parentId !== agent.id ? byId.get(agent.parentId) : undefined
-  const visited = new Set([agent.id])
-  let cursor = parent
-  let depth = 0
-  while (cursor && !visited.has(cursor.id) && depth < 4) {
-    visited.add(cursor.id)
-    depth += 1
-    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined
-  }
-  return { depth, parent }
-}
-
-function parentFirstAgents(agents: WorkbenchSnapshot['agents']): WorkbenchSnapshot['agents'] {
-  const byId = new Map(agents.map((agent) => [agent.id, agent]))
-  const children = new Map<string, WorkbenchSnapshot['agents']>()
-  const roots: WorkbenchSnapshot['agents'] = []
-  for (const agent of agents) {
-    if (agent.parentId && agent.parentId !== agent.id && byId.has(agent.parentId)) {
-      const siblings = children.get(agent.parentId) ?? []
-      siblings.push(agent)
-      children.set(agent.parentId, siblings)
-    } else {
-      roots.push(agent)
-    }
-  }
-
-  const ordered: WorkbenchSnapshot['agents'] = []
-  const visited = new Set<string>()
-  const visit = (agent: WorkbenchSnapshot['agents'][number]): void => {
-    if (visited.has(agent.id)) return
-    visited.add(agent.id)
-    ordered.push(agent)
-    children.get(agent.id)?.forEach(visit)
-  }
-  roots.forEach(visit)
-  // Cycles have no root. Preserve their first-seen order without duplication.
-  agents.forEach(visit)
-  return ordered
-}
-
 const RUNTIME_GOAL_INCREMENT = 20
-const RUNTIME_AGENT_INCREMENT = 50
 const RUNTIME_SCHEDULE_INCREMENT = 20
 
 function runtimeReadinessCopy(readiness: HostRuntimeReadiness | undefined): {
@@ -4256,8 +5653,10 @@ function RuntimePanel({
   host,
   runtime,
   canEndResident,
+  residentLifecycleBusy,
   endPreparing,
   endError,
+  onCheckResident,
   onEndResident,
 }: {
   snapshot: WorkbenchSnapshot
@@ -4265,14 +5664,18 @@ function RuntimePanel({
   host: HostSummary
   runtime: RuntimeSummary
   canEndResident: boolean
+  residentLifecycleBusy: boolean
   endPreparing: boolean
   endError: string
-  onEndResident: (trigger: HTMLElement) => void
+  onCheckResident: (operation: ResidentLifecycleOperationSummary) => void
+  onEndResident: (trigger: HTMLElement, recovery?: ResidentLifecycleOperationSummary) => void
 }) {
   const [goalLimit, setGoalLimit] = useState(RUNTIME_GOAL_INCREMENT)
-  const [agentLimit, setAgentLimit] = useState(RUNTIME_AGENT_INCREMENT)
   const [scheduleLimit, setScheduleLimit] = useState(RUNTIME_SCHEDULE_INCREMENT)
   const session = runtime.session
+  const resourceInventory = session?.resourceInventory
+  const browserExecution = runtime.browserExecution
+  const visibleSkills = resourceInventory?.skills.slice(0, 8) ?? []
   const readinessCopy = runtimeReadinessCopy(host.runtimeReadiness)
   const agentsReported = runtime.agentsReported === true
   const hasAnyRuntimeReport = Boolean(
@@ -4280,9 +5683,7 @@ function RuntimePanel({
   )
   const reportedAgents = agentsReported ? snapshot.agents : []
   const runningAgents = reportedAgents.filter((agent) => agent.status === 'running').length
-  const agentsById = new Map(reportedAgents.map((agent) => [agent.id, agent]))
-  const orderedAgents = parentFirstAgents(reportedAgents)
-  const visibleAgents = orderedAgents.slice(0, agentLimit)
+  const rootActivity = agentActivityPresentation(runtime, reportedAgents)
   const visibleGoals = runtime.goals?.slice(0, goalLimit)
   const visibleSchedules = runtime.schedules?.slice(0, scheduleLimit)
   const activeGoals = runtime.goals?.filter((goal) => goal.state === 'active') ?? []
@@ -4292,6 +5693,24 @@ function RuntimePanel({
   ].join(' · ')
   const isFresh = host.connection === 'online'
   const sessionId = session?.activeSessionId ?? session?.sessionId
+  const residentEndOperation = thread.executionGenerationId
+    ? snapshot.residentLifecycleOperations.find((operation) =>
+        operation.kind === 'end' &&
+        operation.expectedHostId === thread.hostId &&
+        operation.threadId === (thread.remoteId ?? thread.id) &&
+        operation.executionGenerationId === thread.executionGenerationId,
+      )
+    : undefined
+  const residentEndPresentation = residentEndOperation
+    ? residentLifecycleRecoveryCopy(residentEndOperation)
+    : undefined
+  const residentEndMutationBlock = residentEndOperation
+    ? residentLifecycleMutationBlock(residentEndOperation, snapshot, thread, host) ?? (
+        endError
+          ? 'capability_unavailable'
+          : null
+      )
+    : null
   const hostQueueCopy = runtime.queue
     ? runtime.queue.paused
       ? `${runtime.queue.pendingCount} pending · paused`
@@ -4299,14 +5718,14 @@ function RuntimePanel({
         ? 'No pending commands'
         : `${runtime.queue.pendingCount} pending`
     : 'Not reported'
-  const residencyCopy = session?.residency === 'resident'
+  const continuityCopy = session?.residency === 'resident'
     ? isFresh
-      ? 'Reported resident on host'
-      : 'Last reported resident · current status unverified'
+      ? 'Runs after the app closes'
+      : 'Last reported · runs after app closes'
     : session?.residency === 'client_owned'
       ? isFresh
-        ? 'Reported client-owned'
-        : 'Last reported client-owned · current status unverified'
+        ? 'Runs while this app stays connected'
+        : 'Last reported · runs while connected'
       : session
         ? 'Not reported'
         : 'No session report'
@@ -4315,7 +5734,7 @@ function RuntimePanel({
     <div className="inspector-content">
       <PanelHeading
         icon={Bot}
-        title="Reported runtime"
+        title="Agent session"
         meta={!hasAnyRuntimeReport
           ? 'Current thread · runtime not reported'
           : !session
@@ -4329,7 +5748,7 @@ function RuntimePanel({
 
       <section className="runtime-section" aria-labelledby="runtime-session-heading">
         <div className="runtime-section__heading">
-          <h3 id="runtime-session-heading">Status</h3>
+          <h3 id="runtime-session-heading">Overview</h3>
           {!isFresh && session && <span className="runtime-badge runtime-badge--warning">Cached state</span>}
           {isFresh && session && (session.isStreaming || session.isBashRunning || session.isCompacting || session.retryAttempt > 0) && (
             <span className="runtime-badges" aria-label="Runtime activity">
@@ -4357,20 +5776,26 @@ function RuntimePanel({
               </dd>
             </div>
           )}
-          <div><dt>Turn</dt><dd>{taskLabel(thread.status)}</dd></div>
-          <div><dt>Residency</dt><dd>{residencyCopy}</dd></div>
-          {sessionId && <div><dt>Session</dt><dd><bdi>{sessionId}</bdi></dd></div>}
-          {thread.executionGenerationId && <div><dt>Execution</dt><dd><bdi>{thread.executionGenerationId}</bdi></dd></div>}
-          {thread.workspaceId && <div><dt>Workspace</dt><dd><bdi>{thread.workspaceId}</bdi></dd></div>}
+          <div><dt>Turn</dt><dd>{residentEndPresentation?.label ?? taskLabel(thread.status)}</dd></div>
+          <div><dt>Continuity</dt><dd>{continuityCopy}</dd></div>
         </dl>
+        {(sessionId || thread.executionGenerationId || thread.workspaceId) && (
+          <details className="runtime-identifiers">
+            <summary>Technical identifiers</summary>
+            <dl className="runtime-facts">
+              {sessionId && <div><dt>Session</dt><dd><bdi>{sessionId}</bdi></dd></div>}
+              {thread.executionGenerationId && <div><dt>Execution</dt><dd><bdi>{thread.executionGenerationId}</bdi></dd></div>}
+              {thread.workspaceId && <div><dt>Workspace</dt><dd><bdi>{thread.workspaceId}</bdi></dd></div>}
+            </dl>
+          </details>
+        )}
         {!session && <p className="runtime-empty">This snapshot doesn’t report live Prime Agent session activity.</p>}
       </section>
 
-      {(thread.residentLifecycle?.state === 'ended' || session?.residency === 'resident') && (
+      {(residentEndOperation || thread.residentLifecycle?.state === 'ended' || session?.residency === 'resident') && (
       <section className="runtime-section runtime-section--lifecycle" aria-labelledby="runtime-lifecycle-heading">
         <div className="runtime-section__heading">
-          <h3 id="runtime-lifecycle-heading">Session lifecycle</h3>
-          <span>{thread.residentLifecycle?.state === 'ended' ? 'Ended' : 'Host-resident'}</span>
+          <h3 id="runtime-lifecycle-heading">Manage session</h3>
         </div>
         {thread.residentLifecycle?.state === 'ended' ? (
           <div className="resident-end-state resident-end-state--complete" role="status">
@@ -4383,13 +5808,20 @@ function RuntimePanel({
               </small>
             </span>
           </div>
+        ) : residentEndOperation ? (
+          <ResidentLifecycleRecoveryCard
+            operation={residentEndOperation}
+            mutationBlock={residentEndMutationBlock}
+            checkable={residentLifecycleHostIsCheckable(host)}
+            busy={residentLifecycleBusy || endPreparing}
+            onChoose={(event) => onEndResident(event.currentTarget, residentEndOperation)}
+            onCheck={() => onCheckResident(residentEndOperation)}
+            hideChooseAction
+          />
         ) : (
           <>
             <p className="runtime-note">
-              Closing Prime Continuim only detaches this app. Prime Agent keeps running on <bdi>{`${host.name}.`}</bdi>
-            </p>
-            <p className="runtime-note">
-              Ending is permanent for this runtime session. The saved thread and workspace remain available.
+              Close keeps Prime Agent running on <bdi>{host.name}</bdi>. End stops it; the task and files stay.
             </p>
             {(canEndResident || endPreparing) && (
               <button
@@ -4400,14 +5832,14 @@ function RuntimePanel({
                 onClick={(event) => onEndResident(event.currentTarget)}
               >
                 <Icon icon={endPreparing ? Loader2 : Square} size={14} />
-                {endPreparing ? 'Preparing end review…' : 'End resident session…'}
+                {endPreparing ? 'Preparing…' : 'End resident session…'}
               </button>
             )}
             {!canEndResident && !endPreparing && (
               <small className="runtime-empty">
                 {host.connection === 'online'
-                  ? 'A verified attached resident session is required before permanent ending can be reviewed.'
-                  : `Reconnect to ${host.name} before reviewing permanent ending.`}
+                  ? 'Attach this session before ending it.'
+                  : `Reconnect to ${host.name} to end this session.`}
               </small>
             )}
             {endError && <p className="form-error" role="alert">{endError}</p>}
@@ -4455,48 +5887,90 @@ function RuntimePanel({
             </>
           )}
         </div>
-        <div className="runtime-subsection" aria-labelledby="runtime-agents-heading">
-          <div className="runtime-subsection__heading">
-            <h4 id="runtime-agents-heading">Agents</h4>
-            <span>{agentsReported ? reportedAgents.length : 'Not reported'}</span>
-          </div>
-          {!agentsReported ? (
-            <p className="runtime-empty">Agent activity isn’t reported in this snapshot.</p>
-          ) : reportedAgents.length === 0 ? (
-            <p className="runtime-empty">No retained agents are reported for this session.</p>
-          ) : (
-            <ul className="agent-list">
-              {visibleAgents.map((agent) => {
-                const hierarchy = agentHierarchy(agent, agentsById)
-                return (
-                  <li data-runtime-agent key={agent.id} style={{ marginInlineStart: `${hierarchy.depth * 0.75}rem` }}>
-                    <span className={cx('agent-state', `agent-state--${agent.status}`)}>
-                      <Icon icon={agent.status === 'complete' ? Check : agent.status === 'running' ? Activity : agent.status === 'failed' ? AlertCircle : Clock3} size={14} />
-                    </span>
-                    <span className="agent-list__body">
-                      <strong>{agent.name}</strong>
-                      {hierarchy.parent && <span className="agent-list__parent">Subagent of {hierarchy.parent.name}</span>}
-                      <span>{agent.activity ?? agent.recap ?? agent.role}</span>
-                      <small>
-                        <bdi>{agent.hostName}</bdi> · {isFresh ? runtimeStateLabel(agent.status) : `Last reported ${runtimeStateLabel(agent.status).toLocaleLowerCase()}`}
-                        {agent.model ? ` · ${agent.model}` : ''}
-                        {agent.durationMs !== undefined ? ` · ${compactDuration(agent.durationMs)}` : ''}
-                        {agent.toolUseCount !== undefined ? ` · ${agent.toolUseCount.toLocaleString()} tool ${agent.toolUseCount === 1 ? 'use' : 'uses'}` : ''}
-                        {agent.tokenCount !== undefined ? ` · ${agent.tokenCount.toLocaleString()} tokens` : ''}
-                      </small>
-                      {agent.error && <span className="runtime-error">{agent.error}</span>}
-                    </span>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-          {agentsReported && reportedAgents.length > agentLimit && (
-            <button className="button button--secondary button--full runtime-more" type="button" onClick={() => setAgentLimit((limit) => limit + RUNTIME_AGENT_INCREMENT)}>
-              Show {Math.min(RUNTIME_AGENT_INCREMENT, reportedAgents.length - agentLimit)} more subagents
-            </button>
-          )}
+        <RlmDelegationPanel
+          agents={reportedAgents}
+          agentsReported={agentsReported}
+          isFresh={isFresh}
+          rootAvailable={Boolean(session)}
+          rootActive={Boolean(session && (
+            session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
+          ))}
+          rootLabel={rootActivity.label}
+          rootDetail={rootActivity.detail}
+          rootModel={session?.model}
+          rootThinkingLevel={session?.thinkingLevel}
+        />
+      </section>
+
+      <section className="runtime-section" aria-labelledby="runtime-capabilities-heading">
+        <div className="runtime-section__heading">
+          <h3 id="runtime-capabilities-heading">Capabilities</h3>
+          <span>{resourceInventory || browserExecution ? 'Exact session' : 'Not reported'}</span>
         </div>
+        {browserExecution && (
+          <dl className="runtime-facts">
+            <div>
+              <dt>Browser execution</dt>
+              <dd className={cx(
+                'runtime-integrity-fact',
+                browserExecution.readiness === 'ready'
+                  ? 'runtime-integrity-fact--success'
+                  : 'runtime-integrity-fact--warning',
+              )}>
+                <span>{browserExecution.readiness === 'ready' ? 'Ready · clean session' : 'Unavailable · recovering safely'}</span>
+                <small>
+                  {browserExecution.readiness === 'ready'
+                    ? 'Verified Playwright bridge · isolated Electron engine'
+                    : 'This exact resident session has no verified executor yet. Readiness retries in the background.'}
+                </small>
+              </dd>
+            </div>
+          </dl>
+        )}
+        {!resourceInventory ? (
+          <p className="runtime-empty">This session hasn’t reported its discovered Prime Agent resources yet.</p>
+        ) : (
+          <>
+            <dl className="runtime-facts">
+              <div><dt>Skills</dt><dd className="tabular">{resourceInventory.skills.length.toLocaleString()}</dd></div>
+              <div><dt>Extensions</dt><dd className="tabular">{resourceInventory.extensions.count.toLocaleString()}</dd></div>
+              <div><dt>Prompts · themes</dt><dd className="tabular">{resourceInventory.prompts.length.toLocaleString()} · {resourceInventory.themes.length.toLocaleString()}</dd></div>
+              <div><dt>Context files</dt><dd className="tabular">{resourceInventory.contextFileCount.toLocaleString()}</dd></div>
+              <div>
+                <dt>Diagnostics</dt>
+                <dd className="tabular">
+                  {resourceInventory.diagnostics.errorCount.toLocaleString()} errors · {resourceInventory.diagnostics.warningCount.toLocaleString()} warnings
+                </dd>
+              </div>
+            </dl>
+            {visibleSkills.length > 0 && (
+              <div className="runtime-subsection" aria-labelledby="runtime-skills-heading">
+                <div className="runtime-subsection__heading">
+                  <h4 id="runtime-skills-heading">Discovered skills</h4>
+                  <span>{resourceInventory.skills.length > visibleSkills.length ? `First ${visibleSkills.length}` : 'All'}</span>
+                </div>
+                <ul className="runtime-list">
+                  {visibleSkills.map((skill) => (
+                    <li key={`${skill.sourceKind?.scope ?? 'unknown'}:${skill.sourceKind?.origin ?? 'unknown'}:${skill.name}`}>
+                      <span className="runtime-state runtime-state--complete" aria-hidden="true" />
+                      <span className="runtime-list__body">
+                        <strong>{skill.name}</strong>
+                        {skill.description && <span>{skill.description}</span>}
+                        {skill.sourceKind && <small>{skill.sourceKind.scope} · {skill.sourceKind.origin === 'top-level' ? 'top level' : 'package'}</small>}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {resourceInventory.skills.length > visibleSkills.length && (
+                  <p className="runtime-empty">{(resourceInventory.skills.length - visibleSkills.length).toLocaleString()} more skills are loaded by Prime Agent.</p>
+                )}
+              </div>
+            )}
+            <p className="runtime-note">
+              Discovery confirms what Prime Agent loaded. Browser readiness is reported separately only after a live isolated launch probe; provider access still requires its own verification.
+            </p>
+          </>
+        )}
       </section>
 
       <section className="runtime-section" aria-labelledby="runtime-delivery-heading">
@@ -5139,6 +6613,7 @@ interface CommandPaletteDialogProps {
   onOpenInspector: () => void
   onOpenModels: () => void
   onFocusComposer: () => void
+  onSelectTaskStarter: (prompt: string) => void
   onEndResident: () => void
 }
 
@@ -5146,7 +6621,7 @@ interface PaletteItem {
   id: string
   label: string
   detail: string
-  group: 'Threads' | 'Projects' | 'Commands'
+  group: 'Threads' | 'Projects' | 'Tasks' | 'Commands'
   icon: LucideIcon
   keywords: string
   run: () => void
@@ -5166,6 +6641,7 @@ function CommandPaletteDialog({
   onOpenInspector,
   onOpenModels,
   onFocusComposer,
+  onSelectTaskStarter,
   onEndResident,
 }: CommandPaletteDialogProps) {
   const [query, setQuery] = useState('')
@@ -5207,13 +6683,22 @@ function CommandPaletteDialog({
       keywords: 'message prompt compose run stop abort resident',
       run: onFocusComposer,
     }] : []),
+    ...(snapshot.operations.submitCommands ? TASK_STARTERS.map((starter) => ({
+      id: `task:${starter.id}`,
+      label: starter.label,
+      detail: 'Prefill an editable task brief; review it before sending',
+      group: 'Tasks' as const,
+      icon: starter.icon,
+      keywords: `${starter.label} task template preset delegate prompt`,
+      run: () => onSelectTaskStarter(starter.prompt),
+    })) : []),
     {
-      id: 'command:inspector',
-      label: 'Open changes and evidence',
-      detail: 'Review files, agents, checks, and execution context',
+      id: 'command:session',
+      label: 'Manage agent session',
+      detail: 'Review session status, child agents, tools, and lifecycle',
       group: 'Commands' as const,
       icon: ListChecks,
-      keywords: 'changes evidence tests agents context inspector',
+      keywords: 'session runtime agents children tools lifecycle status inspector',
       run: onOpenInspector,
     },
     ...(snapshot.operations.modelCatalog ? [{
@@ -5243,7 +6728,7 @@ function CommandPaletteDialog({
       keywords: 'add computer ssh host remote machine',
       run: onAddComputer,
     }] : []),
-  ], [canEndResident, canManageComputers, onAddComputer, onEndResident, onFocusComposer, onOpenInspector, onOpenModels, onSelectProject, onSelectThread, snapshot])
+  ], [canEndResident, canManageComputers, onAddComputer, onEndResident, onFocusComposer, onOpenInspector, onOpenModels, onSelectProject, onSelectTaskStarter, onSelectThread, snapshot])
 
   const filteredItems = useMemo(() => {
     const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
@@ -5256,7 +6741,7 @@ function CommandPaletteDialog({
         if (left.id === `thread:${selectedThreadId}`) return -1
         if (right.id === `thread:${selectedThreadId}`) return 1
         return 0
-      }).slice(0, 12)
+      }).slice(0, 13)
     }
     return ranked.slice(0, 20)
   }, [items, query, selectedThreadId])
@@ -5412,9 +6897,13 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
       if (typeof dialog.showModal === 'function') dialog.showModal()
       else dialog.setAttribute('open', '')
       window.requestAnimationFrame(() => {
+        dialog.querySelectorAll<HTMLElement>('.sheet__scroll').forEach((scroller) => {
+          scroller.scrollTop = 0
+          scroller.scrollLeft = 0
+        })
         const focusTarget = dialog.querySelector<HTMLElement>('[data-dialog-autofocus], [autofocus]') ??
           dialog.querySelector<HTMLElement>('button, [href], input, select, textarea')
-        focusTarget?.focus()
+        focusTarget?.focus({ preventScroll: true })
       })
     } else if (!open && dialog.open) {
       if (typeof dialog.close === 'function') dialog.close()
@@ -5423,7 +6912,7 @@ function NativeDialog({ open, labelledBy, describedBy, triggerRef, className, di
   }, [open, triggerRef])
 
   const restoreFocus = () => {
-    window.requestAnimationFrame(() => (restoreTargetRef.current ?? triggerRef.current)?.focus())
+    window.requestAnimationFrame(() => (restoreTargetRef.current ?? triggerRef.current)?.focus({ preventScroll: true }))
   }
 
   return (
@@ -5530,18 +7019,29 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
     }
     if (status?.phase === 'ending') {
       return {
-        label: 'End review required',
-        detail: 'Permanent ending was recorded before the kill boundary. Review the exact session again to continue.',
+        label: 'Finish ending',
+        detail: 'The saved End request is ready.',
         tone: 'warning',
         action: 'choose',
-        actionLabel: 'Review end again',
+        actionLabel: 'Finish ending',
+      }
+    }
+    if (operation.state === 'outcome_unknown') {
+      return {
+        label: 'End needs one retry',
+        detail: 'This host has no saved End result. Retry the same request once.',
+        tone: 'warning',
+        action: 'choose',
+        actionLabel: 'Try ending again',
       }
     }
     return {
       label: status?.phase === 'kill_dispatching' || status?.phase === 'kill_acknowledged'
-        ? 'Permanent end is settling'
-        : 'End outcome needs inspection',
-      detail: 'Prime Continuim will not send another kill automatically. Check the exact durable host status.',
+        ? 'Finishing session'
+        : 'Check end status',
+      detail: status?.phase === 'kill_dispatching' || status?.phase === 'kill_acknowledged'
+        ? 'Prime Agent received the End request. Prime Continuim is checking for completion.'
+        : 'Confirm the saved End result before another session action.',
       tone: 'warning',
       action: 'check',
       actionLabel: 'Check status',
@@ -5550,10 +7050,10 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
   const registeredWorkspace = operationUsesRegisteredWorkspace(operation)
   if (operation.state === 'requires_reselection') {
     return {
-      label: 'Workspace confirmation needed',
+      label: 'Reconnect workspace',
       detail: registeredWorkspace
-        ? 'Use the same saved host-owned workspace so Prime Continuim can safely resume this exact setup.'
-        : 'Choose the same folder again so Prime Continuim can safely resume this exact setup.',
+        ? 'Use the same saved workspace to resume this setup.'
+        : 'Choose the same folder to resume this setup.',
       tone: 'warning',
       action: 'choose',
       actionLabel: registeredWorkspace ? 'Use saved workspace' : 'Choose original folder',
@@ -5632,6 +7132,8 @@ function residentLifecycleRecoveryCopy(operation: ResidentLifecycleOperationSumm
 
 function ResidentLifecycleRecoveryList({
   operations,
+  deferOperationId,
+  primaryProjectId,
   mutationBlock,
   isCheckable,
   busy,
@@ -5639,13 +7141,75 @@ function ResidentLifecycleRecoveryList({
   onCheck,
 }: {
   operations: ResidentLifecycleOperationSummary[]
+  deferOperationId?: string
+  primaryProjectId?: string
   mutationBlock: (operation: ResidentLifecycleOperationSummary) => ResidentLifecycleMutationBlock | null
   isCheckable: (operation: ResidentLifecycleOperationSummary) => boolean
   busy: boolean
   onChoose: (operation: ResidentLifecycleOperationSummary, event: ReactMouseEvent<HTMLButtonElement>) => void
   onCheck: (operation: ResidentLifecycleOperationSummary) => void
 }) {
-  const [first, ...remaining] = operations
+  const visibleOperations = deferOperationId
+    ? operations.filter((operation) => operation.operationId !== deferOperationId)
+    : operations
+  const recoverySummary = (count: number, noun: 'session' | 'setup') => (
+    <>
+      <span className="resident-recovery-list__chevron" aria-hidden="true">
+        <Icon icon={ChevronRight} size={14} />
+      </span>
+      <span className="resident-recovery-list__summary-label">
+        <strong>{count}</strong> saved {count === 1 ? noun : `${noun}s`}
+      </span>
+      <small>Review</small>
+    </>
+  )
+  if (deferOperationId && visibleOperations.length > 0) {
+    return (
+      <div className="resident-recovery-list">
+        <details className="resident-recovery-list__more">
+          <summary>
+            {recoverySummary(visibleOperations.length, 'session')}
+          </summary>
+          <div>{visibleOperations.map((operation) => (
+            <ResidentLifecycleRecoveryCard
+              key={operation.operationId}
+              operation={operation}
+              mutationBlock={mutationBlock(operation)}
+              checkable={isCheckable(operation)}
+              busy={busy}
+              onChoose={(event) => onChoose(operation, event)}
+              onCheck={() => onCheck(operation)}
+            />
+          ))}</div>
+        </details>
+      </div>
+    )
+  }
+  const primaryIndex = primaryProjectId
+    ? visibleOperations.findIndex((operation) => operation.projectId === primaryProjectId)
+    : 0
+  if (primaryIndex < 0 && visibleOperations.length > 0) {
+    return (
+      <div className="resident-recovery-list">
+        <details className="resident-recovery-list__more">
+          <summary>{recoverySummary(visibleOperations.length, 'setup')}</summary>
+          <div>{visibleOperations.map((operation) => (
+            <ResidentLifecycleRecoveryCard
+              key={operation.operationId}
+              operation={operation}
+              mutationBlock={mutationBlock(operation)}
+              checkable={isCheckable(operation)}
+              busy={busy}
+              onChoose={(event) => onChoose(operation, event)}
+              onCheck={() => onCheck(operation)}
+            />
+          ))}</div>
+        </details>
+      </div>
+    )
+  }
+  const first = visibleOperations[primaryIndex]
+  const remaining = visibleOperations.filter((_operation, index) => index !== primaryIndex)
   if (!first) return null
   const card = (operation: ResidentLifecycleOperationSummary) => (
     <ResidentLifecycleRecoveryCard
@@ -5663,7 +7227,7 @@ function ResidentLifecycleRecoveryList({
       {card(first)}
       {remaining.length > 0 && (
         <details className="resident-recovery-list__more">
-          <summary>{remaining.length} other {remaining.length === 1 ? 'setup needs' : 'setups need'} attention</summary>
+          <summary>{recoverySummary(remaining.length, 'setup')}</summary>
           <div>{remaining.map(card)}</div>
         </details>
       )}
@@ -5764,6 +7328,7 @@ function ResidentLifecycleRecoveryCard({
   busy,
   onChoose,
   onCheck,
+  hideChooseAction = false,
 }: {
   operation: ResidentLifecycleOperationSummary
   mutationBlock: ResidentLifecycleMutationBlock | null
@@ -5771,9 +7336,11 @@ function ResidentLifecycleRecoveryCard({
   busy: boolean
   onChoose: (event: ReactMouseEvent<HTMLButtonElement>) => void
   onCheck: () => void
+  hideChooseAction?: boolean
 }) {
   const presentation = residentLifecycleRecoveryCopy(operation)
   const statusOnly = presentation.action === 'choose' && mutationBlock !== null
+  const label = statusOnly && operation.kind === 'end' ? 'End saved' : presentation.label
   const detail = statusOnly
     ? residentLifecycleMutationBlockedDetail(mutationBlock, operation.kind)
     : presentation.detail
@@ -5810,7 +7377,7 @@ function ResidentLifecycleRecoveryCard({
         <Icon icon={presentation.tone === 'success' ? CheckCircle2 : presentation.tone === 'warning' ? AlertCircle : Clock3} size={17} />
       </span>
       <div className="resident-recovery__body">
-        <h2 id={`resident-recovery-${operation.operationId}`}>{presentation.label}</h2>
+        <h2 id={`resident-recovery-${operation.operationId}`}>{label}</h2>
         <p>{detail}</p>
         <small>
           {operation.kind === 'provision'
@@ -5818,7 +7385,7 @@ function ResidentLifecycleRecoveryCard({
             : <>Resident session · <bdi>{operation.threadId}</bdi></>}
         </small>
       </div>
-      {presentation.action && (
+      {presentation.action && !(hideChooseAction && presentation.action === 'choose' && !statusOnly) && (
         presentation.action === 'copy' && presentation.diagnostic ? (
           <div className="resident-recovery__actions">
             <ResidentLifecycleDiagnosticAction
@@ -5928,77 +7495,236 @@ function ResidentLifecycleDiagnosticAction({
   )
 }
 
-function ResidentProvisionDialog({
-  api,
-  selection,
-  triggerRef,
-  onClose,
-  onRecoveryRequired,
-  onCommitted,
-}: {
+function residentProvisionIdentityConflictDetails(value: unknown): ResidentProvisioningDetails | undefined {
+  if (!(value instanceof ResidentProvisionError) || value.code !== 'resident.provision_identity_conflict') {
+    return undefined
+  }
+  const projectDisplayName = value.details?.expectedProjectDisplayName
+  const threadTitle = value.details?.expectedThreadTitle
+  const sessionName = value.details?.expectedSessionName
+  const validLabel = (candidate: unknown): candidate is string =>
+    typeof candidate === 'string' &&
+    candidate.length >= 1 &&
+    candidate.length <= 255 &&
+    !/[\0\r\n]/.test(candidate)
+  if (!validLabel(projectDisplayName) || !validLabel(threadTitle)) return undefined
+  if (sessionName !== undefined && !validLabel(sessionName)) return undefined
+  return {
+    projectDisplayName,
+    threadTitle,
+    ...(sessionName === undefined ? {} : { sessionName }),
+  }
+}
+
+type ResidentProvisionDialogProps = {
   api: RendererApi
   selection: ResidentWorkspaceSelection | null
+  initialProjectName?: string
+  recoveryDetails?: ResidentProvisioningDetails
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
   onRecoveryRequired: (reference: ResidentLifecycleRecoveryReference) => void
   onCommitted: (status: ResidentLifecycleStatusResult) => void
+}
+
+type ResidentProvisionAttemptState =
+  | {
+      phase: 'editing'
+      projectDisplayName: string
+      threadTitle: string
+      lockedDetails?: ResidentProvisioningDetails
+      invalidField: 'project' | 'thread' | null
+      message: string
+      error: string
+    }
+  | {
+      phase: 'submitting'
+      projectDisplayName: string
+      threadTitle: string
+      lockedDetails?: ResidentProvisioningDetails
+      invalidField: null
+      message: string
+      error: ''
+    }
+  | {
+      phase: 'settled'
+      projectDisplayName: string
+      threadTitle: string
+      lockedDetails?: ResidentProvisioningDetails
+      invalidField: null
+      message: string
+      error: string
+    }
+
+type ResidentProvisionAttemptAction =
+  | { type: 'edit-project'; value: string }
+  | { type: 'edit-thread'; value: string }
+  | { type: 'validation-failed'; field: 'project' | 'thread'; message: string }
+  | { type: 'submit' }
+  | { type: 'identity-conflict'; details: ResidentProvisioningDetails }
+  | { type: 'settled'; message: string; error?: string }
+
+function createResidentProvisionAttemptState({
+  selection,
+  initialProjectName,
+  recoveryDetails,
+}: {
+  selection: ResidentWorkspaceSelection
+  initialProjectName?: string
+  recoveryDetails?: ResidentProvisioningDetails
+}): ResidentProvisionAttemptState {
+  const projectDisplayName = (recoveryDetails?.projectDisplayName ?? initialProjectName?.trim()) || selection.suggestedName
+  return {
+    phase: 'editing',
+    projectDisplayName,
+    threadTitle: recoveryDetails?.threadTitle ?? `${projectDisplayName} task`,
+    lockedDetails: recoveryDetails,
+    invalidField: null,
+    message: '',
+    error: '',
+  }
+}
+
+function residentProvisionAttemptReducer(
+  state: ResidentProvisionAttemptState,
+  action: ResidentProvisionAttemptAction,
+): ResidentProvisionAttemptState {
+  switch (action.type) {
+    case 'edit-project':
+      if (state.phase !== 'editing' || state.lockedDetails) return state
+      return {
+        ...state,
+        projectDisplayName: action.value,
+        invalidField: state.invalidField === 'project' ? null : state.invalidField,
+        error: state.invalidField === 'project' ? '' : state.error,
+      }
+    case 'edit-thread':
+      if (state.phase !== 'editing' || state.lockedDetails) return state
+      return {
+        ...state,
+        threadTitle: action.value,
+        invalidField: state.invalidField === 'thread' ? null : state.invalidField,
+        error: state.invalidField === 'thread' ? '' : state.error,
+      }
+    case 'validation-failed':
+      if (state.phase !== 'editing') return state
+      return { ...state, invalidField: action.field, error: action.message }
+    case 'submit':
+      if (state.phase !== 'editing') return state
+      return {
+        ...state,
+        phase: 'submitting',
+        invalidField: null,
+        message: 'Creating the durable resident thread…',
+        error: '',
+      }
+    case 'identity-conflict':
+      if (state.phase !== 'submitting') return state
+      return {
+        phase: 'editing',
+        projectDisplayName: action.details.projectDisplayName,
+        threadTitle: action.details.threadTitle,
+        lockedDetails: action.details,
+        invalidField: null,
+        message: 'Review the restored names, then continue setup.',
+        error: 'This is the original setup. Its names have been restored so you can continue safely.',
+      }
+    case 'settled':
+      if (state.phase !== 'submitting') return state
+      return {
+        ...state,
+        phase: 'settled',
+        invalidField: null,
+        message: action.message,
+        error: action.error ?? '',
+      }
+  }
+}
+
+function ResidentProvisionDialog(props: ResidentProvisionDialogProps) {
+  const retainedSelectionRef = useRef<ResidentWorkspaceSelection | null>(null)
+  useLayoutEffect(() => {
+    if (props.selection) retainedSelectionRef.current = props.selection
+  }, [props.selection])
+  const selection = props.selection ?? retainedSelectionRef.current
+  if (!selection) return null
+  return (
+    <ResidentProvisionAttempt
+      key={selection.selectionToken}
+      {...props}
+      selection={selection}
+      open={props.selection !== null}
+    />
+  )
+}
+
+function ResidentProvisionAttempt({
+  api,
+  selection,
+  open,
+  initialProjectName,
+  recoveryDetails,
+  triggerRef,
+  onClose,
+  onRecoveryRequired,
+  onCommitted,
+}: Omit<ResidentProvisionDialogProps, 'selection'> & {
+  selection: ResidentWorkspaceSelection
+  open: boolean
 }) {
-  const registeredWorkspace = selection?.kind === 'registered_workspace'
-  const [projectDisplayName, setProjectDisplayName] = useState('')
-  const [threadTitle, setThreadTitle] = useState('')
-  const [invalidField, setInvalidField] = useState<'project' | 'thread' | null>(null)
-  const [submitting, setSubmitting] = useState(false)
-  const [settled, setSettled] = useState(false)
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
+  const registeredWorkspace = selection.kind === 'registered_workspace'
+  const [state, dispatch] = useReducer(
+    residentProvisionAttemptReducer,
+    { selection, initialProjectName, recoveryDetails },
+    createResidentProvisionAttemptState,
+  )
+  const [workspaceNameEditing, setWorkspaceNameEditing] = useState(false)
+  const submitting = state.phase === 'submitting'
+  const settled = state.phase === 'settled'
+  const lockedDetails = state.lockedDetails
+  const submissionStartedRef = useRef(false)
   const projectRef = useRef<HTMLInputElement>(null)
   const threadRef = useRef<HTMLInputElement>(null)
   const resultRef = useRef<HTMLParagraphElement>(null)
 
   useEffect(() => {
-    if (!selection) return
-    setProjectDisplayName(selection.suggestedName)
-    setThreadTitle(`${selection.suggestedName} thread`)
-    setInvalidField(null)
-    setSubmitting(false)
-    setSettled(false)
-    setMessage('')
-    setError('')
-  }, [selection])
-
-  useEffect(() => {
-    if (!selection || !settled) return
+    if (!settled) return
     window.requestAnimationFrame(() => resultRef.current?.focus())
-  }, [selection, settled])
+  }, [settled])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!selection || submitting || settled) return
-    const project = registeredWorkspace ? selection.suggestedName : projectDisplayName.trim()
-    const thread = threadTitle.trim()
+    if (state.phase !== 'editing' || submissionStartedRef.current) return
+    const project = lockedDetails?.projectDisplayName ?? (
+      registeredWorkspace ? selection.suggestedName : state.projectDisplayName.trim()
+    )
+    const thread = lockedDetails?.threadTitle ?? state.threadTitle.trim()
     if (!registeredWorkspace && (!project || project.length > 255 || /[\0\r\n]/.test(project))) {
-      setInvalidField('project')
-      setError('Enter a project name between 1 and 255 characters.')
-      projectRef.current?.focus()
+      dispatch({ type: 'validation-failed', field: 'project', message: 'Enter a workspace name between 1 and 255 characters.' })
+      setWorkspaceNameEditing(true)
+      window.requestAnimationFrame(() => projectRef.current?.focus())
       return
     }
     if (!thread || thread.length > 255 || /[\0\r\n]/.test(thread)) {
-      setInvalidField('thread')
-      setError('Enter a thread title between 1 and 255 characters.')
+      dispatch({
+        type: 'validation-failed',
+        field: 'thread',
+        message: registeredWorkspace
+          ? 'Enter a thread title between 1 and 255 characters.'
+          : 'Enter a task name between 1 and 255 characters.',
+      })
       threadRef.current?.focus()
       return
     }
-    setInvalidField(null)
-    setError('')
-    setMessage('Creating the durable resident thread…')
-    setSubmitting(true)
+    submissionStartedRef.current = true
+    dispatch({ type: 'submit' })
     try {
       const status = await api.provisionResident({
         selectionToken: selection.selectionToken,
         projectDisplayName: project,
         threadTitle: thread,
+        ...(lockedDetails?.sessionName === undefined ? {} : { sessionName: lockedDetails.sessionName }),
       })
-      setSettled(true)
       onRecoveryRequired({
         kind: 'provision',
         operationId: status.operationId,
@@ -6016,31 +7742,68 @@ function ResidentProvisionDialog({
         threadId: status.threadId,
         executionGenerationId: status.executionGenerationId,
         status,
+        provisioningDetails: {
+          projectDisplayName: project,
+          threadTitle: thread,
+          ...(lockedDetails?.sessionName === undefined ? {} : { sessionName: lockedDetails.sessionName }),
+        },
       })
       if (status.phase === 'committed') {
-        setMessage('Resident thread created. Opening its authoritative host snapshot…')
+        dispatch({ type: 'settled', message: 'Resident thread created. Opening its authoritative host snapshot…' })
         onClose()
         onCommitted(status)
         return
       }
       if (status.phase === 'completed') {
-        setMessage(registeredWorkspace
-          ? status.completionReason === 'owned_create_cleaned'
-            ? 'Prime Agent cleaned up the temporary session. No resident session remains; use this saved workspace when you are ready to try again.'
-            : 'Prime Agent did not create a session. Use this saved workspace when you are ready to retry.'
-          : status.completionReason === 'owned_create_cleaned'
-            ? 'Prime Agent cleaned up the temporary session. No resident session remains; choose the original folder when you are ready to try again.'
-            : 'Prime Agent did not create a session. Choose the original folder again when you are ready to retry.')
+        dispatch({
+          type: 'settled',
+          message: registeredWorkspace
+            ? status.completionReason === 'owned_create_cleaned'
+              ? 'Prime Agent cleaned up the temporary session. No resident session remains; use this saved workspace when you are ready to try again.'
+              : 'Prime Agent did not create a session. Use this saved workspace when you are ready to retry.'
+            : status.completionReason === 'owned_create_cleaned'
+              ? 'Prime Agent cleaned up the temporary session. No resident session remains; choose the original folder when you are ready to try again.'
+              : 'Prime Agent did not create a session. Choose the original folder again when you are ready to retry.',
+        })
       } else if (status.phase === 'quarantined') {
-        setError('The setup outcome is not proven. Prime Continuim will not retry it automatically; inspect the durable host state first.')
-        setMessage('Resident setup stopped at an uncertain mutation boundary.')
+        dispatch({
+          type: 'settled',
+          message: 'Resident setup stopped at an uncertain mutation boundary.',
+          error: 'The setup outcome is not proven. Prime Continuim will not retry it automatically; inspect the durable host state first.',
+        })
       } else {
-        setMessage(registeredWorkspace
-          ? 'Setup is durably recorded. Continue in this saved workspace if recovery asks for it.'
-          : 'Setup is durably recorded. Choose the original folder again if recovery asks for it.')
+        dispatch({
+          type: 'settled',
+          message: registeredWorkspace
+            ? 'Setup is durably recorded. Continue in this saved workspace if recovery asks for it.'
+            : 'Setup is durably recorded. Choose the original folder again if recovery asks for it.',
+        })
       }
     } catch (reason) {
-      setSettled(true)
+      const restoredDetails = residentProvisionIdentityConflictDetails(reason)
+      if (restoredDetails) {
+        submissionStartedRef.current = false
+        dispatch({ type: 'identity-conflict', details: restoredDetails })
+        if (residentProvisionMayHaveDurableOperation(reason)) {
+          onRecoveryRequired({
+            kind: 'provision',
+            operationId: selection.operationId,
+            expectedHostId: selection.expectedHostId,
+            suggestedName: selection.suggestedName,
+            workspaceKind: selection.kind ?? 'local_path',
+            ...(selection.kind === 'registered_workspace'
+              ? {
+                  projectId: selection.projectId,
+                  workspaceId: selection.workspaceId,
+                  referenceThreadId: selection.referenceThreadId,
+                  referenceExecutionGenerationId: selection.referenceExecutionGenerationId,
+                }
+              : {}),
+            provisioningDetails: restoredDetails,
+          })
+        }
+        return
+      }
       if (residentProvisionMayHaveDurableOperation(reason)) {
         onRecoveryRequired({
           kind: 'provision',
@@ -6054,26 +7817,32 @@ function ResidentProvisionDialog({
                 workspaceId: selection.workspaceId,
                 referenceThreadId: selection.referenceThreadId,
                 referenceExecutionGenerationId: selection.referenceExecutionGenerationId,
-              }
-            : {}),
+            }
+          : {}),
+          provisioningDetails: {
+            projectDisplayName: project,
+            threadTitle: thread,
+            ...(lockedDetails?.sessionName === undefined ? {} : { sessionName: lockedDetails.sessionName }),
+          },
         })
       }
-      setError(reason instanceof Error
-        ? reason.message
-        : 'Resident setup did not finish. Prime Continuim will not retry it automatically.')
-      setMessage(residentProvisionMayHaveDurableOperation(reason)
-        ? 'Check the durable recovery state before trying again.'
-        : registeredWorkspace
-          ? 'Close this dialog, refresh the saved workspace, and try again.'
-          : 'Close this dialog, correct the issue, and choose the workspace folder again.')
-    } finally {
-      setSubmitting(false)
+      dispatch({
+        type: 'settled',
+        error: reason instanceof Error
+          ? reason.message
+          : 'Resident setup did not finish. Prime Continuim will not retry it automatically.',
+        message: residentProvisionMayHaveDurableOperation(reason)
+          ? 'Check the durable recovery state before trying again.'
+          : registeredWorkspace
+            ? 'Close this dialog, refresh the saved workspace, and try again.'
+            : 'Close this dialog, correct the issue, and choose the workspace folder again.',
+      })
     }
   }
 
   return (
     <NativeDialog
-      open={selection !== null}
+      open={open}
       labelledBy="resident-provision-title"
       describedBy="resident-provision-description"
       triggerRef={triggerRef}
@@ -6084,15 +7853,18 @@ function ResidentProvisionDialog({
       <form className="sheet__frame" onSubmit={submit} aria-busy={submitting}>
         <header className="sheet__header">
           <div className="sheet__title-group">
-            <span className="sheet__title-icon"><Icon icon={FolderGit2} size={18} /></span>
             <div>
               <h2 id="resident-provision-title">
-                {registeredWorkspace ? 'New resident thread in this workspace' : 'Start resident thread'}
+                {lockedDetails
+                  ? 'Continue setup'
+                  : registeredWorkspace ? 'Start another task' : 'Start agent'}
               </h2>
               <p id="resident-provision-description">
-                {registeredWorkspace
-                  ? 'Prime Agent will start this thread in the saved host-owned workspace. Only the new thread title can be changed here.'
-                  : 'Confirm how this workspace appears in Prime Continuim. The verified local host keeps its folder location.'}
+                {lockedDetails
+                  ? 'Original task restored. Continue the same setup.'
+                  : registeredWorkspace
+                    ? 'Name the task. Prime Agent runs it here.'
+                    : 'Name the task. Prime Agent runs it in this folder.'}
               </p>
             </div>
           </div>
@@ -6108,73 +7880,92 @@ function ResidentProvisionDialog({
         </header>
 
         <div className="sheet__scroll resident-provision__fields">
-          {registeredWorkspace ? (
-            <div className="form-field">
-              <span className="form-field__label">Saved project</span>
-              <div className="form-field__fixed-value"><bdi>{selection?.suggestedName}</bdi></div>
-              <small>Fixed by the selected host-owned workspace.</small>
-            </div>
-          ) : (
-            <div className="form-field">
-              <label htmlFor="resident-project-name">Project name</label>
-              <input
-                ref={projectRef}
-                id="resident-project-name"
-                type="text"
-                value={projectDisplayName}
-                maxLength={255}
-                data-dialog-autofocus
-                autoComplete="off"
-                aria-invalid={invalidField === 'project'}
-                aria-describedby={invalidField === 'project'
-                  ? 'resident-project-help resident-provision-error'
-                  : 'resident-project-help'}
-                disabled={submitting || settled}
-                onChange={(event) => {
-                  setProjectDisplayName(event.target.value)
-                  if (invalidField === 'project') {
-                    setInvalidField(null)
-                    setError('')
-                  }
-                }}
-              />
-              <small id="resident-project-help">Shown in the project list.</small>
+          {lockedDetails && (
+            <div className="resident-provision__recovery" role="note">
+              <Icon icon={ShieldCheck} size={16} />
+              <div>
+                <strong>Original setup restored</strong>
+                <span>No duplicate session or task.</span>
+              </div>
             </div>
           )}
-          <div className="form-field">
-            <label htmlFor="resident-thread-title">Thread title</label>
-            <input
-              ref={threadRef}
-              id="resident-thread-title"
-              type="text"
-              value={threadTitle}
-              maxLength={255}
-              data-dialog-autofocus={registeredWorkspace || undefined}
-              autoComplete="off"
-              aria-invalid={invalidField === 'thread'}
-              aria-describedby={invalidField === 'thread'
-                ? 'resident-thread-help resident-provision-error'
-                : 'resident-thread-help'}
-              disabled={submitting || settled}
-              onChange={(event) => {
-                setThreadTitle(event.target.value)
-                if (invalidField === 'thread') {
-                  setInvalidField(null)
-                  setError('')
-                }
-              }}
-            />
-            <small id="resident-thread-help">Shown in the thread list and window title.</small>
-          </div>
-          <div className="resident-provision__privacy">
-            <Icon icon={LockKeyhole} size={15} />
-            <span>
-              {registeredWorkspace
-                ? 'Prime Continuim uses the saved project and workspace identity reported by this verified SSH host. No filesystem location is selected or shown.'
-                : 'Prime Continuim does not display this folder location or send it to another computer. The verified local host uses it for this workspace.'}
-            </span>
-          </div>
-          <p id="resident-provision-error" className="form-error" role="alert">{error}</p>
+          {lockedDetails ? (
+            <dl className="resident-provision__fixed-details">
+              <div><dt>Workspace</dt><dd><bdi>{state.projectDisplayName}</bdi></dd></div>
+              <div><dt>Task</dt><dd><bdi>{state.threadTitle}</bdi></dd></div>
+            </dl>
+          ) : (
+            <>
+              <div className="form-field form-field--primary">
+                <label htmlFor="resident-thread-title">Task name</label>
+                <input
+                  ref={threadRef}
+                  id="resident-thread-title"
+                  type="text"
+                  value={state.threadTitle}
+                  maxLength={255}
+                  data-dialog-autofocus
+                  autoComplete="off"
+                  aria-invalid={state.invalidField === 'thread'}
+                  aria-describedby={state.invalidField === 'thread'
+                    ? 'resident-thread-help resident-provision-error'
+                    : 'resident-thread-help'}
+                  disabled={submitting || settled}
+                  onChange={(event) => {
+                    dispatch({ type: 'edit-thread', value: event.target.value })
+                  }}
+                />
+                <small id="resident-thread-help">Shown in the sidebar.</small>
+              </div>
+              <section className="resident-provision__workspace" aria-label="Selected workspace">
+                <span className="resident-provision__workspace-icon"><Icon icon={FolderGit2} size={16} /></span>
+                <div>
+                  <small>Runs in</small>
+                  <strong><bdi>{registeredWorkspace ? selection.suggestedName : state.projectDisplayName}</bdi></strong>
+                  <span>
+                    {registeredWorkspace
+                      ? 'Access stays on the verified host'
+                      : 'Folder access stays on this computer'}
+                  </span>
+                </div>
+                {!registeredWorkspace && !workspaceNameEditing && (
+                  <button
+                    className="button button--quiet button--small"
+                    type="button"
+                    aria-expanded="false"
+                    onClick={() => {
+                      setWorkspaceNameEditing(true)
+                      window.requestAnimationFrame(() => projectRef.current?.focus())
+                    }}
+                    disabled={submitting || settled}
+                  >
+                    Rename
+                  </button>
+                )}
+              </section>
+              {!registeredWorkspace && workspaceNameEditing && (
+                <div className="form-field resident-provision__workspace-name">
+                  <label htmlFor="resident-project-name">Workspace name</label>
+                  <input
+                    ref={projectRef}
+                    id="resident-project-name"
+                    type="text"
+                    value={state.projectDisplayName}
+                    maxLength={255}
+                    autoComplete="off"
+                    aria-invalid={state.invalidField === 'project'}
+                    aria-describedby={state.invalidField === 'project'
+                      ? 'resident-project-help resident-provision-error'
+                      : 'resident-project-help'}
+                    disabled={submitting || settled}
+                    onChange={(event) => dispatch({ type: 'edit-project', value: event.target.value })}
+                  />
+                  <small id="resident-project-help">Used only to identify this workspace in Prime Continuim.</small>
+                </div>
+              )}
+            </>
+          )}
+          <p id="resident-provision-error" className="form-error" role="alert">{state.error}</p>
           <p
             ref={resultRef}
             className="form-status"
@@ -6183,7 +7974,7 @@ function ResidentProvisionDialog({
             aria-atomic="true"
             tabIndex={settled ? -1 : undefined}
           >
-            {message}
+            {state.message}
           </p>
         </div>
 
@@ -6192,11 +7983,16 @@ function ResidentProvisionDialog({
             {settled ? 'Close' : 'Cancel'}
           </button>
           {!settled && (
-            <button className="button button--primary" type="submit" disabled={submitting}>
-              <Icon icon={submitting ? Loader2 : FolderGit2} />
+            <button
+              className="button button--primary"
+              type="submit"
+              disabled={submitting}
+              data-dialog-autofocus={lockedDetails ? true : undefined}
+            >
+              <Icon icon={submitting ? Loader2 : Activity} />
               {submitting
-                ? 'Starting…'
-                : registeredWorkspace ? 'Create resident thread' : 'Start resident thread'}
+                ? lockedDetails ? 'Continuing…' : 'Starting…'
+                : lockedDetails ? 'Continue setup' : 'Start agent'}
             </button>
           )}
         </footer>
@@ -6218,76 +8014,136 @@ function ResidentEndDialog({
   onClose: () => void
   onSettled: (status: ResidentLifecycleStatusResult) => void
 }) {
-  const [confirmed, setConfirmed] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [settled, setSettled] = useState(false)
   const [canCheckStatus, setCanCheckStatus] = useState(false)
   const [checking, setChecking] = useState(false)
+  const [resumeStatus, setResumeStatus] = useState<ResidentLifecycleStatusResult | null>(null)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
-  const confirmationRef = useRef<HTMLInputElement>(null)
   const resultRef = useRef<HTMLParagraphElement>(null)
+  const resumeButtonRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (!context) return
-    setConfirmed(false)
     setSubmitting(false)
     setSettled(false)
     setCanCheckStatus(false)
     setChecking(false)
+    setResumeStatus(null)
     setMessage('')
     setError('')
   }, [context])
 
   useEffect(() => {
     if (!context || !settled) return
-    window.requestAnimationFrame(() => resultRef.current?.focus())
-  }, [context, settled])
+    window.requestAnimationFrame(() => (resumeStatus ? resumeButtonRef.current : resultRef.current)?.focus())
+  }, [context, resumeStatus, settled])
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!context || submitting || settled) return
-    if (!confirmed) {
-      setError('Confirm that you understand this resident session cannot be resumed.')
-      confirmationRef.current?.focus()
-      return
+  const applyEndStatus = (status: ResidentLifecycleStatusResult) => {
+    setSettled(true)
+    onSettled(status)
+    if (status.phase === 'completed') {
+      setResumeStatus(null)
+      setCanCheckStatus(false)
+      setMessage('Agent session ended. Your task, transcript, and workspace are still here.')
+    } else if (status.phase === 'ending') {
+      setResumeStatus(status)
+      setCanCheckStatus(false)
+      setMessage('End saved. Finish to send it.')
+    } else if (status.phase === 'quarantined') {
+      setResumeStatus(null)
+      setCanCheckStatus(false)
+      setMessage('Ending stopped at an uncertain boundary.')
+      setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
+    } else {
+      setResumeStatus(null)
+      setCanCheckStatus(true)
+      setMessage('Prime Agent received the End request. Checking completion will not send it again.')
     }
+  }
+
+  const executeEnd = async (
+    preparation: ResidentEndPreparation,
+    resumeOnce: boolean,
+  ) => {
+    setSettled(false)
+    setResumeStatus(null)
+    setCanCheckStatus(false)
     setError('')
-    setMessage('Recording the permanent end before asking Prime Agent to stop…')
+    setMessage('Ending session…')
     setSubmitting(true)
     try {
-      const status = await api.endResident({
-        confirmationToken: context.preparation.confirmationToken,
+      let status = await api.endResident({
+        confirmationToken: preparation.confirmationToken,
         consent: true,
       })
-      setSettled(true)
-      onSettled(status)
-      if (status.phase === 'completed') {
-        setCanCheckStatus(false)
-        setMessage('Resident session ended. The saved thread and workspace remain available.')
-      } else if (status.phase === 'quarantined') {
-        setCanCheckStatus(false)
-        setMessage('Permanent ending stopped at an uncertain boundary.')
-        setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
-      } else {
-        setCanCheckStatus(true)
-        setMessage('Permanent ending is durably recorded. Prime Continuim will check status without replaying the kill.')
+      if (resumeOnce && status.phase === 'ending') {
+        setMessage('Finishing session…')
+        const resumedPreparation = await api.prepareResidentEnd({
+          expectedHostId: status.expectedHostId,
+          projectId: status.projectId,
+          workspaceId: status.workspaceId,
+          threadId: status.threadId,
+          executionGenerationId: status.executionGenerationId,
+          resumeOperationId: status.operationId,
+        })
+        status = await api.endResident({
+          confirmationToken: resumedPreparation.confirmationToken,
+          consent: true,
+        })
       }
+      applyEndStatus(status)
+      if (status.phase !== 'ending' && status.phase !== 'quarantined') onClose()
     } catch (reason) {
       setSettled(true)
+      setResumeStatus(null)
       if (isResidentEndSourceCursorChangedError(reason)) {
         setCanCheckStatus(false)
         setError(reason instanceof Error
           ? reason.message
           : 'Resident state changed after this end review.')
-        setMessage('No end was admitted. Close this review, refresh the thread, and review the permanent action again.')
+        setMessage('No End request was admitted. Close this review, refresh the task, and review the action again.')
       } else {
         setCanCheckStatus(true)
         setError(reason instanceof Error
           ? reason.message
-          : 'The resident end outcome could not be confirmed.')
-        setMessage('Check the durable lifecycle status. Prime Continuim will not send another kill automatically.')
+          : 'The resident End outcome could not be confirmed.')
+        setMessage('Check the saved lifecycle status. Prime Continuim will not send another kill automatically.')
       }
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!context || submitting || settled) return
+    await executeEnd(context.preparation, true)
+  }
+
+  const finishPendingEnd = async () => {
+    if (!resumeStatus || submitting || checking) return
+    setSettled(false)
+    setResumeStatus(null)
+    setError('')
+    setMessage('Finishing session…')
+    setSubmitting(true)
+    try {
+      const preparation = await api.prepareResidentEnd({
+        expectedHostId: resumeStatus.expectedHostId,
+        projectId: resumeStatus.projectId,
+        workspaceId: resumeStatus.workspaceId,
+        threadId: resumeStatus.threadId,
+        executionGenerationId: resumeStatus.executionGenerationId,
+        resumeOperationId: resumeStatus.operationId,
+      })
+      await executeEnd(preparation, false)
+    } catch (reason) {
+      setSettled(true)
+      setCanCheckStatus(true)
+      setError(reason instanceof Error ? reason.message : 'Unable to continue the saved End request.')
+      setMessage('The saved request was not sent again. Check its status before another action.')
     } finally {
       setSubmitting(false)
     }
@@ -6308,20 +8164,12 @@ function ResidentEndDialog({
         setMessage('No durable status is available yet. The end outcome remains unknown, so Prime Continuim will not send another kill. Close this review and use Check status from recovery.')
         return
       }
-      onSettled(status)
       if (status.kind !== 'end') {
         setCanCheckStatus(false)
         setError('The host returned a different lifecycle operation for this end review.')
         setMessage('No permanent action was retried.')
-      } else if (status.phase === 'completed') {
-        setCanCheckStatus(false)
-        setMessage('Resident session ended. The saved thread and workspace remain available.')
-      } else if (status.phase === 'quarantined') {
-        setCanCheckStatus(false)
-        setMessage('Permanent ending stopped at an uncertain boundary.')
-        setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
       } else {
-        setMessage('Status checked. Permanent ending is still settling; no mutation was replayed.')
+        applyEndStatus(status)
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The durable resident end status is unavailable.')
@@ -6346,40 +8194,34 @@ function ResidentEndDialog({
           <div className="sheet__title-group">
             <span className="sheet__title-icon sheet__title-icon--warning"><Icon icon={AlertCircle} size={18} /></span>
             <div>
-              <h2 id="resident-end-title">End resident session?</h2>
+              <h2 id="resident-end-title">
+                End agent session?
+              </h2>
               <p id="resident-end-description">
-                This permanently stops the Prime Agent runtime for “{context?.threadTitle ?? 'this thread'}”. The saved thread and workspace remain available, but this resident session cannot be resumed.
+                Stop Prime Agent for “{context?.threadTitle ?? 'this task'}”.
               </p>
             </div>
           </div>
-          <button className="icon-button" type="button" aria-label="Close resident end review" onClick={onClose} disabled={submitting}>
+          <button className="icon-button" type="button" aria-label="Close session review" onClick={onClose} disabled={submitting}>
             <Icon icon={X} size={17} />
           </button>
         </header>
 
         <div className="sheet__scroll resident-end-dialog__body">
+          <dl className="resident-end-dialog__impact">
+            <div>
+              <dt><Icon icon={Square} size={14} /> Ends</dt>
+              <dd>{`Prime Agent on ${context?.hostName ?? 'this computer'}`}</dd>
+            </div>
+            <div>
+              <dt><Icon icon={Check} size={14} /> Keeps</dt>
+              <dd>Task, transcript, and workspace files</dd>
+            </div>
+          </dl>
           <div className="resident-end-dialog__distinction" role="note">
             <Icon icon={Info} size={16} />
-            <span>
-              <strong>Closing is different from ending.</strong>
-              Closing Prime Continuim only detaches this app; Prime Agent keeps running on <bdi>{`${context?.hostName ?? 'this computer'}.`}</bdi>
-            </span>
+            <span>Closing the app keeps this agent running. If it already stopped, only its saved session is cleared.</span>
           </div>
-          <label className="resident-end-dialog__confirmation">
-            <input
-              ref={confirmationRef}
-              type="checkbox"
-              checked={confirmed}
-              disabled={submitting || settled}
-              aria-invalid={error && !confirmed ? 'true' : undefined}
-              aria-describedby="resident-end-error"
-              onChange={(event) => {
-                setConfirmed(event.target.checked)
-                if (event.target.checked) setError('')
-              }}
-            />
-            <span>I understand this resident session cannot be resumed.</span>
-          </label>
           <p id="resident-end-error" className="form-error" role="alert">{error}</p>
           <p
             ref={resultRef}
@@ -6409,10 +8251,22 @@ function ResidentEndDialog({
               {checking ? 'Checking…' : 'Check status'}
             </button>
           )}
+          {settled && resumeStatus && (
+            <button
+              ref={resumeButtonRef}
+              className="button button--stop"
+              type="button"
+              onClick={() => void finishPendingEnd()}
+              disabled={submitting || checking}
+            >
+              <Icon icon={Square} size={14} />
+              Finish ending
+            </button>
+          )}
           {!settled && (
-            <button className="button button--stop" type="submit" disabled={submitting}>
+            <button className="button button--stop" type="submit" aria-label="End agent session" disabled={submitting}>
               <Icon icon={submitting ? Loader2 : Square} size={14} />
-              {submitting ? 'Ending resident session…' : 'End resident session'}
+              {submitting ? 'Ending…' : 'End session'}
             </button>
           )}
         </footer>
@@ -6428,722 +8282,6 @@ function isResidentEndSourceCursorChangedError(reason: unknown): boolean {
     'code' in reason &&
     (reason as { code?: unknown }).code === 'host.resident_end_source_cursor_changed'
   )
-}
-
-interface ModelsDialogProps {
-  api: RendererApi
-  open: boolean
-  host: HostSummary
-  threadId?: string
-  executionGenerationId?: string
-  currentModel?: string
-  canSelectResidentModel: boolean
-  canConnectRuntimeOAuth: boolean
-  triggerRef: RefObject<HTMLElement | null>
-  onClose: () => void
-}
-
-type ModelsCatalogError = {
-  kind: 'retryable' | 'stale-authority'
-  message: string
-}
-
-type ModelSelectionView = {
-  providerId: string
-  modelId: string
-  modelName: string
-  state: 'selecting' | 'completed' | 'rejected' | 'uncertain'
-  message: string
-  projected?: boolean
-  retryable?: boolean
-}
-
-type RuntimeOAuthView = {
-  providerId: string
-  providerName: string
-  state: RuntimeOAuthProgress['phase'] | RuntimeOAuthResult['state']
-  message: string
-  retryable?: boolean
-}
-
-function ModelsDialog({
-  api,
-  open,
-  host,
-  threadId,
-  executionGenerationId,
-  currentModel,
-  canSelectResidentModel,
-  canConnectRuntimeOAuth,
-  triggerRef,
-  onClose,
-}: ModelsDialogProps) {
-  const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<ModelsCatalogError | null>(null)
-  const [selection, setSelection] = useState<ModelSelectionView | null>(null)
-  const [oauth, setOAuth] = useState<RuntimeOAuthView | null>(null)
-  const [query, setQuery] = useState('')
-  const [selectedProviderId, setSelectedProviderId] = useState('all')
-  const [showAllModels, setShowAllModels] = useState(false)
-  const [visibleModelLimit, setVisibleModelLimit] = useState(MODEL_REVEAL_INCREMENT)
-  const [loadAttempt, setLoadAttempt] = useState(0)
-  const providerNavRef = useRef<HTMLElement>(null)
-  const selectionRequestRef = useRef(0)
-  const oauthRequestRef = useRef(0)
-  const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
-  const dialogOpenRef = useRef(open)
-  const selectionAuthorityKey = JSON.stringify([host.id, threadId ?? '', executionGenerationId ?? ''])
-  const oauthAuthorityKey = JSON.stringify([host.id])
-  const selectionAuthorityRef = useRef(selectionAuthorityKey)
-  const oauthAuthorityRef = useRef(oauthAuthorityKey)
-  const providerRailHorizontal = useMediaQueryMatch('(max-width: 75rem)')
-  dialogOpenRef.current = open
-  selectionAuthorityRef.current = selectionAuthorityKey
-  oauthAuthorityRef.current = oauthAuthorityKey
-
-  useEffect(() => {
-    selectionRequestRef.current += 1
-    setSelection(null)
-  }, [open, selectionAuthorityKey])
-
-  useEffect(() => {
-    oauthRequestRef.current += 1
-    const oauthRequest = activeOAuthRequestRef.current
-    activeOAuthRequestRef.current = null
-    setOAuth(null)
-    if (oauthRequest && api.cancelRuntimeOAuth) void api.cancelRuntimeOAuth(oauthRequest)
-  }, [api, oauthAuthorityKey, open])
-
-  useEffect(() => {
-    if (!open) return
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    setCatalog(null)
-    setQuery('')
-    setSelectedProviderId('all')
-    setShowAllModels(false)
-    setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
-    void api.loadRuntimeModelCatalog(host.id)
-      .then((nextCatalog) => {
-        if (!cancelled) setCatalog(nextCatalog)
-      })
-      .catch((reason: unknown) => {
-        if (cancelled) return
-        setCatalog(null)
-        setError(
-          isStaleHostAuthorityError(reason)
-            ? {
-                kind: 'stale-authority',
-                message: 'The active host changed. Close this dialog, confirm the active computer, then reopen Models & accounts.',
-              }
-            : {
-                kind: 'retryable',
-                message: reason instanceof Error
-                  ? reason.message
-                  : `Unable to read the runtime model catalog from ${host.name}. Check the host connection, then try again.`,
-              },
-        )
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [api, host.id, host.name, loadAttempt, open])
-
-  const selectedProvider = catalog?.providers.find((provider) => provider.providerId === selectedProviderId)
-  const normalizedQuery = query.trim().toLocaleLowerCase()
-  const filteredModels = useMemo(() => {
-    if (!catalog) return []
-    return catalog.models.filter((model) => {
-      if (selectedProviderId !== 'all' && model.providerId !== selectedProviderId) return false
-      if (!showAllModels && !model.available) return false
-      if (!normalizedQuery) return true
-      const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
-      return `${model.name} ${model.modelId} ${model.providerId} ${provider?.displayName ?? ''}`
-        .toLocaleLowerCase()
-        .includes(normalizedQuery)
-    })
-  }, [catalog, normalizedQuery, selectedProviderId, showAllModels])
-  const visibleModels = filteredModels.slice(0, visibleModelLimit)
-  const remainingModelCount = Math.max(0, filteredModels.length - visibleModels.length)
-  const availableCount = catalog?.models.filter((model) => model.available).length ?? 0
-  const scopedModelCount = selectedProvider?.modelCount ?? catalog?.models.length ?? 0
-  const scopedAvailableCount = selectedProvider?.availableModelCount ?? availableCount
-  const oauthProviders = catalog?.providers.filter((provider) => provider.oauthSupported) ?? []
-  const configuredProviders = catalog?.providers.filter((provider) => provider.configured) ?? []
-  const providerIds = catalog ? ['all', ...catalog.providers.map((provider) => provider.providerId)] : []
-  const selectionMatchesCurrentModel = Boolean(
-    selection && modelMatchesCurrent(selection.providerId, selection.modelId, selection.modelName, currentModel),
-  )
-  const selectionLocksActions = Boolean(
-    selection?.state === 'selecting'
-      || selection?.state === 'uncertain'
-      || (selection?.state === 'completed' && !selectionMatchesCurrentModel),
-  )
-  const selectionStatusMessage = !selection
-    ? ''
-    : selection.state === 'selecting'
-      ? `Selecting ${selection.modelName} for this thread's next prompt…`
-      : selection.state === 'completed'
-        ? selectionMatchesCurrentModel
-          ? `${selection.message} ${selection.modelName} is now shown as current for this thread.`
-          : selection.projected
-            ? `${selection.message} Refreshing this dialog's current-model label. Continuim will not resend the selection.`
-            : `${selection.message} Selected on host · refreshing current model. Continuim will not resend the selection.`
-        : ''
-  const selectionErrorMessage = !selection
-    ? ''
-    : selection.state === 'uncertain'
-      ? `${selection.message} The outcome is unknown. Continuim will not send this model change again automatically. Do not retry it from this dialog; close Models & accounts and inspect the current thread first.`
-      : selection.state === 'rejected'
-        ? `${selection.message} No model change was applied.${selection.retryable ? ' You can choose a model again.' : ' This request cannot be retried.'}`
-        : ''
-  const oauthInProgress = Boolean(
-    oauth && ['starting', 'awaiting_user', 'committing', 'cancelling'].includes(oauth.state),
-  )
-  const oauthLocksConnect = Boolean(
-    oauthInProgress || oauth?.state === 'uncertain' || oauth?.state === 'completed' || (oauth?.state === 'failed' && !oauth.retryable),
-  )
-  const selectedProviderCanConnect = Boolean(
-    selectedProvider &&
-    selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID &&
-    selectedProvider.oauthSupported &&
-    !selectedProvider.configured &&
-    canConnectRuntimeOAuth &&
-    api.startRuntimeOAuth &&
-    api.cancelRuntimeOAuth,
-  )
-  const oauthStatusMessage = oauth && ['starting', 'awaiting_user', 'committing', 'cancelling', 'completed', 'cancelled'].includes(oauth.state)
-    ? oauth.message
-    : ''
-  const oauthErrorMessage = oauth?.state === 'failed'
-    ? `${oauth.message}${oauth.retryable ? ' You can start sign-in again.' : ''}`
-    : oauth?.state === 'uncertain'
-      ? `${oauth.message} Do not start another sign-in from this dialog. Close it and inspect the Prime Agent account on this computer first.`
-      : ''
-
-  const selectProvider = (providerId: string) => {
-    setSelectedProviderId(providerId)
-    setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
-  }
-
-  const handleProviderKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    const previousKey = providerRailHorizontal
-      ? document.documentElement.dir === 'rtl' ? 'ArrowRight' : 'ArrowLeft'
-      : 'ArrowUp'
-    const nextKey = providerRailHorizontal
-      ? document.documentElement.dir === 'rtl' ? 'ArrowLeft' : 'ArrowRight'
-      : 'ArrowDown'
-    if (![previousKey, nextKey, 'Home', 'End'].includes(event.key)) return
-
-    const buttons = Array.from(providerNavRef.current?.querySelectorAll<HTMLButtonElement>('[data-provider-filter]') ?? [])
-    if (buttons.length === 0) return
-    event.preventDefault()
-    const focusedIndex = buttons.indexOf(event.target as HTMLButtonElement)
-    const selectedIndex = Math.max(0, providerIds.indexOf(selectedProviderId))
-    const currentIndex = focusedIndex >= 0 ? focusedIndex : selectedIndex
-    const nextIndex = event.key === 'Home'
-      ? 0
-      : event.key === 'End'
-        ? buttons.length - 1
-        : event.key === nextKey
-          ? (currentIndex + 1) % buttons.length
-          : (currentIndex - 1 + buttons.length) % buttons.length
-    const nextButton = buttons[nextIndex]
-    const nextProviderId = providerIds[nextIndex]
-    if (!nextButton || !nextProviderId) return
-    selectProvider(nextProviderId)
-    nextButton.focus()
-  }
-
-  const selectModel = async (model: RuntimeModelCatalog['models'][number]) => {
-    if (
-      !open
-      || !threadId
-      || !canSelectResidentModel
-      || selectionLocksActions
-      || !model.available
-      || modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
-    ) return
-
-    const requestId = selectionRequestRef.current + 1
-    selectionRequestRef.current = requestId
-    const requestAuthorityKey = selectionAuthorityKey
-    const target = {
-      providerId: model.providerId,
-      modelId: model.modelId,
-      modelName: model.name,
-    }
-    setSelection({
-      ...target,
-      state: 'selecting',
-      message: `Selecting ${model.name} for the next prompt.`,
-    })
-
-    try {
-      const result = await api.selectResidentModel({
-        threadId,
-        providerId: model.providerId,
-        modelId: model.modelId,
-      })
-      if (
-        !dialogOpenRef.current
-        || selectionRequestRef.current !== requestId
-        || selectionAuthorityRef.current !== requestAuthorityKey
-      ) return
-      setSelection({ ...target, ...result })
-    } catch (reason: unknown) {
-      if (
-        !dialogOpenRef.current
-        || selectionRequestRef.current !== requestId
-        || selectionAuthorityRef.current !== requestAuthorityKey
-      ) return
-      setSelection(
-        isStaleHostAuthorityError(reason)
-          ? {
-              ...target,
-              state: 'rejected',
-              retryable: false,
-              message: 'The active host or thread changed before this selection could be verified.',
-            }
-          : {
-              ...target,
-              state: 'uncertain',
-              retryable: false,
-              message: reason instanceof Error
-                ? reason.message
-                : 'The model selection response could not be verified.',
-            },
-      )
-    }
-  }
-
-  const startProviderOAuth = async () => {
-    if (
-      !open ||
-      !selectedProviderCanConnect ||
-      oauthLocksConnect ||
-      !selectedProvider ||
-      !api.startRuntimeOAuth
-    ) return
-
-    const request: RuntimeOAuthRequest = {
-      hostId: host.id,
-      providerId: selectedProvider.providerId,
-    }
-    const requestId = oauthRequestRef.current + 1
-    oauthRequestRef.current = requestId
-    activeOAuthRequestRef.current = request
-    const requestAuthorityKey = oauthAuthorityKey
-    const providerName = selectedProvider.displayName
-    setOAuth({
-      providerId: request.providerId,
-      providerName,
-      state: 'starting',
-      message: 'Opening the verified ChatGPT sign-in page…',
-    })
-
-    try {
-      const result = await api.startRuntimeOAuth(request, (progress) => {
-        if (
-          !dialogOpenRef.current ||
-          oauthRequestRef.current !== requestId ||
-          oauthAuthorityRef.current !== requestAuthorityKey
-        ) return
-        setOAuth({
-          providerId: request.providerId,
-          providerName,
-          state: progress.phase,
-          message: progress.message,
-        })
-      })
-      if (
-        !dialogOpenRef.current ||
-        oauthRequestRef.current !== requestId ||
-        oauthAuthorityRef.current !== requestAuthorityKey
-      ) return
-      if (result.state === 'completed' && result.catalog) setCatalog(result.catalog)
-      setOAuth({
-        providerId: request.providerId,
-        providerName,
-        state: result.state,
-        message: result.message,
-        ...('retryable' in result ? { retryable: result.retryable } : {}),
-      })
-    } catch (reason: unknown) {
-      if (
-        !dialogOpenRef.current ||
-        oauthRequestRef.current !== requestId ||
-        oauthAuthorityRef.current !== requestAuthorityKey
-      ) return
-      setOAuth({
-        providerId: request.providerId,
-        providerName,
-        state: isStaleHostAuthorityError(reason) ? 'failed' : 'uncertain',
-        retryable: false,
-        message: isStaleHostAuthorityError(reason)
-          ? 'The active computer connection changed before sign-in could start.'
-          : 'Prime Agent sign-in could not be verified. Prime Continuim will not start it again automatically.',
-      })
-    } finally {
-      if (oauthRequestRef.current === requestId) activeOAuthRequestRef.current = null
-    }
-  }
-
-  const cancelProviderOAuth = async () => {
-    const request = activeOAuthRequestRef.current
-    if (!request || !api.cancelRuntimeOAuth || !oauthInProgress) return
-    setOAuth((current) => current ? {
-      ...current,
-      state: 'cancelling',
-      message: 'Cancelling ChatGPT sign-in…',
-    } : current)
-    await api.cancelRuntimeOAuth(request)
-  }
-
-  const closeDialog = () => {
-    selectionRequestRef.current += 1
-    oauthRequestRef.current += 1
-    const oauthRequest = activeOAuthRequestRef.current
-    activeOAuthRequestRef.current = null
-    if (oauthRequest && api.cancelRuntimeOAuth) void api.cancelRuntimeOAuth(oauthRequest)
-    onClose()
-  }
-
-  return (
-    <NativeDialog
-      open={open}
-      labelledBy="models-title"
-      describedBy="models-description"
-      triggerRef={triggerRef}
-      className="models-sheet"
-      onClose={closeDialog}
-    >
-      <div className="sheet__surface models-sheet__surface">
-        <header className="sheet__header models-sheet__header">
-          <div className="sheet__title-group">
-            <span className="sheet__title-icon"><Icon icon={Bot} size={18} /></span>
-            <div>
-              <h2 id="models-title">Models &amp; accounts</h2>
-              <p id="models-description">
-                Provider and model metadata reported by Prime Agent on <bdi>{host.name}</bdi>.
-              </p>
-            </div>
-          </div>
-          <button className="icon-button" type="button" aria-label="Close models and accounts" onClick={closeDialog}>
-            <Icon icon={X} size={17} />
-          </button>
-        </header>
-
-        {loading ? (
-          <div className="models-loading" role="status">
-            <Icon icon={Loader2} size={18} />
-            <div><strong>Reading the runtime catalog</strong><span>Provider status and model metadata stay scoped to {host.name}.</span></div>
-          </div>
-        ) : error ? (
-          <div className="models-error" role="alert">
-            <span><Icon icon={AlertCircle} size={17} /></span>
-            <div>
-              <strong>Model catalog unavailable</strong>
-              <p>{error.message}</p>
-              {error.kind === 'retryable' ? (
-                <button className="button button--secondary" type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
-                  <Icon icon={RefreshCw} size={14} />
-                  Retry loading catalog
-                </button>
-              ) : (
-                <button className="button button--secondary" type="button" onClick={closeDialog}>Close dialog</button>
-              )}
-            </div>
-          </div>
-        ) : catalog ? (
-          <div className="models-workspace">
-            <aside className="provider-rail" aria-label={`Accounts on ${host.name}`}>
-              <div className="provider-rail__summary">
-                <span className="eyebrow">Accounts on <bdi>{host.name}</bdi></span>
-                <strong>{configuredProviders.length} configured</strong>
-                <small>{oauthProviders.length} OAuth-capable providers · Prime Agent {catalog.releaseVersion}</small>
-              </div>
-              <p className="sr-only" id="provider-filter-instructions">
-                {providerRailHorizontal
-                  ? 'Use Left and Right Arrow keys to select a provider. Use Home and End to jump to the first or last provider.'
-                  : 'Use Up and Down Arrow keys to select a provider. Use Home and End to jump to the first or last provider.'}
-              </p>
-              <nav
-                ref={providerNavRef}
-                aria-describedby="provider-filter-instructions"
-                aria-label="Filter models by provider"
-                aria-orientation={providerRailHorizontal ? 'horizontal' : 'vertical'}
-                role="toolbar"
-                onKeyDown={handleProviderKeyDown}
-              >
-                <button
-                  type="button"
-                  aria-pressed={selectedProviderId === 'all'}
-                  data-provider-filter
-                  data-provider-id="all"
-                  tabIndex={selectedProviderId === 'all' ? 0 : -1}
-                  onClick={() => selectProvider('all')}
-                >
-                  <span className="provider-rail__icon"><Icon icon={Bot} size={15} /></span>
-                  <span><strong>All providers</strong><small>{catalog.providers.length} in catalog</small></span>
-                  <span className="provider-rail__count tabular">{catalog.models.length}</span>
-                </button>
-                {catalog.providers.map((provider) => (
-                  <button
-                    key={provider.providerId}
-                    type="button"
-                    aria-pressed={selectedProviderId === provider.providerId}
-                    data-provider-filter
-                    data-provider-id={provider.providerId}
-                    tabIndex={selectedProviderId === provider.providerId ? 0 : -1}
-                    onClick={() => selectProvider(provider.providerId)}
-                  >
-                    <span className={cx('provider-rail__icon', provider.configured && 'provider-rail__icon--ready')}>
-                      <Icon icon={provider.configured ? CheckCircle2 : LockKeyhole} size={15} />
-                    </span>
-                    <span><strong>{provider.displayName}</strong><small>{provider.configured ? 'Configured' : provider.oauthSupported ? 'Supports OAuth' : 'Setup required'}</small></span>
-                    <span className="provider-rail__count tabular">{provider.availableModelCount}/{provider.modelCount}</span>
-                  </button>
-                ))}
-              </nav>
-            </aside>
-
-            <section className="model-catalog" aria-label="Prime Agent models">
-              <div className="model-catalog__topline">
-                <div>
-                  <span className="eyebrow">Runtime catalog</span>
-                  <h3>{selectedProvider?.displayName ?? 'Models reported by this host'}</h3>
-                  <p>{scopedAvailableCount} available with current setup · {scopedModelCount} listed by the runtime</p>
-                </div>
-                <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
-              </div>
-
-              {selectedProvider && !selectedProvider.configured && (
-                <div
-                  className="provider-setup-note"
-                  aria-busy={oauthInProgress && oauth?.providerId === selectedProvider.providerId ? 'true' : undefined}
-                >
-                  <span><Icon icon={LockKeyhole} size={16} /></span>
-                  <div className="provider-setup-note__body">
-                    <strong>{selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
-                    {selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && selectedProvider.oauthSupported ? (
-                      <>
-                        <p>
-                          {selectedProviderCanConnect
-                            ? <>Connect ChatGPT to this Prime Agent runtime on <bdi>{host.name}</bdi>. The verified sign-in page opens in your system browser; no authorization URL or credential is exposed to this view.</>
-                            : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. This desktop can connect ChatGPT only when the trusted local host advertises OAuth support.</>}
-                        </p>
-                        <p className="provider-setup-note__storage">
-                          Prime Agent {catalog.releaseVersion} stores OAuth credentials in its host-only <code>auth.json</code>, protected by this operating-system account’s file permissions. Availability checks reload the account state before model selection.
-                        </p>
-                        <p className="provider-setup-note__storage">
-                          auth.json is plaintext at rest; it is not a keychain or keyring.
-                        </p>
-                        {selectedProviderCanConnect && (
-                          <div className="provider-setup-note__actions">
-                            <button
-                              className="button button--secondary"
-                              type="button"
-                              disabled={oauthLocksConnect}
-                              onClick={() => void startProviderOAuth()}
-                            >
-                              <Icon icon={oauthInProgress ? Loader2 : ShieldCheck} size={14} />
-                              {oauthInProgress ? 'Signing in…' : 'Connect ChatGPT'}
-                            </button>
-                          </div>
-                        )}
-                      </>
-                    ) : (
-                      <p>
-                        Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim’s host protocol and renderer.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              <div className={cx('runtime-oauth-feedback', !oauth && 'runtime-oauth-feedback--empty')} aria-busy={oauthInProgress ? 'true' : undefined}>
-                <p
-                  className={cx('runtime-oauth-feedback__message', !oauthStatusMessage && 'sr-only')}
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {oauthStatusMessage && <Icon icon={oauth?.state === 'completed' ? CheckCircle2 : Loader2} size={14} />}
-                  {oauthStatusMessage}
-                </p>
-                <p
-                  className={cx('runtime-oauth-feedback__message', 'runtime-oauth-feedback__message--error', !oauthErrorMessage && 'sr-only')}
-                  role="alert"
-                >
-                  {oauthErrorMessage && <Icon icon={AlertCircle} size={14} />}
-                  {oauthErrorMessage}
-                </p>
-                {oauthInProgress && api.cancelRuntimeOAuth && (
-                  <button className="button button--quiet" type="button" onClick={() => void cancelProviderOAuth()} disabled={oauth?.state === 'cancelling'}>
-                    {oauth?.state === 'cancelling' ? 'Cancelling…' : 'Cancel sign-in'}
-                  </button>
-                )}
-              </div>
-
-              <div className="model-catalog__controls">
-                <label className="model-search">
-                  <span className="sr-only">Search models</span>
-                  <Icon icon={Search} size={15} />
-                  <input
-                    type="search"
-                    value={query}
-                    placeholder="Search models"
-                    onChange={(event) => {
-                      setQuery(event.target.value)
-                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
-                    }}
-                  />
-                </label>
-                <div className="catalog-scope" aria-label="Model availability filter">
-                  <button
-                    type="button"
-                    aria-pressed={!showAllModels}
-                    onClick={() => {
-                      setShowAllModels(false)
-                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
-                    }}
-                  >Available</button>
-                  <button
-                    type="button"
-                    aria-pressed={showAllModels}
-                    onClick={() => {
-                      setShowAllModels(true)
-                      setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
-                    }}
-                  >All models</button>
-                </div>
-              </div>
-
-              <p className="model-results-count tabular" role="status" aria-live="polite" aria-atomic="true">
-                {filteredModels.length === 0
-                  ? 'No models match'
-                  : `Showing ${visibleModels.length} of ${filteredModels.length} ${filteredModels.length === 1 ? 'model' : 'models'}`}
-              </p>
-
-              <div className="model-list">
-                {visibleModels.length > 0 ? visibleModels.map((model) => {
-                  const provider = catalog.providers.find((candidate) => candidate.providerId === model.providerId)
-                  const current = modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
-                  const selectionTargeted = selection?.providerId === model.providerId && selection.modelId === model.modelId
-                  const selectingTarget = selectionTargeted && selection?.state === 'selecting'
-                  const refreshingTarget = selectionTargeted && selection?.state === 'completed' && !selectionMatchesCurrentModel
-                  const rejectedWithoutRetry = selectionTargeted && selection?.state === 'rejected' && !selection.retryable
-                  const selectionButtonLabel = selectingTarget ? 'Selecting…' : refreshingTarget ? 'Refreshing…' : 'Use model'
-                  return (
-                    <article className={cx('model-row', current && 'model-row--current')} key={`${model.providerId}:${model.modelId}`}>
-                      <span className="model-row__icon"><Icon icon={Bot} size={16} /></span>
-                      <div className="model-row__body">
-                        <div className="model-row__title">
-                          <strong>{model.name}</strong>
-                          {current && <span className="model-badge model-badge--current">Current</span>}
-                          {model.usingOAuth && <span className="model-badge">OAuth</span>}
-                        </div>
-                        <span><bdi>{provider?.displayName ?? model.providerId}</bdi> · <bdi>{model.modelId}</bdi></span>
-                        <small>{formatTokenCapacity(model.contextWindow)} context · {formatTokenCapacity(model.maxOutputTokens)} max output{model.reasoning ? ' · Reasoning' : ''}{model.input.includes('image') ? ' · Images' : ''}</small>
-                      </div>
-                      <div className="model-row__actions">
-                        <span className={cx('model-row__status', model.available && 'model-row__status--ready')}>
-                          <Icon icon={model.available ? CheckCircle2 : LockKeyhole} size={14} />
-                          {model.available ? 'Available' : 'Setup required'}
-                        </span>
-                        {model.available && !current && canSelectResidentModel && (
-                          <button
-                            className="button button--secondary model-row__select"
-                            type="button"
-                            aria-label={`${selectionButtonLabel.replace('…', '')} ${model.name}`}
-                            disabled={selectionLocksActions || rejectedWithoutRetry}
-                            onClick={() => void selectModel(model)}
-                          >
-                            {(selectingTarget || refreshingTarget) && <Icon icon={Loader2} size={14} />}
-                            {selectionButtonLabel}
-                          </button>
-                        )}
-                      </div>
-                    </article>
-                  )
-                }) : (
-                  <div className="model-list__empty">
-                    <Icon icon={Search} size={18} />
-                    <strong>{showAllModels ? 'No catalog models match' : 'No available models match'}</strong>
-                    <p>{showAllModels ? 'Try another provider or search term.' : `Configure a provider on ${host.name}, or show all models.`}</p>
-                  </div>
-                )}
-              </div>
-              {remainingModelCount > 0 && (
-                <div className="model-list__reveal">
-                  <button
-                    className="button button--quiet"
-                    type="button"
-                    onClick={() => setVisibleModelLimit((limit) => limit + MODEL_REVEAL_INCREMENT)}
-                  >
-                    Show {Math.min(MODEL_REVEAL_INCREMENT, remainingModelCount)} more {Math.min(MODEL_REVEAL_INCREMENT, remainingModelCount) === 1 ? 'model' : 'models'}
-                  </button>
-                </div>
-              )}
-              <div className="model-selection-feedback">
-                <p
-                  className={cx('model-selection-feedback__message', !selectionStatusMessage && 'sr-only')}
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {selectionStatusMessage && <Icon icon={selectionMatchesCurrentModel ? CheckCircle2 : Loader2} size={14} />}
-                  {selectionStatusMessage}
-                </p>
-                <p
-                  className={cx('model-selection-feedback__message', 'model-selection-feedback__message--error', !selectionErrorMessage && 'sr-only')}
-                  role="alert"
-                >
-                  {selectionErrorMessage && <Icon icon={AlertCircle} size={14} />}
-                  {selectionErrorMessage}
-                </p>
-              </div>
-              <footer className="model-catalog__footer">
-                <Icon icon={Info} size={14} />
-                <span>
-                  {canSelectResidentModel
-                    ? 'Choose a model for this thread’s next prompt. This changes the resident session only; it does not send a prompt. “Available” means Prime Agent reports provider access, not that an inference smoke test passed.'
-                    : 'Model selection is available only while this exact resident session is idle and ready for its next prompt. “Available” means Prime Agent reports provider access; no inference smoke test was run.'}
-                </span>
-              </footer>
-            </section>
-          </div>
-        ) : null}
-      </div>
-    </NativeDialog>
-  )
-}
-
-function modelMatchesCurrent(providerId: string, modelId: string, modelName: string, currentModel: string | undefined): boolean {
-  if (!currentModel) return false
-  const normalizedCurrentModel = currentModel.toLocaleLowerCase()
-  return normalizedCurrentModel === modelId.toLocaleLowerCase()
-    || normalizedCurrentModel === modelName.toLocaleLowerCase()
-    || normalizedCurrentModel === `${providerId}/${modelId}`.toLocaleLowerCase()
-    || normalizedCurrentModel === `${providerId}:${modelId}`.toLocaleLowerCase()
-}
-
-function formatTokenCapacity(value: number): string {
-  if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1))}M`
-  if (value >= 1_000) return `${Number((value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1))}K`
-  return String(value)
-}
-
-function formatCatalogTime(value: string): string {
-  const parsed = Date.parse(value)
-  if (!Number.isFinite(parsed)) return 'recently'
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(parsed))
 }
 
 interface AddComputerDialogProps {

@@ -63,6 +63,7 @@ export function installHudClickThrough(options: HudClickThroughOptions): () => v
   let pendingIgnored: boolean | undefined
   let requestSequence = 0
   let lastPoint: { clientX: number; clientY: number } | undefined
+  let pointerFrame: number | undefined
 
   const setIgnored = (next: boolean, force = false) => {
     if (!force && (confirmedIgnored === next || pendingIgnored === next)) return
@@ -86,10 +87,20 @@ export function installHudClickThrough(options: HudClickThroughOptions): () => v
     }
   }
 
+  const schedulePointerUpdate = () => {
+    if (pointerFrame !== undefined) return
+    pointerFrame = window.requestAnimationFrame(() => {
+      pointerFrame = undefined
+      updateFromLastPoint()
+    })
+  }
+
   const handlePointerMove = (event: Event) => {
     const pointerEvent = event as PointerEvent
     lastPoint = { clientX: pointerEvent.clientX, clientY: pointerEvent.clientY }
-    updateFromLastPoint()
+    // Hit testing can force layout. Pointer events may arrive far faster than
+    // the HUD can paint, so sample only the latest point once per frame.
+    schedulePointerUpdate()
   }
   const handleFocusIn = () => updateFromLastPoint()
   const handleFocusOut = () => {
@@ -114,6 +125,10 @@ export function installHudClickThrough(options: HudClickThroughOptions): () => v
     window.removeEventListener('blur', handleBlur)
     document.removeEventListener('focusin', handleFocusIn)
     document.removeEventListener('focusout', handleFocusOut)
+    if (pointerFrame !== undefined) {
+      window.cancelAnimationFrame(pointerFrame)
+      pointerFrame = undefined
+    }
     // Teardown is the final recovery boundary. Never trust local bookkeeping
     // to prove that the native skip-taskbar window is still interactive.
     requestSequence += 1

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "kind": "prime_continuim_macos_distribution_policy_v1",
+  "bundleIdentifier": "ai.primeintellect.continuim",
+  "productName": "Prime Continuim",
+  "expectedTeamId": null
+}

@@ -116,6 +116,57 @@ describe('DesktopControlService recovery', () => {
     expect(stores.commandIdentities.read).toHaveBeenCalledTimes(1)
   })
 
+  it('does not return a pre-reconciliation outbox after the same host becomes online', async () => {
+    const command = prompt('device-a', 'bootstrap-reconciled-prompt')
+    const retained = {
+      hostId: 'host-a',
+      command,
+      state: 'awaiting_idle_proof' as const,
+      updatedAt: timestamp,
+    }
+    const directory = await createUserData({ cache: verifiedCache('host-a'), outbox: [retained] })
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const internals = service as unknown as {
+      target?: { kind: 'local' }
+      authorityHostId?: string
+      setState: (state: unknown) => void
+      outbox: { read: () => Promise<unknown[]> }
+    }
+    const firstRead = deferred<void>()
+    const releaseFirstRead = deferred<void>()
+    let readCount = 0
+    internals.outbox.read = vi.fn(async () => {
+      readCount += 1
+      if (readCount === 1) {
+        firstRead.resolve()
+        await releaseFirstRead.promise
+        return [retained]
+      }
+      return []
+    })
+
+    const bootstrap = service.bootstrap()
+    await firstRead.promise
+    internals.target = { kind: 'local' }
+    internals.authorityHostId = 'host-a'
+    internals.setState({
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-a',
+      path: 'local_socket',
+      since: timestamp,
+      attempt: 1,
+      capabilities: ['prime_agent_commands_v2'],
+    })
+    releaseFirstRead.resolve()
+
+    await expect(bootstrap).resolves.toMatchObject({
+      connection: { phase: 'online', hostId: 'host-a' },
+      outbox: [],
+    })
+    expect(internals.outbox.read).toHaveBeenCalledTimes(2)
+  })
+
   it('restores the persisted last target during bootstrap and can reconnect to it', async () => {
     const directory = await createUserData({
       cache: {

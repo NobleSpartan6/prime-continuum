@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -9,7 +9,7 @@ import type {
   ResidentLifecycleOperationView,
   ResidentProvisionOperationView,
 } from '../../src/main/control/contracts'
-import type { ResidentLifecycleStatus } from '../../src/shared/protocol'
+import type { ResidentLifecycleStatus, RuntimeIntegritySnapshot } from '../../src/shared/protocol'
 import { ControlError } from '../../src/main/control/errors'
 
 const { connectLocalHostd } = vi.hoisted(() => ({
@@ -82,6 +82,108 @@ afterEach(async () => {
 })
 
 describe('DesktopControlService resident provisioning boundary', () => {
+  it('withholds the native picker before live seed-validation progress', async () => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return initializingHealth('preparing')
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, picker)
+
+    await expect(service.preselectResidentWorkspace()).rejects.toMatchObject({
+      code: 'resident.workspace_preselection_not_ready',
+    })
+    expect(picker).not.toHaveBeenCalled()
+  })
+
+  it('keeps an initializing-runtime workspace preselection path-private and converts it once after exact readiness', async () => {
+    const directory = await testDirectory()
+    const selectedPath = path.join(directory, 'private-preselection-parent', 'Workspace')
+    await mkdir(selectedPath, { recursive: true })
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return initializingHealth('copying')
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, vi.fn().mockResolvedValue(selectedPath))
+
+    const preselection = await service.preselectResidentWorkspace()
+    expect(preselection).toEqual({
+      preselectionToken: expect.any(String),
+      suggestedName: 'Workspace',
+      expiresAt: expect.any(String),
+    })
+    expect(JSON.stringify({ preselection, bootstrap: await service.bootstrap() }))
+      .not.toContain('private-preselection-parent')
+    await expect(service.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.lifecycle_unavailable' })
+
+    markLocalRuntimeReady(service)
+    const selection = await service.completeResidentWorkspacePreselection(preselection.preselectionToken)
+    expect(selection).toMatchObject({ expectedHostId: 'host-a', suggestedName: 'Workspace' })
+    await expect(service.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_consumed' })
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
+    await expect(readFile(path.join(directory, 'control', 'resident-lifecycle.json'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('revokes early workspace choices on supersession, cancellation, expiry, and connection change', async () => {
+    const directory = await testDirectory()
+    const firstPath = path.join(directory, 'First')
+    const secondPath = path.join(directory, 'Second')
+    await Promise.all([mkdir(firstPath), mkdir(secondPath)])
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return initializingHealth('verifying')
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const picker = vi.fn().mockResolvedValueOnce(firstPath).mockResolvedValueOnce(secondPath).mockResolvedValue(secondPath)
+    const service = await connectedService(directory, connection, picker)
+
+    const first = await service.preselectResidentWorkspace()
+    const second = await service.preselectResidentWorkspace()
+    markLocalRuntimeReady(service)
+    await expect(service.completeResidentWorkspacePreselection(first.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_superseded' })
+
+    service.cancelResidentWorkspacePreselection(second.preselectionToken)
+    await expect(service.completeResidentWorkspacePreselection(second.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_cancelled' })
+
+    markLocalRuntimeInitializing(service, 'publishing')
+    const expiring = await service.preselectResidentWorkspace()
+    vi.setSystemTime(new Date(Date.parse(expiring.expiresAt) + 1))
+    await expect(service.completeResidentWorkspacePreselection(expiring.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_expired' })
+
+    const authorityBound = await service.preselectResidentWorkspace()
+    await service.disconnect()
+    await expect(service.completeResidentWorkspacePreselection(authorityBound.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_authority_changed' })
+  })
+
+  it('consumes without replay when the private directory identity changes before completion', async () => {
+    const directory = await testDirectory()
+    const selectedPath = path.join(directory, 'Workspace')
+    const movedPath = path.join(directory, 'Workspace-before-replacement')
+    await mkdir(selectedPath)
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') return initializingHealth('copying')
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, vi.fn().mockResolvedValue(selectedPath))
+    const preselection = await service.preselectResidentWorkspace()
+    await rename(selectedPath, movedPath)
+    await mkdir(selectedPath)
+    markLocalRuntimeReady(service)
+
+    await expect(service.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_selection_changed' })
+    await expect(service.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toMatchObject({ code: 'resident.workspace_preselection_consumed' })
+    expect(connection.requests.filter(({ method }) => method === 'resident.provision')).toEqual([])
+  })
+
   it('keeps the selected absolute path out of renderer results, events, and durable caches', async () => {
     const directory = await testDirectory()
     const selectedPath = path.join(directory, 'private-parent-never-render', 'Workspace')
@@ -210,6 +312,45 @@ describe('DesktopControlService resident provisioning boundary', () => {
         state: 'terminal',
       }),
     ])
+  })
+
+  it('starts another resident task in an exact saved local workspace without reopening the picker', async () => {
+    const directory = await testDirectory()
+    const picker = vi.fn()
+    let provisionPayload: Record<string, unknown> | undefined
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') return health(['resident_lifecycle_v1'])
+      if (method === 'catalog.snapshot') return registeredCatalog(provisionPayload)
+      if (method === 'thread.snapshot') {
+        const threadId = String((params as Record<string, unknown>).threadId)
+        return threadId === registeredReference.referenceThreadId
+          ? registeredReferenceSnapshot()
+          : threadSnapshotFor({
+              ...provisionPayload!,
+              projectDisplayName: 'Remote workspace',
+              threadTitle: 'Local follow-up task',
+            })
+      }
+      if (method === 'resident.provision.registered') {
+        provisionPayload = params as Record<string, unknown>
+        return provisionStatus(provisionPayload, 'committed')
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const service = await connectedService(directory, connection, picker)
+
+    const selection = await service.selectResidentWorkspace({
+      kind: 'registered_workspace',
+      ...registeredReference,
+    })
+    await expect(service.provisionResident({
+      selectionToken: selection.selectionToken,
+      projectDisplayName: 'Renderer attempted rename',
+      threadTitle: 'Local follow-up task',
+    })).resolves.toMatchObject({ kind: 'provision', phase: 'committed' })
+
+    expect(picker).not.toHaveBeenCalled()
+    expect(connection.requests.some(({ method }) => method === 'resident.provision.registered')).toBe(true)
   })
 
   it('fails closed when the saved donor changes between authoritative catalog and thread reads', async () => {
@@ -398,6 +539,11 @@ describe('DesktopControlService resident provisioning boundary', () => {
     ])
     await expect(service.provisionResident({ ...exact, threadTitle: 'Changed retry' })).rejects.toMatchObject({
       code: 'resident.provision_identity_conflict',
+      details: {
+        durableOperationPossible: true,
+        expectedProjectDisplayName: 'Workspace',
+        expectedThreadTitle: 'New resident thread',
+      },
     })
     await expect(service.provisionResident(exact)).resolves.toMatchObject({ phase: 'prepared' })
 
@@ -1575,6 +1721,23 @@ function health(capabilities = ['resident_lifecycle_v1']) {
 }
 
 function healthForHost(hostId: string, capabilities = ['resident_lifecycle_v1']) {
+  const runtimeIntegrity: RuntimeIntegritySnapshot = {
+    contractVersion: 1,
+    status: 'ready',
+    changedAt: timestamp,
+    trustAnchorId: 'a'.repeat(64),
+    target: {
+      runtime: 'prime-agent',
+      releaseVersion: '0.7.1',
+      runtimeBuildId: 'resident-test-runtime',
+      platform: process.platform,
+      arch: process.arch,
+      manifestSha256: 'a'.repeat(64),
+      treeSha256: 'b'.repeat(64),
+      filesSha256: 'c'.repeat(64),
+    },
+    assurance: 'development-integrity',
+  }
   return {
     protocolVersion: 1,
     hostdVersion: '0.1.0',
@@ -1582,8 +1745,69 @@ function healthForHost(hostId: string, capabilities = ['resident_lifecycle_v1'])
     checkedAt: timestamp,
     serviceState: 'ready',
     host: { hostId },
-    capabilities,
+    capabilities: [...capabilities, 'runtime_integrity_v1'],
+    runtimeIntegrity,
   }
+}
+
+function initializingHealth(phase: 'preparing' | 'validating_seed' | 'copying' | 'verifying' | 'publishing') {
+  const ready = healthForHost('host-a', [])
+  const { assurance: _assurance, ...runtime } = ready.runtimeIntegrity
+  const runtimeIntegrity: RuntimeIntegritySnapshot = {
+    ...runtime,
+    status: 'initializing',
+    phase,
+    attempt: 1,
+  }
+  return {
+    ...ready,
+    serviceState: 'starting',
+    capabilities: ['runtime_integrity_v1'],
+    runtimeIntegrity,
+  }
+}
+
+function markLocalRuntimeReady(service: DesktopControlService): void {
+  const ready = healthForHost('host-a')
+  const runtimeReadiness = {
+    kind: 'reported' as const,
+    hostId: 'host-a',
+    hostdVersion: ready.hostdVersion,
+    startedAt: ready.startedAt,
+    observedAt: timestamp,
+    snapshot: ready.runtimeIntegrity,
+  }
+  const mutable = service as unknown as {
+    authorityCapabilities: string[]
+    authorityRuntimeReadiness: typeof runtimeReadiness
+    state: ReturnType<DesktopControlService['getConnectionState']>
+  }
+  mutable.authorityCapabilities = ready.capabilities
+  mutable.authorityRuntimeReadiness = runtimeReadiness
+  mutable.state = { ...mutable.state, capabilities: ready.capabilities, runtimeReadiness }
+}
+
+function markLocalRuntimeInitializing(
+  service: DesktopControlService,
+  phase: 'validating_seed' | 'copying' | 'verifying' | 'publishing',
+): void {
+  const initializing = initializingHealth(phase)
+  const runtimeReadiness = {
+    kind: 'reported' as const,
+    hostId: 'host-a',
+    hostdVersion: initializing.hostdVersion,
+    startedAt: initializing.startedAt,
+    observedAt: timestamp,
+    snapshot: initializing.runtimeIntegrity,
+  }
+  const mutable = service as unknown as {
+    authorityCapabilities: string[]
+    authorityRuntimeReadiness: typeof runtimeReadiness
+    state: ReturnType<DesktopControlService['getConnectionState']>
+  }
+  mutable.authorityCapabilities = initializing.capabilities
+  mutable.authorityRuntimeReadiness = runtimeReadiness
+  mutable.state = { ...mutable.state, capabilities: initializing.capabilities, runtimeReadiness }
 }
 
 function completedProvisionStatus(payload: Record<string, unknown>): ResidentLifecycleStatus {

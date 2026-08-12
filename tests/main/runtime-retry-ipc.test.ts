@@ -55,7 +55,7 @@ describe('runtime integrity retry IPC', () => {
     await expect(invoke?.(trustedEvent, {
       expectedHostId: 'host-local',
       runtimePath: 'C:\\private\\runtime',
-    })).resolves.toMatchObject({ ok: false, error: { code: 'native.unexpected' } })
+    })).resolves.toMatchObject({ ok: false, error: { code: 'ipc.invalid_payload' } })
     await expect(invoke?.({}, { expectedHostId: 'host-local' })).resolves.toMatchObject({
       ok: false,
       error: { code: 'ipc.untrusted_sender' },
@@ -115,11 +115,11 @@ describe('runtime integrity retry IPC', () => {
     await expect(invoke?.(trustedEvent, {
       ...input,
       runtimePath: 'C:\\private\\runtime',
-    })).resolves.toMatchObject({ ok: false, error: { code: 'native.unexpected' } })
+    })).resolves.toMatchObject({ ok: false, error: { code: 'ipc.invalid_payload' } })
     await expect(invoke?.(trustedEvent, {
       ...input,
       expectedTrustAnchorId: 'not-a-digest',
-    })).resolves.toMatchObject({ ok: false, error: { code: 'native.unexpected' } })
+    })).resolves.toMatchObject({ ok: false, error: { code: 'ipc.invalid_payload' } })
     await expect(invoke?.({}, input)).resolves.toMatchObject({
       ok: false,
       error: { code: 'ipc.untrusted_sender' },

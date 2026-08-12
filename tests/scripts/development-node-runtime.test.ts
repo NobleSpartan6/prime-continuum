@@ -6,6 +6,7 @@ import {
   DevelopmentNodeRuntimeError,
   readPinnedDevelopmentNodeVersion,
   readPinnedDevelopmentPnpmVersion,
+  resolvePinnedDevelopmentNodeExecutable,
 } from '../../scripts/development-node-runtime.mjs'
 
 const projectRoot = resolve(import.meta.dirname, '..', '..')
@@ -51,6 +52,17 @@ describe('development Node.js runtime policy', () => {
       actualVersion: `v${pinnedVersion}`,
       execPath: 'C:\\managed-node\\node.exe',
     })).toBe(pinnedVersion)
+  })
+
+  it('resolves the dependency-local pinned host executable for packaged platform layouts', () => {
+    expect(resolvePinnedDevelopmentNodeExecutable(projectRoot, 'win32')).toBe(
+      resolve(projectRoot, 'node_modules', 'node', 'node.exe'),
+    )
+    for (const platform of ['darwin', 'linux'] as const) {
+      expect(resolvePinnedDevelopmentNodeExecutable(projectRoot, platform)).toBe(
+        resolve(projectRoot, 'node_modules', 'node', 'bin', 'node'),
+      )
+    }
   })
 
   it('fails before workflow work with exact recovery guidance when runtime management is bypassed', () => {

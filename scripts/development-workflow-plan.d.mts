@@ -12,4 +12,12 @@ export function createDevelopmentWorkflowPlan(
   projectRoot: string,
 ): readonly DevelopmentWorkflowPlanStep[]
 
+export function createDevelopmentBuildPlan(
+  projectRoot: string,
+): readonly DevelopmentWorkflowPlanStep[]
+
+export function createDevelopmentHostBuildPlan(
+  projectRoot: string,
+): readonly DevelopmentWorkflowPlanStep[]
+
 export function createPreviewWorkflowPlan(): readonly DevelopmentWorkflowPlanStep[]

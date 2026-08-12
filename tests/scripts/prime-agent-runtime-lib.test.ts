@@ -15,6 +15,7 @@ import {
   createRuntimeManifest,
   loadRuntimeInputs,
   pruneRuntimePackagingNoise,
+  pruneReviewedRuntimeDirectories,
   removeObsoleteRuntimeInstalls,
   resolveVerifiedEntrypoints,
   smokeRuntime,
@@ -78,7 +79,7 @@ describe("Prime Agent runtime build policy", () => {
     expect(inputs.sources.assets.every((asset: { url: string }) => !asset.url.includes("openai/codex"))).toBe(true);
     expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
-    expect(Object.keys(inputs.lockfile.packages)).toHaveLength(202);
+    expect(Object.keys(inputs.lockfile.packages)).toHaveLength(203);
     const zeromq = inputs.lockfile.packages["node_modules/zeromq"];
     expect(zeromq).toMatchObject({ version: "6.5.0" });
     if (!zeromq) throw new Error("The pinned zeromq package is missing from the runtime lock.");
@@ -400,6 +401,8 @@ describe("Prime Agent runtime tree attestation", () => {
       if (helperName === "runtime-probe.mjs") {
         expect(args[1]).toBe(entrypoints.moduleUrl);
         expect(helperSource).toContain("await import(moduleUrl)");
+        expect(helperSource).toContain('"@mistralai/mistralai"');
+        expect(helperSource).toContain('"openai-codex-responses-AMLRMEWM.js"');
         return {
           stdout: JSON.stringify({
             node: "22.22.3",
@@ -631,13 +634,191 @@ describe("Prime Agent package seed selection", () => {
     await mkdir(packageDirectory, { recursive: true });
     await Promise.all([
       writeFile(join(packageDirectory, ".gitkeep"), ""),
+      writeFile(join(packageDirectory, "runtime.d.ts"), "export {};\n"),
+      writeFile(join(packageDirectory, "runtime.js.map"), "{}\n"),
       writeFile(join(packageDirectory, "runtime.js"), "export {};\n"),
     ]);
 
-    await expect(pruneRuntimePackagingNoise(root, { packaging: { excludedBasenames: [".gitkeep"] } })).resolves.toEqual([
+    await expect(pruneRuntimePackagingNoise(root, {
+      packaging: {
+        excludedBasenames: [".gitkeep"],
+        excludedSuffixes: [".d.ts", ".d.mts", ".d.cts", ".map"],
+      },
+    })).resolves.toEqual([
       "node_modules/fixture/.gitkeep",
+      "node_modules/fixture/runtime.d.ts",
+      "node_modules/fixture/runtime.js.map",
     ]);
     expect(await readdir(packageDirectory)).toEqual(["runtime.js"]);
+  });
+
+  it("prunes only an exact reviewed package directory after validating its complete identity", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await mkdir(join(target, "nested"), { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "a.ts"), "export const a = 1;\n"),
+      writeFile(join(target, "nested", "b.ts"), "export const b = 2;\n"),
+    ]);
+    const entries = [
+      { path: "a.ts", bytes: "export const a = 1;\n" },
+      { path: "nested/b.ts", bytes: "export const b = 2;\n" },
+    ].map((entry) => ({
+      ...entry,
+      size: Buffer.byteLength(entry.bytes),
+      sha256: createHash("sha256").update(entry.bytes).digest("hex"),
+    }));
+    const treeSource = entries.map((entry) => `${entry.sha256} ${entry.size} ${entry.path}\n`).join("");
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: entries.length,
+          totalBytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+          treeSha256: createHash("sha256").update(treeSource).digest("hex"),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).resolves.toEqual([
+      "node_modules/fixture/src",
+    ]);
+    await expect(realpath(target)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(packageDirectory, "package.json"), "utf8")).resolves.toBe(packageJson);
+  });
+
+  it("fails closed without pruning when a reviewed directory identity drifts", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await mkdir(target, { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "runtime.ts"), "changed\n"),
+    ]);
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: 7,
+          treeSha256: "a".repeat(64),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).rejects.toThrow(
+      "Reviewed runtime prune target drifted",
+    );
+    await expect(readFile(join(target, "runtime.ts"), "utf8")).resolves.toBe("changed\n");
+  });
+
+  it("includes runtime-shaped package files in the reviewed directory identity", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    const runtimeSource = "export const runtime = true;\n";
+    await mkdir(target, { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "runtime.ts"), runtimeSource),
+      writeFile(join(target, "runtime.json"), "unreviewed\n"),
+    ]);
+    const runtimeSha256 = createHash("sha256").update(runtimeSource).digest("hex");
+    const treeSource = `${runtimeSha256} ${Buffer.byteLength(runtimeSource)} runtime.ts\n`;
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: Buffer.byteLength(runtimeSource),
+          treeSha256: createHash("sha256").update(treeSource).digest("hex"),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).rejects.toThrow(
+      "Reviewed runtime prune target drifted",
+    );
+    await expect(readFile(join(target, "runtime.json"), "utf8")).resolves.toBe("unreviewed\n");
+  });
+
+  it("validates every reviewed directory before removing any of them", async () => {
+    const root = await makeTemporaryDirectory();
+    const makeEntry = async (packageName: string, contents: string, treeSha256?: string) => {
+      const packageDirectory = join(root, "node_modules", packageName);
+      const target = join(packageDirectory, "src");
+      const packageJson = `${JSON.stringify({ name: packageName, version: "1.0.0" })}\n`;
+      await mkdir(target, { recursive: true });
+      await Promise.all([
+        writeFile(join(packageDirectory, "package.json"), packageJson),
+        writeFile(join(target, "index.ts"), contents),
+      ]);
+      const sha256 = createHash("sha256").update(contents).digest("hex");
+      const treeSource = `${sha256} ${Buffer.byteLength(contents)} index.ts\n`;
+      return {
+        relativePath: `node_modules/${packageName}/src`,
+        package: packageName,
+        version: "1.0.0",
+        packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+        fileCount: 1,
+        totalBytes: Buffer.byteLength(contents),
+        treeSha256: treeSha256 ?? createHash("sha256").update(treeSource).digest("hex"),
+      };
+    };
+    const first = await makeEntry("first", "first\n");
+    const second = await makeEntry("second", "second\n", "a".repeat(64));
+
+    await expect(pruneReviewedRuntimeDirectories(root, {
+      packaging: { reviewedPrunedDirectories: [first, second] },
+    })).rejects.toThrow("Reviewed runtime prune target drifted");
+    await expect(readFile(join(root, "node_modules", "first", "src", "index.ts"), "utf8")).resolves.toBe("first\n");
+    await expect(readFile(join(root, "node_modules", "second", "src", "index.ts"), "utf8")).resolves.toBe("second\n");
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a symlinked reviewed directory without deleting its target", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const outside = join(root, "outside");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await Promise.all([
+      mkdir(packageDirectory, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(outside, "keep.ts"), "keep\n"),
+      symlink(outside, join(packageDirectory, "src"), "dir"),
+    ]);
+
+    await expect(pruneReviewedRuntimeDirectories(root, {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: 5,
+          treeSha256: "a".repeat(64),
+        }],
+      },
+    })).rejects.toThrow("not a plain package directory");
+    await expect(readFile(join(outside, "keep.ts"), "utf8")).resolves.toBe("keep\n");
   });
 
   it("keeps only the selected content-addressed install", async () => {
@@ -711,12 +892,21 @@ async function makeRuntimeFixture(name: string): Promise<string> {
   const prime = join(root, "node_modules", "prime-agent");
   await mkdir(join(prime, "dist", "bundle"), { recursive: true });
   await mkdir(join(root, "node_modules", "zeromq", "build", "fixture"), { recursive: true });
+  await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+  await mkdir(join(root, "bridge", "skills", "playwright-cli"), { recursive: true });
   await Promise.all([
     writeFile(join(root, "package.json"), '{"name":"fixture"}\n'),
     writeFile(join(root, "package-lock.json"), '{"lockfileVersion":3}\n'),
     writeFile(join(prime, "package.json"), '{"name":"prime-agent","version":"0.7.1"}\n'),
     writeFile(join(prime, "dist", "index.js"), "export class DaemonClient {}\n"),
     writeFile(join(prime, "dist", "bundle", "cli.js"), "process.exitCode = 0;\n"),
+    writeFile(join(root, "node_modules", "playwright-core", "package.json"), '{"name":"playwright-core","version":"1.63.0-alpha-2026-08-05"}\n'),
+    writeFile(join(root, "bridge", "browser-bridge.mjs"), "export const bridge = true;\n"),
+    writeFile(join(root, "bridge", "browser-doctor-host.cjs"), "module.exports = {};\n"),
+    writeFile(join(root, "bridge", "browser-host.cjs"), "module.exports = {};\n"),
+    writeFile(join(root, "bridge", "playwright-cli"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }),
+    writeFile(join(root, "bridge", "playwright-cli.cmd"), "@exit /b 0\r\n"),
+    writeFile(join(root, "bridge", "skills", "playwright-cli", "SKILL.md"), "# Browser\n"),
     writeFile(join(root, "node_modules", "zeromq", "build", "fixture", "addon.node"), "native-fixture"),
   ]);
   return root;
@@ -741,10 +931,23 @@ function fixtureInputs() {
       installStrategy: "hoisted",
       targetNativePrebuildsOnly: true,
     },
-    packaging: { excludedBasenames: [".gitkeep"] },
+    packaging: {
+      excludedBasenames: [".gitkeep"],
+      excludedSuffixes: [".d.ts", ".d.mts", ".d.cts", ".map"],
+    },
     entrypoints: {
       module: "node_modules/prime-agent/dist/index.js",
       cli: "node_modules/prime-agent/dist/bundle/cli.js",
+      browserBridge: "bridge/browser-bridge.mjs",
+      browserHost: "bridge/browser-host.cjs",
+      browserLauncher: "bridge/playwright-cli",
+      browserLauncherWindows: "bridge/playwright-cli.cmd",
+      browserSkill: "bridge/skills/playwright-cli/SKILL.md",
+    },
+    browserBridge: {
+      protocol: "prime-continuim.browser.v1",
+      playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+      engine: "verified-electron-host",
     },
     daemon: {
       protocolName: "prime-agent.daemon",

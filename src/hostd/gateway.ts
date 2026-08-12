@@ -83,6 +83,8 @@ export interface PrimeAgentGateway {
    * generation-only liveness cannot prove resident control quiescence.
    */
   isResidentBindingLive?(binding: ResidentSessionBinding): Promise<boolean>;
+  /** Exact-binding proof that the packaged browser command surface passed verification. */
+  isResidentBrowserExecutionReady?(binding: ResidentSessionBinding): Promise<boolean>;
   submit(command: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission>;
   close(): Promise<void>;
 }

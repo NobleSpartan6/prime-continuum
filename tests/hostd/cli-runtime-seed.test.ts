@@ -6,12 +6,22 @@ import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
 describe("hostd runtime seed CLI authority", () => {
   const seed = path.resolve("test-runtime-seed");
+  const browserExecutable = path.resolve("browser-runtime", process.platform === "win32" ? "electron.exe" : "electron");
 
   it("accepts one absolute runtime seed only for serve", () => {
     expect(parseHostdCli(["serve", "--runtime-seed", seed])).toMatchObject({
       mode: "serve",
       runtimeSeed: seed,
     });
+  });
+
+  it("accepts one separately supplied absolute browser Electron only for serve", () => {
+    expect(parseHostdCli(["serve", "--browser-executable", browserExecutable])).toMatchObject({
+      mode: "serve",
+      browserExecutable,
+    });
+    expect(() => parseHostdCli(["serve", "--browser-executable", "relative/electron"])).toThrow("absolute path");
+    expect(() => parseHostdCli(["connect", "--stdio", "--browser-executable", browserExecutable])).toThrow("valid only with serve");
   });
 
   it.each([

@@ -42,6 +42,9 @@ export const IPC = {
   candidateEvaluationPreflight: 'prime:candidate:evaluation:preflight',
   startCandidateEvaluation: 'prime:candidate:evaluation:start',
   candidateEvaluationSnapshot: 'prime:candidate:evaluation:snapshot',
+  preselectResidentWorkspace: 'prime:resident:workspace:preselect',
+  completeResidentWorkspacePreselection: 'prime:resident:workspace:preselection:complete',
+  cancelResidentWorkspacePreselection: 'prime:resident:workspace:preselection:cancel',
   selectResidentWorkspace: 'prime:resident:workspace:select',
   provisionResident: 'prime:resident:provision',
   prepareResidentEnd: 'prime:resident:end:prepare',
@@ -207,6 +210,16 @@ export interface ResidentWorkspaceSelection {
   selectionToken: string
   operationId: string
   expectedHostId: string
+  suggestedName: string
+  expiresAt: string
+}
+
+/**
+ * A short-lived, path-free preview of a native folder choice made while the
+ * local runtime is still preparing. The absolute path never leaves main.
+ */
+export interface ResidentWorkspacePreselection {
+  preselectionToken: string
   suggestedName: string
   expiresAt: string
 }
@@ -472,6 +485,11 @@ export interface PrimeBridge {
   candidateEvaluationPreflight(input: CandidateEvaluationPreflightRequest): Promise<Result<CandidateEvaluationPreflight>>
   startCandidateEvaluation(input: CandidateEvaluationStartRequest): Promise<Result<CandidateEvaluationStatus>>
   candidateEvaluationSnapshot(input: CandidateEvaluationPreflightRequest): Promise<Result<CandidateEvaluationSnapshot>>
+  preselectResidentWorkspace(): Promise<Result<ResidentWorkspacePreselection>>
+  completeResidentWorkspacePreselection(input: {
+    preselectionToken: string
+  }): Promise<Result<ResidentWorkspaceSelection>>
+  cancelResidentWorkspacePreselection(input: { preselectionToken: string }): Promise<Result<void>>
   selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<Result<ResidentWorkspaceSelection>>
   provisionResident(input: ResidentProvisionInput): Promise<Result<ResidentLifecycleStatus>>
   prepareResidentEnd(input: ResidentEndPreparationInput): Promise<Result<ResidentEndPreparation>>

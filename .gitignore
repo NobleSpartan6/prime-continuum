@@ -11,3 +11,21 @@ Thumbs.db
 prime-agent-data/
 .prime-continuim-workflow.lock*
 .prime-continuim-self-build/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local agent and test state
+.playwright-cli/
+test-results/
+playwright-report/
+
+# Local design explorations are not product screenshots
+artifacts/*-concept.png

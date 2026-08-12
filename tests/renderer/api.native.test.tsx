@@ -141,11 +141,44 @@ function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][
       compactionCount: 0,
       queuedActionCount: thread.status === 'running' ? 2 : 0,
       activeToolNames: [],
+      resourceInventory: {
+        skills: [{
+          name: 'playwright-cli',
+          description: 'Browser automation guidance.',
+          sourceKind: { scope: 'project', origin: 'top-level' },
+        }],
+        prompts: [],
+        themes: [],
+        extensions: { count: 0, sourceKinds: [] },
+        contextFileCount: 1,
+        diagnostics: { warningCount: 0, errorCount: 0, collisions: [] },
+      },
       context: { usedTokens: 12_000, maxTokens: 100_000 },
     },
     pendingAttention: [],
     git: { branch: 'main', stagedFiles: 0, unstagedFiles: 0, untrackedFiles: 0 },
     evidence: { testsPassed: 0, testsFailed: 0, artifactCount: 0 },
+    residentControl: {
+      projectionVersion: 1,
+      hostId: thread.currentLocation.hostId,
+      threadId: thread.threadId,
+      executionGenerationId: thread.currentLocation.executionGenerationId,
+      bindingFingerprint: 'a'.repeat(64),
+      controlSequence: 1,
+      changedAt: '2026-08-05T20:00:01.000Z',
+      authorityCursor: latestCursor,
+      commandReadiness: 'ready',
+      browserExecution: {
+        readiness: 'ready',
+        protocol: 'prime-continuim.browser.v1',
+        surface: 'playwright-cli',
+        controller: 'playwright-core/1.63.0-alpha-2026-08-05',
+        engine: 'verified-electron-host',
+      },
+      quiescence: thread.status === 'running'
+        ? { state: 'uncertain', reason: 'active_without_operation' }
+        : { state: 'idle_proven' },
+    },
     latestCursor,
   }
 }
@@ -210,6 +243,36 @@ function registeredWorkspaceFixture(residentActive = false) {
     activeHostId: 'host-b',
     entries: {
       'host-b': { hostId: 'host-b', catalog, lastSnapshot: snapshot },
+    },
+  }
+  return { catalog, thread, snapshot, connection, cache }
+}
+
+function registeredLocalWorkspaceFixture() {
+  const fixture = registeredWorkspaceFixture()
+  const connection = residentLifecycleConnection()
+  const catalog = structuredClone(fixture.catalog)
+  catalog.host = {
+    ...catalog.host,
+    hostId: 'host-local',
+    kind: 'local',
+    connectionPaths: [{ kind: 'local_socket', priority: 0, state: 'available' }],
+  }
+  catalog.projects = catalog.projects.map((project) => ({ ...project, hostId: 'host-local' }))
+  catalog.threads = catalog.threads.map((thread) => ({
+    ...thread,
+    currentLocation: { ...thread.currentLocation, hostId: 'host-local' },
+  }))
+  const thread = catalog.threads[0]
+  const snapshot = recoverySnapshot(thread, 'Saved local workspace authority.')
+  snapshot.runtime.residency = 'client_owned'
+  delete snapshot.runtime.activeSessionId
+  delete snapshot.runtime.sessionId
+  const cache = {
+    version: 3,
+    activeHostId: 'host-local',
+    entries: {
+      'host-local': { hostId: 'host-local', catalog, lastSnapshot: snapshot },
     },
   }
   return { catalog, thread, snapshot, connection, cache }
@@ -513,6 +576,157 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('cleans historical RLM protocol blocks before they reach the transcript', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(
+      catalog.threads[0]!,
+      "rlm\nRLMSpawnHandle(agent_id='opaque-child', session_dir=PosixPath('/Users/operator/Library/Application Support/PrimeAgent/private'), model='openai-codex/gpt-5.6-sol')",
+    )
+    snapshot.materializedRecentBlocks.push({
+      blockId: 'block-agent-message',
+      kind: 'status',
+      text: [
+        'agent_message',
+        '[from child:reviewer]',
+        'Agent-to-agent message received.',
+        'From: reviewer, active opaque-active, session opaque-session',
+        'To: Prime Agent, active root-active, session root-session',
+        'Message id: agentmsg_opaque',
+        '',
+        'Review complete.',
+      ].join('\n'),
+      createdAt: '2026-08-05T20:00:02.000Z',
+      sequence: 2,
+    })
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+
+    const loaded = await new NativeRendererApi(bridge).loadWorkbench()
+    const transcript = loaded.threads[0]?.transcript ?? []
+
+    expect(transcript.map((block) => block.body)).toEqual([
+      'rlm\nDelegated to RLM child · openai-codex/gpt-5.6-sol',
+      'Agent message\nFrom reviewer\nReview complete.',
+    ])
+    expect(loaded.runtime.agentsReported).toBe(true)
+    expect(loaded.agents).toEqual([{
+      id: 'transcript-agent-block-agent-message',
+      name: 'reviewer',
+      sessionName: 'reviewer',
+      role: 'Retained subagent',
+      status: 'complete',
+      hostName: 'This computer',
+      answerPreview: 'Review complete.',
+      repliedSinceTask: true,
+    }])
+    expect(JSON.stringify(transcript)).not.toMatch(/Users|Application Support|opaque-session|agentmsg_opaque|RLMSpawnHandle/)
+  })
+
+  it('keeps early workspace choice path-free and consumes conversion before an interrupted reply', async () => {
+    const initializingConnection = {
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-local',
+      path: 'local_socket',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['runtime_integrity_v1'],
+      runtimeReadiness: {
+        kind: 'reported',
+        hostId: 'host-local',
+        hostdVersion: '0.1.0',
+        startedAt: '2026-08-05T19:59:00.000Z',
+        observedAt: '2026-08-05T20:00:00.000Z',
+        snapshot: { status: 'initializing', phase: 'copying' },
+      },
+    }
+    const preselection = {
+      preselectionToken: 'preselection-one',
+      suggestedName: 'Workspace',
+      expiresAt: '2099-08-07T12:05:00.000Z',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 3, entries: {} },
+        outbox: [],
+        connection: initializingConnection,
+        appVersion: '0.1.0',
+      })),
+      preselectResidentWorkspace: vi.fn(() => ok(preselection)),
+      completeResidentWorkspacePreselection: vi.fn(() => Promise.reject(new Error('reply interrupted'))),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+
+    await expect(api.preselectResidentWorkspace()).resolves.toEqual(preselection)
+    expect(JSON.stringify(preselection)).not.toMatch(/[/\\]|Users|private/i)
+    const readyConnection = {
+      ...initializingConnection,
+      capabilities: ['runtime_integrity_v1', 'resident_lifecycle_v1'],
+      runtimeReadiness: {
+        ...initializingConnection.runtimeReadiness,
+        snapshot: { status: 'ready', assurance: 'development-integrity' },
+      },
+    }
+    const mutable = api as unknown as {
+      connection: unknown
+      mutationAuthorityReadyHostId?: string
+    }
+    mutable.connection = readyConnection
+    mutable.mutationAuthorityReadyHostId = 'host-local'
+
+    await expect(api.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toThrow('reply interrupted')
+    await expect(api.completeResidentWorkspacePreselection(preselection.preselectionToken))
+      .rejects.toThrow('Choose the workspace folder again')
+    expect(bridge.completeResidentWorkspacePreselection).toHaveBeenCalledOnce()
+  })
+
+  it('rejects native early workspace receipts that expose any additional path field', async () => {
+    const connection = {
+      phase: 'online',
+      target: { kind: 'local' },
+      hostId: 'host-local',
+      path: 'local_socket',
+      since: '2026-08-05T20:00:00.000Z',
+      attempt: 1,
+      capabilities: ['runtime_integrity_v1'],
+      runtimeReadiness: {
+        kind: 'reported',
+        hostId: 'host-local',
+        hostdVersion: '0.1.0',
+        startedAt: '2026-08-05T19:59:00.000Z',
+        observedAt: '2026-08-05T20:00:00.000Z',
+        snapshot: { status: 'initializing', phase: 'verifying' },
+      },
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({ cache: { version: 3, entries: {} }, outbox: [], connection, appVersion: '0.1.0' })),
+      preselectResidentWorkspace: vi.fn(() => ok({
+        preselectionToken: 'preselection-one',
+        suggestedName: 'Workspace',
+        expiresAt: '2099-08-07T12:05:00.000Z',
+        workspaceDirectory: '/Users/operator/private',
+      })),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+    await expect(api.preselectResidentWorkspace()).rejects.toThrow('invalid path-free early workspace choice')
+  })
+
   it('forwards the narrow HUD bridge without mixing window state into workbench projection', async () => {
     const target = {
       expectedHostId: 'host-local',
@@ -610,6 +824,45 @@ describe('NativeRendererApi', () => {
     expect(bridge.provisionResident).toHaveBeenCalledTimes(1)
 
     unsubscribe()
+  })
+
+  it('starts another task from an ended saved local workspace without reopening the folder picker', async () => {
+    const fixture = registeredLocalWorkspaceFixture()
+    const selection = {
+      ...registeredWorkspaceSelection(),
+      expectedHostId: 'host-local',
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: fixture.cache,
+        outbox: [],
+        residentLifecycleOperations: [],
+        connection: fixture.connection,
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(fixture.catalog)),
+      requestSnapshot: vi.fn(() => ok(fixture.snapshot)),
+      selectResidentWorkspace: vi.fn(() => ok(selection)),
+      provisionResident: vi.fn(() => ok({ ...registeredProvisionStatus(), expectedHostId: 'host-local' })),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    await api.loadWorkbench()
+    const reference = {
+      kind: 'registered_workspace' as const,
+      projectId: fixture.thread.currentLocation.projectId,
+      workspaceId: fixture.thread.currentLocation.workspaceId,
+      referenceThreadId: fixture.thread.threadId,
+      referenceExecutionGenerationId: fixture.thread.currentLocation.executionGenerationId,
+    }
+
+    await expect(api.selectResidentWorkspace(reference)).resolves.toMatchObject({
+      ...reference,
+      expectedHostId: 'host-local',
+    })
+    expect(bridge.selectResidentWorkspace).toHaveBeenCalledWith(reference)
   })
 
   it('withholds saved-workspace create while the exact selected resident authority remains endable', async () => {
@@ -1357,6 +1610,132 @@ describe('NativeRendererApi', () => {
     unsubscribe()
   })
 
+  it('exposes a pre-dispatch resident End as a resumable action instead of passive progress', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident end recovery.')
+    snapshot.runtime.residency = 'client_owned'
+    delete snapshot.runtime.activeSessionId
+    delete snapshot.runtime.sessionId
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [residentEndOperation('submitted')],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      prepareResidentEnd: vi.fn(() => ok(residentEndPreparation())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+
+    expect(view.composerReceipt).toEqual({
+      state: 'sent',
+      operation: 'end',
+      retryable: true,
+      message: 'Ready to finish · Prime Agent has not received an End request',
+    })
+    expect(view.operations.endResident).toBe(true)
+    await expect(api.prepareResidentEnd({
+      expectedHostId: 'host-local',
+      projectId: 'project-local',
+      workspaceId: 'workspace-local',
+      threadId: 'thread-one',
+      executionGenerationId: 'generation-one',
+      resumeOperationId: 'resident-end-operation-one',
+    })).resolves.toEqual(residentEndPreparation())
+    expect(bridge.prepareResidentEnd).toHaveBeenCalledOnce()
+  })
+
+  it('offers the same-operation End retry when the exact host has no durable result', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resident End result is missing.')
+    snapshot.runtime.residency = 'client_owned'
+    delete snapshot.runtime.activeSessionId
+    delete snapshot.runtime.sessionId
+    const operation = {
+      ...residentEndOperation('outcome_unknown'),
+      lastStatus: undefined,
+    }
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [operation],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      prepareResidentEnd: vi.fn(() => ok(residentEndPreparation())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+
+    expect(view.operations.endResident).toBe(true)
+    expect(view.composerReceipt).toMatchObject({ state: 'uncertain', operation: 'end' })
+    await expect(api.prepareResidentEnd({
+      expectedHostId: operation.expectedHostId,
+      projectId: operation.projectId,
+      workspaceId: operation.workspaceId,
+      threadId: operation.threadId,
+      executionGenerationId: operation.executionGenerationId,
+      resumeOperationId: operation.operationId,
+    })).resolves.toEqual(residentEndPreparation())
+  })
+
+  it('does not expose a fresh resident End from a non-exact saved operation after runtime detach', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Detached resident session.')
+    snapshot.runtime.residency = 'client_owned'
+    delete snapshot.runtime.activeSessionId
+    delete snapshot.runtime.sessionId
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        durableUncertainReceipts: [],
+        residentLifecycleOperations: [{
+          ...residentEndOperation('submitted'),
+          workspaceId: 'other-workspace',
+        }],
+        connection: residentLifecycleConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => ok(snapshot)),
+      prepareResidentEnd: vi.fn(() => ok(residentEndPreparation())),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const view = await api.loadWorkbench()
+
+    expect(view.operations.endResident).toBeUndefined()
+    await expect(api.prepareResidentEnd({
+      expectedHostId: 'host-local',
+      projectId: 'project-local',
+      workspaceId: 'workspace-local',
+      threadId: 'thread-one',
+      executionGenerationId: 'generation-one',
+    })).rejects.toThrow(/not ready on this verified host/i)
+    expect(bridge.prepareResidentEnd).not.toHaveBeenCalled()
+  })
+
   it('materializes only an exact same-lineage ended disposition after a completed resident end', async () => {
     const catalog = recoveryCatalog()
     const source = recoverySnapshot(catalog.threads[0], 'Resident end source.')
@@ -1682,7 +2061,15 @@ describe('NativeRendererApi', () => {
     const snapshot = {
       ...recoverySnapshot(catalog.threads[0], 'Persisted work remains available.'),
       runtime: undefined,
-      childAgents: [{ agentId: 'persisted-agent', title: 'Persisted helper', state: 'waiting' }],
+      childAgents: [{
+        agentId: 'persisted-agent',
+        activeSessionId: 'active-persisted-agent',
+        sessionName: 'Persisted helper session',
+        title: 'Persisted helper',
+        state: 'complete',
+        answerPreview: 'Returned a bounded result.',
+        repliedSinceTask: true,
+      }],
     }
     const bridge = {
       bootstrap: vi.fn(() => ok({
@@ -1703,13 +2090,45 @@ describe('NativeRendererApi', () => {
 
     expect(projected.runtime.session).toBeUndefined()
     expect(projected.runtime.agentsReported).toBe(true)
-    expect(projected.agents).toEqual([expect.objectContaining({ name: 'Persisted helper', status: 'waiting' })])
+    expect(projected.agents).toEqual([expect.objectContaining({
+      name: 'Persisted helper',
+      status: 'complete',
+      activeSessionId: 'active-persisted-agent',
+      sessionName: 'Persisted helper session',
+      answerPreview: 'Returned a bounded result.',
+      repliedSinceTask: true,
+    })])
     expect(projected.runtime.goals).toEqual([
       expect.objectContaining({ objective: 'Finish First durable thread', state: 'active' }),
     ])
     expect(projected.runtime.schedules).toEqual([
       expect.objectContaining({ label: 'Review verification', state: 'active' }),
     ])
+  })
+
+  it('projects only the validated path-free resource inventory for the exact session', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0], 'Resource inventory projection.')
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 1, catalog, lastSnapshot: snapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+
+    const projected = await new NativeRendererApi(bridge).loadWorkbench()
+
+    expect(projected.runtime.session?.resourceInventory).toEqual(snapshot.runtime.resourceInventory)
+    expect(JSON.stringify(projected.runtime.session?.resourceInventory)).not.toMatch(/\/Users\/|credential|artifact/i)
+    expect(projected.runtime.browserExecution).toEqual(snapshot.residentControl.browserExecution)
+    expect(JSON.stringify(projected.runtime.browserExecution)).not.toMatch(/\/Users\/|path|credential|artifact/i)
   })
 
   it('unwraps structured bridge failures instead of treating them as projection data', async () => {
@@ -3436,6 +3855,21 @@ describe('NativeRendererApi', () => {
     })
     expect(missingLifecycle.operations.provisionResident).toBeUndefined()
 
+    const warmingLifecycle = await load({
+      ...exactConnection,
+      capabilities: ['runtime_integrity_v1'],
+      runtimeReadiness: {
+        ...readyRuntime(),
+        observedAt: new Date().toISOString(),
+      },
+    })
+    expect(warmingLifecycle.localSetup).toMatchObject({
+      stage: 'preparing_runtime',
+      runtimeReadiness: { status: 'ready' },
+    })
+    expect(warmingLifecycle.localSetup?.issue).toBeUndefined()
+    expect(warmingLifecycle.operations.provisionResident).toBeUndefined()
+
     const degraded = await load({ ...exactConnection, phase: 'degraded' })
     expect(degraded.localSetup).toMatchObject({
       stage: 'needs_attention',
@@ -4655,6 +5089,7 @@ describe('NativeRendererApi', () => {
     })
 
     await expect(idleApi.loadWorkbench()).resolves.toMatchObject({
+      runtime: { residentControlReadiness: 'ready' },
       operations: {
         startResidentTurn: true,
         stopResidentTurn: false,
@@ -4689,6 +5124,46 @@ describe('NativeRendererApi', () => {
       providerId: 'openai-codex',
       modelId: 'gpt-5.3-codex',
     })).toThrow(StaleHostAuthorityError)
+  })
+
+  it('fails resident commands closed when exact per-thread readiness is absent or unavailable', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const ready = recoverySnapshot(catalog.threads[0], 'Per-thread command authority.')
+    const { residentControl: _residentControl, ...absent } = ready
+    const unavailable = {
+      ...ready,
+      residentControl: { ...ready.residentControl, commandReadiness: 'unavailable' },
+    }
+
+    for (const [snapshot, expectedReadiness] of [
+      [absent, undefined],
+      [unavailable, 'unavailable'],
+    ] as const) {
+      const api = new NativeRendererApi({
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [],
+          quarantinedOutboxCount: 0,
+          connection: {
+            ...onlineConnection(),
+            capabilities: ['prime_agent_commands_v2', 'runtime_model_catalog_v1'],
+          },
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+        requestSnapshot: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      })
+
+      const projection = await api.loadWorkbench()
+      expect(projection.operations).toMatchObject({
+        submitCommands: false,
+        startResidentTurn: false,
+        stopResidentTurn: false,
+      })
+      expect(projection.runtime.residentControlReadiness).toBe(expectedReadiness)
+      expect(projection.operations.selectResidentModel).toBeUndefined()
+    }
   })
 
   it('submits one exact live-only model command and completes only after the refreshed model projects', async () => {
@@ -6151,6 +6626,103 @@ describe('NativeRendererApi', () => {
     }))
     expect(view.attention).not.toContainEqual(expect.objectContaining({
       id: 'durable-uncertain-background-stale',
+    }))
+  })
+
+  it('indexes uncertain commands by the exact host, thread, and generation tuple', async () => {
+    const catalog = recoveryCatalog()
+    const localThread = catalog.threads[0]
+    localThread.currentLocation.executionGenerationId = 'shared-generation'
+    const remoteThread = structuredClone(localThread)
+    remoteThread.currentLocation = {
+      hostId: 'host-remote',
+      projectId: 'project-remote',
+      workspaceId: 'workspace-remote',
+      executionGenerationId: 'shared-generation',
+    }
+    remoteThread.title = 'Remote duplicate thread identity'
+    catalog.threads = [localThread, remoteThread]
+    const snapshot = recoverySnapshot(localThread, 'Exact local transcript.')
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: {
+          version: 3,
+          activeHostId: 'host-local',
+          entries: {
+            'host-local': { hostId: 'host-local', catalog, lastSnapshot: snapshot },
+            'host-remote': { hostId: 'host-remote', catalog },
+          },
+        },
+        outbox: [{
+          state: 'uncertain',
+          hostId: 'host-local',
+          command: {
+            kind: 'thread.prompt',
+            expectedHostId: 'host-local',
+            deviceId: 'device-local',
+            commandId: 'local-exact-outbox',
+            threadId: 'thread-one',
+            expectedExecutionGenerationId: 'shared-generation',
+            issuedAt: '2026-08-05T20:00:00.000Z',
+          },
+        }],
+        durableUncertainReceipts: [
+          {
+            hostId: 'host-remote',
+            deviceId: 'device-remote',
+            commandId: 'remote-exact-receipt',
+            threadId: 'thread-one',
+            executionGenerationId: 'shared-generation',
+            status: 'uncertain',
+            durable: true,
+            error: {
+              code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+              message: 'Remote exact outcome is unknown.',
+              retryable: false,
+            },
+          },
+          {
+            hostId: 'host-remote',
+            deviceId: 'device-remote',
+            commandId: 'remote-stale-receipt',
+            threadId: 'thread-one',
+            executionGenerationId: 'retired-generation',
+            status: 'uncertain',
+            durable: true,
+            error: {
+              code: 'RESIDENT_DISPATCH_RESTART_UNCERTAIN',
+              message: 'Retired generation must not correlate.',
+              retryable: false,
+            },
+          },
+        ],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      }),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+
+    const view = await api.loadWorkbench()
+    const localRendererThread = view.threads.find((thread) => thread.hostId === 'host-local')
+    const remoteRendererThread = view.threads.find((thread) => thread.hostId === 'host-remote')
+    expect(localRendererThread?.id).not.toBe(remoteRendererThread?.id)
+    expect(view.attention).toContainEqual(expect.objectContaining({
+      id: 'resident-uncertain-local-exact-outbox',
+      threadId: localRendererThread?.id,
+      hostName: 'This computer',
+    }))
+    expect(view.attention).toContainEqual(expect.objectContaining({
+      id: 'durable-uncertain-remote-exact-receipt',
+      threadId: remoteRendererThread?.id,
+      hostName: 'devbox',
+    }))
+    expect(view.attention).not.toContainEqual(expect.objectContaining({
+      id: 'durable-uncertain-remote-stale-receipt',
     }))
   })
 

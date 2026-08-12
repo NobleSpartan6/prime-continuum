@@ -2632,6 +2632,7 @@ export class HostStore {
     threadIdValue: string,
     executionGenerationIdValue: string,
     livePreparedBindingValue?: ResidentSessionBinding,
+    browserExecutionReadyValue = false,
   ): Promise<ResidentControlProjectionSnapshot> {
     const expectedHostId = IdSchema.parse(expectedHostIdValue);
     const threadId = IdSchema.parse(threadIdValue);
@@ -2701,6 +2702,8 @@ export class HostStore {
       let bindingFingerprint: string;
       let operation: ResidentControlOperation | undefined;
       let quiescence: ResidentControlProjectionSnapshot["quiescence"];
+      let commandReadiness: ResidentControlProjectionSnapshot["commandReadiness"] = "unavailable";
+      let browserExecution: ResidentControlProjectionSnapshot["browserExecution"] = { readiness: "unavailable" };
 
       if (ended) {
         if (promptAttempt || abortAttempt || activeRecord || transitionRecord) {
@@ -2738,6 +2741,16 @@ export class HostStore {
           livePreparedBinding !== undefined &&
           isDeepStrictEqual(activeRecord.binding, livePreparedBinding) &&
           await this.hasExactResidentProjectionUnlocked(livePreparedBinding);
+        commandReadiness = exactResidentAuthorityReady ? "ready" : "unavailable";
+        if (exactResidentAuthorityReady && browserExecutionReadyValue === true) {
+          browserExecution = {
+            readiness: "ready",
+            protocol: "prime-continuim.browser.v1",
+            surface: "playwright-cli",
+            controller: "playwright-core/1.63.0-alpha-2026-08-05",
+            engine: "verified-electron-host",
+          };
+        }
         if (operation?.phase === "uncertain") {
           quiescence = { state: "uncertain", reason: "mutation_outcome_unknown" };
         } else if (operation?.kind === "abort") {
@@ -2760,6 +2773,8 @@ export class HostStore {
         executionGenerationId,
         bindingFingerprint,
         authorityCursor: snapshot.latestCursor,
+        commandReadiness,
+        browserExecution,
         ...(operation ? { operation } : {}),
         quiescence,
       };
@@ -3992,9 +4007,10 @@ export class HostStore {
           );
         }
         await this.assertResidentEndExpectedSourceCursorUnlocked(input);
-        await this.guardResidentLifecycleMaterializationUnlocked(() =>
-          this.materializeEndingResidentBindingRevocationUnlocked(existing),
-        );
+        await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+          await this.materializeEndingResidentBindingRevocationUnlocked(existing);
+          await this.supersedeResidentDispatchProofBarriersForEndUnlocked(existing);
+        });
         return residentLifecycleStatus(existing);
       }
       const authority = await this.resolveResidentLifecycleAuthorityUnlocked(input);
@@ -4011,8 +4027,9 @@ export class HostStore {
         );
       }
       await this.assertNoResidentLifecycleOperationUnlocked(input.threadId);
-      await this.assertNoResidentDispatchTransitionUnlocked(
+      await this.assertResidentEndDispatchTransitionsUnlocked(
         input.threadId,
+        binding,
         "Resident end cannot begin while a dispatch is unresolved",
       );
       this.assertBindingMatchesLifecycleAuthority(binding, authority);
@@ -4034,6 +4051,7 @@ export class HostStore {
       await this.writeResidentLifecycleBoundaryUnlocked(record, "after_ending");
       await this.guardResidentLifecycleMaterializationUnlocked(async () => {
         await this.materializeEndingResidentBindingRevocationUnlocked(record);
+        await this.supersedeResidentDispatchProofBarriersForEndUnlocked(record);
         await this.injectResidentLifecycleFault("after_binding_revoked", record.operationId);
       });
       return residentLifecycleStatus(record);
@@ -4221,6 +4239,7 @@ export class HostStore {
       await this.prepareResidentEndProjectionUnlocked(acknowledged);
       await this.guardResidentLifecycleMaterializationUnlocked(async () => {
         await this.materializeCompletedResidentBindingUnlocked(acknowledged);
+        await this.supersedeResidentDispatchProofBarriersForEndUnlocked(acknowledged);
         await this.injectResidentLifecycleFault("after_completed_binding", record.operationId);
       });
       const completedAt = causalNow(acknowledged.updatedAt);
@@ -4252,6 +4271,7 @@ export class HostStore {
       if (operation.phase === "completed") {
         await this.prepareResidentEndProjectionUnlocked(operation);
         await this.materializeCompletedResidentBindingUnlocked(operation);
+        await this.supersedeResidentDispatchProofBarriersForEndUnlocked(operation);
         return residentLifecycleStatus(operation);
       }
       if (operation.phase !== "kill_acknowledged") {
@@ -4259,7 +4279,7 @@ export class HostStore {
       }
       await this.prepareResidentEndProjectionUnlocked(operation);
       await this.guardResidentLifecycleMaterializationUnlocked(() =>
-        this.materializeCompletedResidentBindingUnlocked(operation),
+        this.materializeCompletedResidentEndUnlocked(operation),
       );
       const completedAt = causalNow(operation.updatedAt);
       operation = ResidentLifecycleOperationRecordSchema.parse({
@@ -6900,6 +6920,7 @@ export class HostStore {
           `Unexpected resident control projection file ${entry.name}`,
         );
       }
+      await this.migrateLegacyResidentControlProjectionUnavailableUnlocked(entry.name);
       files.push(entry.name);
     }
     const retained = files.length > this.residentControlProjectionLimit
@@ -6911,6 +6932,65 @@ export class HostStore {
         `Resident control projection storage exceeds ${this.residentControlProjectionLimit} retained generations`,
       );
     }
+  }
+
+  /**
+   * The original v1 control projection predated exact command and browser
+   * readiness. Upgrade those otherwise-valid bytes once, before any resident
+   * adapter can become live, and deliberately publish both capabilities as
+   * unavailable. A later normal projection read may advance to ready only
+   * after it re-proves the exact current binding and projection lineage.
+   *
+   * Malformed JSON and current-schema corruption are left untouched here so
+   * the established read path continues to return its precise fail-closed
+   * diagnostic. This migration never repairs or guesses invalid authority.
+   */
+  private async migrateLegacyResidentControlProjectionUnavailableUnlocked(fileName: string): Promise<void> {
+    const path = join(this.paths.residentControlProjections, fileName);
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(path);
+    } catch {
+      return;
+    }
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_RESIDENT_CONTROL_PROJECTION_BYTES) return;
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(bytes.toString("utf8")) as unknown;
+    } catch {
+      return;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const record = raw as Record<string, unknown>;
+    const missingCommandReadiness = !Object.prototype.hasOwnProperty.call(record, "commandReadiness");
+    const missingBrowserExecution = !Object.prototype.hasOwnProperty.call(record, "browserExecution");
+    if (!missingCommandReadiness && !missingBrowserExecution) return;
+
+    const parsed = ResidentControlProjectionSnapshotSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const legacy = parsed.data;
+    if (fileName !== this.residentControlProjectionName(legacy.threadId, legacy.executionGenerationId)) {
+      throw new HostStoreError(
+        "RESIDENT_CONTROL_PROJECTION_INVALID",
+        "A legacy resident control projection filename does not match its authority",
+      );
+    }
+    if (legacy.controlSequence === Number.MAX_SAFE_INTEGER) {
+      throw new HostStoreError(
+        "RESIDENT_CONTROL_SEQUENCE_EXHAUSTED",
+        "A legacy resident control projection cannot advance its migration sequence",
+      );
+    }
+
+    const migrated = ResidentControlProjectionSnapshotSchema.parse({
+      ...legacy,
+      commandReadiness: "unavailable",
+      browserExecution: { readiness: "unavailable" },
+      controlSequence: legacy.controlSequence + 1,
+      changedAt: causalNow(legacy.changedAt),
+    });
+    await atomicWriteJson(path, migrated, MAX_RESIDENT_CONTROL_PROJECTION_BYTES);
   }
 
   private async assertResidentControlProjectionCapacityUnlocked(fileName: string): Promise<void> {
@@ -8774,6 +8854,77 @@ export class HostStore {
       if (attempt.command.threadId === threadId) {
         throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
       }
+    }
+    await this.assertNoModelSelectionTransitionUnlocked(threadId, message);
+  }
+
+  /**
+   * End is the one explicit operation that may supersede a dispatch whose
+   * upstream call is already settled but whose idle proof never arrived.
+   * Admitted/dispatching attempts and model mutations still block End so no
+   * external invocation can race the lifecycle boundary.
+   */
+  private async assertResidentEndDispatchTransitionsUnlocked(
+    threadId: string,
+    binding: ResidentSessionBinding,
+    message: string,
+  ): Promise<void> {
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "Resident dispatch authority cannot be inspected because its bounded store is full",
+      );
+    }
+    const host = await this.readHostUnlocked();
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch authority cannot be inspected because its storage contains an unexpected entry",
+        );
+      }
+      const attempt = await readJsonFile(
+        join(this.paths.residentDispatchAttempts, entry.name),
+        ResidentDispatchAttemptSchema,
+        { maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES },
+      );
+      if (!attempt) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident dispatch authority cannot be inspected because an attempt is missing",
+        );
+      }
+      if (entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End found a command proof barrier with a mismatched storage identity",
+        );
+      }
+      if (attempt.command.threadId !== threadId) continue;
+      if (
+        !residentDispatchAttemptRetainsReconciliation(attempt) ||
+        !isDeepStrictEqual(attempt.binding, binding) ||
+        attempt.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+        attempt.command.expectedHostId !== host.hostId
+      ) {
+        throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+      }
+      const identity = await this.readCommandIdentityUnlocked(attempt.command);
+      const current = await this.readReceiptUnlocked(attempt.command);
+      if (
+        !identity ||
+        !isDeepStrictEqual(identity.command, attempt.command) ||
+        !attempt.finalReceipt ||
+        !current ||
+        !isDeepStrictEqual(current, attempt.finalReceipt)
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End found a command proof barrier without exact durable identity and receipt evidence",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, attempt.command);
     }
     await this.assertNoModelSelectionTransitionUnlocked(threadId, message);
   }
@@ -11555,6 +11706,158 @@ export class HostStore {
     await this.writeResidentSessionBindingRecordsUnlocked(records);
   }
 
+  private async materializeCompletedResidentEndUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    await this.materializeCompletedResidentBindingUnlocked(operation);
+    await this.supersedeResidentDispatchProofBarriersForEndUnlocked(operation);
+  }
+
+  private async supersedeResidentDispatchProofBarriersForEndUnlocked(
+    operation: ResidentLifecycleOperationRecord,
+  ): Promise<void> {
+    if (
+      operation.kind !== "end" ||
+      !(
+        operation.phase === "ending" ||
+        operation.phase === "kill_dispatching" ||
+        operation.phase === "kill_acknowledged" ||
+        operation.phase === "completed" ||
+        (operation.phase === "quarantined" &&
+          (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching"))
+      ) ||
+      !operation.binding
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_LIFECYCLE_END_INVALID",
+        "Only a durable resident End may supersede unresolved command proof barriers",
+      );
+    }
+    const binding = validateResidentSessionBinding(operation.binding);
+    const entries = await readdir(this.paths.residentDispatchAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "RESIDENT_DISPATCH_ATTEMPT_LIMIT",
+        "Resident End cannot retire command proof barriers because their bounded store is full",
+      );
+    }
+    const host = await this.readHostUnlocked();
+    const candidates: Array<{
+      path: string;
+      attempt: ResidentDispatchAttempt;
+      current: CommandReceipt;
+      alreadySuperseded: boolean;
+    }> = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End cannot retire command proof barriers from unexpected storage",
+        );
+      }
+      const path = join(this.paths.residentDispatchAttempts, entry.name);
+      const attempt = await readJsonFile(path, ResidentDispatchAttemptSchema, {
+        maxBytes: MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
+      });
+      if (!attempt) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End cannot retire a missing command proof barrier",
+        );
+      }
+      if (entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End found a command proof barrier with a mismatched storage identity",
+        );
+      }
+      if (attempt.command.threadId !== binding.threadId) continue;
+      if (
+        !residentDispatchAttemptRetainsReconciliation(attempt) ||
+        !isDeepStrictEqual(attempt.binding, binding) ||
+        attempt.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+        attempt.command.expectedHostId !== host.hostId ||
+        !attempt.finalReceipt
+      ) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ACTIVE",
+          "Resident End cannot retire a command whose upstream invocation is still changing",
+          true,
+        );
+      }
+      const identity = await this.readCommandIdentityUnlocked(attempt.command);
+      if (!identity || !isDeepStrictEqual(identity.command, attempt.command)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End found a command proof barrier without its exact durable command identity",
+        );
+      }
+      const current = await this.readReceiptUnlocked(attempt.command);
+      const alreadySuperseded = Boolean(
+        current?.status === "uncertain" &&
+        current.error?.code === "RESIDENT_COMMAND_SUPERSEDED_BY_END" &&
+        current.error.details?.endOperationId === operation.operationId &&
+        current.error.details?.replayed === false &&
+        current.receiptId === attempt.finalReceipt.receiptId &&
+        current.receivedAt === attempt.finalReceipt.receivedAt &&
+        current.queuePosition === undefined &&
+        Date.parse(current.updatedAt) >= Date.parse(attempt.finalReceipt.updatedAt) &&
+        Date.parse(current.updatedAt) >= Date.parse(operation.preparedAt),
+      );
+      if (!current || (!isDeepStrictEqual(current, attempt.finalReceipt) && !alreadySuperseded)) {
+        throw new HostStoreError(
+          "RESIDENT_DISPATCH_ATTEMPT_INVALID",
+          "Resident End found command evidence that changed after its lifecycle boundary",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, attempt.command);
+
+      candidates.push({ path, attempt, current, alreadySuperseded });
+    }
+
+    // Validate the complete bounded set before changing the first receipt.
+    // This prevents one malformed sibling barrier from producing a partial
+    // End supersession in the same Store turn.
+    for (const { path, attempt, current, alreadySuperseded } of candidates) {
+      const receipt = alreadySuperseded
+        ? current
+        : CommandReceiptSchema.parse({
+            ...current,
+            status: "uncertain",
+            queuePosition: undefined,
+            updatedAt: causalNow(current.updatedAt, operation.updatedAt),
+            message: "Explicit End superseded this command before final idle proof; it was not replayed",
+            error: {
+              code: "RESIDENT_COMMAND_SUPERSEDED_BY_END",
+              message: "The saved End request now owns this session, so the prior command cannot regain execution authority",
+              retryable: false,
+              diagnosticId: attempt.attemptId,
+              details: {
+                operation: attempt.command.command.kind,
+                endOperationId: operation.operationId,
+                replayed: false,
+              },
+            },
+          });
+      if (!alreadySuperseded) {
+        await atomicWriteJson(this.receiptPath(attempt.command), receipt);
+      }
+      await this.appendResidentDispatchJournalUnlocked(
+        attempt.command,
+        "uncertain",
+        receipt.updatedAt,
+        receipt.message,
+        "ended-before-idle-proof",
+      );
+      // The End WAL and superseded receipt are durable before this proof
+      // barrier is removed. Startup can therefore repeat this helper after a
+      // crash without replaying the command or losing its final audit state.
+      await rm(path, { force: true });
+      this.residentPromptReconciliationLeaseCache.delete(attempt.attemptId);
+      this.residentAbortReconciliationLeaseCache.delete(attempt.attemptId);
+    }
+  }
+
   private createResidentLifecycleProjectionLease(
     operation: ResidentLifecycleOperationRecord,
     promotionObservedAt: string,
@@ -11702,10 +12005,13 @@ export class HostStore {
         if (operation.kind === "end" && operation.binding) {
           if (
             operation.phase === "ending" ||
+            operation.phase === "kill_acknowledged" ||
+            operation.phase === "completed" ||
             (operation.phase === "quarantined" &&
               (operation.quarantinedFrom === "ending" || operation.quarantinedFrom === "kill_dispatching"))
           ) {
             await this.materializeEndingResidentBindingRevocationUnlocked(operation);
+            await this.supersedeResidentDispatchProofBarriersForEndUnlocked(operation);
           }
         } else if (operation.kind === "detach") {
           await this.materializeDetachedResidentBindingUnlocked(operation);
@@ -11754,7 +12060,7 @@ export class HostStore {
         (operation.phase === "kill_acknowledged" || operation.phase === "completed")
       ) {
         await this.prepareResidentEndProjectionUnlocked(operation);
-        await this.materializeCompletedResidentBindingUnlocked(operation);
+        await this.materializeCompletedResidentEndUnlocked(operation);
         if (operation.phase === "kill_acknowledged") {
           const completedAt = causalNow(operation.updatedAt);
           operation = ResidentLifecycleOperationRecordSchema.parse({
@@ -12200,7 +12506,8 @@ export class HostStore {
       | "abort-idle-completed"
       | "failed-before-start"
       | "recovered-not-started"
-      | "recovered-uncertain",
+      | "recovered-uncertain"
+      | "ended-before-idle-proof",
   ): Promise<void> {
     if (command.command.kind !== "prompt" && command.command.kind !== "abort") {
       throw new HostStoreError(

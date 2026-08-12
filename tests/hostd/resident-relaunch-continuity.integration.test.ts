@@ -150,6 +150,14 @@ class SharedFakePrimeDaemon {
             daemon.chronology.push(`daemon:snapshot:${activeSessionId}`);
             return session.snapshot;
           },
+          getResourceSnapshot: async () => ({
+            contextFiles: [],
+            skills: [],
+            prompts: [],
+            extensions: [],
+            themes: [],
+            diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+          }),
           subscribe: () => () => undefined,
           promoteToResident: async () => undefined,
           dispose: async () => {

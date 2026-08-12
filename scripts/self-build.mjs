@@ -11,7 +11,7 @@ main().catch(reportFailure)
 async function main() {
   const args = process.argv.slice(2)
   if (args[0] === '--verify-receipt') {
-    if (args.length !== 2) throw new Error('Usage: pnpm verify:self-build-receipt -- <receipt.json>')
+    if (args.length !== 2) throw new Error('Usage: pnpm verify:self-build-receipt <receipt.json>')
     const envelope = await verifyReceiptFile(resolve(args[1]))
     process.stdout.write(`${JSON.stringify({ digestMatches: true, authenticated: false, runId: envelope.receipt.runId, outcome: envelope.receipt.outcome, receiptSha256: envelope.receiptSha256 }, null, 2)}\n`)
     return

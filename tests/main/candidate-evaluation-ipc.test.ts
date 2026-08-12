@@ -54,7 +54,7 @@ describe('candidate evaluation control IPC', () => {
     }) as { ok: boolean; error?: { code?: string } }
 
     expect(result.ok).toBe(false)
-    expect(result.error?.code).toBe('native.unexpected')
+    expect(result.error?.code).toBe('ipc.invalid_payload')
     expect(service.candidateEvaluationPreflight).not.toHaveBeenCalled()
     dispose()
   })
@@ -73,7 +73,7 @@ describe('candidate evaluation control IPC', () => {
     }) as { ok: boolean; error?: { code?: string } }
 
     expect(result.ok).toBe(false)
-    expect(result.error?.code).toBe('native.unexpected')
+    expect(result.error?.code).toBe('ipc.invalid_payload')
     expect(service.startCandidateEvaluation).not.toHaveBeenCalled()
     dispose()
   })

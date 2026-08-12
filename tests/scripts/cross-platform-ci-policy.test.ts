@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { vitestWorkerLimit } from '../../vitest.config'
 
 const workflowPath = resolve('.github/workflows/cross-platform-source.yml')
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n?/g, '\n')
@@ -10,6 +11,7 @@ const rootPackage = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as
 }
 const selfBuildSource = readFileSync(resolve('scripts/self-build-lib.mjs'), 'utf8').replace(/\r\n?/g, '\n')
 const workflowRunnerSource = readFileSync(resolve('scripts/run-workflow.mjs'), 'utf8').replace(/\r\n?/g, '\n')
+const developmentWorkflowPlanSource = readFileSync(resolve('scripts/development-workflow-plan.mjs'), 'utf8').replace(/\r\n?/g, '\n')
 
 describe('cross-platform source CI policy', () => {
   it('runs the exact source gates on stable Linux, Windows, and macOS hosts', () => {
@@ -44,9 +46,15 @@ describe('cross-platform source CI policy', () => {
     expect(workflow).not.toContain('@prime-agent/relay-server')
 
     const relayBuildStep = "pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build'])"
-    expect(workflowRunnerSource.match(new RegExp(relayBuildStep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(2)
+    const rootBuildSources = `${workflowRunnerSource}\n${developmentWorkflowPlanSource}`
+    expect(rootBuildSources.match(new RegExp(relayBuildStep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(2)
     expect(workflowRunnerSource).toMatch(/const releaseBuildSteps = \[\n\s+pnpmStep\('Build the relay server'/)
-    expect(workflowRunnerSource).toMatch(/\bbuild: \[\n\s+pnpmStep\('Build the relay server'/)
+    expect(workflowRunnerSource).toContain('build: createDevelopmentBuildPlan(PROJECT_ROOT).map(materializePlannedStep)')
+    expect(workflowRunnerSource).toContain("'build:hostd': createDevelopmentHostBuildPlan(PROJECT_ROOT).map(materializePlannedStep)")
+    expect(workflowRunnerSource).toMatch(
+      /'build:hostd:release': \[\n\s+nodeStep\('Build the attested host service', 'scripts\/build-hostd\.mjs', \['--attestation', 'out\/main\/runtime-attestation\.json'\]\),\n\s+\]/,
+    )
+    expect(developmentWorkflowPlanSource).toMatch(/createDevelopmentBuildPlan[\s\S]+pnpmStep\('Build the relay server'/)
   })
 
   it('keeps self-build on the same relay-inclusive canonical root gates', () => {
@@ -87,16 +95,22 @@ describe('cross-platform source CI policy', () => {
     expect(actionReferences.every((match) => /^[0-9a-f]{40}$/.test(match[2]!))).toBe(true)
   })
 
-  it('runs every portable test with deterministic hosted-runner concurrency and watchdog bounds', () => {
+  it('runs every portable test with deterministic local and hosted concurrency and watchdog bounds', () => {
     expect(workflow).toContain('run: pnpm test')
     expect(vitestConfig).toContain("include: ['tests/**/*.test.{ts,tsx}']")
     expect(vitestConfig).toContain("const hostedWindows = Boolean(process.env.CI) && process.platform === 'win32'")
     expect(vitestConfig).toContain("const githubActions = process.env.GITHUB_ACTIONS === 'true'")
-    expect(vitestConfig).toContain("maxWorkers: process.env.CI ? (process.platform === 'win32' ? 1 : 2) : undefined")
+    expect(vitestConfig).toContain('maxWorkers: vitestWorkerLimit()')
     expect(vitestConfig).toContain('testTimeout: hostedWindows ? 60_000 : 5_000')
     expect(vitestConfig).toContain("reporters: githubActions ? ['default', 'github-actions'] : ['default']")
     expect([...vitestConfig.matchAll(/\btestTimeout\s*:/g)]).toHaveLength(1)
     expect(vitestConfig).not.toMatch(/\b(?:shard|passWithNoTests)\s*:/)
+
+    expect(vitestWorkerLimit({}, 'win32')).toBe(2)
+    expect(vitestWorkerLimit({}, 'darwin')).toBe(2)
+    expect(vitestWorkerLimit({ CI: '1' }, 'win32')).toBe(1)
+    expect(vitestWorkerLimit({ CI: '1' }, 'darwin')).toBe(2)
+    expect(vitestWorkerLimit({ CI: '1' }, 'linux')).toBe(2)
   })
 
 })

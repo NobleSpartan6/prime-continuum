@@ -948,6 +948,19 @@ class WorkerDaemonConnectionProxy implements PrimeDaemonAgentConnectionPublic {
     );
   }
 
+  async getResourceSnapshot(): Promise<unknown> {
+    this.assertLive();
+    return this.bridge.invoke(
+      "connection.get_resource_snapshot",
+      { connectionId: this.connectionId },
+      {
+        timeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+        mutation: false,
+        resourceKey: connectionResource(this.connectionId),
+      },
+    );
+  }
+
   async getAvailableModels(): Promise<unknown> {
     this.assertLive();
     return this.bridge.invoke(

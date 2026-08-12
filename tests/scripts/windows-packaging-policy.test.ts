@@ -45,6 +45,31 @@ describe('unsigned Windows development packaging policy', () => {
     expect(packageJson.devDependencies.resedit).toBe('1.7.2')
   })
 
+  it('packages the pinned host Node and preserves both attested runtime byte sets during macOS signing', async () => {
+    const packageJson = JSON.parse(await readFile(resolve('package.json'), 'utf8'))
+
+    expect(packageJson.build.mac.signIgnore).toEqual([
+      'Contents/Resources/browser-runtime/',
+      'Contents/Resources/host-runtime/',
+      'Contents/Resources/runtime-seed/',
+    ])
+    expect(packageJson.build.extraResources).toContainEqual({
+      from: 'node_modules/node',
+      to: 'host-runtime',
+      filter: ['bin/node', 'node.exe', 'LICENSE'],
+    })
+    expect(packageJson.build.extraResources).toContainEqual({
+      from: 'node_modules/electron/dist',
+      to: 'browser-runtime',
+      filter: ['**/*'],
+    })
+    expect(packageJson.build.extraResources).toContainEqual({
+      from: 'out/runtime',
+      to: 'runtime-seed',
+      filter: ['current.json', 'installs/**/*'],
+    })
+  })
+
   it('forces both Electron Builder entry points to remain local-only', async () => {
     expect(createWindowsElectronBuilderArguments({ directoryOnly: true })).toEqual([
       'exec',
@@ -172,7 +197,7 @@ describe('unsigned Windows development packaging policy', () => {
       mutate: (packageJson: any) => {
         packageJson.build.extraResources.push({ from: 'unreviewed.bin', to: 'unreviewed.bin' })
       },
-      message: 'build.extraResources must contain only the reviewed host and runtime resources',
+      message: 'build.extraResources must contain only the reviewed host, host runtime, browser runtime, and agent runtime resources',
     },
     {
       name: 'a custom NSIS compiler',
@@ -198,8 +223,8 @@ describe('unsigned Windows development packaging policy', () => {
     },
     {
       name: 'an unexpected fuse',
-      mutate: (packageJson: any) => { packageJson.build.electronFuses.runAsNode = false },
-      message: 'build.electronFuses contains unreviewed configuration keys: runAsNode',
+      mutate: (packageJson: any) => { packageJson.build.electronFuses.resetAdHocDarwinSignature = false },
+      message: 'build.electronFuses contains unreviewed configuration keys: resetAdHocDarwinSignature',
     },
     {
       name: 'an alternate build resource directory',

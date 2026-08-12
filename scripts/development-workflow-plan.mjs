@@ -2,6 +2,25 @@ import { resolve } from 'node:path'
 import { DESKTOP_LAUNCH_ENVIRONMENT_BOUNDARY } from './workflow-step-environment.mjs'
 
 export function createDevelopmentWorkflowPlan(projectRoot) {
+  return Object.freeze([
+    ...createDevelopmentHostBuildPlan(projectRoot),
+    pnpmStep(
+      'Start the desktop development server',
+      ['exec', 'electron-vite', 'dev'],
+      DESKTOP_LAUNCH_ENVIRONMENT_BOUNDARY,
+    ),
+  ])
+}
+
+export function createDevelopmentBuildPlan(projectRoot) {
+  return Object.freeze([
+    pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build']),
+    pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
+    ...createDevelopmentHostBuildPlan(projectRoot),
+  ])
+}
+
+export function createDevelopmentHostBuildPlan(projectRoot) {
   const root = resolve(projectRoot)
   const runtimeRoot = resolve(root, 'out', 'runtime')
   // electron-vite owns and cleans out/main during development. Keep the
@@ -14,28 +33,29 @@ export function createDevelopmentWorkflowPlan(projectRoot) {
     'prime-continuim',
     'development-runtime-attestation.json',
   )
+  const checkpointPath = resolve(
+    root,
+    'node_modules',
+    '.cache',
+    'prime-continuim',
+    'development-runtime-checkpoint.json',
+  )
 
   return Object.freeze([
     nodeStep('Verify the Electron desktop runtime', 'scripts/ensure-electron-runtime.mjs'),
     nodeStep(
-      'Verify or build the pinned Prime Agent runtime',
-      'scripts/ensure-prime-agent-runtime.mjs',
-      ['--runtime-root', runtimeRoot],
-    ),
-    nodeStep(
-      'Generate the development-integrity runtime attestation',
-      'scripts/generate-runtime-attestation.mjs',
-      ['--runtime-root', runtimeRoot, '--output', attestationPath],
+      'Prepare the development Prime Agent runtime',
+      'scripts/prepare-development-runtime.mjs',
+      [
+        '--runtime-root', runtimeRoot,
+        '--attestation', attestationPath,
+        '--cache', checkpointPath,
+      ],
     ),
     nodeStep(
       'Build the development-integrity host service',
       'scripts/build-hostd.mjs',
       ['--attestation', attestationPath],
-    ),
-    pnpmStep(
-      'Start the desktop development server',
-      ['exec', 'electron-vite', 'dev'],
-      DESKTOP_LAUNCH_ENVIRONMENT_BOUNDARY,
     ),
   ])
 }

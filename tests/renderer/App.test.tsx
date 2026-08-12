@@ -5,9 +5,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import App from '../../src/renderer/src/App'
+import { createPreviewRendererApi, previewSnapshot } from '../../src/renderer/src/api.preview'
 import {
-  createPreviewRendererApi,
-  previewSnapshot,
   ResidentProvisionError,
   StaleHostAuthorityError,
   type HostRuntimeReadiness,
@@ -366,7 +365,9 @@ function createContinuityApi(options: {
       activeSessionId: residency === 'resident' ? 'active-continuity-one' : undefined,
       sessionId: residency === 'resident' ? 'session-continuity-one' : undefined,
       isStreaming: options.taskState === 'running',
+      activeToolNames: [],
     }
+    snapshot.agents = []
     snapshot.operations.startResidentTurn = options.taskState === 'idle' && host.connection === 'online'
     snapshot.operations.stopResidentTurn = options.taskState === 'running' && host.connection === 'online'
     return snapshot
@@ -545,6 +546,7 @@ function lifecycleOperation(
   state: ResidentLifecycleOperationSummary['state'],
 ): ResidentLifecycleOperationSummary {
   return {
+    kind: 'provision',
     operationId: 'resident-operation-one',
     expectedHostId: 'host-local',
     projectId: 'resident-project-one',
@@ -656,10 +658,12 @@ function createRegisteredWorkspaceHarness(options: {
     listeners.add(listener)
     return () => listeners.delete(listener)
   }
+  let residentSelectionSequence = 0
   api.selectResidentWorkspace = vi.fn(async (input) => {
     if (input?.kind !== 'registered_workspace') throw new Error('Expected one saved-workspace reference')
+    residentSelectionSequence += 1
     return {
-      selectionToken: 'registered-selection-one',
+      selectionToken: residentSelectionSequence === 1 ? 'registered-selection-one' : `registered-selection-${residentSelectionSequence}`,
       operationId: 'registered-operation-one',
       expectedHostId: 'host-devbox',
       suggestedName: 'Prime Continuim',
@@ -807,7 +811,9 @@ function createLocalSetupHarness(
     selectedThreadId: '',
     projects: [],
     threads: [],
-    hosts: [],
+    hosts: previewSnapshot.hosts
+      .filter((host) => host.kind === 'local')
+      .map((host) => ({ ...host, connection: 'online' as const, activationRequired: false })),
     runtime: {},
     localSetup: initialSetup,
     residentLifecycleOperations: options.lifecycleOperations ?? [],
@@ -828,6 +834,23 @@ function createLocalSetupHarness(
   }
   api.retryLocalSetup = vi.fn(async () => undefined)
   api.repairLocalRuntime = vi.fn(async () => undefined)
+  api.preselectResidentWorkspace = vi.fn(async () => ({
+    preselectionToken: 'preselection-local-one',
+    suggestedName: 'Prime workspace',
+    expiresAt: '2099-08-07T12:05:00.000Z',
+  }))
+  api.completeResidentWorkspacePreselection = vi.fn(async () => ({
+    kind: 'local_path' as const,
+    selectionToken: 'selection-local-one',
+    operationId: 'resident-local-one',
+    expectedHostId: 'host-local',
+    suggestedName: 'Prime workspace',
+    expiresAt: '2099-08-07T12:05:00.000Z',
+  }))
+  api.cancelResidentWorkspacePreselection = vi.fn(async () => undefined)
+  api.provisionResident = vi.fn(async () => {
+    throw new Error('The local setup harness must not provision before explicit confirmation.')
+  })
   const publish = (setup: LocalSetupSummary) => {
     snapshot = {
       ...snapshot,
@@ -842,7 +865,9 @@ function createLocalSetupHarness(
   return { api: api as RendererApi, publish }
 }
 
-function residentEndStatus(phase: 'ending' | 'completed' = 'ending') {
+function residentEndStatus(
+  phase: 'ending' | 'kill_dispatching' | 'kill_acknowledged' | 'completed' = 'ending',
+) {
   return {
     version: 1 as const,
     kind: 'end' as const,
@@ -920,7 +945,14 @@ function createResidentEndApi(operation?: ResidentLifecycleOperationSummary) {
     snapshot.composerReceipt = operation
       ? operation.lastStatus?.phase === 'quarantined'
         ? { state: 'uncertain', operation: 'end', message: 'End outcome unknown · this resident session stays locked for inspection' }
-        : { state: 'sent', operation: 'end', message: 'Ending resident session · no kill will be replayed automatically' }
+        : {
+            state: 'sent',
+            operation: 'end',
+            retryable: operation.lastStatus?.phase === 'ending' ? true : undefined,
+            message: operation.lastStatus?.phase === 'ending'
+              ? 'Ready to finish · Prime Agent has not received an End request'
+              : 'Finishing session · checking for completion',
+          }
       : { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
   }
@@ -962,6 +994,8 @@ beforeAll(() => {
 afterEach(() => {
   cleanup()
   window.history.replaceState({}, '', '/')
+  window.localStorage.removeItem('prime.renderer.workbench-layout.v1')
+  Object.defineProperty(window, 'matchMedia', { configurable: true, value: undefined })
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1_024 })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
@@ -980,6 +1014,10 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByLabelText('Thread transcript')).toBeVisible()
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Repair runtime' })).not.toBeInTheDocument()
+    const liveSession = screen.getByRole('region', { name: 'Live agent session' })
+    expect(within(liveSession).getByText('GPT-5.6 Sol')).toBeVisible()
+    expect(within(liveSession).getByText('2 active')).toBeVisible()
+    expect(within(liveSession).getByText('Ready', { selector: 'dd' })).toBeVisible()
 
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
@@ -990,14 +1028,14 @@ describe('Prime Continuim renderer', () => {
       text: 'Build the HUD from this resident thread',
     })
 
-    await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
-    const buddy = await screen.findByRole('button', { name: /Working: Seamless remote experience\. Open conversation/ })
+    await user.click(screen.getByRole('button', { name: 'Collapse to desktop buddy' }))
+    const buddy = await screen.findByRole('button', { name: /Working: Seamless remote experience\..*Open session HUD/ })
     await waitFor(() => expect(buddy).toHaveFocus())
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     await user.click(buddy)
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
     await user.keyboard('{Escape}')
-    expect(await screen.findByRole('button', { name: /Open conversation/ })).toBeVisible()
+    expect(await screen.findByRole('button', { name: /Open session HUD/ })).toBeVisible()
   })
 
   it('never falls back to another thread when the HUD generation fence does not match', async () => {
@@ -1077,8 +1115,8 @@ describe('Prime Continuim renderer', () => {
     expect(await screen.findByRole('heading', { name: 'Second HUD resident thread' })).toBeVisible()
     expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Keep this draft while changing HUD modes')
 
-    await user.click(screen.getByRole('button', { name: 'Keep as desktop buddy' }))
-    await user.click(await screen.findByRole('button', { name: /Open conversation/ }))
+    await user.click(screen.getByRole('button', { name: 'Collapse to desktop buddy' }))
+    await user.click(await screen.findByRole('button', { name: /Open session HUD/ }))
     expect(await screen.findByRole('textbox', { name: 'Task brief' })).toHaveValue('Keep this draft while changing HUD modes')
 
     await user.click(screen.getByRole('button', { name: 'Delegate task' }))
@@ -1156,10 +1194,10 @@ describe('Prime Continuim renderer', () => {
 
   it('keeps passive HUD and transcript updates from stealing focus', async () => {
     const user = userEvent.setup()
-    const harness = createHudHarness()
+    const harness = createHudHarness({ taskState: 'running' })
     render(<App api={harness.api} surface="hud" />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    const returnButton = screen.getByRole('button', { name: 'Workbench' })
+    const returnButton = screen.getByRole('button', { name: 'Open Seamless remote experience in the workbench' })
     await user.click(returnButton)
     expect(returnButton).toHaveFocus()
 
@@ -1180,10 +1218,21 @@ describe('Prime Continuim renderer', () => {
           body: 'Passive HUD update.',
         },
       ]
+      next.runtime.session!.activeToolNames = ['playwright-cli']
+      next.agents = [{
+        id: 'hud-browser-auditor',
+        name: 'Browser auditor',
+        role: 'Retained subagent',
+        status: 'running',
+        hostName: 'Resident workstation',
+        activity: 'Executing browser snapshot',
+      }]
       harness.publishSnapshot(next)
     })
 
     await screen.findByText('Passive HUD update.')
+    expect(within(screen.getByRole('region', { name: 'Live agent session' })).getByText('Using playwright-cli')).toBeVisible()
+    expect(screen.getByText('1 active')).toBeVisible()
     expect(returnButton).toHaveFocus()
   })
 
@@ -1193,13 +1242,13 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    await user.click(screen.getByRole('button', { name: 'Show desktop HUD' }))
+    await user.click(screen.getByRole('button', { name: 'Open floating session HUD' }))
     expect(harness.api.hudOpen).toHaveBeenCalledWith(harness.target)
 
     cleanup()
     render(<App api={asNativeFixture(createPreviewRendererApi())} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
-    expect(screen.queryByRole('button', { name: 'Show desktop HUD' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open floating session HUD' })).not.toBeInTheDocument()
   })
 
   it('shows approval as Needs you and routes review to the workbench without a fake approval control', async () => {
@@ -1207,69 +1256,129 @@ describe('Prime Continuim renderer', () => {
     const harness = createHudHarness({ taskState: 'needs_approval' })
     render(<App api={harness.api} surface="hud" />)
 
-    expect(await screen.findByText('Needs you', { selector: '.hud-status > span' })).toBeVisible()
-    expect(screen.getByText(/approval needs review in the full workbench/i)).toBeVisible()
+    expect(await screen.findByText('Needs you', { selector: '.hud-status strong' })).toBeVisible()
+    const review = screen.getByRole('button', { name: 'Review approval' })
+    expect(review.closest('.hud-notice')).toHaveTextContent(/approval needs review in the full workbench/i)
     expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Review in workbench' }))
+    await user.click(review)
     expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
   })
 
-  it('requires explicit confirmation for permanent resident ending and checks an ambiguous result without replay', async () => {
+  it('requires one confirmation, then dismisses the sheet once End is admitted', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
     const endResult = deferred<ReturnType<typeof residentEndStatus>>()
     api.endResident = vi.fn(() => endResult.promise)
     render(<App api={api} />)
 
-    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(await screen.findByRole('tab', { name: 'Session' }))
     await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
     await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus())
-    expect(within(dialog).getByText('Closing is different from ending.')).toBeVisible()
+    expect(within(dialog).getByText(/Closing the app keeps this agent running/)).toBeVisible()
 
-    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
-    const confirmation = within(dialog).getByRole('checkbox', { name: /cannot be resumed/i })
-    expect(confirmation).toHaveFocus()
-    expect(api.endResident).not.toHaveBeenCalled()
-
-    await user.click(confirmation)
-    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    expect(within(dialog).getByText('Task, transcript, and workspace files')).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
     expect(api.endResident).toHaveBeenCalledTimes(1)
     expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled()
     fireEvent.keyDown(dialog, { key: 'Escape' })
     expect(dialog).toBeVisible()
 
-    endResult.resolve(residentEndStatus('ending'))
-    const check = await within(dialog).findByRole('button', { name: 'Check status' })
-    await waitFor(() => expect(within(dialog).getByRole('status')).toHaveFocus())
-    await user.click(check)
-    expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
-      expectedHostId: 'host-local',
-      operationId: 'resident-end-operation-one',
-    })
-    expect(await within(dialog).findByText(/Resident session ended/i)).toBeVisible()
+    endResult.resolve(residentEndStatus('kill_dispatching'))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
     expect(api.endResident).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps a null end-status observation outcome-unknown and never invites another kill', async () => {
+  it('carries one confirmed End through one safe pre-effect resume', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
-    api.residentLifecycleStatus = vi.fn(async () => null)
+    api.endResident = vi.fn()
+      .mockResolvedValueOnce(residentEndStatus('ending'))
+      .mockResolvedValueOnce(residentEndStatus('kill_dispatching'))
     render(<App api={api} />)
 
-    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(await screen.findByRole('tab', { name: 'Session' }))
     await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
-    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
-    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
-    const check = await within(dialog).findByRole('button', { name: 'Check status' })
-    await user.click(check)
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
+    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
 
-    expect(await within(dialog).findByText(/end outcome remains unknown/i)).toBeVisible()
-    expect(within(dialog).getByText(/will not send another kill/i)).toBeVisible()
-    expect(within(dialog).queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
+    expect(api.prepareResidentEnd).toHaveBeenCalledTimes(2)
+    expect(api.prepareResidentEnd).toHaveBeenLastCalledWith(expect.objectContaining({
+      resumeOperationId: 'resident-end-operation-one',
+      expectedHostId: 'host-local',
+      threadId: 'thread-protocol',
+      executionGenerationId: 'generation-end-one',
+    }))
+    expect(api.endResident).toHaveBeenCalledTimes(2)
+  })
+
+  it('turns an unattached saved session into a clear, keyboard-reachable recovery path', async () => {
+    const user = userEvent.setup()
+    const api = createResidentEndApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.operations.submitCommands = false
+      snapshot.operations.startResidentTurn = false
+      snapshot.operations.stopResidentTurn = false
+      snapshot.operations.endResident = true
+      snapshot.runtime.residentControlReadiness = 'unavailable'
+      if (snapshot.runtime.session) snapshot.runtime.session.activeToolNames = ['ipython']
+      snapshot.composerReceipt = { state: 'waiting_for_connection', message: '' }
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident thread')
+      thread.title = 'Test Thread'
+      thread.transcript = []
+      return snapshot
+    }
+
+    render(<App api={api} />)
+
+    const continuity = await screen.findByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByRole('status')).toHaveTextContent('Needs you')
+    expect(within(continuity).getByText(/could not attach this saved session/i)).toBeVisible()
+    expect(within(continuity).getByText('Restart session')).toBeVisible()
+    expect(within(continuity).queryByText('Using ipython')).not.toBeInTheDocument()
+    expect(within(continuity).queryByText('No active goal')).not.toBeInTheDocument()
+    expect(await screen.findByText('Session needs a restart')).toBeVisible()
+    expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Task state: Needs you')).toBeVisible()
+    expect(screen.getByRole('button', { name: /Test Thread/i })).toHaveTextContent(/Needs you.*Test Thread/i)
+    expect(screen.getByText('End this inactive session')).toBeVisible()
+    expect(screen.getByText('Session needs a restart', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeDisabled()
+    expect(screen.getByText(/saved thread stays in this project/i)).toBeVisible()
+    expect(screen.queryByText('Ready to send')).not.toBeInTheDocument()
+
+    const recover = screen.getByRole('button', { name: 'End session…' })
+    expect(recover).toBeEnabled()
+    recover.focus()
+    await user.keyboard('{Enter}')
+
+    expect(api.prepareResidentEnd).toHaveBeenCalledOnce()
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
+    expect(dialog).toBeVisible()
+    expect(within(dialog).getByText(/If it already stopped, only its saved session is cleared/)).toBeVisible()
+    expect(within(dialog).queryByText(/no Stop is sent/i)).not.toBeInTheDocument()
+  })
+
+  it('dismisses an admitted End without inviting another kill', async () => {
+    const user = userEvent.setup()
+    const api = createResidentEndApi()
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('tab', { name: 'Session' }))
+    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
+    api.endResident = vi.fn(async () => residentEndStatus('kill_dispatching'))
+    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
     expect(api.endResident).toHaveBeenCalledTimes(1)
-    expect(api.residentLifecycleStatus).toHaveBeenCalledTimes(1)
+    expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
   })
 
   it('allows a fresh review only after the exact stale-cursor rejection', async () => {
@@ -1282,39 +1391,293 @@ describe('Prime Continuim renderer', () => {
     api.endResident = vi.fn(async () => { throw staleConsent })
     render(<App api={api} />)
 
-    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(await screen.findByRole('tab', { name: 'Session' }))
     await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
-    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
-    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
+    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
 
-    expect(await within(dialog).findByText(/No end was admitted/i)).toBeVisible()
-    expect(within(dialog).getByText(/refresh the thread.*review the permanent action again/i)).toBeVisible()
+    expect(await within(dialog).findByText(/No End request was admitted/i)).toBeVisible()
+    expect(within(dialog).getByText(/refresh the task.*review the action again/i)).toBeVisible()
     expect(within(dialog).queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
     expect(api.endResident).toHaveBeenCalledTimes(1)
     expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
   })
 
-  it('keeps an admitted resident end in a compact locked composer and resumes only its pre-effect review', async () => {
+  it('finishes an admitted pre-effect End with one explicit action', async () => {
     const user = userEvent.setup()
     const operation = residentEndOperation('submitted')
     const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident end fixture')
+      thread.transcript = []
+      return snapshot
+    }
+    const endResult = deferred<ReturnType<typeof residentEndStatus>>()
+    api.endResident = vi.fn(async () => endResult.promise)
     render(<App api={api} />)
 
-    expect(await screen.findByText('Ending resident session', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByText('Ready to close', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByRole('form', { name: 'Resident session ending' })).toBeVisible()
+    expect(screen.getByRole('main')).toHaveClass('thread-view--launchpad')
+    expect(screen.getByRole('main')).not.toHaveClass('thread-view--end-action')
+    expect(screen.queryByRole('region', { name: 'Session status' })).not.toBeInTheDocument()
+    expect(screen.getByTitle('Task state: Finish ending')).toBeVisible()
+    expect(screen.getByRole('button', { name: /Finish ending.*Frame protocol boundaries/i })).toBeVisible()
+    expect(await screen.findByText('Ready to close', { selector: '.agent-launchpad__setup-copy h2' })).toBeVisible()
+    expect(screen.getByText('Finish this session to start a new task.')).toBeVisible()
+    expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Delegate a task.*Coordinate bounded RLM workers/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Resident session end is durably pending' })).toBeDisabled()
+    const finish = screen.getByRole('button', { name: 'Finish ending this resident session' })
+    expect(finish).toBeEnabled()
+    expect(finish).toHaveTextContent('Finish ending')
     expect(api.endResident).not.toHaveBeenCalled()
 
-    const review = screen.getByRole('button', { name: 'Review end again' })
-    await user.click(review)
+    const sidebar = screen.getByLabelText('Projects and threads')
+    expect(within(sidebar).queryByRole('button', { name: 'New agent' })).not.toBeInTheDocument()
+    expect(within(sidebar).queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
+    await user.click(finish)
     expect(api.prepareResidentEnd).toHaveBeenCalledWith(expect.objectContaining({
       resumeOperationId: operation.operationId,
       expectedHostId: operation.expectedHostId,
       threadId: operation.threadId,
       executionGenerationId: operation.executionGenerationId,
     }))
-    expect(await screen.findByRole('dialog', { name: 'End resident session?' })).toBeVisible()
+    await waitFor(() => expect(api.endResident).toHaveBeenCalledWith({
+      confirmationToken: 'resident-end-confirmation-one',
+      consent: true,
+    }))
+    const finishing = screen.getByRole('button', { name: 'Finishing this resident session' })
+    expect(finishing).toBeDisabled()
+    expect(finishing).toHaveAttribute('aria-busy', 'true')
+    expect(finishing).toHaveTextContent('Finishing…')
+    await user.click(finishing)
+    expect(api.endResident).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await act(async () => {
+      endResult.resolve(residentEndStatus('completed'))
+      await endResult.promise
+    })
+    await waitFor(() => expect(finishing).not.toHaveAttribute('aria-busy'))
+  })
+
+  it('keeps a one-click End failure visible with the Session panel closed', async () => {
+    const user = userEvent.setup()
+    const operation = residentEndOperation('submitted')
+    const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (thread) thread.transcript = []
+      return snapshot
+    }
+    api.prepareResidentEnd = vi.fn(async () => {
+      throw new Error('The saved End authorization is temporarily unavailable.')
+    })
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Finish ending this resident session' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Unable to end session')
+    expect(alert).toHaveTextContent('The saved End authorization is temporarily unavailable.')
+    expect(screen.queryByRole('tab', { name: 'Session', selected: true })).not.toBeInTheDocument()
+    expect(api.endResident).not.toHaveBeenCalled()
+    expect(screen.getByTitle('Task state: End saved')).toBeVisible()
+    expect(screen.getByText('End saved', { selector: '.agent-launchpad__setup-copy h2' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'End saved; waiting for resident controls' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Finish ending this resident session' })).not.toBeInTheDocument()
+  })
+
+  it('keeps a saved End passive while resident lifecycle control is unavailable', async () => {
+    const user = userEvent.setup()
+    const operation = residentEndOperation('submitted')
+    const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.operations.endResident = false
+      snapshot.runtime.residentControlReadiness = 'unavailable'
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (thread) thread.transcript = []
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    expect(await screen.findByTitle('Task state: End saved')).toBeVisible()
+    expect(screen.getByText('End saved', { selector: '.agent-launchpad__setup-copy h2' })).toBeVisible()
+    expect(screen.getByText('Waiting for resident controls on This computer.')).toBeVisible()
+    expect(screen.getByText('Waiting for resident controls', { selector: '.composer__connection span' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'End saved; waiting for resident controls' })).toBeDisabled()
+    expect(screen.queryByText(/Prime Agent received the End request/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/checked automatically|checking for completion automatically/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Finish ending/i })).not.toBeInTheDocument()
+    expect(api.prepareResidentEnd).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    const inspector = screen.getByLabelText('Thread inspector')
+    const card = await within(inspector).findByRole('region', { name: 'End saved' })
+    expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
+    expect(within(card).queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
+  })
+
+  it('lets the user retry the same End once when the host has no durable result', async () => {
+    const user = userEvent.setup()
+    const operation = {
+      ...residentEndOperation('outcome_unknown'),
+      lastStatus: undefined,
+    }
+    const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.composerReceipt = {
+        state: 'uncertain',
+        operation: 'end',
+        retryable: false,
+        message: 'The host has no saved End result.',
+      }
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Try ending this resident session again' }))
+
+    expect(api.prepareResidentEnd).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-end-one',
+      threadId: 'thread-protocol',
+      executionGenerationId: 'generation-end-one',
+      resumeOperationId: operation.operationId,
+    })
+    expect(api.endResident).toHaveBeenCalledWith({
+      confirmationToken: 'resident-end-confirmation-one',
+      consent: true,
+    })
+  })
+
+  it('does not confuse detached prompt controls with an available saved End action', async () => {
+    const operation = residentEndOperation('submitted')
+    const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.runtime.residentControlReadiness = 'unavailable'
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (thread) thread.transcript = []
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    expect(await screen.findByTitle('Task state: Finish ending')).toBeVisible()
+    expect(await screen.findByText('Ready to close', { selector: '.agent-launchpad__setup-copy h2' })).toBeVisible()
+    expect(screen.getByRole('button', { name: /Frame protocol boundaries/i })).toHaveTextContent(/Finish ending/i)
+    expect(screen.getByRole('button', { name: 'Finish ending this resident session' })).toBeEnabled()
+    expect(screen.queryByText(/Waiting for resident controls/i)).not.toBeInTheDocument()
+  })
+
+  it('offers a new agent after the selected resident End is complete', async () => {
+    const user = userEvent.setup()
+    const completed = {
+      ...residentEndOperation('terminal'),
+      lastStatus: residentEndStatus('completed'),
+    }
+    const api = createResidentEndApi(completed)
+    api.selectResidentWorkspace = vi.fn(async () => ({
+      kind: 'registered_workspace' as const,
+      selectionToken: 'saved-local-selection',
+      operationId: 'saved-local-operation',
+      expectedHostId: 'host-local',
+      suggestedName: 'Prime Continuim',
+      expiresAt: '2099-08-05T20:05:00.000Z',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-end-one',
+      referenceThreadId: 'thread-protocol',
+      referenceExecutionGenerationId: 'generation-end-one',
+    }))
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident end fixture')
+      thread.residentLifecycle = {
+        version: 1,
+        state: 'ended',
+        reason: 'user_end',
+        operationId: completed.operationId,
+        bindingFingerprint: 'a'.repeat(64),
+        sourceCursor: completed.sourceCursor,
+        endedAt: completed.lastStatus!.terminalAt!,
+      }
+      snapshot.operations.provisionResident = true
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'New agent' }))
+    expect(api.selectResidentWorkspace).toHaveBeenCalledWith({
+      kind: 'registered_workspace',
+      projectId: 'project-prime',
+      workspaceId: 'workspace-end-one',
+      referenceThreadId: 'thread-protocol',
+      referenceExecutionGenerationId: 'generation-end-one',
+    })
+    expect(await screen.findByRole('dialog', { name: 'Start another task' })).toBeVisible()
+  })
+
+  it('hides a stale End recovery notice after the exact thread is authoritatively ended', async () => {
+    const staleOperation = {
+      ...residentEndOperation('outcome_unknown'),
+      operationId: 'resident-end-operation-stale',
+      lastStatus: undefined,
+    }
+    const api = createResidentEndApi(staleOperation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident end fixture')
+      thread.residentLifecycle = {
+        version: 1,
+        state: 'ended',
+        reason: 'user_end',
+        operationId: 'resident-end-operation-completed',
+        bindingFingerprint: 'b'.repeat(64),
+        sourceCursor: staleOperation.sourceCursor,
+        endedAt: '2026-08-05T20:00:03.000Z',
+      }
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    expect(await screen.findByTitle('Task state: Ended')).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Check end status' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+  })
+
+  it('checks a dispatched resident End automatically without replaying it', async () => {
+    const operation = {
+      ...residentEndOperation('submitted'),
+      updatedAt: '2026-08-05T20:00:02.000Z',
+      lastStatus: residentEndStatus('kill_acknowledged'),
+    }
+    const api = createResidentEndApi(operation)
+    Object.defineProperty(api, 'environment', { configurable: true, value: 'native' })
+    render(<App api={api} />)
+
+    expect(await screen.findByText('Finishing resident session', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Resident session is finishing' })).toBeDisabled()
+    expect(screen.getByText('Prime Continuim is checking for completion automatically')).toBeVisible()
+    await waitFor(() => expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
+      expectedHostId: operation.expectedHostId,
+      operationId: operation.operationId,
+    }), { timeout: 2_000 })
+    expect(api.prepareResidentEnd).not.toHaveBeenCalled()
     expect(api.endResident).not.toHaveBeenCalled()
   })
 
@@ -1339,8 +1702,23 @@ describe('Prime Continuim renderer', () => {
       },
     }
     const api = createResidentEndApi(operation)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected quarantined end fixture')
+      thread.transcript = []
+      return snapshot
+    }
     render(<App api={api} />)
 
+    const continuity = await screen.findByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByRole('status')).toHaveTextContent('Needs you')
+    expect(screen.getByTitle('Task state: Needs you')).toBeVisible()
+    expect(screen.getByRole('button', { name: /Needs you.*Frame protocol boundaries/i })).toBeVisible()
+    expect(screen.getByText('End outcome needs review')).toBeVisible()
+    expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
+    await user.click(within(continuity).getByRole('button', { name: 'Review ending' }))
     const card = await screen.findByRole('region', { name: 'End outcome needs inspection' })
     expect(within(card).getByText(/will not send another kill/i)).toBeVisible()
     expect(within(card).queryByRole('button', { name: /review end/i })).not.toBeInTheDocument()
@@ -1367,7 +1745,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     const create = await screen.findByRole('button', { name: 'New resident thread in this workspace' })
-    expect(screen.getByText(/uses this saved host-owned workspace/i)).toBeVisible()
+    expect(screen.getByText('Uses this saved workspace.')).toBeVisible()
     create.focus()
     await user.keyboard('{Enter}')
     expect(harness.api.selectResidentWorkspace).toHaveBeenCalledWith({
@@ -1378,25 +1756,27 @@ describe('Prime Continuim renderer', () => {
       referenceExecutionGenerationId: 'generation-prime-ssh',
     })
 
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await waitFor(() => expect(within(dialog).getByRole('textbox', { name: 'Thread title' })).toHaveFocus())
-    expect(within(dialog).getByText('Saved project')).toBeVisible()
-    expect(within(dialog).getByText('Prime Continuim', { selector: '.form-field__fixed-value bdi' })).toBeVisible()
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await waitFor(() => expect(within(dialog).getByRole('textbox', { name: 'Task name' })).toHaveFocus())
+    expect(within(dialog).getByRole('region', { name: 'Selected workspace' })).toHaveTextContent('Runs in')
+    expect(within(dialog).getByText('Prime Continuim', { selector: '.resident-provision__workspace bdi' })).toBeVisible()
+    expect(within(dialog).getByText('Access stays on the verified host')).toBeVisible()
+    expect(within(dialog).queryByLabelText('Agent setup progress')).not.toBeInTheDocument()
     expect(within(dialog).queryByRole('textbox', { name: 'Project name' })).not.toBeInTheDocument()
     expect(within(dialog).getAllByRole('textbox')).toHaveLength(1)
     expect(dialog.textContent).not.toMatch(/folder picker|handoff|mobile/i)
 
-    const title = within(dialog).getByRole('textbox', { name: 'Thread title' })
+    const title = within(dialog).getByRole('textbox', { name: 'Task name' })
     await user.clear(title)
     await user.type(title, 'Overnight verification')
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(harness.api.provisionResident).toHaveBeenCalledWith({
       selectionToken: 'registered-selection-one',
       projectDisplayName: 'Prime Continuim',
       threadTitle: 'Overnight verification',
     })
     expect(within(dialog).getByRole('status')).toHaveTextContent(/durably recorded/i)
-    expect(within(dialog).queryByText(/folder/i)).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /choose.*folder/i })).not.toBeInTheDocument()
   })
 
   it('shows End-first guidance instead of saved-workspace create while its exact resident authority is active', async () => {
@@ -1405,11 +1785,11 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-    expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
 
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
     expect(screen.getByRole('button', { name: 'End resident session…' })).toBeEnabled()
   })
 
@@ -1421,7 +1801,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-    expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
@@ -1480,7 +1860,7 @@ describe('Prime Continuim renderer', () => {
       render(<App api={harness.api} />)
 
       expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-      expect(screen.getByText(/open or select that resident thread.*End resident session in Runtime/i)).toBeVisible()
+      expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
       expect(screen.queryByText(/earlier resident setup still holds this workspace/i)).not.toBeInTheDocument()
       expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     },
@@ -1506,14 +1886,26 @@ describe('Prime Continuim renderer', () => {
     const ending = structuredClone(harness.getSnapshot())
     const operation = registeredWorkspaceEndOperation('ending', 'selected')
     ending.residentLifecycleOperations = [operation]
+    ending.composerReceipt = {
+      state: 'sent',
+      operation: 'end',
+      retryable: true,
+      message: 'Ready to finish · Prime Agent has not received an End request',
+    }
     ending.operations.provisionResident = undefined
     ending.operations.endResident = true
+    harness.api.endResident = vi.fn(async () => ({
+      ...operation.lastStatus!,
+      phase: 'completed',
+      updatedAt: '2026-08-05T20:00:03.000Z',
+      terminalAt: '2026-08-05T20:00:03.000Z',
+    }))
     harness.publish(ending)
     render(<App api={harness.api} />)
 
     expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
-    const review = screen.getByRole('button', { name: 'Review end again' })
+    const review = screen.getByRole('button', { name: 'Finish ending this resident session' })
     expect(review).toBeEnabled()
     await user.click(review)
     expect(harness.api.prepareResidentEnd).toHaveBeenCalledWith(expect.objectContaining({
@@ -1522,7 +1914,12 @@ describe('Prime Continuim renderer', () => {
       threadId: operation.threadId,
       executionGenerationId: operation.executionGenerationId,
     }))
-    expect(await screen.findByRole('dialog', { name: 'End resident session?' })).toBeVisible()
+    await waitFor(() => expect(harness.api.endResident).toHaveBeenCalledWith({
+      confirmationToken: 'registered-end-confirmation-one',
+      consent: true,
+    }))
+    expect(harness.api.endResident).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('keeps a remote End recovery status-only until its exact resident thread is selected', async () => {
@@ -1542,9 +1939,9 @@ describe('Prime Continuim renderer', () => {
     harness.publish(changed)
     render(<App api={harness.api} />)
 
-    const card = await screen.findByRole('region', { name: 'End review required' })
-    expect(within(card).getByText(/open or select the resident thread.*End resident session in Runtime/i)).toBeVisible()
-    expect(within(card).queryByRole('button', { name: 'Review end again' })).not.toBeInTheDocument()
+    const card = await screen.findByRole('region', { name: 'End saved' })
+    expect(within(card).getByText(/open or select the resident thread.*End resident session in Session/i)).toBeVisible()
+    expect(within(card).queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
     expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
     expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
   })
@@ -1552,9 +1949,21 @@ describe('Prime Continuim renderer', () => {
   it('reviews and submits permanent end for the exact saved SSH resident lineage', async () => {
     const user = userEvent.setup()
     const harness = createRegisteredWorkspaceHarness({ residentActive: true })
+    const ending = await vi.mocked(harness.api.endResident!).getMockImplementation()!({
+      confirmationToken: 'fixture-token',
+      consent: true,
+    })
+    vi.mocked(harness.api.endResident!)
+      .mockResolvedValueOnce(ending)
+      .mockResolvedValueOnce({
+        ...ending,
+        phase: 'completed',
+        updatedAt: '2026-08-05T20:00:03.000Z',
+        terminalAt: '2026-08-05T20:00:03.000Z',
+      })
     render(<App api={harness.api} />)
 
-    await user.click(await screen.findByRole('tab', { name: 'Runtime' }))
+    await user.click(await screen.findByRole('tab', { name: 'Session' }))
     await user.click(screen.getByRole('button', { name: 'End resident session…' }))
     expect(harness.api.prepareResidentEnd).toHaveBeenCalledWith({
       expectedHostId: 'host-devbox',
@@ -1563,14 +1972,24 @@ describe('Prime Continuim renderer', () => {
       threadId: 'thread-seamless',
       executionGenerationId: 'generation-prime-ssh',
     })
-    const dialog = await screen.findByRole('dialog', { name: 'End resident session?' })
-    await user.click(within(dialog).getByRole('checkbox', { name: /cannot be resumed/i }))
-    await user.click(within(dialog).getByRole('button', { name: 'End resident session' }))
+    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
+    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
     expect(harness.api.endResident).toHaveBeenCalledWith({
       confirmationToken: 'registered-end-confirmation-one',
       consent: true,
     })
-    expect(within(dialog).getByRole('status')).toHaveTextContent(/durably recorded/i)
+    await waitFor(() => {
+      expect(harness.api.prepareResidentEnd).toHaveBeenLastCalledWith({
+        expectedHostId: 'host-devbox',
+        projectId: 'project-prime',
+        workspaceId: 'workspace-prime-ssh',
+        threadId: 'thread-seamless',
+        executionGenerationId: 'generation-prime-ssh',
+        resumeOperationId: 'registered-end-operation-one',
+      })
+      expect(harness.api.endResident).toHaveBeenCalledTimes(2)
+      expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
+    })
   })
 
   it('closes a saved-workspace authorization when the selected source generation changes', async () => {
@@ -1580,12 +1999,12 @@ describe('Prime Continuim renderer', () => {
 
     const create = await screen.findByRole('button', { name: 'New resident thread in this workspace' })
     await user.click(create)
-    expect(await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })).toBeVisible()
+    expect(await screen.findByRole('dialog', { name: 'Start another task' })).toBeVisible()
     const changed = structuredClone(harness.getSnapshot())
     changed.threads.find((thread) => thread.id === 'thread-seamless')!.executionGenerationId = 'generation-prime-ssh-next'
     act(() => harness.publish(changed))
     await waitFor(() => expect(screen.queryByRole('dialog', {
-      name: 'New resident thread in this workspace',
+      name: 'Start another task',
     })).not.toBeInTheDocument())
     expect(harness.api.provisionResident).not.toHaveBeenCalled()
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveFocus())
@@ -1602,7 +2021,7 @@ describe('Prime Continuim renderer', () => {
 
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
     expect(screen.queryByRole('button', { name: 'End resident session…' })).not.toBeInTheDocument()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
     expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
@@ -1617,8 +2036,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(await within(dialog).findByText(/check the durable recovery state/i)).toBeVisible()
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
 
@@ -1665,8 +2084,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
 
     const fallback = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
@@ -1687,7 +2106,7 @@ describe('Prime Continuim renderer', () => {
       referenceExecutionGenerationId: 'generation-prime-ssh',
       resumeOperationId: 'registered-operation-one',
     })
-    expect(await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })).toBeVisible()
+    expect(await screen.findByRole('dialog', { name: 'Continue setup' })).toBeVisible()
     expect(harness.api.provisionResident).toHaveBeenCalledTimes(1)
   })
 
@@ -1713,8 +2132,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
     expect(await screen.findByRole('region', { name: 'Setup outcome needs inspection' })).toBeVisible()
     vi.mocked(harness.api.selectResidentWorkspace).mockClear()
@@ -1784,8 +2203,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
     const unresolved = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
@@ -1818,8 +2237,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
 
     const changed = structuredClone(harness.getSnapshot())
@@ -1867,8 +2286,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('button', { name: 'New resident thread in this workspace' }))
-    const dialog = await screen.findByRole('dialog', { name: 'New resident thread in this workspace' })
-    await user.click(within(dialog).getByRole('button', { name: 'Create resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start another task' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
     const unresolved = await screen.findByRole('region', { name: 'Setup outcome needs inspection' })
     await user.click(within(unresolved).getByRole('button', { name: 'Check status' }))
@@ -1879,7 +2298,7 @@ describe('Prime Continuim renderer', () => {
 
     const fallback = await screen.findByRole('region', { name: 'Setup paused safely' })
     expect(within(fallback).getByText(/another resident session owns this workspace/i)).toBeVisible()
-    expect(within(fallback).getByText(/open or select the resident thread.*End resident session in Runtime/i)).toBeVisible()
+    expect(within(fallback).getByText(/open or select the resident thread.*End resident session in Session/i)).toBeVisible()
     expect(fallback).not.toHaveTextContent(/lifecycle control is unavailable/i)
     expect(within(fallback).queryByRole('button', { name: 'Use saved workspace' })).not.toBeInTheDocument()
     expect(within(fallback).getByRole('button', { name: 'Check status' })).toBeEnabled()
@@ -1910,7 +2329,7 @@ describe('Prime Continuim renderer', () => {
     harness.publish(withdrawn)
     render(<App api={harness.api} />)
 
-    const card = await screen.findByRole('region', { name: 'Workspace confirmation needed' })
+    const card = await screen.findByRole('region', { name: 'Reconnect workspace' })
     expect(within(card).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
     await user.click(within(card).getByRole('button', { name: 'Check status' }))
     expect(harness.api.residentLifecycleStatus).toHaveBeenCalledWith({
@@ -1956,7 +2375,7 @@ describe('Prime Continuim renderer', () => {
     harness.publish(changed)
     render(<App api={harness.api} />)
 
-    const card = await screen.findByRole('region', { name: 'Workspace confirmation needed' })
+    const card = await screen.findByRole('region', { name: 'Reconnect workspace' })
     expect(within(card).getByText(/open the saved workspace and its original source thread/i)).toBeVisible()
     expect(within(card).queryByRole('button', { name: /use saved workspace|try again/i })).not.toBeInTheDocument()
     await user.click(within(card).getByRole('button', { name: 'Check status' }))
@@ -1973,7 +2392,7 @@ describe('Prime Continuim renderer', () => {
     const api = createResidentProvisioningApi(operation)
     render(<App api={api} />)
 
-    await screen.findByRole('heading', { name: 'Workspace confirmation needed' })
+    await screen.findByRole('heading', { name: 'Reconnect workspace' })
     expect(api.selectResidentWorkspace).not.toHaveBeenCalled()
     expect(api.provisionResident).not.toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Choose original folder' }))
@@ -1983,7 +2402,7 @@ describe('Prime Continuim renderer', () => {
       resumeOperationId: operation.operationId,
     })
     expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
-    expect(await screen.findByRole('dialog', { name: 'Start resident thread' })).toBeVisible()
+    expect(await screen.findByRole('dialog', { name: 'Continue setup' })).toBeVisible()
   })
 
   it('checks the exact uncertain lifecycle status without reselecting or retrying provision', async () => {
@@ -2075,8 +2494,11 @@ describe('Prime Continuim renderer', () => {
     api.residentLifecycleStatus = vi.fn(async () => null)
     render(<App api={api} />)
 
+    await user.click(await screen.findByText((_content, element) =>
+      element?.classList.contains('resident-recovery-list__summary-label') === true &&
+      element.textContent === '2 saved setups'
+    ))
     await screen.findByRole('heading', { name: 'Setup outcome needs inspection' })
-    await user.click(screen.getByText('1 other setup needs attention'))
     expect(screen.getByRole('button', { name: 'Choose original folder' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Check status' }))
     expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
@@ -2121,10 +2543,104 @@ describe('Prime Continuim renderer', () => {
       },
     }))
     expect(main).toHaveAttribute('data-local-setup-stage', 'choose_workspace')
-    expect(screen.getByRole('heading', { name: 'Choose a workspace' })).toBeVisible()
-    expect(within(main).getByRole('status')).toHaveTextContent('bundled Prime Agent runtime is verified')
+    expect(screen.getByRole('heading', { name: 'Start an agent' })).toBeVisible()
+    expect(within(main).queryByRole('status')).not.toBeInTheDocument()
+    expect(within(main).queryByText('Start local service')).not.toBeInTheDocument()
     const chooseWorkspace = screen.getByRole('button', { name: 'Choose workspace folder' })
     await waitFor(() => expect(chooseWorkspace).toHaveFocus())
+  })
+
+  it('chooses and names a path-private workspace during live runtime preparation, then waits for final confirmation', async () => {
+    const user = userEvent.setup()
+    const harness = createLocalSetupHarness({
+      stage: 'preparing_runtime',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'initializing',
+        phase: 'preparing',
+      },
+    })
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Getting Prime Continuim ready' })
+    expect(screen.queryByRole('button', { name: 'Choose workspace while Prime finishes' })).not.toBeInTheDocument()
+    act(() => harness.publish({
+      stage: 'preparing_runtime',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'initializing',
+        phase: 'copying',
+      },
+    }))
+
+    const choose = await screen.findByRole('button', { name: 'Choose workspace while Prime finishes' })
+    await user.click(choose)
+    const earlyChoice = await screen.findByRole('region', { name: 'Workspace chosen' })
+    expect(within(earlyChoice).getByText(/no workspace access or agent has started/i)).toBeVisible()
+    const name = within(earlyChoice).getByRole('textbox', { name: 'Workspace name' })
+    expect(name).toHaveValue('Prime workspace')
+    await user.clear(name)
+    await user.type(name, 'Renamed workspace')
+    expect(harness.api.preselectResidentWorkspace).toHaveBeenCalledOnce()
+    expect(harness.api.provisionResident).not.toHaveBeenCalled()
+
+    act(() => harness.publish({
+      stage: 'choose_workspace',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    const selectedWorkspace = within(dialog).getByRole('region', { name: 'Selected workspace' })
+    expect(within(selectedWorkspace).getByText('Renamed workspace')).toBeVisible()
+    expect(within(dialog).getByRole('textbox', { name: /^Task name/ })).toHaveValue('Renamed workspace task')
+    expect(harness.api.completeResidentWorkspacePreselection).toHaveBeenCalledOnce()
+    expect(harness.api.provisionResident).not.toHaveBeenCalled()
+    const readyChooser = screen.getByRole('button', { name: 'Choose workspace folder' })
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(readyChooser).toHaveFocus())
+  })
+
+  it('cancels an early workspace choice and never replays a failed readiness conversion', async () => {
+    const user = userEvent.setup()
+    const setup: LocalSetupSummary = {
+      stage: 'preparing_runtime',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'initializing',
+        phase: 'verifying',
+      },
+    }
+    const harness = createLocalSetupHarness(setup)
+    render(<App api={harness.api} />)
+    const choose = await screen.findByRole('button', { name: 'Choose workspace while Prime finishes' })
+    await user.click(choose)
+    await user.click(await screen.findByRole('button', { name: 'Remove' }))
+    expect(harness.api.cancelResidentWorkspacePreselection).toHaveBeenCalledWith('preselection-local-one')
+    expect(screen.queryByRole('region', { name: 'Workspace chosen' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Choose workspace while Prime finishes' }))
+    vi.mocked(harness.api.completeResidentWorkspacePreselection).mockRejectedValueOnce(new Error('Selection expired'))
+    const ready: LocalSetupSummary = {
+      stage: 'choose_workspace',
+      runtimeReadiness: {
+        kind: 'reported',
+        freshness: 'live',
+        status: 'ready',
+        assurance: 'development-integrity',
+      },
+    }
+    act(() => harness.publish(ready))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Selection expired')
+    act(() => harness.publish(ready))
+    expect(harness.api.completeResidentWorkspacePreselection).toHaveBeenCalledOnce()
+    expect(harness.api.provisionResident).not.toHaveBeenCalled()
   })
 
   it('opens Prime Agent accounts and starts host-scoped OAuth before a resident thread exists', async () => {
@@ -2157,14 +2673,13 @@ describe('Prime Continuim renderer', () => {
     harness.api.cancelRuntimeOAuth = vi.fn(async () => null)
 
     render(<App api={harness.api} />)
-    await screen.findByRole('heading', { name: 'Start a resident thread' })
+    await screen.findByRole('heading', { name: 'Start an agent' })
     const models = screen.getByRole('button', { name: 'Models & accounts' })
     expect(screen.queryByRole('heading', { name: 'Seamless remote experience' })).not.toBeInTheDocument()
     await user.click(models)
 
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
-    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
 
     expect(harness.api.startRuntimeOAuth).toHaveBeenCalledWith({
       hostId: 'host-local',
@@ -2424,10 +2939,166 @@ describe('Prime Continuim renderer', () => {
     }, { lifecycleOperations: [operation] })
     render(<App api={harness.api} />)
 
-    expect(await screen.findByRole('heading', { name: 'Finish resident setup' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Finish agent setup' })).toBeVisible()
     expect(screen.getByRole('heading', { name: 'Setup outcome needs inspection' })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Choose workspace folder' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Use another computer' })).toBeVisible()
+  })
+
+  it('reuses the original path-free names when continuing resident setup', async () => {
+    const user = userEvent.setup()
+    const operation = {
+      ...lifecycleOperation('requires_reselection'),
+      projectDisplayName: 'Original workspace',
+      threadTitle: 'Original task',
+    }
+    const api = createResidentProvisioningApi(operation)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose original folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Continue setup' })
+    expect(within(dialog).getByText('Original workspace')).toBeVisible()
+    expect(within(dialog).getByText('Original task')).toBeVisible()
+    expect(within(dialog).queryByRole('textbox')).not.toBeInTheDocument()
+    expect(within(dialog).getByText('Original setup restored')).toBeVisible()
+    expect(within(dialog).getByText(/no duplicate session or task/i)).toBeVisible()
+    const continueSetup = within(dialog).getByRole('button', { name: 'Continue setup' })
+    await waitFor(() => expect(continueSetup).toHaveFocus())
+    await user.click(continueSetup)
+
+    expect(api.provisionResident).toHaveBeenCalledWith({
+      selectionToken: 'resident-selection-one',
+      projectDisplayName: 'Original workspace',
+      threadTitle: 'Original task',
+    })
+    expect(api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores immutable names inline after an identity conflict and continues without reselecting', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    const prepared = await vi.mocked(api.provisionResident).getMockImplementation()!({
+      selectionToken: 'unused',
+      projectDisplayName: 'unused',
+      threadTitle: 'unused',
+    })
+    api.provisionResident = vi.fn()
+      .mockRejectedValueOnce(new ResidentProvisionError('This setup already has names from its original attempt.', {
+        durableOperationPossible: false,
+        code: 'resident.provision_identity_conflict',
+        details: {
+          expectedProjectDisplayName: 'Original workspace',
+          expectedThreadTitle: 'Original task',
+        },
+      }))
+      .mockResolvedValueOnce(prepared)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    const taskName = within(dialog).getByRole('textbox', { name: 'Task name' })
+    await user.click(within(dialog).getByRole('button', { name: 'Rename' }))
+    const workspaceName = within(dialog).getByRole('textbox', { name: 'Workspace name' })
+    await user.clear(workspaceName)
+    await user.type(workspaceName, 'Different workspace')
+    await user.clear(taskName)
+    await user.type(taskName, 'Different task')
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/original setup.*restored/i)
+    expect(within(dialog).getByText('Original workspace')).toBeVisible()
+    expect(within(dialog).getByText('Original task')).toBeVisible()
+    expect(within(dialog).queryByRole('textbox')).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Continue setup' }))
+
+    expect(api.provisionResident).toHaveBeenCalledTimes(2)
+    expect(api.provisionResident).toHaveBeenLastCalledWith({
+      selectionToken: 'resident-selection-one',
+      projectDisplayName: 'Original workspace',
+      threadTitle: 'Original task',
+    })
+    expect(api.selectResidentWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts a new provision attempt without rendering the prior identity conflict', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    api.selectResidentWorkspace = vi.fn()
+      .mockResolvedValueOnce({
+        selectionToken: 'resident-selection-one',
+        operationId: 'resident-operation-one',
+        expectedHostId: 'host-local',
+        suggestedName: 'Prime GUI',
+        expiresAt: '2099-08-05T20:05:00.000Z',
+      })
+      .mockResolvedValueOnce({
+        selectionToken: 'resident-selection-two',
+        operationId: 'resident-operation-two',
+        expectedHostId: 'host-local',
+        suggestedName: 'Fresh workspace',
+        expiresAt: '2099-08-05T20:06:00.000Z',
+      })
+    api.provisionResident = vi.fn(async () => {
+      throw new ResidentProvisionError('This setup already has names from its original attempt.', {
+        durableOperationPossible: false,
+        code: 'resident.provision_identity_conflict',
+        details: {
+          expectedProjectDisplayName: 'Original workspace',
+          expectedThreadTitle: 'Original task',
+        },
+      })
+    })
+    render(<App api={api} />)
+
+    const trigger = await screen.findByRole('button', { name: 'Choose workspace folder' })
+    await user.click(trigger)
+    let dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/original setup.*restored/i)
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(trigger).toHaveFocus())
+
+    await user.click(trigger)
+    dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    expect(within(dialog).getByRole('region', { name: 'Selected workspace' })).toHaveTextContent('Fresh workspace')
+    expect(within(dialog).getByRole('textbox', { name: 'Task name' })).toHaveValue('Fresh workspace task')
+    expect(within(dialog).queryByText(/original setup.*restored/i)).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Rename' }))
+    expect(within(dialog).getByRole('textbox', { name: 'Workspace name' })).toHaveValue('Fresh workspace')
+  })
+
+  it('admits at most one provision mutation from rapid duplicate form submissions', async () => {
+    const user = userEvent.setup()
+    const api = createResidentProvisioningApi()
+    const provision = deferred<Awaited<ReturnType<RendererApi['provisionResident']>>>()
+    api.provisionResident = vi.fn(() => provision.promise)
+    render(<App api={api} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    const submit = within(dialog).getByRole('button', { name: 'Start agent' })
+    const form = submit.closest('form')
+    expect(form).not.toBeNull()
+    fireEvent.submit(form!)
+    fireEvent.submit(form!)
+
+    expect(api.provisionResident).toHaveBeenCalledTimes(1)
+    expect(await within(dialog).findByRole('button', { name: 'Starting…' })).toBeDisabled()
+    provision.resolve({
+      version: 1,
+      kind: 'provision',
+      operationId: 'resident-operation-one',
+      phase: 'prepared',
+      expectedHostId: 'host-local',
+      projectId: 'resident-project-one',
+      workspaceId: 'resident-workspace-one',
+      threadId: 'resident-thread-one',
+      executionGenerationId: 'resident-generation-one',
+      preparedAt: '2026-08-05T20:00:00.000Z',
+      updatedAt: '2026-08-05T20:00:01.000Z',
+    })
+    expect(await within(dialog).findByText(/setup is durably recorded/i)).toBeVisible()
+    expect(api.provisionResident).toHaveBeenCalledTimes(1)
   })
 
   it('labels and validates resident setup, keeps paths hidden, and cancels without mutation', async () => {
@@ -2437,26 +3108,28 @@ describe('Prime Continuim renderer', () => {
 
     const trigger = await screen.findByRole('button', { name: 'Choose workspace folder' })
     await user.click(trigger)
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    expect(dialog).toHaveAccessibleDescription(/verified local host keeps its folder location/i)
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    expect(dialog).toHaveAccessibleDescription(/runs it in this folder/i)
     expect(document.body).not.toHaveTextContent('C:\\Users\\operator\\secret-workspace')
 
-    const projectName = within(dialog).getByRole('textbox', { name: /^Project name/ })
-    const threadTitle = within(dialog).getByRole('textbox', { name: /^Thread title/ })
+    const threadTitle = within(dialog).getByRole('textbox', { name: /^Task name/ })
+    expect(threadTitle).toHaveValue('Prime GUI task')
+    await waitFor(() => expect(threadTitle).toHaveFocus())
+    await user.click(within(dialog).getByRole('button', { name: 'Rename' }))
+    const projectName = within(dialog).getByRole('textbox', { name: /^Workspace name/ })
     expect(projectName).toHaveValue('Prime GUI')
-    expect(threadTitle).toHaveValue('Prime GUI thread')
     await waitFor(() => expect(projectName).toHaveFocus())
 
     await user.clear(projectName)
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(projectName).toHaveAttribute('aria-invalid', 'true')
     expect(projectName.getAttribute('aria-describedby')).toContain('resident-provision-error')
     expect(projectName).toHaveFocus()
-    expect(within(dialog).getByText('Enter a project name between 1 and 255 characters.')).toBeVisible()
+    expect(within(dialog).getByText('Enter a workspace name between 1 and 255 characters.')).toBeVisible()
     expect(api.provisionResident).not.toHaveBeenCalled()
 
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start resident thread' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start agent' })).not.toBeInTheDocument())
     await waitFor(() => expect(trigger).toHaveFocus())
     expect(api.provisionResident).not.toHaveBeenCalled()
   })
@@ -2490,8 +3163,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(within(dialog).getByRole('button', { name: 'Starting…' })).toBeDisabled()
 
     const projected = structuredClone(initial)
@@ -2520,11 +3193,11 @@ describe('Prime Continuim renderer', () => {
     projected.selectedThreadId = projected.threads[0]!.id
     act(() => publishSnapshot?.(projected))
 
-    expect(screen.getByRole('dialog', { name: 'Start resident thread' })).toBe(dialog)
+    expect(screen.getByRole('dialog', { name: 'Start agent' })).toBe(dialog)
     expect(within(dialog).getByRole('button', { name: 'Starting…' })).toBeDisabled()
     await act(async () => provision.resolve(committedStatus))
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start resident thread' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start agent' })).not.toBeInTheDocument())
     const heading = await screen.findByRole('heading', { name: 'Prime GUI thread' })
     await waitFor(() => expect(heading).toHaveFocus())
     expect(api.provisionResident).toHaveBeenCalledTimes(1)
@@ -2536,8 +3209,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(await within(dialog).findByText(/setup is durably recorded/i)).toBeVisible()
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
 
@@ -2556,14 +3229,14 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
 
     expect(await within(dialog).findByText('The resident setup outcome is unknown.')).toBeVisible()
     const result = within(dialog).getByRole('status')
     expect(result).toHaveTextContent('Check the durable recovery state before trying again.')
     await waitFor(() => expect(result).toHaveFocus())
-    expect(within(dialog).queryByRole('button', { name: 'Start resident thread' })).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: 'Start agent' })).not.toBeInTheDocument()
     await act(async () => {
       await Promise.resolve()
       await Promise.resolve()
@@ -2594,8 +3267,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     expect(await within(dialog).findByText(/correct the issue, and choose the workspace folder again/i)).toBeVisible()
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
 
@@ -2670,8 +3343,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('button', { name: 'Choose workspace folder' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Start resident thread' })
-    await user.click(within(dialog).getByRole('button', { name: 'Start resident thread' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start agent' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start agent' }))
     await user.click(await within(dialog).findByRole('button', { name: 'Close' }))
 
     const card = await screen.findByRole('region', { name: 'Setup needs manual recovery' })
@@ -2984,6 +3657,99 @@ describe('Prime Continuim renderer', () => {
     })
   })
 
+  it('prefills a generic investigation task without sending it', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+
+    await user.click(screen.getByRole('button', { name: 'Investigate an issue' }))
+
+    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue in this workspace')
+    expect((composer as HTMLTextAreaElement).value).toContain('identify the root cause')
+    expect(api.sendComposer).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Investigate an issue' })).toHaveAttribute('aria-pressed', 'true')
+
+    await user.type(composer, ' Add one more constraint.')
+    expect((composer as HTMLTextAreaElement).value).toContain('Add one more constraint.')
+    expect(screen.getByRole('button', { name: 'Investigate an issue' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('prefills a generic RLM delegation task without sending it', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+
+    await user.click(screen.getByRole('button', { name: 'Delegate a task' }))
+
+    expect((composer as HTMLTextAreaElement).value).toContain('First define a concrete goal')
+    expect((composer as HTMLTextAreaElement).value).toContain('bounded, independent subtasks to child agents')
+    expect((composer as HTMLTextAreaElement).value).toContain('integrate their findings and resolve conflicts')
+    expect((composer as HTMLTextAreaElement).value).toContain('verify the complete result')
+    expect((composer as HTMLTextAreaElement).value).toContain('persist concise reusable lessons')
+    expect(api.sendComposer).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Delegate a task' })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('turns a fresh resident thread into a guided agent launchpad without duplicating composer starters', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = vi.fn(async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread || !snapshot.runtime.session) throw new Error('Expected the selected resident fixture')
+      thread.transcript = []
+      snapshot.runtime.session.model = 'unknown/unknown'
+      snapshot.runtime.browserExecution = { readiness: 'ready' }
+      return snapshot
+    })
+
+    render(<App api={api} />)
+    expect(await screen.findByRole('heading', { name: 'What should we build?' })).toBeVisible()
+    expect(screen.getByText('Describe the outcome or choose a brief.')).toBeVisible()
+    expect(screen.getByText('Connect a model to begin')).toBeVisible()
+    expect(document.querySelector('.agent-launchpad__capabilities')).not.toBeInTheDocument()
+    expect(document.querySelector('.task-starters')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /Investigate an issue.*Reproduce and resolve root cause/ }))
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    await waitFor(() => expect(composer).toHaveFocus())
+    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue')
+    expect(api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('finds task starters from the command palette and returns focus to the editable composer', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    await user.click(screen.getByRole('button', { name: 'Search projects, threads, and commands' }))
+
+    const palette = await screen.findByRole('dialog', { name: 'Search and commands' })
+    await user.type(
+      within(palette).getByRole('combobox', { name: 'Search projects, threads, and commands' }),
+      'Investigate an issue',
+    )
+    await user.click(within(palette).getByRole('option', { name: /Investigate an issue/ }))
+
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    await waitFor(() => expect(composer).toHaveFocus())
+    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue in this workspace')
+    expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
+    expect(api.sendComposer).not.toHaveBeenCalled()
+  })
+
   it.each([
     { taskState: 'idle' as const, expectedStatus: 'Ready', expectedDetail: 'Resident workstation is ready for another delegated task.' },
     { taskState: 'waiting' as const, expectedStatus: 'Needs you', expectedDetail: 'Prime Agent needs your input on Resident workstation before it can continue.' },
@@ -2996,6 +3762,27 @@ describe('Prime Continuim renderer', () => {
     expect(within(continuity).getByRole('status')).toHaveTextContent(expectedStatus)
     expect(within(continuity).getByText(expectedDetail)).toBeVisible()
     expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
+    if (connection !== 'reconnecting') {
+      expect(within(continuity).getByText(/GPT-5\.6 Sol · Browser ready/)).toBeVisible()
+    } else {
+      expect(within(continuity).queryByText(/Exact session/)).not.toBeInTheDocument()
+    }
+  })
+
+  it('opens the cohesive session manager from the live session status', async () => {
+    const user = userEvent.setup()
+    render(<App api={createContinuityApi({ taskState: 'idle' })} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    const manage = within(continuity).getByRole('button', { name: 'Session' })
+    await user.click(manage)
+
+    expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
+    const sessionPanel = screen.getByRole('tabpanel', { name: 'Session' })
+    expect(within(sessionPanel).getByRole('heading', { name: 'Agent session' })).toBeVisible()
+    expect(within(sessionPanel).getByRole('heading', { name: 'Overview' })).toBeVisible()
+    expect(within(sessionPanel).getByRole('heading', { name: 'Manage session' })).toBeVisible()
   })
 
   it.each([
@@ -3049,6 +3836,30 @@ describe('Prime Continuim renderer', () => {
     expect(document.getElementById('composer-message-error')).not.toBeInTheDocument()
   })
 
+  it('keeps ordinary prompt keystrokes inside the composer render boundary', async () => {
+    const user = userEvent.setup()
+    const previewApi = createIdleResidentApi()
+    let rootEnvironmentReads = 0
+    const api = Object.create(previewApi) as typeof previewApi
+    Object.defineProperty(api, 'environment', {
+      configurable: true,
+      get() {
+        rootEnvironmentReads += 1
+        return previewApi.environment
+      },
+    })
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    rootEnvironmentReads = 0
+
+    await user.type(composer, 'A bounded task brief')
+
+    expect(composer).toHaveValue('A bounded task brief')
+    expect(rootEnvironmentReads).toBe(0)
+  })
+
   it('preserves a draft when the host rejects command admission', async () => {
     const user = userEvent.setup()
     const api = createIdleResidentApi()
@@ -3098,8 +3909,10 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toHaveAttribute('aria-busy', 'true')
     expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
     const continuity = screen.getByRole('region', { name: 'Session status' })
-    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).getByText('Starting')).toBeVisible()
     expect(within(continuity).getByText(/Delegating this task to Prime Agent/)).toBeVisible()
+    expect(continuity.querySelector('.session-continuity__state')).toHaveClass('session-continuity__state--working')
+    expect(continuity.querySelector('.session-continuity__state .lucide-activity')).toBeInTheDocument()
 
     await act(async () => {
       admission.resolve({ state: 'sent', message: 'Sent · durably admitted by host' })
@@ -3108,12 +3921,13 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument())
     expect(screen.getByText('Prompt owned by Prime Agent', { selector: '.composer__intent' })).toBeVisible()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
-    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).getByText('Starting')).toBeVisible()
     expect(within(continuity).getByText(/Prime Agent owns this task.*waiting for authoritative activity/)).toBeVisible()
 
     const authoritative = structuredClone(snapshot)
     const selected = authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)
     if (!selected) throw new Error('Expected the selected thread fixture')
+    selected.status = 'running'
     selected.transcript.push({
       id: 'authoritative-user-prompt',
       kind: 'user',
@@ -3125,6 +3939,8 @@ describe('Prime Continuim renderer', () => {
 
     await act(async () => publish?.(authoritative))
     expect(await within(transcript).findByText(prompt)).toBeVisible()
+    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).queryByText('Starting')).not.toBeInTheDocument()
   })
 
   it('turns an owned prompt receipt into an enabled Stop control without inventing transcript state', async () => {
@@ -3432,11 +4248,11 @@ describe('Prime Continuim renderer', () => {
 
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
     expect(await within(dialog).findByRole('complementary', { name: 'Accounts on devbox' })).toBeVisible()
-    expect(dialog.querySelector('#models-description')).toHaveTextContent(/reported by Prime Agent on devbox/i)
+    expect(dialog.querySelector('#models-description')).toHaveTextContent('Choose the model for this thread on devbox.')
     expect(within(dialog).queryByText(/illustrative|sample catalog|browser preview/i)).not.toBeInTheDocument()
     expect(loadRuntimeModelCatalog).toHaveBeenCalledWith('host-devbox')
     expect(within(dialog).getByText('2 configured')).toBeVisible()
-    expect(within(dialog).getByText(/OAuth-capable providers · Prime Agent 0\.7\.1/)).toBeVisible()
+    expect(within(dialog).getByText('3 support OAuth')).toBeVisible()
     expect(within(dialog).getByText('GPT-5.6 Sol')).toBeVisible()
     expect(within(dialog).getByText('Kimi K3')).toBeVisible()
     expect(within(dialog).getByText('Current')).toBeVisible()
@@ -3444,7 +4260,8 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).queryByRole('button', { name: /Use model/i })).not.toBeInTheDocument()
     expect(within(dialog).getByText(/Model selection is available only while this exact resident session is idle/)).toBeVisible()
 
-    const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
+    const providerToolbar = await within(dialog).findByRole('toolbar', { name: 'Filter models by provider' })
+    expect(providerToolbar).toHaveClass('provider-rail__toolbar')
     const allProviders = within(providerToolbar).getByRole('button', { name: /All providers/ })
     const codexProvider = within(providerToolbar).getByRole('button', { name: /ChatGPT Plus\/Pro/ })
     expect(providerToolbar).toHaveAttribute('aria-orientation', 'horizontal')
@@ -3513,15 +4330,16 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /Browse all \d+ providers/ }))
     await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
     expect(within(dialog).queryByRole('button', { name: /Connect/ })).not.toBeInTheDocument()
     await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
 
     expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
     expect(within(dialog).getByText(/no authorization URL or credential is exposed to this view/i)).toBeVisible()
-    expect(dialog.querySelector('.provider-setup-note__storage')).toHaveTextContent(/Prime Agent 0\.7\.1.*auth\.json.*operating-system account’s file permissions/i)
-    expect(within(dialog).getByText('auth.json is plaintext at rest; it is not a keychain or keyring.')).toBeVisible()
-    expect(within(dialog).getByText(/Availability checks reload the account state before model selection/i)).toBeVisible()
+    const storageDisclosure = dialog.querySelector('.provider-setup-note__storage')
+    expect(storageDisclosure).toHaveTextContent(/Prime Agent 0\.7\.1.*stores OAuth credentials as plaintext.*auth\.json.*operating-system account’s file permissions/i)
+    expect(storageDisclosure).toHaveTextContent(/Account availability is refreshed before model selection.*not keychain or keyring storage/i)
     expect(within(dialog).queryByText(/new resident session|restart/i)).not.toBeInTheDocument()
 
     await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
@@ -3549,6 +4367,50 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText(/connected to Prime Agent.*catalog is refreshed/i)).toHaveAttribute('role', 'status')
     expect(within(dialog).queryByRole('button', { name: 'Connect ChatGPT' })).not.toBeInTheDocument()
     expect(within(dialog).getByRole('button', { name: /ChatGPT Plus\/Pro/ })).toHaveTextContent('Configured')
+    expect(within(dialog).getByText('RLM recommended')).toBeVisible()
+  })
+
+  it('opens an unconfigured first-run catalog directly on the supported ChatGPT setup path', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const loadRuntimeModelCatalog = harness.api.loadRuntimeModelCatalog.bind(harness.api)
+    harness.api.loadRuntimeModelCatalog = vi.fn(async (hostId) => {
+      const catalog = await loadRuntimeModelCatalog(hostId)
+      const chatGptProvider = catalog.providers.find((provider) => provider.providerId === 'openai-codex')!
+      chatGptProvider.configured = false
+      chatGptProvider.authSource = 'none'
+      chatGptProvider.availableModelCount = 0
+      catalog.models.forEach((model) => {
+        if (model.providerId === 'openai-codex') {
+          model.available = false
+          model.usingOAuth = false
+        }
+      })
+      return catalog
+    })
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await within(dialog).findByText('ChatGPT setup recommended')
+    expect(within(dialog).queryByRole('toolbar', { name: 'Filter models by provider' })).not.toBeInTheDocument()
+    expect(within(dialog).getByText('ChatGPT setup recommended')).toBeVisible()
+    expect(within(dialog).getByText(/Set up GPT-5.6 Sol for native RLM/)).toBeVisible()
+    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
+    expect(within(dialog).queryByText('No available models match')).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('searchbox', { name: 'Search models' })).not.toBeInTheDocument()
+
+    const browseProviders = within(dialog).getByRole('button', { name: /Browse all \d+ providers/ })
+    expect(browseProviders).toHaveAttribute('aria-expanded', 'false')
+    await user.click(browseProviders)
+    expect(browseProviders).toHaveAttribute('aria-expanded', 'true')
+    const providerToolbar = within(dialog).getByRole('toolbar', { name: 'Filter models by provider' })
+    const chatGptProvider = within(providerToolbar).getByRole('button', { name: /ChatGPT Plus\/Pro/ })
+    expect(chatGptProvider).toHaveAttribute('aria-pressed', 'true')
+    expect(chatGptProvider).toHaveAttribute('tabindex', '0')
+    expect(within(providerToolbar).getByRole('button', { name: /All providers/ })).toBeVisible()
+    expect(within(providerToolbar).getByRole('button', { name: /Anthropic/ })).toBeVisible()
   })
 
   it('keeps a host-scoped Prime Agent sign-in visible and cancellable when the selected resident thread changes', async () => {
@@ -3565,8 +4427,7 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
-    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
 
     expect(within(dialog).getByText(/Opening the verified ChatGPT sign-in page/)).toHaveAttribute('role', 'status')
     expect(within(dialog).getByRole('button', { name: 'Cancel sign-in' })).toBeEnabled()
@@ -3614,8 +4475,7 @@ describe('Prime Continuim renderer', () => {
     const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
     await user.click(trigger)
     let dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
-    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
     await user.click(within(dialog).getByRole('button', { name: 'Cancel sign-in' }))
 
     await waitFor(() => expect(within(dialog).getByText('ChatGPT sign-in was cancelled.')).toHaveAttribute('role', 'status'))
@@ -3637,8 +4497,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(trigger)
     dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
-    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
+    expect(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
     expect(dialog.querySelector('.runtime-oauth-feedback__message--error')).toHaveTextContent('')
   })
 
@@ -3981,11 +4840,11 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Goal state unavailable')).toBeVisible()
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
-    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
 
     expect(within(runtimePanel).getByText('Current thread · runtime not reported')).toBeVisible()
-    expect(within(runtimePanel).getByText('Agent activity isn’t reported in this snapshot.')).toBeVisible()
+    expect(within(runtimePanel).getByText('Child activity isn’t reported.')).toBeVisible()
     expect(within(runtimePanel).getByText('Goals aren’t reported in this snapshot.')).toBeVisible()
     expect(within(runtimePanel).getByText('Schedules aren’t reported in this snapshot.')).toBeVisible()
     expect(within(runtimePanel).getByText('Goals not reported · Agents not reported')).toBeVisible()
@@ -4044,8 +4903,8 @@ describe('Prime Continuim renderer', () => {
 
       render(<App api={api} />)
       await screen.findByRole('heading', { name: 'Seamless remote experience' })
-      await user.click(screen.getByRole('tab', { name: 'Runtime' }))
-      const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+      await user.click(screen.getByRole('tab', { name: 'Session' }))
+      const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
 
       expect(within(runtimePanel).getByText('Runtime verification')).toBeVisible()
       expect(within(runtimePanel).getByText(summary)).toBeVisible()
@@ -4083,8 +4942,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Finish the persisted review')).toBeVisible()
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
-    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
 
     expect(within(runtimePanel).getByText('Current thread · session not reported')).toBeVisible()
     expect(within(runtimePanel).getByText('Finish the persisted review')).toBeVisible()
@@ -4164,13 +5023,84 @@ describe('Prime Continuim renderer', () => {
     changes.focus()
     await user.keyboard('{ArrowRight}')
 
-    expect(screen.getByRole('tab', { name: 'Runtime' })).toHaveAttribute('aria-selected', 'true')
-    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
-    expect(within(runtimePanel).getByRole('heading', { name: 'Reported runtime' })).toBeVisible()
+    expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
+    expect(within(runtimePanel).getByRole('heading', { name: 'Agent session' })).toBeVisible()
     expect(within(runtimePanel).getByText('Implement the seamless remote workbench')).toBeVisible()
     expect(within(runtimePanel).getByText('Review overnight verification')).toBeVisible()
-    expect(within(runtimePanel).getAllByText('Subagent of Workbench lead')).toHaveLength(2)
+    expect(within(runtimePanel).getByRole('heading', { name: 'RLM delegation' })).toBeVisible()
+    expect(within(runtimePanel).getByText(/delegates focused work, then folds results/i)).toBeVisible()
+    expect(within(runtimePanel).getByText('Coordinator · main session')).toBeVisible()
+    expect(within(runtimePanel).getAllByText('Branch of Workbench lead')).toHaveLength(2)
+    const rlmSummary = within(runtimePanel).getByLabelText('RLM activity summary')
+    expect(within(rlmSummary).getByText('2')).toBeVisible()
+    expect(within(rlmSummary).getByText('1')).toBeVisible()
+    expect(within(runtimePanel).getByText('Returned')).toBeVisible()
+    const returnedResult = within(runtimePanel).getByText('View result')
+    expect(returnedResult).toBeVisible()
+    await user.click(returnedResult)
+    expect(within(runtimePanel).getByText(/snapshot boundary is generation-fenced/i)).toBeVisible()
+    const agentRows = runtimePanel.querySelectorAll<HTMLElement>('[data-runtime-agent]')
+    expect(agentRows[0]).toHaveAttribute('data-rlm-depth', '0')
+    expect(agentRows[1]).toHaveAttribute('data-rlm-depth', '1')
+    expect(agentRows[1]?.style.getPropertyValue('--rlm-depth')).toBe('1')
     expect(within(runtimePanel).getByText(/18 tool uses/)).toBeVisible()
+    expect(within(runtimePanel).getByText('Continuity')).toBeVisible()
+    expect(within(runtimePanel).getByText('Last reported · runs after app closes')).toBeVisible()
+    expect(within(runtimePanel).getByRole('heading', { name: 'Capabilities' })).toBeVisible()
+    expect(within(runtimePanel).getByText('playwright-cli')).toBeVisible()
+    expect(within(runtimePanel).getByText('Ready · clean session')).toBeVisible()
+    expect(within(runtimePanel).getByText(/live isolated launch probe/i)).toBeVisible()
+  })
+
+  it('explains that unavailable browser readiness recovers without blocking the resident session', async () => {
+    const user = userEvent.setup()
+    const api = createPreviewRendererApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      snapshot.runtime.browserExecution = { readiness: 'unavailable' }
+      return snapshot
+    }
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
+    expect(within(runtimePanel).getByText('Unavailable · recovering safely')).toBeVisible()
+    expect(within(runtimePanel).getByText(/Readiness retries in the background/i)).toBeVisible()
+  })
+
+  it('skips closed inspector list work until the panel opens', async () => {
+    const user = userEvent.setup()
+    const api = createIdleResidentApi()
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    let changeListReads = 0
+    api.loadWorkbench = vi.fn(async () => {
+      const snapshot = await loadWorkbench()
+      const changes = snapshot.changes
+      Object.defineProperty(snapshot, 'changes', {
+        configurable: true,
+        get: () => {
+          changeListReads += 1
+          return changes
+        },
+      })
+      return snapshot
+    })
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const initialReads = changeListReads
+    expect(initialReads).toBeGreaterThan(0)
+
+    await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Keep typing responsive.')
+    expect(changeListReads).toBe(initialReads)
+
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    expect(changeListReads).toBeGreaterThan(initialReads)
   })
 
   it('progressively mounts large retained-subagent projections in bounded windows', async () => {
@@ -4193,8 +5123,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: 'Open inspector' }))
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
-    const runtimePanel = screen.getByRole('tabpanel', { name: 'Runtime' })
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    const runtimePanel = screen.getByRole('tabpanel', { name: 'Session' })
 
     expect(runtimePanel.querySelectorAll('[data-runtime-agent]')).toHaveLength(50)
     await user.click(within(runtimePanel).getByRole('button', { name: 'Show 50 more subagents' }))
@@ -4214,8 +5144,8 @@ describe('Prime Continuim renderer', () => {
     expect(within(changesPanel).queryByRole('button')).not.toBeInTheDocument()
     expect(within(changesPanel).queryByText('App.tsx')).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('tab', { name: 'Runtime' }))
-    expect(within(screen.getByRole('tabpanel', { name: 'Runtime' })).queryByRole('button')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    expect(within(screen.getByRole('tabpanel', { name: 'Session' })).queryByRole('button')).not.toBeInTheDocument()
     await user.click(screen.getByRole('tab', { name: 'Evidence' }))
     expect(within(screen.getByRole('tabpanel', { name: 'Evidence' })).queryByRole('button', { name: 'Run checks' })).not.toBeInTheDocument()
 
@@ -4784,7 +5714,7 @@ describe('Prime Continuim renderer', () => {
 
     const palette = await screen.findByRole('dialog', { name: 'Search and commands' })
     expect(screen.getByRole('button', { name: 'Open sidebar' })).toHaveAttribute('aria-expanded', 'false')
-    await user.click(within(palette).getByRole('option', { name: /Open changes and evidence/ }))
+    await user.click(within(palette).getByRole('option', { name: /Manage agent session/ }))
 
     const inspector = await screen.findByRole('dialog', { name: 'Thread inspector' })
     await waitFor(() => expect(within(inspector).getByRole('tab', { name: 'Changes' })).toHaveFocus())
@@ -5033,7 +5963,7 @@ describe('Prime Continuim renderer', () => {
     if (!streamingArticle) throw new Error('Expected the streaming assistant article')
     expect(streamingArticle).toHaveClass('message--assistant', 'message--streaming')
     expect(streamingArticle).toHaveAttribute('aria-busy', 'true')
-    expect(within(streamingArticle).getByText('Live')).toBeVisible()
+    expect(within(streamingArticle).getByText('Streaming')).toBeVisible()
     expect(within(streamingArticle).queryByRole('status')).not.toBeInTheDocument()
     const oneTimeStatus = screen.getByText('Prime Agent is responding.').closest('[role="status"]')
     if (!oneTimeStatus) throw new Error('Expected the one-time assistant stream status')
@@ -5078,8 +6008,167 @@ describe('Prime Continuim renderer', () => {
     expect(completedArticle).not.toHaveAttribute('aria-busy')
     expect(within(completedArticle!).queryByRole('status')).not.toBeInTheDocument()
     expect(oneTimeStatus.textContent).toBe('')
-    expect(within(transcript).queryByText('Live')).not.toBeInTheDocument()
+    expect(within(transcript).queryByText('Streaming')).not.toBeInTheDocument()
     expect(within(transcript).getAllByText('The authoritative assistant response is complete.')).toHaveLength(1)
+  })
+
+  it('replaces an empty upstream stream placeholder with truthful live activity', async () => {
+    const api = createPreviewRendererApi()
+    const current = await api.loadWorkbench()
+    const selected = current.threads.find((thread) => thread.id === current.selectedThreadId)
+    if (!selected || !current.runtime.session) throw new Error('Expected a selected resident thread')
+    current.runtime.session.isStreaming = true
+    current.runtime.session.isBashRunning = false
+    current.runtime.session.isCompacting = false
+    current.runtime.session.activeToolNames = []
+    current.agents = []
+    selected.transcript.push({
+      id: 'empty-authoritative-assistant-stream',
+      kind: 'assistant',
+      author: 'Prime Agent',
+      time: 'Now',
+      body: '(No display text)',
+      streaming: true,
+    })
+    api.loadWorkbench = vi.fn(() => Promise.resolve(current))
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    expect(within(transcript).queryByText('(No display text)')).not.toBeInTheDocument()
+
+    const thinking = transcript.querySelector('.message__thinking')
+    const streamingArticle = thinking?.closest('article')
+    expect(thinking).not.toBeNull()
+    expect(streamingArticle).toHaveAttribute('aria-busy', 'true')
+    expect(streamingArticle).toHaveAttribute('data-stream-tone', 'thinking')
+    expect(within(thinking as HTMLElement).getByText('Thinking')).toBeVisible()
+    expect(within(thinking as HTMLElement).getByText('Preparing the next visible update')).toBeVisible()
+    expect(thinking?.querySelector('.message__thinking-track')).not.toBeNull()
+  })
+
+  it('collapses and resizes desktop panels with pointer and keyboard controls, then restores the layout', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const user = userEvent.setup()
+    const first = render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    const shell = document.querySelector<HTMLElement>('.app-shell')
+    if (!shell) throw new Error('Expected the desktop workbench shell')
+    expect(shell.style.getPropertyValue('--sidebar-width')).toBe('280px')
+    expect(shell.style.getPropertyValue('--inspector-width')).toBe('376px')
+
+    const sidebarResizer = screen.getByRole('separator', { name: 'Resize project sidebar' })
+    expect(sidebarResizer).toHaveAttribute('aria-valuenow', '280')
+    fireEvent.keyDown(sidebarResizer, { key: 'ArrowRight' })
+    expect(sidebarResizer).toHaveAttribute('aria-valuenow', '292')
+    fireEvent.pointerDown(sidebarResizer, { button: 0, pointerId: 7, clientX: 100 })
+    fireEvent.pointerMove(window, { pointerId: 7, clientX: 160 })
+    fireEvent.pointerUp(window, { pointerId: 7, clientX: 160 })
+    await waitFor(() => expect(sidebarResizer).toHaveAttribute('aria-valuenow', '352'))
+
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+    const inspectorResizer = screen.getByRole('separator', { name: 'Resize thread inspector' })
+    fireEvent.keyDown(inspectorResizer, { key: 'ArrowLeft' })
+    expect(inspectorResizer).toHaveAttribute('aria-valuenow', '388')
+
+    await user.click(screen.getByRole('button', { name: 'Collapse sidebar' }))
+    expect(shell).toHaveAttribute('data-sidebar-collapsed', 'true')
+    expect(screen.getByRole('button', { name: 'Expand sidebar' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('separator', { name: 'Resize project sidebar' })).not.toBeInTheDocument()
+    expect(screen.getByRole('separator', { name: 'Resize thread inspector' })).toBeInTheDocument()
+    await waitFor(() => expect(JSON.parse(
+      window.localStorage.getItem('prime.renderer.workbench-layout.v1') ?? '{}',
+    )).toMatchObject({
+      sidebarWidth: 352,
+      inspectorWidth: 388,
+      sidebarCollapsed: true,
+      inspectorOpen: true,
+    }))
+
+    first.unmount()
+    render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const restoredShell = document.querySelector<HTMLElement>('.app-shell')
+    expect(restoredShell).toHaveAttribute('data-sidebar-collapsed', 'true')
+    expect(restoredShell?.style.getPropertyValue('--sidebar-width')).toBe('352px')
+    expect(restoredShell?.style.getPropertyValue('--inspector-width')).toBe('388px')
+    expect(screen.getByRole('separator', { name: 'Resize thread inspector' })).toHaveAttribute('aria-valuenow', '388')
+  })
+
+  it('does not restore a desktop inspector as an unexpected narrow-screen overlay', async () => {
+    window.localStorage.setItem('prime.renderer.workbench-layout.v1', JSON.stringify({
+      sidebarWidth: 320,
+      inspectorWidth: 440,
+      sidebarCollapsed: false,
+      inspectorOpen: true,
+    }))
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: query.includes('max-width'),
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+
+    render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    expect(screen.getByRole('button', { name: 'Open inspector' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('dialog', { name: 'Thread inspector' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('separator')).not.toBeInTheDocument()
+  })
+
+  it('ends a panel drag when the window loses focus', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+
+    render(<App api={createPreviewRendererApi()} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+
+    const shell = document.querySelector<HTMLElement>('.app-shell')
+    const sidebarResizer = screen.getByRole('separator', { name: 'Resize project sidebar' })
+    fireEvent.pointerDown(sidebarResizer, { button: 0, pointerId: 19, clientX: 100 })
+    fireEvent.pointerMove(window, { pointerId: 19, clientX: 148 })
+    expect(sidebarResizer).toHaveAttribute('aria-valuenow', '328')
+    expect(shell).toHaveAttribute('data-resizing-panel', 'sidebar')
+
+    fireEvent.blur(window)
+    fireEvent.pointerMove(window, { pointerId: 19, clientX: 260 })
+
+    await waitFor(() => expect(shell).not.toHaveAttribute('data-resizing-panel'))
+    expect(sidebarResizer).toHaveAttribute('aria-valuenow', '328')
   })
 
   it('contains focus in narrow drawers, closes with Escape, and restores each trigger', async () => {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { isAbsolute, resolve as resolvePath } from "node:path";
+import { SessionCursorSchema, type SessionCursor } from "../shared/protocol";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
 import type { ResidentKillLease } from "./store";
 
@@ -70,6 +71,7 @@ export type ResidentRuntimeContractErrorCode =
   | "PRIME_RUNTIME_MODULE_INVALID"
   | "PRIME_RUNTIME_UNAVAILABLE"
   | "PRIME_RUNTIME_DAEMON_START_FAILED"
+  | "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED"
   | "PRIME_RUNTIME_RESPONSE_INVALID"
   | "PRIME_RUNTIME_REQUEST_FAILED"
   | "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN"
@@ -130,6 +132,14 @@ export class ResidentRuntimeContractError extends Error {
 }
 
 const BoundedWireStringSchema = z.string().min(1).max(4_096);
+const DaemonRuntimeIdentityEnvelopeSchema = z
+  .object({
+    buildId: BoundedWireStringSchema,
+    executablePath: BoundedWireStringSchema,
+    entrypointPath: BoundedWireStringSchema,
+    launcherPath: BoundedWireStringSchema.optional(),
+  })
+  .strict();
 const DaemonRuntimeIdentitySchema = z
   .object({
     buildId: z.literal(PINNED_PRIME_AGENT_RUNTIME.runtimeBuildId),
@@ -168,6 +178,115 @@ const PinnedDaemonHelloSchema = z
       }),
   })
   .strict();
+
+const RetirableDaemonHelloSchema = PinnedDaemonHelloSchema.extend({
+  runtime: DaemonRuntimeIdentityEnvelopeSchema,
+}).strict();
+
+export interface ResidentDaemonRetirementTarget {
+  readonly appVersion: string;
+  readonly protocolVersion: number;
+  readonly schemaRevision: number;
+  readonly schemaId: string;
+  readonly runtimeBuildId: string;
+  readonly runtimeExecutablePath: string;
+  readonly runtimeEntrypointPath: string;
+  readonly supervisorGeneration: string;
+  readonly supervisorPid: number;
+  readonly supervisorOwnerToken: string;
+  readonly supervisorProcessStartId: string;
+  readonly supervisorSocketPath: string;
+  readonly clientId: string;
+}
+
+/**
+ * Narrow recognition boundary used only before asking an incompatible daemon
+ * to retire. It deliberately does not make the daemon compatible or authorize
+ * any session command: the exact endpoint, Prime protocol identity, absolute
+ * runtime paths, and supervisor generation must still be structurally sound.
+ */
+export function validateResidentDaemonRetirementHello(
+  value: unknown,
+  expectedSocketPathValue: string,
+): ResidentDaemonRetirementTarget {
+  const expectedSocketPath = boundedAbsolutePath(expectedSocketPathValue, "expectedSocketPath");
+  const parsed = RetirableDaemonHelloSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join(".") || "hello"}: ${issue.message}`)
+      .join("; ")
+      .slice(0, 2_048);
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_HELLO_INVALID",
+      "Prime Agent returned an invalid daemon handshake.",
+      { details: { issues } },
+    );
+  }
+
+  const hello = parsed.data;
+  if (hello.socketPath !== expectedSocketPath) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
+      "Prime Agent daemon handshake belongs to a different local endpoint.",
+      { details: { field: "socketPath", expected: expectedSocketPath, received: hello.socketPath } },
+    );
+  }
+  if (hello.protocol.name !== PINNED_PRIME_AGENT_RUNTIME.daemon.protocolName) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROTOCOL_NAME_MISMATCH",
+      "Prime Agent daemon protocol name does not identify the pinned runtime family.",
+      { details: { field: "protocolName" } },
+    );
+  }
+  if (
+    !isAbsolute(hello.runtime.executablePath) ||
+    !isAbsolute(hello.runtime.entrypointPath) ||
+    (hello.runtime.launcherPath !== undefined && !isAbsolute(hello.runtime.launcherPath))
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_IDENTITY_MISMATCH",
+      "Prime Agent daemon runtime identity contains a non-absolute path.",
+      { details: { field: "runtime" } },
+    );
+  }
+  if (
+    !hello.supervisorGeneration ||
+    hello.supervisorPid === undefined ||
+    hello.supervisorOwnerToken === undefined ||
+    hello.supervisorProcessStartId === undefined ||
+    hello.supervisorSocketPath === undefined
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_HELLO_INVALID",
+      "Prime Agent daemon handshake has no exact supervisor ownership identity.",
+      { details: { field: "supervisorOwnership" } },
+    );
+  }
+  if (hello.supervisorSocketPath !== expectedSocketPath) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
+      "Prime Agent supervisor handshake belongs to a different local endpoint.",
+      { details: { field: "supervisorSocketPath" } },
+    );
+  }
+
+  return Object.freeze({
+    appVersion: hello.appVersion,
+    protocolVersion: hello.protocol.version,
+    schemaRevision: hello.schemaRevision,
+    schemaId: hello.schemaId,
+    runtimeBuildId: hello.runtime.buildId,
+    runtimeExecutablePath: hello.runtime.executablePath,
+    runtimeEntrypointPath: hello.runtime.entrypointPath,
+    supervisorGeneration: hello.supervisorGeneration,
+    supervisorPid: hello.supervisorPid,
+    supervisorOwnerToken: hello.supervisorOwnerToken,
+    supervisorProcessStartId: hello.supervisorProcessStartId,
+    supervisorSocketPath: hello.supervisorSocketPath,
+    clientId: hello.clientId,
+  });
+}
 
 /** Sanitized host-owned compatibility result; no upstream daemon DTO escapes. */
 export interface ResidentRuntimeCompatibility {
@@ -321,7 +440,7 @@ function assertExact<T extends string | number>(
 
 export interface ResidentDaemonStartInvocation {
   readonly executable: string;
-  readonly argv: readonly [string, "--mode", "daemon", "--daemon-socket", string];
+  readonly argv: readonly string[];
   readonly spawn: Readonly<{
     shell: false;
     windowsHide: true;
@@ -342,14 +461,26 @@ export function buildResidentDaemonStartInvocation(input: {
   daemonWorkingDirectory: string;
   /** Defaults to process.env and is stripped of inherited runtime role state. */
   environment?: Readonly<NodeJS.ProcessEnv>;
+  /** Exact verified skill document exposed only to this resident daemon. */
+  additionalSkillPath?: string;
 }): ResidentDaemonStartInvocation {
   const executable = boundedAbsolutePath(input.executable, "executable");
   const cliEntrypoint = boundedAbsolutePath(input.cliEntrypoint, "cliEntrypoint");
   const socketPath = boundedAbsolutePath(input.socketPath, "socketPath");
   const daemonWorkingDirectory = boundedAbsolutePath(input.daemonWorkingDirectory, "daemonWorkingDirectory");
+  const additionalSkillPath = input.additionalSkillPath
+    ? boundedAbsolutePath(input.additionalSkillPath, "additionalSkillPath")
+    : undefined;
   return Object.freeze({
     executable,
-    argv: Object.freeze([cliEntrypoint, "--mode", "daemon", "--daemon-socket", socketPath] as const),
+    argv: Object.freeze([
+      cliEntrypoint,
+      "--mode",
+      "daemon",
+      "--daemon-socket",
+      socketPath,
+      ...(additionalSkillPath ? ["--skill", additionalSkillPath] : []),
+    ]),
     spawn: Object.freeze({
       shell: false,
       windowsHide: true,
@@ -385,6 +516,10 @@ export function sanitizeResidentDaemonEnvironment(
     if (normalized === "ELECTRON_RUN_AS_NODE" && value !== "1") continue;
     sanitized[key] = value;
   }
+  // The verified runtime is immutable. Python otherwise writes __pycache__
+  // beside bundled RLM skills on first import, which invalidates the next
+  // exact-tree verification and withdraws models and resident capabilities.
+  sanitized.PYTHONDONTWRITEBYTECODE = "1";
   return Object.freeze(sanitized);
 }
 
@@ -724,6 +859,8 @@ export interface ResidentPromptIdleReconciliationRequest {
   readonly reconciliationVersion: 1;
   readonly dispatchAttemptId: string;
   readonly binding: ResidentSessionBinding;
+  /** Durable cursor observed immediately after upstream prompt admission. */
+  readonly settlementCursor: SessionCursor;
 }
 
 /**
@@ -761,8 +898,21 @@ const ResidentPromptIdleReconciliationRequestSchema = z
     reconciliationVersion: z.literal(1),
     dispatchAttemptId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
     binding: ResidentSessionBindingSchema,
+    settlementCursor: SessionCursorSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((request, context) => {
+    if (
+      request.settlementCursor.threadId !== request.binding.threadId ||
+      request.settlementCursor.executionGenerationId !== request.binding.executionGenerationId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["settlementCursor"],
+        message: "The settlement cursor must belong to the exact resident generation",
+      });
+    }
+  });
 
 const ResidentAbortIdleReconciliationRequestSchema = z
   .object({
@@ -792,6 +942,7 @@ export function validateResidentPromptIdleReconciliationRequest(
     reconciliationVersion: 1,
     dispatchAttemptId: parsed.data.dispatchAttemptId,
     binding: validateResidentSessionBinding(parsed.data.binding),
+    settlementCursor: Object.freeze(SessionCursorSchema.parse(parsed.data.settlementCursor)),
   });
 }
 

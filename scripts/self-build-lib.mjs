@@ -13,6 +13,7 @@ import {
   realpath,
   rm,
   stat,
+  symlink,
   unlink,
 } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -38,6 +39,8 @@ const MAX_UNTRACKED_FILES = 2_000
 const MAX_UNTRACKED_BYTES = 128 * 1024 * 1024
 const MAX_ARTIFACT_FILES = 50_000
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
+const MAX_NODE_RUNTIME_FILES = 4_096
+const MAX_NODE_RUNTIME_BYTES = 256 * 1024 * 1024
 const DEFAULT_STEP_TIMEOUT_MS = 20 * 60 * 1000
 const UTF8 = new TextDecoder('utf-8', { fatal: true })
 const SHA256 = /^[a-f0-9]{64}$/
@@ -894,7 +897,10 @@ export async function materializeEvaluationNodeRuntimeDependency(evaluationRoot,
   ) {
     throw new Error('The synthetic pnpm Node runtime executable does not match the bound Node toolchain.')
   }
-  const sourceTree = await digestFileTree(source, { maxFiles: 128, maxBytes: 256 * 1024 * 1024 })
+  const sourceTree = await digestFileTree(source, {
+    maxFiles: MAX_NODE_RUNTIME_FILES,
+    maxBytes: MAX_NODE_RUNTIME_BYTES,
+  })
   await unlink(runtimeLink)
   await mkdir(runtimeLink, { mode: 0o700 })
   for (const entry of sourceTree.entries) {
@@ -908,9 +914,26 @@ export async function materializeEvaluationNodeRuntimeDependency(evaluationRoot,
     await copyFile(sourceFile, targetFile)
     if (process.platform !== 'win32') await chmod(targetFile, metadata.mode & 0o777)
   }
+  const runtimeBinLink = resolve(modules, '.bin', 'node')
+  try {
+    const binMetadata = await lstat(runtimeBinLink)
+    if (binMetadata.isSymbolicLink()) {
+      const linkedExecutable = await realpath(runtimeBinLink)
+      if (!samePath(linkedExecutable, sourceExecutable)) {
+        throw new Error('The synthetic pnpm Node runtime bin link does not match the bound executable.')
+      }
+      const materializedExecutable = resolveContained(runtimeLink, executablePath)
+      await unlink(runtimeBinLink)
+      await symlink(relative(dirname(runtimeBinLink), materializedExecutable), runtimeBinLink, 'file')
+    } else if (process.platform !== 'win32') {
+      throw new Error('The synthetic pnpm Node runtime bin entry is not an exact link.')
+    }
+  } catch (error) {
+    if (!isErrorCode(error, 'ENOENT')) throw error
+  }
   const [sourceAfter, materialized] = await Promise.all([
-    digestFileTree(source, { maxFiles: 128, maxBytes: 256 * 1024 * 1024 }),
-    digestFileTree(runtimeLink, { maxFiles: 128, maxBytes: 256 * 1024 * 1024 }),
+    digestFileTree(source, { maxFiles: MAX_NODE_RUNTIME_FILES, maxBytes: MAX_NODE_RUNTIME_BYTES }),
+    digestFileTree(runtimeLink, { maxFiles: MAX_NODE_RUNTIME_FILES, maxBytes: MAX_NODE_RUNTIME_BYTES }),
   ])
   const expected = canonicalJson({
     treeSha256: sourceTree.treeSha256,

@@ -53,6 +53,7 @@ export interface HostdCliOptions {
   dataDir: string;
   socket?: string;
   runtimeSeed?: string;
+  browserExecutable?: string;
   stdio: boolean;
   json: boolean;
 }
@@ -99,6 +100,7 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         ? new RuntimeInitializationCoordinator({
             paths: store.paths,
             envelope: runtimeAttestation,
+            browserExecutable: options.browserExecutable,
             ...(process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === "1"
               ? { onFailure: reportPackageSmokeRuntimeFailure }
               : {}),
@@ -228,6 +230,7 @@ export function parseHostdCli(argv: string[]): HostdCliOptions {
   let dataDir = resolveHostDataDir();
   let socket: string | undefined;
   let runtimeSeed: string | undefined;
+  let browserExecutable: string | undefined;
   let stdio = false;
   let json = false;
   let dataDirSpecified = false;
@@ -245,7 +248,7 @@ export function parseHostdCli(argv: string[]): HostdCliOptions {
       json = true;
       continue;
     }
-    if (argument === "--data-dir" || argument === "--socket" || argument === "--runtime-seed") {
+    if (argument === "--data-dir" || argument === "--socket" || argument === "--runtime-seed" || argument === "--browser-executable") {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`${argument} requires one value`);
       index += 1;
@@ -257,11 +260,15 @@ export function parseHostdCli(argv: string[]): HostdCliOptions {
         if (socketSpecified) throw new Error("--socket may be specified only once");
         socketSpecified = true;
         socket = value;
-      } else {
+      } else if (argument === "--runtime-seed") {
         if (runtimeSeedSpecified) throw new Error("--runtime-seed may be specified only once");
         runtimeSeedSpecified = true;
         if (!isAbsolute(value)) throw new Error("--runtime-seed requires an absolute path");
         runtimeSeed = resolve(value);
+      } else {
+        if (browserExecutable !== undefined) throw new Error("--browser-executable may be specified only once");
+        if (!isAbsolute(value)) throw new Error("--browser-executable requires an absolute path");
+        browserExecutable = resolve(value);
       }
       continue;
     }
@@ -274,13 +281,14 @@ export function parseHostdCli(argv: string[]): HostdCliOptions {
   if (mode !== "probe" && json) throw new Error("--json is valid only with probe");
   if (mode !== "serve" && socket) throw new Error("--socket is valid only with serve");
   if (mode !== "serve" && runtimeSeed) throw new Error("--runtime-seed is valid only with serve");
-  return { mode, dataDir, socket, runtimeSeed, stdio, json };
+  if (mode !== "serve" && browserExecutable) throw new Error("--browser-executable is valid only with serve");
+  return { mode, dataDir, socket, runtimeSeed, browserExecutable, stdio, json };
 }
 
 function usage(): string {
   return [
     "Usage:",
-    "  prime-agent-hostd serve [--socket <local-endpoint>] [--data-dir <directory>] [--runtime-seed <absolute-directory>]",
+    "  prime-agent-hostd serve [--socket <local-endpoint>] [--data-dir <directory>] [--runtime-seed <absolute-directory>] [--browser-executable <absolute-file>]",
     "  prime-agent-hostd connect --stdio [--data-dir <directory>]",
     "  prime-agent-hostd probe --json [--data-dir <directory>]",
   ].join("\n");

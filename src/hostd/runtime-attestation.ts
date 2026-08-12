@@ -33,7 +33,24 @@ export interface EmbeddedRuntimeAttestation {
     fileCount: number;
     totalBytes: number;
   }>;
-  readonly entrypoints: Readonly<{ module: string; cli: string }>;
+  readonly entrypoints: Readonly<{
+    module: string;
+    cli: string;
+    browserBridge: string;
+    browserHost: string;
+    browserLauncher: string;
+    browserLauncherWindows: string;
+    browserSkill: string;
+  }>;
+  readonly browserBridge: Readonly<{
+    protocol: "prime-continuim.browser.v1";
+    playwrightCoreVersion: "1.63.0-alpha-2026-08-05";
+    engine: "verified-electron-host";
+    smoke: Readonly<{
+      verified: true;
+      operations: readonly ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"];
+    }>;
+  }>;
   readonly daemon: Readonly<{
     protocolName: string;
     protocolVersion: number;
@@ -42,15 +59,24 @@ export interface EmbeddedRuntimeAttestation {
     requiredCapabilities: readonly string[];
   }>;
   readonly nativeAddons: readonly Readonly<{ path: string; size: number; sha256: string }>[];
-  readonly hostRuntime: Readonly<{
-    kind: "electron-run-as-node";
+  readonly guiRuntime: Readonly<{
+    kind: "electron";
     electronVersion: string;
     nodeVersion: string;
     modulesAbi: string;
     napiVersion: string;
     platform: string;
     arch: string;
-    runAsNode: true;
+    executableSha256: string;
+  }>;
+  readonly hostRuntime: Readonly<{
+    kind: "node";
+    nodeVersion: string;
+    modulesAbi: string;
+    napiVersion: string;
+    platform: string;
+    arch: string;
+    executableSha256: string;
   }>;
 }
 
@@ -122,6 +148,7 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
   const tree = value.tree;
   const entrypoints = value.entrypoints;
   const daemon = value.daemon;
+  const guiRuntime = value.guiRuntime;
   const hostRuntime = value.hostRuntime;
   return (
     jsonEqual(Object.keys(value).sort(), [
@@ -133,8 +160,10 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
       "manifest",
       "tree",
       "entrypoints",
+      "browserBridge",
       "daemon",
       "nativeAddons",
+      "guiRuntime",
       "hostRuntime",
     ].sort()) &&
     value.schemaVersion === 1 &&
@@ -164,6 +193,20 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
     isRecord(entrypoints) &&
     isSafeRelativePath(entrypoints.module) &&
     isSafeRelativePath(entrypoints.cli) &&
+    isSafeRelativePath(entrypoints.browserBridge) &&
+    isSafeRelativePath(entrypoints.browserHost) &&
+    isSafeRelativePath(entrypoints.browserLauncher) &&
+    isSafeRelativePath(entrypoints.browserLauncherWindows) &&
+    isSafeRelativePath(entrypoints.browserSkill) &&
+    isRecord(value.browserBridge) &&
+    value.browserBridge.protocol === "prime-continuim.browser.v1" &&
+    value.browserBridge.playwrightCoreVersion === "1.63.0-alpha-2026-08-05" &&
+    value.browserBridge.engine === "verified-electron-host" &&
+    isRecord(value.browserBridge.smoke) &&
+    value.browserBridge.smoke.verified === true &&
+    jsonEqual(value.browserBridge.smoke.operations, [
+      "doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close",
+    ]) &&
     isRecord(daemon) &&
     isBoundedString(daemon.protocolName) &&
     isBoundedInteger(daemon.protocolVersion, 1, 1_000_000) &&
@@ -178,15 +221,26 @@ function isEmbeddedRuntimeAttestation(value: unknown): value is EmbeddedRuntimeA
     value.nativeAddons.length > 0 &&
     value.nativeAddons.length <= 32 &&
     value.nativeAddons.every(isNativeAddon) &&
+    isRecord(guiRuntime) &&
+    guiRuntime.kind === "electron" &&
+    isBoundedString(guiRuntime.electronVersion) &&
+    isBoundedString(guiRuntime.nodeVersion) &&
+    isBoundedString(guiRuntime.modulesAbi) &&
+    isBoundedString(guiRuntime.napiVersion) &&
+    isBoundedString(guiRuntime.platform) &&
+    isBoundedString(guiRuntime.arch) &&
+    isSha256(guiRuntime.executableSha256) &&
     isRecord(hostRuntime) &&
-    hostRuntime.kind === "electron-run-as-node" &&
-    isBoundedString(hostRuntime.electronVersion) &&
+    hostRuntime.kind === "node" &&
     isBoundedString(hostRuntime.nodeVersion) &&
     isBoundedString(hostRuntime.modulesAbi) &&
     isBoundedString(hostRuntime.napiVersion) &&
     isBoundedString(hostRuntime.platform) &&
     isBoundedString(hostRuntime.arch) &&
-    hostRuntime.runAsNode === true
+    isSha256(hostRuntime.executableSha256) &&
+    guiRuntime.executableSha256 !== hostRuntime.executableSha256 &&
+    guiRuntime.platform === hostRuntime.platform &&
+    guiRuntime.arch === hostRuntime.arch
   );
 }
 

@@ -10,6 +10,7 @@ import {
   installLockedRuntime,
   loadRuntimeInputs,
   pruneEmptyRuntimeDirectories,
+  pruneReviewedRuntimeDirectories,
   pruneRuntimePackagingNoise,
   pruneRuntimeForTarget,
   removeLegacyRuntimeAssetCache,
@@ -50,6 +51,7 @@ try {
   );
   const npmVersion = await installLockedRuntime({ inputs, stagingDirectory, npmCli });
   await pruneRuntimePackagingNoise(stagingDirectory, inputs.policy);
+  await pruneReviewedRuntimeDirectories(stagingDirectory, inputs.policy);
   await pruneRuntimeForTarget(stagingDirectory);
   await pruneEmptyRuntimeDirectories(stagingDirectory);
   const smoke = await smokeRuntime(stagingDirectory, {

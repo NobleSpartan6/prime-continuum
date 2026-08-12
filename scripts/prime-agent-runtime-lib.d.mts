@@ -48,6 +48,7 @@ export function installLockedRuntime(options: {
   npmCli: string;
 }): Promise<string>;
 export function pruneRuntimePackagingNoise(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
+export function pruneReviewedRuntimeDirectories(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
 export function pruneRuntimeForTarget(runtimeDirectory: string): Promise<void>;
 export function smokeRuntime(
   runtimeDirectory: string,

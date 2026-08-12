@@ -30,7 +30,7 @@ credentials, caches, or arbitrary private files into the evaluation worktree.
 Verify a receipt before citing it:
 
 ```text
-pnpm verify:self-build-receipt -- .prime-continuim-self-build/receipts/<receipt>.json
+pnpm verify:self-build-receipt .prime-continuim-self-build/receipts/<receipt>.json
 ```
 
 The receipt SHA-256 detects later receipt corruption and correlates evidence; it

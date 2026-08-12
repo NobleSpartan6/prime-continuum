@@ -53,6 +53,7 @@ interface RuntimeFixtureOptions {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ) => Promise<void>;
   readonly snapshot?: () => Promise<unknown>;
+  readonly resources?: () => Promise<unknown>;
   readonly models?: () => Promise<unknown>;
   readonly dispose?: () => Promise<void>;
   readonly promote?: () => Promise<void>;
@@ -110,6 +111,17 @@ class FakeConnection {
 
   async waitForIdle(): Promise<void> {
     await this.options.waitForIdle?.(this);
+  }
+
+  async getResourceSnapshot(): Promise<unknown> {
+    return this.options.resources?.() ?? Object.freeze({
+      contextFiles: [],
+      skills: [],
+      prompts: [],
+      extensions: [],
+      themes: [],
+      diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+    });
   }
 
   async getAvailableModels(): Promise<unknown> {
@@ -455,6 +467,32 @@ describe("Prime Agent resident Worker proxy", () => {
     await loader.close();
   });
 
+  it("reads the exact attached session resource snapshot without classifying it as a mutation", async () => {
+    const resourceSnapshot = Object.freeze({
+      contextFiles: [],
+      skills: [{ name: "playwright-cli", filePath: "/private/skill/SKILL.md" }],
+      prompts: [],
+      extensions: [],
+      themes: [],
+      diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+    });
+    const resources = vi.fn(async () => resourceSnapshot);
+    const fixture = runtimeFixture({ resources });
+    const { loader, module, harness } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.getResourceSnapshot()).resolves.toEqual(resourceSnapshot);
+    expect(resources).toHaveBeenCalledOnce();
+    expect(harness.worker().hostMessages).toContainEqual(expect.objectContaining({
+      type: "request",
+      operation: "connection.get_resource_snapshot",
+      payload: expect.objectContaining({ connectionId: "connection:1" }),
+    }));
+
+    await connection.dispose();
+    await loader.close();
+  });
+
   it("cancels an in-flight prompt through the Worker signal and preserves exact status", async () => {
     const fixture = runtimeFixture({
       prompt: async (_message, options) => new Promise<void>((_resolve, reject) => {
@@ -600,6 +638,18 @@ describe("Prime Agent resident Worker proxy", () => {
       ResidentWorkerTransportError,
     );
     await eventProxy.loader.close();
+  });
+
+  it("preflights cyclic resource snapshots inside the Worker", async () => {
+    const cyclicResources: Record<string, unknown> = {};
+    cyclicResources.self = cyclicResources;
+    const fixture = runtimeFixture({ resources: async () => cyclicResources });
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.getResourceSnapshot()).rejects.toBeInstanceOf(ResidentWorkerTransportError);
+
+    await loader.close();
   });
 
   it("normalizes and bounds upstream errors before posting them", async () => {

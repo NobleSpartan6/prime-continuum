@@ -794,24 +794,30 @@ export class HostService {
           const broker = await this.requireRuntimeOAuthAttemptBroker(
             request.payload.attempt.identity.expectedHostId,
           );
-          return await this.callRuntimeOAuthAttemptBroker(() =>
+          const result = await this.callRuntimeOAuthAttemptBroker(() =>
             broker.statusAttempt(
               request.payload,
               context.transport === "trusted_user" ? context.oauthAttemptAdmission : undefined,
             ));
+          this.invalidateRuntimeModelCatalogAfterOAuthCompletion(result);
+          return result;
         });
       }
       case "oauth.attempt.cancel": {
         const broker = await this.requireRuntimeOAuthAttemptBroker(
           request.payload.attempt.identity.expectedHostId,
         );
-        return await this.callRuntimeOAuthAttemptBroker(() => broker.cancelAttempt(request.payload));
+        const result = await this.callRuntimeOAuthAttemptBroker(() => broker.cancelAttempt(request.payload));
+        this.invalidateRuntimeModelCatalogAfterOAuthCompletion(result);
+        return result;
       }
       case "oauth.attempt.acknowledge": {
         const broker = await this.requireRuntimeOAuthAttemptBroker(
           request.payload.attempt.identity.expectedHostId,
         );
-        return await this.callRuntimeOAuthAttemptBroker(() => broker.acknowledgeAttempt(request.payload));
+        const result = await this.callRuntimeOAuthAttemptBroker(() => broker.acknowledgeAttempt(request.payload));
+        this.invalidateRuntimeModelCatalogAfterOAuthCompletion(result);
+        return result;
       }
       case "candidate.evaluation.preflight": {
         return (await this.requireCandidateEvaluationCoordinator()).preflight(request.payload);
@@ -827,7 +833,7 @@ export class HostService {
       case "thread.snapshot":
         // A Phase 0 attach always returns an authoritative atomic snapshot. A
         // later replay adapter may use the supplied generation-aware cursor.
-        return this.store.getThreadSnapshot(request.payload.threadId);
+        return this.getThreadSnapshotWithResidentControl(request.payload.threadId);
       case "thread.control.snapshot":
         {
           const binding = await this.store.getResidentSessionBinding(
@@ -835,13 +841,19 @@ export class HostService {
             request.payload.expectedExecutionGenerationId,
           );
           let livePreparedBinding: typeof binding;
+          let browserExecutionReady = false;
           if (
             binding &&
             this.gateway.continuity === "resident" &&
             this.gateway.isResidentBindingLive
           ) {
             try {
-              if (await this.gateway.isResidentBindingLive(binding)) livePreparedBinding = binding;
+              if (await this.gateway.isResidentBindingLive(binding)) {
+                livePreparedBinding = binding;
+                if (this.gateway.isResidentBrowserExecutionReady) {
+                  browserExecutionReady = await this.gateway.isResidentBrowserExecutionReady(binding);
+                }
+              }
             } catch {
               // Liveness is optional runtime evidence. A failed or unavailable
               // probe must degrade this read to lifecycle_transition, never
@@ -853,6 +865,7 @@ export class HostService {
             request.payload.threadId,
             request.payload.expectedExecutionGenerationId,
             livePreparedBinding,
+            browserExecutionReady,
           );
         }
       case "command.submit": {
@@ -1235,6 +1248,50 @@ export class HostService {
     }
   }
 
+  private async getThreadSnapshotWithResidentControl(threadId: string) {
+    const snapshot = await this.store.getThreadSnapshot(threadId);
+    const expectedHostId = snapshot.thread.currentLocation.hostId;
+    const executionGenerationId = snapshot.thread.currentLocation.executionGenerationId;
+    const binding = await this.store.getResidentSessionBinding(threadId, executionGenerationId);
+    let livePreparedBinding: typeof binding;
+    let browserExecutionReady = false;
+    if (
+      binding &&
+      this.gateway.continuity === "resident" &&
+      this.gateway.isResidentBindingLive
+    ) {
+      try {
+        if (await this.gateway.isResidentBindingLive(binding)) {
+          livePreparedBinding = binding;
+          if (this.gateway.isResidentBrowserExecutionReady) {
+            browserExecutionReady = await this.gateway.isResidentBrowserExecutionReady(binding);
+          }
+        }
+      } catch {
+        // A failed liveness probe is fail-closed per thread. The durable
+        // snapshot remains readable, but it cannot advertise command authority.
+      }
+    }
+    try {
+      const residentControl = await this.store.getResidentControlProjection(
+        expectedHostId,
+        threadId,
+        executionGenerationId,
+        livePreparedBinding,
+        browserExecutionReady,
+      );
+      return ThreadProjectionSnapshotSchema.parse({ ...snapshot, residentControl });
+    } catch (error) {
+      if (
+        error instanceof HostStoreError &&
+        error.code === "RESIDENT_CONTROL_PROJECTION_UNAVAILABLE"
+      ) {
+        return snapshot;
+      }
+      throw error;
+    }
+  }
+
   private withRuntimeOAuthAttemptAdmission<T>(action: () => Promise<T>): Promise<T> {
     const prior = this.runtimeOAuthAttemptAdmissionTail;
     let release!: () => void;
@@ -1275,6 +1332,16 @@ export class HostService {
       this.observeRuntimeOAuthAttemptFailure(error);
       throw error;
     }
+  }
+
+  private invalidateRuntimeModelCatalogAfterOAuthCompletion(
+    result: { readonly record: { readonly phase: string } | null },
+  ): void {
+    if (result.record?.phase !== "completed") return;
+    // The catalog caches provider availability for a short bounded window.
+    // Exact durable OAuth completion changes that availability immediately, so
+    // the desktop's completion-time refresh must not receive the pre-login view.
+    this.runtimeModelCatalogProvider?.invalidate?.();
   }
 
   private observeRuntimeOAuthAttemptFailure(error: unknown): void {

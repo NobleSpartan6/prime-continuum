@@ -28,9 +28,9 @@ export const REMOTE_HOST_PAYLOAD_PRIME_AGENT = deepFreeze({
   daemonSchemaId: 'protocol-7-schema-13-816309b1cd50',
   runtimeBuildId: '95afd31-dirty',
   releaseCommit: '95afd319a78ae017a41241d50b013d656a0685ce',
-  runtimePolicySha256: '5e08665a0510ee2c785a910a5d665e8391fb9d2e85277f65bac43cdb6748f97c',
+  runtimePolicySha256: 'da9cc49e6feacc870ef4fbce35e9db395927abd52777fa8517426c97560437d1',
   sourcesSha256: '070af8b8f591240b27d33e8f9606ddc11ec6712906cfed2766c89244beebf7ea',
-  packageLockSha256: '0cba345a1ebb89c6d5a3c890801200c905abe8c3ba6f5ce1c246d98557a5579a',
+  packageLockSha256: 'c1c39408ed8daeced4b2bbe5a7d491af6e4c2497d83adc3525c4d88586ce4eca',
 })
 
 export const REMOTE_HOST_ELECTRON_PROVENANCE = deepFreeze({

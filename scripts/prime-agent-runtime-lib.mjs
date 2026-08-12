@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   access,
+  chmod,
   copyFile,
   lstat,
   mkdtemp,
@@ -35,6 +36,62 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
 const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
+const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
+const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
+const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/src", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 1173, totalBytes: 3225460, treeSha256: "0c91eac7b18ed1988ecde01d2fb184abd2e4bf9950b22e248f89fe826af19570" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/examples", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 33, totalBytes: 53098, treeSha256: "da24af65ab0423b3ef4657dc4338a620733fb93a8ce34f8f3881b5f97b14253a" }),
+  Object.freeze({ relativePath: "node_modules/openai/src", package: "openai", version: "6.47.0", packageJsonSha256: "58936a8b912670945aff7e72a2c5cf435a36448215c7a3ed06569816198be88b", fileCount: 305, totalBytes: 2701229, treeSha256: "d113ee08904222ce6566aa83dab146f9a32a23ff29eb0c80eeb98bb6f1691253" }),
+  Object.freeze({ relativePath: "node_modules/zod/src", package: "zod", version: "4.4.3", packageJsonSha256: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e", fileCount: 286, totalBytes: 2237613, treeSha256: "69c0cc8db91a7c1072e20f4843863510c86a57975f86f46f2f927aa756111965" }),
+  Object.freeze({ relativePath: "node_modules/@anthropic-ai/sdk/src", package: "@anthropic-ai/sdk", version: "0.91.1", packageJsonSha256: "28aaef57dd52864476e417dac7b0b389ca65b9e4f3ee42631e450a9c1a654f82", fileCount: 108, totalBytes: 849702, treeSha256: "196379af890a46c70704840e2eda7dbb9a4d341e45fe9892dbd7034eb9bfec35" }),
+  Object.freeze({ relativePath: "node_modules/prime-agent/examples", package: "prime-agent", version: "0.7.1", packageJsonSha256: "0bf756952f21542fa814acf301e0e868745b095eaf190b3457c729b41239a900", fileCount: 120, totalBytes: 920809, treeSha256: "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849" }),
+  Object.freeze({ relativePath: "node_modules/cmake-ts/src", package: "cmake-ts", version: "1.0.2", packageJsonSha256: "a351b1724f7c219bbe3abaf6e8557558565953464b760e4dbe0694d2165d0db6", fileCount: 26, totalBytes: 71551, treeSha256: "f1de2a37e85c5dbade19d727f177c9ec3e3d42c50952862dba98d12fd7b535a3" }),
+  Object.freeze({ relativePath: "node_modules/zeromq/src", package: "zeromq", version: "6.5.0", packageJsonSha256: "9fa3e9fd40a74cdace0c4fbed3821ab5fff68e91340f16b39e567edbcbab435e", fileCount: 47, totalBytes: 229916, treeSha256: "b78dc3f71311e1bddefad17fe0db0694abadee66641a53ac5e62a1f3b9b684e2" }),
+  Object.freeze({ relativePath: "node_modules/data-uri-to-buffer/src", package: "data-uri-to-buffer", version: "4.0.1", packageJsonSha256: "ad4f90a737ab5d8af4dad265e9218456e3779ca5beb70df38dd5feecf80121dd", fileCount: 1, totalBytes: 1785, treeSha256: "dbb9f6843ac7532c491c3b7d53bdf3f356c2432a4e5f2c2310509e155623a199" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/packages", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 224, totalBytes: 523201, treeSha256: "db88bccded8005daaf593e5b3155ef2c4a2ee18f9c7d8ccda7a86bceaac25bde" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/tests", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 16, totalBytes: 105898, treeSha256: "6d78be7e61f91e0d7d129852fde93968d87398f0fe7d63a2024bd7689801a238" }),
+  Object.freeze({ relativePath: "node_modules/highlight.js/scss", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "d7dd896e7977d12dcb4c504b94ec5293fc5fc5c50ce903533039967086ea7700" }),
+  Object.freeze({ relativePath: "node_modules/highlight.js/styles", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "88ccb109d9fbd658b000acfdd7372215d909d7f7519b650b3406585832e2ff20" }),
+]);
+const REVIEWED_RUNTIME_PROVIDER_CHUNKS = Object.freeze([
+  "anthropic-JSWLCBSK.js",
+  "azure-openai-responses-MKUC6IUK.js",
+  "google-KPIDA2AM.js",
+  "google-vertex-6B27OGDI.js",
+  "mistral-H3PDU4M4.js",
+  "openai-codex-responses-AMLRMEWM.js",
+  "openai-completions-T2XCYCXY.js",
+  "openai-responses-V7TBT7NU.js",
+]);
+const REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS = Object.freeze([
+  "openai",
+  "zod",
+  "@anthropic-ai/sdk",
+  "@mistralai/mistralai",
+  "data-uri-to-buffer",
+  "cmake-ts",
+  "zeromq",
+  "highlight.js",
+]);
+const PINNED_BROWSER_BRIDGE = Object.freeze({
+  protocol: "prime-continuim.browser.v1",
+  playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+  engine: "verified-electron-host",
+});
+const BROWSER_BRIDGE_FILES = Object.freeze([
+  Object.freeze({ relativePath: "browser-bridge.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-launch-journal.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-doctor-host.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-host.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "electron-node-shim.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-arguments.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-environment.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-session-lock.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-state.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "playwright-cli", mode: 0o755 }),
+  Object.freeze({ relativePath: "playwright-cli.cmd", mode: 0o644 }),
+  Object.freeze({ relativePath: "skills/playwright-cli/SKILL.md", mode: 0o644 }),
+]);
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNTIME_TEMPLATE_DIRECTORY = join(REPO_ROOT, "runtime", "prime-agent");
@@ -166,7 +223,12 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
 
   const prime = lockfile.packages["node_modules/prime-agent"];
   const zeromq = lockfile.packages["node_modules/zeromq"];
-  for (const [name, entry] of Object.entries({ "prime-agent": prime, zeromq })) {
+  const playwrightCore = lockfile.packages["node_modules/playwright-core"];
+  for (const [name, entry] of Object.entries({
+    "playwright-core": playwrightCore,
+    "prime-agent": prime,
+    zeromq,
+  })) {
     const expected = policy.criticalPackages?.[name];
     if (!entry || entry.version !== expected?.version || entry.integrity !== expected?.integrity) {
       throw buildError(`Critical package ${name} drifted from runtime policy.`);
@@ -183,12 +245,27 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   }
   if (
     !Array.isArray(policy.packaging?.excludedBasenames) ||
-    JSON.stringify(policy.packaging.excludedBasenames) !== JSON.stringify([".gitkeep"])
+    JSON.stringify(policy.packaging.excludedBasenames) !== JSON.stringify(REVIEWED_RUNTIME_EXCLUDED_BASENAMES) ||
+    !Array.isArray(policy.packaging?.excludedSuffixes) ||
+    JSON.stringify(policy.packaging.excludedSuffixes) !== JSON.stringify(REVIEWED_RUNTIME_EXCLUDED_SUFFIXES) ||
+    !Array.isArray(policy.packaging?.reviewedPrunedDirectories) ||
+    JSON.stringify(policy.packaging.reviewedPrunedDirectories) !== JSON.stringify(REVIEWED_RUNTIME_PRUNED_DIRECTORIES)
   ) {
     throw buildError("Runtime packaging exclusions changed without review.");
   }
   for (const entrypoint of Object.values(policy.entrypoints ?? {})) {
     assertSafeRelativePath(entrypoint, "runtime entrypoint");
+  }
+  if (
+    packageJson.dependencies?.["playwright-core"] !== PINNED_BROWSER_BRIDGE.playwrightCoreVersion ||
+    !jsonEqual(policy.browserBridge, PINNED_BROWSER_BRIDGE) ||
+    policy.entrypoints?.browserBridge !== "bridge/browser-bridge.mjs" ||
+    policy.entrypoints?.browserHost !== "bridge/browser-host.cjs" ||
+    policy.entrypoints?.browserLauncher !== "bridge/playwright-cli" ||
+    policy.entrypoints?.browserLauncherWindows !== "bridge/playwright-cli.cmd" ||
+    policy.entrypoints?.browserSkill !== "bridge/skills/playwright-cli/SKILL.md"
+  ) {
+    throw buildError("Verified browser bridge policy changed without review.");
   }
 }
 
@@ -334,6 +411,15 @@ export async function installLockedRuntime({ inputs, stagingDirectory, npmCli })
     copyFile(join(inputs.templateDirectory, "package.json"), join(stagingDirectory, "package.json")),
     copyFile(join(inputs.templateDirectory, "package-lock.json"), join(stagingDirectory, "package-lock.json")),
   ]);
+  const bridgeSource = join(inputs.templateDirectory, "bridge");
+  const bridgeDestination = join(stagingDirectory, "bridge");
+  await mkdir(join(bridgeDestination, "skills", "playwright-cli"), { recursive: true });
+  await Promise.all(BROWSER_BRIDGE_FILES.map(async ({ relativePath, mode }) => {
+    const source = join(bridgeSource, ...relativePath.split("/"));
+    const destination = join(bridgeDestination, ...relativePath.split("/"));
+    await copyFile(source, destination);
+    await chmod(destination, mode);
+  }));
   const npmConfigPaths = {
     user: join(stagingDirectory, ".prime-continuim-user-npmrc"),
     global: join(stagingDirectory, ".prime-continuim-global-npmrc"),
@@ -383,8 +469,17 @@ export async function installLockedRuntime({ inputs, stagingDirectory, npmCli })
 
 export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
   const excludedBasenames = new Set(policy?.packaging?.excludedBasenames);
+  const excludedSuffixes = policy?.packaging?.excludedSuffixes;
   if (excludedBasenames.size < 1 || excludedBasenames.size !== policy.packaging.excludedBasenames.length) {
     throw buildError("Runtime packaging exclusions are invalid.");
+  }
+  if (
+    !Array.isArray(excludedSuffixes) ||
+    excludedSuffixes.length < 1 ||
+    new Set(excludedSuffixes).size !== excludedSuffixes.length ||
+    excludedSuffixes.some((suffix) => typeof suffix !== "string" || !/^\.[a-z.]{2,16}$/.test(suffix))
+  ) {
+    throw buildError("Runtime packaging exclusion suffixes are invalid.");
   }
   const removed = [];
   async function visit(directory, prefix) {
@@ -395,7 +490,10 @@ export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
       const absolutePath = join(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolutePath, relativePath);
-      } else if (entry.isFile() && excludedBasenames.has(entry.name)) {
+      } else if (
+        entry.isFile() &&
+        (excludedBasenames.has(entry.name) || excludedSuffixes.some((suffix) => entry.name.endsWith(suffix)))
+      ) {
         await rm(absolutePath, { force: false });
         removed.push(relativePath);
       }
@@ -403,6 +501,87 @@ export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
   }
   await visit(runtimeDirectory, "");
   return Object.freeze(removed);
+}
+
+export async function pruneReviewedRuntimeDirectories(runtimeDirectory, policy) {
+  const reviewed = policy?.packaging?.reviewedPrunedDirectories;
+  if (!Array.isArray(reviewed) || reviewed.length < 1) {
+    throw buildError("Runtime reviewed directory pruning policy is invalid.");
+  }
+  const root = resolve(runtimeDirectory);
+  const rootDetails = await lstat(root);
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw buildError("Runtime reviewed directory pruning root must be a plain directory.");
+  }
+
+  const validated = [];
+  for (const entry of reviewed) {
+    const relativePath = entry?.relativePath;
+    const packageName = entry?.package;
+    assertSafeRelativePath(relativePath, "reviewed runtime prune path");
+    if (
+      typeof packageName !== "string" ||
+      !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(packageName) ||
+      !relativePath.startsWith(`node_modules/${packageName}/`) ||
+      typeof entry.version !== "string" ||
+      !/^[a-f0-9]{64}$/.test(entry.packageJsonSha256) ||
+      !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 ||
+      !Number.isSafeInteger(entry.totalBytes) || entry.totalBytes < 1 ||
+      !/^[a-f0-9]{64}$/.test(entry.treeSha256)
+    ) {
+      throw buildError(`Runtime reviewed directory policy is invalid for ${relativePath ?? "(unknown)"}.`);
+    }
+
+    const packageDirectory = join(root, "node_modules", ...packageName.split("/"));
+    const packageDetails = await lstat(packageDirectory);
+    const target = join(root, ...relativePath.split("/"));
+    const targetDetails = await lstat(target);
+    if (
+      !packageDetails.isDirectory() || packageDetails.isSymbolicLink() ||
+      !targetDetails.isDirectory() || targetDetails.isSymbolicLink()
+    ) {
+      throw buildError(`Reviewed runtime prune target is not a plain package directory: ${relativePath}.`);
+    }
+    const packageJsonPath = join(packageDirectory, "package.json");
+    const packageJsonDetails = await lstat(packageJsonPath);
+    if (!packageJsonDetails.isFile() || packageJsonDetails.isSymbolicLink()) {
+      throw buildError(`Reviewed runtime package manifest is not a plain file: ${packageName}.`);
+    }
+    const packageJsonBytes = await readFile(packageJsonPath);
+    let packageJson;
+    try {
+      packageJson = JSON.parse(packageJsonBytes.toString("utf8"));
+    } catch (error) {
+      throw buildError(`Reviewed runtime package manifest is invalid: ${packageName}.`, { cause: error });
+    }
+    if (
+      packageJson.name !== packageName ||
+      packageJson.version !== entry.version ||
+      createHash("sha256").update(packageJsonBytes).digest("hex") !== entry.packageJsonSha256
+    ) {
+      throw buildError(`Reviewed runtime package identity drifted: ${packageName}.`);
+    }
+
+    const files = await collectRuntimeFiles(target, {
+      includeRuntimeMetadata: true,
+      rejectEmptyDirectories: true,
+    });
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const treeSource = files.map((file) => `${file.sha256} ${file.size} ${file.path}\n`).join("");
+    if (
+      files.length !== entry.fileCount ||
+      totalBytes !== entry.totalBytes ||
+      sha256Text(treeSource) !== entry.treeSha256
+    ) {
+      throw buildError(`Reviewed runtime prune target drifted: ${relativePath}.`);
+    }
+    validated.push({ relativePath, target });
+  }
+
+  for (const entry of validated) {
+    await rm(entry.target, { recursive: true, force: false, maxRetries: 5, retryDelay: 100 });
+  }
+  return Object.freeze(validated.map((entry) => entry.relativePath));
 }
 
 export async function pruneEmptyRuntimeDirectories(runtimeDirectory) {
@@ -606,8 +785,14 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     "const runtime = await import(moduleUrl);",
     'if (typeof runtime.DaemonClient !== "function" || typeof runtime.DaemonAgentConnection?.attach !== "function") throw new Error("missing daemon exports");',
     "const require = createRequire(packageJsonPath);",
-    'const zeromq = require("zeromq");',
-    'if (!zeromq || (typeof zeromq !== "object" && typeof zeromq !== "function")) throw new Error("zeromq did not load");',
+    `for (const packageName of ${JSON.stringify(REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS)}) {`,
+    "  const loaded = require(packageName);",
+    '  if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function")) throw new Error(`reviewed package entrypoint did not load: ${packageName}`);',
+    "}",
+    `for (const fileName of ${JSON.stringify(REVIEWED_RUNTIME_PROVIDER_CHUNKS)}) {`,
+    '  const loaded = await import(new URL(`./bundle/${fileName}`, moduleUrl));',
+    '  if (!loaded || Object.keys(loaded).length < 1) throw new Error(`provider chunk did not load: ${fileName}`);',
+    "}",
     'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
   ].join("\n");
   const retryWorkerProbeSource = [
@@ -751,6 +936,110 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   }
 }
 
+export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
+  const runtimeExecutable = await requireAbsoluteRealFile(
+    options.runtimeExecutable,
+    "browser smoke runtime executable",
+  );
+  const commandRunner = options.commandRunner ?? runCommand;
+  if (typeof commandRunner !== "function") throw buildError("Browser smoke command runner is invalid.");
+  const entrypoints = await resolveVerifiedEntrypoints(runtimeDirectory, options.policy);
+  const scratchDirectory = await mkdtemp(join(tmpdir(), "prime-continuim-browser-smoke-"));
+  const stateDirectory = join(scratchDirectory, "state");
+  const screenshotPath = join(scratchDirectory, "browser-smoke.png");
+  const session = `runtime-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
+  await mkdir(stateDirectory, { mode: 0o700 });
+  const environment = {
+    ...cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
+    PRIME_CONTINUIM_BROWSER_EXECUTABLE: runtimeExecutable,
+    PRIME_CONTINUIM_BROWSER_BRIDGE: entrypoints.browserBridge,
+    PRIME_CONTINUIM_BROWSER_STATE_DIR: stateDirectory,
+    PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID: `smoke-${session}`,
+  };
+  const invoke = (args, timeoutMs = 25_000) => commandRunner(
+    runtimeExecutable,
+    [entrypoints.browserBridge, `--session=${session}`, ...args],
+    { cwd: scratchDirectory, env: environment, timeoutMs },
+  );
+  let opened = false;
+  try {
+    const doctor = await commandRunner(runtimeExecutable, [entrypoints.browserBridge, "doctor", "--json"], {
+      cwd: scratchDirectory,
+      env: environment,
+      timeoutMs: 25_000,
+    });
+    let doctorResult;
+    try {
+      doctorResult = JSON.parse(String(doctor.stdout));
+    } catch (error) {
+      throw buildError("Browser bridge doctor returned invalid JSON.", error);
+    }
+    if (
+      JSON.stringify(Object.keys(doctorResult).sort()) !==
+        JSON.stringify(["bridgeVersion", "controller", "engine", "protocol", "ready"].sort()) ||
+      doctorResult.protocol !== PINNED_BROWSER_BRIDGE.protocol ||
+      doctorResult.bridgeVersion !== 1 ||
+      doctorResult.ready !== true ||
+      doctorResult.controller !== `playwright-core/${PINNED_BROWSER_BRIDGE.playwrightCoreVersion}` ||
+      doctorResult.engine !== PINNED_BROWSER_BRIDGE.engine
+    ) throw buildError("Browser bridge doctor returned an unexpected identity.");
+
+    const page = encodeURIComponent([
+      "<!doctype html><title>Prime browser smoke</title>",
+      '<button type="button" onclick="this.textContent=\'After\'">Before</button>',
+      '<input aria-label="Name">',
+    ].join(""));
+    await invoke(["open", `data:text/html,${page}`]);
+    opened = true;
+    const snapshot = await invoke(["snapshot"]);
+    const snapshotText = String(snapshot.stdout);
+    const reference = /button\s+"Before"[^\n]*\[ref=(e\d+)\]/.exec(snapshotText)?.[1] ??
+      /\[ref=(e\d+)\][^\n]*Before/.exec(snapshotText)?.[1];
+    if (!reference) throw buildError("Browser smoke did not receive a stable snapshot reference.");
+    const found = await invoke(["find", "Before"]);
+    if (!String(found.stdout).includes("Before")) throw buildError("Browser smoke find did not observe page content.");
+    await invoke(["click", reference]);
+    const read = await invoke(["eval", "document.querySelector('button')?.textContent"]);
+    if (!String(read.stdout).includes("After")) throw buildError("Browser smoke interaction was not observable.");
+    await invoke(["screenshot", `--filename=${screenshotPath}`]);
+    const screenshot = await readFile(screenshotPath);
+    if (screenshot.byteLength < 8 || !screenshot.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
+      throw buildError("Browser smoke screenshot is not a PNG.");
+    }
+    await invoke(["close"]);
+    opened = false;
+    await assertBrowserSmokeStateRetired(stateDirectory);
+    return Object.freeze({
+      verified: true,
+      protocol: PINNED_BROWSER_BRIDGE.protocol,
+      controller: `playwright-core/${PINNED_BROWSER_BRIDGE.playwrightCoreVersion}`,
+      engine: PINNED_BROWSER_BRIDGE.engine,
+      operations: Object.freeze(["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"]),
+    });
+  } finally {
+    if (opened) await invoke(["close"], 10_000).catch(() => undefined);
+    await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function assertBrowserSmokeStateRetired(stateDirectory) {
+  const pending = [stateDirectory];
+  let inspected = 0;
+  while (pending.length) {
+    const directory = pending.pop();
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      inspected += 1;
+      if (inspected > 4_096) throw buildError("Browser smoke state exceeded its cleanup inspection bound.");
+      if (
+        entry.name === "browser.json" || entry.name === "launch.json" || entry.name === "profile" ||
+        entry.name.startsWith("launch.owner-") || entry.name.includes(".candidate-")
+      ) throw buildError(`Browser smoke retained private lifecycle state: ${entry.name}`);
+      if (entry.isDirectory()) pending.push(join(directory, entry.name));
+    }
+  }
+}
+
 export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersion, smoke }) {
   const entries = await collectRuntimeFiles(runtimeDirectory);
   if (entries.some((entry) => entry.path === "companions" || entry.path.startsWith("companions/"))) {
@@ -783,6 +1072,7 @@ export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersi
     packageLockSha256: inputs.lockfileSha256,
     installPolicy: inputs.policy.install,
     entrypoints: inputs.policy.entrypoints,
+    browserBridge: inputs.policy.browserBridge,
     daemon: inputs.policy.daemon,
     sources: inputs.sources.assets.map(({ packageName, fileName, url, size, sha256, integrity }) => ({
       packageName,
@@ -821,6 +1111,7 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
     manifest.runtimeBuildId !== options.policy?.runtimeBuildId ||
     !jsonEqual(manifest.installPolicy, options.policy?.install) ||
     !jsonEqual(manifest.entrypoints, options.policy?.entrypoints) ||
+    !jsonEqual(manifest.browserBridge, options.policy?.browserBridge) ||
     !jsonEqual(manifest.daemon, options.policy?.daemon) ||
     Object.prototype.hasOwnProperty.call(manifest, "codexAppServer")
   ) {
@@ -892,12 +1183,46 @@ export async function resolveVerifiedEntrypoints(runtimeDirectory, policy) {
   const root = await realpath(runtimeDirectory);
   const modulePath = await requireContainedRealFile(root, policy.entrypoints.module, "Prime Agent module");
   const cli = await requireContainedRealFile(root, policy.entrypoints.cli, "Prime Agent CLI");
+  const browserBridge = await requireContainedRealFile(root, policy.entrypoints.browserBridge, "browser bridge");
+  const browserHost = await requireContainedRealFile(root, policy.entrypoints.browserHost, "browser host");
+  const browserLauncher = await requireContainedRealFile(root, policy.entrypoints.browserLauncher, "browser launcher");
+  const browserLauncherWindows = await requireContainedRealFile(
+    root,
+    policy.entrypoints.browserLauncherWindows,
+    "Windows browser launcher",
+  );
+  const browserSkill = await requireContainedRealFile(root, policy.entrypoints.browserSkill, "browser skill");
+  if (process.platform !== "win32") await access(browserLauncher, fsConstants.X_OK);
   const packageJson = await requireContainedRealFile(root, "node_modules/prime-agent/package.json", "Prime Agent package");
+  const playwrightPackageJson = await requireContainedRealFile(
+    root,
+    "node_modules/playwright-core/package.json",
+    "Playwright package",
+  );
   const packageValue = await readJson(packageJson);
+  const playwrightPackageValue = await readJson(playwrightPackageJson);
   if (packageValue.name !== "prime-agent" || packageValue.version !== policy.releaseVersion) {
     throw buildError("Installed Prime Agent package identity is invalid.");
   }
-  return Object.freeze({ root, modulePath, moduleUrl: pathToFileURL(modulePath).href, cli, packageJson });
+  if (
+    playwrightPackageValue.name !== "playwright-core" ||
+    playwrightPackageValue.version !== policy.browserBridge.playwrightCoreVersion
+  ) {
+    throw buildError("Installed Playwright controller identity is invalid.");
+  }
+  return Object.freeze({
+    root,
+    modulePath,
+    moduleUrl: pathToFileURL(modulePath).href,
+    cli,
+    packageJson,
+    browserBridge,
+    browserHost,
+    browserLauncher,
+    browserLauncherWindows,
+    browserSkill,
+    playwrightPackageJson,
+  });
 }
 
 export async function writeCurrentPointer(outputRoot, finalDirectory, manifest, manifestSha256) {
@@ -1119,7 +1444,7 @@ async function collectRuntimeFiles(root, options = {}) {
       if (child.isDirectory()) {
         await visit(absolutePath, relativePath);
       } else if (child.isFile()) {
-        if (RUNTIME_METADATA_FILES.has(relativePath)) continue;
+        if (options.includeRuntimeMetadata !== true && RUNTIME_METADATA_FILES.has(relativePath)) continue;
         const details = await stat(absolutePath);
         entries.push({ path: relativePath, size: details.size, sha256: await sha256File(absolutePath) });
       } else {

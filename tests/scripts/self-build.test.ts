@@ -1,6 +1,6 @@
 import { spawnSync, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { canonicalTemporaryDirectory } from '../helpers/canonical-temp'
@@ -90,7 +90,15 @@ describe('Prime Continuim self-build evidence', () => {
     await mkdir(join(source, 'bin'), { recursive: true })
     await writeFile(join(source, executablePath), executable)
     await writeFile(join(source, 'README.md'), 'runtime package\n')
+    await mkdir(join(source, 'include', 'node'), { recursive: true })
+    await Promise.all(Array.from({ length: 160 }, (_, index) => (
+      writeFile(join(source, 'include', 'node', `header-${index}.h`), `#define PRIME_HEADER_${index} ${index}\n`)
+    )))
     await symlink(source, runtimeLink, process.platform === 'win32' ? 'junction' : 'dir')
+    if (process.platform !== 'win32') {
+      await mkdir(join(evaluationRoot, 'node_modules', '.bin'), { recursive: true })
+      await symlink(join(source, executablePath), join(evaluationRoot, 'node_modules', '.bin', 'node'), 'file')
+    }
 
     await materializeEvaluationNodeRuntimeDependency(evaluationRoot, {
       node: {
@@ -101,6 +109,12 @@ describe('Prime Continuim self-build evidence', () => {
     })
 
     expect(await readFile(join(runtimeLink, executablePath))).toEqual(executable)
+    expect(await readFile(join(runtimeLink, 'include', 'node', 'header-159.h'), 'utf8'))
+      .toBe('#define PRIME_HEADER_159 159\n')
+    if (process.platform !== 'win32') {
+      expect(await realpath(join(evaluationRoot, 'node_modules', '.bin', 'node')))
+        .toBe(join(runtimeLink, executablePath))
+    }
     await writeFile(join(source, executablePath), 'changed after copy')
     expect(await readFile(join(runtimeLink, executablePath))).toEqual(executable)
   })

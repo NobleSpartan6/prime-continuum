@@ -7,6 +7,7 @@ const REVIEWED_BUILD_KEYS = [
   'afterPack',
   'asar',
   'directories',
+  'dmg',
   'electronFuses',
   'extends',
   'extraResources',
@@ -203,27 +204,42 @@ export function assertWindowsInstallerConfiguration(projectPackage, { projectRoo
   assertObject(build.electronFuses, 'build.electronFuses')
   assertExactKeys(
     build.electronFuses,
-    ['enableEmbeddedAsarIntegrityValidation', 'onlyLoadAppFromAsar'],
+    ['enableEmbeddedAsarIntegrityValidation', 'onlyLoadAppFromAsar', 'runAsNode'],
     'build.electronFuses',
   )
   assertExactBoolean(build.electronFuses, 'enableEmbeddedAsarIntegrityValidation', true, 'build.electronFuses')
   assertExactBoolean(build.electronFuses, 'onlyLoadAppFromAsar', true, 'build.electronFuses')
+  assertExactBoolean(build.electronFuses, 'runAsNode', false, 'build.electronFuses')
 
   assertExactStringArray(build.files, REVIEWED_FILES, 'build.files')
 
-  invariant(Array.isArray(build.extraResources) && build.extraResources.length === 2, 'build.extraResources must contain only the reviewed host and runtime resources.')
+  invariant(Array.isArray(build.extraResources) && build.extraResources.length === 4, 'build.extraResources must contain only the reviewed host, host runtime, browser runtime, and agent runtime resources.')
   const hostResource = build.extraResources[0]
   assertObject(hostResource, 'build.extraResources[0]')
   assertExactKeys(hostResource, ['from', 'to'], 'build.extraResources[0]')
   invariant(hostResource.from === 'out/hostd/hostd.cjs', 'build.extraResources[0].from must select the attested host service.')
   invariant(hostResource.to === 'hostd/hostd.cjs', 'build.extraResources[0].to must use the reviewed host resource destination.')
 
-  const runtimeResource = build.extraResources[1]
-  assertObject(runtimeResource, 'build.extraResources[1]')
-  assertExactKeys(runtimeResource, ['filter', 'from', 'to'], 'build.extraResources[1]')
-  invariant(runtimeResource.from === 'out/runtime', 'build.extraResources[1].from must select the verified runtime tree.')
-  invariant(runtimeResource.to === 'runtime-seed', 'build.extraResources[1].to must use the reviewed runtime resource destination.')
-  assertExactStringArray(runtimeResource.filter, ['current.json', 'installs/**/*'], 'build.extraResources[1].filter')
+  const hostRuntimeResource = build.extraResources[1]
+  assertObject(hostRuntimeResource, 'build.extraResources[1]')
+  assertExactKeys(hostRuntimeResource, ['filter', 'from', 'to'], 'build.extraResources[1]')
+  invariant(hostRuntimeResource.from === 'node_modules/node', 'build.extraResources[1].from must select the pnpm-pinned host Node distribution.')
+  invariant(hostRuntimeResource.to === 'host-runtime', 'build.extraResources[1].to must use the reviewed host runtime destination.')
+  assertExactStringArray(hostRuntimeResource.filter, ['bin/node', 'node.exe', 'LICENSE'], 'build.extraResources[1].filter')
+
+  const browserRuntimeResource = build.extraResources[2]
+  assertObject(browserRuntimeResource, 'build.extraResources[2]')
+  assertExactKeys(browserRuntimeResource, ['filter', 'from', 'to'], 'build.extraResources[2]')
+  invariant(browserRuntimeResource.from === 'node_modules/electron/dist', 'build.extraResources[2].from must select the exact Electron browser distribution.')
+  invariant(browserRuntimeResource.to === 'browser-runtime', 'build.extraResources[2].to must use the reviewed browser runtime destination.')
+  assertExactStringArray(browserRuntimeResource.filter, ['**/*'], 'build.extraResources[2].filter')
+
+  const runtimeResource = build.extraResources[3]
+  assertObject(runtimeResource, 'build.extraResources[3]')
+  assertExactKeys(runtimeResource, ['filter', 'from', 'to'], 'build.extraResources[3]')
+  invariant(runtimeResource.from === 'out/runtime', 'build.extraResources[3].from must select the verified runtime tree.')
+  invariant(runtimeResource.to === 'runtime-seed', 'build.extraResources[3].to must use the reviewed runtime resource destination.')
+  assertExactStringArray(runtimeResource.filter, ['current.json', 'installs/**/*'], 'build.extraResources[3].filter')
 
   assertObject(build.directories, 'build.directories')
   assertExactKeys(build.directories, ['output'], 'build.directories')
@@ -263,10 +279,54 @@ export function assertWindowsInstallerConfiguration(projectPackage, { projectRoo
   invariant(nsis.uninstallerIcon === 'build/icon.ico', 'build.nsis.uninstallerIcon must use the reviewed product icon.')
   invariant(nsis.uninstallDisplayName === '${productName} ${version}', 'build.nsis.uninstallDisplayName must include the product name and version.')
 
+  const dmg = build.dmg
+  assertObject(dmg, 'build.dmg')
+  assertExactKeys(
+    dmg,
+    ['artifactName', 'backgroundColor', 'format', 'iconSize', 'iconTextSize', 'internetEnabled', 'shrink', 'sign', 'title', 'window', 'writeUpdateInfo'],
+    'build.dmg',
+  )
+  invariant(dmg.artifactName === 'Prime-Continuim-${version}-macos-${arch}.${ext}', 'build.dmg.artifactName must use the reviewed cross-architecture template.')
+  invariant(dmg.backgroundColor === '#0b0f0d', 'build.dmg.backgroundColor must use the reviewed Prime surface color.')
+  invariant(dmg.format === 'UDZO', 'build.dmg.format must remain the verified zlib-compressed read-only format.')
+  invariant(dmg.iconSize === 96 && dmg.iconTextSize === 12, 'build.dmg icon sizing changed without review.')
+  assertExactBoolean(dmg, 'internetEnabled', false, 'build.dmg')
+  assertExactBoolean(dmg, 'shrink', true, 'build.dmg')
+  assertExactBoolean(dmg, 'sign', false, 'build.dmg')
+  invariant(dmg.title === 'Prime Continuim ${version}', 'build.dmg.title must use the reviewed volume-title template.')
+  assertObject(dmg.window, 'build.dmg.window')
+  assertExactKeys(dmg.window, ['height', 'width'], 'build.dmg.window')
+  invariant(dmg.window.width === 560 && dmg.window.height === 360, 'build.dmg.window must retain the reviewed dimensions.')
+  assertExactBoolean(dmg, 'writeUpdateInfo', false, 'build.dmg')
+
   assertObject(build.mac, 'build.mac')
-  assertExactKeys(build.mac, ['category', 'target'], 'build.mac')
+  assertExactKeys(build.mac, ['category', 'extendInfo', 'identity', 'notarize', 'signIgnore', 'target'], 'build.mac')
   invariant(build.mac.target === 'dmg', 'build.mac.target must remain the reviewed DMG target.')
   invariant(build.mac.category === 'public.app-category.developer-tools', 'build.mac.category must remain the reviewed developer-tools category.')
+  invariant(build.mac.identity === '-', 'build.mac.identity must remain the explicit ad-hoc development identity.')
+  invariant(build.mac.notarize === false, 'build.mac.notarize must remain disabled for the local directory package.')
+  assertObject(build.mac.extendInfo, 'build.mac.extendInfo')
+  const reviewedMacosPrivacyPurposeStrings = {
+    NSDesktopFolderUsageDescription: 'Prime Continuim accesses a Desktop workspace only after you choose it.',
+    NSDocumentsFolderUsageDescription: 'Prime Continuim accesses a Documents workspace only after you choose it.',
+    NSDownloadsFolderUsageDescription: 'Prime Continuim accesses a Downloads workspace only after you choose it.',
+    NSNetworkVolumesUsageDescription: 'Prime Continuim accesses a workspace on a network volume only after you choose it.',
+    NSRemovableVolumesUsageDescription: 'Prime Continuim accesses a workspace on a removable volume only after you choose it.',
+  }
+  assertExactKeys(build.mac.extendInfo, Object.keys(reviewedMacosPrivacyPurposeStrings), 'build.mac.extendInfo')
+  invariant(
+    Object.entries(reviewedMacosPrivacyPurposeStrings).every(([key, value]) => build.mac.extendInfo[key] === value),
+    'build.mac.extendInfo must retain the reviewed user-selected workspace purpose strings.',
+  )
+  invariant(
+    Array.isArray(build.mac.signIgnore) &&
+      JSON.stringify(build.mac.signIgnore) === JSON.stringify([
+        'Contents/Resources/browser-runtime/',
+        'Contents/Resources/host-runtime/',
+        'Contents/Resources/runtime-seed/',
+      ]),
+    'build.mac.signIgnore must preserve the exact attested browser Electron, host Node, and runtime seed bytes.',
+  )
 
   assertObject(build.linux, 'build.linux')
   assertExactKeys(build.linux, ['category', 'target'], 'build.linux')

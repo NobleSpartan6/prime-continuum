@@ -9,6 +9,36 @@ import {
   type RuntimeOAuthAttemptTerminalV1,
   type RuntimeOAuthAttemptV1,
 } from "./runtime-oauth-attempt";
+export {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+  THREAD_HANDOFF_CAPABILITY,
+} from "./capabilities";
+import {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+  THREAD_HANDOFF_CAPABILITY,
+} from "./capabilities";
 
 /**
  * Public host protocol version. This is intentionally distinct from Prime
@@ -52,23 +82,6 @@ export const CapabilitySchema = z
   .min(4)
   .max(96)
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
-
-export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
-export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" as const;
-export const RUNTIME_INTEGRITY_REPAIR_CAPABILITY = "runtime_integrity_repair_v1" as const;
-export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
-export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
-export const RUNTIME_OAUTH_ATTEMPT_CAPABILITY = "runtime_oauth_attempt_v1" as const;
-export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
-export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
-export const RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY =
-  "resident_registered_workspace_lifecycle_v1" as const;
-export const RESIDENT_CONTROL_PROJECTION_CAPABILITY = "resident_control_projection_v1" as const;
-export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
-/** Trusted-local probe only; executable self-evaluation remains workspace-scoped. */
-export const CANDIDATE_EVALUATION_PROBE_CAPABILITY = "candidate_evaluation_probe_v1" as const;
-export const PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY =
-  "prime_continuim_self_build_evaluation_v1" as const;
 
 /** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
 export const ThreadChangedEventPayloadSchema = z
@@ -252,6 +265,20 @@ export const ResidentControlQuiescenceSchema = z.discriminatedUnion("state", [
 ]);
 export type ResidentControlQuiescence = z.infer<typeof ResidentControlQuiescenceSchema>;
 
+export const ResidentBrowserExecutionSchema = z.discriminatedUnion("readiness", [
+  z.object({ readiness: z.literal("unavailable") }).strict(),
+  z
+    .object({
+      readiness: z.literal("ready"),
+      protocol: z.literal("prime-continuim.browser.v1"),
+      surface: z.literal("playwright-cli"),
+      controller: z.literal("playwright-core/1.63.0-alpha-2026-08-05"),
+      engine: z.literal("verified-electron-host"),
+    })
+    .strict(),
+]);
+export type ResidentBrowserExecution = z.infer<typeof ResidentBrowserExecutionSchema>;
+
 /**
  * Bounded generation-scoped read model for cross-device control discovery.
  * `controlSequence` is Store-owned and monotonic for this exact thread
@@ -268,6 +295,13 @@ export const ResidentControlProjectionSnapshotSchema = z
     controlSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     changedAt: IsoDateTimeSchema,
     authorityCursor: SessionCursorSchema,
+    /** Exact-thread command readiness; host-global capabilities never imply this state. */
+    // Pre-readiness v1 projections omitted this field. They remain readable
+    // only as explicitly unavailable evidence; a current HostStore must prove
+    // the exact live binding again before publishing `ready`.
+    commandReadiness: z.enum(["ready", "unavailable"]).default("unavailable"),
+    /** Exact-binding execution proof; catalog skill discovery alone never makes this ready. */
+    browserExecution: ResidentBrowserExecutionSchema.default({ readiness: "unavailable" }),
     operation: ResidentControlOperationSchema.optional(),
     quiescence: ResidentControlQuiescenceSchema,
   })
@@ -492,6 +526,66 @@ export const ScheduleSummarySchema = z.object({
 });
 export type ScheduleSummary = z.infer<typeof ScheduleSummarySchema>;
 
+export const RuntimeResourceSourceKindSchema = z
+  .object({
+    scope: z.enum(["user", "project", "temporary"]),
+    origin: z.enum(["package", "top-level"]),
+  })
+  .strict();
+export type RuntimeResourceSourceKind = z.infer<typeof RuntimeResourceSourceKindSchema>;
+
+export const RuntimeNamedResourceSchema = z
+  .object({
+    name: z.string().min(1).max(255).regex(/^[^\0\r\n]+$/),
+    description: z.string().max(4_096).optional(),
+    sourceKind: RuntimeResourceSourceKindSchema.optional(),
+  })
+  .strict();
+export type RuntimeNamedResource = z.infer<typeof RuntimeNamedResourceSchema>;
+
+export const RuntimeResourceCollisionSchema = z
+  .object({
+    resourceType: z.enum(["extension", "skill", "prompt", "theme"]),
+    name: z.string().min(1).max(255).regex(/^[^\0\r\n]+$/),
+  })
+  .strict();
+export type RuntimeResourceCollision = z.infer<typeof RuntimeResourceCollisionSchema>;
+
+/**
+ * Secret- and path-free inventory of resources loaded by the exact resident
+ * Prime Agent session. Raw diagnostics are reduced to counts and collision
+ * identities because their free-form text and source records may contain local
+ * filesystem paths.
+ */
+export const RuntimeResourceInventorySchema = z
+  .object({
+    skills: z.array(RuntimeNamedResourceSchema).max(2_000),
+    prompts: z.array(RuntimeNamedResourceSchema).max(2_000),
+    themes: z.array(RuntimeNamedResourceSchema).max(1_000),
+    extensions: z
+      .object({
+        count: z.number().int().nonnegative().max(2_000),
+        sourceKinds: z
+          .array(RuntimeResourceSourceKindSchema)
+          .max(6)
+          .refine(
+            (items) => new Set(items.map((item) => `${item.scope}:${item.origin}`)).size === items.length,
+            "Extension source kinds must be unique",
+          ),
+      })
+      .strict(),
+    contextFileCount: z.number().int().nonnegative().max(2_000),
+    diagnostics: z
+      .object({
+        warningCount: z.number().int().nonnegative().max(2_000),
+        errorCount: z.number().int().nonnegative().max(2_000),
+        collisions: z.array(RuntimeResourceCollisionSchema).max(2_000),
+      })
+      .strict(),
+  })
+  .strict();
+export type RuntimeResourceInventory = z.infer<typeof RuntimeResourceInventorySchema>;
+
 /** Stable host-owned subset of Prime Agent state. Upstream local DTOs stop here. */
 export const RuntimeSessionSummarySchema = z.object({
   runtime: z.literal("prime_agent"),
@@ -513,6 +607,7 @@ export const RuntimeSessionSummarySchema = z.object({
   compactionCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   queuedActionCount: z.number().int().nonnegative().max(1_000_000),
   activeToolNames: z.array(z.string().min(1).max(255)).max(128),
+  resourceInventory: RuntimeResourceInventorySchema.optional(),
   context: z
     .object({
       usedTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -929,6 +1024,7 @@ export const ThreadProjectionSnapshotSchema = z
     goals: z.array(GoalSummarySchema).max(1_000),
     schedules: z.array(ScheduleSummarySchema).max(1_000),
     runtime: RuntimeSessionSummarySchema.optional(),
+    residentControl: ResidentControlProjectionSnapshotSchema.optional(),
     residentLifecycle: ResidentLifecycleDispositionSchema.optional(),
     git: GitSummarySchema,
     evidence: EvidenceSummarySchema,
@@ -951,6 +1047,19 @@ export const ThreadProjectionSnapshotSchema = z
         code: "custom",
         path: ["latestCursor", "executionGenerationId"],
         message: "The latest cursor must belong to the current execution generation",
+      });
+    }
+    const residentControl = snapshot.residentControl;
+    if (
+      residentControl &&
+      (residentControl.hostId !== snapshot.thread.currentLocation.hostId ||
+        residentControl.threadId !== snapshot.thread.threadId ||
+        residentControl.executionGenerationId !== snapshot.thread.currentLocation.executionGenerationId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentControl"],
+        message: "Resident control readiness must belong to the exact projected host thread generation",
       });
     }
     const residentLifecycle = snapshot.residentLifecycle;

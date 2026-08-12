@@ -4,8 +4,10 @@ import { lstat, open, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { build } from "esbuild";
 import { createEmbeddedRuntimeAttestationRecord, parseRuntimeAttestation } from "./runtime-attestation-lib.mjs";
+import { resolvePinnedDevelopmentNodeExecutable } from "./development-node-runtime.mjs";
 
 const argumentsValue = parseArguments(process.argv.slice(2));
+const hostNodeExecutable = resolvePinnedDevelopmentNodeExecutable(resolve(import.meta.dirname, ".."));
 let attestationRecord;
 if (argumentsValue.attestation) {
   const bytes = await readFile(resolve(argumentsValue.attestation));
@@ -97,7 +99,7 @@ async function verifyBuiltHostStartup(path) {
   const maximumOutputBytes = 64 * 1024;
   const timeoutMs = 10_000;
   await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [path, "--help"], {
+    const child = spawn(hostNodeExecutable, [path, "--help"], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

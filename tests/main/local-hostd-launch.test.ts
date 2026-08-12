@@ -1,13 +1,16 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   bundledHostdEnvironment,
+  bundledHostdInvocation,
   bundledHostdLaunchArguments,
   bundledHostdPaths,
-  bundledHostdServeArguments
+  bundledHostdServeArguments,
+  verifyBundledHostExecutables
 } from '../../src/main/control/local-hostd'
 
 describe('bundled hostd launch contract', () => {
@@ -15,10 +18,14 @@ describe('bundled hostd launch contract', () => {
     const resources = path.resolve('C:/PrimeContinuim/resources')
     const paths = bundledHostdPaths(
       { isPackaged: true, getAppPath: () => path.resolve('C:/ignored') },
-      resources
+      resources,
+      'win32'
     )
 
     expect(paths).toEqual({
+      attestation: path.join(path.resolve('C:/ignored'), 'out', 'main', 'runtime-attestation.json'),
+      browserExecutable: path.join(resources, 'browser-runtime', 'electron.exe'),
+      hostExecutable: path.join(resources, 'host-runtime', 'node.exe'),
       hostdScript: path.join(resources, 'hostd', 'hostd.cjs'),
       runtimeSeed: path.join(resources, 'runtime-seed')
     })
@@ -32,7 +39,9 @@ describe('bundled hostd launch contract', () => {
       '--data-dir',
       path.resolve('C:/PrimeContinuim/data'),
       '--runtime-seed',
-      paths.runtimeSeed
+      paths.runtimeSeed,
+      '--browser-executable',
+      paths.browserExecutable
     ])
   })
 
@@ -41,9 +50,13 @@ describe('bundled hostd launch contract', () => {
     expect(
       bundledHostdPaths(
         { isPackaged: false, getAppPath: () => applicationRoot },
-        path.resolve('C:/ignored/resources')
+        path.resolve('C:/ignored/resources'),
+        'win32'
       )
     ).toEqual({
+      attestation: path.join(applicationRoot, 'node_modules', '.cache', 'prime-continuim', 'development-runtime-attestation.json'),
+      browserExecutable: process.execPath,
+      hostExecutable: path.join(applicationRoot, 'node_modules', 'node', 'node.exe'),
       hostdScript: path.join(applicationRoot, 'out', 'hostd', 'hostd.cjs'),
       runtimeSeed: path.join(applicationRoot, 'out', 'runtime')
     })
@@ -53,7 +66,8 @@ describe('bundled hostd launch contract', () => {
     const resources = path.resolve('C:/PrimeContinuim/resources')
     const paths = bundledHostdPaths(
       { isPackaged: true, getAppPath: () => path.resolve('C:/ignored') },
-      resources
+      resources,
+      'win32'
     )
     const endpoint = '\\\\.\\pipe\\prime-test'
     const dataDirectory = path.resolve('C:/PrimeContinuim/data')
@@ -69,6 +83,10 @@ describe('bundled hostd launch contract', () => {
     expect(path.basename(launchArguments[2] ?? '')).not.toBe('hostd.cjs')
     expect(launchArguments.slice(3)).toEqual(serveArguments)
     expect(bundledHostdLaunchArguments(paths, endpoint, dataDirectory, false)).toEqual(serveArguments)
+    expect(bundledHostdInvocation(paths, endpoint, dataDirectory, false)).toEqual({
+      executable: path.join(resources, 'host-runtime', 'node.exe'),
+      args: serveArguments
+    })
   })
 
   it('terminates the package-smoke host when parent stdin ends without data', async () => {
@@ -84,7 +102,7 @@ describe('bundled hostd launch contract', () => {
 `,
         'utf8'
       )
-      const paths = { hostdScript: hostdPath, runtimeSeed: path.join(root, 'runtime') }
+      const paths = { attestation: path.join(root, 'attestation.json'), browserExecutable: process.execPath, hostExecutable: process.execPath, hostdScript: hostdPath, runtimeSeed: path.join(root, 'runtime') }
       const launch = bundledHostdLaunchArguments(paths, 'endpoint', root, true)
       const child = spawn(process.execPath, launch, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
       let stdout = ''
@@ -116,8 +134,32 @@ describe('bundled hostd launch contract', () => {
       })
     ).toEqual({
       Path: 'C:\\Windows',
-      PRIME_API_KEY: 'provider-key',
-      ELECTRON_RUN_AS_NODE: '1'
+      PRIME_API_KEY: 'provider-key'
     })
+  })
+
+  it('fails closed when either separately attested executable drifts or aliases the other', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'prime-host-executable-'))
+    try {
+      const hostExecutable = path.join(root, 'node')
+      const browserExecutable = path.join(root, 'electron')
+      const attestationPath = path.join(root, 'attestation.json')
+      await Promise.all([
+        writeFile(hostExecutable, 'standalone-node'),
+        writeFile(browserExecutable, 'browser-electron'),
+      ])
+      const digest = (value: string) => createHash('sha256').update(value).digest('hex')
+      await writeFile(attestationPath, JSON.stringify({
+        guiRuntime: { kind: 'electron', electronVersion: '43.3.0', nodeVersion: '24.18.1', modulesAbi: '148', napiVersion: '10', platform: process.platform, arch: process.arch, executableSha256: digest('browser-electron') },
+        hostRuntime: { kind: 'node', nodeVersion: '24.14.0', modulesAbi: '137', napiVersion: '10', platform: process.platform, arch: process.arch, executableSha256: digest('standalone-node') },
+      }))
+      const paths = { attestation: attestationPath, browserExecutable, hostExecutable, hostdScript: path.join(root, 'hostd.cjs'), runtimeSeed: path.join(root, 'runtime') }
+      await expect(verifyBundledHostExecutables(paths)).resolves.toBeUndefined()
+      await writeFile(hostExecutable, 'drifted-node')
+      await expect(verifyBundledHostExecutables(paths)).rejects.toThrow('does not match')
+      await expect(verifyBundledHostExecutables({ ...paths, hostExecutable: browserExecutable })).rejects.toThrow('must be distinct')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

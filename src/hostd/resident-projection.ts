@@ -6,11 +6,13 @@ import {
   GoalSummarySchema,
   IdSchema,
   InProgressStreamSchema,
+  RuntimeResourceInventorySchema,
   RuntimeSessionSummarySchema,
   TranscriptBlockSchema,
   type ChildAgentSummary,
   type GoalSummary,
   type InProgressStream,
+  type RuntimeResourceInventory,
   type RuntimeSessionSummary,
   type TranscriptBlock,
 } from "../shared/protocol";
@@ -18,6 +20,10 @@ import {
   type ResidentSessionBinding,
   validateResidentSessionBinding,
 } from "./resident-runtime";
+import {
+  sanitizeResidentDisplayText,
+  type ResidentDisplayRedactionContext,
+} from "../shared/resident-display";
 
 export const MAX_RESIDENT_PROJECTION_INPUT_BYTES = 8 * 1024 * 1024;
 export const MAX_RESIDENT_PROJECTION_MESSAGES = 2_000;
@@ -30,6 +36,7 @@ export const MAX_RESIDENT_PROJECTION_TEXT_CHARS = 262_144;
 const MAX_GENERIC_STRING_CHARS = 2 * 1024 * 1024;
 const MAX_CONTENT_ITEMS = 256;
 const MAX_QUEUE_ITEMS = 1_000;
+const MAX_RESOURCE_ITEMS = 2_000;
 const MAX_OBJECT_KEYS = 256;
 const MAX_ARRAY_ITEMS = 20_000;
 const MAX_GRAPH_NODES = 200_000;
@@ -89,6 +96,13 @@ export interface ResidentProjectionSelectedModelIdentity {
   readonly modelId: string;
 }
 
+/** Private request-scoped marker for one finalized non-tool-use assistant result. */
+export interface ResidentTerminalAssistantMarker {
+  readonly digest: string;
+  readonly timestamp: number;
+  readonly stopReason: "stop" | "length" | "error" | "aborted";
+}
+
 /**
  * Private host-owned projection of a pinned Prime Agent v0.7.1 snapshot.
  * It is deliberately not a public IPC DTO: session paths remain host-private.
@@ -99,6 +113,7 @@ export interface ResidentProjectionSnapshot {
   readonly cursor: Readonly<ResidentProjectionCursor>;
   /** Exact private identity; the public runtime model remains display-only. */
   readonly selectedModel?: Readonly<ResidentProjectionSelectedModelIdentity>;
+  readonly terminalAssistant?: Readonly<ResidentTerminalAssistantMarker>;
   readonly runtime: Readonly<RuntimeSessionSummary>;
   readonly transcript: readonly Readonly<TranscriptBlock>[];
   readonly stream?: Readonly<InProgressStream>;
@@ -355,7 +370,11 @@ const ChildAgentSchema = z
     activeSessionId: IdSchema.optional(),
     sessionName: ShortStringSchema.optional(),
     model: ShortStringSchema.optional(),
-    label: ShortStringSchema,
+    // Prime Agent uses the delegated prompt as the child label. Keep the
+    // private input bounded, then compact it before it reaches the public UI.
+    label: ProjectionTextSchema.refine(noNullOrLineBreaks, {
+      message: "Child labels cannot contain control line breaks or NUL bytes",
+    }),
     status: z.enum(["queued", "running", "done", "error", "cancelled"]),
     durationMs: SafeIntegerSchema.optional(),
     answerPreview: z.string().max(4_096).optional(),
@@ -374,6 +393,120 @@ const ChildAgentSchema = z
     error: z.string().max(2_048).optional(),
   })
   .strict();
+
+const ResourceArtifactSchema = z
+  .object({
+    id: ShortStringSchema,
+    sessionId: ShortStringSchema,
+    type: z.enum(["context_file", "extension", "prompt", "skill", "theme"]),
+    logicalPath: WirePathSchema,
+    relativePath: WirePathSchema.optional(),
+    mimeType: z.string().min(1).max(255).refine(noControlCharacters).optional(),
+  })
+  .strict();
+
+const ResourceSourceInfoSchema = z
+  .object({
+    path: WirePathSchema,
+    source: z.string().min(1).max(4_096).refine(noNullOrLineBreaks),
+    scope: z.enum(["user", "project", "temporary"]),
+    origin: z.enum(["package", "top-level"]),
+    baseDir: WirePathSchema.optional(),
+  })
+  .strict();
+
+const ResourceSkillSchema = z
+  .object({
+    name: ShortStringSchema,
+    description: StatusTextSchema.optional(),
+    filePath: WirePathSchema,
+    sourceInfo: ResourceSourceInfoSchema.optional(),
+    artifact: ResourceArtifactSchema.optional(),
+  })
+  .strict();
+
+const ResourcePromptSchema = z
+  .object({
+    name: ShortStringSchema,
+    description: StatusTextSchema.optional(),
+    argumentHint: StatusTextSchema.optional(),
+    filePath: WirePathSchema,
+    sourceInfo: ResourceSourceInfoSchema.optional(),
+    artifact: ResourceArtifactSchema.optional(),
+  })
+  .strict();
+
+const ResourceExtensionSchema = z
+  .object({
+    path: WirePathSchema,
+    sourceInfo: ResourceSourceInfoSchema.optional(),
+    artifact: ResourceArtifactSchema.optional(),
+  })
+  .strict();
+
+const ResourceThemeSchema = z
+  .object({
+    name: ShortStringSchema.optional(),
+    sourcePath: WirePathSchema.optional(),
+    sourceInfo: ResourceSourceInfoSchema.optional(),
+    artifact: ResourceArtifactSchema.optional(),
+  })
+  .strict();
+
+const ResourceContextFileSchema = z
+  .object({
+    path: WirePathSchema,
+    artifact: ResourceArtifactSchema.optional(),
+  })
+  .strict();
+
+const ResourceCollisionSchema = z
+  .object({
+    resourceType: z.enum(["extension", "skill", "prompt", "theme"]),
+    name: ShortStringSchema,
+    winnerPath: WirePathSchema,
+    loserPath: WirePathSchema,
+    winnerSource: z.string().max(4_096).refine(noNullOrLineBreaks).optional(),
+    loserSource: z.string().max(4_096).refine(noNullOrLineBreaks).optional(),
+  })
+  .strict();
+
+const ResourceDiagnosticSchema = z
+  .object({
+    type: z.enum(["warning", "error", "collision"]),
+    message: StatusTextSchema,
+    path: WirePathSchema.optional(),
+    collision: ResourceCollisionSchema.optional(),
+  })
+  .strict()
+  .superRefine((diagnostic, context) => {
+    if ((diagnostic.type === "collision") !== (diagnostic.collision !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["collision"],
+        message: "Collision details must appear only on collision diagnostics",
+      });
+    }
+  });
+
+const ResourceSnapshotSchema = z
+  .object({
+    contextFiles: z.array(ResourceContextFileSchema).max(MAX_RESOURCE_ITEMS),
+    skills: z.array(ResourceSkillSchema).max(MAX_RESOURCE_ITEMS),
+    prompts: z.array(ResourcePromptSchema).max(MAX_RESOURCE_ITEMS),
+    extensions: z.array(ResourceExtensionSchema).max(MAX_RESOURCE_ITEMS),
+    themes: z.array(ResourceThemeSchema).max(1_000),
+    diagnostics: z
+      .object({
+        skills: z.array(ResourceDiagnosticSchema).max(MAX_RESOURCE_ITEMS),
+        prompts: z.array(ResourceDiagnosticSchema).max(MAX_RESOURCE_ITEMS),
+        extensions: z.array(ResourceDiagnosticSchema).max(MAX_RESOURCE_ITEMS),
+        themes: z.array(ResourceDiagnosticSchema).max(MAX_RESOURCE_ITEMS),
+      })
+      .strict(),
+  })
+  .strict();
+type PinnedResourceSnapshot = z.infer<typeof ResourceSnapshotSchema>;
 
 const CursorSchema = z
   .object({
@@ -425,9 +558,11 @@ const ResidentProjectionQueueSummarySchema = z
 export function normalizeResidentProjectionSnapshot(
   value: unknown,
   bindingValue: ResidentSessionBinding,
+  resourceValue?: unknown,
 ): ResidentProjectionSnapshot {
   const binding = validateResidentSessionBinding(bindingValue);
   assertBoundedJsonValue(value);
+  if (resourceValue !== undefined) assertBoundedJsonValue(resourceValue);
 
   const parsed = PinnedAgentConnectionSnapshotSchema.safeParse(value);
   if (!parsed.success) {
@@ -440,33 +575,56 @@ export function normalizeResidentProjectionSnapshot(
   }
 
   const snapshot = parsed.data;
+  const displayContext = createResidentDisplayRedactionContext(binding, snapshot.children ?? []);
+  const resources = resourceValue === undefined
+    ? undefined
+    : parseResourceSnapshot(resourceValue, displayContext);
   const cursor = requireAuthoritativeCursor(snapshot);
   assertBindingIdentity(snapshot, binding);
   assertSnapshotConsistency(snapshot);
 
   const blockIdOccurrences = new Map<string, number>();
   const transcript = snapshot.messages.flatMap((message, index) => {
-    const block = normalizeTranscriptMessage(message, index, binding.sessionId, blockIdOccurrences);
+    const block = normalizeTranscriptMessage(
+      message,
+      index,
+      binding.sessionId,
+      blockIdOccurrences,
+      displayContext,
+    );
     return block ? [block] : [];
   });
   const stream = snapshot.streamingMessage
-    ? normalizeStream(snapshot.streamingMessage, binding.sessionId)
+    ? normalizeStream(snapshot.streamingMessage, binding.sessionId, displayContext)
     : undefined;
-  const childAgents = (snapshot.children ?? []).map(normalizeChildAgent);
-  const goal = normalizeGoal(snapshot.state.goal);
+  const childAgents = (snapshot.children ?? []).map((child) => normalizeChildAgent(child, displayContext));
+  const goal = normalizeGoal(snapshot.state.goal, displayContext);
   const selectedModel = snapshot.state.model
     ? {
         providerId: snapshot.state.model.provider,
         modelId: snapshot.state.model.id,
       }
     : undefined;
-  const runtime = normalizeRuntime(snapshot, binding);
+  const terminalAssistant = findTerminalAssistantMarker(snapshot.messages);
+  const runtime = normalizeRuntime(snapshot, binding, resources, displayContext);
   const queue = ResidentProjectionQueueSummarySchema.parse({
     queuedCount: snapshot.state.sessionActions.queuedCount,
     steeringCount: snapshot.state.sessionActions.steering.length,
     followUpCount: snapshot.state.sessionActions.followUps.length,
     ...(snapshot.state.sessionActions.active
-      ? { active: { ...snapshot.state.sessionActions.active } }
+      ? {
+          active: {
+            ...snapshot.state.sessionActions.active,
+            ...(snapshot.state.sessionActions.active.label
+              ? {
+                  label: sanitizeResidentDisplayText(
+                    snapshot.state.sessionActions.active.label,
+                    displayContext,
+                  ),
+                }
+              : {}),
+          },
+        }
       : {}),
   });
 
@@ -480,6 +638,7 @@ export function normalizeResidentProjectionSnapshot(
     }),
     cursor,
     ...(selectedModel ? { selectedModel } : {}),
+    ...(terminalAssistant ? { terminalAssistant } : {}),
     runtime,
     transcript,
     ...(stream ? { stream } : {}),
@@ -490,6 +649,72 @@ export function normalizeResidentProjectionSnapshot(
 
   assertNormalizedOutputSize(output);
   return deepFreeze(output);
+}
+
+/**
+ * Extract the same bounded, opaque marker from a public Prime session event.
+ * The marker contains no provider output or tool arguments and is useful only
+ * for matching the later authoritative snapshot on this connection.
+ */
+export function residentTerminalAssistantMarkerFromSessionEvent(
+  value: unknown,
+): ResidentTerminalAssistantMarker | undefined {
+  assertBoundedJsonValue(value);
+  const parsed = z
+    .object({ type: z.literal("message_end"), message: AssistantMessageSchema })
+    .passthrough()
+    .safeParse(value);
+  if (!parsed.success) return undefined;
+  return terminalAssistantMarker(parsed.data.message);
+}
+
+/** Normalize one live RLM child update without retaining its private session directory. */
+export function residentChildAgentSummaryFromSessionEvent(
+  value: unknown,
+): ChildAgentSummary | undefined {
+  assertBoundedJsonValue(value);
+  const parsed = z
+    .object({ type: z.literal("rlm_child_update"), child: ChildAgentSchema })
+    .passthrough()
+    .safeParse(value);
+  return parsed.success ? Object.freeze(normalizeChildAgent(parsed.data.child)) : undefined;
+}
+
+function findTerminalAssistantMarker(
+  messages: readonly PinnedAgentMessage[],
+): ResidentTerminalAssistantMarker | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== "assistant") continue;
+    const marker = terminalAssistantMarker(message);
+    if (marker) return marker;
+  }
+  return undefined;
+}
+
+function terminalAssistantMarker(
+  message: PinnedAssistantMessage,
+): ResidentTerminalAssistantMarker | undefined {
+  if (message.stopReason === "toolUse") return undefined;
+  const digest = createHash("sha256")
+    .update(JSON.stringify({
+      content: message.content,
+      api: message.api,
+      provider: message.provider,
+      model: message.model,
+      responseModel: message.responseModel ?? null,
+      responseId: message.responseId ?? null,
+      stopReason: message.stopReason,
+      stopReasonRaw: message.stopReasonRaw ?? null,
+      errorMessage: message.errorMessage ?? null,
+      timestamp: message.timestamp,
+    }), "utf8")
+    .digest("hex");
+  return Object.freeze({
+    digest,
+    timestamp: message.timestamp,
+    stopReason: message.stopReason,
+  });
 }
 
 function requireAuthoritativeCursor(snapshot: PinnedSnapshot): ResidentProjectionCursor {
@@ -544,7 +769,89 @@ function assertSnapshotConsistency(snapshot: PinnedSnapshot): void {
   }
 }
 
-function normalizeRuntime(snapshot: PinnedSnapshot, binding: ResidentSessionBinding): RuntimeSessionSummary {
+function parseResourceSnapshot(
+  value: unknown,
+  displayContext: ResidentDisplayRedactionContext,
+): RuntimeResourceInventory {
+  const parsed = ResourceSnapshotSchema.safeParse(value);
+  if (!parsed.success) {
+    const isLimit = parsed.error.issues.some((issue) => issue.code === "too_big");
+    throw new ResidentProjectionError(
+      isLimit ? "PRIME_PROJECTION_LIMIT_EXCEEDED" : "PRIME_PROJECTION_INVALID",
+      "Prime Agent returned an invalid resource inventory snapshot.",
+      { issues: formatZodIssues(parsed.error) },
+    );
+  }
+  return normalizeResourceInventory(parsed.data, displayContext);
+}
+
+function normalizeResourceInventory(
+  resources: PinnedResourceSnapshot,
+  displayContext: ResidentDisplayRedactionContext,
+): RuntimeResourceInventory {
+  const sourceKind = (
+    source: z.infer<typeof ResourceSourceInfoSchema> | undefined,
+  ): { scope: "user" | "project" | "temporary"; origin: "package" | "top-level" } | undefined =>
+    source ? { scope: source.scope, origin: source.origin } : undefined;
+  const namedResource = (
+    resource: Readonly<{
+      name: string;
+      description?: string;
+      sourceInfo?: z.infer<typeof ResourceSourceInfoSchema>;
+    }>,
+  ) => ({
+    name: resource.name,
+    ...(resource.description !== undefined
+      ? { description: sanitizeResidentDisplayText(resource.description, displayContext) }
+      : {}),
+    ...(resource.sourceInfo ? { sourceKind: sourceKind(resource.sourceInfo) } : {}),
+  });
+  const extensionSourceKinds = resources.extensions.flatMap((extension) => {
+    const kind = sourceKind(extension.sourceInfo);
+    return kind ? [kind] : [];
+  }).filter((kind, index, items) =>
+    items.findIndex((candidate) => candidate.scope === kind.scope && candidate.origin === kind.origin) === index,
+  );
+  const diagnostics = [
+    ...resources.diagnostics.skills,
+    ...resources.diagnostics.prompts,
+    ...resources.diagnostics.extensions,
+    ...resources.diagnostics.themes,
+  ];
+
+  return RuntimeResourceInventorySchema.parse({
+    skills: resources.skills.map(namedResource),
+    prompts: resources.prompts.map(namedResource),
+    themes: resources.themes.flatMap((theme) => theme.name
+      ? [{
+          name: theme.name,
+          ...(theme.sourceInfo ? { sourceKind: sourceKind(theme.sourceInfo) } : {}),
+        }]
+      : []),
+    extensions: {
+      count: resources.extensions.length,
+      sourceKinds: extensionSourceKinds,
+    },
+    contextFileCount: resources.contextFiles.length,
+    diagnostics: {
+      warningCount: diagnostics.filter((diagnostic) => diagnostic.type === "warning").length,
+      errorCount: diagnostics.filter((diagnostic) => diagnostic.type === "error").length,
+      collisions: diagnostics.flatMap((diagnostic) => diagnostic.collision
+        ? [{
+            resourceType: diagnostic.collision.resourceType,
+            name: diagnostic.collision.name,
+          }]
+        : []),
+    },
+  });
+}
+
+function normalizeRuntime(
+  snapshot: PinnedSnapshot,
+  binding: ResidentSessionBinding,
+  resourceInventory?: RuntimeResourceInventory,
+  displayContext?: ResidentDisplayRedactionContext,
+): RuntimeSessionSummary {
   const state = snapshot.state;
   const model = state.model ? `${state.model.provider}/${state.model.id}` : undefined;
   return RuntimeSessionSummarySchema.parse({
@@ -553,7 +860,9 @@ function normalizeRuntime(snapshot: PinnedSnapshot, binding: ResidentSessionBind
     appVersion: binding.runtime.appVersion,
     activeSessionId: state.activeSessionId,
     sessionId: state.sessionId,
-    ...(state.sessionName ? { sessionName: state.sessionName } : {}),
+    ...(state.sessionName
+      ? { sessionName: sanitizeResidentDisplayText(state.sessionName, displayContext) }
+      : {}),
     ...(model ? { model } : {}),
     thinkingLevel: state.thinkingLevel,
     serviceTier: state.serviceTier,
@@ -567,6 +876,7 @@ function normalizeRuntime(snapshot: PinnedSnapshot, binding: ResidentSessionBind
     compactionCount: state.compactionCount,
     queuedActionCount: state.sessionActions.queuedCount,
     activeToolNames: [...state.activeToolNames],
+    ...(resourceInventory ? { resourceInventory } : {}),
     ...(state.contextUsage?.tokens !== null && state.contextUsage?.tokens !== undefined
       ? {
           context: {
@@ -578,7 +888,7 @@ function normalizeRuntime(snapshot: PinnedSnapshot, binding: ResidentSessionBind
     // Prime may rehydrate a missing recap as an empty string. Both mean that no
     // recap exists; canonicalize them so an otherwise identical attachment
     // does not create a false resident semantic change.
-    ...(state.recap ? { recap: state.recap } : {}),
+    ...(state.recap ? { recap: sanitizeResidentDisplayText(state.recap, displayContext) } : {}),
   });
 }
 
@@ -587,11 +897,15 @@ function normalizeTranscriptMessage(
   sourceIndex: number,
   sessionId: string,
   idOccurrences: Map<string, number>,
+  displayContext: ResidentDisplayRedactionContext,
 ): TranscriptBlock | undefined {
   if (message.role === "custom" && !message.display) return undefined;
 
   const normalized = normalizeMessageText(message);
-  const text = boundedOutputText(normalized.text, `messages.${sourceIndex}`);
+  const text = boundedOutputText(
+    sanitizeResidentDisplayText(normalized.text, displayContext),
+    `messages.${sourceIndex}`,
+  );
   const identityParts = [sessionId, message.role, message.timestamp, text] as const;
   const identityKey = JSON.stringify(identityParts);
   const occurrence = idOccurrences.get(identityKey) ?? 0;
@@ -646,8 +960,15 @@ function normalizeMessageText(
   }
 }
 
-function normalizeStream(message: PinnedAssistantMessage, sessionId: string): InProgressStream {
-  const text = boundedOutputText(assistantContentToText(message), "streamingMessage");
+function normalizeStream(
+  message: PinnedAssistantMessage,
+  sessionId: string,
+  displayContext: ResidentDisplayRedactionContext,
+): InProgressStream {
+  const text = boundedOutputText(
+    sanitizeResidentDisplayText(assistantContentToText(message), displayContext),
+    "streamingMessage",
+  );
   return InProgressStreamSchema.parse({
     blockId: stableId("resident-stream", [
       sessionId,
@@ -683,28 +1004,48 @@ function displayContentToText(
     .join("\n\n");
 }
 
-function normalizeChildAgent(child: z.infer<typeof ChildAgentSchema>): ChildAgentSummary {
+function normalizeChildAgent(
+  child: z.infer<typeof ChildAgentSchema>,
+  displayContext?: ResidentDisplayRedactionContext,
+): ChildAgentSummary {
   const state = child.status === "done" ? "complete" : child.status === "error" ? "failed" : child.status;
   return ChildAgentSummarySchema.parse({
     agentId: child.id,
     ...(child.parentId ? { parentAgentId: child.parentId } : {}),
     ...(child.activeSessionId ? { activeSessionId: child.activeSessionId } : {}),
-    ...(child.sessionName ? { sessionName: child.sessionName } : {}),
+    ...(child.sessionName
+      ? { sessionName: sanitizeResidentDisplayText(child.sessionName, displayContext) }
+      : {}),
     ...(child.model ? { model: child.model } : {}),
-    title: child.label,
+    title: compactChildAgentTitle(sanitizeResidentDisplayText(child.label, displayContext)),
     state,
     ...(child.durationMs !== undefined ? { durationMs: child.durationMs } : {}),
-    ...(child.answerPreview !== undefined ? { answerPreview: child.answerPreview } : {}),
+    ...(child.answerPreview !== undefined
+      ? { answerPreview: sanitizeResidentDisplayText(child.answerPreview, displayContext) }
+      : {}),
     ...(child.repliedSinceTask !== undefined ? { repliedSinceTask: child.repliedSinceTask } : {}),
     ...(child.toolUseCount !== undefined ? { toolUseCount: child.toolUseCount } : {}),
     ...(child.tokenCount !== undefined ? { tokenCount: child.tokenCount } : {}),
-    ...(child.recap !== undefined ? { recap: child.recap } : {}),
+    ...(child.recap !== undefined
+      ? { recap: sanitizeResidentDisplayText(child.recap, displayContext) }
+      : {}),
     ...(child.activity ? { activity: { ...child.activity } } : {}),
-    ...(child.error !== undefined ? { error: child.error } : {}),
+    ...(child.error !== undefined
+      ? { error: sanitizeResidentDisplayText(child.error, displayContext) }
+      : {}),
   });
 }
 
-function normalizeGoal(goal: z.infer<typeof GoalStateSchema>): GoalSummary | undefined {
+function compactChildAgentTitle(label: string): string {
+  const compact = label.replace(/\s+/g, " ").trim();
+  if (compact.length <= 255) return compact;
+  return `${compact.slice(0, 254).trimEnd()}…`;
+}
+
+function normalizeGoal(
+  goal: z.infer<typeof GoalStateSchema>,
+  displayContext: ResidentDisplayRedactionContext,
+): GoalSummary | undefined {
   if (goal.status === "idle") {
     if (goal.active) {
       throw new ResidentProjectionError(
@@ -728,17 +1069,45 @@ function normalizeGoal(goal: z.infer<typeof GoalStateSchema>): GoalSummary | und
   }
   return GoalSummarySchema.parse({
     goalId: goal.goalId,
-    objective: goal.objective,
+    objective: sanitizeResidentDisplayText(goal.objective, displayContext),
     state: goal.status,
     ...(goal.tokenBudget !== undefined ? { tokenBudget: goal.tokenBudget } : {}),
     tokensUsed: goal.tokensUsed,
     timeUsedSeconds: goal.timeUsedSeconds,
     continuationsUsed: goal.continuationsUsed,
-    ...(goal.lastReason !== undefined ? { lastReason: goal.lastReason } : {}),
-    ...(goal.lastError !== undefined ? { lastError: goal.lastError } : {}),
+    ...(goal.lastReason !== undefined
+      ? { lastReason: sanitizeResidentDisplayText(goal.lastReason, displayContext) }
+      : {}),
+    ...(goal.lastError !== undefined
+      ? { lastError: sanitizeResidentDisplayText(goal.lastError, displayContext) }
+      : {}),
     ...(goal.updatedAt !== undefined || goal.createdAt !== undefined
       ? { updatedAt: timestampToIso(goal.updatedAt ?? goal.createdAt!) }
       : {}),
+  });
+}
+
+function createResidentDisplayRedactionContext(
+  binding: ResidentSessionBinding,
+  children: readonly z.infer<typeof ChildAgentSchema>[],
+): ResidentDisplayRedactionContext {
+  const exactValues = [
+    { value: binding.workspaceDirectory, replacement: "[workspace]" },
+    ...(binding.sessionFile
+      ? [{ value: binding.sessionFile, replacement: "[session file]" }]
+      : []),
+    { value: binding.activeSessionId, replacement: "[active session]" },
+    { value: binding.sessionId, replacement: "[resident session]" },
+  ]
+    .filter(({ value }) => value.length > 1)
+    .sort((left, right) => right.value.length - left.value.length);
+  const childNamesById = new Map<string, string>();
+  for (const child of children) {
+    childNamesById.set(child.id, child.sessionName ?? child.label);
+  }
+  return Object.freeze({
+    exactValues: Object.freeze(exactValues.map((entry) => Object.freeze(entry))),
+    childNamesById,
   });
 }
 

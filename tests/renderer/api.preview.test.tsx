@@ -2,10 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  createPreviewRendererApi,
   INTERNAL_VISUAL_QA_USER_AGENT,
   isInternalVisualQaRequest,
-} from '../../src/renderer/src/api'
+} from '../../src/renderer/src/preview-bootstrap'
+import { createPreviewRendererApi } from '../../src/renderer/src/api.preview'
 import {
   CandidateEvaluationPreflightSchema,
   CandidateEvaluationSnapshotSchema,
@@ -156,7 +156,7 @@ describe('browser preview evidence labels', () => {
         threadState: 'idle',
         receiptState: 'sent',
         operation: 'end',
-        message: 'Ending resident session · Prime Continuim will not send another kill automatically',
+        message: 'Ready to finish · Prime Agent has not received an End request',
         canStart: false,
         canStop: false,
       },

@@ -52,7 +52,7 @@ describe('verified SSH host activation IPC', () => {
     ]) {
       await expect(invoke?.(trustedEvent, input)).resolves.toMatchObject({
         ok: false,
-        error: { code: 'native.unexpected' },
+        error: { code: 'ipc.invalid_payload' },
       })
     }
     await expect(invoke?.({}, { expectedHostId: 'host-remote' })).resolves.toMatchObject({

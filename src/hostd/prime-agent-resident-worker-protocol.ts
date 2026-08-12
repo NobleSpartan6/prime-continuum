@@ -7,6 +7,7 @@ export const RESIDENT_WORKER_LIMITS = Object.freeze({
   maxControlMessageBytes: 8 * 1024 * 1024,
   maxSnapshotBytes: 50 * 1024 * 1024,
   maxEventBytes: 50 * 1024 * 1024,
+  maxResourceSnapshotBytes: 8 * 1024 * 1024,
   maxModelCatalogBytes: 8 * 1024 * 1024,
   maxDaemonResponseBytes: 8 * 1024 * 1024,
   maxHelloBytes: 64 * 1024,
@@ -38,6 +39,7 @@ export type ResidentWorkerOperation =
   | "connection.attach"
   | "connection.get_initial_snapshot"
   | "connection.wait_for_idle"
+  | "connection.get_resource_snapshot"
   | "connection.get_available_models"
   | "connection.set_model"
   | "connection.promote_to_resident"
@@ -54,6 +56,7 @@ export const RESIDENT_WORKER_OPERATIONS: ReadonlySet<ResidentWorkerOperation> = 
   "connection.attach",
   "connection.get_initial_snapshot",
   "connection.wait_for_idle",
+  "connection.get_resource_snapshot",
   "connection.get_available_models",
   "connection.set_model",
   "connection.promote_to_resident",
@@ -363,6 +366,8 @@ export function residentWorkerOperationResultBound(operation: ResidentWorkerOper
   switch (operation) {
     case "connection.get_initial_snapshot":
       return RESIDENT_WORKER_LIMITS.maxSnapshotBytes;
+    case "connection.get_resource_snapshot":
+      return RESIDENT_WORKER_LIMITS.maxResourceSnapshotBytes;
     case "connection.get_available_models":
       return RESIDENT_WORKER_LIMITS.maxModelCatalogBytes;
     case "client.request":

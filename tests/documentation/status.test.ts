@@ -21,7 +21,9 @@ describe('documented release boundary', () => {
       expect(document).toMatch(/relay connectivity/i)
       expect(document).toMatch(/mobile control/i)
       expect(document).toMatch(/Windows x64 development artifact/i)
-      expect(document).toMatch(/macOS and Linux packag(?:e|ing).*(?:not been verified|require.*verification)/i)
+      expect(document).toMatch(/ad-hoc macOS[\s\S]{0,50}arm64 development/i)
+      expect(document).toMatch(/Linux packaging[\s\S]{0,200}(?:remain|is) unverified/i)
+      expect(document).toMatch(/notarized macOS DMG[\s\S]{0,200}(?:remains?|is) unverified/i)
     }
 
     expect(readme).not.toMatch(/^Cross-platform desktop control plane.*can run locally or over SSH/m)

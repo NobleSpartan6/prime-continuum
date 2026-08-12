@@ -7,7 +7,7 @@
 - Prime Agent is a Node/TypeScript runtime with a persistent Python/IPython execution layer. Tauri, Flutter, Qt, and platform-native shells still need that runtime or a Node sidecar.
 - Electron embeds Node 24.18.1, above Prime Agent's Node 22.8 minimum, and gives the renderer one deterministic Chromium target across desktop platforms.
 - Hermes Desktop independently validates the same Electron + React boundary for a polished, cross-platform agent client. Its strongest reusable ideas are architectural—chat as home, contextual panes, direct manipulation, persistent expensive views, and strict focus ownership—not its dependency breadth or pane editor.
-- At commit `20f4058`, the measured renderer is 831,898 bytes raw and 154,595 bytes gzip. That is a 5.0% gzip increase from the pre-workbench baseline and remains below the 200 KiB release budget, so bundle size is not the current bottleneck.
+- The exact production eager JavaScript closure is 542,947 bytes raw / 150,474 bytes gzip. Markdown rendering, Models & accounts, internal visual-QA fixtures, protocol validators, and inspector features load behind caught static boundaries. The build measures final emitted bytes, enforces the 200 KiB gzip release budget, and currently retains 54,326 bytes of headroom.
 - The renderer now bounds transcript and runtime-list mounting, but the current host-event hot path still replaces the whole workbench snapshot and root React state. Delta publication and consumption remain the next dataflow optimization; that is not an Electron limitation.
 - A rewrite would replace thousands of lines of working renderer, main-process, hostd, and protocol code while preserving the difficult daemon/Python boundary.
 

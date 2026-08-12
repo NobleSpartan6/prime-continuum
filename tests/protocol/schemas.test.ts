@@ -19,12 +19,75 @@ import {
   ResidentControlProjectionSnapshotSchema,
   ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
+  RuntimeSessionSummarySchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
   ThreadProjectionSnapshotSchema,
 } from "../../src/shared/protocol";
 
 describe("host protocol schemas", () => {
+  it("admits only the path-free resident resource inventory contract", () => {
+    const runtime = {
+      runtime: "prime_agent" as const,
+      residency: "resident" as const,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      steeringMode: "all" as const,
+      followUpMode: "one-at-a-time" as const,
+      messageCount: 0,
+      compactionCount: 0,
+      queuedActionCount: 0,
+      activeToolNames: ["ipython"],
+      resourceInventory: {
+        skills: [{
+          name: "playwright-cli",
+          description: "Automate browser interactions.",
+          sourceKind: { scope: "project" as const, origin: "package" as const },
+        }],
+        prompts: [],
+        themes: [],
+        extensions: {
+          count: 1,
+          sourceKinds: [{ scope: "project" as const, origin: "top-level" as const }],
+        },
+        contextFileCount: 1,
+        diagnostics: {
+          warningCount: 1,
+          errorCount: 0,
+          collisions: [{ resourceType: "skill" as const, name: "playwright-cli" }],
+        },
+      },
+    };
+
+    expect(RuntimeSessionSummarySchema.parse(runtime)).toEqual(runtime);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        skills: [{ ...runtime.resourceInventory.skills[0], filePath: "/private/SKILL.md" }],
+      },
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        credential: "must-not-cross",
+      },
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        diagnostics: {
+          ...runtime.resourceInventory.diagnostics,
+          message: "Private diagnostic text",
+        },
+      },
+    }).success).toBe(false);
+  });
+
   it("binds runtime retry to one host and one retryable failed integrity snapshot", () => {
     const runtimeIntegrity = {
       contractVersion: 1 as const,
@@ -191,6 +254,14 @@ describe("host protocol schemas", () => {
       bindingFingerprint: "a".repeat(64),
       controlSequence: 7,
       changedAt: "2026-08-08T12:01:00.000Z",
+      commandReadiness: "ready" as const,
+      browserExecution: {
+        readiness: "ready" as const,
+        protocol: "prime-continuim.browser.v1" as const,
+        surface: "playwright-cli" as const,
+        controller: "playwright-core/1.63.0-alpha-2026-08-05" as const,
+        engine: "verified-electron-host" as const,
+      },
       authorityCursor: {
         threadId: "thread-1",
         executionGenerationId: "execution-2",
@@ -208,6 +279,12 @@ describe("host protocol schemas", () => {
       quiescence: { state: "stop_owned" as const },
     };
     expect(ResidentControlProjectionSnapshotSchema.parse(projection)).toEqual(projection);
+    const { commandReadiness: _commandReadiness, browserExecution: _browserExecution, ...legacy } = projection;
+    expect(ResidentControlProjectionSnapshotSchema.parse(legacy)).toEqual({
+      ...legacy,
+      commandReadiness: "unavailable",
+      browserExecution: { readiness: "unavailable" },
+    });
     expect(HostIpcResponseSchema.safeParse({
       protocolVersion: PROTOCOL_VERSION,
       requestId: request.requestId,

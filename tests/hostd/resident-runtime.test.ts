@@ -11,6 +11,7 @@ import {
   buildResidentDaemonStartInvocation,
   sanitizeResidentDaemonEnvironment,
   validateResidentDaemonHello,
+  validateResidentDaemonRetirementHello,
   validateResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 
@@ -32,6 +33,9 @@ function validHello(): Record<string, unknown> {
     },
     supervisorGeneration: "supervisor-generation-1",
     supervisorPid: 42,
+    supervisorOwnerToken: "owner-token-1",
+    supervisorProcessStartId: "process-start-1",
+    supervisorSocketPath: "\\\\.\\pipe\\prime-agent-daemon",
     clientId: "daemon-client:test",
     serverCapabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES, "session_input_admission"],
   };
@@ -189,6 +193,50 @@ describe("resident daemon compatibility", () => {
       "PRIME_RUNTIME_HELLO_INVALID",
     );
   });
+
+  it("binds incompatible retirement recognition to one exact supervisor owner", () => {
+    const retirementSocket = resolve(tmpdir(), "prime-agent-retirement.sock");
+    const prior = {
+      ...validHello(),
+      socketPath: retirementSocket,
+      appVersion: "0.7.0",
+      schemaRevision: 12,
+      schemaId: "protocol-7-schema-12-prior",
+      runtime: {
+        buildId: "verified-prior-build",
+        executablePath: resolve("Prime Agent prior", "prime-agent"),
+        entrypointPath: resolve("Prime Agent prior", "cli.js"),
+      },
+      supervisorSocketPath: retirementSocket,
+    };
+
+    expect(
+      validateResidentDaemonRetirementHello(prior, retirementSocket),
+    ).toMatchObject({
+      appVersion: "0.7.0",
+      runtimeBuildId: "verified-prior-build",
+      supervisorGeneration: "supervisor-generation-1",
+      supervisorPid: 42,
+      supervisorOwnerToken: "owner-token-1",
+      supervisorProcessStartId: "process-start-1",
+      supervisorSocketPath: retirementSocket,
+      clientId: "daemon-client:test",
+    });
+    expectContractError(
+      () => validateResidentDaemonRetirementHello(
+        { ...prior, supervisorProcessStartId: undefined },
+        retirementSocket,
+      ),
+      "PRIME_RUNTIME_HELLO_INVALID",
+    );
+    expectContractError(
+      () => validateResidentDaemonRetirementHello(
+        { ...prior, supervisorSocketPath: resolve(tmpdir(), "other-daemon.sock") },
+        retirementSocket,
+      ),
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
+    );
+  });
 });
 
 describe("resident launch and create plans", () => {
@@ -220,7 +268,11 @@ describe("resident launch and create plans", () => {
         windowsHide: true,
         detached: true,
         cwd: daemonWorkingDirectory,
-        env: { Path: "C:\\Windows", ELECTRON_RUN_AS_NODE: "1" },
+        env: {
+          Path: "C:\\Windows",
+          ELECTRON_RUN_AS_NODE: "1",
+          PYTHONDONTWRITEBYTECODE: "1",
+        },
         stdio: "ignore",
       },
     });
@@ -229,6 +281,21 @@ describe("resident launch and create plans", () => {
     expect(invocation.argv.join(" ")).not.toContain("cmd /c");
     expect(invocation.argv.join(" ")).not.toContain("powershell");
     expect(Object.isFrozen(invocation.argv)).toBe(true);
+  });
+
+  it("adds the verified browser skill as fixed argv without shell interpolation", () => {
+    const browserSkill = resolve("Prime Agent & tools", "bridge skills", "playwright-cli", "SKILL.md");
+    const invocation = buildResidentDaemonStartInvocation({
+      executable: resolve("Prime Agent & tools", "node"),
+      cliEntrypoint: resolve("Prime Agent & tools", "cli.js"),
+      socketPath: resolve(tmpdir(), "prime-agent-browser-skill.sock"),
+      daemonWorkingDirectory: resolve("Prime Agent & tools", "data"),
+      environment: {},
+      additionalSkillPath: browserSkill,
+    });
+
+    expect(invocation.argv.slice(-2)).toEqual(["--skill", browserSkill]);
+    expect(invocation.spawn.shell).toBe(false);
   });
 
   it("launches a verified package CLI entrypoint through an explicit Node executable", () => {
@@ -260,7 +327,7 @@ describe("resident launch and create plans", () => {
         windowsHide: true,
         detached: true,
         cwd: daemonWorkingDirectory,
-        env: {},
+        env: { PYTHONDONTWRITEBYTECODE: "1" },
         stdio: "ignore",
       },
     });
@@ -299,7 +366,11 @@ describe("resident launch and create plans", () => {
         node_path: "C:\\shadow-modules",
         ELECTRON_RUN_AS_NODE: "0",
       }),
-    ).toEqual({ Path: "C:\\Windows", PRIME_API_KEY: "provider-secret" });
+    ).toEqual({
+      Path: "C:\\Windows",
+      PRIME_API_KEY: "provider-secret",
+      PYTHONDONTWRITEBYTECODE: "1",
+    });
   });
 
   it("creates resident work through DaemonClient semantics, never client-owned RPC semantics", () => {

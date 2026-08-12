@@ -251,50 +251,59 @@ setInterval(() => undefined, 1000)
       detached: true,
     })
     let supervisorPid: number | undefined
+    let supervisedChildPid: number | undefined
     const childPid = orphan.pid!
 
-    await expect(runSupervisedWorkflowStep({
-      workflow: 'dev',
-      lock: main,
-      step: {
-        executable: process.execPath,
-        args: ['--eval', 'setInterval(() => undefined, 1000)'],
-        cwd: root,
-        environment: process.env,
-      },
-      createLease: async (options) => {
-        supervisorPid = options.supervisorPid
-        const real = await createWorkflowChildLease(options)
-        return {
-          ...real,
-          setChildPid: async () => {
-            await real.setChildPid(childPid)
-            process.kill(options.supervisorPid, 'SIGKILL')
-          },
-        }
-      },
-      teardownTimeoutMs: 2_000,
-    })).rejects.toThrow('supervisor exited without confirming child-tree completion')
+    try {
+      await expect(runSupervisedWorkflowStep({
+        workflow: 'dev',
+        lock: main,
+        step: {
+          executable: process.execPath,
+          args: ['--eval', 'setInterval(() => undefined, 1000)'],
+          cwd: root,
+          environment: process.env,
+        },
+        createLease: async (options) => {
+          supervisorPid = options.supervisorPid
+          const real = await createWorkflowChildLease(options)
+          return {
+            ...real,
+            setChildPid: async (pid) => {
+              supervisedChildPid = pid
+              await real.setChildPid(childPid)
+              process.kill(options.supervisorPid, 'SIGKILL')
+            },
+          }
+        },
+        teardownTimeoutMs: 2_000,
+      })).rejects.toThrow('supervisor exited without confirming child-tree completion')
 
-    expect(supervisorPid).toEqual(expect.any(Number))
-    expect(childPid).toEqual(expect.any(Number))
-    expect(isProcessAlive(supervisorPid!)).toBe(false)
-    expect(isProcessAlive(childPid!)).toBe(true)
-    await expect(rejectActiveWorkflowChild({
-      lockPath,
-      lockToken: main.owner.token,
-      workflow: 'dist',
-    })).rejects.toBeInstanceOf(WorkflowChildLeaseError)
+      expect(supervisorPid).toEqual(expect.any(Number))
+      expect(supervisedChildPid).toEqual(expect.any(Number))
+      expect(childPid).toEqual(expect.any(Number))
+      expect(isProcessAlive(supervisorPid!)).toBe(false)
+      expect(isProcessAlive(childPid!)).toBe(true)
+      await expect(rejectActiveWorkflowChild({
+        lockPath,
+        lockToken: main.owner.token,
+        workflow: 'dist',
+      })).rejects.toBeInstanceOf(WorkflowChildLeaseError)
 
-    process.kill(childPid, 'SIGKILL')
-    await waitForProcessesToExit([childPid])
-    await rejectActiveWorkflowChild({
-      lockPath,
-      lockToken: main.owner.token,
-      workflow: 'dist',
-    })
-    await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
-    await main.release()
+      process.kill(childPid, 'SIGKILL')
+      await waitForProcessesToExit([childPid])
+      await rejectActiveWorkflowChild({
+        lockPath,
+        lockToken: main.owner.token,
+        workflow: 'dist',
+      })
+      await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
+    } finally {
+      if (supervisedChildPid !== undefined) await terminateTestProcessGroup(supervisedChildPid)
+      if (isProcessAlive(childPid)) process.kill(childPid, 'SIGKILL')
+      await waitForProcessesToExit([childPid])
+      await main.release()
+    }
   }, 15_000)
 
   it.skipIf(process.platform !== 'win32')(
@@ -418,6 +427,16 @@ async function waitForProcessesToExit(pids: number[]) {
 
 function isProcessAlive(pid: number) {
   try { process.kill(pid, 0); return true } catch { return false }
+}
+
+async function terminateTestProcessGroup(pid: number) {
+  if (!isProcessAlive(pid)) return
+  try {
+    process.kill(process.platform === 'win32' ? pid : -pid, 'SIGKILL')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+  await waitForProcessesToExit([pid])
 }
 
 function delay(milliseconds: number) {

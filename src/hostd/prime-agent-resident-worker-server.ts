@@ -41,6 +41,7 @@ interface WorkerDaemonClient {
 interface WorkerDaemonConnection {
   getInitialSnapshot(): Promise<unknown>;
   waitForIdle?(): Promise<void>;
+  getResourceSnapshot?(): Promise<unknown>;
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
   promoteToResident?(): Promise<void>;
@@ -432,6 +433,13 @@ export class ResidentRuntimeWorkerServer {
         if (typeof record.connection.waitForIdle !== "function") throw new Error("Public idle barrier is unavailable");
         await record.connection.waitForIdle.call(record.connection);
         return { result: null };
+      }
+      case "connection.get_resource_snapshot": {
+        const [, record] = this.requireConnectionPayload(payload, operation);
+        if (typeof record.connection.getResourceSnapshot !== "function") {
+          throw new Error("Resource inventory is unavailable");
+        }
+        return { result: await record.connection.getResourceSnapshot.call(record.connection) };
       }
       case "connection.get_available_models": {
         const [, record] = this.requireConnectionPayload(payload, operation);
