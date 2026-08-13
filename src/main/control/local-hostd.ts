@@ -486,8 +486,11 @@ function hostdBuildIdentitiesMatch(left: HostdBuildIdentity, right: HostdBuildId
  * application bytes. The hostd bundle digest changes for every host build;
  * the trust anchor binds its embedded Prime Agent runtime attestation.
  */
-export async function bundledHostdBuildIdentity(app: Pick<App, 'isPackaged' | 'getAppPath'>): Promise<HostdBuildIdentity> {
-  const paths = bundledHostdPaths(app)
+export async function bundledHostdBuildIdentity(
+  app: Pick<App, 'isPackaged' | 'getAppPath'>,
+  resourcesPath = process.resourcesPath
+): Promise<HostdBuildIdentity> {
+  const paths = bundledHostdPaths(app, resourcesPath)
   try {
     await Promise.all([
       access(paths.attestation),
@@ -495,7 +498,9 @@ export async function bundledHostdBuildIdentity(app: Pick<App, 'isPackaged' | 'g
     ])
     const [bundleSha256, attestationBytes] = await Promise.all([
       hashBoundedRegularFile(paths.hostdScript, 256 * 1024 * 1024, 'hostd bundle'),
-      readBoundedRegularFile(paths.attestation, 256 * 1024, 'runtime attestation')
+      app.isPackaged
+        ? readBoundedAsarEntry(paths.attestation, 256 * 1024, 'runtime attestation')
+        : readBoundedRegularFile(paths.attestation, 256 * 1024, 'runtime attestation')
     ])
     const { trustAnchorId: runtimeTrustAnchorId } = parseEmbeddedRuntimeAttestationBytes(attestationBytes)
     return Object.freeze({ contractVersion: 1, bundleSha256, runtimeTrustAnchorId })
@@ -506,6 +511,26 @@ export async function bundledHostdBuildIdentity(app: Pick<App, 'isPackaged' | 'g
       { cause }
     )
   }
+}
+
+/**
+ * Electron exposes ASAR entries through a virtual filesystem: `lstat()`
+ * describes the entry while `open().stat()` describes the containing archive.
+ * Comparing those identities therefore rejects every valid packaged build.
+ * The packaged app enables Electron's embedded ASAR-integrity fuse, so retain
+ * the entry boundary here and require the virtual size to match the exact
+ * bytes returned by Electron's ASAR-aware reader.
+ */
+async function readBoundedAsarEntry(filePath: string, maximumBytes: number, label: string): Promise<Buffer> {
+  const expected = await lstat(filePath)
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.size < 1 || expected.size > maximumBytes) {
+    throw new Error(`The ${label} is outside its packaged ASAR-entry bound.`)
+  }
+  const bytes = await readFile(filePath)
+  if (bytes.byteLength !== expected.size) {
+    throw new Error(`The ${label} changed while its packaged ASAR entry was read.`)
+  }
+  return bytes
 }
 
 export async function requireCompatibleLocalHostd<
