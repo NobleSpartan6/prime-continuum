@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { ControlError } from '../../src/main/control/errors'
 import {
+  bundledHostdBuildIdentity,
   bundledHostdEnvironment,
   bundledHostdInvocation,
   bundledHostdLaunchArguments,
@@ -17,6 +18,7 @@ import {
   retireVerifiedLocalHostd,
   verifyBundledHostExecutables
 } from '../../src/main/control/local-hostd'
+import { serializeRuntimeAttestation } from '../../scripts/runtime-attestation-lib.mjs'
 
 describe('bundled hostd launch contract', () => {
   const buildIdentity = Object.freeze({
@@ -213,6 +215,51 @@ describe('bundled hostd launch contract', () => {
       '--browser-executable',
       paths.browserExecutable
     ])
+  })
+
+  it('reads packaged attestation bytes without comparing an ASAR entry to an archive handle', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'prime-packaged-host-identity-'))
+    try {
+      const appRoot = path.join(root, 'app.asar')
+      const resources = path.join(root, 'resources')
+      const attestationPath = path.join(appRoot, 'out', 'main', 'runtime-attestation.json')
+      const hostdPath = path.join(resources, 'hostd', 'hostd.cjs')
+      const attestationBytes = serializeRuntimeAttestation({
+        schemaVersion: 1,
+        product: 'Prime Continuim',
+        assurance: 'development-integrity',
+        runtimePolicySchemaVersion: 1,
+        runtime: { name: 'prime-agent', releaseVersion: '0.7.2', runtimeBuildId: 'test-build', platform: process.platform, arch: process.arch, libc: 'none' },
+        manifest: { relativePath: 'installs/test/runtime.json', sha256: '1'.repeat(64), sourcesSha256: '2'.repeat(64), policySha256: '3'.repeat(64), packageLockSha256: '4'.repeat(64) },
+        tree: { sha256: '5'.repeat(64), filesSha256: '6'.repeat(64), fileCount: 1, totalBytes: 1 },
+        entrypoints: { module: 'module.js', cli: 'cli.js', browserBridge: 'bridge.js', browserHost: 'host.cjs', browserLauncher: 'launcher', browserLauncherWindows: 'launcher.cmd', browserSkill: 'skill.md' },
+        browserBridge: { protocol: 'prime-continuim.browser.v1', playwrightCoreVersion: '1.63.0-alpha-2026-08-05', engine: 'verified-electron-host', smoke: { verified: true, operations: ['doctor', 'open', 'snapshot', 'find', 'click', 'eval', 'screenshot', 'close'] } },
+        daemon: { protocolName: 'prime-agent.daemon', protocolVersion: 1, schemaRevision: 1, schemaId: 'test', requiredCapabilities: ['attach_snapshot'] },
+        nativeAddons: [{ path: 'addon.node', size: 1, sha256: '7'.repeat(64) }],
+        guiRuntime: { kind: 'electron', electronVersion: '43.3.0', nodeVersion: '24.18.1', modulesAbi: '148', napiVersion: '10', platform: process.platform, arch: process.arch, executableSha256: '8'.repeat(64) },
+        hostRuntime: { kind: 'node', nodeVersion: '24.14.0', modulesAbi: '137', napiVersion: '10', platform: process.platform, arch: process.arch, executableSha256: '9'.repeat(64) }
+      })
+      const hostdBytes = Buffer.from('packaged-hostd')
+      await Promise.all([
+        mkdir(path.dirname(attestationPath), { recursive: true }),
+        mkdir(path.dirname(hostdPath), { recursive: true })
+      ])
+      await Promise.all([
+        writeFile(attestationPath, attestationBytes),
+        writeFile(hostdPath, hostdBytes)
+      ])
+
+      await expect(bundledHostdBuildIdentity(
+        { isPackaged: true, getAppPath: () => appRoot },
+        resources
+      )).resolves.toEqual({
+        contractVersion: 1,
+        bundleSha256: createHash('sha256').update(hostdBytes).digest('hex'),
+        runtimeTrustAnchorId: createHash('sha256').update(attestationBytes).digest('hex')
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('uses the build output as the development seed without probing it', () => {
