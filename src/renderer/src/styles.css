@@ -1196,52 +1196,36 @@ code {
 }
 
 .attention-list small {
+  display: flex;
+  min-inline-size: 0;
+  gap: 0.25rem;
+  overflow: hidden;
   color: var(--color-text-muted);
   font-size: 0.6875rem;
-}
-
-.attention-diagnostic {
-  display: grid;
-  gap: 0.15rem;
-  margin-block-start: 0.35rem;
-  padding: 0.4rem 3.05rem 0.4rem 0.45rem;
-  color: var(--color-text-secondary);
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-  user-select: text;
-  background: color-mix(in oklch, var(--color-danger-soft) 58%, var(--color-surface-raised));
-  border: 1px solid color-mix(in oklch, var(--color-danger) 18%, var(--color-border));
-  border-radius: var(--radius-sm);
-}
-
-.attention-diagnostic code {
-  color: var(--color-danger);
-  font-family: var(--font-mono);
-  font-size: 0.625rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.attention-diagnostic span,
-.attention-diagnostic em {
-  color: var(--color-text-muted);
-  font-size: 0.6875rem;
-  font-style: normal;
   white-space: normal;
 }
 
-.attention-diagnostic em {
-  color: var(--color-text-secondary);
+.attention-list small bdi,
+.attention-list small span:last-child {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .attention-list__item--diagnostic {
   position: relative;
 }
 
+.attention-list__item--diagnostic > button:first-child {
+  padding-inline-end: 3.35rem;
+}
+
 .attention-list button.attention-diagnostic__copy {
   position: absolute;
   z-index: 1;
   inset-inline-end: 0.45rem;
-  inset-block-end: 0.45rem;
+  inset-block-start: 50%;
   display: grid;
   grid-template-columns: 1fr;
   place-items: center;
@@ -1254,6 +1238,7 @@ code {
   background: color-mix(in oklch, var(--color-surface-raised) 92%, transparent);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
+  translate: 0 -50%;
 }
 
 .attention-list button.attention-diagnostic__copy:hover {
@@ -5376,6 +5361,21 @@ dialog.sheet.models-sheet {
   padding: 0.05rem 0.25rem;
   background: var(--color-surface-raised);
   border-radius: var(--radius-sm);
+}
+
+.provider-setup-note__steps {
+  display: grid;
+  gap: 0.28rem;
+  padding-inline-start: 1.15rem;
+  margin: 0.45rem 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-caption);
+  line-height: 1.45;
+}
+
+.provider-setup-note__steps li::marker {
+  color: var(--color-text-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .provider-setup-note .provider-setup-note__storage {

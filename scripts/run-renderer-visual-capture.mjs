@@ -109,7 +109,7 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     result.visualState !== visualState ||
     result.surface !== surface ||
     result.stateEvidence?.expectedTextPresent !== true ||
-    (name.startsWith('desktop-') && name !== 'desktop-idle' && name !== 'desktop-end-pending-390' && name !== 'desktop-extension-question' && result.stateEvidence?.composerStatusVisible !== true) ||
+    (['desktop-prompt-admission', 'desktop-prompt-proof-390', 'desktop-stop-proof-390', 'desktop-uncertain-320'].includes(name) && result.stateEvidence?.composerStatusVisible !== true) ||
     (name === 'desktop-end-pending-390' && result.stateEvidence?.composerStatusVisible !== false) ||
     ((name === 'desktop-extension-question' || name === 'mobile-extension-question-390') && (
       result.stateEvidence?.extensionQuestionVisible !== true ||

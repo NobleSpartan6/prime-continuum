@@ -63,6 +63,14 @@ Reviewed on 2026-08-13.
   depends on: disconnected workers no longer report ready, timed-out stops
   finish cleanup, zombies are not considered alive, and stale registrations
   self-heal when a session is opened or resumed.
+- The pinned provider and RPC documentation confirms that `/login` is an
+  interactive TUI flow for both subscription OAuth and stored API keys. The RPC
+  command set has no login method, and built-in TUI commands are not exposed by
+  `get_commands` or executable through `prompt`. Continuim therefore keeps its
+  verified native OAuth action limited to `openai-codex`; every other provider
+  uses an explicit host handoff and an authoritative catalog recheck. That
+  handoff names the host-owned `PRIME_AGENT_CODING_AGENT_DIR` boundary because
+  an ambient Prime Agent terminal otherwise defaults to a different profile.
 - The pinned `docs/extensions.md`, `docs/rpc.md`, public
   `DaemonAgentConnection`, and daemon tests were reviewed for native extension
   UI. Continuim advertises `supportsExtensionUi: true` only through the verified

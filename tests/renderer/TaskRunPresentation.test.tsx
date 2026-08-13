@@ -17,6 +17,7 @@ function baseline(overrides: Partial<TaskRunPresentationInput> = {}): TaskRunPre
     endReadyToFinish: false,
     endPhase: undefined,
     modelReady: true,
+    snapshotFresh: true,
     activity: { live: false, fresh: true },
     receipt: { state: 'idle' },
     authority: {
@@ -25,6 +26,7 @@ function baseline(overrides: Partial<TaskRunPresentationInput> = {}): TaskRunPre
       conflictingMutation: false,
       canStart: true,
       canStop: false,
+      canEnd: false,
       canFinishEnd: false,
       canReview: true,
       canSetUpModel: true,
@@ -60,6 +62,7 @@ function randomInput(random: () => number): TaskRunPresentationInput {
     endOperationPresent: bool(),
     endReadyToFinish: bool(),
     modelReady: bool(),
+    snapshotFresh: bool(),
     activity: { live: bool(), fresh: bool() },
     receipt: {
       state: pick(random, ['idle', 'sending', 'sent', 'queued', 'waiting_for_connection', 'uncertain', 'rejected'] as const),
@@ -73,6 +76,7 @@ function randomInput(random: () => number): TaskRunPresentationInput {
       conflictingMutation: bool(),
       canStart: bool(),
       canStop: bool(),
+      canEnd: bool(),
       canFinishEnd: bool(),
       canReview: bool(),
       canSetUpModel: bool(),
@@ -110,22 +114,33 @@ describe('taskRunPresentation', () => {
           expect(input.authority.canReview).toBe(true)
           break
         case 'finish_end':
+          expect(input.snapshotFresh).toBe(true)
           expect(input.authority.mutation).toBe(true)
           expect(input.authority.conflictingMutation).toBe(false)
           expect(input.authority.canFinishEnd).toBe(true)
           expect(input.endReadyToFinish).toBe(true)
           break
+        case 'end_session':
+          expect(input.snapshotFresh).toBe(true)
+          expect(input.authority.mutation).toBe(true)
+          expect(input.authority.conflictingMutation).toBe(false)
+          expect(input.authority.canEnd).toBe(true)
+          expect(input.sessionNeedsRecovery).toBe(true)
+          break
         case 'stop':
+          expect(input.snapshotFresh).toBe(true)
           expect(input.authority.mutation).toBe(true)
           expect(input.authority.conflictingMutation).toBe(false)
           expect(input.authority.canStop).toBe(true)
           break
         case 'submit':
+          expect(input.snapshotFresh).toBe(true)
           expect(input.authority.mutation).toBe(true)
           expect(input.authority.conflictingMutation).toBe(false)
           expect(input.authority.canStart).toBe(true)
           break
         case 'setup_model':
+          expect(input.snapshotFresh).toBe(true)
           expect(input.authority.mutation).toBe(true)
           expect(input.authority.conflictingMutation).toBe(false)
           expect(input.authority.canSetUpModel).toBe(true)
@@ -189,9 +204,46 @@ describe('taskRunPresentation', () => {
         conflictingMutation: false,
         canStop: false,
       }
+      input.snapshotFresh = true
 
       expect(taskRunPresentation(input).kind).not.toBe('working')
     }
+  })
+
+  it('fails closed on cached state even when stale authority claims mutation grants', () => {
+    const presentation = taskRunPresentation(baseline({
+      snapshotFresh: false,
+      taskState: 'running',
+      activity: { live: true, fresh: true },
+      authority: {
+        ...baseline().authority,
+        canStart: true,
+        canStop: true,
+        canEnd: true,
+      },
+    }))
+
+    expect(presentation).toEqual({
+      kind: 'stale',
+      headline: 'Cached status',
+      detail: 'Last reported working. Waiting for a fresh session update.',
+      tone: 'muted',
+      iconKey: 'refresh',
+    })
+  })
+
+  it('keeps uncertain control outcomes dominant over cached projection data', () => {
+    const presentation = taskRunPresentation(baseline({
+      snapshotFresh: false,
+      taskState: 'running',
+      receipt: { state: 'uncertain', operation: 'abort' },
+    }))
+
+    expect(presentation).toMatchObject({
+      kind: 'needs_attention',
+      headline: 'Stop needs review',
+      primaryAction: { kind: 'review_status' },
+    })
   })
 
   it('follows the authoritative Ready to Starting to Working to Stopping to Ready trace', () => {
@@ -216,6 +268,29 @@ describe('taskRunPresentation', () => {
     expect([ready, starting, working, stopping, returnedReady].map((input) =>
       taskRunPresentation(input).kind,
     )).toEqual(['ready', 'starting', 'working', 'stopping', 'ready'])
+  })
+
+  it('follows one-action End recovery from ready through ending to ended', () => {
+    const restart = baseline({
+      sessionNeedsRecovery: true,
+      authority: { ...baseline().authority, canStart: false, canEnd: true },
+    })
+    const ending = baseline({
+      endOperationPresent: true,
+      endPhase: 'kill_dispatching',
+      authority: { ...baseline().authority, canStart: false },
+    })
+    const ended = baseline({
+      sessionEnded: true,
+      authority: { ...baseline().authority, canStart: false },
+    })
+
+    expect(taskRunPresentation(restart)).toMatchObject({
+      kind: 'needs_attention',
+      primaryAction: { kind: 'end_session' },
+    })
+    expect(taskRunPresentation(ending)).toMatchObject({ kind: 'ending' })
+    expect(taskRunPresentation(ended)).toMatchObject({ kind: 'ended' })
   })
 
   it('promotes current resident activity to Working after the prompt receipt retires', () => {
@@ -246,8 +321,8 @@ describe('taskRunPresentation', () => {
     expect(presentation).toMatchObject({
       kind: 'starting',
       headline: 'Starting',
+      primaryAction: { kind: 'stop' },
     })
-    expect(presentation.primaryAction).toBeUndefined()
     },
   )
 

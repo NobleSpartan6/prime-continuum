@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-The reviewed working tree contains no confirmed credential, private key, OAuth token, or developer-specific absolute path intended for publication. Synthetic secrets and paths remain in tests where they verify redaction and rejection behavior. Public repository defaults now ignore common local credential files, document the runtime trust boundary, provide a private-reporting policy, and retain notices for copied development skills.
+The reviewed working tree contains no confirmed credential, private key, OAuth token, or developer-specific absolute path intended for publication. Synthetic secrets and paths remain in tests where they verify redaction and rejection behavior. Public repository defaults now ignore common local credential files, document the runtime trust boundary, provide a private-reporting policy, protect `main` with the cross-platform source gates, and retain notices for copied development skills.
 
 This is a source review, not a guarantee about Git history, packaged dependency licenses, or a developer's untracked files. Run a dedicated history and artifact scanner before the first public release tag.
 
@@ -43,18 +43,20 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 - The GitHub workflow uses frozen dependencies, pinned action commits, read-only contents permission, typechecking, tests, and a source build on Linux, Windows, and macOS.
 - Copied development skills now have an attribution index and the Apache 2.0 text required by the Playwright CLI skill.
 - GitHub reports the repository as public, with private vulnerability reporting, Dependabot security updates, secret scanning, and push protection enabled.
+- The protected `main` branch requires pull requests, up-to-date Linux, Windows, and macOS source gates, linear history, and resolved review conversations; force-pushes and branch deletion are disabled.
 - The repository has a public description and focused `ai-agents`, `coding-agent`, `electron`, `local-first`, and `rlm` topics.
 
 ## Publication checks still requiring an owner
 
-1. Configure branch protection or a repository ruleset for the source gates; GitHub currently reports none.
-2. Add a current, real-product social preview after the authenticated packaged journey is proven. Do not use simulation fixtures as launch evidence.
-3. Run an organization-approved secret and license scan over full Git history and the final release artifacts.
-4. Do not publish binary releases until the signing findings above are closed.
+1. Add a current, real-product social preview after the authenticated packaged journey is proven. Do not use simulation fixtures as launch evidence.
+2. Run an organization-approved secret and license scan over the final release artifacts.
+3. Do not publish binary releases until the signing findings above are closed.
 
 ## Verification performed
 
 - High-signal current-tree scans for private-key headers, common provider-token prefixes, credential-bearing URLs, credential-shaped filenames, and developer-specific home paths found no publishable secret. Matching values in tests were synthetic redaction fixtures.
+- GitHub's repository-history secret scanner and Dependabot API each reported zero open alerts.
+- The installed dependency inventory contained 633 unique name/version entries and no package without a declared license. This is inventory evidence, not legal approval or a final-artifact license scan.
 - Local Markdown targets in the public repository documents resolved successfully.
 - Every GitHub YAML file parsed successfully.
 - `corepack pnpm typecheck` passed.
