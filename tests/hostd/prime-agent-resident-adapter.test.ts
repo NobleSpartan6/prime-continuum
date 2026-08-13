@@ -309,6 +309,8 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined;
   }>;
   abortCalls: number;
+  extensionUiResponseCalls: Array<{ requestId: string; response: Readonly<Record<string, unknown>> }>;
+  ephemeralProjectionChanges: ResidentSessionBinding[];
   promoteCalls: number;
   availableModelsHandler?: () => Promise<unknown> | unknown;
   setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
@@ -317,6 +319,10 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
   ) => Promise<void> | void;
   abortHandler?: () => Promise<void> | void;
+  extensionUiResponseHandler?: (
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ) => Promise<void> | void;
   promoteHandler?: () => Promise<void> | void;
   promoteAvailable: boolean;
   attachHandler?: (attachmentOrdinal: number) => Promise<void> | void;
@@ -324,6 +330,7 @@ interface HarnessState {
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
   authorizeResidentKillInvocation?: ResidentKillInvocationAuthorizer;
+  now?: () => Date;
 }
 
 function createHarness(overrides: Partial<HarnessState> = {}) {
@@ -353,6 +360,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     setModelCalls: [],
     promptCalls: [],
     abortCalls: 0,
+    extensionUiResponseCalls: [],
+    ephemeralProjectionChanges: [],
     promoteCalls: 0,
     promoteAvailable: true,
     ...overrides,
@@ -491,6 +500,13 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           state.chronology.push("abort");
           await state.abortHandler?.();
         },
+        respondToExtensionUiRequest: async (
+          requestId: string,
+          response: Readonly<Record<string, unknown>>,
+        ) => {
+          state.extensionUiResponseCalls.push({ requestId, response });
+          await state.extensionUiResponseHandler?.(requestId, response);
+        },
         promoteToResident: state.promoteAvailable
           ? async () => {
               state.promoteCalls += 1;
@@ -537,6 +553,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
   };
 
   const adapter = new PrimeAgentResidentAdapter({
+    hostId: "host-local",
     socketPath: DAEMON_SOCKET,
     executable: RUNTIME_NODE,
     cliEntrypoint: RUNTIME_CLI,
@@ -564,6 +581,9 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
         await state.publishModelSelectionProjectionHandler(command, projectionBinding, projection);
       }
     },
+    publishEphemeralProjectionChange: (projectionBinding) => {
+      state.ephemeralProjectionChanges.push(projectionBinding);
+    },
     authorizeResidentKillInvocation: state.authorizeResidentKillInvocation,
     spawnFactory: (executable, argv, options) => {
       state.spawnCalls.push({ executable, argv, options });
@@ -574,7 +594,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     startupTimeoutMs: 100,
     requestTimeoutMs: 100,
     wait: async (milliseconds) => void (await state.waitHandler?.(milliseconds)),
-    now: () => new Date("2026-08-06T17:00:00.000Z"),
+    now: state.now ?? (() => new Date("2026-08-06T17:00:00.000Z")),
   });
 
   const emit = async (event: unknown): Promise<void> => {
@@ -1133,7 +1153,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: true,
         telemetryDisabled: true,
       },
@@ -1529,6 +1549,125 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
     );
     expect(cleanupError.details).toMatchObject({ state: "promotion_unknown" });
     expect(state.disposeCalls).toBe(0);
+  });
+});
+
+describe("PrimeAgentResidentAdapter extension UI", () => {
+  it("normalizes only the four bounded dialog methods on their exact live attachment", async () => {
+    const { adapter, emit } = createHarness();
+    await adapter.attachResident(binding());
+    const dialogs = [
+      { id: "request-select", method: "select", payload: { title: "Choose", options: ["A", "B"] } },
+      { id: "request-confirm", method: "confirm", payload: { title: "Continue?", message: "Run it", timeout: 5_000 } },
+      { id: "request-input", method: "input", payload: { title: "Name", placeholder: "value" } },
+      { id: "request-editor", method: "editor", payload: { title: "Edit", prefill: "line one" } },
+    ] as const;
+    for (const request of dialogs) await emit({ type: "extension_ui_request", request });
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-notify", method: "notify", payload: { message: "ignored" } },
+    });
+
+    const requests = adapter.listResidentExtensionUiRequests(binding());
+    expect(requests.map((request) => request.method)).toEqual(["select", "confirm", "input", "editor"]);
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        hostId: "host-local",
+        threadId: "thread-1",
+        executionGenerationId: "generation-1",
+        requestId: "request-select",
+        method: "select",
+        options: ["A", "B"],
+      }),
+      expect.objectContaining({ requestId: "request-confirm", method: "confirm", timeoutMs: 5_000 }),
+    ]));
+    expect(requests.every((request) => /^[a-f0-9]{64}$/.test(request.requestDigest))).toBe(true);
+    expect(requests.every((request) => /^[a-f0-9]{64}$/.test(request.bindingFingerprint))).toBe(true);
+  });
+
+  it("keeps the first timestamp for duplicate events and retires timed-out dialog truthfully", async () => {
+    let current = new Date("2026-08-06T17:00:00.000Z");
+    const { adapter, emit, state } = createHarness({ now: () => current });
+    const connection = await adapter.attachResident(binding());
+    const request = {
+      id: "request-timeout",
+      method: "input",
+      payload: { title: "Value", timeout: 1_000 },
+    } as const;
+    await emit({ type: "extension_ui_request", request });
+    current = new Date("2026-08-06T17:00:00.500Z");
+    await emit({ type: "extension_ui_request", request });
+    expect(adapter.listResidentExtensionUiRequests(binding())).toHaveLength(1);
+    const liveRequest = adapter.listResidentExtensionUiRequests(binding())[0];
+    expect(liveRequest?.receivedAt).toBe("2026-08-06T17:00:00.000Z");
+
+    current = new Date("2026-08-06T17:00:01.000Z");
+    expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+    if (!liveRequest) throw new Error("timed dialog fixture missing");
+    await expect(connection.respondToExtensionUiRequest(liveRequest, { kind: "value", value: "late" }))
+      .rejects.toMatchObject({ code: "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED" });
+    expect(state.extensionUiResponseCalls).toEqual([]);
+    await emit({ type: "extension_ui_request", request });
+    expect(await adapter.isLive("thread-1", "generation-1")).toBe(true);
+    expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+    await emit({
+      type: "extension_ui_request",
+      request: { ...request, payload: { ...request.payload, title: "Changed" } },
+    });
+    expect(await adapter.isLive("thread-1", "generation-1")).toBe(false);
+  });
+
+  it("publishes dialog expiry even when no projection read occurs", async () => {
+    vi.useFakeTimers();
+    try {
+      const { adapter, emit, state } = createHarness();
+      await adapter.attachResident(binding());
+      await emit({
+        type: "extension_ui_request",
+        request: { id: "request-timer", method: "input", payload: { title: "Value", timeout: 1_000 } },
+      });
+      expect(adapter.listResidentExtensionUiRequests(binding())).toHaveLength(1);
+      expect(state.ephemeralProjectionChanges).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+      expect(state.ephemeralProjectionChanges).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires queued dialogs synchronously before invoking either upstream response", async () => {
+    const firstResponse = deferred();
+    const { adapter, emit, state } = createHarness({
+      extensionUiResponseHandler: async (requestId) => {
+        if (requestId === "request-a") await firstResponse.promise;
+      },
+    });
+    const connection = await adapter.attachResident(binding());
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-a", method: "input", payload: { title: "First" } },
+    });
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-b", method: "input", payload: { title: "Second" } },
+    });
+    const [requestA, requestB] = connection.listExtensionUiRequests();
+    if (!requestA || !requestB) throw new Error("extension UI queue fixture missing");
+
+    const responseA = connection.respondToExtensionUiRequest(requestA, { kind: "value", value: "A" });
+    expect(connection.listExtensionUiRequests().map((request) => request.requestId)).toEqual(["request-b"]);
+    await vi.waitFor(() => expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a"]));
+
+    const responseB = connection.respondToExtensionUiRequest(requestB, { kind: "value", value: "B" });
+    expect(connection.listExtensionUiRequests()).toEqual([]);
+    expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a"]);
+
+    firstResponse.resolve();
+    await expect(Promise.all([responseA, responseB])).resolves.toEqual([undefined, undefined]);
+    expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a", "request-b"]);
   });
 });
 
@@ -1951,7 +2090,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: false,
         telemetryDisabled: true,
       },

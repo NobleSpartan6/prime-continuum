@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   InProgressStreamSchema,
+  ResidentExtensionUiRequestSchema,
   ResidentBrowserExecutionSchema,
   ResidentLifecycleDispositionSchema,
   ResidentLifecycleStatusSchema,
@@ -8,6 +9,7 @@ import {
 } from '../../src/shared/protocol'
 import {
   parseInProgressStream,
+  parseResidentExtensionUiRequest,
   parseResidentBrowserExecution,
   parseResidentLifecycleDisposition,
   parseResidentLifecycleLookupResult,
@@ -164,6 +166,33 @@ describe('renderer startup protocol guards', () => {
       ],
       RuntimeResourceInventorySchema,
       parseRuntimeResourceInventory,
+    )
+  })
+
+  it('matches the exact bounded extension UI request schema', () => {
+    const authority = {
+      interactionVersion: 1,
+      hostId: 'host-1',
+      threadId: 'thread-1',
+      executionGenerationId: 'generation-1',
+      bindingFingerprint: 'a'.repeat(64),
+      requestId: 'request-1',
+      requestDigest: 'b'.repeat(64),
+      receivedAt: '2026-08-10T20:00:00.000Z',
+    }
+    expectParity(
+      [
+        { ...authority, method: 'select', title: 'Choose a branch', options: ['main', 'release'] },
+        { ...authority, method: 'confirm', title: 'Apply changes?', message: '' },
+        { ...authority, method: 'input', title: 'Name this task', placeholder: 'Task name' },
+        { ...authority, method: 'editor', title: 'Revise the plan', prefill: '' },
+        { ...authority, method: 'select', title: 'Duplicate options', options: ['main', 'main'] },
+        { ...authority, method: 'input', title: 'Unexpected bytes', extra: true },
+        { ...authority, method: 'editor', title: 'Oversized', prefill: 'x'.repeat(65_537) },
+        { ...authority, method: 'confirm', title: '', message: 'Missing title' },
+      ],
+      ResidentExtensionUiRequestSchema,
+      parseResidentExtensionUiRequest,
     )
   })
 

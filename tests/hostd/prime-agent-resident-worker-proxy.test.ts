@@ -34,7 +34,7 @@ interface ProxyModule {
       options: Readonly<{
         closeClientOnDispose: true;
         sendClientEnv: false;
-        supportsExtensionUi: false;
+        supportsExtensionUi: true;
         ownedSession: boolean;
         telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
@@ -58,6 +58,10 @@ interface RuntimeFixtureOptions {
   readonly models?: () => Promise<unknown>;
   readonly dispose?: () => Promise<void>;
   readonly promote?: () => Promise<void>;
+  readonly respondToExtensionUi?: (
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ) => Promise<void>;
 }
 
 interface RuntimeFixtureState {
@@ -100,6 +104,7 @@ class FakeConnection {
   disposeCalls = 0;
   abortCalls = 0;
   promotionCalls = 0;
+  readonly extensionUiResponses: Array<{ requestId: string; response: Readonly<Record<string, unknown>> }> = [];
 
   constructor(client: FakeClient, options: RuntimeFixtureOptions) {
     this.client = client;
@@ -147,6 +152,14 @@ class FakeConnection {
 
   async abort(): Promise<void> {
     this.abortCalls += 1;
+  }
+
+  async respondToExtensionUiRequest(
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
+    this.extensionUiResponses.push({ requestId, response });
+    await this.options.respondToExtensionUi?.(requestId, response);
   }
 
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void {
@@ -381,7 +394,7 @@ async function attach(
   const connection = await module.DaemonAgentConnection.attach(client, "active-session", {
     closeClientOnDispose: true,
     sendClientEnv: false,
-    supportsExtensionUi: false,
+    supportsExtensionUi: true,
     ownedSession,
     telemetryDisabled: true,
     recoverDaemon,
@@ -437,7 +450,7 @@ describe("Prime Agent resident Worker proxy", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: true,
         telemetryDisabled: true,
       },
@@ -445,6 +458,23 @@ describe("Prime Agent resident Worker proxy", () => {
     await connection.promoteToResident();
     expect(fixture.state.connection.promotionCalls).toBe(1);
 
+    await connection.dispose();
+    await loader.close();
+  });
+
+  it("forwards one bounded extension UI response through the resident Worker", async () => {
+    const fixture = runtimeFixture();
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await connection.respondToExtensionUiRequest?.("request-1", { confirmed: true });
+
+    expect(fixture.state.connection.extensionUiResponses).toEqual([
+      { requestId: "request-1", response: { confirmed: true } },
+    ]);
+    await expect(
+      connection.respondToExtensionUiRequest?.("request-2", { value: "x".repeat(65_537) }),
+    ).rejects.toThrow("Extension UI response is invalid");
     await connection.dispose();
     await loader.close();
   });

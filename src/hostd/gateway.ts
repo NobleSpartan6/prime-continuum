@@ -1,7 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
-import { CommandEnvelopeSchema, type CommandEnvelope } from "../shared/protocol";
+import {
+  CommandEnvelopeSchema,
+  type CommandEnvelope,
+  type ResidentExtensionUiRequest,
+} from "../shared/protocol";
 import type { ResidentSessionBinding } from "./resident-runtime";
 import type {
   ResidentAbortIdleObservedEvent,
@@ -9,6 +13,7 @@ import type {
   ResidentDispatchLease,
   ResidentPromptIdleObservedEvent,
   ResidentPromptReconciliationLease,
+  ExtensionUiResponseLease,
 } from "./store";
 
 export const PRIME_RPC_MAX_COMMAND_BYTES = 128 * 1024;
@@ -45,6 +50,7 @@ export interface PrimeAgentGatewayEvent {
 export interface GatewayDispatchContext {
   readonly residentBinding?: ResidentSessionBinding;
   readonly residentDispatch?: ResidentDispatchLease;
+  readonly extensionUiResponse?: ExtensionUiResponseLease;
 }
 
 export interface PrimeAgentProjectionChange {
@@ -83,6 +89,8 @@ export interface PrimeAgentGateway {
    * generation-only liveness cannot prove resident control quiescence.
    */
   isResidentBindingLive?(binding: ResidentSessionBinding): Promise<boolean>;
+  /** Process-local, path-free dialogs owned by one exact prepared connection. */
+  listResidentExtensionUiRequests?(binding: ResidentSessionBinding): readonly ResidentExtensionUiRequest[];
   /** Exact-binding proof that the packaged browser command surface passed verification. */
   isResidentBrowserExecutionReady?(binding: ResidentSessionBinding): Promise<boolean>;
   submit(command: CommandEnvelope, context?: GatewayDispatchContext): Promise<GatewayAdmission>;
@@ -164,6 +172,11 @@ export function mapHostCommandToPrimeRpc(command: CommandEnvelope): PrimeRpcRequ
       throw new GatewayError(
         "RPC_COMMAND_UNSUPPORTED",
         "Approval resolution requires a daemon adapter with approval-object support",
+      );
+    case "extension_ui.respond":
+      throw new GatewayError(
+        "RPC_COMMAND_UNSUPPORTED",
+        "Extension UI responses require an authority-bound resident daemon adapter",
       );
     case "model.select":
       throw new GatewayError(

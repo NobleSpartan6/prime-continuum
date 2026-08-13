@@ -1,4 +1,8 @@
 import { z } from "zod";
+import type {
+  ExtensionUiDialogResponse,
+  ResidentExtensionUiRequest,
+} from "../shared/protocol";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import { SessionCursorSchema, type SessionCursor } from "../shared/protocol";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
@@ -509,7 +513,8 @@ export function sanitizeResidentDaemonEnvironment(
       normalized === "PRIME_AGENT_BUILD_ID" ||
       normalized === "PRIME_AGENT_LAUNCHER_PATH" ||
       normalized === "NODE_OPTIONS" ||
-      normalized === "NODE_PATH"
+      normalized === "NODE_PATH" ||
+      normalized === "NAPI_RS_NATIVE_LIBRARY_PATH"
     ) {
       continue;
     }
@@ -1030,6 +1035,13 @@ export interface ResidentRuntimeConnection {
   reconcileAcknowledgedAbortIdle(
     request: ResidentAbortIdleReconciliationRequest,
   ): Promise<ResidentAbortIdleAuthorityEvidence>;
+  /** Current process-local dialog requests for this exact live attachment. */
+  listExtensionUiRequests(): readonly ResidentExtensionUiRequest[];
+  /** One-shot response; request identity and digest must still match live state. */
+  respondToExtensionUiRequest(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<void>;
   /** Detach the client-side connection without stopping the resident worker. */
   detach(): Promise<void>;
 }

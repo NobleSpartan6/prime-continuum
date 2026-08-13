@@ -9,6 +9,7 @@ export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as co
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const RUNTIME_OAUTH_ATTEMPT_CAPABILITY = "runtime_oauth_attempt_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
+export const RESIDENT_EXTENSION_UI_CAPABILITY = "resident_extension_ui_v1" as const;
 export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
 export const RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY =
   "resident_registered_workspace_lifecycle_v1" as const;

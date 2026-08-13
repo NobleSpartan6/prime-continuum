@@ -84,6 +84,7 @@ import type {
   CandidateEvaluationSnapshot,
   CandidateEvaluationStartRequest,
   CandidateEvaluationStatus,
+  ResidentExtensionUiRequest,
 } from '../../shared/protocol'
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
@@ -95,6 +96,7 @@ import {
   type TaskRunPresentation,
 } from './TaskRunPresentation'
 import { DeferredModelsDialog } from './DeferredModelsDialog'
+import { PrimeInteractionPrompt } from './PrimeInteractionPrompt'
 import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, Suspense, lazy, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { AgentLaunchpadProps } from './AgentLaunchpad'
 
@@ -610,6 +612,18 @@ function composerActionAuthorityKey(hostId: string, thread: ThreadSummary): stri
   return `${hostId}\u0000${thread.remoteId ?? thread.id}\u0000${thread.executionGenerationId ?? ''}`
 }
 
+function extensionUiRequestKey(request: ResidentExtensionUiRequest): string {
+  return [
+    request.hostId,
+    request.threadId,
+    request.executionGenerationId,
+    request.bindingFingerprint,
+    request.requestId,
+    request.requestDigest,
+    request.method,
+  ].join('\u0000')
+}
+
 function rememberComposerDraft(drafts: Map<string, string>, authorityKey: string, text: string): void {
   drafts.delete(authorityKey)
   if (!text) return
@@ -943,6 +957,7 @@ function hudStatusPresentation(
     needsWorkbench:
       presentation.kind === 'disconnected' ||
       presentation.kind === 'needs_attention' ||
+      presentation.kind === 'waiting_for_response' ||
       presentation.kind === 'model_setup' ||
       presentation.primaryAction?.kind === 'finish_end',
   }
@@ -1356,6 +1371,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     state: 'idle',
     message: '',
   })
+  const [retainedResidentExtensionUiRequest, setRetainedResidentExtensionUiRequest] =
+    useState<ResidentExtensionUiRequest | null>(null)
+  const [residentExtensionUiPromptEpoch, setResidentExtensionUiPromptEpoch] = useState(0)
   const addComputerTriggerRef = useRef<HTMLButtonElement>(null)
   const addComputerReturnTargetRef = useRef<HTMLElement | null>(null)
   const residentProvisionReturnTargetRef = useRef<HTMLElement | null>(null)
@@ -1577,6 +1595,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const composerDraftsRef = useRef(new Map<string, string>())
   const composerDraftAuthorityKeyRef = useRef('')
   const composerHandleRef = useRef<ComposerHandle | null>(null)
+  const residentExtensionUiCompletionTimerRef = useRef<number | undefined>(undefined)
+  const suppressedResidentExtensionUiRequestKeysRef = useRef(new Set<string>())
   const hudSelectionRequestRef = useRef('')
   const previousHudTargetKeyRef = useRef('')
   const hudFocusKeyRef = useRef('')
@@ -1748,6 +1768,15 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const selectedRuntimeHasLiveActivity = runtimeHasLiveActivity(selectedRuntime, snapshot?.agents ?? [])
   const selectedThreadIsMaterialized = Boolean(snapshot && selectedThread && snapshot.selectedThreadId === selectedThread.id)
   const selectedThreadIsEmpty = selectedThread?.transcript.length === 0
+  const liveResidentExtensionUiRequests = selectedThreadIsMaterialized
+    ? (snapshot?.residentExtensionUiRequests ?? []).filter(
+        (request) => !suppressedResidentExtensionUiRequestKeysRef.current.has(extensionUiRequestKey(request)),
+      )
+    : []
+  const selectedResidentExtensionUiRequests = retainedResidentExtensionUiRequest
+    ? [retainedResidentExtensionUiRequest]
+    : liveResidentExtensionUiRequests
+  const residentExtensionUiOwnsAttention = selectedResidentExtensionUiRequests.length > 0
   const composerDraftAuthorityKey = selectedHost && selectedThread
     ? composerActionAuthorityKey(selectedHost.id, selectedThread)
     : ''
@@ -1779,7 +1808,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     })
   }, [clearComposerValidation, composerDraftAuthorityKey])
 
-  const canStartResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.startResidentTurn ?? false)
+  const canStartResidentTurn = selectedThreadIsMaterialized &&
+    !residentExtensionUiOwnsAttention &&
+    (snapshot?.operations.startResidentTurn ?? false)
   const canStopResidentTurn = selectedThreadIsMaterialized && (snapshot?.operations.stopResidentTurn ?? false)
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   const canLoadModelCatalog = api.environment === 'native' && (snapshot?.operations.modelCatalog ?? false)
@@ -1891,6 +1922,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     taskState: selectedThread?.status ?? 'idle',
     sessionEnded: selectedThread?.residentLifecycle?.state === 'ended',
     sessionNeedsRecovery: selectedSessionNeedsRecovery,
+    extensionResponsePending: residentExtensionUiOwnsAttention,
     endOperationPresent: selectedResidentEnd !== undefined || composerReceipt.operation === 'end',
     endReadyToFinish: selectedResidentEndReadyForOneAction,
     endPhase: selectedResidentEnd?.lastStatus?.phase === 'ending' ||
@@ -1931,16 +1963,92 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   })
   const launchpadSessionState: AgentLaunchpadProps['sessionState'] = selectedTaskRun.kind === 'ready'
     ? 'ready'
-    : selectedTaskRun.kind === 'needs_attention'
+    : selectedTaskRun.kind === 'needs_attention' || selectedTaskRun.kind === 'waiting_for_response'
       ? selectedSessionNeedsRecovery ? 'needs-recovery' : 'needs-input'
       : 'preparing'
   const selectedThreadUsesLaunchpad = Boolean(
     selectedThreadIsEmpty &&
+    !residentExtensionUiOwnsAttention &&
     !selectedRuntimeHasLiveActivity &&
     !selectedResidentEnd &&
     selectedThread?.residentLifecycle?.state !== 'ended' &&
     composerReceipt.operation !== 'end',
   )
+  const selectedExtensionUiAuthorityKey = selectedThread && selectedHost && selectedThread.executionGenerationId
+    ? [
+        selectedHost.id,
+        selectedThread.remoteId ?? selectedThread.id,
+        selectedThread.executionGenerationId,
+      ].join('\u0000')
+    : ''
+
+  useEffect(() => {
+    if (!retainedResidentExtensionUiRequest) return
+    const retainedAuthorityKey = [
+      retainedResidentExtensionUiRequest.hostId,
+      retainedResidentExtensionUiRequest.threadId,
+      retainedResidentExtensionUiRequest.executionGenerationId,
+    ].join('\u0000')
+    if (retainedAuthorityKey === selectedExtensionUiAuthorityKey) return
+    if (residentExtensionUiCompletionTimerRef.current !== undefined) {
+      window.clearTimeout(residentExtensionUiCompletionTimerRef.current)
+      residentExtensionUiCompletionTimerRef.current = undefined
+    }
+    setRetainedResidentExtensionUiRequest(null)
+  }, [retainedResidentExtensionUiRequest, selectedExtensionUiAuthorityKey])
+
+  useEffect(() => () => {
+    if (residentExtensionUiCompletionTimerRef.current !== undefined) {
+      window.clearTimeout(residentExtensionUiCompletionTimerRef.current)
+    }
+  }, [])
+
+  const respondToResidentExtensionUi = useCallback(async (
+    request: Parameters<NonNullable<RendererApi['respondToResidentExtensionUi']>>[0],
+    response: Parameters<NonNullable<RendererApi['respondToResidentExtensionUi']>>[1],
+  ) => {
+    if (residentExtensionUiCompletionTimerRef.current !== undefined) {
+      window.clearTimeout(residentExtensionUiCompletionTimerRef.current)
+      residentExtensionUiCompletionTimerRef.current = undefined
+    }
+    const requestKey = extensionUiRequestKey(request)
+    const suppressed = suppressedResidentExtensionUiRequestKeysRef.current
+    suppressed.delete(requestKey)
+    suppressed.add(requestKey)
+    while (suppressed.size > 128) {
+      const oldestKey = suppressed.values().next().value as string | undefined
+      if (!oldestKey) break
+      suppressed.delete(oldestKey)
+    }
+    setRetainedResidentExtensionUiRequest(request)
+    let result: Awaited<ReturnType<NonNullable<RendererApi['respondToResidentExtensionUi']>>>
+    if (!api.respondToResidentExtensionUi) {
+      result = {
+        state: 'rejected' as const,
+        retryable: false,
+        message: 'Prime Agent responses are unavailable in this build.',
+      }
+    } else {
+      result = await api.respondToResidentExtensionUi(request, response)
+    }
+    if (result.state === 'completed') {
+      residentExtensionUiCompletionTimerRef.current = window.setTimeout(() => {
+        residentExtensionUiCompletionTimerRef.current = undefined
+        setRetainedResidentExtensionUiRequest((current) =>
+          current && extensionUiRequestKey(current) === requestKey ? null : current,
+        )
+      }, 900)
+    }
+    return result
+  }, [api])
+  const dismissResidentExtensionUiResult = useCallback((request: ResidentExtensionUiRequest) => {
+    const requestKey = extensionUiRequestKey(request)
+    suppressedResidentExtensionUiRequestKeysRef.current.delete(requestKey)
+    setRetainedResidentExtensionUiRequest((current) =>
+      current && extensionUiRequestKey(current) === requestKey ? null : current,
+    )
+    setResidentExtensionUiPromptEpoch((current) => current + 1)
+  }, [])
   const activeHudTarget = hudState && hudState.state !== 'closed' ? hudState.target : undefined
   const activeHudTargetKey = activeHudTarget
     ? [
@@ -3159,6 +3267,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               </div>
             )}
             <Transcript thread={selectedThread} streamingActivity={selectedAgentActivity} />
+            <PrimeInteractionPrompt
+              key={`hud-extension-ui-${residentExtensionUiPromptEpoch}`}
+              requests={selectedResidentExtensionUiRequests}
+              onRespond={respondToResidentExtensionUi}
+              onDismissResult={dismissResidentExtensionUiResult}
+            />
             <Composer
               authorityKey={composerDraftAuthorityKey}
               initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
@@ -3929,6 +4043,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           ) : undefined}
         />
 
+        <PrimeInteractionPrompt
+          key={`workbench-extension-ui-${residentExtensionUiPromptEpoch}`}
+          requests={selectedResidentExtensionUiRequests}
+          onRespond={respondToResidentExtensionUi}
+          onDismissResult={dismissResidentExtensionUiResult}
+        />
         <Composer
               authorityKey={composerDraftAuthorityKey}
               initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
@@ -4791,6 +4911,8 @@ function SessionContinuity({
         : receipt.state === 'uncertain' || receipt.state === 'rejected'
           ? 'Review required'
           : 'Finishing session'
+    : presentation.kind === 'waiting_for_response'
+      ? 'Prime Agent asked a question'
     : presentation.kind === 'needs_attention'
       ? attentionCopy
       : sessionReportsActivity
@@ -4988,8 +5110,9 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   const canStopNow = canStopTurn && !disconnected
   const retryingStop = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable !== false
   const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
-  const controlMode = running || endLifecyclePresent
-  const canAct = endLifecyclePresent ? false : running ? canStopNow : canStartNow
+  const waitingForExtensionResponse = presentation.kind === 'waiting_for_response'
+  const controlMode = running || endLifecyclePresent || waitingForExtensionResponse
+  const canAct = waitingForExtensionResponse ? false : endLifecyclePresent ? false : running ? canStopNow : canStartNow
   const sessionRecoveryAvailable = Boolean(
     sessionNeedsRecovery &&
     !disconnected &&
@@ -5073,9 +5196,12 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   const textareaDisabled = !canStartNow
   const intentCopy = presentation.headline
 
-  if (endCompleted) {
+  if (endCompleted || waitingForExtensionResponse) {
     return (
-      <footer className="composer-wrap composer-wrap--compact composer-wrap--terminal">
+      <footer className={cx(
+        'composer-wrap composer-wrap--compact',
+        endCompleted && 'composer-wrap--terminal',
+      )}>
         <SessionContinuity
           connection={connection}
           authorityVerified={authorityVerified}
@@ -5242,6 +5368,8 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                     : endWaitingForControls
                       ? 'Waiting for resident controls'
                     : 'Prime Continuim is checking for completion automatically'
+                : waitingForExtensionResponse
+                ? 'Answer the question above to continue'
                 : running
                 ? disconnected
                   ? unavailableCopy
@@ -5256,7 +5384,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
             </span>
           </div>
           <div className="composer__primary-actions">
-            {((!endLifecyclePresent && !stopAwaitingProof && !stopOutcomeUnknown) || endReadyToFinish) &&
+            {!waitingForExtensionResponse && ((!endLifecyclePresent && !stopAwaitingProof && !stopOutcomeUnknown) || endReadyToFinish) &&
               !modelSetupOwnedByLaunchpad &&
               !modelSetupUnavailable && (
             <button

@@ -1,4 +1,6 @@
 import {
+  type ExtensionUiDialogResponse,
+  type ResidentExtensionUiRequest,
   type ResidentLifecycleStatus,
   type CandidateEvaluationPreflight,
   type CandidateEvaluationPreflightRequest,
@@ -15,6 +17,7 @@ import {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
@@ -26,6 +29,7 @@ import {
 } from '../../shared/capabilities'
 import {
   parseInProgressStream,
+  parseResidentExtensionUiRequest,
   parseResidentBrowserExecution,
   parseResidentLifecycleDisposition,
   parseResidentLifecycleLookupResult,
@@ -328,6 +332,8 @@ export interface WorkbenchSnapshot {
   localSetup?: LocalSetupSummary
   /** Bounded, path-free desktop ledger for fresh resident lifecycle recovery. */
   residentLifecycleOperations: ResidentLifecycleOperationSummary[]
+  /** Exact live Prime Agent dialog requests for the selected resident attachment. */
+  residentExtensionUiRequests?: ResidentExtensionUiRequest[]
   operations: {
     submitCommands: boolean
     startResidentTurn?: boolean
@@ -572,6 +578,11 @@ export type ResidentModelSelectionResult =
   | { state: 'rejected'; message: string; retryable: boolean }
   | { state: 'uncertain'; message: string; retryable: false }
 
+export type ResidentExtensionUiResponseResult =
+  | { state: 'completed'; message: string }
+  | { state: 'rejected'; message: string; retryable: boolean }
+  | { state: 'uncertain'; message: string; retryable: false }
+
 export interface RuntimeOAuthRequest {
   hostId: string
   providerId: string
@@ -605,6 +616,10 @@ export interface RendererApi {
   activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult>
+  respondToResidentExtensionUi?(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<ResidentExtensionUiResponseResult>
   startRuntimeOAuth?(
     request: RuntimeOAuthRequest,
     onProgress: (progress: RuntimeOAuthProgress) => void,
@@ -2541,6 +2556,40 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   if (residentControlIsExact) {
     runtime.residentControlReadiness = residentControlReady ? 'ready' : 'unavailable'
   }
+  const residentExtensionUiRequests: ResidentExtensionUiRequest[] = []
+  const rawExtensionUiRequests = threadSnapshot?.residentExtensionUiRequests
+  const residentBindingFingerprint = asString(rawResidentControl?.bindingFingerprint)
+  if (
+    snapshotIsLive &&
+    advertisedCapabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) &&
+    residentControlIsExact &&
+    residentBindingFingerprint &&
+    Array.isArray(rawExtensionUiRequests) &&
+    rawExtensionUiRequests.length <= 16
+  ) {
+    const seen = new Set<string>()
+    for (const candidate of rawExtensionUiRequests) {
+      const parsed = parseResidentExtensionUiRequest(candidate)
+      if (!parsed.success) continue
+      const request = parsed.data
+      if (
+        request.hostId !== selectedThread?.hostId ||
+        request.threadId !== (selectedThread ? protocolThreadId(selectedThread) : undefined) ||
+        request.executionGenerationId !== selectedThread?.executionGenerationId ||
+        request.bindingFingerprint !== residentBindingFingerprint
+      ) continue
+      const identity = canonicalRendererJson([
+        request.executionGenerationId,
+        request.bindingFingerprint,
+        request.requestId,
+        request.requestDigest,
+        request.method,
+      ])
+      if (seen.has(identity)) continue
+      seen.add(identity)
+      residentExtensionUiRequests.push(request)
+    }
+  }
   const residentSessionReady = Boolean(
     input.mutationAuthorityReady !== false &&
     selectedHostHasAuthority &&
@@ -2677,6 +2726,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     ...(gitSummary ? { gitSummary } : {}),
     ...(localSetup ? { localSetup } : {}),
     residentLifecycleOperations,
+    residentExtensionUiRequests,
     operations: {
       submitCommands: residentSessionReady,
       startResidentTurn: residentTurnStartReady,
@@ -2813,9 +2863,26 @@ interface ResidentModelSelectionAuthority {
   connectionGeneration: number
 }
 
+interface ResidentExtensionUiResponseAuthority {
+  localThreadId: string
+  remoteThreadId: string
+  expectedHostId: string
+  expectedExecutionGenerationId: string
+  bindingFingerprint: string
+  requestId: string
+  requestDigest: string
+  method: ResidentExtensionUiRequest['method']
+  connectionGeneration: number
+}
+
 interface ActiveResidentModelSelection {
   bindingKey: string
   result: Promise<ResidentModelSelectionResult>
+}
+
+interface ResidentExtensionUiResponseAttempt {
+  responseFingerprint: string
+  promise: Promise<ResidentExtensionUiResponseResult>
 }
 
 interface RuntimeOAuthAuthority {
@@ -2996,6 +3063,7 @@ export class NativeRendererApi implements RendererApi {
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
   private activeResidentModelSelection?: ActiveResidentModelSelection
+  private readonly residentExtensionUiResponseAttempts = new Map<string, ResidentExtensionUiResponseAttempt>()
   private activeRuntimeOAuth?: ActiveRuntimeOAuth
   private mutationAuthorityReadyHostId?: string
   private mutationAuthorityHydrationGeneration?: number
@@ -4963,6 +5031,272 @@ export class NativeRendererApi implements RendererApi {
     }
     if (!this.residentModelSelectionAuthorityIsCurrent(authority)) throw new StaleHostAuthorityError()
     return this.projection?.runtime.session?.model === `${request.providerId}/${request.modelId}`
+  }
+
+  async respondToResidentExtensionUi(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<ResidentExtensionUiResponseResult> {
+    const { ExtensionUiDialogResponseSchema, ResidentExtensionUiRequestSchema } = await loadProtocolSchemas()
+    const parsedRequest = ResidentExtensionUiRequestSchema.safeParse(request)
+    const parsedResponse = ExtensionUiDialogResponseSchema.safeParse(response)
+    if (!parsedRequest.success || !parsedResponse.success) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question or response is no longer valid.',
+      }
+    }
+    if (
+      (parsedRequest.data.method === 'confirm' && parsedResponse.data.kind === 'value') ||
+      (parsedRequest.data.method !== 'confirm' && parsedResponse.data.kind === 'confirmed')
+    ) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This response does not match the Prime Agent question.',
+      }
+    }
+
+    let authority: ResidentExtensionUiResponseAuthority
+    try {
+      authority = this.captureResidentExtensionUiResponseAuthority(parsedRequest.data)
+    } catch {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question is no longer active on the selected session.',
+      }
+    }
+    const attemptKey = canonicalRendererJson([
+      authority.expectedHostId,
+      authority.remoteThreadId,
+      authority.expectedExecutionGenerationId,
+      authority.bindingFingerprint,
+      authority.requestId,
+      authority.requestDigest,
+      authority.method,
+    ])
+    const responseFingerprint = canonicalRendererJson(parsedResponse.data)
+    const existing = this.residentExtensionUiResponseAttempts.get(attemptKey)
+    if (existing) {
+      return existing.responseFingerprint === responseFingerprint
+        ? existing.promise
+        : Promise.resolve({
+            state: 'rejected',
+            retryable: false,
+            message: 'A different response is already being delivered for this Prime Agent question.',
+          })
+    }
+    const attempt = this.performResidentExtensionUiResponse(
+      parsedRequest.data,
+      parsedResponse.data,
+      authority,
+    )
+    const tracked = { responseFingerprint, promise: attempt }
+    this.residentExtensionUiResponseAttempts.set(attemptKey, tracked)
+    void attempt.then(() => {
+      if (this.residentExtensionUiResponseAttempts.get(attemptKey) !== tracked) return
+      this.residentExtensionUiResponseAttempts.delete(attemptKey)
+    }, () => {
+      if (this.residentExtensionUiResponseAttempts.get(attemptKey) === tracked) {
+        this.residentExtensionUiResponseAttempts.delete(attemptKey)
+      }
+    })
+    return attempt
+  }
+
+  private captureResidentExtensionUiResponseAuthority(
+    request: ResidentExtensionUiRequest,
+  ): ResidentExtensionUiResponseAuthority {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === projection.selectedThreadId)
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    const connection = asRecord(this.connection)
+    const residentControl = asRecord(asRecord(this.threadSnapshot)?.residentControl)
+    const materialization = this.authoritativeMaterializationProof()
+    const currentRequest = projection?.residentExtensionUiRequests?.find((candidate) =>
+      candidate.requestId === request.requestId &&
+      candidate.requestDigest === request.requestDigest &&
+      candidate.method === request.method
+    )
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (
+      !this.workbenchLoaded ||
+      !projection ||
+      projection.snapshotAuthority?.source !== 'live' ||
+      !thread ||
+      !remoteThreadId ||
+      !thread.executionGenerationId ||
+      request.hostId !== thread.hostId ||
+      request.threadId !== remoteThreadId ||
+      request.executionGenerationId !== thread.executionGenerationId ||
+      !currentRequest ||
+      canonicalRendererJson(currentRequest) !== canonicalRendererJson(request) ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== thread.hostId ||
+      this.mutationAuthorityReadyHostId !== thread.hostId ||
+      !capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) ||
+      !capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) ||
+      !materialization ||
+      materialization.connectionGeneration !== this.connectionGeneration ||
+      materialization.hostId !== thread.hostId ||
+      materialization.threadId !== remoteThreadId ||
+      materialization.executionGenerationId !== thread.executionGenerationId ||
+      asString(residentControl?.hostId) !== thread.hostId ||
+      asString(residentControl?.threadId) !== remoteThreadId ||
+      asString(residentControl?.executionGenerationId) !== thread.executionGenerationId ||
+      asString(residentControl?.bindingFingerprint) !== request.bindingFingerprint ||
+      asString(residentControl?.commandReadiness) !== 'ready'
+    ) throw new StaleHostAuthorityError()
+
+    return {
+      localThreadId: thread.id,
+      remoteThreadId,
+      expectedHostId: thread.hostId,
+      expectedExecutionGenerationId: thread.executionGenerationId,
+      bindingFingerprint: request.bindingFingerprint,
+      requestId: request.requestId,
+      requestDigest: request.requestDigest,
+      method: request.method,
+      connectionGeneration: this.connectionGeneration,
+    }
+  }
+
+  private residentExtensionUiResponseAuthorityIsCurrent(
+    authority: ResidentExtensionUiResponseAuthority,
+  ): boolean {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === projection.selectedThreadId)
+    const connection = asRecord(this.connection)
+    const residentControl = asRecord(asRecord(this.threadSnapshot)?.residentControl)
+    const materialization = this.authoritativeMaterializationProof()
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    return Boolean(
+      projection &&
+      projection.snapshotAuthority?.source === 'live' &&
+      authority.connectionGeneration === this.connectionGeneration &&
+      thread?.id === authority.localThreadId &&
+      thread.hostId === authority.expectedHostId &&
+      protocolThreadId(thread) === authority.remoteThreadId &&
+      thread.executionGenerationId === authority.expectedExecutionGenerationId &&
+      projection.residentExtensionUiRequests?.some((request) =>
+        request.hostId === authority.expectedHostId &&
+        request.threadId === authority.remoteThreadId &&
+        request.executionGenerationId === authority.expectedExecutionGenerationId &&
+        request.bindingFingerprint === authority.bindingFingerprint &&
+        request.requestId === authority.requestId &&
+        request.requestDigest === authority.requestDigest &&
+        request.method === authority.method
+      ) &&
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.hostId) === authority.expectedHostId &&
+      this.mutationAuthorityReadyHostId === authority.expectedHostId &&
+      capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+      capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) &&
+      materialization?.connectionGeneration === authority.connectionGeneration &&
+      materialization.hostId === authority.expectedHostId &&
+      materialization.threadId === authority.remoteThreadId &&
+      materialization.executionGenerationId === authority.expectedExecutionGenerationId &&
+      asString(residentControl?.hostId) === authority.expectedHostId &&
+      asString(residentControl?.threadId) === authority.remoteThreadId &&
+      asString(residentControl?.executionGenerationId) === authority.expectedExecutionGenerationId &&
+      asString(residentControl?.bindingFingerprint) === authority.bindingFingerprint &&
+      asString(residentControl?.commandReadiness) === 'ready'
+    )
+  }
+
+  private async performResidentExtensionUiResponse(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+    authority: ResidentExtensionUiResponseAuthority,
+  ): Promise<ResidentExtensionUiResponseResult> {
+    if (!this.residentExtensionUiResponseAuthorityIsCurrent(authority)) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question is no longer active on the selected session.',
+      }
+    }
+    const commandId = createStableId('command')
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId: authority.expectedHostId,
+      threadId: authority.remoteThreadId,
+      kind: 'extension_ui.respond',
+      payload: {
+        requestId: request.requestId,
+        requestDigest: request.requestDigest,
+        method: request.method,
+        response,
+      },
+      delivery: 'live_only',
+      expectedExecutionGenerationId: authority.expectedExecutionGenerationId,
+      issuedAt: this.nextComposerIssuedAt(authority.expectedHostId, authority.remoteThreadId),
+    }
+    let invoked = false
+    let receipt: UnknownRecord | undefined
+    try {
+      receipt = asRecord(await this.callAtInvocationBoundary<unknown>(
+        'submitCommand',
+        clientCommand,
+        () => { invoked = true },
+      ))
+    } catch (error) {
+      if (!invoked) {
+        return {
+          state: 'rejected',
+          retryable: true,
+          message: error instanceof Error ? error.message : 'Prime Agent responses are unavailable in this build.',
+        }
+      }
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: error instanceof Error
+          ? `${error.message} Prime Continuim will not send this response again.`
+          : 'Response outcome unknown. Prime Continuim will not send it again.',
+      }
+    }
+    if (
+      !receipt ||
+      asString(receipt.deviceId) !== this.deviceId ||
+      asString(receipt.commandId) !== commandId ||
+      asString(receipt.hostId) !== authority.expectedHostId ||
+      asString(receipt.threadId) !== authority.remoteThreadId ||
+      asString(receipt.executionGenerationId) !== authority.expectedExecutionGenerationId
+    ) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'The host returned a receipt for another command authority. Prime Continuim will not send this response again.',
+      }
+    }
+    const status = asString(receipt.status)
+    const error = asRecord(receipt.error)
+    const detail = asString(receipt.detail) ?? asString(receipt.message) ?? asString(error?.message)
+    if (status === 'completed') {
+      return { state: 'completed', message: detail ?? 'Response delivered to Prime Agent.' }
+    }
+    if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: detail ?? 'Prime Agent rejected this response.',
+      }
+    }
+    return {
+      state: 'uncertain',
+      retryable: false,
+      message: detail
+        ? `${detail} Prime Continuim will not send this response again.`
+        : 'Response outcome unknown. Prime Continuim will not send it again.',
+    }
   }
 
   private residentLifecycleAuthority(options: {

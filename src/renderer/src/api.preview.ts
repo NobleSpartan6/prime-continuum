@@ -370,6 +370,7 @@ export type PreviewVisualState =
   | 'reconnecting'
   | 'idle'
   | 'rlm-activity'
+  | 'extension-ui-confirm'
   | 'launchpad'
   | 'model-selection'
   | 'prime-oauth'
@@ -390,6 +391,7 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
   'idle',
   'rlm-activity',
+  'extension-ui-confirm',
   'launchpad',
   'model-selection',
   'prime-oauth',
@@ -682,6 +684,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
   if (
     visualState === 'idle' ||
     visualState === 'rlm-activity' ||
+    visualState === 'extension-ui-confirm' ||
     visualState === 'launchpad' ||
     visualState === 'model-selection' ||
     visualState === 'hud-expanded' ||
@@ -695,6 +698,28 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     selectedThread.status = hudActive ? 'running' : 'idle'
     session.isStreaming = hudActive
     if (!hudActive && visualState !== 'rlm-activity') snapshot.agents = []
+    if (visualState === 'extension-ui-confirm') {
+      const bindingFingerprint = 'a'.repeat(64)
+      const executionGenerationId = selectedThread.executionGenerationId ?? 'execution-extension-ui-preview'
+      selectedThread.executionGenerationId = executionGenerationId
+      selectedThread.status = 'running'
+      snapshot.residentExtensionUiRequests = [{
+        interactionVersion: 1,
+        hostId: selectedHost.id,
+        threadId: selectedThread.remoteId ?? selectedThread.id,
+        executionGenerationId,
+        bindingFingerprint,
+        requestId: 'preview-extension-confirm',
+        requestDigest: 'b'.repeat(64),
+        receivedAt: '2026-08-07T12:00:04.000Z',
+        method: 'confirm',
+        title: 'Use the verified migration plan?',
+        message: 'Prime Agent needs this decision before it changes the workspace.',
+      }]
+      snapshot.operations.startResidentTurn = false
+      snapshot.composerReceipt = { state: 'idle', message: 'Prime Agent is waiting for your response' }
+      return snapshot
+    }
     if (visualState === 'launchpad') {
       selectedThread.transcript = []
       session.messageCount = 0

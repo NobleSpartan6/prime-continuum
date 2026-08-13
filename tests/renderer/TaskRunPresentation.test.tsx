@@ -12,6 +12,7 @@ function baseline(overrides: Partial<TaskRunPresentationInput> = {}): TaskRunPre
     taskState: 'idle',
     sessionEnded: false,
     sessionNeedsRecovery: false,
+    extensionResponsePending: false,
     endOperationPresent: false,
     endReadyToFinish: false,
     endPhase: undefined,
@@ -55,6 +56,7 @@ function randomInput(random: () => number): TaskRunPresentationInput {
     taskState: pick(random, ['idle', 'running', 'waiting', 'needs_approval', 'complete', 'failed'] as const),
     sessionEnded: bool(),
     sessionNeedsRecovery: bool(),
+    extensionResponsePending: bool(),
     endOperationPresent: bool(),
     endReadyToFinish: bool(),
     modelReady: bool(),
@@ -287,6 +289,21 @@ describe('taskRunPresentation', () => {
       kind: 'model_setup',
       headline: 'Choose a model',
       primaryAction: { kind: 'setup_model' },
+    })
+  })
+
+  it('makes a live Prime Agent question the single dominant task state', () => {
+    expect(taskRunPresentation(baseline({
+      taskState: 'running',
+      extensionResponsePending: true,
+      activity: { live: true, fresh: true },
+      authority: { ...baseline().authority, canStart: false, canStop: true },
+    }))).toEqual({
+      kind: 'waiting_for_response',
+      headline: 'Response needed',
+      detail: 'Prime Agent is waiting for your answer.',
+      tone: 'warning',
+      iconKey: 'alert-circle',
     })
   })
 })

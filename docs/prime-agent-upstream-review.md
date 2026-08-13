@@ -53,6 +53,16 @@ Reviewed on 2026-08-12.
   depends on: disconnected workers no longer report ready, timed-out stops
   finish cleanup, zombies are not considered alive, and stale registrations
   self-heal when a session is opened or resumed.
+- The pinned `docs/extensions.md`, `docs/rpc.md`, public
+  `DaemonAgentConnection`, and daemon tests were reviewed for native extension
+  UI. Continuim advertises `supportsExtensionUi: true` only through the verified
+  resident worker and exposes the documented blocking dialogs `select`,
+  `confirm`, `input`, and `editor`; fire-and-forget UI messages remain ignored.
+  Requests are path-free, bounded, and process-local to one exact live binding.
+  Responses use a dedicated durable no-replay attempt: an acknowledged response
+  completes, a lost or ambiguous acknowledgement is non-retryable uncertain,
+  and a host restart never resends it. This surface is separately negotiated as
+  `resident_extension_ui_v1`; retaining the v0.7.2 runtime pin is compatible.
 - The release dependency graph still includes `extract-zip@2.0.1`, and the
   shipped CLI bundle embeds the same implementation. GitHub advisory
   `GHSA-jmr9-qjv8-65gv` reports an unpatched symlink-target traversal for every

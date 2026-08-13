@@ -14,6 +14,7 @@ export type TaskRunPresentationKind =
   | 'disconnected'
   | 'ending'
   | 'needs_attention'
+  | 'waiting_for_response'
   | 'stopping'
   | 'starting'
   | 'working'
@@ -78,6 +79,8 @@ export interface TaskRunPresentationInput {
   taskState: TaskRunTaskState
   sessionEnded: boolean
   sessionNeedsRecovery: boolean
+  /** Prime Agent has a live, exact extension dialog awaiting this user. */
+  extensionResponsePending: boolean
   /** A retained lifecycle operation can outlive its composer receipt. */
   endOperationPresent: boolean
   /** The retained End operation is at its one safe, resumable boundary. */
@@ -237,6 +240,16 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
       tone: 'warning',
       iconKey: 'alert-circle',
       ...(canReview ? { primaryAction: REVIEW_STATUS_ACTION } : {}),
+    }
+  }
+
+  if (input.extensionResponsePending) {
+    return {
+      kind: 'waiting_for_response',
+      headline: 'Response needed',
+      detail: 'Prime Agent is waiting for your answer.',
+      tone: 'warning',
+      iconKey: 'alert-circle',
     }
   }
 

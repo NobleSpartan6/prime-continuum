@@ -366,6 +366,7 @@ describe("resident launch and create plans", () => {
         PRIME_AGENT_LAUNCHER_PATH: "C:\\spoofed.exe",
         NODE_OPTIONS: "--require=C:\\attacker.cjs",
         node_path: "C:\\shadow-modules",
+        NAPI_RS_NATIVE_LIBRARY_PATH: "C:\\attacker-native.node",
         ELECTRON_RUN_AS_NODE: "0",
       }),
     ).toEqual({

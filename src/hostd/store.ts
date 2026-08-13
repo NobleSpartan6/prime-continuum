@@ -1391,6 +1391,47 @@ const ModelSelectionIdentityRecordSchema = z
   });
 type ModelSelectionIdentityRecord = z.infer<typeof ModelSelectionIdentityRecordSchema>;
 
+const ExtensionUiResponseAttemptSchema = z
+  .object({
+    version: z.literal(1),
+    command: CommandEnvelopeSchema,
+    binding: ResidentSessionBindingSchema,
+    bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    state: z.enum(["admitted", "dispatching"]),
+    admittedAt: IsoDateTimeSchema,
+    updatedAt: IsoDateTimeSchema,
+    dispatchStartedAt: IsoDateTimeSchema.optional(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    if (attempt.command.command.kind !== "extension_ui.respond") {
+      context.addIssue({ code: "custom", path: ["command", "command"], message: "Attempt is not an extension UI response" });
+    }
+    if (
+      attempt.command.threadId !== attempt.binding.threadId ||
+      attempt.command.expectedExecutionGenerationId !== attempt.binding.executionGenerationId ||
+      attempt.bindingFingerprint !== residentDispatchAuthorityFingerprint(attempt.binding)
+    ) {
+      context.addIssue({ code: "custom", message: "Extension UI response attempt changed resident authority" });
+    }
+    if ((attempt.state === "dispatching") !== (attempt.dispatchStartedAt !== undefined)) {
+      context.addIssue({ code: "custom", path: ["dispatchStartedAt"], message: "Dispatch time must match attempt state" });
+    }
+  });
+type ExtensionUiResponseAttempt = z.infer<typeof ExtensionUiResponseAttemptSchema>;
+
+const extensionUiResponseLeaseBrand: unique symbol = Symbol("extension-ui-response-lease");
+
+/** Process-local proof that Store persisted the no-replay boundary for one dialog response. */
+export interface ExtensionUiResponseLease {
+  readonly [extensionUiResponseLeaseBrand]: true;
+  readonly leaseVersion: 1;
+  readonly command: CommandEnvelope;
+  readonly binding: ResidentSessionBinding;
+  readonly bindingFingerprint: string;
+  readonly dispatchStartedAt: string;
+}
+
 const LegacyModelSelectionAttemptSchema = z
   .object({
     version: z.literal(1),
@@ -1432,8 +1473,10 @@ type LegacyModelSelectionIdentityRecord = z.infer<typeof LegacyModelSelectionIde
 
 export const MAX_PENDING_MODEL_SELECTION_ATTEMPTS = 10_000;
 export const MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS = 10_000;
+export const MAX_PENDING_EXTENSION_UI_RESPONSE_ATTEMPTS = 10_000;
 export const MAX_MODEL_SELECTION_ATTEMPT_BYTES = 1024 * 1024;
 export const MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES = 1024 * 1024;
+export const MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES = 1024 * 1024;
 export const MAX_MODEL_SELECTION_IDENTITY_BYTES = 1024 * 1024;
 export const MAX_COMMAND_IDENTITY_BYTES = 1024 * 1024;
 
@@ -1513,6 +1556,7 @@ const AdmissionTransactionSchema = z
     residentDispatchAttempt: ResidentDispatchAttemptSchema.optional(),
     modelSelectionIdentity: ModelSelectionIdentityRecordSchema.optional(),
     modelSelectionAttempt: ModelSelectionAttemptSchema.optional(),
+    extensionUiResponseAttempt: ExtensionUiResponseAttemptSchema.optional(),
   })
   .strict()
   .superRefine((transaction, context) => {
@@ -1523,6 +1567,7 @@ const AdmissionTransactionSchema = z
       transaction.receipt.status === "admitted" &&
       transaction.command.command.kind !== "abort" &&
       transaction.command.command.kind !== "model.select" &&
+      transaction.command.command.kind !== "extension_ui.respond" &&
       transaction.residentDispatchAttempt === undefined;
     if (requiresProjection !== (transaction.snapshot !== undefined)) {
       context.addIssue({ code: "custom", message: "Admission projection does not match its prepared outcome" });
@@ -1642,6 +1687,17 @@ const AdmissionTransactionSchema = z
         transaction.residentDispatchAttempt.updatedAt !== transaction.preparedAt)
     ) {
       context.addIssue({ code: "custom", message: "Resident dispatch attempt is not an admitted prompt or abort" });
+    }
+    const requiresExtensionUiResponseAttempt =
+      transaction.command.command.kind === "extension_ui.respond" && transaction.receipt.status === "admitted";
+    if (requiresExtensionUiResponseAttempt !== (transaction.extensionUiResponseAttempt !== undefined)) {
+      context.addIssue({ code: "custom", message: "Admitted extension UI response must materialize one private attempt" });
+    }
+    if (
+      transaction.extensionUiResponseAttempt &&
+      !isDeepStrictEqual(transaction.extensionUiResponseAttempt.command, transaction.command)
+    ) {
+      context.addIssue({ code: "custom", message: "Extension UI response attempt does not match its admission command" });
     }
   });
 type AdmissionTransaction = z.infer<typeof AdmissionTransactionSchema>;
@@ -2460,6 +2516,7 @@ export class HostStore {
         ensurePrivateDirectory(this.paths.residentProjectionLineages),
         ensurePrivateDirectory(this.paths.residentControlProjections),
         ensurePrivateDirectory(this.paths.residentDispatchAttempts),
+        ensurePrivateDirectory(this.paths.extensionUiResponseAttempts),
         ensurePrivateDirectory(this.paths.residentLifecycleOperations),
         ensurePrivateDirectory(this.paths.workspaceThreadBootstrapOperations),
         ensurePrivateDirectory(this.commandIdentitiesDirectory()),
@@ -2583,6 +2640,7 @@ export class HostStore {
       // replayed by a new hostd/Prime client identity. Startup converts the
       // incomplete receipt to `uncertain` before serving reconciliation.
       await this.recoverInterruptedModelSelectionsUnlocked();
+      await this.recoverInterruptedExtensionUiResponsesUnlocked();
       await this.recoverInterruptedResidentDispatchesUnlocked();
 
       this.initialized = true;
@@ -2625,7 +2683,7 @@ export class HostStore {
         optional: true,
       });
       if (!snapshot) throw new HostStoreError("SNAPSHOT_NOT_FOUND", `Thread ${threadId} has no durable snapshot`);
-      return snapshot;
+      return durableThreadSnapshot(snapshot);
     });
   }
 
@@ -3353,6 +3411,7 @@ export class HostStore {
   async upsertThread(threadValue: ThreadSummary, snapshotValue: ThreadProjectionSnapshot): Promise<void> {
     const thread = ThreadSummarySchema.parse(threadValue);
     const snapshot = ThreadProjectionSnapshotSchema.parse(snapshotValue);
+    assertNoEphemeralExtensionUiProjection(snapshot);
     if (snapshot.thread.threadId !== thread.threadId) {
       throw new HostStoreError("THREAD_SNAPSHOT_MISMATCH", "Thread and snapshot identifiers differ");
     }
@@ -3383,7 +3442,7 @@ export class HostStore {
         if (threads.length >= 10_000) throw new HostStoreError("THREAD_LIMIT_REACHED", "Thread catalog is full");
         threads.push(thread);
       }
-      await atomicWriteJson(this.snapshotPath(thread.threadId), snapshot);
+      await atomicWriteJson(this.snapshotPath(thread.threadId), durableThreadSnapshot(snapshot));
       await atomicWriteJson(this.paths.threads, { version: 1, threads });
     });
   }
@@ -6141,6 +6200,171 @@ export class HostStore {
     });
   }
 
+  /** Persist the one-way no-replay boundary before answering a live extension dialog. */
+  async beginExtensionUiResponseDispatch(commandValue: CommandEnvelope): Promise<ExtensionUiResponseLease> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "extension_ui.respond") {
+      throw new HostStoreError("EXTENSION_UI_RESPONSE_COMMAND_REQUIRED", "This dispatch path accepts only extension UI responses");
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readExtensionUiResponseAttemptUnlocked(command);
+      const receipt = await this.readReceiptUnlocked(command);
+      if (!attempt || !receipt || !isDeepStrictEqual(attempt.command, command)) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_MISSING",
+          "No exact durable extension UI response admission exists for this command",
+        );
+      }
+      if (attempt.state !== "admitted" || receipt.status !== "admitted") {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ALREADY_DISPATCHED",
+          "This extension UI response cannot cross the dispatch boundary again",
+        );
+      }
+      const binding = await this.resolveExtensionUiResponseBindingUnlocked(command);
+      const bindingFingerprint = residentDispatchAuthorityFingerprint(binding);
+      if (bindingFingerprint !== attempt.bindingFingerprint) {
+        throw new HostStoreError(
+          "RESIDENT_BINDING_CONFLICT",
+          "The resident session binding changed after dialog response admission",
+        );
+      }
+      const dispatchStartedAt = now();
+      const dispatching = ExtensionUiResponseAttemptSchema.parse({
+        ...attempt,
+        binding,
+        bindingFingerprint,
+        state: "dispatching",
+        dispatchStartedAt,
+        updatedAt: dispatchStartedAt,
+      });
+      const running = CommandReceiptSchema.parse({
+        ...receipt,
+        status: "running",
+        queuePosition: undefined,
+        message: "Delivering the dialog response to Prime Agent",
+        error: undefined,
+        updatedAt: dispatchStartedAt,
+      });
+      try {
+        await atomicWriteJson(
+          this.extensionUiResponseAttemptPath(command),
+          dispatching,
+          MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES,
+        );
+        await atomicWriteJson(this.receiptPath(command), running);
+        await this.appendExtensionUiResponseJournalUnlocked(
+          command,
+          "running",
+          running.updatedAt,
+          running.message,
+          "dispatching",
+        );
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return createExtensionUiResponseLease(dispatching);
+    });
+  }
+
+  async failExtensionUiResponseBeforeStart(
+    commandValue: CommandEnvelope,
+    error: StructuredError,
+  ): Promise<CommandReceipt> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "extension_ui.respond") {
+      throw new HostStoreError("EXTENSION_UI_RESPONSE_COMMAND_REQUIRED", "This failure path accepts only extension UI responses");
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readExtensionUiResponseAttemptUnlocked(command);
+      const current = await this.readReceiptUnlocked(command);
+      if (!attempt || !current || attempt.state !== "admitted" || current.status !== "admitted") {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ALREADY_DISPATCHED",
+          "Only a non-dispatched extension UI response can fail before start",
+        );
+      }
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        status: "failed",
+        queuePosition: undefined,
+        message: error.message.slice(0, 1_024),
+        error,
+        updatedAt: now(),
+      });
+      try {
+        await atomicWriteJson(this.receiptPath(command), receipt);
+        await this.appendExtensionUiResponseJournalUnlocked(
+          command,
+          "failed",
+          receipt.updatedAt,
+          receipt.message,
+          "failed-before-start",
+        );
+        await rm(this.extensionUiResponseAttemptPath(command), { force: true });
+      } catch (cause) {
+        this.initialized = false;
+        throw cause;
+      }
+      return receipt;
+    });
+  }
+
+  /** Settle an extension dialog response exactly once and retire its no-replay marker. */
+  async finalizeExtensionUiResponseDispatch(
+    leaseValue: ExtensionUiResponseLease,
+    update: Pick<CommandReceipt, "status"> & Partial<Pick<CommandReceipt, "message" | "error">>,
+  ): Promise<CommandReceipt> {
+    const lease = validateExtensionUiResponseLease(leaseValue);
+    if (update.status !== "completed" && update.status !== "uncertain") {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_STATUS_INVALID",
+        "A dispatched extension UI response may finish only as completed or uncertain",
+      );
+    }
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      const attempt = await this.readExtensionUiResponseAttemptUnlocked(lease.command);
+      const current = await this.readReceiptUnlocked(lease.command);
+      if (!attempt || !current || !extensionUiResponseLeaseMatchesAttempt(lease, attempt)) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_MISSING",
+          "The exact extension UI response attempt is no longer available",
+        );
+      }
+      if (current.status !== "running") {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ALREADY_FINALIZED",
+          "The extension UI response receipt is already terminal",
+        );
+      }
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        ...update,
+        queuePosition: undefined,
+        updatedAt: now(),
+      });
+      try {
+        await atomicWriteJson(this.receiptPath(lease.command), receipt);
+        await this.appendExtensionUiResponseJournalUnlocked(
+          lease.command,
+          receipt.status,
+          receipt.updatedAt,
+          receipt.message,
+          "settled",
+        );
+        await rm(this.extensionUiResponseAttemptPath(lease.command), { force: true });
+      } catch (error) {
+        this.initialized = false;
+        throw error;
+      }
+      return receipt;
+    });
+  }
+
   async reconcileCommands(commandValues: CommandEnvelope[]): Promise<{
     receipts: CommandReceipt[];
     unknown: CommandIdentity[];
@@ -6394,7 +6618,7 @@ export class HostStore {
 
       let authoritySwitched = false;
       try {
-        await atomicWriteJson(this.snapshotPath(thread.threadId), candidate);
+        await atomicWriteJson(this.snapshotPath(thread.threadId), durableThreadSnapshot(candidate));
         threads[index] = candidate.thread;
         await atomicWriteJson(this.paths.threads, { version: 1, threads });
         authoritySwitched = true;
@@ -6429,7 +6653,7 @@ export class HostStore {
           threads[index] = thread;
           await atomicWriteJson(this.paths.threads, { version: 1, threads }).catch(() => undefined);
         }
-        await atomicWriteJson(this.snapshotPath(thread.threadId), sourceSnapshot).catch(() => undefined);
+        await atomicWriteJson(this.snapshotPath(thread.threadId), durableThreadSnapshot(sourceSnapshot)).catch(() => undefined);
         return this.recordFailedHandoffUnlocked(
           { ...record, progress },
           command,
@@ -6526,7 +6750,7 @@ export class HostStore {
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_lineage", transaction.transactionId);
     }
-    await atomicWriteJson(this.snapshotPath(binding.threadId), transaction.snapshot);
+    await atomicWriteJson(this.snapshotPath(binding.threadId), durableThreadSnapshot(transaction.snapshot));
     if (injectFaults) {
       await this.injectResidentProjectionFault("after_snapshot", transaction.transactionId);
     }
@@ -6748,7 +6972,7 @@ export class HostStore {
         "Prepared resident end projection changed preserved history or unrelated catalog state",
       );
     }
-    await atomicWriteJson(this.snapshotPath(binding.threadId), transaction.snapshot);
+    await atomicWriteJson(this.snapshotPath(binding.threadId), durableThreadSnapshot(transaction.snapshot));
     if (injectFaults) {
       await this.injectResidentLifecycleFault("after_end_projection_snapshot", operation.operationId);
     }
@@ -7320,6 +7544,7 @@ export class HostStore {
     let sourceSnapshot: ThreadProjectionSnapshot | undefined;
     let residentDispatchBinding: ResidentSessionBinding | undefined;
     let modelSelectionBinding: ResidentSessionBinding | undefined;
+    let extensionUiResponseBinding: ResidentSessionBinding | undefined;
 
     if (!thread) {
       rejection = structured("THREAD_NOT_FOUND", `Thread ${command.threadId} does not exist`);
@@ -7350,6 +7575,17 @@ export class HostStore {
           rejection = error instanceof HostStoreError
             ? error.toStructuredError()
             : structured("RESIDENT_BINDING_UNAVAILABLE", "Resident session authority is unavailable", true);
+        }
+      }
+      if (!rejection && command.command.kind === "extension_ui.respond") {
+        try {
+          await this.assertExtensionUiResponseAttemptCapacityUnlocked();
+          extensionUiResponseBinding = await this.resolveExtensionUiResponseBindingUnlocked(command);
+          await this.assertNoOtherExtensionUiResponseAttemptUnlocked(command, extensionUiResponseBinding);
+        } catch (error) {
+          rejection = error instanceof HostStoreError
+            ? error.toStructuredError()
+            : structured("RESIDENT_BINDING_UNAVAILABLE", "Resident dialog authority is unavailable", true);
         }
       }
       let promptLock: ResidentDispatchAttempt | undefined;
@@ -7438,6 +7674,7 @@ export class HostStore {
         !rejection &&
         command.command.kind !== "abort" &&
         command.command.kind !== "model.select" &&
+        command.command.kind !== "extension_ui.respond" &&
         sourceSnapshot.queueState.pendingCommandIds.length >= 1_000
       ) {
         rejection = structured("COMMAND_QUEUE_FULL", "The host command queue has reached its bounded limit", true);
@@ -7451,6 +7688,8 @@ export class HostStore {
         ? "Abort admitted for live dispatch"
         : command.command.kind === "model.select"
           ? "Model selection admitted for live dispatch"
+          : command.command.kind === "extension_ui.respond"
+            ? "Dialog response admitted for live dispatch"
           : command.command.kind === "prompt" && residentDispatchBinding
             ? "Prompt admitted for resident dispatch"
           : "Queued durably on host");
@@ -7462,6 +7701,7 @@ export class HostStore {
       thread &&
       command.command.kind !== "abort" &&
       command.command.kind !== "model.select" &&
+      command.command.kind !== "extension_ui.respond" &&
       residentDispatchBinding === undefined
     ) {
       snapshot = applyCommand(sourceSnapshot, command, canDispatchLive);
@@ -7486,6 +7726,7 @@ export class HostStore {
         initialStatus === "admitted" &&
         command.command.kind !== "abort" &&
         command.command.kind !== "model.select" &&
+        command.command.kind !== "extension_ui.respond" &&
         residentDispatchBinding === undefined
           ? (sourceSnapshot?.queueState.pendingCommandIds.length ?? 0) + 1
           : undefined,
@@ -7580,6 +7821,21 @@ export class HostStore {
               }),
             }
           : {}),
+      ...(initialStatus === "admitted" &&
+        command.command.kind === "extension_ui.respond" &&
+        extensionUiResponseBinding
+          ? {
+              extensionUiResponseAttempt: ExtensionUiResponseAttemptSchema.parse({
+                version: 1,
+                command,
+                binding: extensionUiResponseBinding,
+                bindingFingerprint: residentDispatchAuthorityFingerprint(extensionUiResponseBinding),
+                state: "admitted",
+                admittedAt: preparedAt,
+                updatedAt: preparedAt,
+              }),
+            }
+          : {}),
     });
   }
 
@@ -7588,7 +7844,7 @@ export class HostStore {
     injectFaults: boolean,
   ): Promise<void> {
     if (transaction.snapshot && transaction.threadsFile) {
-      await atomicWriteJson(this.snapshotPath(transaction.command.threadId), transaction.snapshot);
+      await atomicWriteJson(this.snapshotPath(transaction.command.threadId), durableThreadSnapshot(transaction.snapshot));
       if (injectFaults) await this.injectAdmissionFault("after_snapshot", transaction.transactionId);
 
       await atomicWriteJson(this.paths.threads, transaction.threadsFile);
@@ -7675,6 +7931,25 @@ export class HostStore {
       }
     }
 
+    if (transaction.extensionUiResponseAttempt) {
+      const attemptPath = this.extensionUiResponseAttemptPath(transaction.command);
+      const existingAttempt = await readJsonFile(attemptPath, ExtensionUiResponseAttemptSchema, {
+        optional: true,
+        maxBytes: MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES,
+      });
+      if (existingAttempt && !isDeepStrictEqual(existingAttempt, transaction.extensionUiResponseAttempt)) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_CONFLICT",
+          `Admission transaction ${transaction.transactionId} conflicts with its durable extension UI response attempt`,
+        );
+      }
+      await atomicWriteJson(
+        attemptPath,
+        transaction.extensionUiResponseAttempt,
+        MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES,
+      );
+    }
+
     const existingReceipt = await this.readReceiptUnlocked(transaction.command);
     if (existingReceipt && !isDeepStrictEqual(existingReceipt, transaction.receipt)) {
       throw new HostStoreError(
@@ -7709,7 +7984,7 @@ export class HostStore {
     await this.validateLegacyAdmissionTransactionUnlocked(transaction);
 
     if (transaction.snapshot && transaction.threadsFile) {
-      await atomicWriteJson(this.snapshotPath(transaction.command.threadId), transaction.snapshot);
+      await atomicWriteJson(this.snapshotPath(transaction.command.threadId), durableThreadSnapshot(transaction.snapshot));
       await atomicWriteJson(this.paths.threads, transaction.threadsFile);
     }
 
@@ -8204,6 +8479,106 @@ export class HostStore {
     }
   }
 
+  private async recoverInterruptedExtensionUiResponsesUnlocked(): Promise<void> {
+    const directory = this.paths.extensionUiResponseAttempts;
+    const entries = await readdir(directory, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_EXTENSION_UI_RESPONSE_ATTEMPTS) {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_ATTEMPT_LIMIT",
+        `Extension UI response attempt directory exceeds ${MAX_PENDING_EXTENSION_UI_RESPONSE_ATTEMPTS} entries`,
+      );
+    }
+    const names: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response attempt directory contains a non-file entry",
+        );
+      }
+      if (entry.name.endsWith(".json")) names.push(entry.name);
+      else if (entry.name.includes(".json.tmp-")) await rm(join(directory, entry.name), { force: true });
+      else {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          `Unexpected extension UI response attempt file ${entry.name}`,
+        );
+      }
+    }
+    names.sort();
+    for (const name of names) {
+      const path = join(directory, name);
+      const attempt = await readJsonFile(path, ExtensionUiResponseAttemptSchema, {
+        maxBytes: MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES,
+      });
+      if (!attempt || name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response attempt filename or payload is invalid",
+        );
+      }
+      const [identity, current] = await Promise.all([
+        this.resolveCommandIdentityUnlocked(attempt.command),
+        this.readReceiptUnlocked(attempt.command),
+      ]);
+      if (!identity || !current || !isDeepStrictEqual(identity.command, attempt.command)) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response attempt has no exact durable command identity and receipt",
+        );
+      }
+      this.assertReceiptMatchesCommand(current, attempt.command);
+      if (current.status === "completed" || current.status === "failed" || current.status === "uncertain") {
+        await this.appendExtensionUiResponseJournalUnlocked(
+          attempt.command,
+          current.status,
+          current.updatedAt,
+          current.message,
+          attempt.state === "dispatching" ? "settled" : "failed-before-start",
+        );
+        await rm(path, { force: true });
+        continue;
+      }
+      const dispatched = attempt.state === "dispatching";
+      if (
+        (!dispatched && current.status !== "admitted") ||
+        (dispatched && current.status !== "running" && current.status !== "admitted")
+      ) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response attempt conflicts with its receipt lifecycle",
+        );
+      }
+      const receipt = CommandReceiptSchema.parse({
+        ...current,
+        status: dispatched ? "uncertain" : "failed",
+        queuePosition: undefined,
+        message: dispatched
+          ? "Host service restarted before the dialog response acknowledgement was observed"
+          : "Host service restarted before the dialog response was sent",
+        error: {
+          code: dispatched
+            ? "EXTENSION_UI_RESPONSE_RESTART_UNCERTAIN"
+            : "EXTENSION_UI_RESPONSE_NOT_DISPATCHED",
+          message: dispatched
+            ? "The dialog response was not replayed after the host service or Prime client identity changed"
+            : "The dialog response did not cross the no-replay dispatch boundary",
+          retryable: false,
+        },
+        updatedAt: now(),
+      });
+      await atomicWriteJson(this.receiptPath(attempt.command), receipt);
+      await this.appendExtensionUiResponseJournalUnlocked(
+        attempt.command,
+        receipt.status,
+        receipt.updatedAt,
+        receipt.message,
+        dispatched ? "recovered-uncertain" : "recovered-not-started",
+      );
+      await rm(path, { force: true });
+    }
+  }
+
   private async assertCommittedModelSelectionProofUnlocked(
     attempt: ModelSelectionAttempt,
   ): Promise<void> {
@@ -8553,7 +8928,7 @@ export class HostStore {
       entries.some(
         (entry) =>
           !entry.isFile() ||
-          (!entry.name.endsWith(".json") && !entry.name.includes(".json.tmp-")),
+          !entry.name.endsWith(".json"),
       )
     ) {
       throw new HostStoreError(
@@ -8890,6 +9265,7 @@ export class HostStore {
       }
     }
     await this.assertNoModelSelectionTransitionUnlocked(threadId, message);
+    await this.assertNoExtensionUiResponseTransitionUnlocked(threadId, message);
   }
 
   /**
@@ -8961,12 +9337,62 @@ export class HostStore {
       this.assertReceiptMatchesCommand(current, attempt.command);
     }
     await this.assertNoModelSelectionTransitionUnlocked(threadId, message);
+    await this.assertNoExtensionUiResponseTransitionUnlocked(threadId, message);
   }
 
   private async assertNoModelSelectionTransitionUnlocked(threadId: string, message: string): Promise<void> {
     const attempts = await this.readModelSelectionTransitionsUnlocked();
     if (attempts.some((attempt) => attempt.command.threadId === threadId)) {
       throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+    }
+  }
+
+  private async assertNoExtensionUiResponseTransitionUnlocked(threadId: string, message: string): Promise<void> {
+    const entries = await readdir(this.paths.extensionUiResponseAttempts, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_EXTENSION_UI_RESPONSE_ATTEMPTS) {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_ATTEMPT_LIMIT",
+        "Extension UI response authority cannot be inspected because its bounded store is full",
+      );
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response storage contains an unexpected entry",
+        );
+      }
+      const attempt = await readJsonFile(
+        join(this.paths.extensionUiResponseAttempts, entry.name),
+        ExtensionUiResponseAttemptSchema,
+        { maxBytes: MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES },
+      );
+      if (!attempt || entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response storage lost its exact command identity",
+        );
+      }
+      const [identity, receipt] = await Promise.all([
+        this.resolveCommandIdentityUnlocked(attempt.command),
+        this.readReceiptUnlocked(attempt.command),
+      ]);
+      if (
+        !identity ||
+        !receipt ||
+        !isDeepStrictEqual(identity.command, attempt.command) ||
+        (attempt.state === "admitted" ? receipt.status !== "admitted" :
+          (receipt.status !== "admitted" && receipt.status !== "running"))
+      ) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response barrier lost its exact durable command identity or receipt",
+        );
+      }
+      this.assertReceiptMatchesCommand(receipt, attempt.command);
+      if (attempt.command.threadId === threadId) {
+        throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+      }
     }
   }
 
@@ -8991,6 +9417,102 @@ export class HostStore {
         "MODEL_SELECTION_ATTEMPT_INVALID",
         "Model-selection attempt storage contains an unexpected entry",
       );
+    }
+  }
+
+  private async assertExtensionUiResponseAttemptCapacityUnlocked(): Promise<void> {
+    const entries = await readdir(this.paths.extensionUiResponseAttempts, { withFileTypes: true });
+    const attempts = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+    if (attempts.length >= MAX_PENDING_EXTENSION_UI_RESPONSE_ATTEMPTS) {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_ATTEMPT_LIMIT",
+        "The host is already tracking the maximum number of non-replayable extension UI responses",
+        true,
+      );
+    }
+    if (
+      entries.some(
+        (entry) =>
+          !entry.isFile() ||
+          (!entry.name.endsWith(".json") && !entry.name.includes(".json.tmp-")),
+      )
+    ) {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+        "Extension UI response attempt storage contains an unexpected entry",
+      );
+    }
+  }
+
+  private async assertNoOtherExtensionUiResponseAttemptUnlocked(
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+  ): Promise<void> {
+    if (command.command.kind !== "extension_ui.respond") {
+      throw new HostStoreError("EXTENSION_UI_RESPONSE_COMMAND_REQUIRED", "Expected extension UI response command");
+    }
+    const entries = await readdir(this.paths.extensionUiResponseAttempts, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response ownership contains an unexpected entry",
+        );
+      }
+      let attempt: ExtensionUiResponseAttempt | undefined;
+      try {
+        attempt = await readJsonFile(
+          join(this.paths.extensionUiResponseAttempts, entry.name),
+          ExtensionUiResponseAttemptSchema,
+          { maxBytes: MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES },
+        );
+      } catch (error) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response ownership cannot be validated",
+          false,
+          { cause: error },
+        );
+      }
+      if (
+        !attempt ||
+        attempt.command.command.kind !== "extension_ui.respond" ||
+        entry.name !== `${storageKey(attempt.command.deviceId, attempt.command.commandId)}.json`
+      ) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response ownership lost its exact filename or command identity",
+        );
+      }
+      const [identity, receipt] = await Promise.all([
+        this.resolveCommandIdentityUnlocked(attempt.command),
+        this.readReceiptUnlocked(attempt.command),
+      ]);
+      if (
+        !identity ||
+        !receipt ||
+        !isDeepStrictEqual(identity.command, attempt.command) ||
+        (attempt.state === "admitted" ? receipt.status !== "admitted" :
+          (receipt.status !== "admitted" && receipt.status !== "running"))
+      ) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ATTEMPT_INVALID",
+          "Extension UI response ownership lost its exact durable receipt",
+        );
+      }
+      this.assertReceiptMatchesCommand(receipt, attempt.command);
+      if (
+        attempt.bindingFingerprint === residentDispatchAuthorityFingerprint(binding) &&
+        attempt.command.command.requestId === command.command.requestId &&
+        attempt.command.command.requestDigest === command.command.requestDigest &&
+        (attempt.command.deviceId !== command.deviceId || attempt.command.commandId !== command.commandId)
+      ) {
+        throw new HostStoreError(
+          "EXTENSION_UI_RESPONSE_ALREADY_OWNED",
+          "Another command already owns the exact live dialog response",
+          false,
+        );
+      }
     }
   }
 
@@ -9091,6 +9613,15 @@ export class HostStore {
     return readJsonFile(this.modelSelectionAttemptPath(command), ModelSelectionAttemptSchema, {
       optional: true,
       maxBytes: MAX_MODEL_SELECTION_ATTEMPT_BYTES,
+    });
+  }
+
+  private async readExtensionUiResponseAttemptUnlocked(
+    command: CommandIdentity,
+  ): Promise<ExtensionUiResponseAttempt | undefined> {
+    return readJsonFile(this.extensionUiResponseAttemptPath(command), ExtensionUiResponseAttemptSchema, {
+      optional: true,
+      maxBytes: MAX_EXTENSION_UI_RESPONSE_ATTEMPT_BYTES,
     });
   }
 
@@ -9293,6 +9824,54 @@ export class HostStore {
       throw new HostStoreError(
         "RESIDENT_BINDING_NOT_FOUND",
         "No active resident Prime Agent session is bound to this execution generation",
+        true,
+      );
+    }
+    this.assertBindingMatchesScope(binding, scope, workspaceDirectory);
+    return validateResidentSessionBinding(binding);
+  }
+
+  private async resolveExtensionUiResponseBindingUnlocked(command: CommandEnvelope): Promise<ResidentSessionBinding> {
+    if (command.command.kind !== "extension_ui.respond") {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_AUTHORITY_INVALID",
+        "Extension UI response requires an exact thread execution generation",
+      );
+    }
+    this.assertResidentSubsystemAvailable();
+    await this.assertNoResidentLifecycleOperationUnlocked(command.threadId);
+    const host = await this.readHostUnlocked();
+    if (command.expectedHostId !== host.hostId) {
+      throw new HostStoreError(
+        "HOST_AUTHORITY_MISMATCH",
+        "The extension UI response was composed for a different host authority",
+      );
+    }
+    const scope = await this.currentWorkspaceScopeUnlocked(
+      command.threadId,
+      command.expectedExecutionGenerationId,
+    );
+    const snapshot = await this.readSnapshotUnlocked(command.threadId);
+    if (
+      snapshot.thread.threadId !== scope.threadId ||
+      snapshot.thread.currentLocation.hostId !== scope.hostId ||
+      snapshot.thread.currentLocation.projectId !== scope.projectId ||
+      snapshot.thread.currentLocation.workspaceId !== scope.workspaceId ||
+      snapshot.thread.currentLocation.executionGenerationId !== scope.executionGenerationId
+    ) {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_AUTHORITY_INVALID",
+        "The authoritative thread snapshot does not match dialog response admission",
+      );
+    }
+    const workspaceDirectory = await this.resolveWorkspaceDirectoryUnlocked(scope);
+    const binding = (await this.readResidentSessionBindingsUnlocked()).find(
+      (candidate) => candidate.threadId === scope.threadId,
+    );
+    if (!binding) {
+      throw new HostStoreError(
+        "RESIDENT_BINDING_NOT_FOUND",
+        "No active resident Prime Agent session owns this dialog",
         true,
       );
     }
@@ -12464,7 +13043,7 @@ export class HostStore {
   private async readSnapshotUnlocked(threadId: string): Promise<ThreadProjectionSnapshot> {
     const snapshot = await readJsonFile(this.snapshotPath(threadId), ThreadProjectionSnapshotSchema);
     if (!snapshot) throw new HostStoreError("SNAPSHOT_NOT_FOUND", `Thread ${threadId} has no durable snapshot`);
-    return snapshot;
+    return durableThreadSnapshot(snapshot);
   }
 
   private async readReceiptUnlocked(identity: CommandIdentity): Promise<CommandReceipt | undefined> {
@@ -12515,6 +13094,42 @@ export class HostStore {
           command.deviceId,
           command.commandId,
           status,
+        ),
+        recordedAt,
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        commandKind: command.command.kind,
+        status,
+        message,
+      }),
+      "journalId",
+    );
+  }
+
+  private async appendExtensionUiResponseJournalUnlocked(
+    command: CommandEnvelope,
+    status: CommandReceiptStatus,
+    recordedAt: string,
+    message: string | undefined,
+    phase: "dispatching" | "settled" | "failed-before-start" | "recovered-not-started" | "recovered-uncertain",
+  ): Promise<void> {
+    if (command.command.kind !== "extension_ui.respond") {
+      throw new HostStoreError(
+        "EXTENSION_UI_RESPONSE_COMMAND_REQUIRED",
+        "The extension UI response journal accepts only exact response envelopes",
+      );
+    }
+    await appendJsonLineOnce(
+      this.paths.commandJournal,
+      CommandJournalRecordSchema.parse({
+        version: 1,
+        journalId: deterministicId(
+          "journal",
+          "extension-ui-response",
+          command.deviceId,
+          command.commandId,
+          phase,
         ),
         recordedAt,
         deviceId: command.deviceId,
@@ -12630,7 +13245,7 @@ export class HostStore {
       latestTurnOutcome: candidateOutcome,
     });
     if (!isDeepStrictEqual(candidate, snapshot)) {
-      await atomicWriteJson(this.snapshotPath(snapshot.thread.threadId), candidate);
+      await atomicWriteJson(this.snapshotPath(snapshot.thread.threadId), durableThreadSnapshot(candidate));
     }
   }
 
@@ -12818,6 +13433,13 @@ export class HostStore {
   private modelSelectionAttemptPath(identity: CommandIdentity): string {
     return join(
       this.modelSelectionAttemptsDirectory(),
+      `${storageKey(identity.deviceId, identity.commandId)}.json`,
+    );
+  }
+
+  private extensionUiResponseAttemptPath(identity: CommandIdentity): string {
+    return join(
+      this.paths.extensionUiResponseAttempts,
       `${storageKey(identity.deviceId, identity.commandId)}.json`,
     );
   }
@@ -13595,6 +14217,79 @@ function createResidentDispatchLease(attempt: ResidentDispatchAttempt): Resident
   });
 }
 
+function createExtensionUiResponseLease(attempt: ExtensionUiResponseAttempt): ExtensionUiResponseLease {
+  if (attempt.state !== "dispatching" || !attempt.dispatchStartedAt) {
+    throw new HostStoreError(
+      "EXTENSION_UI_RESPONSE_LEASE_INVALID",
+      "Only a durable dispatching attempt can create an extension UI response lease",
+    );
+  }
+  const command = CommandEnvelopeSchema.parse(attempt.command);
+  if (command.command.kind !== "extension_ui.respond") {
+    throw new HostStoreError(
+      "EXTENSION_UI_RESPONSE_LEASE_INVALID",
+      "Extension UI response attempt no longer contains a response command",
+    );
+  }
+  const immutableCommand = Object.freeze({
+    ...command,
+    command: Object.freeze({ ...command.command, response: Object.freeze({ ...command.command.response }) }),
+  }) as CommandEnvelope;
+  const binding = validateResidentSessionBinding(attempt.binding);
+  return Object.freeze({
+    [extensionUiResponseLeaseBrand]: true as const,
+    leaseVersion: 1 as const,
+    command: immutableCommand,
+    binding,
+    bindingFingerprint: attempt.bindingFingerprint,
+    dispatchStartedAt: attempt.dispatchStartedAt,
+  });
+}
+
+export function validateExtensionUiResponseLease(value: ExtensionUiResponseLease): ExtensionUiResponseLease {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value[extensionUiResponseLeaseBrand] !== true ||
+    value.leaseVersion !== 1 ||
+    !Object.isFrozen(value) ||
+    !Object.isFrozen(value.command) ||
+    !Object.isFrozen(value.command.command) ||
+    !Object.isFrozen(value.binding)
+  ) {
+    throw new HostStoreError(
+      "EXTENSION_UI_RESPONSE_LEASE_INVALID",
+      "Extension UI response dispatch requires an opaque lease from this HostStore process",
+    );
+  }
+  const command = CommandEnvelopeSchema.parse(value.command);
+  const binding = validateResidentSessionBinding(value.binding);
+  if (
+    command.command.kind !== "extension_ui.respond" ||
+    value.bindingFingerprint !== residentDispatchAuthorityFingerprint(binding) ||
+    command.threadId !== binding.threadId ||
+    command.expectedExecutionGenerationId !== binding.executionGenerationId
+  ) {
+    throw new HostStoreError(
+      "EXTENSION_UI_RESPONSE_LEASE_INVALID",
+      "Extension UI response lease no longer identifies one exact command and binding",
+    );
+  }
+  IsoDateTimeSchema.parse(value.dispatchStartedAt);
+  return value;
+}
+
+function extensionUiResponseLeaseMatchesAttempt(
+  lease: ExtensionUiResponseLease,
+  attempt: ExtensionUiResponseAttempt,
+): boolean {
+  return attempt.state === "dispatching" &&
+    attempt.dispatchStartedAt === lease.dispatchStartedAt &&
+    attempt.bindingFingerprint === lease.bindingFingerprint &&
+    isDeepStrictEqual(attempt.command, lease.command) &&
+    isDeepStrictEqual(attempt.binding, lease.binding);
+}
+
 /** Runtime proof that a lease came from this process's private HostStore brand. */
 export function validateResidentDispatchLease(value: ResidentDispatchLease): ResidentDispatchLease {
   if (
@@ -14265,6 +14960,10 @@ function applyCommand(
       // Selection becomes visible only through a fresh authoritative resident
       // projection after Prime Agent has applied and verified the mutation.
       break;
+    case "extension_ui.respond":
+      // Live extension dialogs are a service overlay. Their responses never
+      // rewrite durable projection state.
+      break;
     case "approval.resolve": {
       const approvalCommand = envelope.command;
       const approvalIndex = approvals.findIndex((approval) => approval.approvalId === approvalCommand.approvalId);
@@ -14386,6 +15085,19 @@ function createLocalHostSummary(): HostSummary {
 
 function structured(code: string, message: string, retryable = false): StructuredError {
   return { code, message, retryable };
+}
+
+function assertNoEphemeralExtensionUiProjection(snapshot: ThreadProjectionSnapshot): void {
+  if ((snapshot.residentExtensionUiRequests?.length ?? 0) === 0) return;
+  throw new HostStoreError(
+    "EPHEMERAL_EXTENSION_UI_PERSIST_FORBIDDEN",
+    "Live extension UI requests may be overlaid by HostService but may never enter durable thread state",
+  );
+}
+
+function durableThreadSnapshot(snapshot: ThreadProjectionSnapshot): ThreadProjectionSnapshot {
+  assertNoEphemeralExtensionUiProjection(snapshot);
+  return snapshot;
 }
 
 function createCommandJournalRecord(

@@ -58,6 +58,23 @@ const targets = [
     selectRuntimeTab: true,
   },
   {
+    name: 'desktop-extension-question',
+    width: 1200,
+    height: 800,
+    visualState: 'extension-ui-confirm',
+    expectedText: 'Use the verified migration plan?',
+    expectExtensionQuestion: true,
+  },
+  {
+    name: 'mobile-extension-question-390',
+    width: 390,
+    height: 844,
+    visualState: 'extension-ui-confirm',
+    expectedText: 'Use the verified migration plan?',
+    expectResponsiveTopbar: true,
+    expectExtensionQuestion: true,
+  },
+  {
     name: 'mobile-idle-390',
     width: 390,
     height: 844,
@@ -109,7 +126,7 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'prime-oauth',
-    expectedText: 'Account availability is refreshed before model selection; this is not keychain or keyring storage.',
+    expectedText: 'Sign-in opens in your browser; this view never receives the authorization URL or credential.',
     expectOAuthAction: 'Connect ChatGPT',
     selectProviderId: 'openai-codex',
     openModelsDialog: true,
@@ -119,7 +136,7 @@ const targets = [
     width: 320,
     height: 256,
     visualState: 'prime-oauth',
-    expectedText: 'Account availability is refreshed before model selection; this is not keychain or keyring storage.',
+    expectedText: 'Sign-in opens in your browser; this view never receives the authorization URL or credential.',
     expectOAuthAction: 'Connect ChatGPT',
     selectProviderId: 'openai-codex',
     openModelsDialog: true,
@@ -907,10 +924,23 @@ async function capture(target, rendererOrigin) {
       const responsiveInspector = document.querySelector('.inspector')
       const responsiveInspectorRect = responsiveInspector?.getBoundingClientRect()
       const responsiveInspectorStyle = responsiveInspector ? window.getComputedStyle(responsiveInspector) : undefined
+      const extensionQuestion = document.querySelector('.prime-interaction')
+      const extensionQuestionRect = extensionQuestion?.getBoundingClientRect()
+      const extensionConfirm = [...(extensionQuestion?.querySelectorAll('button') ?? [])]
+        .find((candidate) => candidate.textContent?.trim() === 'Confirm')
       return {
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
         composerStatusVisible: Boolean(status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0),
+        extensionQuestionVisible: Boolean(
+          extensionQuestionRect &&
+          extensionQuestionRect.width > 0 &&
+          extensionQuestionRect.height > 0 &&
+          extensionQuestionRect.left >= 0 &&
+          extensionQuestionRect.right <= window.innerWidth
+        ),
+        extensionComposerSuppressed: !document.querySelector('.composer'),
+        extensionConfirmEnabled: extensionConfirm instanceof HTMLButtonElement && !extensionConfirm.disabled,
         residentDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-provision-title"]')),
         residentDialogModal: Boolean(residentDialog?.matches(':modal')),
         residentDialogDisplay: residentDialogStyle?.display,
@@ -1062,6 +1092,14 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectStatusHidden) {
       invariant(!stateEvidence.composerStatusVisible, `${target.name} duplicated its resident-state copy`)
+    }
+    if (target.expectExtensionQuestion) {
+      invariant(
+        stateEvidence.extensionQuestionVisible &&
+        stateEvidence.extensionComposerSuppressed &&
+        stateEvidence.extensionConfirmEnabled,
+        `${target.name} did not keep the Prime Agent question singular and actionable: ${JSON.stringify(stateEvidence)}`,
+      )
     }
     if (target.openResidentDialog) {
       invariant(stateEvidence.residentDialogOpen, `${target.name} did not open the resident setup dialog`)

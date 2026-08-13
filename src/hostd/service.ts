@@ -7,6 +7,7 @@ import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PROTOCOL_VERSION,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   ResidentLifecycleStatusSchema,
@@ -535,6 +536,10 @@ export class HostService {
           (runtimeIntegrity === undefined || runtimeIntegrity.status === "ready")
           ? [PRIME_AGENT_COMMAND_CAPABILITY]
           : [];
+        const extensionUiCapabilities = executionCapabilities.length > 0 &&
+          typeof this.gateway.listResidentExtensionUiRequests === "function"
+          ? [RESIDENT_EXTENSION_UI_CAPABILITY]
+          : [];
         let residentLifecycleReady = false;
         if (
           (context.transport === "trusted_user" || context.transport === "ssh_bridge") &&
@@ -627,6 +632,7 @@ export class HostService {
             ? [
                 ...HOST_CAPABILITIES,
                 ...executionCapabilities,
+                ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
@@ -638,6 +644,7 @@ export class HostService {
             : [
                 ...HOST_CAPABILITIES,
                 ...executionCapabilities,
+                ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
                 ...oauthCapabilities,
@@ -913,20 +920,60 @@ export class HostService {
         const residentCommandUnsupported = this.gateway.continuity === "resident" &&
           command.command.kind !== "prompt" &&
           command.command.kind !== "abort" &&
-          command.command.kind !== "model.select"
+          command.command.kind !== "model.select" &&
+          command.command.kind !== "extension_ui.respond"
           ? {
               code: "RESIDENT_COMMAND_UNSUPPORTED",
-              message: "This continuity checkpoint supports only a new prompt, Stop, and model selection.",
+              message: "This continuity checkpoint does not support that resident command.",
               retryable: false,
             }
           : undefined;
+        let extensionUiRequestUnavailable: StructuredError | undefined;
+        if (
+          live &&
+          command.command.kind === "extension_ui.respond"
+        ) {
+          const responseCommand = command.command;
+          const binding = await this.store.getResidentSessionBinding(
+            command.threadId,
+            command.expectedExecutionGenerationId,
+          );
+          const request = binding
+            ? this.gateway.listResidentExtensionUiRequests?.(binding).find(
+                (candidate) =>
+                  candidate.requestId === responseCommand.requestId &&
+                  candidate.requestDigest === responseCommand.requestDigest &&
+                  candidate.method === responseCommand.method &&
+                  candidate.hostId === command.expectedHostId &&
+                  candidate.threadId === command.threadId &&
+                  candidate.executionGenerationId === command.expectedExecutionGenerationId,
+              )
+            : undefined;
+          if (!request) {
+            extensionUiRequestUnavailable = {
+              code: "EXTENSION_UI_REQUEST_EXPIRED",
+              message: "This dialog is no longer waiting for a response.",
+              retryable: false,
+            };
+          } else if (
+            request.method === "select" &&
+            responseCommand.response.kind === "value" &&
+            !request.options.includes(responseCommand.response.value)
+          ) {
+            extensionUiRequestUnavailable = {
+              code: "EXTENSION_UI_SELECTION_INVALID",
+              message: "The selected value is no longer available for this dialog.",
+              retryable: false,
+            };
+          }
+        }
         const gatewayUnavailable = this.gateway instanceof UnavailablePrimeAgentGateway
           ? {
               code: "GATEWAY_UNAVAILABLE",
               message: "Prime Agent execution is not attached in this build; the command was not queued.",
               retryable: true,
             }
-          : residentCommandUnsupported ?? liveCheckFailure ?? (!live
+          : residentCommandUnsupported ?? extensionUiRequestUnavailable ?? liveCheckFailure ?? (!live
             ? {
                 code: "RESIDENT_SESSION_NOT_ATTACHED",
                 message: "The exact resident Prime Agent session is not attached; the command was not sent.",
@@ -985,6 +1032,51 @@ export class HostService {
                 code: gatewayError?.code ?? "MODEL_SELECTION_OUTCOME_UNKNOWN",
                 message,
                 retryable: uncertain ? false : (gatewayError?.retryable ?? true),
+              },
+            });
+          }
+        }
+
+        if (command.command.kind === "extension_ui.respond") {
+          let lease: Awaited<ReturnType<HostStore["beginExtensionUiResponseDispatch"]>>;
+          try {
+            lease = await this.store.beginExtensionUiResponseDispatch(command);
+          } catch (error) {
+            const storeError = error instanceof HostStoreError ? error : undefined;
+            return this.store.failExtensionUiResponseBeforeStart(command, {
+              code: storeError?.code ?? "EXTENSION_UI_RESPONSE_DISPATCH_REJECTED",
+              message: (storeError?.message ?? "Dialog authority changed before dispatch").slice(0, 2_048),
+              retryable: false,
+            });
+          }
+          try {
+            const gatewayAdmission = await this.gateway.submit(command, { extensionUiResponse: lease });
+            if (gatewayAdmission.disposition !== "handled") {
+              return this.store.finalizeExtensionUiResponseDispatch(lease, {
+                status: "uncertain",
+                message: "Prime Agent returned an invalid dialog response acknowledgement",
+                error: {
+                  code: "EXTENSION_UI_RESPONSE_ACK_INVALID",
+                  message: "The response may have been accepted, but no definitive acknowledgement was received",
+                  retryable: false,
+                },
+              });
+            }
+            return this.store.finalizeExtensionUiResponseDispatch(lease, {
+              status: "completed",
+              message: gatewayAdmission.message?.slice(0, 1_024) ?? "Prime Agent acknowledged the dialog response",
+            });
+          } catch (error) {
+            const gatewayError = error instanceof GatewayError ? error : undefined;
+            const message = gatewayError?.message.slice(0, 1_024) ??
+              "Prime Agent did not provide a definitive dialog response acknowledgement";
+            return this.store.finalizeExtensionUiResponseDispatch(lease, {
+              status: "uncertain",
+              message,
+              error: {
+                code: gatewayError?.code ?? "EXTENSION_UI_RESPONSE_OUTCOME_UNKNOWN",
+                message,
+                retryable: false,
               },
             });
           }
@@ -1272,6 +1364,9 @@ export class HostService {
         // snapshot remains readable, but it cannot advertise command authority.
       }
     }
+    const residentExtensionUiRequests = livePreparedBinding
+      ? this.gateway.listResidentExtensionUiRequests?.(livePreparedBinding) ?? []
+      : [];
     try {
       const residentControl = await this.store.getResidentControlProjection(
         expectedHostId,
@@ -1280,7 +1375,11 @@ export class HostService {
         livePreparedBinding,
         browserExecutionReady,
       );
-      return ThreadProjectionSnapshotSchema.parse({ ...snapshot, residentControl });
+      return ThreadProjectionSnapshotSchema.parse({
+        ...snapshot,
+        residentControl,
+        ...(residentExtensionUiRequests.length > 0 ? { residentExtensionUiRequests } : {}),
+      });
     } catch (error) {
       if (
         error instanceof HostStoreError &&
@@ -1538,6 +1637,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
           return "model.select";
         case "approval.resolve":
           return "approval.resolve";
+        case "extension_ui.respond":
+          return "extension_ui.respond";
       }
   }
 }

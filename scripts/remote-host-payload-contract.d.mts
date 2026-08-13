@@ -18,9 +18,9 @@ export const REMOTE_HOST_PAYLOAD_PRIME_AGENT: Readonly<{
   daemonSchemaId: 'protocol-7-schema-16-1bcb9e7f1a49'
   runtimeBuildId: '83a0f9f-dirty'
   releaseCommit: '83a0f9f9566219551fcb6ffaf7f519a815749a58'
-  runtimePolicySha256: '570ad339d58762baf42454cc492d51941cc71f277bc260359683e03f7baf644a'
+  runtimePolicySha256: '54d42378d056f655af8ab629a2dce49699cdfe672c3a45cf6e3bee707d02d2a2'
   sourcesSha256: '8d1d2207ff27bcc264386f7e4c2fa693d76e7b1b1fd6d4848ffcb94da1b45704'
-  packageLockSha256: '7eb5fd87f89abbf12f5e82f9a4ac50f4db2c2a281d73347460a4b08c295cdae3'
+  packageLockSha256: 'edb0676a8ddaf29dd19ee13719e962a9cdfaf398f8500a35200c025639d1b7ce'
 }>
 
 export interface RemoteHostElectronProvenance {

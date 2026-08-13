@@ -26,14 +26,14 @@ const temporaryDirectories: string[] = []
 class TestConnection extends EventEmitter {
   isClosed = false
   terminatedWith?: unknown
-  readonly requests: Array<{ method: string; params: unknown }> = []
+  readonly requests: Array<{ method: string; params: unknown; options?: unknown }> = []
 
   constructor(private readonly respond: (method: string, params: unknown) => unknown) {
     super()
   }
 
-  async request(method: string, params: unknown): Promise<unknown> {
-    this.requests.push({ method, params })
+  async request(method: string, params: unknown, options?: unknown): Promise<unknown> {
+    this.requests.push({ method, params, options })
     return this.respond(method, params)
   }
 
@@ -763,6 +763,93 @@ describe('DesktopControlService recovery', () => {
         command: expect.objectContaining({ commandId: uncertainPrompt.commandId }),
       }),
     ])
+  })
+
+  it('feature-gates native dialogs and submits an exact response with urgent priority', async () => {
+    const directory = await createUserData({})
+    const command = extensionUiResponse('device-a', 'extension-ui-submit')
+    const oldHost = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`An old host must not receive ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(oldHost)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    await expect(service.submitCommand(command)).rejects.toMatchObject({
+      code: 'command.extension_ui_capability_unavailable',
+    })
+    expect((await service.bootstrap()).outbox).toEqual([])
+    await service.disconnect()
+
+    const newHost = new TestConnection((method, params) => {
+      if (method === 'health.get') {
+        return { ...health('host-a'), capabilities: ['prime_agent_commands_v2', 'resident_extension_ui_v1'] }
+      }
+      if (method === 'command.submit') {
+        expect(params).toMatchObject({
+          command: {
+            command: {
+              kind: 'extension_ui.respond',
+              requestId: 'dialog-one',
+              requestDigest: 'a'.repeat(64),
+              method: 'select',
+              response: { kind: 'value', value: 'A' },
+            },
+          },
+        })
+        return commandReceipt(command)
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(newHost)
+    await service.connect({ kind: 'local' })
+    await expect(service.submitCommand(command)).resolves.toMatchObject({ status: 'completed' })
+    expect(newHost.requests.find(({ method }) => method === 'command.submit')?.options).toEqual({ priority: 'urgent' })
+    expect((await service.bootstrap()).outbox).toEqual([])
+    await service.disconnect()
+  })
+
+  it('never replays an unknown live-only dialog response after reconnect', async () => {
+    const command = extensionUiResponse('device-a', 'extension-ui-unknown')
+    const directory = await createUserData({
+      cache: verifiedCache('host-a'),
+      outbox: [{ hostId: 'host-a', command, state: 'uncertain', updatedAt: timestamp }],
+    })
+    const connection = new TestConnection((method, params) => {
+      if (method === 'health.get') {
+        return { ...health('host-a'), capabilities: ['prime_agent_commands_v2', 'resident_extension_ui_v1'] }
+      }
+      if (method === 'command.reconcile') {
+        expect(params).toMatchObject({ commands: [expect.objectContaining({ commandId: command.commandId })] })
+        return { receipts: [], unknown: [{ deviceId: command.deviceId, commandId: command.commandId }] }
+      }
+      throw new Error(`An unknown dialog response must not invoke ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+
+    await service.bootstrap()
+    await service.reconnect()
+    expect(connection.requests.map(({ method }) => method)).toEqual(['health.get', 'command.reconcile'])
+    expect(connection.requests.some(({ method }) => method === 'command.submit')).toBe(false)
+    expect((await service.bootstrap()).outbox).toEqual([])
+    await service.disconnect()
+  })
+
+  it('rejects a method-mismatched dialog response before persistence or transport', async () => {
+    const directory = await createUserData({ cache: verifiedCache('host-a') })
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.bootstrap()
+    await expect(service.submitCommand({
+      ...extensionUiResponse('device-a', 'extension-ui-invalid'),
+      payload: {
+        requestId: 'dialog-one',
+        requestDigest: 'a'.repeat(64),
+        method: 'confirm',
+        response: { kind: 'value', value: 'A' },
+      },
+    })).rejects.toMatchObject({ code: 'command.extension_ui_response_invalid' })
+    expect((await service.bootstrap()).outbox).toEqual([])
   })
 
   it('replays by immutable host identity when the SSH alias has changed', async () => {
@@ -2152,6 +2239,40 @@ describe('DesktopControlService recovery', () => {
     await service.disconnect()
   })
 
+  it('emits live dialogs but never writes them into the desktop projection cache', async () => {
+    const directory = await createUserData({})
+    const snapshot = threadSnapshotWithDialogs()
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return { ...health('host-a'), capabilities: ['prime_agent_commands_v2', 'resident_extension_ui_v1'] }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    const published = deferred<unknown>()
+    service.once('snapshot', published.resolve)
+    await service.connect({ kind: 'local' })
+
+    connection.emit('event', { type: 'snapshot.update', payload: snapshot })
+    await expect(published.promise).resolves.toMatchObject({
+      residentExtensionUiRequests: [
+        expect.objectContaining({ method: 'select' }),
+        expect.objectContaining({ method: 'confirm' }),
+        expect.objectContaining({ method: 'input' }),
+        expect.objectContaining({ method: 'editor' }),
+      ],
+    })
+
+    const persisted = await readFile(path.join(directory, 'control', 'projection-cache.json'), 'utf8')
+    expect(persisted).not.toContain('residentExtensionUiRequests')
+    expect(persisted).not.toContain('private editor prefill')
+    await service.disconnect()
+
+    const restarted = new DesktopControlService({ app: testApp(directory) })
+    expect(JSON.stringify((await restarted.bootstrap()).cache)).not.toContain('residentExtensionUiRequests')
+  })
+
   it('terminates a connection that sends an invalid thread-change signal', async () => {
     const directory = await createUserData({})
     const connection = new TestConnection((method) => {
@@ -2697,6 +2818,20 @@ function prompt(deviceId: string, commandId: string, expectedHostId = 'host-a'):
   }
 }
 
+function extensionUiResponse(deviceId: string, commandId: string, expectedHostId = 'host-a'): ClientCommand {
+  return {
+    ...followUp(deviceId, commandId, expectedHostId),
+    kind: 'extension_ui.respond',
+    delivery: 'live_only',
+    payload: {
+      requestId: 'dialog-one',
+      requestDigest: 'a'.repeat(64),
+      method: 'select',
+      response: { kind: 'value', value: 'A' },
+    },
+  }
+}
+
 function abortCommand(deviceId: string, commandId: string, expectedHostId = 'host-a'): ClientCommand {
   return {
     ...followUp(deviceId, commandId, expectedHostId),
@@ -2888,6 +3023,41 @@ function threadSnapshotAt(input: {
       lastKnownCursor: cursor,
     },
     latestCursor: cursor,
+  }
+}
+
+function threadSnapshotWithDialogs() {
+  const snapshot = threadSnapshot('thread-1', 'host-a')
+  const bindingFingerprint = 'b'.repeat(64)
+  const authority = {
+    interactionVersion: 1 as const,
+    hostId: 'host-a',
+    threadId: 'thread-1',
+    executionGenerationId: 'execution-1',
+    bindingFingerprint,
+    receivedAt: timestamp,
+  }
+  return {
+    ...snapshot,
+    residentControl: {
+      projectionVersion: 1 as const,
+      hostId: 'host-a',
+      threadId: 'thread-1',
+      executionGenerationId: 'execution-1',
+      bindingFingerprint,
+      controlSequence: 1,
+      changedAt: timestamp,
+      authorityCursor: snapshot.latestCursor,
+      commandReadiness: 'ready' as const,
+      browserExecution: { readiness: 'unavailable' as const },
+      quiescence: { state: 'idle_proven' as const },
+    },
+    residentExtensionUiRequests: [
+      { ...authority, requestId: 'dialog-select', requestDigest: '1'.repeat(64), method: 'select' as const, title: 'Select', options: ['A', 'B'] },
+      { ...authority, requestId: 'dialog-confirm', requestDigest: '2'.repeat(64), method: 'confirm' as const, title: 'Confirm', message: 'Proceed?' },
+      { ...authority, requestId: 'dialog-input', requestDigest: '3'.repeat(64), method: 'input' as const, title: 'Input', placeholder: 'Value' },
+      { ...authority, requestId: 'dialog-editor', requestDigest: '4'.repeat(64), method: 'editor' as const, title: 'Editor', prefill: 'private editor prefill' },
+    ],
   }
 }
 

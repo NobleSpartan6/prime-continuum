@@ -584,9 +584,9 @@ describe("host protocol schemas", () => {
     ]);
   });
 
-  it("publishes one immutable exact nine-scope vocabulary without accepting aliases or duplicates", () => {
+  it("publishes one immutable exact ten-scope vocabulary without accepting aliases or duplicates", () => {
     expect(Object.isFrozen(REMOTE_DEVICE_SCOPES)).toBe(true);
-    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(9);
+    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(10);
     expect(REMOTE_DEVICE_SCOPES).toEqual([
       "projection.read",
       "thread.follow_up",
@@ -595,6 +595,7 @@ describe("host protocol schemas", () => {
       "thread.start",
       "model.select",
       "approval.resolve",
+      "extension_ui.respond",
       "run_location.change",
       "host.admin",
     ]);

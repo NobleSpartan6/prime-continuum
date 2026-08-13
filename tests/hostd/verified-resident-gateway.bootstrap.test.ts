@@ -325,6 +325,27 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     await fixture.gateway.close();
   });
 
+  it("publishes an immediate live-only invalidation without persisting dialog state", async () => {
+    const durableBinding = binding("thread-dialog", "execution-dialog", "active-dialog");
+    const fixture = await gatewayFixture([durableBinding]);
+    const changes: PrimeAgentProjectionChange[] = [];
+    const unsubscribe = fixture.gateway.subscribeProjectionChanges((change) => changes.push(change));
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    vi.mocked(fixture.store.publishResidentProjectionSnapshot).mockClear();
+
+    fixture.adapterOptions.publishEphemeralProjectionChange?.(durableBinding);
+
+    expect(changes).toContainEqual({
+      threadId: "thread-dialog",
+      executionGenerationId: "execution-dialog",
+    });
+    expect(fixture.store.publishResidentProjectionSnapshot).not.toHaveBeenCalled();
+    unsubscribe();
+    await fixture.gateway.close();
+  });
+
   it("proves only the exact prepared binding without retiring a healthy replacement", async () => {
     const current = binding("thread-a", "execution-a", "active-current");
     const stale = {
@@ -601,6 +622,7 @@ async function gatewayFixture(
   let projectedBindings = [...(fixtureOptions.projectedBindings ?? bindings)];
   const store = {
     paths: { root },
+    getHost: vi.fn(async () => ({ hostId: "host-local" })),
     listResidentSessionBindings: vi.fn(async () => [...currentBindings]),
     getResidentSessionBinding: vi.fn(async (threadId: string, executionGenerationId: string) =>
       currentBindings.find(

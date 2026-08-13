@@ -6,6 +6,12 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { CommandEnvelopeSchema, type CommandEnvelope } from "../shared/protocol";
 import {
+  ExtensionUiDialogResponseSchema,
+  ResidentExtensionUiRequestSchema,
+  type ExtensionUiDialogResponse,
+  type ResidentExtensionUiRequest,
+} from "../shared/protocol";
+import {
   GatewayError,
   residentCommandEnvelopeFingerprint,
   type GatewayAdmission,
@@ -61,11 +67,13 @@ import {
   validateResidentAbortReconciliationLease,
   validateResidentPromptReconciliationLease,
   validateResidentKillLeaseEnvelope,
+  validateExtensionUiResponseLease,
   type ResidentAbortReconciliationLease,
   type ResidentDispatchLease,
   type ResidentKillInvocationAuthorizer,
   type ResidentKillLease,
   type ResidentPromptReconciliationLease,
+  type ExtensionUiResponseLease,
 } from "./store";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 750;
@@ -342,6 +350,10 @@ export interface PrimeDaemonAgentConnectionPublic {
   ): Promise<void>;
   /** v0.7.2 resolves abort when requestAbort() is accepted, not when stopping completes. */
   abort?(): Promise<void>;
+  respondToExtensionUiRequest?(
+    requestId: string,
+    response: Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }>,
+  ): Promise<void>;
   /** v0.7.2 promotes one client-owned worker to ordinary resident lifetime. */
   promoteToResident(): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
@@ -357,7 +369,7 @@ export interface PrimeAgentPublicModule {
       options: Readonly<{
         closeClientOnDispose: true;
         sendClientEnv: false;
-        supportsExtensionUi: false;
+        supportsExtensionUi: true;
         ownedSession: boolean;
         telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
@@ -382,6 +394,8 @@ export type ResidentDaemonSpawn = (
 ) => ResidentDaemonLauncher;
 
 export interface PrimeAgentResidentAdapterOptions {
+  /** Immutable verified host identity used only in path-free live projections. */
+  readonly hostId: string;
   readonly socketPath: string;
   /** Absolute, verified Node-compatible executable for the pinned runtime. */
   readonly executable: string;
@@ -409,6 +423,8 @@ export interface PrimeAgentResidentAdapterOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  /** Invalidate only the service overlay; this callback must never persist the dialogs. */
+  readonly publishEphemeralProjectionChange?: (binding: ResidentSessionBinding) => void;
   readonly spawnFactory?: ResidentDaemonSpawn;
   readonly connectTimeoutMs?: number;
   readonly startupTimeoutMs?: number;
@@ -418,6 +434,7 @@ export interface PrimeAgentResidentAdapterOptions {
 }
 
 interface ResolvedOptions {
+  readonly hostId: string;
   readonly invocation: ResidentDaemonStartInvocation;
   readonly socketPath: string;
   readonly loadRuntimeModule: PrimeAgentPublicModuleLoader;
@@ -432,6 +449,7 @@ interface ResolvedOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  readonly publishEphemeralProjectionChange: (binding: ResidentSessionBinding) => void;
   readonly spawnFactory: ResidentDaemonSpawn;
   readonly connectTimeoutMs: number;
   readonly startupTimeoutMs: number;
@@ -545,6 +563,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       additionalSkillPath: options.browserSkill,
     });
     this.options = Object.freeze({
+      hostId: options.hostId,
       invocation,
       socketPath: invocation.argv[4]!,
       loadRuntimeModule: options.loadRuntimeModule,
@@ -557,6 +576,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       }),
       publishProjection: options.publishProjection,
       publishModelSelectionProjection: options.publishModelSelectionProjection,
+      publishEphemeralProjectionChange: options.publishEphemeralProjectionChange ?? (() => undefined),
       spawnFactory: options.spawnFactory ?? defaultResidentDaemonSpawn,
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
       startupTimeoutMs: boundedTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, "startupTimeoutMs"),
@@ -1221,6 +1241,18 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     return connection?.isLive() ?? false;
   }
 
+  listResidentExtensionUiRequests(bindingValue: ResidentSessionBinding): readonly ResidentExtensionUiRequest[] {
+    const binding = validateResidentSessionBinding(bindingValue);
+    const connection = this.connections.get(binding.activeSessionId);
+    if (
+      !connection ||
+      residentDispatchAuthorityFingerprint(connection.binding) !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      return Object.freeze([]);
+    }
+    return connection.listExtensionUiRequests();
+  }
+
   reconcileAcknowledgedPromptIdle(
     leaseValue: ResidentPromptReconciliationLease,
   ): Promise<ResidentPromptIdleAuthorityEvidence> {
@@ -1301,6 +1333,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     if (command.command.kind === "prompt" || command.command.kind === "abort") {
       return this.submitResidentDispatch(command, context?.residentDispatch);
     }
+    if (command.command.kind === "extension_ui.respond") {
+      return this.submitExtensionUiResponse(command, context?.extensionUiResponse);
+    }
     if (command.command.kind !== "model.select") {
       return Promise.reject(
         new GatewayError(
@@ -1375,6 +1410,77 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       Object.freeze({ command: Object.freeze(command), binding: durableBinding, result }),
     );
     return result;
+  }
+
+  private submitExtensionUiResponse(
+    command: CommandEnvelope,
+    leaseValue: ExtensionUiResponseLease | undefined,
+  ): Promise<GatewayAdmission> {
+    if (command.command.kind !== "extension_ui.respond") {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_COMMAND_REQUIRED",
+        "This dispatch path accepts only extension UI responses",
+      ));
+    }
+    const responseCommand = command.command;
+    let lease: ExtensionUiResponseLease;
+    try {
+      if (!leaseValue) throw new Error("missing lease");
+      lease = validateExtensionUiResponseLease(leaseValue);
+    } catch (error) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_DURABLE_AUTHORITY_REQUIRED",
+        "Extension UI response requires exact durable no-replay authority",
+        false,
+        false,
+        { cause: error },
+      ));
+    }
+    if (!isDeepStrictEqual(lease.command, command)) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_AUTHORITY_MISMATCH",
+        "Extension UI response changed after durable admission",
+      ));
+    }
+    const connection = this.connections.get(lease.binding.activeSessionId);
+    if (!connection || !isDeepStrictEqual(connection.binding, lease.binding)) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_BINDING_MISMATCH",
+        "The live Prime Agent connection no longer owns this dialog",
+        false,
+      ));
+    }
+    const request = connection.listExtensionUiRequests().find(
+      (candidate) =>
+        candidate.requestId === responseCommand.requestId &&
+        candidate.requestDigest === responseCommand.requestDigest &&
+        candidate.method === responseCommand.method &&
+        candidate.bindingFingerprint === lease.bindingFingerprint,
+    );
+    if (!request) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_REQUEST_EXPIRED",
+        "The extension UI request disappeared before its response was sent",
+        false,
+      ));
+    }
+    return connection.respondToExtensionUiRequest(request, responseCommand.response).then(() => ({
+      disposition: "handled" as const,
+      message: "Prime Agent acknowledged the dialog response",
+    })).catch((error: unknown) => {
+      if (error instanceof ResidentRuntimeContractError) {
+        throw new GatewayError(error.code, error.message, error.retryable, error.code === "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN", {
+          cause: error,
+        });
+      }
+      throw new GatewayError(
+        "EXTENSION_UI_RESPONSE_OUTCOME_UNKNOWN",
+        "Prime Agent did not provide a definitive dialog response acknowledgement",
+        false,
+        true,
+        { cause: error },
+      );
+    });
   }
 
   private submitResidentDispatch(
@@ -1871,7 +1977,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     return runtimeModule.DaemonAgentConnection.attach(client, activeSessionId, {
       closeClientOnDispose: true,
       sendClientEnv: false,
-      supportsExtensionUi: false,
+      supportsExtensionUi: true,
       ownedSession,
       telemetryDisabled: true,
       // Do not re-enter the adapter operation queue: recovery may be invoked
@@ -1895,6 +2001,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     }
     const connection = new ManagedResidentRuntimeConnection({
       binding,
+      hostId: this.options.hostId,
       client,
       attached,
       requestTimeoutMs: this.options.requestTimeoutMs,
@@ -1906,6 +2013,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       persistBinding: this.options.persistBinding,
       publishProjection: this.options.publishProjection,
       publishModelSelectionProjection: this.options.publishModelSelectionProjection,
+      publishEphemeralProjectionChange: this.options.publishEphemeralProjectionChange,
       readStableSelectedModelProjection: (selectionBinding, providerId, modelId) =>
         this.readStableSelectedModelProjection(selectionBinding, providerId, modelId),
       initialProjection,
@@ -2178,6 +2286,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private abortTail: Promise<void> = Promise.resolve();
   private residentIdleReconciliationTail: Promise<void> = Promise.resolve();
+  private extensionUiResponseTail: Promise<void> = Promise.resolve();
   private promptIdleReconciliationRecord: PromptIdleReconciliationRecord | undefined;
   private abortIdleReconciliationRecord: AbortIdleReconciliationRecord | undefined;
   private residentIdleReconciliationCancellation: ResidentIdleReconciliationCancellation | undefined;
@@ -2192,6 +2301,17 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private cancelledPromptAdmission: PromptAdmissionAttempt | undefined;
   private authoritativeProjectionValue: ResidentProjectionSnapshot | undefined;
   private readonly observedChildAgents = new Map<string, ResidentProjectionSnapshot["childAgents"][number]>();
+  private readonly extensionUiRequests = new Map<string, ResidentExtensionUiRequest>();
+  private readonly extensionUiExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly retiredExtensionUiRequests = new Map<string, Readonly<{
+    requestDigest: string;
+    method: ResidentExtensionUiRequest["method"];
+  }>>();
+  private readonly extensionUiResponseAttempts = new Map<string, Readonly<{
+    requestDigest: string;
+    responseDigest: string;
+    result: Promise<void>;
+  }>>();
   private upstreamEventOrdinal = 0;
   private latestTerminalAssistantEvent: Readonly<{
     ordinal: number;
@@ -2210,6 +2330,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   constructor(
     private readonly options: Readonly<{
       binding: ResidentSessionBinding;
+      hostId: string;
       client: PrimeDaemonClientPublic;
       attached: PrimeDaemonAgentConnectionPublic;
       requestTimeoutMs: number;
@@ -2228,6 +2349,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         binding: ResidentSessionBinding,
         projection: ResidentProjectionSnapshot,
       ) => Promise<void>;
+      publishEphemeralProjectionChange: (binding: ResidentSessionBinding) => void;
       readStableSelectedModelProjection: (
         binding: ResidentSessionBinding,
         providerId: string,
@@ -2271,6 +2393,105 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       this.options.client.isConnected !== false &&
       this.lifecycle.get().state === "ready"
     );
+  }
+
+  listExtensionUiRequests(): readonly ResidentExtensionUiRequest[] {
+    if (!this.isLive()) return Object.freeze([]);
+    const currentTime = this.options.now().getTime();
+    for (const [requestId, request] of this.extensionUiRequests) {
+      if (
+        request.timeoutMs !== undefined &&
+        currentTime >= Date.parse(request.receivedAt) + request.timeoutMs
+      ) {
+        this.extensionUiRequests.delete(requestId);
+        this.retireExtensionUiRequest(request);
+        this.clearExtensionUiExpiryTimer(requestId);
+        this.options.publishEphemeralProjectionChange(this.binding);
+      }
+    }
+    return Object.freeze([...this.extensionUiRequests.values()]);
+  }
+
+  respondToExtensionUiRequest(
+    requestValue: ResidentExtensionUiRequest,
+    responseValue: ExtensionUiDialogResponse,
+  ): Promise<void> {
+    let request: ResidentExtensionUiRequest;
+    let response: ExtensionUiDialogResponse;
+    try {
+      request = ResidentExtensionUiRequestSchema.parse(requestValue);
+      response = ExtensionUiDialogResponseSchema.parse(responseValue);
+      if (
+        request.method === "select" &&
+        response.kind === "value" &&
+        !request.options.includes(response.value)
+      ) {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+          "The selected value is not one of the exact dialog options.",
+        );
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const responseDigest = normalizedJsonDigest(response);
+    const existing = this.extensionUiResponseAttempts.get(request.requestId);
+    if (existing) {
+      if (
+        existing.requestDigest !== request.requestDigest ||
+        existing.responseDigest !== responseDigest
+      ) {
+        return Promise.reject(new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+          "This extension UI response identity is already bound to different immutable bytes.",
+          { retryable: false },
+        ));
+      }
+      return existing.result;
+    }
+    const current = this.extensionUiRequests.get(request.requestId);
+    if (
+      !this.isLive() ||
+      !current ||
+      !isDeepStrictEqual(current, request) ||
+      current.bindingFingerprint !== residentDispatchAuthorityFingerprint(this.binding)
+    ) {
+      return Promise.reject(new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+        "The extension UI request is no longer owned by this exact live resident connection.",
+        { retryable: false, details: { requestId: request.requestId } },
+      ));
+    }
+    // Store already crossed its durable no-replay boundary before the adapter
+    // receives this call. Remove visibility synchronously, before this response
+    // queues behind any prior dialog mutation.
+    this.extensionUiRequests.delete(request.requestId);
+    this.retireExtensionUiRequest(request);
+    this.clearExtensionUiExpiryTimer(request.requestId);
+    this.options.publishEphemeralProjectionChange(this.binding);
+    const result = this.extensionUiResponseTail.then(() =>
+      this.respondToExtensionUiRequestOnce(request, response),
+    );
+    this.extensionUiResponseTail = result.then(() => undefined, () => undefined);
+    const record = Object.freeze({
+      requestDigest: request.requestDigest,
+      responseDigest,
+      result,
+    });
+    this.extensionUiResponseAttempts.set(request.requestId, record);
+    void result.then(
+      () => {
+        if (this.extensionUiResponseAttempts.get(request.requestId) === record) {
+          this.extensionUiResponseAttempts.delete(request.requestId);
+        }
+      },
+      () => {
+        if (this.extensionUiResponseAttempts.get(request.requestId) === record) {
+          this.extensionUiResponseAttempts.delete(request.requestId);
+        }
+      },
+    );
+    return result;
   }
 
   selectModel(
@@ -2426,6 +2647,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.locallyClosed = true;
     this.projectionRefreshRequested = false;
     this.unsubscribeUpstream();
+    this.clearExtensionUiRequests();
     closeDaemonClientQuietly(this.options.client);
     this.cancelResidentIdleReconciliation();
     this.lifecycle.transition("closed", { binding: this.binding });
@@ -2615,6 +2837,47 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       () => undefined,
     );
     return result;
+  }
+
+  private async respondToExtensionUiRequestOnce(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<void> {
+    if (
+      !this.isLive() ||
+      request.threadId !== this.binding.threadId ||
+      request.executionGenerationId !== this.binding.executionGenerationId ||
+      request.bindingFingerprint !== residentDispatchAuthorityFingerprint(this.binding)
+    ) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+        "The extension UI request is no longer owned by this exact live resident connection.",
+        { retryable: false, details: { requestId: request.requestId } },
+      );
+    }
+    const respond = this.options.attached.respondToExtensionUiRequest;
+    if (typeof respond !== "function") {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_MODULE_INVALID",
+        "The verified Prime Agent connection does not expose extension UI response admission.",
+      );
+    }
+    const upstreamResponse = extensionUiResponseForUpstream(request.method, response);
+    let invocation: Promise<void>;
+    try {
+      invocation = respond.call(this.options.attached, request.requestId, upstreamResponse);
+    } catch (error) {
+      throw unknownExtensionUiResponseOutcome(request.requestId, error);
+    }
+    try {
+      await awaitResidentMutationInvocation(
+        invocation,
+        this.options.requestTimeoutMs,
+        "extension UI response",
+      );
+    } catch (error) {
+      throw unknownExtensionUiResponseOutcome(request.requestId, error);
+    }
   }
 
   private async reconcileAcknowledgedPromptIdleOnce(
@@ -2888,6 +3151,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       } finally {
         this.readAuthorityDisposed = true;
         this.unsubscribeUpstream();
+        this.clearExtensionUiRequests();
       }
     }
     // A hostile or buggy public waitForIdle Promise may ignore client close.
@@ -3068,6 +3332,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       this.promptAdmissionTail,
       this.abortTail,
       this.modelMutationTail,
+      this.extensionUiResponseTail,
     ]).then(operation).then(
       () => {
         if (this.locallyClosed) return;
@@ -3388,6 +3653,10 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     if (this.locallyClosed || this.terminalAction) return;
     if (!isRecord(event) || typeof event.type !== "string") throw invalidResponse("connection event");
     this.upstreamEventOrdinal += 1;
+    if (event.type === "extension_ui_request") {
+      this.acceptExtensionUiRequest(event.request);
+      return;
+    }
     if (event.type === "session_event") {
       const marker = residentTerminalAssistantMarkerFromSessionEvent(event.event);
       if (marker) {
@@ -3404,6 +3673,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     switch (event.type) {
       case "connection_status": {
         if (event.status === "reconnecting") {
+          this.clearExtensionUiRequests();
           this.resyncValidated = false;
           this.lifecycle.transition("reconnecting", { binding: this.binding });
           return;
@@ -3469,6 +3739,85 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         this.requestProjectionRefresh();
         return;
     }
+  }
+
+  private acceptExtensionUiRequest(value: unknown): void {
+    const request = normalizeExtensionUiRequest(
+      value,
+      this.binding,
+      this.options.hostId,
+      this.options.now(),
+    );
+    if (!request) return;
+    const existing = this.extensionUiRequests.get(request.requestId);
+    if (existing) {
+      if (
+        existing.requestDigest !== request.requestDigest ||
+        existing.method !== request.method ||
+        existing.hostId !== request.hostId ||
+        existing.threadId !== request.threadId ||
+        existing.executionGenerationId !== request.executionGenerationId ||
+        existing.bindingFingerprint !== request.bindingFingerprint
+      ) {
+        throw invalidResponse("extension UI request identity");
+      }
+      return;
+    }
+    const retired = this.retiredExtensionUiRequests.get(request.requestId);
+    if (retired) {
+      if (retired.requestDigest === request.requestDigest && retired.method === request.method) return;
+      throw invalidResponse("retired extension UI request identity");
+    }
+    if (this.extensionUiRequests.size >= 16) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_RESPONSE_INVALID",
+        "Prime Agent exceeded the bounded extension UI request limit.",
+      );
+    }
+    this.extensionUiRequests.set(request.requestId, request);
+    this.scheduleExtensionUiExpiry(request);
+    this.options.publishEphemeralProjectionChange(this.binding);
+  }
+
+  private scheduleExtensionUiExpiry(request: ResidentExtensionUiRequest): void {
+    if (request.timeoutMs === undefined) return;
+    const remaining = Math.max(0, Date.parse(request.receivedAt) + request.timeoutMs - this.options.now().getTime());
+    const timer = setTimeout(() => {
+      if (this.extensionUiExpiryTimers.get(request.requestId) !== timer) return;
+      this.extensionUiExpiryTimers.delete(request.requestId);
+      if (!isDeepStrictEqual(this.extensionUiRequests.get(request.requestId), request)) return;
+      this.extensionUiRequests.delete(request.requestId);
+      this.retireExtensionUiRequest(request);
+      this.options.publishEphemeralProjectionChange(this.binding);
+    }, remaining);
+    timer.unref?.();
+    this.extensionUiExpiryTimers.set(request.requestId, timer);
+  }
+
+  private clearExtensionUiExpiryTimer(requestId: string): void {
+    const timer = this.extensionUiExpiryTimers.get(requestId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.extensionUiExpiryTimers.delete(requestId);
+  }
+
+  private clearExtensionUiRequests(): void {
+    const hadRequests = this.extensionUiRequests.size > 0;
+    for (const timer of this.extensionUiExpiryTimers.values()) clearTimeout(timer);
+    this.extensionUiExpiryTimers.clear();
+    for (const request of this.extensionUiRequests.values()) this.retireExtensionUiRequest(request);
+    this.extensionUiRequests.clear();
+    if (hadRequests) this.options.publishEphemeralProjectionChange(this.binding);
+  }
+
+  private retireExtensionUiRequest(request: ResidentExtensionUiRequest): void {
+    this.retiredExtensionUiRequests.set(request.requestId, Object.freeze({
+      requestDigest: request.requestDigest,
+      method: request.method,
+    }));
+    if (this.retiredExtensionUiRequests.size <= 256) return;
+    const oldest = this.retiredExtensionUiRequests.keys().next().value as string | undefined;
+    if (oldest) this.retiredExtensionUiRequests.delete(oldest);
   }
 
   private async waitForUpstreamEventOrBackoffAfter(
@@ -3537,6 +3886,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.locallyClosed = true;
     this.projectionRefreshRequested = false;
     this.unsubscribeUpstream();
+    this.clearExtensionUiRequests();
     this.options.client.close();
     this.cancelResidentIdleReconciliation();
     this.lifecycle.transition("failed", { binding: this.binding, error: normalized.toJSON() });
@@ -3689,6 +4039,115 @@ function unknownResidentMutationOutcome(
       details: { operation, dispatchAttemptId, outcome: "unknown" },
       cause,
     },
+  );
+}
+
+function unknownExtensionUiResponseOutcome(
+  requestId: string,
+  cause: unknown,
+): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    "Prime Agent may have accepted the extension UI response, but no definitive acknowledgement was received.",
+    {
+      retryable: false,
+      details: { operation: "extension_ui_response", requestId, outcome: "unknown" },
+      cause,
+    },
+  );
+}
+
+function extensionUiResponseForUpstream(
+  method: ResidentExtensionUiRequest["method"],
+  response: ExtensionUiDialogResponse,
+): Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }> {
+  if (response.kind === "cancelled") return Object.freeze({ cancelled: true as const });
+  if (method === "confirm" && response.kind === "confirmed") {
+    return Object.freeze({ confirmed: response.confirmed });
+  }
+  if (method !== "confirm" && response.kind === "value") {
+    return Object.freeze({ value: response.value });
+  }
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+    "The extension UI response does not match its exact dialog method.",
+    { retryable: false },
+  );
+}
+
+function normalizeExtensionUiRequest(
+  value: unknown,
+  binding: ResidentSessionBinding,
+  hostId: string,
+  receivedAt: Date,
+): ResidentExtensionUiRequest | undefined {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.method !== "string") {
+    throw invalidResponse("extension UI request");
+  }
+  if (!['select', 'confirm', 'input', 'editor'].includes(value.method)) return undefined;
+  if (!isRecord(value.payload)) throw invalidResponse("extension UI request payload");
+  const title = value.payload.title;
+  if (typeof title !== "string") throw invalidResponse("extension UI request title");
+  const timeoutMs = value.payload.timeout;
+  const common = {
+    interactionVersion: 1 as const,
+    hostId,
+    threadId: binding.threadId,
+    executionGenerationId: binding.executionGenerationId,
+    bindingFingerprint: residentDispatchAuthorityFingerprint(binding),
+    requestId: value.id,
+    receivedAt: receivedAt.toISOString(),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  };
+  let candidate: Record<string, unknown>;
+  switch (value.method) {
+    case "select":
+      candidate = { ...common, method: "select", title, options: value.payload.options as string[] };
+      break;
+    case "confirm":
+      candidate = { ...common, method: "confirm", title, message: value.payload.message as string };
+      break;
+    case "input":
+      candidate = {
+        ...common,
+        method: "input",
+        title,
+        ...(value.payload.placeholder === undefined ? {} : { placeholder: value.payload.placeholder as string }),
+      };
+      break;
+    case "editor":
+      candidate = {
+        ...common,
+        method: "editor",
+        title,
+        ...(value.payload.prefill === undefined ? {} : { prefill: value.payload.prefill as string }),
+      };
+      break;
+    default:
+      return undefined;
+  }
+  const requestDigest = normalizedJsonDigest({
+    activeSessionId: binding.activeSessionId,
+    requestId: value.id,
+    method: value.method,
+    payload: value.payload,
+  });
+  const parsed = ResidentExtensionUiRequestSchema.safeParse({ ...candidate, requestDigest });
+  if (!parsed.success) throw invalidResponse("extension UI request", parsed.error.issues[0]?.message);
+  return Object.freeze(parsed.data);
+}
+
+function normalizedJsonDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(sortExtensionUiJson(value))).digest("hex");
+}
+
+function sortExtensionUiJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortExtensionUiJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => [key, sortExtensionUiJson((value as Record<string, unknown>)[key])]),
   );
 }
 

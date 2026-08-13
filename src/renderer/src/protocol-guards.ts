@@ -1,4 +1,5 @@
 import type {
+  ResidentExtensionUiRequest,
   InProgressStream,
   ResidentBrowserExecution,
   ResidentLifecycleDisposition,
@@ -68,6 +69,147 @@ export function parseInProgressStream(value: unknown): ParseResult<InProgressStr
   return raw && blockId && text !== undefined && startedAt
     ? { success: true, data: { blockId, text, startedAt } }
     : { success: false }
+}
+
+function extensionUiAuthority(value: UnknownRecord): {
+  interactionVersion: 1
+  hostId: string
+  threadId: string
+  executionGenerationId: string
+  bindingFingerprint: string
+  requestId: string
+  requestDigest: string
+  receivedAt: string
+  timeoutMs?: number
+} | undefined {
+  const hostId = id(value.hostId)
+  const threadId = id(value.threadId)
+  const executionGenerationId = id(value.executionGenerationId)
+  const bindingFingerprint = boundedString(value.bindingFingerprint, 64, 64)
+  const requestId = id(value.requestId)
+  const requestDigest = boundedString(value.requestDigest, 64, 64)
+  const receivedAt = isoDateTime(value.receivedAt)
+  const timeoutMs = value.timeoutMs === undefined
+    ? undefined
+    : integer(value.timeoutMs, 1, 24 * 60 * 60 * 1_000)
+  if (
+    value.interactionVersion !== 1 ||
+    !hostId ||
+    !threadId ||
+    !executionGenerationId ||
+    !bindingFingerprint ||
+    !SHA256_PATTERN.test(bindingFingerprint) ||
+    !requestId ||
+    !requestDigest ||
+    !SHA256_PATTERN.test(requestDigest) ||
+    !receivedAt ||
+    (value.timeoutMs !== undefined && timeoutMs === undefined)
+  ) return undefined
+  return {
+    interactionVersion: 1,
+    hostId,
+    threadId,
+    executionGenerationId,
+    bindingFingerprint,
+    requestId,
+    requestDigest,
+    receivedAt,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  }
+}
+
+export function parseResidentExtensionUiRequest(value: unknown): ParseResult<ResidentExtensionUiRequest> {
+  const raw = record(value)
+  if (!raw) return { success: false }
+  const authority = extensionUiAuthority(raw)
+  if (!authority) return { success: false }
+  const optionalAuthorityKeys = ['timeoutMs'] as const
+  if (raw.method === 'select') {
+    if (!exactKeys(raw, [
+      'interactionVersion',
+      'hostId',
+      'threadId',
+      'executionGenerationId',
+      'bindingFingerprint',
+      'requestId',
+      'requestDigest',
+      'receivedAt',
+      'method',
+      'title',
+      'options',
+    ], optionalAuthorityKeys)) return { success: false }
+    const title = boundedString(raw.title, 1, 1_024)
+    const options = parseArray(raw.options, 128, (item) => boundedString(item, 0, 4_096))
+    if (!title || !options || options.length === 0 || new Set(options).size !== options.length) {
+      return { success: false }
+    }
+    return { success: true, data: { ...authority, method: 'select', title, options } }
+  }
+  if (raw.method === 'confirm') {
+    if (!exactKeys(raw, [
+      'interactionVersion',
+      'hostId',
+      'threadId',
+      'executionGenerationId',
+      'bindingFingerprint',
+      'requestId',
+      'requestDigest',
+      'receivedAt',
+      'method',
+      'title',
+      'message',
+    ], optionalAuthorityKeys)) return { success: false }
+    const title = boundedString(raw.title, 1, 1_024)
+    const message = boundedString(raw.message, 0, 8_192)
+    return title && message !== undefined
+      ? { success: true, data: { ...authority, method: 'confirm', title, message } }
+      : { success: false }
+  }
+  if (raw.method === 'input') {
+    if (!exactKeys(raw, [
+      'interactionVersion',
+      'hostId',
+      'threadId',
+      'executionGenerationId',
+      'bindingFingerprint',
+      'requestId',
+      'requestDigest',
+      'receivedAt',
+      'method',
+      'title',
+    ], [...optionalAuthorityKeys, 'placeholder'])) return { success: false }
+    const title = boundedString(raw.title, 1, 1_024)
+    const placeholder = raw.placeholder === undefined
+      ? undefined
+      : boundedString(raw.placeholder, 0, 4_096)
+    if (!title || (raw.placeholder !== undefined && placeholder === undefined)) return { success: false }
+    return {
+      success: true,
+      data: { ...authority, method: 'input', title, ...(placeholder !== undefined ? { placeholder } : {}) },
+    }
+  }
+  if (raw.method === 'editor') {
+    if (!exactKeys(raw, [
+      'interactionVersion',
+      'hostId',
+      'threadId',
+      'executionGenerationId',
+      'bindingFingerprint',
+      'requestId',
+      'requestDigest',
+      'receivedAt',
+      'method',
+      'title',
+    ], [...optionalAuthorityKeys, 'prefill'])) return { success: false }
+    const title = boundedString(raw.title, 1, 1_024)
+    const prefill = raw.prefill === undefined ? undefined : boundedString(raw.prefill, 0, 65_536)
+    if (!title || (raw.prefill !== undefined && prefill === undefined)) return { success: false }
+    return {
+      success: true,
+      data: { ...authority, method: 'editor', title, ...(prefill !== undefined ? { prefill } : {}) },
+    }
+  }
+  return { success: false }
 }
 
 export function parseResidentBrowserExecution(value: unknown): ParseResult<ResidentBrowserExecution> {

@@ -23,6 +23,7 @@ import type {
   CandidateEvaluationSnapshot,
   CandidateEvaluationStartRequest,
   CandidateEvaluationStatus,
+  ResidentExtensionUiRequest,
 } from '../../src/shared/protocol'
 
 function deferred<T>() {
@@ -51,6 +52,74 @@ function createNativeUiFixture(): RendererApi {
   api.discoverComputers = async () => (await discoverComputers()).map(verified)
   api.probeComputer = async (input) => verified(await probeComputer(input))
   return api
+}
+
+function createExtensionUiAppHarness(
+  responseResult: Awaited<ReturnType<NonNullable<RendererApi['respondToResidentExtensionUi']>>> = {
+    state: 'completed',
+    message: 'Response delivered.',
+  },
+) {
+  const api = asNativeFixture(createPreviewRendererApi())
+  let current = structuredClone(previewSnapshot)
+  const listeners = new Set<(snapshot: WorkbenchSnapshot) => void>()
+  const selectedThread = current.threads.find((thread) => thread.id === 'thread-protocol')!
+  const selectedHost = current.hosts.find((host) => host.id === selectedThread.hostId)!
+  const request: ResidentExtensionUiRequest = {
+    interactionVersion: 1,
+    hostId: selectedHost.id,
+    threadId: selectedThread.id,
+    executionGenerationId: 'generation-extension-ui',
+    bindingFingerprint: 'a'.repeat(64),
+    requestId: 'request-extension-ui',
+    requestDigest: 'b'.repeat(64),
+    receivedAt: '2026-08-12T14:00:00.000Z',
+    method: 'confirm',
+    title: 'Use the verified migration plan?',
+    message: 'Prime Agent needs this decision to continue.',
+  }
+  current.selectedProjectId = selectedThread.projectId
+  current.selectedThreadId = selectedThread.id
+  selectedThread.status = 'idle'
+  selectedThread.executionGenerationId = request.executionGenerationId
+  selectedHost.connection = 'online'
+  selectedHost.activationRequired = false
+  current.agents = []
+  current.runtime.agentsReported = true
+  if (current.runtime.session) {
+    current.runtime.session = {
+      ...current.runtime.session,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+      activeToolNames: [],
+    }
+  }
+  current.operations = {
+    ...current.operations,
+    submitCommands: true,
+    startResidentTurn: true,
+    stopResidentTurn: false,
+  }
+  current.residentExtensionUiRequests = [request]
+  current.composerReceipt = { state: 'idle', message: 'Ready to send' }
+  api.loadWorkbench = vi.fn(async () => structuredClone(current))
+  api.subscribe = vi.fn((listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  })
+  api.respondToResidentExtensionUi = vi.fn(async () => responseResult)
+  const publish = (next: WorkbenchSnapshot) => {
+    current = structuredClone(next)
+    listeners.forEach((listener) => listener(structuredClone(current)))
+  }
+  return {
+    api,
+    request,
+    snapshot: () => structuredClone(current),
+    publish,
+  }
 }
 
 const candidateEvaluationBoundary = {
@@ -6469,5 +6538,96 @@ describe('Prime Continuim renderer', () => {
     await user.keyboard('{Escape}')
     await waitFor(() => expect(inspectorToggle).toHaveFocus())
     expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('places one native Prime Agent question above the visible composer and releases it on disappearance', async () => {
+    const user = userEvent.setup()
+    const harness = createExtensionUiAppHarness()
+    render(<App api={harness.api} />)
+
+    const title = await screen.findByRole('heading', { name: 'Use the verified migration plan?' })
+    const prompt = title.closest('section')!
+    const composer = screen.getByRole('contentinfo')
+    expect(document.querySelectorAll('.prime-interaction')).toHaveLength(1)
+    expect(prompt.compareDocumentPosition(composer)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('form', { name: 'Prime Agent prompt' })).not.toBeInTheDocument()
+    expect(screen.getAllByText('Response needed').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Prime Agent is waiting for your answer.').length).toBeGreaterThan(0)
+    expect(screen.queryByRole('button', { name: 'Stop the active Prime Agent turn' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Prime Agent is ready for another task.')).not.toBeInTheDocument()
+
+    await user.click(within(prompt).getByRole('button', { name: 'Confirm' }))
+    expect(harness.api.respondToResidentExtensionUi).toHaveBeenCalledWith(
+      harness.request,
+      { kind: 'confirmed', confirmed: true },
+    )
+
+    const stale = harness.snapshot()
+    const next = structuredClone(stale)
+    next.residentExtensionUiRequests = []
+    act(() => harness.publish(next))
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Use the verified migration plan?' })).not.toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeEnabled()
+    }, { timeout: 1_500 })
+    act(() => harness.publish(stale))
+    expect(screen.queryByRole('heading', { name: 'Use the verified migration plan?' })).not.toBeInTheDocument()
+  })
+
+  it('keeps an uncertain Prime Agent response non-actionable without reopening the composer', async () => {
+    const user = userEvent.setup()
+    const response = deferred<Awaited<ReturnType<NonNullable<RendererApi['respondToResidentExtensionUi']>>>>()
+    const harness = createExtensionUiAppHarness()
+    harness.api.respondToResidentExtensionUi = vi.fn(() => response.promise)
+    render(<App api={harness.api} />)
+
+    const title = await screen.findByRole('heading', { name: 'Use the verified migration plan?' })
+    const prompt = title.closest('section')!
+    await user.click(within(prompt).getByRole('button', { name: 'Confirm' }))
+    await waitFor(() => expect(harness.api.respondToResidentExtensionUi).toHaveBeenCalledOnce())
+
+    const withoutRequest = harness.snapshot()
+    withoutRequest.residentExtensionUiRequests = []
+    act(() => harness.publish(withoutRequest))
+    expect(screen.getByRole('heading', { name: 'Use the verified migration plan?' })).toBeVisible()
+    expect(within(prompt).getByRole('button', { name: 'Sending…' })).toBeDisabled()
+
+    await act(async () => response.resolve({
+      state: 'uncertain',
+      retryable: false,
+      message: 'The host acknowledgement was lost.',
+    }))
+
+    expect(await within(prompt).findByRole('button', { name: 'Outcome unknown' })).toBeDisabled()
+    expect(within(prompt).getByRole('button', { name: 'Dismiss' })).toBeEnabled()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
+    expect(harness.api.respondToResidentExtensionUi).toHaveBeenCalledOnce()
+
+    await user.click(within(prompt).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('heading', { name: 'Use the verified migration plan?' })).not.toBeInTheDocument()
+  })
+
+  it('allows a still-live Prime Agent request to recover only after its uncertain result is dismissed', async () => {
+    const user = userEvent.setup()
+    const harness = createExtensionUiAppHarness({
+      state: 'uncertain',
+      retryable: false,
+      message: 'The host could not prove the acknowledgement.',
+    })
+    render(<App api={harness.api} />)
+
+    const firstPrompt = (await screen.findByRole('heading', {
+      name: 'Use the verified migration plan?',
+    })).closest('section')!
+    await user.click(within(firstPrompt).getByRole('button', { name: 'Confirm' }))
+    expect(await within(firstPrompt).findByRole('button', { name: 'Dismiss' })).toBeEnabled()
+
+    await user.click(within(firstPrompt).getByRole('button', { name: 'Dismiss' }))
+    const recoveredPrompt = (await screen.findByRole('heading', {
+      name: 'Use the verified migration plan?',
+    })).closest('section')!
+    expect(within(recoveredPrompt).getByRole('button', { name: 'Confirm' })).toBeEnabled()
+    expect(harness.api.respondToResidentExtensionUi).toHaveBeenCalledOnce()
   })
 })

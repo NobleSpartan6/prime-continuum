@@ -183,6 +183,23 @@ function recoverySnapshot(thread: ReturnType<typeof recoveryCatalog>['threads'][
   }
 }
 
+function extensionUiRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    interactionVersion: 1,
+    hostId: 'host-local',
+    threadId: 'thread-one',
+    executionGenerationId: 'generation-one',
+    bindingFingerprint: 'a'.repeat(64),
+    requestId: 'request-one',
+    requestDigest: 'b'.repeat(64),
+    receivedAt: '2026-08-05T20:00:02.000Z',
+    method: 'confirm',
+    title: 'Continue with the verified plan?',
+    message: 'Prime Agent needs one decision before it can continue.',
+    ...overrides,
+  }
+}
+
 function onlineConnection() {
   return {
     phase: 'online',
@@ -192,6 +209,62 @@ function onlineConnection() {
     since: '2026-08-05T20:00:00.000Z',
     attempt: 1,
     capabilities: ['prime_agent_commands_v2'],
+  }
+}
+
+async function liveExtensionUiHarness(
+  submitCommand: (command: Record<string, unknown>) => Promise<unknown>,
+  options: { advertiseCapability?: boolean } = {},
+) {
+  const catalog = recoveryCatalog()
+  const cachedSnapshot = recoverySnapshot(catalog.threads[0]!, 'Cached resident state.')
+  const liveSnapshot = recoverySnapshot(catalog.threads[0]!, 'Live resident state.')
+  liveSnapshot.generatedAt = '2026-08-05T20:00:03.000Z'
+  Object.assign(liveSnapshot, { residentExtensionUiRequests: [extensionUiRequest()] })
+  let snapshotListener: ((snapshot: unknown) => void) | undefined
+  const bridge = {
+    bootstrap: vi.fn(() => ok({
+      cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: cachedSnapshot },
+      outbox: [],
+      connection: {
+        ...onlineConnection(),
+        capabilities: options.advertiseCapability === false
+          ? ['prime_agent_commands_v2']
+          : ['prime_agent_commands_v2', 'resident_extension_ui_v1'],
+      },
+      appVersion: '0.1.0',
+    })),
+    hostCatalog: vi.fn(() => ok(catalog)),
+    requestSnapshot: vi.fn(() => ok(liveSnapshot)),
+    submitCommand: vi.fn(submitCommand),
+    onConnectionState: vi.fn(() => () => undefined),
+    onSnapshot: vi.fn((listener: (snapshot: unknown) => void) => {
+      snapshotListener = listener
+      return () => undefined
+    }),
+    onHostEvent: vi.fn(() => () => undefined),
+    onHandoffProgress: vi.fn(() => () => undefined),
+  }
+  const api = new NativeRendererApi(bridge)
+  const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+  const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+  const cached = await api.loadWorkbench()
+  await vi.waitFor(() => {
+    expect(published.at(-1)?.snapshotAuthority?.source).toBe('live')
+    expect(published.at(-1)?.residentExtensionUiRequests).toHaveLength(
+      options.advertiseCapability === false ? 0 : 1,
+    )
+  })
+  return {
+    api,
+    bridge,
+    cached,
+    liveSnapshot,
+    current: () => published.at(-1)!,
+    emitSnapshot(snapshot: unknown) {
+      snapshotListener?.(snapshot)
+    },
+    unsubscribe,
   }
 }
 
@@ -576,6 +649,142 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('projects only exact live extension UI requests under the advertised resident capability', async () => {
+    const harness = await liveExtensionUiHarness(() => Promise.reject(new Error('not invoked')))
+    expect(harness.cached.residentExtensionUiRequests).toEqual([])
+
+    const nextSnapshot = structuredClone(harness.liveSnapshot) as Record<string, unknown>
+    nextSnapshot.residentExtensionUiRequests = [
+      extensionUiRequest(),
+      extensionUiRequest({ requestId: 'foreign-host', hostId: 'host-remote' }),
+      extensionUiRequest({ requestId: 'malformed', requestDigest: 'not-a-digest' }),
+    ]
+    harness.emitSnapshot(nextSnapshot)
+
+    expect(harness.current().residentExtensionUiRequests).toEqual([extensionUiRequest()])
+    expect(harness.bridge.submitCommand).not.toHaveBeenCalled()
+    harness.unsubscribe()
+  })
+
+  it('keeps extension UI inert for an older host that did not advertise the capability', async () => {
+    const harness = await liveExtensionUiHarness(
+      () => Promise.reject(new Error('must remain untouched')),
+      { advertiseCapability: false },
+    )
+    expect(harness.current().residentExtensionUiRequests).toEqual([])
+    expect(harness.bridge.submitCommand).not.toHaveBeenCalled()
+    harness.unsubscribe()
+  })
+
+  it('submits one exact live-only extension UI response envelope and rejects it after disappearance', async () => {
+    const harness = await liveExtensionUiHarness((command) => ok({
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      hostId: command.expectedHostId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+      detail: 'Prime Agent received the decision.',
+    }))
+    const request = harness.current().residentExtensionUiRequests![0]!
+    await expect(harness.api.respondToResidentExtensionUi(request, {
+      kind: 'confirmed',
+      confirmed: true,
+    })).resolves.toEqual({
+      state: 'completed',
+      message: 'Prime Agent received the decision.',
+    })
+    expect(harness.bridge.submitCommand).toHaveBeenCalledOnce()
+    expect(harness.bridge.submitCommand).toHaveBeenCalledWith(expect.objectContaining({
+      expectedHostId: request.hostId,
+      threadId: request.threadId,
+      expectedExecutionGenerationId: request.executionGenerationId,
+      kind: 'extension_ui.respond',
+      delivery: 'live_only',
+      payload: {
+        requestId: request.requestId,
+        requestDigest: request.requestDigest,
+        method: request.method,
+        response: { kind: 'confirmed', confirmed: true },
+      },
+    }))
+
+    const withoutRequest = structuredClone(harness.liveSnapshot) as Record<string, unknown>
+    withoutRequest.residentExtensionUiRequests = []
+    harness.emitSnapshot(withoutRequest)
+    expect(harness.current().residentExtensionUiRequests).toEqual([])
+    await expect(harness.api.respondToResidentExtensionUi(
+      request,
+      { kind: 'confirmed', confirmed: true },
+    )).resolves.toEqual(expect.objectContaining({ state: 'rejected', retryable: false }))
+    expect(harness.bridge.submitCommand).toHaveBeenCalledOnce()
+    harness.unsubscribe()
+  })
+
+  it('retains an uncertain extension UI attempt and never submits that request twice', async () => {
+    const acknowledgement = deferred<unknown>()
+    const harness = await liveExtensionUiHarness(() => acknowledgement.promise)
+    const request = harness.current().residentExtensionUiRequests![0]!
+    const response = { kind: 'confirmed' as const, confirmed: true }
+
+    const first = harness.api.respondToResidentExtensionUi(request, response)
+    const duplicate = harness.api.respondToResidentExtensionUi(request, response)
+    await expect(harness.api.respondToResidentExtensionUi(request, {
+      kind: 'confirmed',
+      confirmed: false,
+    })).resolves.toEqual({
+      state: 'rejected',
+      retryable: false,
+      message: 'A different response is already being delivered for this Prime Agent question.',
+    })
+    expect(harness.bridge.submitCommand).toHaveBeenCalledOnce()
+    acknowledgement.reject(new Error('Acknowledgement lost'))
+    await expect(first).resolves.toEqual({
+      state: 'uncertain',
+      retryable: false,
+      message: 'Acknowledgement lost Prime Continuim will not send this response again.',
+    })
+    await expect(duplicate).resolves.toEqual(
+      expect.objectContaining({ state: 'uncertain', retryable: false }),
+    )
+    harness.unsubscribe()
+  })
+
+  it('allows a fresh explicit extension UI attempt after a settled pre-host failure', async () => {
+    let attempts = 0
+    const harness = await liveExtensionUiHarness((command) => {
+      attempts += 1
+      if (attempts === 1) return Promise.reject(new Error('Transport closed before acknowledgement'))
+      return ok({
+        deviceId: command.deviceId,
+        commandId: command.commandId,
+        hostId: command.expectedHostId,
+        threadId: command.threadId,
+        executionGenerationId: command.expectedExecutionGenerationId,
+        status: 'completed',
+        durable: true,
+      })
+    })
+    const request = harness.current().residentExtensionUiRequests![0]!
+    await expect(harness.api.respondToResidentExtensionUi(request, {
+      kind: 'confirmed',
+      confirmed: true,
+    })).resolves.toEqual(expect.objectContaining({ state: 'uncertain', retryable: false }))
+    await expect(harness.api.respondToResidentExtensionUi(request, {
+      kind: 'confirmed',
+      confirmed: false,
+    })).resolves.toEqual({
+      state: 'completed',
+      message: 'Response delivered to Prime Agent.',
+    })
+    expect(harness.bridge.submitCommand).toHaveBeenCalledTimes(2)
+    expect(harness.bridge.submitCommand.mock.calls[1]?.[0]).toMatchObject({
+      payload: { response: { kind: 'confirmed', confirmed: false } },
+    })
+    harness.unsubscribe()
+  })
+
   it('projects exact latest-turn evidence, snapshot freshness, and aggregate Git facts', async () => {
     const catalog = recoveryCatalog()
     const cachedSnapshot = recoverySnapshot(catalog.threads[0]!, 'Cached outcome materialization.')

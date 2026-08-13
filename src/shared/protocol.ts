@@ -14,6 +14,7 @@ export {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
@@ -29,6 +30,7 @@ import {
   PRIME_AGENT_COMMAND_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
@@ -1028,6 +1030,63 @@ export const LatestTurnOutcomeSchema = z
   .strict();
 export type LatestTurnOutcome = z.infer<typeof LatestTurnOutcomeSchema>;
 
+const ExtensionUiRequestAuthorityFields = {
+  interactionVersion: z.literal(1),
+  hostId: IdSchema,
+  threadId: IdSchema,
+  executionGenerationId: IdSchema,
+  bindingFingerprint: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+  requestId: IdSchema,
+  requestDigest: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+  receivedAt: IsoDateTimeSchema,
+  timeoutMs: z.number().int().positive().max(24 * 60 * 60 * 1_000).optional(),
+};
+
+/**
+ * Ephemeral, path-free view of a dialog owned by one exact live Prime Agent
+ * attachment. HostStore never persists a non-empty value; hostd overlays the
+ * current connection's bounded requests while serving a fresh snapshot.
+ */
+export const ResidentExtensionUiRequestSchema = z.discriminatedUnion("method", [
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("select"),
+      title: z.string().min(1).max(1_024),
+      options: z
+        .array(z.string().max(4_096))
+        .min(1)
+        .max(128)
+        .refine((items) => new Set(items).size === items.length, "Select options must be unique"),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("confirm"),
+      title: z.string().min(1).max(1_024),
+      message: z.string().max(8_192),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("input"),
+      title: z.string().min(1).max(1_024),
+      placeholder: z.string().max(4_096).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("editor"),
+      title: z.string().min(1).max(1_024),
+      prefill: z.string().max(65_536).optional(),
+    })
+    .strict(),
+]);
+export type ResidentExtensionUiRequest = z.infer<typeof ResidentExtensionUiRequestSchema>;
+
 export const ThreadProjectionSnapshotSchema = z
   .object({
     snapshotVersion: z.literal(SNAPSHOT_VERSION),
@@ -1044,6 +1103,7 @@ export const ThreadProjectionSnapshotSchema = z
     schedules: z.array(ScheduleSummarySchema).max(1_000),
     runtime: RuntimeSessionSummarySchema.optional(),
     residentControl: ResidentControlProjectionSnapshotSchema.optional(),
+    residentExtensionUiRequests: z.array(ResidentExtensionUiRequestSchema).max(16).optional(),
     residentLifecycle: ResidentLifecycleDispositionSchema.optional(),
     git: GitSummarySchema,
     evidence: EvidenceSummarySchema,
@@ -1129,6 +1189,22 @@ export const ThreadProjectionSnapshotSchema = z
         message: "Resident control readiness must belong to the exact projected host thread generation",
       });
     }
+    for (const request of snapshot.residentExtensionUiRequests ?? []) {
+      if (
+        !residentControl ||
+        request.hostId !== snapshot.thread.currentLocation.hostId ||
+        request.threadId !== snapshot.thread.threadId ||
+        request.executionGenerationId !== snapshot.thread.currentLocation.executionGenerationId ||
+        request.bindingFingerprint !== residentControl.bindingFingerprint
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["residentExtensionUiRequests"],
+          message: "Extension UI request must belong to the exact live resident control authority",
+        });
+        break;
+      }
+    }
     const residentLifecycle = snapshot.residentLifecycle;
     if (!residentLifecycle) return;
     if (
@@ -1158,6 +1234,7 @@ export const ThreadProjectionSnapshotSchema = z
       snapshot.childAgents.length !== 0 ||
       snapshot.goals.length !== 0 ||
       snapshot.schedules.length !== 0 ||
+      (snapshot.residentExtensionUiRequests?.length ?? 0) !== 0 ||
       snapshot.pendingAttention.length !== 0;
     if (liveStateRemains) {
       context.addIssue({
@@ -1875,6 +1952,7 @@ export const REMOTE_DEVICE_SCOPES = Object.freeze([
   "thread.start",
   "model.select",
   "approval.resolve",
+  "extension_ui.respond",
   "run_location.change",
   "host.admin",
 ] as const);
@@ -1955,7 +2033,17 @@ const TextCommandFields = {
   text: z.string().min(1).max(65_536),
 };
 
-export const CommandPayloadSchema = z.discriminatedUnion("kind", [
+export const ExtensionUiDialogMethodSchema = z.enum(["select", "confirm", "input", "editor"]);
+export type ExtensionUiDialogMethod = z.infer<typeof ExtensionUiDialogMethodSchema>;
+
+export const ExtensionUiDialogResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cancelled") }).strict(),
+  z.object({ kind: z.literal("value"), value: z.string().max(65_536) }).strict(),
+  z.object({ kind: z.literal("confirmed"), confirmed: z.boolean() }).strict(),
+]);
+export type ExtensionUiDialogResponse = z.infer<typeof ExtensionUiDialogResponseSchema>;
+
+export const CommandPayloadSchema = z.union([
   z.object({ kind: z.literal("prompt"), ...TextCommandFields }).strict(),
   z.object({ kind: z.literal("steer"), ...TextCommandFields }).strict(),
   z.object({ kind: z.literal("follow_up"), ...TextCommandFields }).strict(),
@@ -1975,6 +2063,27 @@ export const CommandPayloadSchema = z.discriminatedUnion("kind", [
       comment: z.string().max(4_096).optional(),
     })
     .strict(),
+  z
+    .object({
+      kind: z.literal("extension_ui.respond"),
+      requestId: IdSchema,
+      requestDigest: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+      method: ExtensionUiDialogMethodSchema,
+      response: ExtensionUiDialogResponseSchema,
+    })
+    .strict()
+    .superRefine((command, context) => {
+      if (
+        (command.method === "confirm" && command.response.kind === "value") ||
+        (command.method !== "confirm" && command.response.kind === "confirmed")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["response"],
+          message: "Extension UI response does not match its dialog method",
+        });
+      }
+    }),
 ]);
 export type CommandPayload = z.infer<typeof CommandPayloadSchema>;
 

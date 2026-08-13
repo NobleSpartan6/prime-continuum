@@ -16,6 +16,8 @@ const expectedTargets = [
   ['desktop-idle', 1600, 1000, 'idle', undefined],
   ['desktop-investigation', 1600, 1000, 'idle', undefined],
   ['desktop-rlm-activity', 1200, 800, 'rlm-activity', undefined],
+  ['desktop-extension-question', 1200, 800, 'extension-ui-confirm', undefined],
+  ['mobile-extension-question-390', 390, 844, 'extension-ui-confirm', undefined],
   ['mobile-idle-390', 390, 844, 'idle', undefined],
   ['compact-idle-320', 320, 704, 'idle', undefined],
   ['mobile-inspector-390', 390, 844, 'idle', undefined],
@@ -107,8 +109,13 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     result.visualState !== visualState ||
     result.surface !== surface ||
     result.stateEvidence?.expectedTextPresent !== true ||
-    (name.startsWith('desktop-') && name !== 'desktop-idle' && name !== 'desktop-end-pending-390' && result.stateEvidence?.composerStatusVisible !== true) ||
+    (name.startsWith('desktop-') && name !== 'desktop-idle' && name !== 'desktop-end-pending-390' && name !== 'desktop-extension-question' && result.stateEvidence?.composerStatusVisible !== true) ||
     (name === 'desktop-end-pending-390' && result.stateEvidence?.composerStatusVisible !== false) ||
+    ((name === 'desktop-extension-question' || name === 'mobile-extension-question-390') && (
+      result.stateEvidence?.extensionQuestionVisible !== true ||
+      result.stateEvidence?.extensionComposerSuppressed !== true ||
+      result.stateEvidence?.extensionConfirmEnabled !== true
+    )) ||
     ((name === 'resident-dialog-390' || name === 'resident-dialog-short-320') && result.stateEvidence?.residentDialogOpen !== true) ||
     (name === 'resident-dialog-short-320' && result.stateEvidence?.residentDialogContentReachable !== true) ||
     (name.startsWith('ssh-registered-workspace-dialog-') && (

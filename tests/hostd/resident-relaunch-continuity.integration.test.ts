@@ -19,6 +19,7 @@ import { normalizeResidentProjectionSnapshot } from "../../src/hostd/resident-pr
 import { HostStore } from "../../src/hostd/store";
 
 const THREAD_ID = "test-thread";
+const HOST_ID = "host-local";
 const EXECUTION_GENERATION_ID = "test-execution-1";
 const ACTIVE_SESSION_ID = "resident-active-session-continuity-1";
 const SESSION_ID = "resident-session-continuity-1";
@@ -131,7 +132,7 @@ class SharedFakePrimeDaemon {
         options: Readonly<{
           closeClientOnDispose: true;
           sendClientEnv: false;
-          supportsExtensionUi: false;
+          supportsExtensionUi: true;
           ownedSession: boolean;
           telemetryDisabled: true;
           recoverDaemon: () => Promise<void>;
@@ -318,6 +319,7 @@ function createAdapter(
   paths: RuntimePaths,
 ): PrimeAgentResidentAdapter {
   return new PrimeAgentResidentAdapter({
+    hostId: HOST_ID,
     ...paths,
     environment: {},
     loadRuntimeModule: async () => runtimeModule,

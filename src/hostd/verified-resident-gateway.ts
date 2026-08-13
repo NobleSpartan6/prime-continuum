@@ -51,7 +51,7 @@ import {
   type ResidentPromptIdleObservedEvent,
   type ResidentPromptReconciliationLease,
 } from "./store";
-import type { CommandEnvelope } from "../shared/protocol";
+import type { CommandEnvelope, ResidentExtensionUiRequest } from "../shared/protocol";
 import type { PrimeAgentRuntimeSecurityGate } from "./prime-agent-auth-security";
 
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
@@ -74,6 +74,7 @@ type ResidentGatewayAdapter = PrimeAgentGateway & {
   endResidentSession?: NonNullable<ResidentProvisioningAdapter["endResidentSession"]>;
   detachResidentSession?(binding: ResidentSessionBinding): Promise<void>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
+  listResidentExtensionUiRequests?(binding: ResidentSessionBinding): readonly ResidentExtensionUiRequest[];
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,
   ): Promise<ResidentPromptIdleAuthorityEvidence>;
@@ -245,6 +246,21 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       if (isDefinitivelyUnavailableResident(error)) return false;
       throw error;
     }
+  }
+
+  listResidentExtensionUiRequests(bindingValue: ResidentSessionBinding): readonly ResidentExtensionUiRequest[] {
+    if (this.closed || !this.adapter?.listResidentExtensionUiRequests) return Object.freeze([]);
+    const binding = validateResidentSessionBinding(bindingValue);
+    const slot = residentBindingSlotKeyFor(binding);
+    const attached = this.attachedBindings.get(slot);
+    if (
+      !attached ||
+      this.preparedBindings.get(slot) !== attached ||
+      attached.fingerprint !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      return Object.freeze([]);
+    }
+    return this.adapter.listResidentExtensionUiRequests(binding);
   }
 
   async isResidentBrowserExecutionReady(bindingValue: ResidentSessionBinding): Promise<boolean> {
@@ -1048,6 +1064,7 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
         );
       }
       adapter = this.adapterFactory({
+        hostId: (await this.store.getHost()).hostId,
         executable: handle.executable,
         cliEntrypoint: handle.cliEntrypoint,
         socketPath,
@@ -1080,6 +1097,17 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
           }
           await this.store.publishResidentModelSelectionProjection(command, binding, projection);
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
+          this.publishProjectionChange(binding);
+        },
+        publishEphemeralProjectionChange: (binding) => {
+          if (this.closed) return;
+          const slot = residentBindingSlotKeyFor(binding);
+          const attached = this.attachedBindings.get(slot);
+          if (
+            !attached ||
+            this.preparedBindings.get(slot) !== attached ||
+            attached.fingerprint !== residentDispatchAuthorityFingerprint(binding)
+          ) return;
           this.publishProjectionChange(binding);
         },
       });

@@ -14,6 +14,7 @@ import {
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
@@ -2728,6 +2729,16 @@ export class DesktopControlService extends EventEmitter {
         { retryable: true, details: { hostId, capability: PRIME_AGENT_COMMAND_CAPABILITY } }
       )
     }
+    if (
+      command.kind === 'extension_ui.respond' &&
+      !this.authorityCapabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY)
+    ) {
+      throw new ControlError(
+        'command.extension_ui_capability_unavailable',
+        'This host does not support native Prime Agent dialogs. Refresh after updating the host.',
+        { retryable: true, details: { hostId, capability: RESIDENT_EXTENSION_UI_CAPABILITY } },
+      )
+    }
 
     await this.putOutbox(pendingEntry)
     this.beginCommandSubmission(identity)
@@ -3559,7 +3570,16 @@ export class DesktopControlService extends EventEmitter {
           )
         }
         const rawReceipt = receipts[0]
-        if (!rawReceipt) continue
+        if (!rawReceipt) {
+          if (unknown.length === 1 && isExtensionUiResponseClientCommand(entry.command)) {
+            // The host has no durable admission for this live-only response.
+            // Retire the local envelope without submitting it; the still-live
+            // request may be answered explicitly with a fresh command.
+            await this.removeOutbox([outboxIdentity(authority.hostId, entry.command)])
+            madeProgress = true
+          }
+          continue
+        }
         assertReceiptMatchesCommand(rawReceipt, entry.command)
         const receipt: CommandReceipt = { ...rawReceipt, hostId: authority.hostId }
         await this.recordDurableUncertainReceipt(receipt, entry.command)
@@ -5797,18 +5817,19 @@ export class DesktopControlService extends EventEmitter {
         details: { expectedHostId: authority.hostId, receivedHostId: snapshot.thread.currentLocation.hostId },
       })
     }
+    const durableSnapshot = stripEphemeralExtensionUiRequests(snapshot)
     let accepted = false
     await this.cache.update((current) => {
       this.assertProjectionAuthority(authority, 'thread snapshot')
       const cache = normalizeCache(current)
       const previous = cache.entries[authority.hostId]
-      const decision = threadSnapshotProjectionDecision(previous, snapshot)
+      const decision = threadSnapshotProjectionDecision(previous, durableSnapshot)
       if (!decision.accept) return cache
       accepted = true
       return replaceProjectionEntry(cache, authority.hostId, {
         ...previous,
         hostId: authority.hostId,
-        lastSnapshot: snapshot,
+        lastSnapshot: durableSnapshot,
         retiredExecutionGenerations: decision.retiredExecutionGenerations,
         retiredCursorGenerations: decision.retiredCursorGenerations,
         updatedAt: now(),
@@ -6109,6 +6130,7 @@ export class DesktopControlService extends EventEmitter {
     const durableEntries: ScopedOutboxEntry[] = []
     const durableReceipts: CommandReceipt[] = []
     const explicitlyUnknownWaitingEntries: ScopedOutboxEntry[] = []
+    const unknownLiveOnlyResponses: ScopedOutboxEntry[] = []
 
     for (const entry of pending) {
       if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
@@ -6166,6 +6188,8 @@ export class DesktopControlService extends EventEmitter {
           }
           if (entry.state === 'waiting_for_connection' && isExplicitOfflineFollowUp(entry.command)) {
             explicitlyUnknownWaitingEntries.push(entry)
+          } else if (isExtensionUiResponseClientCommand(entry.command)) {
+            unknownLiveOnlyResponses.push(entry)
           }
         }
       } catch (error) {
@@ -6182,6 +6206,7 @@ export class DesktopControlService extends EventEmitter {
       this.emit('host-event', { type: 'command.receipt', payload: receipt })
     }
     await this.removeOutbox(durableEntries.map((entry) => outboxIdentity(hostId, entry.command)))
+    await this.removeOutbox(unknownLiveOnlyResponses.map((entry) => outboxIdentity(hostId, entry.command)))
 
     for (const entry of explicitlyUnknownWaitingEntries) {
       try {
@@ -6627,6 +6652,54 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
       providerId: payload.providerId,
       modelId: payload.modelId,
     }
+  } else if (normalizedKind === 'extension_ui.respond') {
+    const requestId = payload.requestId
+    const requestDigest = payload.requestDigest
+    const method = payload.method
+    const response = payload.response
+    if (
+      typeof requestId !== 'string' ||
+      typeof requestDigest !== 'string' ||
+      (method !== 'select' && method !== 'confirm' && method !== 'input' && method !== 'editor') ||
+      !isRecord(response)
+    ) {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response is missing its exact request identity.',
+      )
+    }
+    let normalizedResponse:
+      | { kind: 'cancelled' }
+      | { kind: 'value'; value: string }
+      | { kind: 'confirmed'; confirmed: boolean }
+    if (response.kind === 'cancelled') {
+      normalizedResponse = { kind: 'cancelled' }
+    } else if (response.kind === 'value' && typeof response.value === 'string') {
+      normalizedResponse = { kind: 'value', value: response.value }
+    } else if (response.kind === 'confirmed' && typeof response.confirmed === 'boolean') {
+      normalizedResponse = { kind: 'confirmed', confirmed: response.confirmed }
+    } else {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response has an invalid value.',
+      )
+    }
+    if (
+      (method === 'confirm' && normalizedResponse.kind === 'value') ||
+      (method !== 'confirm' && normalizedResponse.kind === 'confirmed')
+    ) {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response does not match the exact dialog method.',
+      )
+    }
+    command = {
+      kind: 'extension_ui.respond',
+      requestId,
+      requestDigest,
+      method,
+      response: normalizedResponse,
+    }
   } else {
     throw new ControlError('command.unsupported_kind', 'This command kind is not supported by the host protocol.', {
       details: { kind: input.kind }
@@ -6646,7 +6719,8 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
 }
 
 function isUrgentCommand(kind: string): boolean {
-  return kind === 'approval.resolve' || kind === 'thread.cancel' || kind === 'thread.abort'
+  return kind === 'approval.resolve' || kind === 'extension_ui.respond' ||
+    kind === 'thread.cancel' || kind === 'thread.abort'
 }
 
 function isDefinitiveCommandIdentityError(error: unknown): boolean {
@@ -6686,6 +6760,10 @@ function isPromptClientCommand(command: ClientCommand): boolean {
 
 function isAbortClientCommand(command: ClientCommand): boolean {
   return command.kind === 'abort' || command.kind === 'thread.abort' || command.kind === 'thread.cancel'
+}
+
+function isExtensionUiResponseClientCommand(command: ClientCommand): boolean {
+  return command.kind === 'extension_ui.respond'
 }
 
 function residentCommandOperation(command: ClientCommand): 'prompt' | 'abort' | undefined {
@@ -7119,7 +7197,7 @@ function normalizeCache(value: unknown): CacheEnvelope {
       entries[legacyHostId] = {
         hostId: legacyHostId,
         ...(catalogMatches ? { catalog: legacyCatalog.data } : {}),
-        ...(snapshotMatches ? { lastSnapshot: legacySnapshot.data } : {}),
+        ...(snapshotMatches ? { lastSnapshot: stripEphemeralExtensionUiRequests(legacySnapshot.data) } : {}),
         ...(typeof raw.updatedAt === 'string' ? { updatedAt: raw.updatedAt } : {}),
       }
     }
@@ -7149,6 +7227,13 @@ function normalizeCache(value: unknown): CacheEnvelope {
     ...(typeof raw.lastTargetUpdatedAt === 'string' ? { lastTargetUpdatedAt: raw.lastTargetUpdatedAt } : {}),
     ...(activeHostId ? { activeHostId } : {})
   }
+}
+
+/** Prime Agent dialogs belong only to the exact live connection that emitted them. */
+function stripEphemeralExtensionUiRequests(snapshot: ThreadProjectionSnapshot): ThreadProjectionSnapshot {
+  if (!("residentExtensionUiRequests" in snapshot)) return snapshot
+  const { residentExtensionUiRequests: _ephemeral, ...durable } = snapshot
+  return ThreadProjectionSnapshotSchema.parse(durable)
 }
 
 function visibleCacheForAuthority(cache: CacheEnvelope, hostId: string | undefined): CacheEnvelope {
@@ -7367,7 +7452,7 @@ function asCachedHostProjection(value: unknown, hostId: string): CachedHostProje
   return {
     hostId,
     ...(catalogMatches ? { catalog: catalog.data } : {}),
-    ...(snapshotMatches ? { lastSnapshot: snapshot.data } : {}),
+    ...(snapshotMatches ? { lastSnapshot: stripEphemeralExtensionUiRequests(snapshot.data) } : {}),
     ...(
       isRecord(value.retiredExecutionGenerations)
         ? { retiredExecutionGenerations: cloneRetiredExecutionGenerations(value.retiredExecutionGenerations) }
