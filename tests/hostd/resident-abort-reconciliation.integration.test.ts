@@ -93,11 +93,17 @@ describe("verified resident Stop idle reconciliation", () => {
     await vi.waitFor(async () => expect((await fixture.store.listResidentAbortReconciliationLeases()).length).toBe(1));
     expect((await fixture.store.reconcileCommands([command])).receipts[0]?.status).toBe("running");
 
-    await expect(fixture.gateway.capabilityReady()).resolves.toBe(true);
-    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedAbortIdle).toHaveBeenCalledTimes(2));
-    await vi.waitFor(async () => expect((await fixture.store.reconcileCommands([command])).receipts[0]?.status)
-      .toBe("completed"));
-    expect(fixture.adapter.submit).toHaveBeenCalledOnce();
+    const completed = waitForCompletedAbortIdleSignal(fixture.gateway, command.commandId);
+    try {
+      await expect(fixture.gateway.capabilityReady()).resolves.toBe(true);
+      const observation = await completed.promise;
+      expect((await fixture.store.reconcileCommands([command])).receipts[0]).toEqual(observation.receipt);
+      expect(fixture.adapter.reconcileAcknowledgedAbortIdle).toHaveBeenCalledTimes(2);
+      expect(fixture.adapter.submit).toHaveBeenCalledOnce();
+      expect(await fixture.store.listResidentAbortReconciliationLeases()).toEqual([]);
+    } finally {
+      completed.dispose();
+    }
 
     await fixture.service.close();
   });
@@ -137,6 +143,34 @@ describe("verified resident Stop idle reconciliation", () => {
 type ReconcileHandler = (
   lease: ResidentAbortReconciliationLease,
 ) => Promise<ResidentAbortIdleAuthorityEvidence>;
+
+function waitForCompletedAbortIdleSignal(
+  gateway: VerifiedResidentGateway,
+  commandId: string,
+): { promise: Promise<ResidentAbortIdleObservedSignal>; dispose: () => void } {
+  let dispose = () => undefined;
+  const promise = new Promise<ResidentAbortIdleObservedSignal>((resolve, reject) => {
+    const unsubscribe = gateway.subscribeResidentAbortIdleObserved((observation) => {
+      if (
+        observation.receipt.commandId !== commandId ||
+        observation.receipt.status !== "completed"
+      ) {
+        return;
+      }
+      dispose();
+      resolve(observation);
+    });
+    const timer = setTimeout(() => {
+      dispose();
+      reject(new Error(`Timed out waiting for completed Stop idle proof for ${commandId}`));
+    }, 5_000);
+    dispose = () => {
+      clearTimeout(timer);
+      unsubscribe();
+    };
+  });
+  return { promise, dispose };
+}
 
 async function serviceFixture(reconcile: ReconcileHandler) {
   const base = await initializedStore();
