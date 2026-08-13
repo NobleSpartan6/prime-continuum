@@ -1010,6 +1010,24 @@ export const InProgressStreamSchema = z.object({
 });
 export type InProgressStream = z.infer<typeof InProgressStreamSchema>;
 
+export const LatestTurnOutcomeSchema = z
+  .object({
+    outcomeVersion: z.literal(1),
+    commandId: IdSchema,
+    receiptId: IdSchema,
+    observedAt: IsoDateTimeSchema,
+    observedCursor: SessionCursorSchema,
+    terminalAssistant: z
+      .object({
+        blockId: IdSchema,
+        stopReason: z.enum(["stop", "length", "error", "aborted"]),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type LatestTurnOutcome = z.infer<typeof LatestTurnOutcomeSchema>;
+
 export const ThreadProjectionSnapshotSchema = z
   .object({
     snapshotVersion: z.literal(SNAPSHOT_VERSION),
@@ -1018,6 +1036,7 @@ export const ThreadProjectionSnapshotSchema = z
     transcriptBlockIndex: z.array(TranscriptBlockIndexEntrySchema).max(20_000),
     materializedRecentBlocks: z.array(TranscriptBlockSchema).max(2_000),
     inProgressStream: InProgressStreamSchema.optional(),
+    latestTurnOutcome: LatestTurnOutcomeSchema.optional(),
     queueState: QueueStateSchema,
     approvals: z.array(ApprovalSummarySchema).max(1_000),
     childAgents: z.array(ChildAgentSummarySchema).max(1_000),
@@ -1048,6 +1067,54 @@ export const ThreadProjectionSnapshotSchema = z
         path: ["latestCursor", "executionGenerationId"],
         message: "The latest cursor must belong to the current execution generation",
       });
+    }
+    const latestTurnOutcome = snapshot.latestTurnOutcome;
+    if (latestTurnOutcome) {
+      if (
+        latestTurnOutcome.observedCursor.threadId !== snapshot.thread.threadId ||
+        latestTurnOutcome.observedCursor.executionGenerationId !==
+          snapshot.thread.currentLocation.executionGenerationId
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedCursor"],
+          message: "The latest turn outcome must belong to the projected thread generation",
+        });
+      }
+      if (
+        latestTurnOutcome.observedCursor.generation === snapshot.latestCursor.generation &&
+        latestTurnOutcome.observedCursor.sequence > snapshot.latestCursor.sequence
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedCursor", "sequence"],
+          message: "The latest turn outcome cannot be newer than the projected cursor",
+        });
+      }
+      if (Date.parse(latestTurnOutcome.observedAt) > Date.parse(snapshot.generatedAt)) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedAt"],
+          message: "The latest turn outcome cannot be observed after snapshot generation",
+        });
+      }
+      const terminalAssistant = latestTurnOutcome.terminalAssistant;
+      if (terminalAssistant) {
+        const block = snapshot.materializedRecentBlocks.find(
+          (candidate) => candidate.blockId === terminalAssistant.blockId,
+        );
+        if (
+          !block ||
+          block.kind !== "assistant" ||
+          Date.parse(block.createdAt) > Date.parse(latestTurnOutcome.observedAt)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["latestTurnOutcome", "terminalAssistant"],
+            message: "The terminal assistant outcome must reference an observed assistant block",
+          });
+        }
+      }
     }
     const residentControl = snapshot.residentControl;
     if (

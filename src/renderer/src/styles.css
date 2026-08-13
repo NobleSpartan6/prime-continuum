@@ -395,8 +395,7 @@ pre {
 }
 
 bdi,
-code,
-.file-list__path {
+code {
   overflow-wrap: break-word;
 }
 
@@ -2568,64 +2567,6 @@ code,
   font-size: var(--font-caption);
   line-height: 1.4;
   text-wrap: pretty;
-}
-
-.change-totals {
-  display: flex;
-  gap: 0.65rem;
-  margin-block-end: 0.6rem;
-  padding-inline: 0.5rem;
-  font-size: var(--font-caption);
-  font-variant-numeric: tabular-nums;
-}
-
-.change-additions,
-.file-list__stat i {
-  color: var(--color-success);
-  font-style: normal;
-}
-
-.change-deletions,
-.file-list__stat b {
-  color: var(--color-danger);
-  font-weight: 400;
-}
-
-.file-list {
-  display: grid;
-  gap: 0.125rem;
-}
-
-.file-list__row {
-  display: grid;
-  grid-template-columns: 1.25rem minmax(0, 1fr) auto;
-  align-items: center;
-  inline-size: 100%;
-  min-block-size: 2.25rem;
-  gap: 0.35rem;
-  padding-inline: 0.4rem;
-  color: var(--color-text-secondary);
-  text-align: start;
-  background: transparent;
-  border-radius: var(--radius-sm);
-  font-size: var(--font-caption);
-}
-
-.file-list__status {
-  color: var(--color-success);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-weight: 650;
-}
-
-.file-list__path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.file-list__stat {
-  display: flex;
-  gap: 0.35rem;
 }
 
 .agent-list,
@@ -7703,7 +7644,6 @@ body[data-surface="hud"] {
   .run-location select,
   .inspector-tabs button,
   .mode-control button,
-  .file-list__row,
   .disclosure summary,
   .command-disclosure summary,
   .choice-list label,
@@ -8015,8 +7955,7 @@ body[data-surface="hud"] {
 
 .nav-row,
 .thread-row,
-.attention-list button,
-.file-list__row {
+.attention-list button {
   border-radius: 0;
 }
 
@@ -9425,6 +9364,231 @@ dialog.sheet::backdrop {
   background: transparent;
   border: 1px solid currentColor;
   border-radius: 50%;
+}
+
+.inspector-content--review {
+  padding-block-start: 0.95rem;
+}
+
+.inspector {
+  container-name: inspector;
+  container-type: inline-size;
+}
+
+.outcome-review {
+  min-inline-size: 0;
+}
+
+.outcome-review__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-inline-size: 0;
+  gap: 0.75rem;
+  padding-block-end: 1rem;
+}
+
+.outcome-review__heading {
+  min-inline-size: 0;
+}
+
+.outcome-review__eyebrow,
+.outcome-review__facts dt,
+.outcome-review__section-heading h3 {
+  color: var(--color-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 620;
+  letter-spacing: 0.04em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.outcome-review__heading h2 {
+  display: -webkit-box;
+  min-inline-size: 0;
+  margin: 0.2rem 0 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 0.9375rem;
+  font-weight: 640;
+  letter-spacing: -0.012em;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.outcome-review__state {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.35rem;
+  padding-block-start: 0.05rem;
+  color: var(--color-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 620;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.outcome-review__state--complete {
+  color: var(--color-success);
+}
+
+.outcome-review__state--working,
+.outcome-review__state--ready {
+  color: var(--color-accent);
+}
+
+.outcome-review__state--needs_review {
+  color: var(--color-warning);
+}
+
+.outcome-review__result {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+}
+
+.outcome-review__result--empty {
+  color: var(--color-text-muted);
+}
+
+.outcome-review__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem 1rem;
+  margin: 1rem 0 0;
+  padding-block: 0.85rem;
+  border-block: 1px solid var(--color-border);
+}
+
+.outcome-review__facts > div {
+  min-inline-size: 0;
+}
+
+.outcome-review__facts dt,
+.outcome-review__facts dd {
+  margin: 0;
+}
+
+.outcome-review__facts dd {
+  margin-block-start: 0.2rem;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outcome-review__section {
+  padding-block-start: 1rem;
+}
+
+.outcome-review__section-heading {
+  margin-block-end: 0.35rem;
+}
+
+.outcome-review__section-heading h3 {
+  margin: 0;
+}
+
+.outcome-review__list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.outcome-review__row {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr) auto;
+  align-items: start;
+  min-inline-size: 0;
+  gap: 0.55rem;
+  padding-block: 0.65rem;
+}
+
+.outcome-review__row + .outcome-review__row {
+  border-block-start: 1px solid var(--color-border);
+}
+
+.outcome-review__row-icon {
+  display: grid;
+  place-items: center;
+  block-size: 1.2rem;
+  color: var(--color-text-muted);
+}
+
+.outcome-review__row[data-evidence-state="passed"] .outcome-review__row-icon,
+.outcome-review__row[data-agent-state="complete"] .outcome-review__row-icon {
+  color: var(--color-success);
+}
+
+.outcome-review__row[data-evidence-state="warning"] .outcome-review__row-icon,
+.outcome-review__row[data-agent-state="failed"] .outcome-review__row-icon,
+.outcome-review__row[data-agent-state="cancelled"] .outcome-review__row-icon {
+  color: var(--color-warning);
+}
+
+.outcome-review__row-body {
+  display: grid;
+  min-inline-size: 0;
+  gap: 0.15rem;
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.outcome-review__row-body strong {
+  color: var(--color-text-secondary);
+  font-weight: 610;
+}
+
+.outcome-review__row-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  min-inline-size: 0;
+  gap: 0.5rem;
+}
+
+.outcome-review__row-title > :last-child,
+.outcome-review__row-meta {
+  flex: none;
+  color: var(--color-text-muted);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@container inspector (max-width: 22rem) {
+  .outcome-review__header {
+    display: grid;
+    gap: 0.4rem;
+  }
+
+  .outcome-review__facts {
+    gap: 0.75rem;
+  }
+
+  .outcome-review__row {
+    grid-template-columns: 1rem minmax(0, 1fr);
+  }
+
+  .outcome-review__row-meta {
+    grid-column: 2;
+  }
 }
 
 .rlm-map__branch-list .rlm-map__branch-list {

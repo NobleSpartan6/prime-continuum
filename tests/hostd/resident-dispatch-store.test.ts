@@ -102,7 +102,16 @@ describe("HostStore resident prompt and abort dispatch journal", () => {
       command: { commandId: command.commandId },
       receipt: { commandId: command.commandId, status: "completed" },
       observedCursor: { generation: "resident-handled-same-cursor", sequence: 1 },
+      latestTurnOutcome: {
+        outcomeVersion: 1,
+        commandId: command.commandId,
+        receiptId: observation.receipt.receiptId,
+        observedCursor: { generation: "resident-handled-same-cursor", sequence: 1 },
+      },
     });
+    expect((await fixture.store.getThreadSnapshot(command.threadId)).latestTurnOutcome).toEqual(
+      observation.latestTurnOutcome,
+    );
     expect((await fixture.store.reconcileCommands([command])).receipts[0]).toEqual(observation.receipt);
     expect(await residentAttemptNames(fixture.store)).toEqual([]);
     expect(await residentIdleEvents(fixture.store)).toHaveLength(1);
@@ -113,6 +122,54 @@ describe("HostStore resident prompt and abort dispatch journal", () => {
       "running",
       "completed",
     ]);
+  });
+
+  it("projects the exact terminal assistant outcome and lets a newer handled prompt supersede it", async () => {
+    const fixture = await createFixture();
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      projection(fixture.binding, "resident-turn-outcome", 1, false),
+    );
+    const first = residentCommand(fixture.hostId, "resident-terminal-outcome", "prompt");
+    await fixture.store.admitCommand(first, true);
+    const firstDispatch = await fixture.store.beginResidentDispatch(first);
+    await fixture.store.finalizeResidentDispatch(firstDispatch, { status: "running" });
+    const terminal = terminalProjection(fixture.binding, "resident-turn-outcome", 2);
+    await fixture.store.publishResidentProjectionSnapshot(fixture.binding, terminal);
+    const firstReconciliation = await fixture.store.beginResidentPromptReconciliation(firstDispatch);
+    const firstObservation = await fixture.store.completeResidentPromptReconciliation(
+      firstReconciliation,
+      terminalIdleEvidence(firstReconciliation, terminal),
+    );
+    const firstOutcome = (await fixture.store.getThreadSnapshot(first.threadId)).latestTurnOutcome;
+    expect(firstOutcome).toEqual(firstObservation.latestTurnOutcome);
+    expect(firstOutcome).toMatchObject({
+      commandId: first.commandId,
+      terminalAssistant: { blockId: "resident-terminal-block", stopReason: "stop" },
+    });
+    expect(Object.keys(firstOutcome ?? {}).sort()).toEqual([
+      "commandId",
+      "observedAt",
+      "observedCursor",
+      "outcomeVersion",
+      "receiptId",
+      "terminalAssistant",
+    ]);
+
+    const second = residentCommand(fixture.hostId, "resident-handled-outcome", "prompt");
+    await fixture.store.admitCommand(second, true);
+    const secondDispatch = await fixture.store.beginResidentDispatch(second);
+    await fixture.store.finalizeResidentDispatch(secondDispatch, { status: "running" });
+    const secondReconciliation = await fixture.store.beginResidentPromptReconciliation(secondDispatch);
+    const secondObservation = await fixture.store.completeResidentPromptReconciliation(
+      secondReconciliation,
+      idleEvidence(secondReconciliation, terminal),
+    );
+    const secondOutcome = (await fixture.store.getThreadSnapshot(second.threadId)).latestTurnOutcome;
+    expect(secondOutcome).toEqual(secondObservation.latestTurnOutcome);
+    expect(secondOutcome).toMatchObject({ commandId: second.commandId });
+    expect(secondOutcome?.terminalAssistant).toBeUndefined();
+    expect(Date.parse(secondOutcome!.observedAt)).toBeGreaterThan(Date.parse(firstOutcome!.observedAt));
   });
 
   it("excludes uncertain prompts from every idle reconciliation and cursor retirement path", async () => {
@@ -424,6 +481,7 @@ describe("HostStore resident prompt and abort dispatch journal", () => {
     expect((await fixture.store.reconcileCommands([command])).receipts[0]).toEqual(observation.receipt);
     expect(await residentAttemptNames(fixture.store)).toEqual([]);
     expect(await residentAbortIdleEvents(fixture.store)).toHaveLength(1);
+    expect((await fixture.store.getThreadSnapshot(command.threadId)).latestTurnOutcome).toBeUndefined();
     const next = residentCommand(fixture.hostId, "resident-after-abort-proof", "prompt");
     expect((await fixture.store.admitCommand(next, true)).receipt.status).toBe("admitted");
   });
@@ -619,6 +677,7 @@ describe("HostStore resident prompt and abort dispatch journal", () => {
 describe("HostStore resident dispatch crash recovery", () => {
   it.each([
     "after_prompt_idle_attempt",
+    "after_prompt_idle_snapshot",
     "after_prompt_idle_receipt",
     "after_prompt_idle_journal",
     "after_prompt_idle_event",
@@ -658,6 +717,10 @@ describe("HostStore resident dispatch crash recovery", () => {
     expect(await residentAttemptNames(recovered)).toEqual([]);
     expect(await recovered.listResidentPromptReconciliationLeases()).toEqual([]);
     expect(await residentIdleEvents(recovered)).toHaveLength(1);
+    expect((await recovered.getThreadSnapshot(command.threadId)).latestTurnOutcome).toMatchObject({
+      commandId: command.commandId,
+      receiptId: expect.any(String),
+    });
     expect((await commandStatuses(recovered, command.commandId)).filter((status) => status === "completed"))
       .toHaveLength(1);
   });
@@ -1219,6 +1282,33 @@ function projection(
   };
 }
 
+function terminalProjection(
+  residentBinding: ResidentSessionBinding,
+  generation: string,
+  sequence: number,
+): ResidentProjectionSnapshot {
+  const idle = projection(residentBinding, generation, sequence, false);
+  const timestamp = Date.parse("2026-08-07T22:02:00.000Z");
+  const block = {
+    blockId: "resident-terminal-block",
+    kind: "assistant" as const,
+    text: "The requested work is complete.",
+    createdAt: new Date(timestamp).toISOString(),
+    sequence: 1,
+  };
+  return {
+    ...idle,
+    terminalAssistant: {
+      digest: "a".repeat(64),
+      timestamp,
+      stopReason: "stop",
+    },
+    terminalAssistantBlockId: block.blockId,
+    transcript: [block],
+    runtime: { ...idle.runtime, messageCount: 1 },
+  };
+}
+
 function queueOnlyProjection(
   residentBinding: ResidentSessionBinding,
   generation: string,
@@ -1243,6 +1333,22 @@ function idleEvidence(
     dispatchAttemptId: lease.attemptId,
     binding: lease.binding,
     projection: residentProjection,
+  });
+}
+
+function terminalIdleEvidence(
+  lease: ResidentPromptReconciliationLease,
+  residentProjection: ResidentProjectionSnapshot,
+): ResidentPromptIdleAuthorityEvidence {
+  if (!residentProjection.terminalAssistant || !residentProjection.terminalAssistantBlockId) {
+    throw new Error("Terminal prompt evidence requires one exact assistant block");
+  }
+  return Object.freeze({
+    ...idleEvidence(lease, residentProjection),
+    terminalAssistant: Object.freeze({
+      blockId: residentProjection.terminalAssistantBlockId,
+      stopReason: residentProjection.terminalAssistant.stopReason,
+    }),
   });
 }
 

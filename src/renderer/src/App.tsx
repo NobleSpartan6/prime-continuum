@@ -89,11 +89,12 @@ import type {
 import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
 import { RlmDelegationPanel } from './RlmDelegationPanel'
+import { OutcomeReview, type OutcomeReviewProps } from './OutcomeReview'
 import { DeferredModelsDialog } from './DeferredModelsDialog'
 import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, Suspense, lazy, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { AgentLaunchpadProps } from './AgentLaunchpad'
 
-const INSPECTOR_TABS = ['Changes', 'Session', 'Evidence', 'Context'] as const
+const INSPECTOR_TABS = ['Review', 'Session', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
 type ComposerReceiptView = {
   state: ComposerReceiptState
@@ -1333,7 +1334,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [hostActivation, setHostActivation] = useState<HostActivationView | null>(null)
   const [selectedProjectId, setSelectedProjectId] = useState('')
   const [selectedThreadId, setSelectedThreadId] = useState(initialThreadId)
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Changes')
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Review')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [workbenchLayout, setWorkbenchLayout] = useState(readWorkbenchLayout)
   const inspectorOpen = workbenchLayout.inspectorOpen
@@ -5671,7 +5672,17 @@ const InspectorPanelContent = memo(function InspectorPanelContent({
   onCheckResident,
   onEndResident,
 }: InspectorPanelContentProps) {
-  if (activeTab === 'Changes') return <ChangesPanel snapshot={snapshot} />
+  if (activeTab === 'Review') {
+    return (
+      <ReviewPanel
+        snapshot={snapshot}
+        thread={selectedThread}
+        project={selectedProject}
+        runtime={runtime}
+        environment={api.environment}
+      />
+    )
+  }
   if (activeTab === 'Session') {
     return (
       <RuntimePanel
@@ -5719,27 +5730,99 @@ function PanelHeading({ icon, title, meta }: { icon: LucideIcon; title: string; 
   )
 }
 
-function ChangesPanel({ snapshot }: { snapshot: WorkbenchSnapshot }) {
-  const additions = snapshot.changes.reduce((sum, file) => sum + file.additions, 0)
-  const deletions = snapshot.changes.reduce((sum, file) => sum + file.deletions, 0)
+function outcomeReviewProps(
+  snapshot: WorkbenchSnapshot,
+  thread: ThreadSummary,
+  project: WorkbenchSnapshot['projects'][number],
+  runtime: RuntimeSummary,
+  environment: RendererApi['environment'],
+): OutcomeReviewProps {
+  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
+  const onlyGoal = runtime.goals?.length === 1 ? runtime.goals[0] : undefined
+  const terminalGoal = activeGoal || (onlyGoal?.state !== 'complete' && onlyGoal?.state !== 'error')
+    ? undefined
+    : onlyGoal
+  const displayedGoal = activeGoal ?? terminalGoal
+  const exactOutcome = snapshot.latestTurnOutcome
+  const terminalAssistant = exactOutcome?.terminalAssistant
+  const changedFileCount = snapshot.gitSummary?.changedFileCount
+    ?? (environment === 'preview' ? project.dirtyFiles : undefined)
+  const resultBlock = terminalAssistant
+    ? thread.transcript.find((block) => block.id === terminalAssistant.blockId && block.kind === 'assistant')
+    : undefined
+  const promptReceiptState = snapshot.composerReceipt.operation === 'prompt'
+    ? snapshot.composerReceipt.state
+    : undefined
+  const hasLiveRuntimeActivity = Boolean(
+    snapshot.snapshotAuthority?.source !== 'cached'
+    && (
+      Boolean(activeGoal)
+      || runtime.session?.isStreaming
+      || runtime.session?.isCompacting
+      || runtime.session?.isBashRunning
+      || (runtime.session?.queuedActionCount ?? 0) > 0
+      || snapshot.agents.some((agent) => agent.status === 'running' || agent.status === 'waiting')
+      || snapshot.evidence.some((item) => item.status === 'running')
+      || promptReceiptState === 'sending'
+      || promptReceiptState === 'sent'
+      || promptReceiptState === 'queued'
+    ),
+  )
+  const needsReview = Boolean(
+    thread.status === 'needs_approval'
+    || thread.status === 'failed'
+    || snapshot.attention.some((item) => item.threadId === thread.id)
+    || snapshot.evidence.some((item) => item.status === 'warning')
+    || snapshot.agents.some((agent) => agent.status === 'failed' || agent.status === 'cancelled')
+    || promptReceiptState === 'uncertain'
+    || promptReceiptState === 'rejected'
+    || promptReceiptState === 'waiting_for_connection',
+  )
+  let state: OutcomeReviewProps['state'] = 'unknown'
+  if (terminalAssistant?.stopReason === 'error' || terminalAssistant?.stopReason === 'aborted') {
+    state = 'needs_review'
+  } else if (terminalGoal?.state === 'error') {
+    state = 'needs_review'
+  } else if (needsReview) {
+    state = 'needs_review'
+  } else if (hasLiveRuntimeActivity) {
+    state = 'working'
+  } else if (terminalGoal?.state === 'complete') {
+    state = 'complete'
+  } else if (exactOutcome) {
+    state = 'ready'
+  }
+
+  return {
+    state,
+    ...(displayedGoal?.objective ? { objective: displayedGoal.objective } : {}),
+    ...(resultBlock?.body.trim() ? { result: resultBlock.body.trim() } : {}),
+    ...(snapshot.evidence.length > 0 ? { evidence: snapshot.evidence } : {}),
+    ...(runtime.agentsReported === true ? { childAgents: snapshot.agents } : {}),
+    ...(changedFileCount !== undefined ? { changedFileCount } : {}),
+    ...(displayedGoal?.tokensUsed !== undefined ? { tokensUsed: displayedGoal.tokensUsed } : {}),
+    ...(displayedGoal?.timeUsedSeconds !== undefined ? { timeUsedSeconds: displayedGoal.timeUsedSeconds } : {}),
+    ...(snapshot.snapshotAuthority?.source ? { snapshotSource: snapshot.snapshotAuthority.source } : {}),
+  }
+}
+
+function ReviewPanel({
+  snapshot,
+  thread,
+  project,
+  runtime,
+  environment,
+}: {
+  snapshot: WorkbenchSnapshot
+  thread: ThreadSummary
+  project: WorkbenchSnapshot['projects'][number]
+  runtime: RuntimeSummary
+  environment: RendererApi['environment']
+}) {
+  const outcome = outcomeReviewProps(snapshot, thread, project, runtime, environment)
   return (
-    <div className="inspector-content">
-      <PanelHeading icon={FileCode2} title="Working tree" meta={`${snapshot.changes.length} files changed`} />
-      <div className="change-totals" aria-label={`${additions} additions and ${deletions} deletions`}>
-        <span className="change-additions">+{additions}</span>
-        <span className="change-deletions">−{deletions}</span>
-      </div>
-      <ul className="file-list">
-        {snapshot.changes.map((file) => (
-          <li key={file.path}>
-            <div className="file-list__row" title={file.path}>
-              <span className="file-list__status">{file.status === 'added' ? 'A' : 'M'}</span>
-              <span className="file-list__path">{file.path}</span>
-              <span className="file-list__stat tabular"><i>+{file.additions}</i><b>−{file.deletions}</b></span>
-            </div>
-          </li>
-        ))}
-      </ul>
+    <div className="inspector-content inspector-content--review">
+      <OutcomeReview {...outcome} />
     </div>
   )
 }

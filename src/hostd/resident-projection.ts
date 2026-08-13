@@ -114,6 +114,7 @@ export interface ResidentProjectionSnapshot {
   /** Exact private identity; the public runtime model remains display-only. */
   readonly selectedModel?: Readonly<ResidentProjectionSelectedModelIdentity>;
   readonly terminalAssistant?: Readonly<ResidentTerminalAssistantMarker>;
+  readonly terminalAssistantBlockId?: string;
   readonly runtime: Readonly<RuntimeSessionSummary>;
   readonly transcript: readonly Readonly<TranscriptBlock>[];
   readonly stream?: Readonly<InProgressStream>;
@@ -605,7 +606,11 @@ export function normalizeResidentProjectionSnapshot(
         modelId: snapshot.state.model.id,
       }
     : undefined;
-  const terminalAssistant = findTerminalAssistantMarker(snapshot.messages);
+  const terminalAssistantSource = findTerminalAssistant(snapshot.messages);
+  const terminalAssistant = terminalAssistantSource?.marker;
+  const terminalAssistantBlockId = terminalAssistantSource
+    ? transcript.find((block) => block.sequence === terminalAssistantSource.sourceIndex)?.blockId
+    : undefined;
   const runtime = normalizeRuntime(snapshot, binding, resources, displayContext);
   const queue = ResidentProjectionQueueSummarySchema.parse({
     queuedCount: snapshot.state.sessionActions.queuedCount,
@@ -639,6 +644,7 @@ export function normalizeResidentProjectionSnapshot(
     cursor,
     ...(selectedModel ? { selectedModel } : {}),
     ...(terminalAssistant ? { terminalAssistant } : {}),
+    ...(terminalAssistantBlockId ? { terminalAssistantBlockId } : {}),
     runtime,
     transcript,
     ...(stream ? { stream } : {}),
@@ -680,14 +686,14 @@ export function residentChildAgentSummaryFromSessionEvent(
   return parsed.success ? Object.freeze(normalizeChildAgent(parsed.data.child)) : undefined;
 }
 
-function findTerminalAssistantMarker(
+function findTerminalAssistant(
   messages: readonly PinnedAgentMessage[],
-): ResidentTerminalAssistantMarker | undefined {
+): Readonly<{ marker: ResidentTerminalAssistantMarker; sourceIndex: number }> | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!;
     if (message.role !== "assistant") continue;
     const marker = terminalAssistantMarker(message);
-    if (marker) return marker;
+    if (marker) return Object.freeze({ marker, sourceIndex: index });
   }
   return undefined;
 }

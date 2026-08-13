@@ -16,6 +16,7 @@ import {
   HostSummarySchema,
   IdSchema,
   IsoDateTimeSchema,
+  LatestTurnOutcomeSchema,
   PROTOCOL_VERSION,
   ResidentRegisteredWorkspaceProvisionRequestSchema,
   ResidentControlProjectionSnapshotSchema,
@@ -37,6 +38,7 @@ import {
   type HandoffProgress,
   type HandoffReceipt,
   type HostSummary,
+  type LatestTurnOutcome,
   type ResidentControlOperation,
   type ResidentControlProjectionSnapshot,
   type RuntimeSessionSummary,
@@ -978,6 +980,7 @@ export const ResidentPromptIdleObservedEventSchema = z
     binding: ResidentSessionBindingSchema,
     bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     observedCursor: SessionCursorSchema,
+    latestTurnOutcome: LatestTurnOutcomeSchema.optional(),
   })
   .strict()
   .superRefine((event, context) => {
@@ -1003,7 +1006,12 @@ export const ResidentPromptIdleObservedEventSchema = z
       event.binding.threadId !== event.command.threadId ||
       event.binding.executionGenerationId !== event.command.expectedExecutionGenerationId ||
       event.observedCursor.threadId !== event.command.threadId ||
-      event.observedCursor.executionGenerationId !== event.command.expectedExecutionGenerationId
+      event.observedCursor.executionGenerationId !== event.command.expectedExecutionGenerationId ||
+      (event.latestTurnOutcome !== undefined &&
+        (event.latestTurnOutcome.commandId !== event.command.commandId ||
+          event.latestTurnOutcome.receiptId !== event.receipt.receiptId ||
+          event.latestTurnOutcome.observedAt !== event.observedAt ||
+          !isDeepStrictEqual(event.latestTurnOutcome.observedCursor, event.observedCursor)))
     ) {
       context.addIssue({
         code: "custom",
@@ -2255,6 +2263,7 @@ export type ResidentDispatchFaultPoint =
   | "after_settled_receipt"
   | "after_settled_journal"
   | "after_prompt_idle_attempt"
+  | "after_prompt_idle_snapshot"
   | "after_prompt_idle_receipt"
   | "after_prompt_idle_journal"
   | "after_prompt_idle_event"
@@ -4886,6 +4895,10 @@ export class HostStore {
       if (projection.runtime.recap === undefined) delete threadValue.recap;
       else threadValue.recap = projection.runtime.recap;
       const thread = ThreadSummarySchema.parse(threadValue);
+      const retainedTurnOutcome = retainLatestTurnOutcome(
+        source.latestTurnOutcome,
+        projection.transcript,
+      );
       const published = ThreadProjectionSnapshotSchema.parse({
         snapshotVersion: SNAPSHOT_VERSION,
         generatedAt,
@@ -4899,6 +4912,7 @@ export class HostStore {
         })),
         materializedRecentBlocks: projection.transcript,
         ...(projection.stream ? { inProgressStream: projection.stream } : {}),
+        ...(retainedTurnOutcome ? { latestTurnOutcome: retainedTurnOutcome } : {}),
         // Prime v0.7 exposes bounded queue counts but no stable host command
         // identities. Once its exact snapshot is authoritative, speculative
         // host admission IDs must not survive as phantom queued work.
@@ -5684,6 +5698,8 @@ export class HostStore {
         currentSnapshot.runtime?.residency !== "resident" ||
         currentSnapshot.runtime.activeSessionId !== lease.binding.activeSessionId ||
         currentSnapshot.runtime.sessionId !== lease.binding.sessionId ||
+        currentSnapshot.latestCursor.generation !== evidence.projection.cursor.generation ||
+        currentSnapshot.latestCursor.sequence !== evidence.projection.cursor.sequence ||
         residentSnapshotReportsActivity(currentSnapshot)
       ) {
         throw new HostStoreError(
@@ -5693,7 +5709,11 @@ export class HostStore {
         );
       }
 
-      const observedAt = now();
+      const observedAt = causalNowAfter(
+        currentSnapshot.generatedAt,
+        currentReceipt.updatedAt,
+        currentSnapshot.latestTurnOutcome?.observedAt,
+      );
       const completedReceipt = CommandReceiptSchema.parse({
         ...currentReceipt,
         status: "completed",
@@ -5702,6 +5722,13 @@ export class HostStore {
         error: undefined,
         updatedAt: observedAt,
       });
+      const latestTurnOutcome = latestTurnOutcomeFromPromptEvidence(
+        attempt.command,
+        completedReceipt,
+        currentSnapshot,
+        evidence,
+        observedAt,
+      );
       const observation = ResidentPromptIdleObservedEventSchema.parse({
         eventVersion: 1,
         attemptId: attempt.attemptId,
@@ -5712,6 +5739,7 @@ export class HostStore {
         binding: currentBinding,
         bindingFingerprint: attempt.bindingFingerprint,
         observedCursor: currentSnapshot.latestCursor,
+        latestTurnOutcome,
       });
       const { promptSettlementCursor: _settlementCursor, ...attemptWithoutSettlementCursor } = attempt;
       const completedAttempt = ResidentDispatchAttemptSchema.parse({
@@ -5731,6 +5759,8 @@ export class HostStore {
           MAX_RESIDENT_DISPATCH_ATTEMPT_BYTES,
         );
         await this.injectResidentDispatchFault("after_prompt_idle_attempt", attempt.attemptId);
+        await this.materializeLatestTurnOutcomeUnlocked(latestTurnOutcome);
+        await this.injectResidentDispatchFault("after_prompt_idle_snapshot", attempt.attemptId);
         await atomicWriteJson(this.receiptPath(lease.command), completedReceipt);
         await this.injectResidentDispatchFault("after_prompt_idle_receipt", attempt.attemptId);
         await this.appendResidentDispatchJournalUnlocked(
@@ -6599,6 +6629,7 @@ export class HostStore {
       thread,
       transcriptBlockIndex: source.transcriptBlockIndex,
       materializedRecentBlocks: source.materializedRecentBlocks,
+      ...(source.latestTurnOutcome ? { latestTurnOutcome: source.latestTurnOutcome } : {}),
       queueState: { pendingCommandIds: [], paused: false },
       approvals: [],
       childAgents: [],
@@ -8355,6 +8386,9 @@ export class HostStore {
           // The persisted observation is the recovery intent. Complete the
           // exact local ordering without invoking Prime, replaying the prompt,
           // or treating an unrelated completed receipt as idle evidence.
+          if (observation.latestTurnOutcome) {
+            await this.materializeLatestTurnOutcomeUnlocked(observation.latestTurnOutcome);
+          }
           await atomicWriteJson(this.receiptPath(attempt.command), finalReceipt);
           await this.appendResidentDispatchJournalUnlocked(
             attempt.command,
@@ -12558,6 +12592,48 @@ export class HostStore {
     );
   }
 
+  private async materializeLatestTurnOutcomeUnlocked(
+    outcomeValue: LatestTurnOutcome,
+  ): Promise<void> {
+    const outcome = LatestTurnOutcomeSchema.parse(outcomeValue);
+    const snapshot = await this.readSnapshotUnlocked(outcome.observedCursor.threadId);
+    if (
+      snapshot.thread.currentLocation.executionGenerationId !==
+      outcome.observedCursor.executionGenerationId
+    ) {
+      // A later execution generation supersedes this historical proof. Never
+      // attach an old turn outcome to new execution authority.
+      return;
+    }
+    const existing = snapshot.latestTurnOutcome;
+    if (
+      existing &&
+      (Date.parse(existing.observedAt) > Date.parse(outcome.observedAt) ||
+        (existing.observedAt === outcome.observedAt &&
+          (existing.commandId !== outcome.commandId || existing.receiptId !== outcome.receiptId)))
+    ) {
+      return;
+    }
+    const terminalAssistant = outcome.terminalAssistant;
+    const materializedTerminal = terminalAssistant && snapshot.materializedRecentBlocks.some(
+      (block) => block.blockId === terminalAssistant.blockId && block.kind === "assistant",
+    )
+      ? terminalAssistant
+      : undefined;
+    const candidateOutcome = materializedTerminal
+      ? outcome
+      : latestTurnOutcomeWithoutTerminalAssistant(outcome);
+    const generatedAt = causalNow(snapshot.generatedAt, candidateOutcome.observedAt);
+    const candidate = ThreadProjectionSnapshotSchema.parse({
+      ...snapshot,
+      generatedAt,
+      latestTurnOutcome: candidateOutcome,
+    });
+    if (!isDeepStrictEqual(candidate, snapshot)) {
+      await atomicWriteJson(this.snapshotPath(snapshot.thread.threadId), candidate);
+    }
+  }
+
   private async appendResidentAbortIdleEventUnlocked(
     observationValue: ResidentAbortIdleObservedEvent,
   ): Promise<void> {
@@ -13426,6 +13502,7 @@ function residentEndPreservedProjectionDigest(snapshot: ThreadProjectionSnapshot
     latestCursor: snapshot.latestCursor,
     transcriptBlockIndex: snapshot.transcriptBlockIndex,
     materializedRecentBlocks: snapshot.materializedRecentBlocks,
+    latestTurnOutcome: snapshot.latestTurnOutcome,
     git: snapshot.git,
     evidence: snapshot.evidence,
   });
@@ -13893,6 +13970,75 @@ function residentPrivateProjectionReportsActivity(projection: ResidentProjection
   );
 }
 
+function latestTurnOutcomeFromPromptEvidence(
+  command: CommandEnvelope,
+  receipt: CommandReceipt,
+  snapshot: ThreadProjectionSnapshot,
+  evidence: ResidentPromptIdleAuthorityEvidence,
+  observedAt: string,
+): LatestTurnOutcome {
+  const terminalEvidence = evidence.terminalAssistant;
+  let terminalAssistant: LatestTurnOutcome["terminalAssistant"];
+  if (terminalEvidence) {
+    const marker = evidence.projection.terminalAssistant;
+    const projectedBlock = evidence.projection.transcript.find(
+      (block) => block.blockId === terminalEvidence.blockId,
+    );
+    const materializedBlock = snapshot.materializedRecentBlocks.find(
+      (block) => block.blockId === terminalEvidence.blockId,
+    );
+    if (
+      !marker ||
+      evidence.projection.terminalAssistantBlockId !== terminalEvidence.blockId ||
+      marker.stopReason !== terminalEvidence.stopReason ||
+      !projectedBlock ||
+      projectedBlock.kind !== "assistant" ||
+      projectedBlock.createdAt !== new Date(marker.timestamp).toISOString() ||
+      !materializedBlock ||
+      !isDeepStrictEqual(materializedBlock, projectedBlock)
+    ) {
+      throw new HostStoreError(
+        "RESIDENT_PROMPT_IDLE_EVIDENCE_INVALID",
+        "The terminal assistant outcome did not match the exact authoritative prompt projection",
+      );
+    }
+    terminalAssistant = {
+      blockId: terminalEvidence.blockId,
+      stopReason: terminalEvidence.stopReason,
+    };
+  }
+  return LatestTurnOutcomeSchema.parse({
+    outcomeVersion: 1,
+    commandId: command.commandId,
+    receiptId: receipt.receiptId,
+    observedAt,
+    observedCursor: snapshot.latestCursor,
+    ...(terminalAssistant ? { terminalAssistant } : {}),
+  });
+}
+
+function retainLatestTurnOutcome(
+  outcome: LatestTurnOutcome | undefined,
+  transcript: ResidentProjectionSnapshot["transcript"],
+): LatestTurnOutcome | undefined {
+  if (!outcome) return undefined;
+  const terminalAssistant = outcome.terminalAssistant;
+  if (
+    !terminalAssistant ||
+    transcript.some(
+      (block) => block.blockId === terminalAssistant.blockId && block.kind === "assistant",
+    )
+  ) {
+    return outcome;
+  }
+  return latestTurnOutcomeWithoutTerminalAssistant(outcome);
+}
+
+function latestTurnOutcomeWithoutTerminalAssistant(outcome: LatestTurnOutcome): LatestTurnOutcome {
+  const { terminalAssistant: _terminalAssistant, ...withoutTerminal } = outcome;
+  return LatestTurnOutcomeSchema.parse(withoutTerminal);
+}
+
 function residentSnapshotReportsActivity(snapshot: ThreadProjectionSnapshot): boolean {
   const runtime = snapshot.runtime;
   return Boolean(
@@ -14183,6 +14329,7 @@ function createDestinationSnapshot(
   source: ThreadProjectionSnapshot,
   plan: HandoffPlan,
 ): ThreadProjectionSnapshot {
+  const { latestTurnOutcome: _priorGenerationOutcome, ...sourceWithoutTurnOutcome } = source;
   const timestamp = now();
   const cursor = {
     threadId: source.thread.threadId,
@@ -14199,7 +14346,7 @@ function createDestinationSnapshot(
     lastKnownCursor: cursor,
   };
   return ThreadProjectionSnapshotSchema.parse({
-    ...source,
+    ...sourceWithoutTurnOutcome,
     generatedAt: timestamp,
     thread,
     inProgressStream: undefined,
@@ -14291,6 +14438,15 @@ function causalNow(...causalPredecessors: Array<string | undefined>): string {
   for (const predecessor of causalPredecessors) {
     if (predecessor === undefined) continue;
     timestamp = Math.max(timestamp, Date.parse(predecessor));
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function causalNowAfter(...causalPredecessors: Array<string | undefined>): string {
+  let timestamp = Date.now();
+  for (const predecessor of causalPredecessors) {
+    if (predecessor === undefined) continue;
+    timestamp = Math.max(timestamp, Date.parse(predecessor) + 1);
   }
   return new Date(timestamp).toISOString();
 }

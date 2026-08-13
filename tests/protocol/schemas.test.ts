@@ -355,6 +355,60 @@ describe("host protocol schemas", () => {
     ).toBe(false);
   });
 
+  it("accepts only bounded generation-scoped latest turn outcomes", () => {
+    const source = threadSnapshot();
+    const assistantBlock = {
+      blockId: "assistant-terminal",
+      kind: "assistant" as const,
+      text: "Complete.",
+      createdAt: source.generatedAt,
+      sequence: source.latestCursor.sequence,
+    };
+    const latestTurnOutcome = {
+      outcomeVersion: 1 as const,
+      commandId: "prompt-command",
+      receiptId: "prompt-receipt",
+      observedAt: source.generatedAt,
+      observedCursor: source.latestCursor,
+      terminalAssistant: { blockId: assistantBlock.blockId, stopReason: "stop" as const },
+    };
+    const valid = {
+      ...source,
+      transcriptBlockIndex: [{
+        blockId: assistantBlock.blockId,
+        kind: assistantBlock.kind,
+        sequence: assistantBlock.sequence,
+        byteLength: 9,
+        materialized: true,
+      }],
+      materializedRecentBlocks: [assistantBlock],
+      latestTurnOutcome,
+    };
+    expect(ThreadProjectionSnapshotSchema.safeParse(valid).success).toBe(true);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: {
+        ...latestTurnOutcome,
+        observedCursor: { ...latestTurnOutcome.observedCursor, executionGenerationId: "other-execution" },
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: { ...latestTurnOutcome, observedAt: "2026-08-06T00:00:01.000Z" },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: {
+        ...latestTurnOutcome,
+        terminalAssistant: { ...latestTurnOutcome.terminalAssistant, blockId: "missing-block" },
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: { ...latestTurnOutcome, promptText: "must never be projected" },
+    }).success).toBe(false);
+  });
+
   it("accepts only a self-consistent opaque resident end disposition", () => {
     const source = threadSnapshot();
     const ended = {

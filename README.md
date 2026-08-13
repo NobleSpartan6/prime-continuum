@@ -14,6 +14,9 @@ Prime Continuim gives Prime Agent a focused desktop surface: choose a workspace,
 - ChatGPT Plus/Pro sign-in for the `openai-codex` provider, including GPT-5.6 Sol when the account reports it as available.
 - Model discovery and switching across providers configured in Prime Agent. The pinned runtime currently reports 1,177 routes across 32 providers; availability depends on your credentials and account.
 - Native RLM child visibility with parent/child status, model, tool-use, token, and result projections.
+- An Outcome Review that correlates the exact settled turn, written response,
+  checks, Git aggregate, RLM returns, and live-versus-cached snapshot authority
+  without treating idle as semantic success.
 - A verified, isolated browser-tool path for resident agents.
 - Durable local sessions with Stop, End, restart recovery, and saved-workspace reconnection.
 - A compact desktop HUD backed by the same authoritative session as the main workbench.
@@ -93,6 +96,7 @@ Start with:
 - [Architecture](docs/architecture.md)
 - [Implementation status](docs/implementation-status.md)
 - [Interface review](docs/interface-review.md)
+- [Prime Agent upstream review](docs/prime-agent-upstream-review.md)
 - [Stack and performance budgets](docs/stack-decision.md)
 - [Relay threat model](docs/relay-threat-model.md)
 

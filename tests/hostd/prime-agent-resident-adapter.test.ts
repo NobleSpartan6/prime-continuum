@@ -2254,13 +2254,18 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
 
     phase = "terminal";
     await emit({ type: "session_event", event: { type: "message_end", message: terminal } });
-    await expect(connection.reconcileAcknowledgedPromptIdle(
+    const evidence = await connection.reconcileAcknowledgedPromptIdle(
       promptIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId),
-    )).resolves.toMatchObject({
+    );
+    expect(evidence).toMatchObject({
       dispatchAttemptId: dispatch.dispatchAttemptId,
       projection: {
         cursor: { generation: "events-1", sequence: 5 },
         terminalAssistant: { stopReason: "stop" },
+      },
+      terminalAssistant: {
+        blockId: expect.any(String),
+        stopReason: "stop",
       },
     });
 

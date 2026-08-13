@@ -15,6 +15,14 @@ A notarized macOS DMG remains unverified; the current image is an ad-hoc local d
 
 - One Electron/React project-and-thread shell that can project local and configured SSH-backed locations. A projected location does not imply that production resident command execution, remote installation, or handoff is available.
 - The workbench exposes **New agent** as the visible resident-thread entry and three generic editable task starters above the idle composer: build a feature, review the codebase, and investigate an issue. Starters are ordinary Prompt conveniences rather than privileged workflows; they never send automatically or grant additional runtime authority. Domain-specific uses such as improving the RLM harness remain user-authored tasks, not first-class product features.
+- The first inspector tab is a compact Outcome Review backed by a durable,
+  generation-scoped latest-turn proof. It correlates the completed prompt
+  command and receipt with the exact observed cursor and, when materialized,
+  the terminal assistant block and stop reason. It never stores prompt text or
+  paths and never interprets idle as task success; only explicit goal, check,
+  attention, child, Git aggregate, and live/cached snapshot facts drive its
+  labels. Crash recovery replays only local proof materialization, never the
+  prompt.
 - One optional singleton desktop HUD for an exact attached resident host/thread/generation. Its expanded surface reuses the authoritative transcript and Prompt/Stop composer; its draggable buddy is only a compact projection of that same thread. Native IPC distinguishes the trusted workbench and HUD main frames, fans service events to both, and role-gates window controls. Explicit close destroys the overlay; only bounded geometry and the last chosen buddy/expanded mode persist, never open state, target, path, draft, or conversation data. This is an independent always-on-top companion, not target-app docking, window inspection, a second agent, or a separate runtime connection.
 - Sandboxed renderer, context isolation, sender-validated bounded IPC, restrictive navigation and permission policy, and no renderer Node access.
 - Recursive OpenSSH config discovery with concrete-alias filtering, `Include` handling, `ssh -G` resolution, and fixed argument-array process launches. Private key contents are never read.

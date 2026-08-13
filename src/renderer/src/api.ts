@@ -271,6 +271,42 @@ export interface EvidenceSummary {
   duration?: string
 }
 
+export interface OutcomeCursorSummary {
+  threadId: string
+  executionGenerationId: string
+  generation: string
+  sequence: number
+}
+
+/** Exact host-owned completion evidence for the latest acknowledged resident turn. */
+export interface LatestTurnOutcomeSummary {
+  outcomeVersion: 1
+  commandId: string
+  receiptId: string
+  observedAt: string
+  observedCursor: OutcomeCursorSummary
+  terminalAssistant?: {
+    blockId: string
+    stopReason: 'stop' | 'length' | 'error' | 'aborted'
+  }
+}
+
+/** Freshness of the exact selected thread snapshot, never mutation authority. */
+export interface SnapshotAuthoritySummary {
+  source: 'live' | 'cached'
+  generatedAt: string
+  cursor: OutcomeCursorSummary
+}
+
+/** Aggregate Git facts only. The native snapshot does not disclose a file list. */
+export interface GitAggregateSummary {
+  stagedFiles: number
+  unstagedFiles: number
+  untrackedFiles: number
+  changedFileCount: number
+  knownDetail: false
+}
+
 export interface WorkbenchSnapshot {
   selectedProjectId: string
   selectedThreadId: string
@@ -282,6 +318,12 @@ export interface WorkbenchSnapshot {
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
   runtime: RuntimeSummary
+  /** Exact latest acknowledged turn outcome when the host reported one. */
+  latestTurnOutcome?: LatestTurnOutcomeSummary
+  /** Exact snapshot lineage and whether it was freshly materialized from the connected host. */
+  snapshotAuthority?: SnapshotAuthoritySummary
+  /** Aggregate change counts from the selected snapshot; paths are never invented. */
+  gitSummary?: GitAggregateSummary
   /** Current local setup only; never contains a folder, socket, executable, or data-root path. */
   localSetup?: LocalSetupSummary
   /** Bounded, path-free desktop ledger for fresh resident lifecycle recovery. */
@@ -1393,6 +1435,107 @@ interface NativeProjectionInput {
   deviceId?: string
   mutationAuthorityReady?: boolean
   activationRequiredHostId?: string
+  connectionGeneration?: number
+  authoritativeMaterialization?: {
+    connectionGeneration: number
+    hostId: string
+    threadId: string
+    executionGenerationId: string
+  }
+}
+
+function outcomeCursorFromNative(value: unknown): OutcomeCursorSummary | undefined {
+  const cursor = asRecord(value)
+  const threadId = asString(cursor?.threadId)
+  const executionGenerationId = asString(cursor?.executionGenerationId)
+  const generation = asString(cursor?.generation)
+  const sequence = asNumber(cursor?.sequence)
+  if (
+    !threadId ||
+    !executionGenerationId ||
+    !generation ||
+    sequence === undefined ||
+    !Number.isSafeInteger(sequence) ||
+    sequence < 0
+  ) return undefined
+  return { threadId, executionGenerationId, generation, sequence }
+}
+
+function latestTurnOutcomeFromNative(
+  value: unknown,
+  latestCursor: OutcomeCursorSummary,
+  snapshotGeneratedAt: string,
+  materializedRecentBlocks: unknown,
+): LatestTurnOutcomeSummary | undefined {
+  const outcome = asRecord(value)
+  if (!outcome || outcome.outcomeVersion !== 1) return undefined
+  const commandId = asString(outcome.commandId)
+  const receiptId = asString(outcome.receiptId)
+  const observedAt = asString(outcome.observedAt)
+  const observedCursor = outcomeCursorFromNative(outcome.observedCursor)
+  if (
+    !commandId ||
+    !receiptId ||
+    !observedAt ||
+    !Number.isFinite(Date.parse(observedAt)) ||
+    !observedCursor ||
+    observedCursor.threadId !== latestCursor.threadId ||
+    observedCursor.executionGenerationId !== latestCursor.executionGenerationId ||
+    (observedCursor.generation === latestCursor.generation && observedCursor.sequence > latestCursor.sequence) ||
+    Date.parse(observedAt) > Date.parse(snapshotGeneratedAt)
+  ) return undefined
+
+  const terminal = asRecord(outcome.terminalAssistant)
+  if (!terminal) {
+    return { outcomeVersion: 1, commandId, receiptId, observedAt, observedCursor }
+  }
+  const blockId = asString(terminal.blockId)
+  const stopReason = asString(terminal.stopReason)
+  if (
+    !blockId ||
+    (stopReason !== 'stop' && stopReason !== 'length' && stopReason !== 'error' && stopReason !== 'aborted')
+  ) return undefined
+  const terminalBlock = records(materializedRecentBlocks).find((block) => asString(block.blockId) === blockId)
+  if (
+    !terminalBlock ||
+    asString(terminalBlock.kind) !== 'assistant' ||
+    !asString(terminalBlock.createdAt) ||
+    !Number.isFinite(Date.parse(asString(terminalBlock.createdAt)!)) ||
+    Date.parse(asString(terminalBlock.createdAt)!) > Date.parse(observedAt)
+  ) return undefined
+  return {
+    outcomeVersion: 1,
+    commandId,
+    receiptId,
+    observedAt,
+    observedCursor,
+    terminalAssistant: { blockId, stopReason },
+  }
+}
+
+function gitAggregateFromNative(value: unknown): GitAggregateSummary | undefined {
+  const git = asRecord(value)
+  const stagedFiles = asNumber(git?.stagedFiles)
+  const unstagedFiles = asNumber(git?.unstagedFiles)
+  const untrackedFiles = asNumber(git?.untrackedFiles)
+  if (
+    stagedFiles === undefined ||
+    unstagedFiles === undefined ||
+    untrackedFiles === undefined ||
+    !Number.isSafeInteger(stagedFiles) ||
+    !Number.isSafeInteger(unstagedFiles) ||
+    !Number.isSafeInteger(untrackedFiles) ||
+    stagedFiles < 0 ||
+    unstagedFiles < 0 ||
+    untrackedFiles < 0
+  ) return undefined
+  return {
+    stagedFiles,
+    unstagedFiles,
+    untrackedFiles,
+    changedFileCount: stagedFiles + unstagedFiles + untrackedFiles,
+    knownDetail: false,
+  }
 }
 
 const RESIDENT_LIFECYCLE_OPERATION_STATES = new Set<ResidentLifecycleOperationState>([
@@ -1774,6 +1917,36 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     snapshotLocationGenerationId && snapshotLocationGenerationId === snapshotCursorGenerationId
       ? snapshotLocationGenerationId
       : undefined
+  const snapshotCursor = outcomeCursorFromNative(threadSnapshot?.latestCursor)
+  const snapshotGeneratedAt = asString(threadSnapshot?.generatedAt)
+  const exactMaterialization = input.authoritativeMaterialization
+  const snapshotIsLive = Boolean(
+    exactMaterialization &&
+    input.connectionGeneration === exactMaterialization.connectionGeneration &&
+    activePhase === 'online' &&
+    activeHostId === exactMaterialization.hostId &&
+    asString(snapshotLocation?.hostId) === exactMaterialization.hostId &&
+    asString(snapshotThread?.threadId) === exactMaterialization.threadId &&
+    snapshotExecutionGenerationId === exactMaterialization.executionGenerationId
+  )
+  const snapshotAuthority = snapshotCursor && snapshotGeneratedAt && Number.isFinite(Date.parse(snapshotGeneratedAt))
+    ? {
+        source: snapshotIsLive ? 'live' as const : 'cached' as const,
+        generatedAt: snapshotGeneratedAt,
+        cursor: snapshotCursor,
+      }
+    : undefined
+  const latestTurnOutcome = snapshotCursor
+    && snapshotGeneratedAt
+    && Number.isFinite(Date.parse(snapshotGeneratedAt))
+    ? latestTurnOutcomeFromNative(
+        threadSnapshot?.latestTurnOutcome,
+        snapshotCursor,
+        snapshotGeneratedAt,
+        threadSnapshot?.materializedRecentBlocks,
+      )
+    : undefined
+  const gitSummary = gitAggregateFromNative(threadSnapshot?.git)
 
   const rawHosts = records(catalog?.hosts)
   const singleHost = asRecord(catalog?.host)
@@ -2501,6 +2674,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     agents,
     evidence,
     runtime,
+    ...(latestTurnOutcome ? { latestTurnOutcome } : {}),
+    ...(snapshotAuthority ? { snapshotAuthority } : {}),
+    ...(gitSummary ? { gitSummary } : {}),
     ...(localSetup ? { localSetup } : {}),
     residentLifecycleOperations,
     operations: {
@@ -2961,6 +3137,8 @@ export class NativeRendererApi implements RendererApi {
       )
         ? asString(asRecord(this.connection)?.hostId)
         : undefined,
+      connectionGeneration: this.connectionGeneration,
+      authoritativeMaterialization: this.authoritativeMaterializationProof(),
     })
     const selectedThread = this.projection.threads.find((thread) => thread.id === this.projection?.selectedThreadId)
     if (

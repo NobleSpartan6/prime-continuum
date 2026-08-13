@@ -5096,8 +5096,8 @@ describe('Prime Continuim renderer', () => {
     expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
     await user.click(inspectorToggle)
 
-    const changes = screen.getByRole('tab', { name: 'Changes' })
-    changes.focus()
+    const review = screen.getByRole('tab', { name: 'Review' })
+    review.focus()
     await user.keyboard('{ArrowRight}')
 
     expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
@@ -5154,15 +5154,15 @@ describe('Prime Continuim renderer', () => {
     const user = userEvent.setup()
     const api = createIdleResidentApi()
     const loadWorkbench = api.loadWorkbench.bind(api)
-    let changeListReads = 0
+    let evidenceListReads = 0
     api.loadWorkbench = vi.fn(async () => {
       const snapshot = await loadWorkbench()
-      const changes = snapshot.changes
-      Object.defineProperty(snapshot, 'changes', {
+      const evidence = snapshot.evidence
+      Object.defineProperty(snapshot, 'evidence', {
         configurable: true,
         get: () => {
-          changeListReads += 1
-          return changes
+          evidenceListReads += 1
+          return evidence
         },
       })
       return snapshot
@@ -5170,14 +5170,14 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
-    const initialReads = changeListReads
+    const initialReads = evidenceListReads
     expect(initialReads).toBeGreaterThan(0)
 
     await user.type(screen.getByRole('textbox', { name: 'Task brief' }), 'Keep typing responsive.')
-    expect(changeListReads).toBe(initialReads)
+    expect(evidenceListReads).toBe(initialReads)
 
     await user.click(screen.getByRole('button', { name: 'Open inspector' }))
-    expect(changeListReads).toBeGreaterThan(initialReads)
+    expect(evidenceListReads).toBeGreaterThan(initialReads)
   })
 
   it('progressively mounts large retained-subagent projections in bounded windows', async () => {
@@ -5217,9 +5217,12 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
 
     await user.click(screen.getByRole('button', { name: 'Open inspector' }))
-    const changesPanel = screen.getByRole('tabpanel', { name: 'Changes' })
-    expect(within(changesPanel).queryByRole('button')).not.toBeInTheDocument()
-    expect(within(changesPanel).queryByText('App.tsx')).not.toBeInTheDocument()
+    const reviewPanel = screen.getByRole('tabpanel', { name: 'Review' })
+    expect(within(reviewPanel).queryByRole('button')).not.toBeInTheDocument()
+    expect(within(reviewPanel).getByRole('region', { name: 'Implement the seamless remote workbench' })).toBeVisible()
+    expect(within(reviewPanel).getByText('Working')).toBeVisible()
+    expect(within(reviewPanel).getByText('6')).toBeVisible()
+    expect(within(reviewPanel).queryByText('App.tsx')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('tab', { name: 'Session' }))
     expect(within(screen.getByRole('tabpanel', { name: 'Session' })).queryByRole('button')).not.toBeInTheDocument()
@@ -5231,6 +5234,62 @@ describe('Prime Continuim renderer', () => {
     const contextPanel = screen.getByRole('tabpanel', { name: 'Context' })
     expect(within(contextPanel).getByText(/Offline · Last synchronized 18 min ago/)).toBeVisible()
     expect(within(contextPanel).queryByText('Running')).not.toBeInTheDocument()
+  })
+
+  it('reviews only an exact terminal assistant outcome and labels cached authority', async () => {
+    const user = userEvent.setup()
+    const api: RendererApi = createPreviewRendererApi()
+    const snapshot = structuredClone(previewSnapshot)
+    const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)!
+    const terminalBlock = thread.transcript.find((block) => block.id === 'block-5')!
+    thread.status = 'idle'
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session!,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+      activeToolNames: [],
+    }
+    snapshot.agents = []
+    snapshot.runtime.agentsReported = true
+    snapshot.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-review-one',
+      receiptId: 'receipt-review-one',
+      observedAt: '2026-08-07T13:49:00.000Z',
+      observedCursor: {
+        threadId: thread.id,
+        executionGenerationId: 'generation-review-one',
+        generation: 'generation-review-one',
+        sequence: 5,
+      },
+      terminalAssistant: { blockId: terminalBlock.id, stopReason: 'stop' },
+    }
+    snapshot.snapshotAuthority = {
+      source: 'cached',
+      generatedAt: '2026-08-07T13:49:01.000Z',
+      cursor: { ...snapshot.latestTurnOutcome.observedCursor },
+    }
+    snapshot.gitSummary = {
+      stagedFiles: 1,
+      unstagedFiles: 2,
+      untrackedFiles: 1,
+      changedFileCount: 4,
+      knownDetail: false,
+    }
+    api.loadWorkbench = vi.fn(async () => structuredClone(snapshot))
+    api.subscribe = vi.fn(() => () => undefined)
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+
+    const review = within(screen.getByRole('tabpanel', { name: 'Review' }))
+    expect(review.getByText('Last reported · Ready to review')).toBeVisible()
+    expect(review.getByText(terminalBlock.body)).toBeVisible()
+    expect(review.getByText('4')).toBeVisible()
+    expect(review.queryByText('Complete')).not.toBeInTheDocument()
   })
 
   it('withholds candidate evaluation until fresh exact preflight and restores focus when Escape cancels review', async () => {
@@ -5818,7 +5877,7 @@ describe('Prime Continuim renderer', () => {
     await user.click(within(palette).getByRole('option', { name: /Manage agent session/ }))
 
     const inspector = await screen.findByRole('dialog', { name: 'Thread inspector' })
-    await waitFor(() => expect(within(inspector).getByRole('tab', { name: 'Changes' })).toHaveFocus())
+    await waitFor(() => expect(within(inspector).getByRole('tab', { name: 'Review' })).toHaveFocus())
     expect(document.querySelector('.app-shell')).toHaveAttribute('data-sidebar-open', 'false')
     expect(document.querySelector('.app-shell')).toHaveAttribute('data-inspector-open', 'true')
     expect(screen.queryByRole('dialog', { name: 'Projects and threads' })).not.toBeInTheDocument()
@@ -6309,7 +6368,7 @@ describe('Prime Continuim renderer', () => {
     const inspectorToggle = screen.getByRole('button', { name: 'Open inspector' })
     await user.click(inspectorToggle)
     expect(screen.getByRole('dialog', { name: 'Thread inspector' })).toHaveAttribute('aria-modal', 'true')
-    await waitFor(() => expect(screen.getByRole('tab', { name: 'Changes' })).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Review' })).toHaveFocus())
     await user.keyboard('{Escape}')
     await waitFor(() => expect(inspectorToggle).toHaveFocus())
     expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')

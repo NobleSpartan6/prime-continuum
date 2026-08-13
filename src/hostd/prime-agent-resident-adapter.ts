@@ -2744,6 +2744,10 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
             dispatchAttemptId: request.dispatchAttemptId,
             binding: expectedBinding,
             projection,
+            terminalAssistant: Object.freeze({
+              blockId: requireTerminalAssistantBlockId(projection, request.dispatchAttemptId),
+              stopReason: projection.terminalAssistant.stopReason,
+            }),
           });
         }
       }
@@ -3635,6 +3639,24 @@ function residentProjectionProvesIdle(projection: ResidentProjectionSnapshot): b
     projection.queue.steeringCount === 0 &&
     projection.queue.followUpCount === 0
   );
+}
+
+function requireTerminalAssistantBlockId(
+  projection: ResidentProjectionSnapshot,
+  dispatchAttemptId: string,
+): string {
+  const blockId = projection.terminalAssistantBlockId;
+  if (
+    !blockId ||
+    !projection.transcript.some((block) => block.blockId === blockId && block.kind === "assistant")
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+      "Prime Agent's terminal event did not materialize an exact assistant block.",
+      { retryable: true, details: { dispatchAttemptId } },
+    );
+  }
+  return blockId;
 }
 
 function promptAdmissionStatusError(status: "cancelled" | "unsupported"): Error {

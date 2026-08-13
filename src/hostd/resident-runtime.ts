@@ -876,6 +876,11 @@ export interface ResidentPromptIdleAuthorityEvidence {
   readonly dispatchAttemptId: string;
   readonly binding: ResidentSessionBinding;
   readonly projection: ResidentProjectionSnapshot;
+  /** Present only when this exact prompt observed a new terminal assistant event. */
+  readonly terminalAssistant?: Readonly<{
+    blockId: string;
+    stopReason: "stop" | "length" | "error" | "aborted";
+  }>;
 }
 
 /**

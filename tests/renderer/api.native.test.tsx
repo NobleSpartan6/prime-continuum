@@ -576,6 +576,116 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('projects exact latest-turn evidence, snapshot freshness, and aggregate Git facts', async () => {
+    const catalog = recoveryCatalog()
+    const cachedSnapshot = recoverySnapshot(catalog.threads[0]!, 'Cached outcome materialization.')
+    cachedSnapshot.git = { branch: 'main', stagedFiles: 2, unstagedFiles: 3, untrackedFiles: 1 }
+    const observedCursor = { ...cachedSnapshot.latestCursor }
+    const terminalAssistant = { blockId: 'block-thread-one', stopReason: 'stop' }
+    Object.assign(cachedSnapshot, {
+      latestTurnOutcome: {
+        outcomeVersion: 1,
+        commandId: 'command-outcome-one',
+        receiptId: 'receipt-outcome-one',
+        observedAt: '2026-08-05T20:00:01.000Z',
+        observedCursor,
+        terminalAssistant,
+      },
+    })
+    const freshSnapshot = structuredClone(cachedSnapshot)
+    freshSnapshot.generatedAt = '2026-08-05T20:00:02.000Z'
+    let snapshotReads = 0
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: cachedSnapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => ok(catalog)),
+      requestSnapshot: vi.fn(() => {
+        snapshotReads += 1
+        return ok(freshSnapshot)
+      }),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+    const api = new NativeRendererApi(bridge)
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+
+    const cached = await api.loadWorkbench()
+    expect(cached.snapshotAuthority).toEqual({
+      source: 'cached',
+      generatedAt: cachedSnapshot.generatedAt,
+      cursor: cachedSnapshot.latestCursor,
+    })
+    expect(cached.latestTurnOutcome).toEqual({
+      outcomeVersion: 1,
+      commandId: 'command-outcome-one',
+      receiptId: 'receipt-outcome-one',
+      observedAt: '2026-08-05T20:00:01.000Z',
+      observedCursor,
+      terminalAssistant,
+    })
+    expect(cached.gitSummary).toEqual({
+      stagedFiles: 2,
+      unstagedFiles: 3,
+      untrackedFiles: 1,
+      changedFileCount: 6,
+      knownDetail: false,
+    })
+    expect(cached.gitSummary).not.toHaveProperty('files')
+
+    await vi.waitFor(() => {
+      expect(snapshotReads).toBe(1)
+      expect(published.at(-1)?.snapshotAuthority?.source).toBe('live')
+    })
+    expect(published.at(-1)?.snapshotAuthority).toEqual({
+      source: 'live',
+      generatedAt: freshSnapshot.generatedAt,
+      cursor: freshSnapshot.latestCursor,
+    })
+    unsubscribe()
+  })
+
+  it('fails closed on malformed or foreign latest-turn and Git evidence', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0]!, 'Only exact evidence should project.')
+    Object.assign(snapshot, {
+      latestTurnOutcome: {
+        outcomeVersion: 1,
+        commandId: 'command-foreign',
+        receiptId: 'receipt-foreign',
+        observedAt: '2026-08-05T20:00:02.000Z',
+        observedCursor: {
+          ...snapshot.latestCursor,
+          executionGenerationId: 'foreign-generation',
+        },
+      },
+      git: { branch: 'main', stagedFiles: -1, unstagedFiles: 0, untrackedFiles: 0 },
+    })
+    const bridge = {
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+        outbox: [],
+        connection: onlineConnection(),
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => new Promise<never>(() => undefined)),
+      requestSnapshot: vi.fn(() => new Promise<never>(() => undefined)),
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    }
+
+    const view = await new NativeRendererApi(bridge).loadWorkbench()
+    expect(view.snapshotAuthority?.source).toBe('cached')
+    expect(view.latestTurnOutcome).toBeUndefined()
+    expect(view.gitSummary).toBeUndefined()
+  })
+
   it('cleans historical RLM protocol blocks before they reach the transcript', async () => {
     const catalog = recoveryCatalog()
     const snapshot = recoverySnapshot(

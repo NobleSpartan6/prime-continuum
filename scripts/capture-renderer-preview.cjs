@@ -1117,8 +1117,8 @@ async function capture(target, rendererOrigin) {
           responsiveInspectorRect.width > 0 &&
           responsiveInspectorRect.left >= 0 &&
           responsiveInspectorRect.right <= window.innerWidth &&
-          responsiveInspector?.textContent?.includes('Changes') &&
-          responsiveInspector.textContent.includes('Working tree')
+          responsiveInspector?.textContent?.includes('Review') &&
+          responsiveInspector.textContent.includes('Outcome')
         ),
       }
     })()`)
