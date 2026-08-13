@@ -279,9 +279,14 @@ describe("verified resident prompt idle reconciliation", () => {
     const restartedStore = new HostStore(base.directory);
     await restartedStore.initialize();
     const completedIdle = projection(base.binding, "proof-restart-cycle", 2);
+    let markRecoveredReconciliationStarted!: () => void;
+    const recoveredReconciliationStarted = new Promise<void>((resolve) => {
+      markRecoveredReconciliationStarted = resolve;
+    });
     const recoveredAdapter = gatewayFixture(
       restartedStore,
       async (lease, options) => {
+        markRecoveredReconciliationStarted();
         await options.publishProjection(lease.binding, completedIdle);
         return evidence(lease, completedIdle);
       },
@@ -293,7 +298,13 @@ describe("verified resident prompt idle reconciliation", () => {
       recoveredAdapter.gateway.capabilityReady(),
       recoveredAdapter.gateway.capabilityReady(),
     ]);
-    await vi.waitFor(async () => expect(await recoveredAdapter.gateway.capabilityReady()).toBe(true));
+    // capabilityReady() is intentionally nonblocking: concurrent polls share
+    // one background attach/projection job and are not an initialization
+    // barrier. Reconciliation starts only after that exact binding is
+    // promoted, so this causal edge is deterministic even under a loaded
+    // filesystem worker.
+    await recoveredReconciliationStarted;
+    await expect(recoveredAdapter.gateway.capabilityReady()).resolves.toBe(true);
     await vi.waitFor(async () => expect(
       (await restartedStore.reconcileCommands([command])).receipts[0]?.status,
     ).toBe("completed"));
