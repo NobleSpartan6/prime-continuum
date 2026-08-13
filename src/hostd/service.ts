@@ -5,6 +5,7 @@ import {
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   PROTOCOL_VERSION,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RESIDENT_EXTENSION_UI_CAPABILITY,
@@ -540,6 +541,12 @@ export class HostService {
           typeof this.gateway.listResidentExtensionUiRequests === "function"
           ? [RESIDENT_EXTENSION_UI_CAPABILITY]
           : [];
+        // The exact verified v0.7.2 resident runtime reports the allowed list
+        // dynamically. This feature bit keeps older command-v2 hosts from
+        // accepting a command they do not understand.
+        const thinkingLevelCapabilities = executionCapabilities.length > 0
+          ? [PRIME_AGENT_THINKING_LEVELS_CAPABILITY]
+          : [];
         let residentLifecycleReady = false;
         if (
           (context.transport === "trusted_user" || context.transport === "ssh_bridge") &&
@@ -632,6 +639,7 @@ export class HostService {
             ? [
                 ...HOST_CAPABILITIES,
                 ...executionCapabilities,
+                ...thinkingLevelCapabilities,
                 ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
@@ -644,6 +652,7 @@ export class HostService {
             : [
                 ...HOST_CAPABILITIES,
                 ...executionCapabilities,
+                ...thinkingLevelCapabilities,
                 ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
@@ -917,6 +926,8 @@ export class HostService {
           liveCheckFailure = {
             code: command.command.kind === "model.select"
               ? "MODEL_SELECTION_LIVE_CHECK_FAILED"
+              : command.command.kind === "thinking.select"
+                ? "THINKING_SELECTION_LIVE_CHECK_FAILED"
               : "RESIDENT_SESSION_LIVE_CHECK_FAILED",
             message: "The resident Prime Agent session could not be verified as live",
             retryable: true,
@@ -926,6 +937,7 @@ export class HostService {
           command.command.kind !== "prompt" &&
           command.command.kind !== "abort" &&
           command.command.kind !== "model.select" &&
+          command.command.kind !== "thinking.select" &&
           command.command.kind !== "extension_ui.respond"
           ? {
               code: "RESIDENT_COMMAND_UNSUPPORTED",
@@ -992,7 +1004,10 @@ export class HostService {
         );
         if (admission.duplicate || admission.receipt.status !== "admitted" || !live) return admission.receipt;
 
-        if (command.command.kind === "model.select") {
+        if (command.command.kind === "model.select" || command.command.kind === "thinking.select") {
+          const selectingThinking = command.command.kind === "thinking.select";
+          const label = selectingThinking ? "Reasoning-level selection" : "Model selection";
+          const codePrefix = selectingThinking ? "THINKING_SELECTION" : "MODEL_SELECTION";
           let binding: Awaited<ReturnType<HostStore["beginModelSelectionDispatch"]>>;
           try {
             binding = await this.store.beginModelSelectionDispatch(command);
@@ -1000,10 +1015,10 @@ export class HostService {
             const storeError = error instanceof HostStoreError ? error : undefined;
             return this.store.finalizeModelSelectionDispatch(command, {
               status: "failed",
-              message: storeError?.message.slice(0, 1_024) ?? "Model selection lost resident authority before dispatch",
+              message: storeError?.message.slice(0, 1_024) ?? `${label} lost resident authority before dispatch`,
               error: {
-                code: storeError?.code ?? "MODEL_SELECTION_DISPATCH_REJECTED",
-                message: storeError?.message.slice(0, 2_048) ?? "Model selection lost resident authority before dispatch",
+                code: storeError?.code ?? `${codePrefix}_DISPATCH_REJECTED`,
+                message: storeError?.message.slice(0, 2_048) ?? `${label} lost resident authority before dispatch`,
                 retryable: storeError?.retryable ?? true,
               },
             });
@@ -1014,27 +1029,31 @@ export class HostService {
             if (gatewayAdmission.disposition !== "handled") {
               return await this.store.finalizeModelSelectionDispatch(command, {
                 status: "uncertain",
-                message: "Prime Agent returned an invalid model-selection acknowledgement",
+                message: `Prime Agent returned an invalid ${selectingThinking ? "reasoning-level" : "model-selection"} acknowledgement`,
                 error: {
-                  code: "MODEL_SELECTION_ACK_INVALID",
-                  message: "The model mutation may have run, but no authoritative completed acknowledgement was received",
+                  code: `${codePrefix}_ACK_INVALID`,
+                  message: `The ${selectingThinking ? "reasoning" : "model"} mutation may have run, but no authoritative completed acknowledgement was received`,
                   retryable: false,
                 },
               });
             }
             return await this.store.finalizeModelSelectionDispatch(command, {
               status: "completed",
-              message: gatewayAdmission.message?.slice(0, 1_024) ?? "Prime Agent selected and verified the model",
+              message: gatewayAdmission.message?.slice(0, 1_024) ??
+                (selectingThinking
+                  ? "Prime Agent selected and verified the reasoning level"
+                  : "Prime Agent selected and verified the model"),
             });
           } catch (error) {
             const gatewayError = error instanceof GatewayError ? error : undefined;
             const uncertain = gatewayError?.uncertain ?? true;
-            const message = gatewayError?.message.slice(0, 1_024) ?? "Prime Agent model selection could not be reconciled";
+            const message = gatewayError?.message.slice(0, 1_024) ??
+              `Prime Agent ${selectingThinking ? "reasoning-level" : "model"} selection could not be reconciled`;
             return this.store.finalizeModelSelectionDispatch(command, {
               status: uncertain ? "uncertain" : "failed",
               message,
               error: {
-                code: gatewayError?.code ?? "MODEL_SELECTION_OUTCOME_UNKNOWN",
+                code: gatewayError?.code ?? `${codePrefix}_OUTCOME_UNKNOWN`,
                 message,
                 retryable: uncertain ? false : (gatewayError?.retryable ?? true),
               },
@@ -1640,6 +1659,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
           return "thread.abort";
         case "model.select":
           return "model.select";
+        case "thinking.select":
+          return "thinking.select";
         case "approval.resolve":
           return "approval.resolve";
         case "extension_ui.respond":

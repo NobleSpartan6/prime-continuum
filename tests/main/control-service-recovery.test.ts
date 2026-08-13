@@ -809,6 +809,48 @@ describe('DesktopControlService recovery', () => {
     await service.disconnect()
   })
 
+  it('feature-gates reasoning selection and submits only the exact reported-host command', async () => {
+    const directory = await createUserData({})
+    const command: ClientCommand = {
+      ...followUp('device-a', 'thinking-select'),
+      delivery: 'live_only',
+      kind: 'thinking.select',
+      payload: { level: 'high' },
+    }
+    const oldHost = new TestConnection((method) => {
+      if (method === 'health.get') return health('host-a')
+      throw new Error(`An older host must not receive ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(oldHost)
+    const service = new DesktopControlService({ app: testApp(directory) })
+    await service.connect({ kind: 'local' })
+    await expect(service.submitCommand(command)).rejects.toMatchObject({
+      code: 'command.thinking_capability_unavailable',
+    })
+    expect((await service.bootstrap()).outbox).toEqual([])
+    await service.disconnect()
+
+    const currentHost = new TestConnection((method, params) => {
+      if (method === 'health.get') {
+        return {
+          ...health('host-a'),
+          capabilities: ['prime_agent_commands_v2', 'prime_agent_thinking_levels_v1'],
+        }
+      }
+      if (method === 'command.submit') {
+        expect(params).toMatchObject({ command: { command: { kind: 'thinking.select', level: 'high' } } })
+        return commandReceipt(command)
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValueOnce(currentHost)
+    await service.connect({ kind: 'local' })
+    await expect(service.submitCommand(command)).resolves.toMatchObject({ status: 'completed' })
+    expect(currentHost.requests.find(({ method }) => method === 'command.submit')?.options).toEqual({ priority: 'normal' })
+    expect((await service.bootstrap()).outbox).toEqual([])
+    await service.disconnect()
+  })
+
   it('never replays an unknown live-only dialog response after reconnect', async () => {
     const command = extensionUiResponse('device-a', 'extension-ui-unknown')
     const directory = await createUserData({
@@ -2731,11 +2773,17 @@ describe('DesktopControlService recovery', () => {
     await restarted.disconnect()
   })
 
-  it('adapts model selection, approval, and cancellation with one stable issue time and exact generation', async () => {
+  it('adapts resident preferences, approval, and cancellation with one stable issue time and exact generation', async () => {
     const directory = await createUserData({})
     const submitted: Array<Record<string, unknown>> = []
     const connection = new TestConnection((method, params) => {
-      if (method === 'health.get') return health('host-a')
+      if (method === 'health.get') {
+        const current = health('host-a')
+        return {
+          ...current,
+          capabilities: [...current.capabilities, 'prime_agent_thinking_levels_v1'],
+        }
+      }
       if (method === 'command.submit') {
         const envelope = (params as { command: Record<string, unknown> }).command
         submitted.push(envelope)
@@ -2752,8 +2800,15 @@ describe('DesktopControlService recovery', () => {
       kind: 'model.select',
       payload: { providerId: 'openai-codex', modelId: 'gpt-5.3-codex' },
     }
+    const thinkingCommand: ClientCommand = {
+      ...followUp('device-a', 'select-thinking'),
+      delivery: 'live_only',
+      kind: 'thinking.select',
+      payload: { level: 'high' },
+    }
 
     await service.submitCommand(modelCommand)
+    await service.submitCommand(thinkingCommand)
     await service.approve({
       deviceId: 'device-a',
       commandId: 'approve-one',
@@ -2778,6 +2833,11 @@ describe('DesktopControlService recovery', () => {
         issuedAt: timestamp,
         expectedExecutionGenerationId: 'execution-1',
         command: { kind: 'model.select', providerId: 'openai-codex', modelId: 'gpt-5.3-codex' },
+      }),
+      expect.objectContaining({
+        issuedAt: timestamp,
+        expectedExecutionGenerationId: 'execution-1',
+        command: { kind: 'thinking.select', level: 'high' },
       }),
       expect.objectContaining({
         issuedAt: timestamp,

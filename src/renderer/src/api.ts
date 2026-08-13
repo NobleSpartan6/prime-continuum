@@ -17,6 +17,7 @@ import {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   RESIDENT_EXTENSION_UI_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
@@ -231,6 +232,7 @@ export interface RuntimeSessionSummary {
   sessionName?: string
   model?: string
   thinkingLevel?: string
+  availableThinkingLevels?: string[]
   serviceTier?: string
   isStreaming: boolean
   isCompacting: boolean
@@ -344,6 +346,8 @@ export interface WorkbenchSnapshot {
     modelCatalog?: boolean
     /** Eligibility only; the native action revalidates the exact idle resident authority. */
     selectResidentModel?: boolean
+    /** Eligibility only; the native action revalidates the exact idle resident authority and reported level. */
+    selectResidentThinkingLevel?: boolean
     /** Eligibility only; native OAuth revalidates the exact trusted local host connection. */
     runtimeOAuth?: boolean
     /** Capability-derived probe availability only; never an action authorization. */
@@ -573,10 +577,17 @@ export interface ResidentModelSelectionRequest {
   modelId: string
 }
 
+export interface ResidentThinkingLevelSelectionRequest {
+  threadId: string
+  level: string
+}
+
 export type ResidentModelSelectionResult =
   | { state: 'completed'; message: string; projected: boolean }
   | { state: 'rejected'; message: string; retryable: boolean }
   | { state: 'uncertain'; message: string; retryable: false }
+
+export type ResidentThinkingLevelSelectionResult = ResidentModelSelectionResult
 
 export type ResidentExtensionUiResponseResult =
   | { state: 'completed'; message: string }
@@ -616,6 +627,9 @@ export interface RendererApi {
   activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult>
+  selectResidentThinkingLevel?(
+    request: ResidentThinkingLevelSelectionRequest,
+  ): Promise<ResidentThinkingLevelSelectionResult>
   respondToResidentExtensionUi?(
     request: ResidentExtensionUiRequest,
     response: ExtensionUiDialogResponse,
@@ -2213,6 +2227,18 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       const rawContext = asRecord(rawSession.context)
       const usedTokens = asNumber(rawContext?.usedTokens)
       const resourceInventory = parseRuntimeResourceInventory(rawSession.resourceInventory)
+      const rawAvailableThinkingLevels = rawSession.availableThinkingLevels
+      const availableThinkingLevels = Array.isArray(rawAvailableThinkingLevels) &&
+        rawAvailableThinkingLevels.length <= 128 &&
+        rawAvailableThinkingLevels.every((level): level is string =>
+          typeof level === 'string' &&
+          level.length >= 1 &&
+          level.length <= 64 &&
+          !/[\0\r\n]/.test(level),
+        ) &&
+        new Set(rawAvailableThinkingLevels).size === rawAvailableThinkingLevels.length
+          ? [...rawAvailableThinkingLevels]
+          : undefined
       runtime.session = {
         residency: residency === 'resident' || residency === 'client_owned' ? residency : 'unknown',
         ...(asString(rawSession.appVersion) ? { appVersion: asString(rawSession.appVersion) } : {}),
@@ -2221,6 +2247,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         ...(asString(rawSession.sessionName) ? { sessionName: asString(rawSession.sessionName) } : {}),
         ...(asString(rawSession.model) ? { model: asString(rawSession.model) } : {}),
         ...(asString(rawSession.thinkingLevel) ? { thinkingLevel: asString(rawSession.thinkingLevel) } : {}),
+        ...(availableThinkingLevels ? { availableThinkingLevels } : {}),
         ...(asString(rawSession.serviceTier) ? { serviceTier: asString(rawSession.serviceTier) } : {}),
         isStreaming: asBoolean(rawSession.isStreaming) ?? false,
         isCompacting: asBoolean(rawSession.isCompacting) ?? false,
@@ -2701,6 +2728,11 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     activePhase === 'online' &&
     advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY),
   )
+  const thinkingLevelSelectionReady = Boolean(
+    residentTurnStartReady &&
+    advertisedCapabilities.includes(PRIME_AGENT_THINKING_LEVELS_CAPABILITY) &&
+    (runtime.session?.availableThinkingLevels?.length ?? 0) > 0,
+  )
   const runtimeOAuthReady = Boolean(
     input.mutationAuthorityReady !== false &&
     activeAccountHostReady &&
@@ -2743,6 +2775,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
             ...(residentTurnStartReady ? { selectResidentModel: true } : {}),
           }
         : {}),
+      ...(thinkingLevelSelectionReady ? { selectResidentThinkingLevel: true } : {}),
       ...(runtimeOAuthReady ? { runtimeOAuth: true } : {}),
       ...(selectedHostHasAuthority &&
       selectedSnapshotIsMaterialized &&
@@ -2855,7 +2888,7 @@ interface ComposerActionFence {
   sequence: number
 }
 
-interface ResidentModelSelectionAuthority {
+interface ResidentPreferenceSelectionAuthority {
   localThreadId: string
   remoteThreadId: string
   expectedHostId: string
@@ -2875,7 +2908,8 @@ interface ResidentExtensionUiResponseAuthority {
   connectionGeneration: number
 }
 
-interface ActiveResidentModelSelection {
+interface ActiveResidentPreferenceSelection {
+  kind: 'model' | 'thinking'
   bindingKey: string
   result: Promise<ResidentModelSelectionResult>
 }
@@ -3062,7 +3096,7 @@ export class NativeRendererApi implements RendererApi {
   private composerActionSequence = 0
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
-  private activeResidentModelSelection?: ActiveResidentModelSelection
+  private activeResidentPreferenceSelection?: ActiveResidentPreferenceSelection
   private readonly residentExtensionUiResponseAttempts = new Map<string, ResidentExtensionUiResponseAttempt>()
   private activeRuntimeOAuth?: ActiveRuntimeOAuth
   private mutationAuthorityReadyHostId?: string
@@ -4803,13 +4837,18 @@ export class NativeRendererApi implements RendererApi {
 
   selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult> {
     const frozenRequest = { ...request }
-    const active = this.activeResidentModelSelection
+    const active = this.activeResidentPreferenceSelection
     if (active) {
-      if (active.bindingKey === this.currentResidentModelSelectionBindingKey(frozenRequest)) return active.result
+      if (
+        active.kind === 'model' &&
+        active.bindingKey === this.currentResidentModelSelectionBindingKey(frozenRequest)
+      ) return active.result
       return Promise.resolve({
         state: 'rejected',
         retryable: true,
-        message: 'Another resident model change is already being verified. Try again after it finishes.',
+        message: active.kind === 'model'
+          ? 'Another resident model change is already being verified. Try again after it finishes.'
+          : 'Another resident session setting is already being verified. Try again after it finishes.',
       })
     }
 
@@ -4822,13 +4861,149 @@ export class NativeRendererApi implements RendererApi {
       frozenRequest.modelId,
     ])
     const result = this.performResidentModelSelection(frozenRequest, authority)
-    const tracked: ActiveResidentModelSelection = { bindingKey, result }
-    this.activeResidentModelSelection = tracked
+    const tracked: ActiveResidentPreferenceSelection = { kind: 'model', bindingKey, result }
+    this.activeResidentPreferenceSelection = tracked
     const clear = (): void => {
-      if (this.activeResidentModelSelection === tracked) this.activeResidentModelSelection = undefined
+      if (this.activeResidentPreferenceSelection === tracked) this.activeResidentPreferenceSelection = undefined
     }
     void result.then(clear, clear)
     return result
+  }
+
+  selectResidentThinkingLevel(
+    request: ResidentThinkingLevelSelectionRequest,
+  ): Promise<ResidentThinkingLevelSelectionResult> {
+    const frozenRequest = { ...request }
+    const active = this.activeResidentPreferenceSelection
+    if (active) {
+      if (
+        active.kind === 'thinking' &&
+        active.bindingKey === this.currentResidentThinkingLevelSelectionBindingKey(frozenRequest)
+      ) return active.result
+      return Promise.resolve({
+        state: 'rejected',
+        retryable: true,
+        message: 'Another resident session setting is already being verified. Try again after it finishes.',
+      })
+    }
+
+    const authority = this.captureResidentThinkingLevelSelectionAuthority(frozenRequest)
+    if (this.projection?.runtime.session?.thinkingLevel === frozenRequest.level) {
+      return Promise.resolve({
+        state: 'completed',
+        projected: true,
+        message: `Reasoning is already set to ${frozenRequest.level}.`,
+      })
+    }
+    const bindingKey = canonicalRendererJson([
+      authority.expectedHostId,
+      authority.remoteThreadId,
+      authority.expectedExecutionGenerationId,
+      frozenRequest.level,
+    ])
+    const result = this.performResidentThinkingLevelSelection(frozenRequest, authority)
+    const tracked: ActiveResidentPreferenceSelection = { kind: 'thinking', bindingKey, result }
+    this.activeResidentPreferenceSelection = tracked
+    const clear = (): void => {
+      if (this.activeResidentPreferenceSelection === tracked) this.activeResidentPreferenceSelection = undefined
+    }
+    void result.then(clear, clear)
+    return result
+  }
+
+  private currentResidentThinkingLevelSelectionBindingKey(
+    request: ResidentThinkingLevelSelectionRequest,
+  ): string | undefined {
+    const thread = this.projection?.threads.find((candidate) => candidate.id === request.threadId)
+    const expectedHostId = thread?.hostId
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    const expectedExecutionGenerationId = thread?.executionGenerationId
+    if (!expectedHostId || !remoteThreadId || !expectedExecutionGenerationId) return undefined
+    return canonicalRendererJson([
+      expectedHostId,
+      remoteThreadId,
+      expectedExecutionGenerationId,
+      request.level,
+    ])
+  }
+
+  private captureResidentThinkingLevelSelectionAuthority(
+    request: ResidentThinkingLevelSelectionRequest,
+  ): ResidentPreferenceSelectionAuthority {
+    if (
+      request.level.length < 1 ||
+      request.level.length > 64 ||
+      /[\0\r\n]/.test(request.level)
+    ) throw new Error('Choose a reasoning level reported by this Prime Agent session.')
+
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === request.threadId)
+    const connection = asRecord(this.connection)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    const expectedHostId = thread?.hostId
+    const expectedExecutionGenerationId = thread?.executionGenerationId
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    if (
+      !this.workbenchLoaded ||
+      !projection ||
+      projection.selectedThreadId !== request.threadId ||
+      projection.operations.startResidentTurn !== true ||
+      projection.operations.selectResidentThinkingLevel !== true ||
+      !projection.runtime.session?.availableThinkingLevels?.includes(request.level) ||
+      !thread ||
+      !expectedHostId ||
+      !expectedExecutionGenerationId ||
+      !remoteThreadId ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== expectedHostId ||
+      this.mutationAuthorityReadyHostId !== expectedHostId ||
+      !capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) ||
+      !capabilities.includes(PRIME_AGENT_THINKING_LEVELS_CAPABILITY) ||
+      snapshotHostId(this.threadSnapshot) !== expectedHostId ||
+      snapshotThreadId(this.threadSnapshot) !== remoteThreadId ||
+      snapshotExecutionGenerationId(this.threadSnapshot) !== expectedExecutionGenerationId
+    ) throw new StaleHostAuthorityError()
+
+    return {
+      localThreadId: request.threadId,
+      remoteThreadId,
+      expectedHostId,
+      expectedExecutionGenerationId,
+      connectionGeneration: this.connectionGeneration,
+    }
+  }
+
+  private residentThinkingLevelSelectionAuthorityIsCurrent(
+    authority: ResidentPreferenceSelectionAuthority,
+    level: string,
+  ): boolean {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === authority.localThreadId)
+    const connection = asRecord(this.connection)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    return Boolean(
+      projection &&
+      authority.connectionGeneration === this.connectionGeneration &&
+      projection.selectedThreadId === authority.localThreadId &&
+      projection.operations.startResidentTurn === true &&
+      projection.operations.selectResidentThinkingLevel === true &&
+      projection.runtime.session?.availableThinkingLevels?.includes(level) &&
+      thread?.hostId === authority.expectedHostId &&
+      protocolThreadId(thread) === authority.remoteThreadId &&
+      thread.executionGenerationId === authority.expectedExecutionGenerationId &&
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.hostId) === authority.expectedHostId &&
+      this.mutationAuthorityReadyHostId === authority.expectedHostId &&
+      capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+      capabilities.includes(PRIME_AGENT_THINKING_LEVELS_CAPABILITY) &&
+      snapshotHostId(this.threadSnapshot) === authority.expectedHostId &&
+      snapshotThreadId(this.threadSnapshot) === authority.remoteThreadId &&
+      snapshotExecutionGenerationId(this.threadSnapshot) === authority.expectedExecutionGenerationId
+    )
   }
 
   private currentResidentModelSelectionBindingKey(request: ResidentModelSelectionRequest): string | undefined {
@@ -4848,7 +5023,7 @@ export class NativeRendererApi implements RendererApi {
 
   private captureResidentModelSelectionAuthority(
     request: ResidentModelSelectionRequest,
-  ): ResidentModelSelectionAuthority {
+  ): ResidentPreferenceSelectionAuthority {
     if (
       request.providerId.length < 1 ||
       request.providerId.length > 128 ||
@@ -4896,7 +5071,7 @@ export class NativeRendererApi implements RendererApi {
     }
   }
 
-  private residentModelSelectionAuthorityIsCurrent(authority: ResidentModelSelectionAuthority): boolean {
+  private residentModelSelectionAuthorityIsCurrent(authority: ResidentPreferenceSelectionAuthority): boolean {
     const projection = this.projection
     const thread = projection?.threads.find((candidate) => candidate.id === authority.localThreadId)
     const connection = asRecord(this.connection)
@@ -4923,9 +5098,124 @@ export class NativeRendererApi implements RendererApi {
     )
   }
 
+  private async performResidentThinkingLevelSelection(
+    request: ResidentThinkingLevelSelectionRequest,
+    authority: ResidentPreferenceSelectionAuthority,
+  ): Promise<ResidentThinkingLevelSelectionResult> {
+    const commandId = createStableId('command')
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId: authority.expectedHostId,
+      threadId: authority.remoteThreadId,
+      kind: 'thinking.select',
+      payload: { level: request.level },
+      delivery: 'live_only',
+      expectedExecutionGenerationId: authority.expectedExecutionGenerationId,
+      issuedAt: this.nextComposerIssuedAt(authority.expectedHostId, authority.remoteThreadId),
+    }
+
+    let receipt: UnknownRecord | undefined
+    try {
+      receipt = asRecord(await this.call<unknown>('submitCommand', clientCommand))
+    } catch (error) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: error instanceof Error
+          ? `${error.message} Prime Continuim will not replay this reasoning change without terminal proof.`
+          : 'Reasoning-change outcome unknown. Prime Continuim will not replay it without terminal proof.',
+      }
+    }
+
+    if (
+      !receipt ||
+      asString(receipt.deviceId) !== this.deviceId ||
+      asString(receipt.commandId) !== commandId ||
+      asString(receipt.hostId) !== authority.expectedHostId ||
+      asString(receipt.threadId) !== authority.remoteThreadId ||
+      asString(receipt.executionGenerationId) !== authority.expectedExecutionGenerationId
+    ) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'The host returned a receipt for another command authority. Prime Continuim will not replay this reasoning change.',
+      }
+    }
+
+    const status = asString(receipt.status)
+    const error = asRecord(receipt.error)
+    const detail = asString(receipt.detail) ?? asString(receipt.message) ?? asString(error?.message)
+    if (status === 'completed') {
+      let projected = false
+      if (this.residentThinkingLevelSelectionAuthorityIsCurrent(authority, request.level)) {
+        try {
+          projected = await this.refreshResidentThinkingLevelSelectionProjection(authority, request)
+        } catch {
+          projected = false
+        }
+      }
+      return {
+        state: 'completed',
+        projected,
+        message: projected
+          ? detail ?? 'Prime Agent selected and verified this reasoning level.'
+          : 'Prime Agent completed this reasoning change, but the current thread display has not refreshed yet.',
+      }
+    }
+    if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
+      return {
+        state: 'rejected',
+        retryable: asBoolean(error?.retryable) ?? false,
+        message: detail ?? 'Prime Agent rejected this reasoning change before completion.',
+      }
+    }
+    return {
+      state: 'uncertain',
+      retryable: false,
+      message: detail
+        ? `${detail} Prime Continuim will not replay this reasoning change without terminal proof.`
+        : 'Reasoning-change outcome unknown. Prime Continuim will not replay it without terminal proof.',
+    }
+  }
+
+  private async refreshResidentThinkingLevelSelectionProjection(
+    authority: ResidentPreferenceSelectionAuthority,
+    request: ResidentThinkingLevelSelectionRequest,
+  ): Promise<boolean> {
+    let snapshot: unknown
+    try {
+      snapshot = await this.call<unknown>('requestSnapshot', { threadId: authority.remoteThreadId })
+    } catch {
+      if (!this.residentThinkingLevelSelectionAuthorityIsCurrent(authority, request.level)) {
+        throw new StaleHostAuthorityError()
+      }
+      return false
+    }
+    if (!this.residentThinkingLevelSelectionAuthorityIsCurrent(authority, request.level)) {
+      throw new StaleHostAuthorityError()
+    }
+    const runtime = asRecord(asRecord(snapshot)?.runtime)
+    if (
+      snapshotHostId(snapshot) !== authority.expectedHostId ||
+      snapshotThreadId(snapshot) !== authority.remoteThreadId ||
+      snapshotExecutionGenerationId(snapshot) !== authority.expectedExecutionGenerationId ||
+      asString(runtime?.thinkingLevel) !== request.level
+    ) return false
+
+    if (this.replaceSnapshotEntry(authority.expectedHostId, snapshot)) {
+      this.threadSnapshot = snapshot
+      this.publish()
+    }
+    if (!this.residentThinkingLevelSelectionAuthorityIsCurrent(authority, request.level)) {
+      throw new StaleHostAuthorityError()
+    }
+    return this.projection?.runtime.session?.thinkingLevel === request.level
+  }
+
   private async performResidentModelSelection(
     request: ResidentModelSelectionRequest,
-    authority: ResidentModelSelectionAuthority,
+    authority: ResidentPreferenceSelectionAuthority,
   ): Promise<ResidentModelSelectionResult> {
     const commandId = createStableId('command')
     const clientCommand = {
@@ -5006,7 +5296,7 @@ export class NativeRendererApi implements RendererApi {
   }
 
   private async refreshResidentModelSelectionProjection(
-    authority: ResidentModelSelectionAuthority,
+    authority: ResidentPreferenceSelectionAuthority,
     request: ResidentModelSelectionRequest,
   ): Promise<boolean> {
     let snapshot: unknown

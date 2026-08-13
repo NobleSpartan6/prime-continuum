@@ -14,6 +14,7 @@ import {
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   RESIDENT_EXTENSION_UI_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RESIDENT_LIFECYCLE_CAPABILITY,
@@ -2737,6 +2738,16 @@ export class DesktopControlService extends EventEmitter {
         'command.extension_ui_capability_unavailable',
         'This host does not support native Prime Agent dialogs. Refresh after updating the host.',
         { retryable: true, details: { hostId, capability: RESIDENT_EXTENSION_UI_CAPABILITY } },
+      )
+    }
+    if (
+      command.kind === 'thinking.select' &&
+      !this.authorityCapabilities.includes(PRIME_AGENT_THINKING_LEVELS_CAPABILITY)
+    ) {
+      throw new ControlError(
+        'command.thinking_capability_unavailable',
+        'This host does not support verified reasoning-level changes. Refresh after updating the host.',
+        { retryable: true, details: { hostId, capability: PRIME_AGENT_THINKING_LEVELS_CAPABILITY } },
       )
     }
 
@@ -6652,6 +6663,17 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
       providerId: payload.providerId,
       modelId: payload.modelId,
     }
+  } else if (normalizedKind === 'thinking.select') {
+    if (typeof payload.level !== 'string') {
+      throw new ControlError(
+        'command.thinking_level_required',
+        'A session-reported reasoning level is required.',
+      )
+    }
+    command = {
+      kind: 'thinking.select',
+      level: payload.level,
+    }
   } else if (normalizedKind === 'extension_ui.respond') {
     const requestId = payload.requestId
     const requestDigest = payload.requestDigest
@@ -7054,6 +7076,15 @@ function observationFromHealth(value: unknown): HealthObservation {
     throw new ControlError(
       'protocol.runtime_command_capability_mismatch',
       'The host advertised command execution before its reported runtime was ready.',
+    )
+  }
+  if (
+    capabilities.includes(PRIME_AGENT_THINKING_LEVELS_CAPABILITY) &&
+    !capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY)
+  ) {
+    throw new ControlError(
+      'protocol.thinking_capability_mismatch',
+      'The host advertised reasoning-level changes without verified command execution.',
     )
   }
   const runtimeReadiness: HostRuntimeReadiness = runtimeIntegrity

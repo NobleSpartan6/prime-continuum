@@ -149,36 +149,52 @@ function readOwnerRecordSync(path) {
   }
 }
 
-async function readEvidence(path, validator) {
-  let entry;
-  try {
-    entry = await lstat(path);
-  } catch (error) {
-    if (error?.code === "ENOENT") return Object.freeze({ status: "missing" });
-    return Object.freeze({ status: "malformed" });
+async function readEvidence(path, validator, options = {}) {
+  const inspectPath = options.lstat ?? lstat;
+  const openPath = options.open ?? open;
+  // A durable publication replaces the journal with rename(2). If that exact
+  // replacement lands between lstat and open, the two safe regular files have
+  // different identities. Re-read the path a bounded number of times instead
+  // of misclassifying a legitimate writer as corruption.
+  const maxReplacementRetries = options.maxReplacementRetries ?? 2;
+  for (let replacementRetry = 0; replacementRetry <= maxReplacementRetries; replacementRetry += 1) {
+    let entry;
+    try {
+      entry = await inspectPath(path);
+    } catch (error) {
+      if (error?.code === "ENOENT" && replacementRetry === 0) {
+        return Object.freeze({ status: "missing" });
+      }
+      return Object.freeze({ status: "malformed" });
+    }
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1 || entry.size < 2 || entry.size > MAX_EVIDENCE_BYTES) {
+      return Object.freeze({ status: "malformed" });
+    }
+    let handle;
+    try {
+      handle = await openPath(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      const after = await handle.stat();
+      if (!after.isFile() || after.nlink !== 1 || after.size < 2 || after.size > MAX_EVIDENCE_BYTES) {
+        return Object.freeze({ status: "malformed" });
+      }
+      if (after.dev !== entry.dev || after.ino !== entry.ino) {
+        if (replacementRetry < maxReplacementRetries) continue;
+        return Object.freeze({ status: "malformed" });
+      }
+      if (after.size !== entry.size) return Object.freeze({ status: "malformed" });
+      const bytes = await handle.readFile();
+      if (bytes.byteLength !== after.size) return Object.freeze({ status: "malformed" });
+      const value = JSON.parse(bytes.toString("utf8"));
+      return validator(value)
+        ? Object.freeze({ status: "valid", record: Object.freeze(value) })
+        : Object.freeze({ status: "malformed" });
+    } catch {
+      return Object.freeze({ status: "malformed" });
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   }
-  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1 || entry.size < 2 || entry.size > MAX_EVIDENCE_BYTES) {
-    return Object.freeze({ status: "malformed" });
-  }
-  let handle;
-  try {
-    handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-    const after = await handle.stat();
-    if (
-      !after.isFile() || after.nlink !== 1 || after.dev !== entry.dev || after.ino !== entry.ino ||
-      after.size !== entry.size || after.size > MAX_EVIDENCE_BYTES
-    ) return Object.freeze({ status: "malformed" });
-    const bytes = await handle.readFile();
-    if (bytes.byteLength !== after.size) return Object.freeze({ status: "malformed" });
-    const value = JSON.parse(bytes.toString("utf8"));
-    return validator(value)
-      ? Object.freeze({ status: "valid", record: Object.freeze(value) })
-      : Object.freeze({ status: "malformed" });
-  } catch {
-    return Object.freeze({ status: "malformed" });
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
+  return Object.freeze({ status: "malformed" });
 }
 
 async function durableWrite(path, value) {

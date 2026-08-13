@@ -280,6 +280,11 @@ interface HarnessState {
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
   }>;
+  thinkingProjectionCalls: Array<{
+    command: CommandEnvelope;
+    binding: ResidentSessionBinding;
+    projection: ResidentProjectionSnapshot;
+  }>;
   waitForIdleCalls: number;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
   waitForHelloHandler?: () => Promise<unknown> | unknown;
@@ -294,6 +299,11 @@ interface HarnessState {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  publishThinkingSelectionProjectionHandler?: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   snapshotHandler?: (attachmentOrdinal: number) => Promise<unknown> | unknown;
   authoritativeRoundCalls: number;
   authoritativeSnapshotHandler?: (roundOrdinal: number) => Promise<unknown> | unknown;
@@ -304,6 +314,7 @@ interface HarnessState {
   waitForIdleHandler?: () => Promise<void> | void;
   availableModelsCalls: number;
   setModelCalls: Array<{ providerId: string; modelId: string }>;
+  setThinkingLevelCalls: string[];
   promptCalls: Array<{
     message: string;
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined;
@@ -314,6 +325,7 @@ interface HarnessState {
   promoteCalls: number;
   availableModelsHandler?: () => Promise<unknown> | unknown;
   setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
+  setThinkingLevelHandler?: (level: string) => Promise<void> | void;
   promptHandler?: (
     message: string,
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
@@ -354,10 +366,12 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     projectionCalls: [],
     resourceSnapshotCalls: 0,
     modelProjectionCalls: [],
+    thinkingProjectionCalls: [],
     waitForIdleCalls: 0,
     authoritativeRoundCalls: 0,
     availableModelsCalls: 0,
     setModelCalls: [],
+    setThinkingLevelCalls: [],
     promptCalls: [],
     abortCalls: 0,
     extensionUiResponseCalls: [],
@@ -487,6 +501,11 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             ? state.setModelHandler(providerId, modelId)
             : { provider: providerId, id: modelId, rawCredential: "discarded" };
         },
+        setThinkingLevel: async (level: string) => {
+          state.setThinkingLevelCalls.push(level);
+          state.chronology.push(`thinking:set:${level}`);
+          await state.setThinkingLevelHandler?.(level);
+        },
         prompt: async (
           message: string,
           options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
@@ -579,6 +598,14 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
       state.chronology.push("projection:model-selection:publish");
       if (state.publishModelSelectionProjectionHandler) {
         await state.publishModelSelectionProjectionHandler(command, projectionBinding, projection);
+      }
+    },
+    publishThinkingSelectionProjection: async (command, projectionBinding, projection) => {
+      state.projectionCalls.push({ binding: projectionBinding, projection });
+      state.thinkingProjectionCalls.push({ command, binding: projectionBinding, projection });
+      state.chronology.push("projection:thinking-selection:publish");
+      if (state.publishThinkingSelectionProjectionHandler) {
+        await state.publishThinkingSelectionProjectionHandler(command, projectionBinding, projection);
       }
     },
     publishEphemeralProjectionChange: (projectionBinding) => {
@@ -742,6 +769,22 @@ function modelSelectionCommand(commandId = "select-model-1"): CommandEnvelope {
     issuedAt: "2026-08-06T17:00:00.000Z",
     expectedExecutionGenerationId: "generation-1",
     command: { kind: "model.select", providerId: "openai", modelId: "gpt-5" },
+  };
+}
+
+function thinkingSelectionCommand(
+  commandId = "select-thinking-1",
+  level = "high",
+): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "device-1",
+    commandId,
+    expectedHostId: "host-1",
+    threadId: "thread-1",
+    issuedAt: "2026-08-06T17:00:00.000Z",
+    expectedExecutionGenerationId: "generation-1",
+    command: { kind: "thinking.select", level },
   };
 }
 
@@ -3923,6 +3966,148 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     // Initial attach and each event refresh use two matching reads; the burst
     // never creates one authoritative read per token event.
     expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(6);
+    await connection.detach();
+    await adapter.close();
+  });
+});
+
+describe("PrimeAgentResidentAdapter reasoning-level gateway", () => {
+  it("preflights live levels, mutates once, and publishes only a fresh stable projection", async () => {
+    let thinkingLevel = "medium";
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ state: { thinkingLevel } }),
+      setThinkingLevelHandler: (level) => {
+        thinkingLevel = level;
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const command = thinkingSelectionCommand();
+
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).resolves.toEqual({
+      disposition: "handled",
+      message: "Prime Agent selected and verified the requested reasoning level",
+    });
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).resolves.toMatchObject({
+      disposition: "handled",
+    });
+
+    expect(state.setThinkingLevelCalls).toEqual(["high"]);
+    expect(state.thinkingProjectionCalls).toHaveLength(1);
+    expect(state.thinkingProjectionCalls[0]).toMatchObject({
+      command,
+      binding: connection.binding,
+      projection: {
+        runtime: {
+          thinkingLevel: "high",
+          availableThinkingLevels: ["low", "medium", "high"],
+        },
+      },
+    });
+    expect(state.projectionCalls.at(-1)?.projection.runtime.thinkingLevel).toBe("high");
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("rejects a level outside the current model's live list before mutation", async () => {
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({
+        state: { availableThinkingLevels: ["low", "medium", "high"] },
+      }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(thinkingSelectionCommand("thinking-unavailable", "max"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      name: "GatewayError",
+      code: "THINKING_LEVEL_NOT_AVAILABLE",
+      uncertain: false,
+    });
+    expect(state.setThinkingLevelCalls).toHaveLength(0);
+    expect(state.thinkingProjectionCalls).toHaveLength(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("fences an ambiguous upstream rejection and never invokes the same attempt twice", async () => {
+    const { adapter, state } = createHarness({
+      setThinkingLevelHandler: async () => {
+        throw new Error("upstream response was lost");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const command = thinkingSelectionCommand("thinking-unknown");
+
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).rejects.toMatchObject({
+      code: "THINKING_LEVEL_SELECTION_OUTCOME_UNKNOWN",
+      uncertain: true,
+      retryable: false,
+    });
+    await expect(adapter.submit(command, { residentBinding: connection.binding })).rejects.toMatchObject({
+      code: "THINKING_LEVEL_SELECTION_OUTCOME_UNKNOWN",
+    });
+    expect(state.setThinkingLevelCalls).toEqual(["high"]);
+    expect(state.thinkingProjectionCalls).toHaveLength(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("requires the dedicated attempt publisher after fresh reasoning proof", async () => {
+    let thinkingLevel = "medium";
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ state: { thinkingLevel } }),
+      setThinkingLevelHandler: (level) => {
+        thinkingLevel = level;
+      },
+      publishThinkingSelectionProjectionHandler: async () => {
+        throw new Error("Store rejected exact reasoning attempt");
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+
+    await expect(adapter.submit(thinkingSelectionCommand("thinking-publish-rejected"), {
+      residentBinding: connection.binding,
+    })).rejects.toMatchObject({
+      code: "THINKING_LEVEL_SELECTION_RECONCILIATION_FAILED",
+      uncertain: true,
+      retryable: false,
+    });
+    expect(state.setThinkingLevelCalls).toEqual(["high"]);
+    expect(state.thinkingProjectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("shares one preference lane with prompt admission while Stop remains independent", async () => {
+    let thinkingLevel = "medium";
+    const gate = deferred();
+    const { adapter, state } = createHarness({
+      snapshotHandler: () => validSnapshot({ state: { thinkingLevel } }),
+      setThinkingLevelHandler: async (level) => {
+        await gate.promise;
+        thinkingLevel = level;
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const thinking = adapter.submit(thinkingSelectionCommand("thinking-before-prompt"), {
+      residentBinding: connection.binding,
+    });
+    await vi.waitFor(() => expect(state.setThinkingLevelCalls).toEqual(["high"]));
+    const stop = connection.abort(
+      residentDispatchLease("abort", connection.binding, "stop-during-thinking"),
+    );
+    await expect(stop).resolves.toMatchObject({ operation: "abort" });
+    expect(state.abortCalls).toBe(1);
+    const prompt = connection.prompt(
+      "Run after reasoning settles.",
+      residentDispatchLease("prompt", connection.binding, "prompt-after-thinking"),
+    );
+    expect(state.promptCalls).toHaveLength(0);
+
+    gate.resolve();
+    await expect(thinking).resolves.toMatchObject({ disposition: "handled" });
+    await expect(prompt).resolves.toMatchObject({ operation: "prompt" });
+    expect(state.promptCalls).toHaveLength(1);
     await connection.detach();
     await adapter.close();
   });

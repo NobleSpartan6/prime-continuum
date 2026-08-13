@@ -421,6 +421,38 @@ describe("HostService handoff availability", () => {
     await service.close();
   });
 
+  it("denies relay reasoning selection without its exact least-privilege scope", async () => {
+    const { service, store, pairingAuthority, relayDevice } = await temporaryService();
+    const host = await store.getHost();
+    const projectionChannel = await registerTestChannel(pairingAuthority, host.hostId, relayDevice, 191);
+    const command: CommandEnvelope = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: relayDevice.deviceId,
+      commandId: "relay-thinking-selection-scope-canary",
+      expectedHostId: host.hostId,
+      threadId: "test-thread",
+      issuedAt: "2026-08-13T12:00:00.000Z",
+      expectedExecutionGenerationId: "test-execution-1",
+      command: { kind: "thinking.select", level: "high" },
+    };
+
+    const response = await service.handle(
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "relay-thinking-selection-scope-denied",
+        method: "command.submit",
+        payload: { command },
+      },
+      { transport: "relay", channel: projectionChannel.lease },
+    );
+
+    expect(response).toMatchObject({ ok: false, error: { code: "REMOTE_SCOPE_DENIED" } });
+    expect((await store.reconcileCommands([command])).unknown).toEqual([
+      { deviceId: command.deviceId, commandId: command.commandId },
+    ]);
+    await service.close();
+  });
+
   it("does not repurpose approval scope for native dialog responses", async () => {
     const { service, store, pairingAuthority, relayDevice } = await temporaryService();
     const host = await store.getHost();

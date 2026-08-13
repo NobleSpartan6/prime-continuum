@@ -83,7 +83,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RUNTIME_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 const MAX_LIVE_SESSIONS = 10_000;
 const MAX_AVAILABLE_MODELS = 5_000;
-const MAX_MODEL_SELECTION_IDENTITIES = 10_000;
+const MAX_PREFERENCE_SELECTION_IDENTITIES = 10_000;
 const MAX_RESIDENT_DISPATCH_IDENTITIES = 10_000;
 const RETIRED_RESIDENT_DISPATCH_FENCE_BYTES = 2 * 1024 * 1024;
 const RETIRED_RESIDENT_DISPATCH_FENCE_HASHES = 8;
@@ -344,6 +344,7 @@ export interface PrimeDaemonAgentConnectionPublic {
   /** Pinned public AgentConnection methods; guarded at the mutation boundary. */
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
+  setThinkingLevel?(level: string): Promise<void>;
   /** v0.7.2 resolves prompt when the worker accepts/owns it, not at turn completion. */
   prompt?(
     message: string,
@@ -424,6 +425,12 @@ export interface PrimeAgentResidentAdapterOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  /** Attempt-scoped publication for one authoritatively proven thinking.select. */
+  readonly publishThinkingSelectionProjection: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
   /** Invalidate only the service overlay; this callback must never persist the dialogs. */
   readonly publishEphemeralProjectionChange?: (binding: ResidentSessionBinding) => void;
   readonly spawnFactory?: ResidentDaemonSpawn;
@@ -446,6 +453,11 @@ interface ResolvedOptions {
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
   readonly publishModelSelectionProjection: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>;
+  readonly publishThinkingSelectionProjection: (
     command: CommandEnvelope,
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
@@ -539,7 +551,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
   private readonly lifecycle: LifecycleController;
   private readonly connections = new Map<string, ManagedResidentRuntimeConnection>();
   private readonly ownedCandidates = new Set<ManagedResidentOwnedCandidate>();
-  private readonly modelSelectionAttempts = new Map<
+  private readonly preferenceSelectionAttempts = new Map<
     string,
     Readonly<{
       command: CommandEnvelope;
@@ -577,6 +589,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       }),
       publishProjection: options.publishProjection,
       publishModelSelectionProjection: options.publishModelSelectionProjection,
+      publishThinkingSelectionProjection: options.publishThinkingSelectionProjection,
       publishEphemeralProjectionChange: options.publishEphemeralProjectionChange ?? (() => undefined),
       spawnFactory: options.spawnFactory ?? defaultResidentDaemonSpawn,
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
@@ -897,7 +910,27 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
         this.options.wait,
       ),
       "Prime Agent model-selection projection could not be read.",
-      "bounded_model_reconciliation",
+      "bounded_preference_reconciliation",
+      deadline,
+    );
+  }
+
+  private readStableSelectedThinkingProjection(
+    binding: ResidentSessionBinding,
+    level: string,
+  ): Promise<ResidentProjectionSnapshot> {
+    const deadline = performance.now() + this.options.requestTimeoutMs;
+    return this.readThroughEphemeralResidentAttachment(
+      binding,
+      (attached) => readStableThinkingSelectionProjection(
+        attached,
+        binding,
+        level,
+        deadline,
+        this.options.wait,
+      ),
+      "Prime Agent reasoning-level projection could not be read.",
+      "bounded_preference_reconciliation",
       deadline,
     );
   }
@@ -909,7 +942,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       client: PrimeDaemonClientPublic,
     ) => Promise<T>,
     failureMessage: string,
-    cleanupMode: "graceful" | "bounded_model_reconciliation" = "graceful",
+    cleanupMode: "graceful" | "bounded_preference_reconciliation" = "graceful",
     deadline?: number,
   ): Promise<T> {
     return this.enqueue(async () => {
@@ -1046,7 +1079,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
         } catch {
           // Continue releasing the attachment and client below.
         }
-        if (cleanupMode === "bounded_model_reconciliation") {
+        if (cleanupMode === "bounded_preference_reconciliation") {
           let disposal: Promise<unknown> = Promise.resolve();
           if (attached) {
             try {
@@ -1411,20 +1444,23 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     if (command.command.kind === "extension_ui.respond") {
       return this.submitExtensionUiResponse(command, context?.extensionUiResponse);
     }
-    if (command.command.kind !== "model.select") {
+    if (command.command.kind !== "model.select" && command.command.kind !== "thinking.select") {
       return Promise.reject(
         new GatewayError(
           "RESIDENT_COMMAND_UNSUPPORTED",
-          "This resident adapter checkpoint dispatches only model selection",
+          "This resident adapter checkpoint dispatches only model and reasoning preferences",
         ),
       );
     }
+    const isThinkingSelection = command.command.kind === "thinking.select";
     const binding = context?.residentBinding;
     if (!binding) {
       return Promise.reject(
         new GatewayError(
-          "MODEL_SELECTION_DURABLE_AUTHORITY_REQUIRED",
-          "Model selection requires a durable resident dispatch authority",
+          isThinkingSelection
+            ? "THINKING_LEVEL_SELECTION_DURABLE_AUTHORITY_REQUIRED"
+            : "MODEL_SELECTION_DURABLE_AUTHORITY_REQUIRED",
+          `${isThinkingSelection ? "Reasoning level" : "Model"} selection requires a durable resident dispatch authority`,
         ),
       );
     }
@@ -1435,8 +1471,10 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     ) {
       return Promise.reject(
         new GatewayError(
-          "MODEL_SELECTION_AUTHORITY_MISMATCH",
-          "Model selection does not match its durable resident authority",
+          isThinkingSelection
+            ? "THINKING_LEVEL_SELECTION_AUTHORITY_MISMATCH"
+            : "MODEL_SELECTION_AUTHORITY_MISMATCH",
+          `${isThinkingSelection ? "Reasoning level" : "Model"} selection does not match its durable resident authority`,
         ),
       );
     }
@@ -1444,7 +1482,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     if (!connection || !isDeepStrictEqual(connection.binding, durableBinding)) {
       return Promise.reject(
         new GatewayError(
-          "MODEL_SELECTION_BINDING_MISMATCH",
+          isThinkingSelection
+            ? "THINKING_LEVEL_SELECTION_BINDING_MISMATCH"
+            : "MODEL_SELECTION_BINDING_MISMATCH",
           "The live Prime Agent connection does not match the admitted resident binding",
           true,
         ),
@@ -1452,35 +1492,40 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     }
 
     const identity = JSON.stringify([command.deviceId, command.commandId]);
-    const existing = this.modelSelectionAttempts.get(identity);
+    const existing = this.preferenceSelectionAttempts.get(identity);
     if (existing) {
       if (
         !isDeepStrictEqual(existing.command, command) ||
         !isDeepStrictEqual(existing.binding, durableBinding)
       ) {
         return Promise.reject(
-          new GatewayError("COMMAND_ID_REUSED", "This command identity is already bound to another model selection"),
+          new GatewayError("COMMAND_ID_REUSED", "This command identity is already bound to another resident preference"),
         );
       }
       return existing.result;
     }
-    if (this.modelSelectionAttempts.size >= MAX_MODEL_SELECTION_IDENTITIES) {
+    if (this.preferenceSelectionAttempts.size >= MAX_PREFERENCE_SELECTION_IDENTITIES) {
       return Promise.reject(
         new GatewayError(
-          "MODEL_SELECTION_IDENTITY_LIMIT",
-          "The resident model-selection identity ledger reached its bounded limit",
+          isThinkingSelection
+            ? "THINKING_LEVEL_SELECTION_IDENTITY_LIMIT"
+            : "MODEL_SELECTION_IDENTITY_LIMIT",
+          "The resident preference-selection identity ledger reached its bounded limit",
           true,
         ),
       );
     }
 
-    const result = connection
-      .selectModel(command, durableBinding)
+    const result = (isThinkingSelection
+      ? connection.selectThinkingLevel(command, durableBinding)
+      : connection.selectModel(command, durableBinding))
       .then(() => ({
         disposition: "handled" as const,
-        message: "Prime Agent selected and verified the requested model",
+        message: isThinkingSelection
+          ? "Prime Agent selected and verified the requested reasoning level"
+          : "Prime Agent selected and verified the requested model",
       }));
-    this.modelSelectionAttempts.set(
+    this.preferenceSelectionAttempts.set(
       identity,
       Object.freeze({ command: Object.freeze(command), binding: durableBinding, result }),
     );
@@ -1679,7 +1724,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       });
       this.connections.clear();
       this.ownedCandidates.clear();
-      this.modelSelectionAttempts.clear();
+      this.preferenceSelectionAttempts.clear();
       this.closed = true;
       const failure = [...connectionOutcomes, ...candidateOutcomes].find(
         (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
@@ -2088,9 +2133,12 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       persistBinding: this.options.persistBinding,
       publishProjection: this.options.publishProjection,
       publishModelSelectionProjection: this.options.publishModelSelectionProjection,
+      publishThinkingSelectionProjection: this.options.publishThinkingSelectionProjection,
       publishEphemeralProjectionChange: this.options.publishEphemeralProjectionChange,
       readStableSelectedModelProjection: (selectionBinding, providerId, modelId) =>
         this.readStableSelectedModelProjection(selectionBinding, providerId, modelId),
+      readStableSelectedThinkingProjection: (selectionBinding, level) =>
+        this.readStableSelectedThinkingProjection(selectionBinding, level),
       initialProjection,
       refreshProjectionOnStart: initialProjection === undefined,
       onClosed: () => {
@@ -2357,7 +2405,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private bindingValue: ResidentSessionBinding;
   private unsubscribeUpstream: () => void = () => undefined;
   private eventTail: Promise<void> = Promise.resolve();
-  private modelMutationTail: Promise<void> = Promise.resolve();
+  private preferenceMutationTail: Promise<void> = Promise.resolve();
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private abortTail: Promise<void> = Promise.resolve();
   private residentIdleReconciliationTail: Promise<void> = Promise.resolve();
@@ -2424,11 +2472,20 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         binding: ResidentSessionBinding,
         projection: ResidentProjectionSnapshot,
       ) => Promise<void>;
+      publishThinkingSelectionProjection: (
+        command: CommandEnvelope,
+        binding: ResidentSessionBinding,
+        projection: ResidentProjectionSnapshot,
+      ) => Promise<void>;
       publishEphemeralProjectionChange: (binding: ResidentSessionBinding) => void;
       readStableSelectedModelProjection: (
         binding: ResidentSessionBinding,
         providerId: string,
         modelId: string,
+      ) => Promise<ResidentProjectionSnapshot>;
+      readStableSelectedThinkingProjection: (
+        binding: ResidentSessionBinding,
+        level: string,
       ) => Promise<ResidentProjectionSnapshot>;
       initialProjection: ResidentProjectionSnapshot | undefined;
       refreshProjectionOnStart: boolean;
@@ -2592,10 +2649,43 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         new GatewayError("MODEL_SELECTION_AUTHORITY_MISMATCH", "Model selection does not match its durable resident authority"),
       );
     }
-    return this.enqueueModelMutation(() => this.selectModelOnce(
+    return this.enqueuePreferenceMutation(() => this.selectModelOnce(
       command,
       selection.provider,
       selection.id,
+      durableBinding,
+    ));
+  }
+
+  selectThinkingLevel(
+    commandValue: CommandEnvelope,
+    expectedBinding: ResidentSessionBinding,
+  ): Promise<string> {
+    const command = CommandEnvelopeSchema.parse(commandValue);
+    if (command.command.kind !== "thinking.select") {
+      return Promise.reject(
+        new GatewayError(
+          "THINKING_LEVEL_SELECTION_COMMAND_REQUIRED",
+          "Resident reasoning-level selection requires an exact thinking.select command",
+        ),
+      );
+    }
+    const level = command.command.level;
+    const durableBinding = validateResidentSessionBinding(expectedBinding);
+    if (
+      command.threadId !== durableBinding.threadId ||
+      command.expectedExecutionGenerationId !== durableBinding.executionGenerationId
+    ) {
+      return Promise.reject(
+        new GatewayError(
+          "THINKING_LEVEL_SELECTION_AUTHORITY_MISMATCH",
+          "Reasoning-level selection does not match its durable resident authority",
+        ),
+      );
+    }
+    return this.enqueuePreferenceMutation(() => this.selectThinkingLevelOnce(
+      command,
+      level,
       durableBinding,
     ));
   }
@@ -2821,7 +2911,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         try {
           this.assertResidentDispatchAuthority(lease, "abort");
           // The signal belongs to the already-invoked prompt admission. Abort
-          // it synchronously so Stop is never queued behind model work.
+          // it synchronously so Stop is never queued behind preference work.
           for (const queuedAdmission of this.queuedPromptAdmissions) {
             queuedAdmission.controller.abort();
           }
@@ -2873,9 +2963,9 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     }
   }
 
-  private enqueueModelMutation<T>(mutation: () => Promise<T>): Promise<T> {
-    const result = this.modelMutationTail.then(mutation);
-    this.modelMutationTail = result.then(
+  private enqueuePreferenceMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    const result = this.preferenceMutationTail.then(mutation);
+    this.preferenceMutationTail = result.then(
       () => undefined,
       () => undefined,
     );
@@ -2883,15 +2973,15 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   }
 
   private enqueuePromptAdmission<T>(mutation: () => Promise<T>): Promise<T> {
-    // Prompt admission and model selection share one normal-priority lane so
-    // a turn cannot race a model mutation/reconciliation. Stop has its own
-    // priority lane and never waits behind this chain.
-    const result = this.modelMutationTail.then(mutation);
+    // Prompt admission and model/reasoning preferences share one
+    // normal-priority lane so a turn cannot race a preference mutation or
+    // reconciliation. Stop has its own priority lane and never waits here.
+    const result = this.preferenceMutationTail.then(mutation);
     const settled = result.then(
       () => undefined,
       () => undefined,
     );
-    this.modelMutationTail = settled;
+    this.preferenceMutationTail = settled;
     this.promptAdmissionTail = settled;
     return result;
   }
@@ -3406,7 +3496,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.terminalPromise = Promise.all([
       this.promptAdmissionTail,
       this.abortTail,
-      this.modelMutationTail,
+      this.preferenceMutationTail,
       this.extensionUiResponseTail,
     ]).then(operation).then(
       () => {
@@ -3715,10 +3805,99 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     return Object.freeze({ providerId, modelId });
   }
 
+  private async selectThinkingLevelOnce(
+    command: CommandEnvelope,
+    level: string,
+    expectedBinding: ResidentSessionBinding,
+  ): Promise<string> {
+    this.assertThinkingSelectionLive(expectedBinding);
+    const setThinkingLevel = this.options.attached.setThinkingLevel;
+    if (typeof setThinkingLevel !== "function") {
+      throw new GatewayError(
+        "THINKING_LEVEL_SELECTION_UNSUPPORTED",
+        "The verified Prime Agent connection does not support resident reasoning-level selection",
+      );
+    }
+
+    let availableLevels: readonly string[];
+    try {
+      availableLevels = sanitizeAvailableThinkingLevels(
+        await this.options.attached.getInitialSnapshot(),
+        expectedBinding,
+      );
+    } catch {
+      throw new GatewayError(
+        "THINKING_LEVELS_UNAVAILABLE",
+        "Prime Agent's live reasoning levels could not be safely validated",
+        true,
+      );
+    }
+    if (!availableLevels.includes(level)) {
+      throw new GatewayError(
+        "THINKING_LEVEL_NOT_AVAILABLE",
+        "The requested reasoning level is not available for this live model",
+      );
+    }
+
+    // Recheck the exact live binding immediately before the one upstream call.
+    this.assertThinkingSelectionLive(expectedBinding);
+    try {
+      await setThinkingLevel.call(this.options.attached, level);
+    } catch {
+      throw new GatewayError(
+        "THINKING_LEVEL_SELECTION_OUTCOME_UNKNOWN",
+        "Prime Agent may have changed the reasoning level, but no authoritative result is available",
+        false,
+        true,
+      );
+    }
+
+    try {
+      const projection = await awaitResidentMutationInvocation(
+        this.options.readStableSelectedThinkingProjection(expectedBinding, level),
+        this.options.requestTimeoutMs,
+        "reasoning-level selection reconciliation",
+      );
+      this.assertThinkingSelectionLive(expectedBinding);
+      if (
+        projection.runtime.thinkingLevel !== level ||
+        !projection.runtime.availableThinkingLevels?.includes(level)
+      ) {
+        throw new Error("Fresh Prime Agent projection did not prove the selected reasoning level");
+      }
+      await publishThinkingSelectionProjection(
+        this.options.publishThinkingSelectionProjection,
+        command,
+        expectedBinding,
+        projection,
+      );
+      this.assertThinkingSelectionLive(expectedBinding);
+      this.acceptAuthoritativeProjection(projection);
+    } catch {
+      throw new GatewayError(
+        "THINKING_LEVEL_SELECTION_RECONCILIATION_FAILED",
+        "Prime Agent accepted the reasoning-level mutation, but its authoritative state could not be reconciled",
+        false,
+        true,
+      );
+    }
+
+    return level;
+  }
+
   private assertModelSelectionLive(expectedBinding: ResidentSessionBinding): void {
     if (this.isLive() && isDeepStrictEqual(this.binding, expectedBinding)) return;
     throw new GatewayError(
       "MODEL_SELECTION_SESSION_AUTHORITY_CHANGED",
+      "The admitted resident Prime Agent session is no longer live under the exact durable authority",
+      true,
+    );
+  }
+
+  private assertThinkingSelectionLive(expectedBinding: ResidentSessionBinding): void {
+    if (this.isLive() && isDeepStrictEqual(this.binding, expectedBinding)) return;
+    throw new GatewayError(
+      "THINKING_LEVEL_SELECTION_SESSION_AUTHORITY_CHANGED",
       "The admitted resident Prime Agent session is no longer live under the exact durable authority",
       true,
     );
@@ -4723,6 +4902,72 @@ function sanitizeAvailableModels(value: unknown): readonly SanitizedResidentMode
   return Object.freeze(identities);
 }
 
+function sanitizeAvailableThinkingLevels(
+  snapshot: unknown,
+  binding: ResidentSessionBinding,
+): readonly string[] {
+  const levels = normalizeProjection(snapshot, binding).runtime.availableThinkingLevels;
+  if (!levels) throw invalidResponse("available reasoning levels");
+  return Object.freeze([...levels]);
+}
+
+async function readStableThinkingSelectionProjection(
+  connection: PrimeDaemonAgentConnectionPublic,
+  binding: ResidentSessionBinding,
+  level: string,
+  deadline: number,
+  wait: (milliseconds: number) => Promise<void>,
+): Promise<ResidentProjectionSnapshot> {
+  let previous: ResidentProjectionSnapshot | undefined;
+  for (let read = 0; read < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS; read += 1) {
+    const snapshot = await beforeModelSelectionDeadline(
+      deadline,
+      () => connection.getInitialSnapshot(),
+      "reasoning-level selection snapshot",
+    );
+    const projection = normalizeProjection(snapshot, binding);
+    const selected = projection.runtime.thinkingLevel === level &&
+      projection.runtime.availableThinkingLevels?.includes(level) === true;
+    if (selected && previous && isDeepStrictEqual(previous, projection)) {
+      const resources = await beforeModelSelectionDeadline(
+        deadline,
+        () => connection.getResourceSnapshot(),
+        "reasoning-level selection resource inventory",
+      );
+      const confirmationSnapshot = await beforeModelSelectionDeadline(
+        deadline,
+        () => connection.getInitialSnapshot(),
+        "reasoning-level selection confirmation snapshot",
+      );
+      const confirmation = normalizeProjection(confirmationSnapshot, binding);
+      if (
+        isDeepStrictEqual(previous, confirmation) &&
+        confirmation.runtime.thinkingLevel === level &&
+        confirmation.runtime.availableThinkingLevels?.includes(level) === true
+      ) {
+        return normalizeProjection(confirmationSnapshot, binding, resources);
+      }
+      previous = confirmation.runtime.thinkingLevel === level &&
+        confirmation.runtime.availableThinkingLevels?.includes(level) === true
+        ? confirmation
+        : undefined;
+    } else {
+      previous = selected ? projection : undefined;
+    }
+    if (read + 1 < MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS) {
+      await beforeModelSelectionDeadline(
+        deadline,
+        (remainingMs) => wait(Math.min(MODEL_SELECTION_RECONCILIATION_POLL_MS, remainingMs)),
+        "reasoning-level selection reconciliation wait",
+      );
+    }
+  }
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_RESPONSE_INVALID",
+    "Prime Agent state changed throughout authoritative reasoning-level reconciliation.",
+  );
+}
+
 async function readStableModelSelectionProjection(
   connection: PrimeDaemonAgentConnectionPublic,
   client: PrimeDaemonClientPublic,
@@ -5017,6 +5262,27 @@ async function publishModelSelectionProjection(
     throw new ResidentRuntimeContractError(
       "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
       "The proven Prime Agent model selection could not be saved under its exact durable attempt.",
+      { retryable: false, cause: error },
+    );
+  }
+}
+
+async function publishThinkingSelectionProjection(
+  publisher: (
+    command: CommandEnvelope,
+    binding: ResidentSessionBinding,
+    projection: ResidentProjectionSnapshot,
+  ) => Promise<void>,
+  command: CommandEnvelope,
+  binding: ResidentSessionBinding,
+  projection: ResidentProjectionSnapshot,
+): Promise<void> {
+  try {
+    await publisher(command, binding, projection);
+  } catch (error) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROJECTION_PERSIST_FAILED",
+      "The proven Prime Agent reasoning-level selection could not be saved under its exact durable attempt.",
       { retryable: false, cause: error },
     );
   }

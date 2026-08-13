@@ -49,6 +49,7 @@ interface RuntimeFixtureOptions {
   readonly recoverDuringAttach?: boolean;
   readonly waitForIdle?: (connection: FakeConnection) => Promise<void>;
   readonly setModel?: (providerId: string, modelId: string) => Promise<unknown>;
+  readonly setThinkingLevel?: (level: string) => Promise<void>;
   readonly prompt?: (
     message: string,
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
@@ -136,6 +137,10 @@ class FakeConnection {
 
   async setModel(providerId: string, modelId: string): Promise<unknown> {
     return this.options.setModel?.(providerId, modelId) ?? Object.freeze({ providerId, modelId });
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
+    await this.options.setThinkingLevel?.(level);
   }
 
   async promoteToResident(): Promise<void> {
@@ -568,6 +573,48 @@ describe("Prime Agent resident Worker proxy", () => {
       operation: "connection.set_model",
     });
     expect(invoked).toHaveBeenCalledOnce();
+
+    await connection.dispose();
+    await loader.close();
+  });
+
+  it("carries one bounded thinking-level mutation through the worker and classifies its boundary", async () => {
+    const invoked = vi.fn<(level: string) => void>();
+    const fixture = runtimeFixture({
+      setThinkingLevel: async (level) => {
+        invoked(level);
+      },
+    });
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.setThinkingLevel?.("high")).resolves.toBeUndefined();
+    await expect(connection.setThinkingLevel?.("")).rejects.toMatchObject({
+      code: "RESIDENT_WORKER_INPUT_INVALID",
+      outcome: "definitive",
+      operation: "connection.set_thinking_level",
+    });
+    expect(invoked).toHaveBeenCalledExactlyOnceWith("high");
+
+    await connection.dispose();
+    await loader.close();
+  });
+
+  it("classifies a thinking-level failure after the worker call as unknown without replay", async () => {
+    const invoked = vi.fn<(level: string) => void>();
+    const fixture = runtimeFixture({
+      setThinkingLevel: async (level) => {
+        invoked(level);
+        throw new Error("daemon response lost after reasoning-level mutation");
+      },
+    });
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.setThinkingLevel?.("max")).rejects.toMatchObject({
+      outcome: "unknown",
+    });
+    expect(invoked).toHaveBeenCalledExactlyOnceWith("max");
 
     await connection.dispose();
     await loader.close();

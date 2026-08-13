@@ -2247,6 +2247,10 @@ code {
   background: var(--color-surface-hover);
 }
 
+.session-continuity__manage.session-continuity__manage--agents {
+  color: var(--color-success);
+}
+
 .session-continuity__manage-icon {
   display: none;
 }
@@ -5348,6 +5352,71 @@ dialog.sheet.models-sheet {
   border-radius: 50%;
 }
 
+.reasoning-control {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(8rem, 1fr) auto minmax(8rem, 11rem) minmax(8rem, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  min-block-size: 2.5rem;
+  margin-block-start: 0.85rem;
+  padding-block: 0.25rem;
+}
+
+.reasoning-control__current {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.reasoning-control__current small {
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+}
+
+.reasoning-control__current strong {
+  overflow: hidden;
+  font-size: var(--font-meta);
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning-control label {
+  color: var(--color-text);
+  font-size: var(--font-meta);
+  font-weight: 620;
+}
+
+.reasoning-control select {
+  min-inline-size: 0;
+  min-block-size: 2rem;
+  padding-inline: 0.6rem 1.75rem;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+}
+
+.reasoning-control select:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.reasoning-control select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.reasoning-control > span {
+  min-inline-size: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-caption);
+  text-wrap: pretty;
+}
+
 .provider-setup-note {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -7183,6 +7252,18 @@ body[data-surface="hud"] {
     align-items: flex-start;
     flex-direction: column;
     gap: 0.35rem;
+  }
+
+  .reasoning-control {
+    grid-template-columns: auto minmax(8rem, 1fr) auto;
+  }
+
+  .reasoning-control__current {
+    grid-column: 1 / -1;
+  }
+
+  .reasoning-control > span:not(.reasoning-control__current) {
+    grid-column: 1 / -1;
   }
 
   .model-catalog__controls {

@@ -73,6 +73,8 @@ const STALE_END_ERROR = Object.freeze({
   retryable: false,
 });
 const RESIDENT_COMMAND_CAPABILITY = "prime_agent_commands_v2";
+const RESIDENT_THINKING_LEVELS_CAPABILITY = "prime_agent_thinking_levels_v1";
+const RESIDENT_EXTENSION_UI_CAPABILITY = "resident_extension_ui_v1";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
 const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
@@ -1115,7 +1117,9 @@ async function waitForResidentReadiness(child, expectCommandCapability) {
         lastHealth.capabilities?.includes(RESIDENT_LIFECYCLE_CAPABILITY) &&
         lastHealth.capabilities.includes(RUNTIME_OAUTH_CAPABILITY) &&
         EXPECTED_WARMED_CAPABILITIES.every((capability) => lastHealth.capabilities.includes(capability)) &&
-        lastHealth.capabilities.includes(RESIDENT_COMMAND_CAPABILITY) === expectCommandCapability
+        lastHealth.capabilities.includes(RESIDENT_COMMAND_CAPABILITY) === expectCommandCapability &&
+        lastHealth.capabilities.includes(RESIDENT_THINKING_LEVELS_CAPABILITY) === expectCommandCapability &&
+        lastHealth.capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) === expectCommandCapability
       ) {
         assertReadyRuntimeHealth(lastHealth, expectCommandCapability);
         return {
@@ -1166,6 +1170,14 @@ function assertReadyRuntimeHealth(health, expectCommandCapability) {
   if (hasCommands !== expectCommandCapability) {
     throw new Error("Ready health resident command capability differs from exact binding state");
   }
+  const hasThinkingLevels = health.capabilities.includes(RESIDENT_THINKING_LEVELS_CAPABILITY);
+  if (hasThinkingLevels !== expectCommandCapability) {
+    throw new Error("Ready health resident thinking capability differs from exact binding state");
+  }
+  const hasExtensionUi = health.capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY);
+  if (hasExtensionUi !== expectCommandCapability) {
+    throw new Error("Ready health resident extension UI capability differs from exact binding state");
+  }
   const missingWarmed = EXPECTED_WARMED_CAPABILITIES.filter((capability) => !health.capabilities.includes(capability));
   if (missingWarmed.length > 0) {
     throw new Error(`Ready health is missing warmed optional capabilities: ${missingWarmed.join(", ")}`);
@@ -1173,6 +1185,8 @@ function assertReadyRuntimeHealth(health, expectCommandCapability) {
   const base = health.capabilities
     .filter((capability) =>
       capability !== RESIDENT_COMMAND_CAPABILITY &&
+      capability !== RESIDENT_THINKING_LEVELS_CAPABILITY &&
+      capability !== RESIDENT_EXTENSION_UI_CAPABILITY &&
       !EXPECTED_WARMED_CAPABILITIES.includes(capability)
     )
     .sort();

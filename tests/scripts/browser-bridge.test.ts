@@ -13,7 +13,9 @@ import {
 import { withBrowserSessionLock } from "../../runtime/prime-agent/bridge/browser-bridge-session-lock.mjs";
 import { retireBrowserEvidence } from "../../runtime/prime-agent/bridge/browser-bridge-evidence.mjs";
 import { browserSessionStateKeys, residentBrowserAuthority } from "../../runtime/prime-agent/bridge/browser-bridge-state.mjs";
-import { link, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +35,15 @@ const launchJournal = require("../../runtime/prime-agent/bridge/browser-bridge-l
   publishClaimedLaunchSync(path: string, owner: Readonly<Record<string, unknown>>, now?: () => number): Readonly<Record<string, unknown>>;
   publishReadyLaunchSync(path: string, nonce: string, hostPid: number, controlPort: number, now?: () => number): Readonly<Record<string, unknown>>;
   readLaunchEvidence(path: string): Promise<Readonly<{ status: string; record?: Readonly<Record<string, unknown>> }>>;
+  readEvidence(
+    path: string,
+    validator: (value: unknown) => boolean,
+    options?: Readonly<{
+      lstat?: (path: string) => Promise<Stats>;
+      open?: (path: string, flags: number) => Promise<FileHandle>;
+      maxReplacementRetries?: number;
+    }>,
+  ): Promise<Readonly<{ status: string; record?: Readonly<Record<string, unknown>> }>>;
   resolveStartingLaunch(path: string, starting: Readonly<Record<string, unknown>>, options: Readonly<{ now: () => number; processStatus: (pid: number) => "live" | "dead" | "unknown" }>): Promise<string>;
   syncDirectory(path: string, platform?: NodeJS.Platform): Promise<void>;
   syncDirectorySync(path: string, platform?: NodeJS.Platform): void;
@@ -200,6 +211,35 @@ describe("verified browser launch journal", () => {
         status: "valid",
         record: { phase: "committed", nonce: starting.nonce, hostPid: process.pid },
       });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("re-reads a journal replaced atomically between path inspection and open", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-browser-launch-replace-race-"));
+    const launchPath = join(directory, "launch.json");
+    const replacementPath = join(directory, "replacement.json");
+    try {
+      await writeFile(launchPath, `${JSON.stringify({ version: 1, phase: "old" })}\n`, { mode: 0o600 });
+      const oldEntry = await lstat(launchPath);
+      const replacement = { version: 1, phase: "ready" };
+      await writeFile(replacementPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+      await rename(replacementPath, launchPath);
+      let inspections = 0;
+
+      await expect(launchJournal.readEvidence(
+        launchPath,
+        (value) => JSON.stringify(value) === JSON.stringify(replacement),
+        {
+          lstat: async (path) => {
+            inspections += 1;
+            return inspections === 1 ? oldEntry : lstat(path);
+          },
+          open,
+        },
+      )).resolves.toEqual({ status: "valid", record: replacement });
+      expect(inspections).toBe(2);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

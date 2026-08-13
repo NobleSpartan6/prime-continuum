@@ -1319,18 +1319,28 @@ const ModelSelectionProofIdentitySchema = z
   .strict();
 
 const MODEL_SELECTION_RUNNING_MESSAGE = "Selecting the model on the resident Prime Agent session";
+const THINKING_SELECTION_RUNNING_MESSAGE = "Selecting the reasoning level on the resident Prime Agent session";
 
 const ModelSelectionProjectionProofSchema = z
   .object({
     bindingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-    selectedModel: ModelSelectionProofIdentitySchema,
+    selectedModel: ModelSelectionProofIdentitySchema.optional(),
+    selectedThinkingLevel: z.string().min(1).max(64).regex(/^[^\0\r\n]+$/).optional(),
     cursor: SessionCursorSchema,
     projectionDigest: z.string().regex(/^[a-f0-9]{64}$/),
     invariantDigest: z.string().regex(/^[a-f0-9]{64}$/),
     runningReceiptDigest: z.string().regex(/^[a-f0-9]{64}$/),
     publishedAt: IsoDateTimeSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((proof, context) => {
+    if ((proof.selectedModel === undefined) === (proof.selectedThinkingLevel === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "A resident preference proof must identify exactly one selected preference",
+      });
+    }
+  });
 type ModelSelectionProjectionProof = z.infer<typeof ModelSelectionProjectionProofSchema>;
 
 const ModelSelectionAttemptSchema = z
@@ -1346,8 +1356,8 @@ const ModelSelectionAttemptSchema = z
   })
   .strict()
   .superRefine((attempt, context) => {
-    if (attempt.command.command.kind !== "model.select") {
-      context.addIssue({ code: "custom", path: ["command", "command"], message: "Attempt is not a model selection" });
+    if (!isResidentPreferenceCommand(attempt.command)) {
+      context.addIssue({ code: "custom", path: ["command", "command"], message: "Attempt is not a resident preference selection" });
     }
     if (
       attempt.command.threadId !== attempt.binding.threadId ||
@@ -1366,9 +1376,7 @@ const ModelSelectionAttemptSchema = z
       (attempt.projectionProof.cursor.threadId !== attempt.command.threadId ||
         attempt.projectionProof.cursor.executionGenerationId !== attempt.command.expectedExecutionGenerationId ||
         attempt.projectionProof.bindingFingerprint !== residentDispatchAuthorityFingerprint(attempt.binding) ||
-        attempt.command.command.kind !== "model.select" ||
-        attempt.projectionProof.selectedModel.providerId !== attempt.command.command.providerId ||
-        attempt.projectionProof.selectedModel.modelId !== attempt.command.command.modelId)
+        !residentPreferenceProofMatchesCommand(attempt.projectionProof, attempt.command))
     ) {
       context.addIssue({ code: "custom", path: ["projectionProof", "cursor"], message: "Projection proof changed command authority" });
     }
@@ -1383,11 +1391,11 @@ const ModelSelectionIdentityRecordSchema = z
   })
   .strict()
   .superRefine((record, context) => {
-    if (record.command.command.kind !== "model.select") {
+    if (!isResidentPreferenceCommand(record.command)) {
       context.addIssue({
         code: "custom",
         path: ["command", "command"],
-        message: "Identity record is not a model selection",
+        message: "Identity record is not a resident preference selection",
       });
     }
   });
@@ -1568,7 +1576,7 @@ const AdmissionTransactionSchema = z
     const requiresProjection =
       transaction.receipt.status === "admitted" &&
       transaction.command.command.kind !== "abort" &&
-      transaction.command.command.kind !== "model.select" &&
+      !isResidentPreferenceCommand(transaction.command) &&
       transaction.command.command.kind !== "extension_ui.respond" &&
       transaction.residentDispatchAttempt === undefined;
     if (requiresProjection !== (transaction.snapshot !== undefined)) {
@@ -1654,13 +1662,13 @@ const AdmissionTransactionSchema = z
       }
     }
     const requiresModelAttempt =
-      transaction.command.command.kind === "model.select" && transaction.receipt.status === "admitted";
-    const requiresModelIdentity = transaction.command.command.kind === "model.select";
+      isResidentPreferenceCommand(transaction.command) && transaction.receipt.status === "admitted";
+    const requiresModelIdentity = isResidentPreferenceCommand(transaction.command);
     if (requiresModelIdentity !== (transaction.modelSelectionIdentity !== undefined)) {
-      context.addIssue({ code: "custom", message: "Every model selection must bind its durable command identity" });
+      context.addIssue({ code: "custom", message: "Every resident preference selection must bind its durable command identity" });
     }
     if (requiresModelAttempt !== (transaction.modelSelectionAttempt !== undefined)) {
-      context.addIssue({ code: "custom", message: "Admitted model selection must materialize one private attempt" });
+      context.addIssue({ code: "custom", message: "Admitted resident preference selection must materialize one private attempt" });
     }
     if (
       transaction.modelSelectionIdentity &&
@@ -2106,7 +2114,6 @@ const ResidentProjectionTransactionSchema = z
       transaction.modelSelectionSourceSnapshot &&
       transaction.modelSelectionInvariantDigest
     ) {
-      const command = modelProof.command.command;
       const runtime = snapshot.runtime;
       const runningReceipt = transaction.modelSelectionRunningReceipt;
       const sourceSnapshot = transaction.modelSelectionSourceSnapshot;
@@ -2116,7 +2123,7 @@ const ResidentProjectionTransactionSchema = z
         transaction.previousLineage.current.generation === nextLineage.current.generation &&
         transaction.previousLineage.current.sequence === nextLineage.current.sequence;
       if (
-        command.kind !== "model.select" ||
+        !isResidentPreferenceCommand(modelProof.command) ||
         modelProof.state !== "dispatching" ||
         !isDeepStrictEqual(modelProof.binding, binding) ||
         runningReceipt.status !== "running" ||
@@ -2126,12 +2133,12 @@ const ResidentProjectionTransactionSchema = z
         runningReceipt.executionGenerationId !== modelProof.command.expectedExecutionGenerationId ||
         runningReceipt.updatedAt !== modelProof.dispatchStartedAt ||
         runningReceipt.receivedAt !== modelProof.admittedAt ||
-        runningReceipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+        runningReceipt.message !== residentPreferenceRunningMessage(modelProof.command) ||
         modelProof.updatedAt !== modelProof.dispatchStartedAt ||
         runningReceipt.queuePosition !== undefined ||
         runningReceipt.error !== undefined ||
         !runtime ||
-        runtime.model !== residentSelectedModelIdentity(modelProof.command) ||
+        !residentSnapshotPreferenceMatchesCommand(snapshot, modelProof.command) ||
         transaction.transactionId !== deterministicId(
           "resident-model-selection-projection",
           modelProof.command.deviceId,
@@ -2150,11 +2157,19 @@ const ResidentProjectionTransactionSchema = z
         sourceSnapshot.latestCursor.generation !== transaction.previousLineage.current.generation ||
         sourceSnapshot.latestCursor.sequence !== transaction.previousLineage.current.sequence ||
         residentPublishedProjectionDigest(sourceSnapshot) !== transaction.previousLineage.current.digest ||
-        residentModelSelectionPublishedInvariantDigest(snapshot, runtime ?? sourceRuntime) !==
+        residentModelSelectionPublishedInvariantDigest(snapshot, runtime ?? sourceRuntime, modelProof.command) !==
           transaction.modelSelectionInvariantDigest ||
         (sameCursor &&
-          (!residentModelSelectionRuntimeDeltaIsValid(sourceRuntime ?? runtime!, runtime ?? sourceRuntime!) ||
-            residentModelSelectionPublishedInvariantDigest(sourceSnapshot, sourceRuntime ?? runtime!) !==
+          (!residentModelSelectionRuntimeDeltaIsValid(
+            sourceRuntime ?? runtime!,
+            runtime ?? sourceRuntime!,
+            modelProof.command,
+          ) ||
+            residentModelSelectionPublishedInvariantDigest(
+              sourceSnapshot,
+              sourceRuntime ?? runtime!,
+              modelProof.command,
+            ) !==
               transaction.modelSelectionInvariantDigest));
       if (
         semanticFenceInvalid
@@ -4630,10 +4645,10 @@ export class HostStore {
     projection: ResidentProjectionSnapshot,
   ): Promise<ThreadProjectionSnapshot> {
     const command = CommandEnvelopeSchema.parse(commandValue);
-    if (command.command.kind !== "model.select") {
+    if (!isResidentPreferenceCommand(command)) {
       throw new HostStoreError(
         "MODEL_SELECTION_COMMAND_REQUIRED",
-        "This projection path accepts only an exact model-selection command",
+        "This projection path accepts only an exact resident preference command",
       );
     }
     return this.exclusive(async () => {
@@ -4911,18 +4926,22 @@ export class HostStore {
               const runtime = source.runtime;
               if (
                 !runtime ||
-                runtime.model !== residentSelectedModelIdentity(modelSelectionProofAttempt.command)
+                !residentSnapshotPreferenceMatchesCommand(source, modelSelectionProofAttempt.command)
               ) {
                 throw new HostStoreError(
                   "MODEL_SELECTION_PROJECTION_TARGET_MISMATCH",
-                  "A digest-equal model projection does not report the exact requested model",
+                  "A digest-equal resident projection does not report the exact requested preference",
                 );
               }
               const committed = createCommittedModelSelectionAttempt(
                 modelSelectionProofAttempt,
                 source.latestCursor,
                 previousLineage.current.digest,
-                residentModelSelectionPublishedInvariantDigest(source, runtime),
+                residentModelSelectionPublishedInvariantDigest(
+                  source,
+                  runtime,
+                  modelSelectionProofAttempt.command,
+                ),
                 modelSelectionRunningReceipt,
                 source.generatedAt,
                 causalNow(modelSelectionProofAttempt.updatedAt, source.generatedAt),
@@ -5064,7 +5083,11 @@ export class HostStore {
         );
       }
       const modelSelectionInvariantDigest = modelSelectionProofAttempt
-        ? residentModelSelectionPublishedInvariantDigest(published, published.runtime!)
+        ? residentModelSelectionPublishedInvariantDigest(
+            published,
+            published.runtime!,
+            modelSelectionProofAttempt.command,
+          )
         : undefined;
       if (modelSelectionProofAttempt && modelSelectionRunningReceipt && modelSelectionInvariantDigest) {
         const committed = createCommittedModelSelectionAttempt(
@@ -6108,8 +6131,8 @@ export class HostStore {
    */
   async beginModelSelectionDispatch(commandValue: CommandEnvelope): Promise<ResidentSessionBinding> {
     const command = CommandEnvelopeSchema.parse(commandValue);
-    if (command.command.kind !== "model.select") {
-      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This dispatch path accepts only model selection");
+    if (!isResidentPreferenceCommand(command)) {
+      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This dispatch path accepts only resident preference selection");
     }
     return this.exclusive(async () => {
       this.assertInitialized();
@@ -6135,6 +6158,24 @@ export class HostStore {
           "The resident session binding changed after model-selection admission",
         );
       }
+      if (command.command.kind === "thinking.select") {
+        const [snapshot, promptLock, abortLock] = await Promise.all([
+          this.readSnapshotUnlocked(command.threadId),
+          this.findResidentPromptLockUnlocked(command.threadId),
+          this.findResidentAbortLockUnlocked(command.threadId),
+        ]);
+        const rejection = validateCommandAgainstState(command, snapshot, true);
+        if (rejection) {
+          throw new HostStoreError(rejection.code, rejection.message, rejection.retryable);
+        }
+        if (promptLock || abortLock) {
+          throw new HostStoreError(
+            "RESIDENT_SESSION_BUSY",
+            "Change the reasoning level after the active resident mutation settles",
+            true,
+          );
+        }
+      }
       await this.assertNoOtherModelSelectionTransitionUnlocked(command, binding);
 
       const dispatchStartedAt = now();
@@ -6148,7 +6189,7 @@ export class HostStore {
         ...receipt,
         status: "running",
         queuePosition: undefined,
-        message: MODEL_SELECTION_RUNNING_MESSAGE,
+        message: residentPreferenceRunningMessage(command),
         error: undefined,
         updatedAt: dispatchStartedAt,
       });
@@ -6181,8 +6222,8 @@ export class HostStore {
     update: Pick<CommandReceipt, "status"> & Partial<Pick<CommandReceipt, "message" | "error">>,
   ): Promise<CommandReceipt> {
     const command = CommandEnvelopeSchema.parse(commandValue);
-    if (command.command.kind !== "model.select") {
-      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This receipt path accepts only model selection");
+    if (!isResidentPreferenceCommand(command)) {
+      throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "This receipt path accepts only resident preference selection");
     }
     if (update.status !== "completed" && update.status !== "failed" && update.status !== "uncertain") {
       throw new HostStoreError(
@@ -7625,10 +7666,23 @@ export class HostStore {
       } else {
         rejection = dispatcherUnavailable ?? validateCommandAgainstState(command, sourceSnapshot, canDispatchLive);
       }
-      if (!rejection && command.command.kind === "model.select") {
+      if (!rejection && isResidentPreferenceCommand(command)) {
         try {
           await this.assertModelSelectionAttemptCapacityUnlocked();
           modelSelectionBinding = await this.resolveModelSelectionBindingUnlocked(command);
+          if (command.command.kind === "thinking.select") {
+            const [promptLock, abortLock] = await Promise.all([
+              this.findResidentPromptLockUnlocked(command.threadId),
+              this.findResidentAbortLockUnlocked(command.threadId),
+            ]);
+            if (promptLock || abortLock) {
+              throw new HostStoreError(
+                "RESIDENT_SESSION_BUSY",
+                "Change the reasoning level after the active resident mutation settles",
+                true,
+              );
+            }
+          }
         } catch (error) {
           rejection = error instanceof HostStoreError
             ? error.toStructuredError()
@@ -7654,6 +7708,12 @@ export class HostStore {
         (command.command.kind === "prompt" || command.command.kind === "abort")
       ) {
         try {
+          if (command.command.kind === "prompt") {
+            await this.assertNoThinkingSelectionTransitionUnlocked(
+              command.threadId,
+              "A reasoning-level change must settle before another resident prompt starts",
+            );
+          }
           promptLock = await this.findResidentPromptLockUnlocked(command.threadId);
           abortLock = await this.findResidentAbortLockUnlocked(command.threadId);
           if (abortLock) {
@@ -7731,7 +7791,7 @@ export class HostStore {
       if (
         !rejection &&
         command.command.kind !== "abort" &&
-        command.command.kind !== "model.select" &&
+        !isResidentPreferenceCommand(command) &&
         command.command.kind !== "extension_ui.respond" &&
         sourceSnapshot.queueState.pendingCommandIds.length >= 1_000
       ) {
@@ -7744,8 +7804,10 @@ export class HostStore {
       rejection?.message ??
       (command.command.kind === "abort"
         ? "Abort admitted for live dispatch"
-        : command.command.kind === "model.select"
-          ? "Model selection admitted for live dispatch"
+        : isResidentPreferenceCommand(command)
+          ? command.command.kind === "model.select"
+            ? "Model selection admitted for live dispatch"
+            : "Reasoning level admitted for live dispatch"
           : command.command.kind === "extension_ui.respond"
             ? "Dialog response admitted for live dispatch"
           : command.command.kind === "prompt" && residentDispatchBinding
@@ -7758,7 +7820,7 @@ export class HostStore {
       sourceSnapshot &&
       thread &&
       command.command.kind !== "abort" &&
-      command.command.kind !== "model.select" &&
+      !isResidentPreferenceCommand(command) &&
       command.command.kind !== "extension_ui.respond" &&
       residentDispatchBinding === undefined
     ) {
@@ -7783,7 +7845,7 @@ export class HostStore {
       queuePosition:
         initialStatus === "admitted" &&
         command.command.kind !== "abort" &&
-        command.command.kind !== "model.select" &&
+        !isResidentPreferenceCommand(command) &&
         command.command.kind !== "extension_ui.respond" &&
         residentDispatchBinding === undefined
           ? (sourceSnapshot?.queueState.pendingCommandIds.length ?? 0) + 1
@@ -7856,7 +7918,7 @@ export class HostStore {
             }),
           }
         : {}),
-      ...(command.command.kind === "model.select"
+      ...(isResidentPreferenceCommand(command)
         ? {
             modelSelectionIdentity: ModelSelectionIdentityRecordSchema.parse({
               version: 1,
@@ -7866,7 +7928,7 @@ export class HostStore {
           }
         : {}),
       ...(initialStatus === "admitted" &&
-        command.command.kind === "model.select" &&
+        isResidentPreferenceCommand(command) &&
         modelSelectionBinding
           ? {
               modelSelectionAttempt: ModelSelectionAttemptSchema.parse({
@@ -8451,7 +8513,7 @@ export class HostStore {
           current.updatedAt !== attempt.dispatchStartedAt ||
           current.queuePosition !== undefined ||
           current.error !== undefined ||
-          current.message !== MODEL_SELECTION_RUNNING_MESSAGE)
+          current.message !== residentPreferenceRunningMessage(attempt.command))
       ) {
         throw new HostStoreError(
           "MODEL_SELECTION_ATTEMPT_INVALID",
@@ -8464,6 +8526,11 @@ export class HostStore {
         (current.status === "completed" && attempt.state === "projection_committed");
       const validPendingState =
         (current.status === "admitted" && attempt.state === "admitted") ||
+        // The durable dispatch marker is written before the running receipt.
+        // A crash between those writes has already crossed the no-replay
+        // boundary even though the public receipt is still admitted. Recover
+        // it below as uncertain instead of poisoning Store initialization.
+        (current.status === "admitted" && attempt.state === "dispatching") ||
         (current.status === "running" &&
           (attempt.state === "dispatching" || attempt.state === "projection_committed"));
       if (!validTerminalState && !validPendingState) {
@@ -8499,7 +8566,7 @@ export class HostStore {
           ...current,
           status: "completed",
           queuePosition: undefined,
-          message: "Recovered the durably published model selection after host restart",
+          message: residentPreferenceRecoveredMessage(attempt.command),
           error: undefined,
           updatedAt: causalNow(current.updatedAt, attempt.updatedAt),
         });
@@ -8518,10 +8585,10 @@ export class HostStore {
         ...current,
         status: "uncertain",
         queuePosition: undefined,
-        message: "Host service restarted before model selection could be authoritatively reconciled",
+        message: "Host service restarted before the resident preference could be authoritatively reconciled",
         error: {
           code: "MODEL_SELECTION_RESTART_UNCERTAIN",
-          message: "Model selection was not replayed after the host service or Prime client identity changed",
+          message: "The resident preference mutation was not replayed after the host service or Prime client identity changed",
           retryable: false,
         },
         updatedAt: now(),
@@ -8705,8 +8772,9 @@ export class HostStore {
       (snapshot.generatedAt !== proof.publishedAt ||
         lineage.current.digest !== proof.projectionDigest ||
         !snapshot.runtime ||
-        snapshot.runtime.model !== residentSelectedModelIdentity(attempt.command) ||
-        residentModelSelectionPublishedInvariantDigest(snapshot, snapshot.runtime) !== proof.invariantDigest)
+        !residentSnapshotPreferenceMatchesCommand(snapshot, attempt.command) ||
+        residentModelSelectionPublishedInvariantDigest(snapshot, snapshot.runtime, attempt.command) !==
+          proof.invariantDigest)
     ) {
       throw new HostStoreError(
         "MODEL_SELECTION_COMMITTED_PROOF_INVALID",
@@ -9239,10 +9307,10 @@ export class HostStore {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ): Promise<Readonly<{ attempt: ModelSelectionAttempt; runningReceipt: CommandReceipt }>> {
-    if (command.command.kind !== "model.select") {
+    if (!isResidentPreferenceCommand(command)) {
       throw new HostStoreError(
         "MODEL_SELECTION_COMMAND_REQUIRED",
-        "Model-selection projection authority requires an exact model.select command",
+        "Preference projection authority requires an exact preference command",
       );
     }
     const [identity, attempt, receipt] = await Promise.all([
@@ -9261,7 +9329,7 @@ export class HostStore {
       receipt.updatedAt !== attempt.dispatchStartedAt ||
       receipt.queuePosition !== undefined ||
       receipt.error !== undefined ||
-      receipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+      receipt.message !== residentPreferenceRunningMessage(command) ||
       attempt.updatedAt !== attempt.dispatchStartedAt ||
       !isDeepStrictEqual(identity.command, command) ||
       !isDeepStrictEqual(attempt.command, command) ||
@@ -9280,13 +9348,10 @@ export class HostStore {
         "The resident session binding changed before model-selection projection publication",
       );
     }
-    if (
-      !residentProjectionSelectedModelMatchesCommand(projection, command) ||
-      projection.runtime.model !== residentSelectedModelIdentity(command)
-    ) {
+    if (!residentProjectionPreferenceMatchesCommand(projection, command)) {
       throw new HostStoreError(
         "MODEL_SELECTION_PROJECTION_TARGET_MISMATCH",
-        "The authoritative resident projection does not report the exact requested model",
+        "The authoritative resident projection does not report the exact requested preference",
       );
     }
     return Object.freeze({ attempt, runningReceipt: receipt });
@@ -9401,6 +9466,19 @@ export class HostStore {
   private async assertNoModelSelectionTransitionUnlocked(threadId: string, message: string): Promise<void> {
     const attempts = await this.readModelSelectionTransitionsUnlocked();
     if (attempts.some((attempt) => attempt.command.threadId === threadId)) {
+      throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
+    }
+  }
+
+  private async assertNoThinkingSelectionTransitionUnlocked(threadId: string, message: string): Promise<void> {
+    const attempts = await this.readModelSelectionTransitionsUnlocked();
+    if (
+      attempts.some(
+        (attempt) =>
+          attempt.command.threadId === threadId &&
+          attempt.command.command.kind === "thinking.select",
+      )
+    ) {
       throw new HostStoreError("RESIDENT_DISPATCH_ACTIVE", message, true);
     }
   }
@@ -9842,10 +9920,10 @@ export class HostStore {
   }
 
   private async resolveModelSelectionBindingUnlocked(command: CommandEnvelope): Promise<ResidentSessionBinding> {
-    if (command.command.kind !== "model.select" || command.expectedExecutionGenerationId === undefined) {
+    if (!isResidentPreferenceCommand(command) || command.expectedExecutionGenerationId === undefined) {
       throw new HostStoreError(
         "MODEL_SELECTION_AUTHORITY_INVALID",
-        "Model selection requires an exact thread execution generation",
+        "Resident preference selection requires an exact thread execution generation",
       );
     }
     this.assertResidentSubsystemAvailable();
@@ -13136,10 +13214,10 @@ export class HostStore {
     recordedAt: string,
     message?: string,
   ): Promise<void> {
-    if (command.command.kind !== "model.select") {
+    if (!isResidentPreferenceCommand(command)) {
       throw new HostStoreError(
         "MODEL_SELECTION_COMMAND_REQUIRED",
-        "The model-selection journal accepts only exact model-selection envelopes",
+        "The resident-preference journal accepts only exact preference envelopes",
       );
     }
     await appendJsonLineOnce(
@@ -13148,7 +13226,7 @@ export class HostStore {
         version: 1,
         journalId: deterministicId(
           "journal",
-          "model-selection",
+          command.command.kind === "model.select" ? "model-selection" : "thinking-selection",
           command.deviceId,
           command.commandId,
           status,
@@ -13931,6 +14009,57 @@ function residentSelectedModelIdentity(command: CommandEnvelope): string {
   return `${command.command.providerId}/${command.command.modelId}`;
 }
 
+type ResidentPreferenceCommandEnvelope = CommandEnvelope & {
+  readonly command: Extract<
+    CommandEnvelope["command"],
+    { readonly kind: "model.select" | "thinking.select" }
+  >;
+};
+
+function isResidentPreferenceCommand(
+  command: CommandEnvelope,
+): command is ResidentPreferenceCommandEnvelope {
+  return command.command.kind === "model.select" || command.command.kind === "thinking.select";
+}
+
+function residentPreferenceRunningMessage(command: CommandEnvelope): string {
+  if (!isResidentPreferenceCommand(command)) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMAND_REQUIRED",
+      "A resident preference command is required to identify the running receipt",
+    );
+  }
+  return command.command.kind === "model.select"
+    ? MODEL_SELECTION_RUNNING_MESSAGE
+    : THINKING_SELECTION_RUNNING_MESSAGE;
+}
+
+function residentPreferenceRecoveredMessage(command: CommandEnvelope): string {
+  if (!isResidentPreferenceCommand(command)) {
+    throw new HostStoreError(
+      "MODEL_SELECTION_COMMAND_REQUIRED",
+      "A resident preference command is required to identify the recovered receipt",
+    );
+  }
+  return command.command.kind === "model.select"
+    ? "Recovered the durably published model selection after host restart"
+    : "Recovered the durably published reasoning level after host restart";
+}
+
+function residentPreferenceProofMatchesCommand(
+  proof: ModelSelectionProjectionProof,
+  command: CommandEnvelope,
+): boolean {
+  if (!isResidentPreferenceCommand(command)) return false;
+  if (command.command.kind === "thinking.select") {
+    return proof.selectedModel === undefined &&
+      proof.selectedThinkingLevel === command.command.level;
+  }
+  return proof.selectedThinkingLevel === undefined &&
+    proof.selectedModel?.providerId === command.command.providerId &&
+    proof.selectedModel.modelId === command.command.modelId;
+}
+
 function residentProjectionSelectedModelMatchesCommand(
   projection: ResidentProjectionSnapshot,
   command: CommandEnvelope,
@@ -13938,6 +14067,39 @@ function residentProjectionSelectedModelMatchesCommand(
   return command.command.kind === "model.select" &&
     projection.selectedModel?.providerId === command.command.providerId &&
     projection.selectedModel.modelId === command.command.modelId;
+}
+
+function residentRuntimeThinkingLevelMatchesCommand(
+  runtime: RuntimeSessionSummary,
+  command: CommandEnvelope,
+): boolean {
+  if (!isResidentPreferenceCommand(command)) return false;
+  return command.command.kind === "thinking.select" &&
+    runtime.thinkingLevel === command.command.level &&
+    runtime.availableThinkingLevels?.includes(command.command.level) === true;
+}
+
+function residentProjectionPreferenceMatchesCommand(
+  projection: ResidentProjectionSnapshot,
+  command: CommandEnvelope,
+): boolean {
+  if (!isResidentPreferenceCommand(command)) return false;
+  return command.command.kind === "model.select"
+    ? residentProjectionSelectedModelMatchesCommand(projection, command) &&
+        projection.runtime.model === residentSelectedModelIdentity(command)
+    : residentRuntimeThinkingLevelMatchesCommand(projection.runtime, command);
+}
+
+function residentSnapshotPreferenceMatchesCommand(
+  snapshot: ThreadProjectionSnapshot,
+  command: CommandEnvelope,
+): boolean {
+  if (!isResidentPreferenceCommand(command)) return false;
+  const runtime = snapshot.runtime;
+  if (!runtime) return false;
+  return command.command.kind === "model.select"
+    ? runtime.model === residentSelectedModelIdentity(command)
+    : residentRuntimeThinkingLevelMatchesCommand(runtime, command);
 }
 
 function modelSelectionCommittedAttemptForTransaction(
@@ -13972,19 +14134,23 @@ function createCommittedModelSelectionAttempt(
   publishedAt: string,
   updatedAt: string,
 ): ModelSelectionAttempt {
-  const selection = attempt.command.command;
-  if (selection.kind !== "model.select") {
+  if (!isResidentPreferenceCommand(attempt.command)) {
     throw new HostStoreError(
       "MODEL_SELECTION_COMMAND_REQUIRED",
-      "Committed model-selection proof requires an exact model.select command",
+      "Committed resident-preference proof requires an exact preference command",
     );
   }
+  const selection = attempt.command.command;
   const projectionProof: ModelSelectionProjectionProof = ModelSelectionProjectionProofSchema.parse({
     bindingFingerprint: residentDispatchAuthorityFingerprint(attempt.binding),
-    selectedModel: {
-      providerId: selection.providerId,
-      modelId: selection.modelId,
-    },
+    ...(selection.kind === "model.select"
+      ? {
+          selectedModel: {
+            providerId: selection.providerId,
+            modelId: selection.modelId,
+          },
+        }
+      : { selectedThinkingLevel: selection.level }),
     cursor,
     projectionDigest,
     invariantDigest,
@@ -14043,13 +14209,16 @@ function assertModelSelectionCommittedReceiptFence(
     : CommandReceiptSchema.parse({
         ...receipt,
         status: "running",
-        message: MODEL_SELECTION_RUNNING_MESSAGE,
+        message: isResidentPreferenceCommand(attempt.command)
+          ? residentPreferenceRunningMessage(attempt.command)
+          : MODEL_SELECTION_RUNNING_MESSAGE,
         error: undefined,
         queuePosition: undefined,
         updatedAt: attempt.dispatchStartedAt,
       });
   if (
-    runningReceipt.message !== MODEL_SELECTION_RUNNING_MESSAGE ||
+    !isResidentPreferenceCommand(attempt.command) ||
+    runningReceipt.message !== residentPreferenceRunningMessage(attempt.command) ||
     runningReceipt.updatedAt !== attempt.dispatchStartedAt ||
     runningReceipt.error !== undefined ||
     proof.runningReceiptDigest !== digestNormalizedJson(runningReceipt)
@@ -14065,6 +14234,7 @@ function residentModelSelectionRuntimeInvariant(runtime: RuntimeSessionSummary):
   const {
     model: _model,
     thinkingLevel: _thinkingLevel,
+    availableThinkingLevels: _availableThinkingLevels,
     serviceTier: _serviceTier,
     context,
     ...stable
@@ -14080,17 +14250,35 @@ function residentModelSelectionRuntimeInvariant(runtime: RuntimeSessionSummary):
 function residentModelSelectionRuntimeDeltaIsValid(
   previous: RuntimeSessionSummary,
   candidate: RuntimeSessionSummary,
+  command: CommandEnvelope,
 ): boolean {
+  if (!isResidentPreferenceCommand(command)) return false;
+  if (command.command.kind === "thinking.select") {
+    const { thinkingLevel: _previousThinkingLevel, ...previousStable } = previous;
+    const { thinkingLevel: _candidateThinkingLevel, ...candidateStable } = candidate;
+    return isDeepStrictEqual(previousStable, candidateStable);
+  }
   return isDeepStrictEqual(
     residentModelSelectionRuntimeInvariant(previous),
     residentModelSelectionRuntimeInvariant(candidate),
   );
 }
 
-function residentModelSelectionPrivateInvariantDigest(projection: ResidentProjectionSnapshot): string {
+function residentModelSelectionPrivateInvariantDigest(
+  projection: ResidentProjectionSnapshot,
+  command: CommandEnvelope,
+): string {
+  if (!isResidentPreferenceCommand(command)) {
+    throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "A resident preference command is required");
+  }
   return digestNormalizedJson({
     cursor: projection.cursor,
-    runtime: residentModelSelectionRuntimeInvariant(projection.runtime),
+    runtime: command.command.kind === "thinking.select"
+      ? (() => {
+          const { thinkingLevel: _thinkingLevel, ...stable } = projection.runtime;
+          return stable;
+        })()
+      : residentModelSelectionRuntimeInvariant(projection.runtime),
     transcript: projection.transcript,
     stream: projection.stream,
     childAgents: projection.childAgents,
@@ -14102,13 +14290,22 @@ function residentModelSelectionPrivateInvariantDigest(projection: ResidentProjec
 function residentModelSelectionPublishedInvariantDigest(
   snapshot: ThreadProjectionSnapshot,
   runtime: RuntimeSessionSummary,
+  command: CommandEnvelope,
 ): string {
+  if (!isResidentPreferenceCommand(command)) {
+    throw new HostStoreError("MODEL_SELECTION_COMMAND_REQUIRED", "A resident preference command is required");
+  }
   return digestNormalizedJson({
     cursor: {
       generation: snapshot.latestCursor.generation,
       sequence: snapshot.latestCursor.sequence,
     },
-    runtime: residentModelSelectionRuntimeInvariant(runtime),
+    runtime: command.command.kind === "thinking.select"
+      ? (() => {
+          const { thinkingLevel: _thinkingLevel, ...stable } = runtime;
+          return stable;
+        })()
+      : residentModelSelectionRuntimeInvariant(runtime),
     transcript: snapshot.materializedRecentBlocks,
     stream: snapshot.inProgressStream,
     childAgents: snapshot.childAgents,
@@ -14126,17 +14323,16 @@ function residentModelSelectionSameCursorDeltaIsValid(
   const previousRuntime = source.runtime;
   if (
     !previousRuntime ||
-    attempt.command.command.kind !== "model.select" ||
-    !residentProjectionSelectedModelMatchesCommand(candidate, attempt.command) ||
-    candidate.runtime.model !== residentSelectedModelIdentity(attempt.command) ||
-    !residentModelSelectionRuntimeDeltaIsValid(previousRuntime, candidate.runtime)
+    !isResidentPreferenceCommand(attempt.command) ||
+    !residentProjectionPreferenceMatchesCommand(candidate, attempt.command) ||
+    !residentModelSelectionRuntimeDeltaIsValid(previousRuntime, candidate.runtime, attempt.command)
   ) {
     return false;
   }
   return (
     residentPublishedProjectionDigest(source) === lineage.current.digest &&
-    residentModelSelectionPublishedInvariantDigest(source, previousRuntime) ===
-      residentModelSelectionPrivateInvariantDigest(candidate) &&
+    residentModelSelectionPublishedInvariantDigest(source, previousRuntime, attempt.command) ===
+      residentModelSelectionPrivateInvariantDigest(candidate, attempt.command) &&
     residentProjectionDigestWithRuntime(candidate, previousRuntime) === lineage.current.digest
   );
 }
@@ -15015,6 +15211,7 @@ function applyCommand(
       recap = "Waiting for Prime Agent to acknowledge the stop request.";
       break;
     case "model.select":
+    case "thinking.select":
       // Selection becomes visible only through a fresh authoritative resident
       // projection after Prime Agent has applied and verified the mutation.
       break;
@@ -15067,6 +15264,32 @@ function validateCommandAgainstState(
   }
   if (envelope.command.kind === "model.select" && !canDispatchLive) {
     return structured("LIVE_CONNECTION_REQUIRED", "Model selection requires a live resident Prime Agent session", true);
+  }
+  if (envelope.command.kind === "thinking.select") {
+    if (!canDispatchLive) {
+      return structured(
+        "LIVE_CONNECTION_REQUIRED",
+        "Reasoning level selection requires a live resident Prime Agent session",
+        true,
+      );
+    }
+    if (
+      !snapshot.runtime ||
+      snapshot.runtime.availableThinkingLevels?.includes(envelope.command.level) !== true
+    ) {
+      return structured(
+        "THINKING_LEVEL_UNAVAILABLE",
+        "The requested reasoning level is not reported by this Prime Agent session",
+        false,
+      );
+    }
+    if (residentSnapshotReportsActivity(snapshot)) {
+      return structured(
+        "RESIDENT_SESSION_BUSY",
+        "Change the reasoning level after the active turn finishes",
+        true,
+      );
+    }
   }
   if (envelope.command.kind === "approval.resolve") {
     const approvalCommand = envelope.command;

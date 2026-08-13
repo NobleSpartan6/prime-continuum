@@ -26,6 +26,42 @@ import {
 } from "../../src/shared/protocol";
 
 describe("host protocol schemas", () => {
+  it("keeps session-reported thinking levels optional, bounded, and unique", () => {
+    const runtime = {
+      runtime: "prime_agent" as const,
+      residency: "resident" as const,
+      thinkingLevel: "high",
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      steeringMode: "all" as const,
+      followUpMode: "one-at-a-time" as const,
+      messageCount: 0,
+      compactionCount: 0,
+      queuedActionCount: 0,
+      activeToolNames: [],
+    };
+
+    expect(RuntimeSessionSummarySchema.parse(runtime).availableThinkingLevels).toBeUndefined();
+    expect(RuntimeSessionSummarySchema.parse({
+      ...runtime,
+      availableThinkingLevels: ["off", "low", "medium", "high", "max"],
+    }).availableThinkingLevels).toEqual(["off", "low", "medium", "high", "max"]);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      availableThinkingLevels: ["high", "high"],
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      availableThinkingLevels: Array.from({ length: 129 }, (_, index) => `level-${index}`),
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      availableThinkingLevels: ["high\nforged"],
+    }).success).toBe(false);
+  });
+
   it("admits only the path-free resident resource inventory contract", () => {
     const runtime = {
       runtime: "prime_agent" as const,
@@ -517,6 +553,7 @@ describe("host protocol schemas", () => {
     { kind: "abort" },
     { kind: "approval.resolve", approvalId: "approval-1", decision: "approve" },
     { kind: "model.select", providerId: "openai", modelId: "gpt-5.6-sol" },
+    { kind: "thinking.select", level: "high" },
   ] as const)("requires an execution generation for $kind", (command) => {
     expect(
       CommandEnvelopeSchema.safeParse({
@@ -584,9 +621,42 @@ describe("host protocol schemas", () => {
     ]);
   });
 
-  it("publishes one immutable exact ten-scope vocabulary without accepting aliases or duplicates", () => {
+  it("bounds thinking selection and requires its exact least-privilege mobile scope", () => {
+    const base = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: "device-1",
+      commandId: "thinking-command-1",
+      expectedHostId: "host-1",
+      threadId: "thread-1",
+      issuedAt: new Date().toISOString(),
+      expectedExecutionGenerationId: "execution-1",
+    } as const;
+
+    expect(CommandEnvelopeSchema.safeParse({
+      ...base,
+      command: { kind: "thinking.select", level: "max" },
+    }).success).toBe(true);
+    expect(CommandEnvelopeSchema.safeParse({
+      ...base,
+      command: { kind: "thinking.select", level: "x".repeat(65) },
+    }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({
+      ...base,
+      command: { kind: "thinking.select", level: "high\nforged-journal-line" },
+    }).success).toBe(false);
+    expect(CommandEnvelopeSchema.safeParse({
+      ...base,
+      command: { kind: "thinking.select", level: "high", hiddenMutation: true },
+    }).success).toBe(false);
+    expect(RemoteDeviceScopesSchema.parse(["projection.read", "thinking.select"])).toEqual([
+      "projection.read",
+      "thinking.select",
+    ]);
+  });
+
+  it("publishes one immutable exact eleven-scope vocabulary without accepting aliases or duplicates", () => {
     expect(Object.isFrozen(REMOTE_DEVICE_SCOPES)).toBe(true);
-    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(10);
+    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(11);
     expect(REMOTE_DEVICE_SCOPES).toEqual([
       "projection.read",
       "thread.follow_up",
@@ -594,6 +664,7 @@ describe("host protocol schemas", () => {
       "thread.abort",
       "thread.start",
       "model.select",
+      "thinking.select",
       "approval.resolve",
       "extension_ui.respond",
       "run_location.change",

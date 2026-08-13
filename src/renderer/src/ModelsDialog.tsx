@@ -18,6 +18,7 @@ import {
   type RuntimeOAuthProgress,
   type RuntimeOAuthRequest,
   type RuntimeOAuthResult,
+  type ResidentThinkingLevelSelectionResult,
 } from './api'
 
 const MODEL_REVEAL_INCREMENT = 80
@@ -56,7 +57,10 @@ export interface ModelsDialogProps {
   threadId?: string
   executionGenerationId?: string
   currentModel?: string
+  currentThinkingLevel?: string
+  availableThinkingLevels?: string[]
   canSelectResidentModel: boolean
+  canSelectResidentThinkingLevel?: boolean
   canConnectRuntimeOAuth: boolean
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
@@ -72,6 +76,14 @@ type ModelSelectionView = {
   modelId: string
   modelName: string
   state: 'selecting' | 'completed' | 'rejected' | 'uncertain'
+  message: string
+  projected?: boolean
+  retryable?: boolean
+}
+
+type ThinkingLevelSelectionView = {
+  level: string
+  state: ResidentThinkingLevelSelectionResult['state'] | 'selecting'
   message: string
   projected?: boolean
   retryable?: boolean
@@ -97,7 +109,10 @@ export default function ModelsDialog({
   threadId,
   executionGenerationId,
   currentModel,
+  currentThinkingLevel,
+  availableThinkingLevels = [],
   canSelectResidentModel,
+  canSelectResidentThinkingLevel = false,
   canConnectRuntimeOAuth,
   onClose,
 }: ModelsDialogProps) {
@@ -105,6 +120,7 @@ export default function ModelsDialog({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ModelsCatalogError | null>(null)
   const [selection, setSelection] = useState<ModelSelectionView | null>(null)
+  const [thinkingSelection, setThinkingSelection] = useState<ThinkingLevelSelectionView | null>(null)
   const [oauth, setOAuth] = useState<RuntimeOAuthView | null>(null)
   const [query, setQuery] = useState('')
   const [selectedProviderId, setSelectedProviderId] = useState('all')
@@ -119,6 +135,7 @@ export default function ModelsDialog({
   const contentRootRef = useRef<HTMLDivElement>(null)
   const completedSelectionActionRef = useRef<HTMLButtonElement>(null)
   const selectionRequestRef = useRef(0)
+  const thinkingSelectionRequestRef = useRef(0)
   const oauthRequestRef = useRef(0)
   const providerRefreshRequestRef = useRef(0)
   const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
@@ -145,6 +162,8 @@ export default function ModelsDialog({
   useEffect(() => {
     selectionRequestRef.current += 1
     setSelection(null)
+    thinkingSelectionRequestRef.current += 1
+    setThinkingSelection(null)
   }, [open, selectionAuthorityKey])
 
   useEffect(() => {
@@ -275,13 +294,28 @@ export default function ModelsDialog({
       || selection?.state === 'uncertain'
       || (selection?.state === 'completed' && !selectionMatchesCurrentModel),
   )
+  const thinkingSelectionMatchesCurrent = Boolean(
+    thinkingSelection && thinkingSelection.level === currentThinkingLevel,
+  )
+  const thinkingSelectionCompletedOnHost = Boolean(
+    thinkingSelection?.state === 'completed' && !thinkingSelectionMatchesCurrent,
+  )
+  const thinkingSelectionLocksActions = Boolean(
+    thinkingSelection?.state === 'selecting'
+      || thinkingSelection?.state === 'uncertain'
+      || (thinkingSelection?.state === 'completed' && !thinkingSelectionMatchesCurrent),
+  )
+  const thinkingSelectionRejectedWithoutRetry = Boolean(
+    thinkingSelection?.state === 'rejected' && thinkingSelection.retryable === false,
+  )
+  const residentPreferenceBusy = selectionLocksActions || thinkingSelectionLocksActions
 
   useLayoutEffect(() => {
-    if (!selectionCompletedOnHost) return
+    if (!selectionCompletedOnHost && !thinkingSelectionCompletedOnHost) return
     const activeElement = document.activeElement
     if (activeElement && activeElement !== document.body && activeElement.isConnected) return
     completedSelectionActionRef.current?.focus()
-  }, [selectionCompletedOnHost])
+  }, [selectionCompletedOnHost, thinkingSelectionCompletedOnHost])
   const selectionStatusMessage = !selection
     ? ''
     : selection.state === 'selecting'
@@ -297,6 +331,22 @@ export default function ModelsDialog({
       ? `${selection.message} The outcome is unknown. Continuim will not send this model change again automatically. Do not retry it from this dialog; close Models & accounts and inspect the current thread first.`
       : selection.state === 'rejected'
         ? `${selection.message} No model change was applied.${selection.retryable ? ' You can choose a model again.' : ' This request cannot be retried.'}`
+        : ''
+  const thinkingSelectionStatusMessage = !thinkingSelection
+    ? ''
+    : thinkingSelection.state === 'selecting'
+      ? `Setting reasoning to ${thinkingSelection.level}…`
+      : thinkingSelection.state === 'completed'
+        ? thinkingSelectionMatchesCurrent
+          ? `Reasoning is now ${thinkingSelection.level}.`
+          : `${thinkingSelection.level} reasoning is selected on Prime Agent. The current label will update after the thread refreshes; Continuim will not resend it.`
+        : ''
+  const thinkingSelectionErrorMessage = !thinkingSelection
+    ? ''
+    : thinkingSelection.state === 'uncertain'
+      ? `${thinkingSelection.message} The outcome is unknown. Continuim will not send this reasoning change again automatically.`
+      : thinkingSelection.state === 'rejected'
+        ? `${thinkingSelection.message}${thinkingSelection.retryable ? ' Choose a level again.' : ''}`
         : ''
   const oauthInProgress = Boolean(
     oauth && ['starting', 'awaiting_user', 'committing', 'cancelling'].includes(oauth.state),
@@ -447,7 +497,7 @@ export default function ModelsDialog({
       !open
       || !threadId
       || !canSelectResidentModel
-      || selectionLocksActions
+      || residentPreferenceBusy
       || !model.available
       || modelMatchesCurrent(model.providerId, model.modelId, model.name, currentModel)
     ) return
@@ -499,6 +549,60 @@ export default function ModelsDialog({
               message: reason instanceof Error
                 ? reason.message
                 : 'The model selection response could not be verified.',
+            },
+      )
+    }
+  }
+
+  const selectThinkingLevel = async (level: string) => {
+    if (
+      !open ||
+      !threadId ||
+      !canSelectResidentThinkingLevel ||
+      !api.selectResidentThinkingLevel ||
+      residentPreferenceBusy ||
+      level === currentThinkingLevel ||
+      (thinkingSelectionRejectedWithoutRetry && thinkingSelection?.level === level) ||
+      !availableThinkingLevels.includes(level)
+    ) return
+
+    const requestId = thinkingSelectionRequestRef.current + 1
+    thinkingSelectionRequestRef.current = requestId
+    const requestAuthorityKey = selectionAuthorityKey
+    setThinkingSelection({
+      level,
+      state: 'selecting',
+      message: `Setting reasoning to ${level}.`,
+    })
+    try {
+      const result = await api.selectResidentThinkingLevel({ threadId, level })
+      if (
+        !dialogOpenRef.current ||
+        thinkingSelectionRequestRef.current !== requestId ||
+        selectionAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setThinkingSelection({ level, ...result })
+    } catch (reason: unknown) {
+      if (
+        !dialogOpenRef.current ||
+        thinkingSelectionRequestRef.current !== requestId ||
+        selectionAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setThinkingSelection(
+        isStaleHostAuthorityError(reason)
+          ? {
+              level,
+              state: 'rejected',
+              retryable: false,
+              message: 'The active host or thread changed before this setting could be verified.',
+            }
+          : {
+              level,
+              state: 'uncertain',
+              retryable: false,
+              message: reason instanceof Error
+                ? reason.message
+                : 'The reasoning-level response could not be verified.',
             },
       )
     }
@@ -589,6 +693,7 @@ export default function ModelsDialog({
 
   const closeDialog = () => {
     selectionRequestRef.current += 1
+    thinkingSelectionRequestRef.current += 1
     oauthRequestRef.current += 1
     const oauthRequest = activeOAuthRequestRef.current
     activeOAuthRequestRef.current = null
@@ -714,6 +819,51 @@ export default function ModelsDialog({
                 </div>
                 <span className="catalog-freshness"><span aria-hidden="true" /> Updated {formatCatalogTime(catalog.observedAt)}</span>
               </div>
+
+              {availableThinkingLevels.length > 0 && (
+                <div className="reasoning-control">
+                  <span className="reasoning-control__current">
+                    <small>Current</small>
+                    <strong>{currentModel ?? 'Prime Agent model'}</strong>
+                  </span>
+                  <label htmlFor="resident-thinking-level">Reasoning</label>
+                  <select
+                    id="resident-thinking-level"
+                    value={thinkingSelection && thinkingSelection.state !== 'rejected'
+                      ? thinkingSelection.level
+                      : currentThinkingLevel ?? ''}
+                    disabled={!canSelectResidentThinkingLevel || residentPreferenceBusy}
+                    aria-describedby="resident-thinking-level-status"
+                    onChange={(event) => void selectThinkingLevel(event.target.value)}
+                  >
+                    {!currentThinkingLevel && <option value="" disabled>Choose level</option>}
+                    {currentThinkingLevel && !availableThinkingLevels.includes(currentThinkingLevel) && (
+                      <option value={currentThinkingLevel} disabled>{formatThinkingLevel(currentThinkingLevel)}</option>
+                    )}
+                    {availableThinkingLevels.map((level) => (
+                      <option
+                        key={level}
+                        value={level}
+                        disabled={thinkingSelectionRejectedWithoutRetry && thinkingSelection?.level === level}
+                      >
+                        {formatThinkingLevel(level)}
+                      </option>
+                    ))}
+                  </select>
+                  <span id="resident-thinking-level-status" role={thinkingSelectionErrorMessage ? 'alert' : 'status'} aria-live="polite">
+                    {thinkingSelectionErrorMessage || thinkingSelectionStatusMessage || (
+                      canSelectResidentThinkingLevel
+                        ? 'Applies to the next prompt.'
+                        : 'Available when this session is idle.'
+                    )}
+                  </span>
+                  {thinkingSelectionCompletedOnHost && (
+                    <button ref={completedSelectionActionRef} className="button button--quiet" type="button" onClick={closeDialog}>
+                      Done
+                    </button>
+                  )}
+                </div>
+              )}
 
               {selectedProvider && !selectedProvider.configured && (
                 <div
@@ -917,7 +1067,7 @@ export default function ModelsDialog({
                             className="button button--secondary model-row__select"
                             type="button"
                             aria-label={`${selectionButtonLabel.replace('…', '')} ${model.name}`}
-                            disabled={selectionLocksActions || rejectedWithoutRetry}
+                            disabled={residentPreferenceBusy || rejectedWithoutRetry}
                             onClick={() => void selectModel(model)}
                           >
                             {selectingTarget && <Icon icon={Loader2} size={14} />}
@@ -997,6 +1147,10 @@ function formatTokenCapacity(value: number): string {
   if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1))}M`
   if (value >= 1_000) return `${Number((value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1))}K`
   return String(value)
+}
+
+function formatThinkingLevel(level: string): string {
+  return level.replace(/[_-]+/g, ' ').replace(/^./, (character) => character.toLocaleUpperCase())
 }
 
 function formatCatalogTime(value: string): string {

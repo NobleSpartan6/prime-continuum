@@ -214,7 +214,11 @@ describe('resident lifecycle smoke structure', () => {
       process.platform === 'win32' ? ['candidate_evaluation_probe_v1'] : [],
     )
     expect(readiness).toContain('EXPECTED_WARMED_CAPABILITIES.every')
+    expect(readiness).toContain('RESIDENT_THINKING_LEVELS_CAPABILITY) === expectCommandCapability')
+    expect(readiness).toContain('RESIDENT_EXTENSION_UI_CAPABILITY) === expectCommandCapability')
     expect(readiness).not.toContain('lastHealth.capabilities.includes(CANDIDATE_EVALUATION_CAPABILITY)')
+    expect(smokeSource).toContain('Ready health resident thinking capability differs from exact binding state')
+    expect(smokeSource).toContain('Ready health resident extension UI capability differs from exact binding state')
     expect(smokeSource).toContain('const residentDaemonSocketRoot = await realpath(tmpdir());')
     expect(smokeSource).toContain('residentDaemonEndpoint(dataDirectory, residentDaemonSocketRoot)')
   })

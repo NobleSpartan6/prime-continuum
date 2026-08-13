@@ -23,6 +23,8 @@ const expectedTargets = [
   ['mobile-inspector-390', 390, 844, 'idle', undefined],
   ['model-selection-dialog-390', 390, 844, 'model-selection', undefined],
   ['model-selection-dialog-short-320', 320, 256, 'model-selection', undefined],
+  ['reasoning-control-dialog-390', 390, 844, 'model-selection', undefined],
+  ['reasoning-control-dialog-short-320', 320, 256, 'model-selection', undefined],
   ['prime-oauth-dialog-390', 390, 844, 'prime-oauth', undefined],
   ['prime-oauth-dialog-short-320', 320, 256, 'prime-oauth', undefined],
   ['desktop-prompt-admission', 1200, 800, 'prompt-admission', undefined],

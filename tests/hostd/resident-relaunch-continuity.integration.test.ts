@@ -333,6 +333,10 @@ function createAdapter(
       await store.publishResidentModelSelectionProjection(command, binding, projection);
       daemon.chronology.push(`store:model-projection:${binding.activeSessionId}`);
     },
+    publishThinkingSelectionProjection: async (command, binding, projection) => {
+      await store.publishResidentModelSelectionProjection(command, binding, projection);
+      daemon.chronology.push(`store:thinking-projection:${binding.activeSessionId}`);
+    },
     spawnFactory: () => daemon.spawnLauncher(),
     connectTimeoutMs: 100,
     startupTimeoutMs: 100,
