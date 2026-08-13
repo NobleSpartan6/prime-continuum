@@ -83,6 +83,46 @@ describe("verified browser bridge arguments", () => {
 });
 
 describe("verified browser host environment", () => {
+  it("keeps cold browser startup and exact commit custody explicitly bounded", async () => {
+    const [bridgeSource, hostSource] = await Promise.all([
+      readFile(join(process.cwd(), "runtime", "prime-agent", "bridge", "browser-bridge.mjs"), "utf8"),
+      readFile(join(process.cwd(), "runtime", "prime-agent", "bridge", "browser-host.cjs"), "utf8"),
+    ]);
+
+    expect(bridgeSource).toContain("const DOCTOR_TIMEOUT_MS = 15_000;");
+    expect(bridgeSource).toContain("const START_TIMEOUT_MS = 30_000;");
+    expect(bridgeSource).toContain("timeout: DOCTOR_TIMEOUT_MS");
+    expect(bridgeSource).toContain("firstWindow({ timeout: DOCTOR_TIMEOUT_MS })");
+    expect(hostSource).toContain("const COMMIT_TIMEOUT_MS = 60_000;");
+  });
+
+  it("routes immediate dead-lock recovery only through exact close and delete-data", async () => {
+    const bridgeSource = await readFile(
+      join(process.cwd(), "runtime", "prime-agent", "bridge", "browser-bridge.mjs"),
+      "utf8",
+    );
+    const routerStart = bridgeSource.indexOf("  switch (command) {");
+    const routerEnd = bridgeSource.indexOf("\n}\n\nasync function verifiedEnvironment", routerStart);
+    const router = bridgeSource.slice(routerStart, routerEnd);
+    const branch = (command: string) => {
+      const marker = `case "${command}":`;
+      const start = router.indexOf(marker);
+      if (start < 0) return "";
+      const boundaries = [
+        router.indexOf("\n    case ", start + marker.length),
+        router.indexOf("\n    default:", start + marker.length),
+      ].filter((index) => index >= 0);
+      return router.slice(start, boundaries.length > 0 ? Math.min(...boundaries) : undefined);
+    };
+
+    expect(router.match(/deadOwnerGraceMs: 0/g)).toHaveLength(2);
+    expect(branch("close")).toContain("{ deadOwnerGraceMs: 0 }");
+    expect(branch("delete-data")).toContain("{ deadOwnerGraceMs: 0 }");
+    expect(branch("open")).toContain("openVerifiedBrowser");
+    expect(branch("open")).not.toContain("deadOwnerGraceMs");
+    expect(branch("detach")).not.toContain("deadOwnerGraceMs");
+  });
+
   it("uses a browser-only doctor host that cannot collide with the desktop single-instance lock", async () => {
     const [bridgeSource, doctorHostSource] = await Promise.all([
       readFile(join(process.cwd(), "runtime", "prime-agent", "bridge", "browser-bridge.mjs"), "utf8"),
@@ -493,6 +533,60 @@ describe("verified browser session serialization", () => {
       await expect(withBrowserSessionLock(directory, async () => "overlap"))
         .rejects.toMatchObject({ code: "SESSION_BUSY" });
       expect(await readFile(lockPath, "utf8")).toContain(`"pid":${process.pid}`);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a fresh dead lock busy by default and reclaims it only with zero grace", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-browser-fresh-dead-lock-"));
+    const lockPath = join(directory, "operation.lock");
+    try {
+      await writeFile(lockPath, operationRecord(2_147_483_647), { mode: 0o600 });
+      const freshMtimeMs = (await lstat(lockPath)).mtimeMs;
+      const ownerStatus = () => "dead" as const;
+      await expect(withBrowserSessionLock(directory, async () => "too-early", {
+        now: () => freshMtimeMs,
+        ownerStatus,
+      })).rejects.toMatchObject({ code: "SESSION_BUSY" });
+      await expect(readFile(lockPath, "utf8")).resolves.toContain('"kind":"operation"');
+
+      await expect(withBrowserSessionLock(directory, async () => "recovered", {
+        deadOwnerGraceMs: 0,
+        now: () => freshMtimeMs,
+        ownerStatus,
+      })).resolves.toBe("recovered");
+      await expect(readFile(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(directory)).filter((entry) => entry.startsWith("operation.lock.reclaim-"))).toHaveLength(1);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["live", "unknown"] as const)("never reclaims a fresh %s owner with zero grace", async (status) => {
+    const directory = await mkdtemp(join(tmpdir(), `prime-browser-fresh-${status}-lock-`));
+    const lockPath = join(directory, "operation.lock");
+    try {
+      await writeFile(lockPath, operationRecord(2_147_483_647), { mode: 0o600 });
+      const freshMtimeMs = (await lstat(lockPath)).mtimeMs;
+      await expect(withBrowserSessionLock(directory, async () => "unsafe", {
+        deadOwnerGraceMs: 0,
+        now: () => freshMtimeMs,
+        ownerStatus: () => status,
+      })).rejects.toMatchObject({ code: "SESSION_BUSY" });
+      await expect(readFile(lockPath, "utf8")).resolves.toContain('"kind":"operation"');
+      expect((await readdir(directory)).filter((entry) => entry.startsWith("operation.lock.reclaim-"))).toEqual([]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([-1, 120_001, 0.5, Number.NaN])("rejects an unbounded dead-owner grace: %s", async (deadOwnerGraceMs) => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-browser-invalid-dead-grace-"));
+    try {
+      await expect(withBrowserSessionLock(directory, async () => "invalid", { deadOwnerGraceMs }))
+        .rejects.toThrow("Browser dead-owner grace must be a bounded integer");
+      await expect(readdir(directory)).resolves.toEqual([]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

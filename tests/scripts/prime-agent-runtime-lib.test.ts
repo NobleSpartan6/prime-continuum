@@ -422,7 +422,7 @@ describe("Prime Agent runtime tree attestation", () => {
     );
   });
 
-  it("gives the verified browser smoke a bounded action timeout for slower Linux hosts", async () => {
+  it("gives cold browser startup and screenshot capture distinct bounded smoke custody", async () => {
     const root = await makeRuntimeFixture("runtime-browser-smoke-timeout");
     const runtimeExecutable = await realpath(process.execPath);
     const calls: Array<{ args: string[]; options: SmokeRunnerOptions }> = [];
@@ -469,8 +469,111 @@ describe("Prime Agent runtime tree attestation", () => {
       operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
     });
     expect(calls).toHaveLength(8);
+    const doctorCall = calls.find(({ args }) => args[1] === "doctor");
+    const openCall = calls.find(({ args }) => args[2] === "open");
     const screenshotCall = calls.find(({ args }) => args[2] === "screenshot");
+    expect(doctorCall?.options.timeoutMs).toBe(25_000);
+    expect(openCall?.options.timeoutMs).toBe(45_000);
     expect(screenshotCall?.options.timeoutMs).toBe(40_000);
+  });
+
+  it("closes one exact session after an open rejection before removing smoke custody", async () => {
+    const root = await makeRuntimeFixture("runtime-browser-smoke-open-rejection");
+    const runtimeExecutable = await realpath(process.execPath);
+    const calls: Array<{ args: string[]; options: SmokeRunnerOptions }> = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options: SmokeRunnerOptions,
+    ): Promise<{ stdout: string; stderr: string }> => {
+      expect(command).toBe(runtimeExecutable);
+      calls.push({ args, options });
+      const operation = args[1] === "doctor" ? "doctor" : args[2];
+      if (operation === "doctor") return { stdout: exactBrowserDoctorResult(), stderr: "" };
+      if (operation === "open") throw new Error("simulated open rejection");
+      return { stdout: "", stderr: "" };
+    };
+
+    await expect(runtimeLib.smokeBrowserBridge(root, {
+      runtimeExecutable,
+      policy: fixtureInputs().policy,
+      commandRunner,
+    })).rejects.toThrow("simulated open rejection");
+
+    const openCall = calls.find(({ args }) => args[2] === "open");
+    const closeCalls = calls.filter(({ args }) => args[2] === "close");
+    expect(closeCalls).toHaveLength(1);
+    expect(closeCalls[0]?.args[1]).toBe(openCall?.args[1]);
+    expect(closeCalls[0]?.options.timeoutMs).toBe(10_000);
+    await expect(readdir(openCall?.options.cwd ?? "")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed and retains smoke custody when exact close fails", async () => {
+    const root = await makeRuntimeFixture("runtime-browser-smoke-close-failure");
+    const runtimeExecutable = await realpath(process.execPath);
+    let scratchDirectory: string | undefined;
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options: SmokeRunnerOptions,
+    ): Promise<{ stdout: string; stderr: string }> => {
+      expect(command).toBe(runtimeExecutable);
+      scratchDirectory = options.cwd;
+      const operation = args[1] === "doctor" ? "doctor" : args[2];
+      if (operation === "doctor") return { stdout: exactBrowserDoctorResult(), stderr: "" };
+      if (operation === "open") throw new Error("simulated open rejection");
+      if (operation === "close") throw new Error("simulated exact close failure");
+      return { stdout: "", stderr: "" };
+    };
+
+    try {
+      await expect(runtimeLib.smokeBrowserBridge(root, {
+        runtimeExecutable,
+        policy: fixtureInputs().policy,
+        commandRunner,
+      })).rejects.toThrow("simulated exact close failure");
+      expect(scratchDirectory).toBeDefined();
+      await expect(readdir(scratchDirectory ?? "")).resolves.toContain("state");
+    } finally {
+      if (scratchDirectory) await rm(scratchDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and retains evidence when close cannot prove retirement", async () => {
+    const root = await makeRuntimeFixture("runtime-browser-smoke-retirement-failure");
+    const runtimeExecutable = await realpath(process.execPath);
+    let scratchDirectory: string | undefined;
+    let launchEvidencePath: string | undefined;
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options: SmokeRunnerOptions,
+    ): Promise<{ stdout: string; stderr: string }> => {
+      expect(command).toBe(runtimeExecutable);
+      scratchDirectory = options.cwd;
+      const operation = args[1] === "doctor" ? "doctor" : args[2];
+      if (operation === "doctor") return { stdout: exactBrowserDoctorResult(), stderr: "" };
+      if (operation === "open") {
+        const stateDirectory = options.env?.PRIME_CONTINUIM_BROWSER_STATE_DIR;
+        if (!stateDirectory) throw new Error("browser smoke state directory missing");
+        launchEvidencePath = join(stateDirectory, "launch.json");
+        await writeFile(launchEvidencePath, "retained evidence\n", { mode: 0o600 });
+        throw new Error("simulated open rejection");
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    try {
+      await expect(runtimeLib.smokeBrowserBridge(root, {
+        runtimeExecutable,
+        policy: fixtureInputs().policy,
+        commandRunner,
+      })).rejects.toThrow("Browser smoke retained private lifecycle state: launch.json");
+      expect(launchEvidencePath).toBeDefined();
+      await expect(readFile(launchEvidencePath ?? "", "utf8")).resolves.toBe("retained evidence\n");
+    } finally {
+      if (scratchDirectory) await rm(scratchDirectory, { recursive: true, force: true });
+    }
   });
 
   it("retains bounded stdout and stderr when a runtime command fails", async () => {
@@ -733,6 +836,16 @@ interface SmokeRunnerOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+}
+
+function exactBrowserDoctorResult(): string {
+  return JSON.stringify({
+    bridgeVersion: 1,
+    controller: "playwright-core/1.63.0-alpha-2026-08-05",
+    engine: "verified-electron-host",
+    protocol: "prime-continuim.browser.v1",
+    ready: true,
+  });
 }
 
 describe("Prime Agent package seed selection", () => {
