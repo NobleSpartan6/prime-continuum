@@ -18,11 +18,14 @@ import {
   assertRuntimeAttestationMatches,
   extractEmbeddedRuntimeAttestation,
   parseRuntimeAttestation,
+  readElectronRuntimeIdentity,
+  readNodeRuntimeIdentity,
 } from './runtime-attestation-lib.mjs'
 import { createPrimeAgentSmokeCustody } from './prime-agent-smoke-custody-lib.mjs'
 
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'ascii')
 const FUSE_ENABLED = '1'.charCodeAt(0)
+const FUSE_DISABLED = '0'.charCodeAt(0)
 const PACKAGE_SMOKE_MARKER = 'PRIME_CONTINUIM_PACKAGE_SMOKE_OK'
 const execFileAsync = promisify(execFile)
 const require = createRequire(import.meta.url)
@@ -71,7 +74,7 @@ function readRequiredFuses(executable) {
   invariant(wireLength >= 6 && wireOffset + 2 + wireLength <= executable.length, 'The Electron fuse wire is truncated.')
 
   const wire = executable.subarray(wireOffset + 2, wireOffset + 2 + wireLength)
-  invariant(wire[0] === FUSE_ENABLED, 'RunAsNode must remain enabled for the external packaged host daemon launcher.')
+  invariant(wire[0] === FUSE_DISABLED, 'RunAsNode must be disabled now that the host daemon has a separate Node executable.')
   invariant(wire[4] === FUSE_ENABLED, 'EnableEmbeddedAsarIntegrityValidation is not enabled in the packaged executable.')
   invariant(wire[5] === FUSE_ENABLED, 'OnlyLoadAppFromAsar is not enabled in the packaged executable.')
 
@@ -90,8 +93,14 @@ async function main() {
   const packageDirectory = resolve(process.argv[2] ?? 'release/win-unpacked')
   const executablePath = resolve(packageDirectory, 'Prime Continuim.exe')
   const packagedHostdPath = resolve(packageDirectory, 'resources/hostd/hostd.cjs')
+  const packagedHostNodePath = resolve(packageDirectory, 'resources/host-runtime/node.exe')
+  const packagedHostNodeLicensePath = resolve(packageDirectory, 'resources/host-runtime/LICENSE')
+  const packagedBrowserExecutablePath = resolve(packageDirectory, 'resources/browser-runtime/electron.exe')
   const asarPath = resolve(packageDirectory, 'resources/app.asar')
   const builtHostdPath = resolve('out/hostd/hostd.cjs')
+  const sourceHostNodePath = resolve('node_modules/node/node.exe')
+  const sourceHostNodeLicensePath = resolve('node_modules/node/LICENSE')
+  const sourceElectronPath = resolve(require('electron'))
   const builtHostdProvenancePath = resolve('out/hostd/hostd-build-provenance.json')
   const builtMainPath = resolve('out/main/index.js')
   const builtAttestationPath = resolve('out/main/runtime-attestation.json')
@@ -100,10 +109,16 @@ async function main() {
   const packagedRuntimeRoot = resolve(packageDirectory, 'resources/runtime-seed')
   const builtRendererDirectory = resolve('out/renderer')
 
-  const [executable, packagedHostd, builtHostd, builtHostdProvenanceBytes, builtMain, builtAttestationBytes, builtPreload, asarMetadata, projectPackageBytes] = await Promise.all([
+  const [executable, packagedHostd, builtHostd, packagedHostNode, sourceHostNode, packagedHostNodeLicense, sourceHostNodeLicense, packagedBrowserExecutable, sourceBrowserExecutable, builtHostdProvenanceBytes, builtMain, builtAttestationBytes, builtPreload, asarMetadata, projectPackageBytes] = await Promise.all([
     readFile(executablePath),
     readFile(packagedHostdPath),
     readFile(builtHostdPath),
+    readFile(packagedHostNodePath),
+    readFile(sourceHostNodePath),
+    readFile(packagedHostNodeLicensePath),
+    readFile(sourceHostNodeLicensePath),
+    readFile(packagedBrowserExecutablePath),
+    readFile(sourceElectronPath),
     readFile(builtHostdProvenancePath),
     readFile(builtMainPath, 'utf8'),
     readFile(builtAttestationPath),
@@ -147,6 +162,11 @@ async function main() {
   const builtHostdHash = sha256(builtHostd)
   const packagedHostdHash = sha256(packagedHostd)
   invariant(packagedHostdHash === builtHostdHash, 'The packaged host daemon does not match the host daemon built in this run.')
+  invariant(packagedHostNode.equals(sourceHostNode), 'The packaged host Node executable does not match the pnpm-pinned runtime bytes.')
+  invariant(packagedHostNodeLicense.equals(sourceHostNodeLicense), 'The packaged host Node license does not match the pnpm-pinned distribution.')
+  invariant(packagedBrowserExecutable.equals(sourceBrowserExecutable), 'The packaged browser Electron executable does not match the exact build runtime bytes.')
+  invariant(sha256(executable) !== sha256(packagedHostNode), 'The GUI Electron and host Node executable identities must be unequal.')
+  invariant(sha256(packagedBrowserExecutable) !== sha256(packagedHostNode), 'The browser Electron and host Node executable identities must be unequal.')
   const hostdProvenance = parseHostdBuildProvenance(builtHostdProvenanceBytes)
   invariant(
     hostdProvenance.bundleSha256.toUpperCase() === builtHostdHash,
@@ -217,17 +237,22 @@ async function main() {
   )
   invariant(packagedRuntime.manifest.tree.sha256 === runtimePointer.treeSha256, 'The packaged runtime pointer digest is stale.')
   const runtimeSmoke = await smokeRuntime(packagedRuntime.root, {
-    runtimeExecutable: executablePath,
-    electronRunAsNode: true,
+    runtimeExecutable: packagedHostNodePath,
+    electronRunAsNode: false,
     policy: inputs.policy,
   })
   const applicationSmoke = await smokePackagedApplication(executablePath, packageDirectory, packagedHostdPath)
+  const [guiRuntime, hostRuntime] = await Promise.all([
+    readElectronRuntimeIdentity(packagedBrowserExecutablePath),
+    readNodeRuntimeIdentity(packagedHostNodePath),
+  ])
   assertRuntimeAttestationMatches(attestation, {
     pointer: runtimePointer,
     manifest: packagedRuntime.manifest,
     manifestBytes: packagedRuntimeManifest,
     fileManifestBytes: packagedFileManifest,
-    runtimeVersions: runtimeSmoke.runtimeVersions,
+    guiRuntime,
+    hostRuntime,
     inputs,
   })
 
@@ -254,7 +279,7 @@ async function main() {
     fuses: {
       version: fuses.version,
       wireLength: fuses.wireLength,
-      runAsNode: true,
+      runAsNode: false,
       embeddedAsarIntegrityValidation: true,
       onlyLoadAppFromAsar: true,
     },
@@ -265,6 +290,8 @@ async function main() {
     asarVerifiedFiles: asarArtifacts.fileCount,
     preloadEntry: 'out/preload/index.cjs',
     hostdSha256: packagedHostdHash,
+    hostNodeSha256: sha256(packagedHostNode),
+    browserElectronSha256: sha256(packagedBrowserExecutable),
     runtimeAttestation: {
       assurance: attestation.assurance,
       bytes: builtAttestationBytes.byteLength,
@@ -276,8 +303,7 @@ async function main() {
       treeSha256: packagedRuntime.manifest.tree.sha256,
       files: packagedRuntime.manifest.tree.fileCount,
       bytes: packagedRuntime.manifest.tree.totalBytes,
-      electron: runtimeSmoke.runtimeVersions.electron,
-      electronNode: runtimeSmoke.runtimeVersions.node,
+      hostNode: runtimeSmoke.runtimeVersions.node,
       electronModulesAbi: runtimeSmoke.runtimeVersions.modules,
       electronNapi: runtimeSmoke.runtimeVersions.napi,
     },
@@ -391,7 +417,11 @@ function selectPackagedMetadata(projectPackage) {
     'version',
     'private',
     'author',
+    'license',
     'description',
+    'homepage',
+    'repository',
+    'bugs',
     'main',
     'type',
     'packageManager',

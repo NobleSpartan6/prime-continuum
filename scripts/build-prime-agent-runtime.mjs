@@ -5,11 +5,13 @@ import {
   REPO_ROOT,
   RUNTIME_TEMPLATE_DIRECTORY,
   acquireBuildLock,
+  applyPinnedPrimeAgentSecurityPatches,
   createRuntimeManifest,
   discoverNpmCli,
   installLockedRuntime,
   loadRuntimeInputs,
   pruneEmptyRuntimeDirectories,
+  pruneReviewedRuntimeDirectories,
   pruneRuntimePackagingNoise,
   pruneRuntimeForTarget,
   removeLegacyRuntimeAssetCache,
@@ -49,7 +51,9 @@ try {
     reviewedAssetNames,
   );
   const npmVersion = await installLockedRuntime({ inputs, stagingDirectory, npmCli });
+  await applyPinnedPrimeAgentSecurityPatches(stagingDirectory);
   await pruneRuntimePackagingNoise(stagingDirectory, inputs.policy);
+  await pruneReviewedRuntimeDirectories(stagingDirectory, inputs.policy);
   await pruneRuntimeForTarget(stagingDirectory);
   await pruneEmptyRuntimeDirectories(stagingDirectory);
   const smoke = await smokeRuntime(stagingDirectory, {

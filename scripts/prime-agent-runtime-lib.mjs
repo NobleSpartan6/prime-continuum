@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   access,
+  chmod,
   copyFile,
   lstat,
   mkdtemp,
@@ -35,6 +36,83 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 5 * 60 * 1000;
 const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
+const DOWNLOAD_FETCH_ATTEMPTS = 3;
+const DOWNLOAD_RETRY_BASE_DELAY_MS = 250;
+const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 30_000;
+const BROWSER_SMOKE_SCREENSHOT_TIMEOUT_MS = 40_000;
+const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
+const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
+const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/src", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 1173, totalBytes: 3225460, treeSha256: "0c91eac7b18ed1988ecde01d2fb184abd2e4bf9950b22e248f89fe826af19570" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/examples", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 33, totalBytes: 53098, treeSha256: "da24af65ab0423b3ef4657dc4338a620733fb93a8ce34f8f3881b5f97b14253a" }),
+  Object.freeze({ relativePath: "node_modules/openai/src", package: "openai", version: "6.47.0", packageJsonSha256: "58936a8b912670945aff7e72a2c5cf435a36448215c7a3ed06569816198be88b", fileCount: 305, totalBytes: 2701229, treeSha256: "d113ee08904222ce6566aa83dab146f9a32a23ff29eb0c80eeb98bb6f1691253" }),
+  Object.freeze({ relativePath: "node_modules/zod/src", package: "zod", version: "4.4.3", packageJsonSha256: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e", fileCount: 286, totalBytes: 2237613, treeSha256: "69c0cc8db91a7c1072e20f4843863510c86a57975f86f46f2f927aa756111965" }),
+  Object.freeze({ relativePath: "node_modules/@anthropic-ai/sdk/src", package: "@anthropic-ai/sdk", version: "0.91.1", packageJsonSha256: "28aaef57dd52864476e417dac7b0b389ca65b9e4f3ee42631e450a9c1a654f82", fileCount: 108, totalBytes: 849702, treeSha256: "196379af890a46c70704840e2eda7dbb9a4d341e45fe9892dbd7034eb9bfec35" }),
+  Object.freeze({ relativePath: "node_modules/prime-agent/examples", package: "prime-agent", version: "0.7.2", packageJsonSha256: "0b45bc86527fcdb73dae76d319f6f50f6d40827a63614303664a57e8fe41c8cf", fileCount: 120, totalBytes: 920809, treeSha256: "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849" }),
+  Object.freeze({ relativePath: "node_modules/cmake-ts/src", package: "cmake-ts", version: "1.0.2", packageJsonSha256: "a351b1724f7c219bbe3abaf6e8557558565953464b760e4dbe0694d2165d0db6", fileCount: 26, totalBytes: 71551, treeSha256: "f1de2a37e85c5dbade19d727f177c9ec3e3d42c50952862dba98d12fd7b535a3" }),
+  Object.freeze({ relativePath: "node_modules/zeromq/src", package: "zeromq", version: "6.5.0", packageJsonSha256: "9fa3e9fd40a74cdace0c4fbed3821ab5fff68e91340f16b39e567edbcbab435e", fileCount: 47, totalBytes: 229916, treeSha256: "b78dc3f71311e1bddefad17fe0db0694abadee66641a53ac5e62a1f3b9b684e2" }),
+  Object.freeze({ relativePath: "node_modules/data-uri-to-buffer/src", package: "data-uri-to-buffer", version: "4.0.1", packageJsonSha256: "ad4f90a737ab5d8af4dad265e9218456e3779ca5beb70df38dd5feecf80121dd", fileCount: 1, totalBytes: 1785, treeSha256: "dbb9f6843ac7532c491c3b7d53bdf3f356c2432a4e5f2c2310509e155623a199" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/packages", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 224, totalBytes: 523201, treeSha256: "db88bccded8005daaf593e5b3155ef2c4a2ee18f9c7d8ccda7a86bceaac25bde" }),
+  Object.freeze({ relativePath: "node_modules/@mistralai/mistralai/tests", package: "@mistralai/mistralai", version: "2.6.1", packageJsonSha256: "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587", fileCount: 16, totalBytes: 105898, treeSha256: "6d78be7e61f91e0d7d129852fde93968d87398f0fe7d63a2024bd7689801a238" }),
+  Object.freeze({ relativePath: "node_modules/highlight.js/scss", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "d7dd896e7977d12dcb4c504b94ec5293fc5fc5c50ce903533039967086ea7700" }),
+  Object.freeze({ relativePath: "node_modules/highlight.js/styles", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "88ccb109d9fbd658b000acfdd7372215d909d7f7519b650b3406585832e2ff20" }),
+]);
+const PINNED_EXTRACT_ZIP_REPLACEMENT = Object.freeze({
+  dependency: "npm:@electron-internal/extract-zip@1.0.5",
+  packageName: "@electron-internal/extract-zip",
+  version: "1.0.5",
+  integrity: "sha512-+bqFCP98pLI0Tt0XQo1TmlXtwjWchISndDOxCkEcIuUgXWpBnLyRI+2DU+mesvnMMX6L1XDqYNA0lXNDHd/yiA==",
+});
+const PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH = Object.freeze({
+  relativePath: "node_modules/prime-agent/dist/bundle/chunk-CAY2X72A.js",
+  sourceSha256: "b987b4046d31c4928e306f56eacb1a3a2efb6cac195d03efd6fda3f6a16c6bbf",
+  sourceMarker: "// ../../node_modules/extract-zip/index.js",
+  endMarker: "// dist/main.js",
+  replacement: [
+    "// Prime Continuim: exact v0.7.2 security substitution for GHSA-jmr9-qjv8-65gv.",
+    "var require_extract_zip = () => { const loaded = require(\"extract-zip\"); return loaded.default ?? loaded; };",
+    "",
+  ].join("\n"),
+});
+const REVIEWED_RUNTIME_PROVIDER_CHUNKS = Object.freeze([
+  "anthropic-6NOSCFKS.js",
+  "azure-openai-responses-FMGB2C5I.js",
+  "google-ESBRCJKR.js",
+  "google-vertex-HHNXIE5P.js",
+  "mistral-F4QFN323.js",
+  "openai-codex-responses-MURTF24R.js",
+  "openai-completions-7BADVXTD.js",
+  "openai-responses-2NOQQGMV.js",
+]);
+const REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS = Object.freeze([
+  "openai",
+  "zod",
+  "@anthropic-ai/sdk",
+  "@mistralai/mistralai",
+  "data-uri-to-buffer",
+  "cmake-ts",
+  "zeromq",
+  "highlight.js",
+]);
+const PINNED_BROWSER_BRIDGE = Object.freeze({
+  protocol: "prime-continuim.browser.v1",
+  playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+  engine: "verified-electron-host",
+});
+const BROWSER_BRIDGE_FILES = Object.freeze([
+  Object.freeze({ relativePath: "browser-bridge.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-launch-journal.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-doctor-host.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-host.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "electron-node-shim.cjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-arguments.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-environment.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-session-lock.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "browser-bridge-state.mjs", mode: 0o644 }),
+  Object.freeze({ relativePath: "playwright-cli", mode: 0o755 }),
+  Object.freeze({ relativePath: "playwright-cli.cmd", mode: 0o644 }),
+  Object.freeze({ relativePath: "skills/playwright-cli/SKILL.md", mode: 0o644 }),
+]);
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const RUNTIME_TEMPLATE_DIRECTORY = join(REPO_ROOT, "runtime", "prime-agent");
@@ -165,12 +243,33 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   }
 
   const prime = lockfile.packages["node_modules/prime-agent"];
+  const extractZip = lockfile.packages["node_modules/extract-zip"];
   const zeromq = lockfile.packages["node_modules/zeromq"];
-  for (const [name, entry] of Object.entries({ "prime-agent": prime, zeromq })) {
+  const playwrightCore = lockfile.packages["node_modules/playwright-core"];
+  for (const [name, entry] of Object.entries({
+    "extract-zip": extractZip,
+    "playwright-core": playwrightCore,
+    "prime-agent": prime,
+    zeromq,
+  })) {
     const expected = policy.criticalPackages?.[name];
     if (!entry || entry.version !== expected?.version || entry.integrity !== expected?.integrity) {
       throw buildError(`Critical package ${name} drifted from runtime policy.`);
     }
+  }
+  if (
+    packageJson.dependencies?.["extract-zip"] !== PINNED_EXTRACT_ZIP_REPLACEMENT.dependency ||
+    packageJson.overrides?.["extract-zip"] !== PINNED_EXTRACT_ZIP_REPLACEMENT.dependency ||
+    extractZip?.name !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    policy.criticalPackages?.["extract-zip"]?.packageName !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    extractZip?.version !== PINNED_EXTRACT_ZIP_REPLACEMENT.version ||
+    extractZip?.integrity !== PINNED_EXTRACT_ZIP_REPLACEMENT.integrity ||
+    Object.entries(lockfile.packages).some(([packagePath, entry]) =>
+      packagePath !== "node_modules/extract-zip" &&
+      (packagePath.endsWith("/node_modules/extract-zip") || entry?.name === "extract-zip"),
+    )
+  ) {
+    throw buildError("Hardened extract-zip substitution drifted from runtime policy.");
   }
   if (
     policy.install?.ignoreScripts !== true ||
@@ -183,13 +282,53 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   }
   if (
     !Array.isArray(policy.packaging?.excludedBasenames) ||
-    JSON.stringify(policy.packaging.excludedBasenames) !== JSON.stringify([".gitkeep"])
+    JSON.stringify(policy.packaging.excludedBasenames) !== JSON.stringify(REVIEWED_RUNTIME_EXCLUDED_BASENAMES) ||
+    !Array.isArray(policy.packaging?.excludedSuffixes) ||
+    JSON.stringify(policy.packaging.excludedSuffixes) !== JSON.stringify(REVIEWED_RUNTIME_EXCLUDED_SUFFIXES) ||
+    !Array.isArray(policy.packaging?.reviewedPrunedDirectories) ||
+    JSON.stringify(policy.packaging.reviewedPrunedDirectories) !== JSON.stringify(REVIEWED_RUNTIME_PRUNED_DIRECTORIES)
   ) {
     throw buildError("Runtime packaging exclusions changed without review.");
   }
   for (const entrypoint of Object.values(policy.entrypoints ?? {})) {
     assertSafeRelativePath(entrypoint, "runtime entrypoint");
   }
+  if (
+    packageJson.dependencies?.["playwright-core"] !== PINNED_BROWSER_BRIDGE.playwrightCoreVersion ||
+    !jsonEqual(policy.browserBridge, PINNED_BROWSER_BRIDGE) ||
+    policy.entrypoints?.browserBridge !== "bridge/browser-bridge.mjs" ||
+    policy.entrypoints?.browserHost !== "bridge/browser-host.cjs" ||
+    policy.entrypoints?.browserLauncher !== "bridge/playwright-cli" ||
+    policy.entrypoints?.browserLauncherWindows !== "bridge/playwright-cli.cmd" ||
+    policy.entrypoints?.browserSkill !== "bridge/skills/playwright-cli/SKILL.md"
+  ) {
+    throw buildError("Verified browser bridge policy changed without review.");
+  }
+}
+
+export async function applyPinnedPrimeAgentSecurityPatches(runtimeDirectory) {
+  const root = resolve(runtimeDirectory);
+  const target = join(root, ...PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.relativePath.split("/"));
+  const details = await lstat(target);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw buildError("Prime Agent bundle security patch target is not a plain file.");
+  }
+  const source = await readFile(target, "utf8");
+  if (sha256Text(source) !== PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceSha256) {
+    throw buildError("Prime Agent bundle security patch source drifted.");
+  }
+  const start = source.indexOf(PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceMarker);
+  const end = source.indexOf(PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.endMarker, start + 1);
+  if (start < 0 || end < 0 || end <= start) {
+    throw buildError("Prime Agent bundle security patch markers drifted.");
+  }
+  const patched = `${source.slice(0, start)}${PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.replacement}${source.slice(end)}`;
+  await writeFile(target, patched, { encoding: "utf8", flag: "w", mode: details.mode & 0o777 });
+  return Object.freeze({
+    relativePath: PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.relativePath,
+    sourceSha256: PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceSha256,
+    patchedSha256: sha256Text(patched),
+  });
 }
 
 export async function verifyReleaseAssets(inputs, cacheDirectory, options = {}) {
@@ -220,12 +359,7 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts, options) 
       noProgressTimeoutMs: options.noProgressTimeoutMs ?? DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
       controller,
     };
-    const response = await awaitDownloadProgress(
-      fetchAllowed(asset.url, allowedHosts, { fetchImpl: options.fetchImpl ?? fetch, signal: controller.signal }),
-      limits,
-      asset.fileName,
-      true,
-    );
+    const response = await fetchReleaseAssetWithRetry(asset, allowedHosts, options, limits);
     if (!response.ok || !response.body) {
       throw buildError(`Could not download ${asset.fileName}: HTTP ${response.status}.`);
     }
@@ -258,6 +392,41 @@ async function downloadVerifiedAsset(asset, destination, allowedHosts, options) 
     await rm(partial, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function fetchReleaseAssetWithRetry(asset, allowedHosts, options, limits) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const sleep = options.sleep ?? ((milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)));
+  for (let attempt = 1; attempt <= DOWNLOAD_FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      return await awaitDownloadProgress(
+        fetchAllowed(asset.url, allowedHosts, { fetchImpl, signal: limits.controller.signal }),
+        limits,
+        asset.fileName,
+        true,
+      );
+    } catch (error) {
+      if (attempt >= DOWNLOAD_FETCH_ATTEMPTS || !hasErrorCode(error, "UND_ERR_SOCKET")) throw error;
+      await awaitDownloadProgress(
+        Promise.resolve(sleep(DOWNLOAD_RETRY_BASE_DELAY_MS * attempt)),
+        limits,
+        asset.fileName,
+        true,
+      );
+    }
+  }
+  throw buildError(`Could not download ${asset.fileName}.`);
+}
+
+function hasErrorCode(error, expected) {
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    if (current.code === expected) return true;
+    seen.add(current);
+    current = current.cause;
+  }
+  return false;
 }
 
 async function fetchAllowed(url, allowedHosts, { fetchImpl, signal }) {
@@ -334,6 +503,15 @@ export async function installLockedRuntime({ inputs, stagingDirectory, npmCli })
     copyFile(join(inputs.templateDirectory, "package.json"), join(stagingDirectory, "package.json")),
     copyFile(join(inputs.templateDirectory, "package-lock.json"), join(stagingDirectory, "package-lock.json")),
   ]);
+  const bridgeSource = join(inputs.templateDirectory, "bridge");
+  const bridgeDestination = join(stagingDirectory, "bridge");
+  await mkdir(join(bridgeDestination, "skills", "playwright-cli"), { recursive: true });
+  await Promise.all(BROWSER_BRIDGE_FILES.map(async ({ relativePath, mode }) => {
+    const source = join(bridgeSource, ...relativePath.split("/"));
+    const destination = join(bridgeDestination, ...relativePath.split("/"));
+    await copyFile(source, destination);
+    await chmod(destination, mode);
+  }));
   const npmConfigPaths = {
     user: join(stagingDirectory, ".prime-continuim-user-npmrc"),
     global: join(stagingDirectory, ".prime-continuim-global-npmrc"),
@@ -383,8 +561,17 @@ export async function installLockedRuntime({ inputs, stagingDirectory, npmCli })
 
 export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
   const excludedBasenames = new Set(policy?.packaging?.excludedBasenames);
+  const excludedSuffixes = policy?.packaging?.excludedSuffixes;
   if (excludedBasenames.size < 1 || excludedBasenames.size !== policy.packaging.excludedBasenames.length) {
     throw buildError("Runtime packaging exclusions are invalid.");
+  }
+  if (
+    !Array.isArray(excludedSuffixes) ||
+    excludedSuffixes.length < 1 ||
+    new Set(excludedSuffixes).size !== excludedSuffixes.length ||
+    excludedSuffixes.some((suffix) => typeof suffix !== "string" || !/^\.[a-z.]{2,16}$/.test(suffix))
+  ) {
+    throw buildError("Runtime packaging exclusion suffixes are invalid.");
   }
   const removed = [];
   async function visit(directory, prefix) {
@@ -395,7 +582,10 @@ export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
       const absolutePath = join(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(absolutePath, relativePath);
-      } else if (entry.isFile() && excludedBasenames.has(entry.name)) {
+      } else if (
+        entry.isFile() &&
+        (excludedBasenames.has(entry.name) || excludedSuffixes.some((suffix) => entry.name.endsWith(suffix)))
+      ) {
         await rm(absolutePath, { force: false });
         removed.push(relativePath);
       }
@@ -403,6 +593,87 @@ export async function pruneRuntimePackagingNoise(runtimeDirectory, policy) {
   }
   await visit(runtimeDirectory, "");
   return Object.freeze(removed);
+}
+
+export async function pruneReviewedRuntimeDirectories(runtimeDirectory, policy) {
+  const reviewed = policy?.packaging?.reviewedPrunedDirectories;
+  if (!Array.isArray(reviewed) || reviewed.length < 1) {
+    throw buildError("Runtime reviewed directory pruning policy is invalid.");
+  }
+  const root = resolve(runtimeDirectory);
+  const rootDetails = await lstat(root);
+  if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) {
+    throw buildError("Runtime reviewed directory pruning root must be a plain directory.");
+  }
+
+  const validated = [];
+  for (const entry of reviewed) {
+    const relativePath = entry?.relativePath;
+    const packageName = entry?.package;
+    assertSafeRelativePath(relativePath, "reviewed runtime prune path");
+    if (
+      typeof packageName !== "string" ||
+      !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(packageName) ||
+      !relativePath.startsWith(`node_modules/${packageName}/`) ||
+      typeof entry.version !== "string" ||
+      !/^[a-f0-9]{64}$/.test(entry.packageJsonSha256) ||
+      !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 ||
+      !Number.isSafeInteger(entry.totalBytes) || entry.totalBytes < 1 ||
+      !/^[a-f0-9]{64}$/.test(entry.treeSha256)
+    ) {
+      throw buildError(`Runtime reviewed directory policy is invalid for ${relativePath ?? "(unknown)"}.`);
+    }
+
+    const packageDirectory = join(root, "node_modules", ...packageName.split("/"));
+    const packageDetails = await lstat(packageDirectory);
+    const target = join(root, ...relativePath.split("/"));
+    const targetDetails = await lstat(target);
+    if (
+      !packageDetails.isDirectory() || packageDetails.isSymbolicLink() ||
+      !targetDetails.isDirectory() || targetDetails.isSymbolicLink()
+    ) {
+      throw buildError(`Reviewed runtime prune target is not a plain package directory: ${relativePath}.`);
+    }
+    const packageJsonPath = join(packageDirectory, "package.json");
+    const packageJsonDetails = await lstat(packageJsonPath);
+    if (!packageJsonDetails.isFile() || packageJsonDetails.isSymbolicLink()) {
+      throw buildError(`Reviewed runtime package manifest is not a plain file: ${packageName}.`);
+    }
+    const packageJsonBytes = await readFile(packageJsonPath);
+    let packageJson;
+    try {
+      packageJson = JSON.parse(packageJsonBytes.toString("utf8"));
+    } catch (error) {
+      throw buildError(`Reviewed runtime package manifest is invalid: ${packageName}.`, { cause: error });
+    }
+    if (
+      packageJson.name !== packageName ||
+      packageJson.version !== entry.version ||
+      createHash("sha256").update(packageJsonBytes).digest("hex") !== entry.packageJsonSha256
+    ) {
+      throw buildError(`Reviewed runtime package identity drifted: ${packageName}.`);
+    }
+
+    const files = await collectRuntimeFiles(target, {
+      includeRuntimeMetadata: true,
+      rejectEmptyDirectories: true,
+    });
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const treeSource = files.map((file) => `${file.sha256} ${file.size} ${file.path}\n`).join("");
+    if (
+      files.length !== entry.fileCount ||
+      totalBytes !== entry.totalBytes ||
+      sha256Text(treeSource) !== entry.treeSha256
+    ) {
+      throw buildError(`Reviewed runtime prune target drifted: ${relativePath}.`);
+    }
+    validated.push({ relativePath, target });
+  }
+
+  for (const entry of validated) {
+    await rm(entry.target, { recursive: true, force: false, maxRetries: 5, retryDelay: 100 });
+  }
+  return Object.freeze(validated.map((entry) => entry.relativePath));
 }
 
 export async function pruneEmptyRuntimeDirectories(runtimeDirectory) {
@@ -534,6 +805,7 @@ async function assertExactLegacyRuntimeAssetCache(cacheRoot, allowed) {
 }
 
 export async function pruneRuntimeForTarget(runtimeDirectory) {
+  await pruneHardenedExtractZipForTarget(runtimeDirectory);
   const buildDirectory = join(runtimeDirectory, "node_modules", "zeromq", "build");
   const manifestPath = join(buildDirectory, "manifest.json");
   const manifest = await readJson(manifestPath);
@@ -585,6 +857,38 @@ export async function pruneRuntimeForTarget(runtimeDirectory) {
   });
 }
 
+async function pruneHardenedExtractZipForTarget(runtimeDirectory) {
+  const packageDirectory = join(runtimeDirectory, "node_modules", "extract-zip");
+  const packageJson = await readJson(join(packageDirectory, "package.json"));
+  if (
+    packageJson.name !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    packageJson.version !== PINNED_EXTRACT_ZIP_REPLACEMENT.version
+  ) {
+    throw buildError("Hardened extract-zip package identity drifted before target pruning.");
+  }
+  const target = (() => {
+    if (process.platform === "darwin") return "index.darwin-universal.node";
+    if (process.platform === "win32" && ["x64", "arm64"].includes(process.arch)) {
+      return `index.win32-${process.arch}-msvc.node`;
+    }
+    if (process.platform === "linux") {
+      const libc = targetLibcFamily() === "musl" ? "musl" : "gnu";
+      if (["x64", "arm64"].includes(process.arch)) return `index.linux-${process.arch}-${libc}.node`;
+      if (process.arch === "ia32" && libc === "gnu") return "index.linux-ia32-gnu.node";
+      if (process.arch === "arm" && libc === "gnu") return "index.linux-arm-gnueabihf.node";
+    }
+    throw buildError(`Hardened extract-zip has no reviewed prebuild for ${process.platform}-${process.arch}.`);
+  })();
+  const entries = await readdir(packageDirectory, { withFileTypes: true });
+  const nativeAddons = entries.filter((entry) => entry.isFile() && /^index\..+\.node$/.test(entry.name));
+  if (!nativeAddons.some((entry) => entry.name === target)) {
+    throw buildError(`Hardened extract-zip is missing ${target}.`);
+  }
+  await Promise.all(nativeAddons
+    .filter((entry) => entry.name !== target)
+    .map((entry) => rm(join(packageDirectory, entry.name), { force: false })));
+}
+
 export async function smokeRuntime(runtimeDirectory, options = {}) {
   const runtimeExecutable = await requireAbsoluteRealFile(options.runtimeExecutable ?? process.execPath, "runtime executable");
   const electronRunAsNode = options.electronRunAsNode ?? process.env.ELECTRON_RUN_AS_NODE === "1";
@@ -602,13 +906,42 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   const daemonClientPath = join(scratchDirectory, "runtime-daemon-client.mjs");
   const probeSource = [
     'import { createRequire } from "node:module";',
-    "const [moduleUrl, packageJsonPath] = process.argv.slice(2);",
+    'import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";',
+    'import { dirname, join } from "node:path";',
+    'import { fileURLToPath, pathToFileURL } from "node:url";',
+    "const [moduleUrl, packageJsonPath, scratchDirectory] = process.argv.slice(2);",
     "const runtime = await import(moduleUrl);",
     'if (typeof runtime.DaemonClient !== "function" || typeof runtime.DaemonAgentConnection?.attach !== "function") throw new Error("missing daemon exports");',
     "const require = createRequire(packageJsonPath);",
-    'const zeromq = require("zeromq");',
-    'if (!zeromq || (typeof zeromq !== "object" && typeof zeromq !== "function")) throw new Error("zeromq did not load");',
-    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
+    'const extractZipEntry = require.resolve("extract-zip");',
+    "const extractZipManifest = JSON.parse(await readFile(join(dirname(extractZipEntry), \"package.json\"), \"utf8\"));",
+    'if (extractZipManifest.name !== "@electron-internal/extract-zip" || extractZipManifest.version !== "1.0.5") throw new Error("hardened extract-zip identity changed");',
+    "const extractZipModule = await import(pathToFileURL(extractZipEntry).href);",
+    'if (typeof extractZipModule.default !== "function") throw new Error("hardened extract-zip default API changed");',
+    'const zipPath = join(scratchDirectory, "extract-probe.zip");',
+    'const extractDirectory = join(scratchDirectory, "extract-probe");',
+    'await writeFile(zipPath, Buffer.from("UEsDBAoAAAAAAOi6DF0M/H5NEAAAABAAAAAJAAAAcHJvYmUudHh0cHJpbWUtY29udGludWltClBLAQIeAwoAAAAAAOi6DF0M/H5NEAAAABAAAAAJAAAAAAAAAAEAAACkgQAAAABwcm9iZS50eHRQSwUGAAAAAAEAAQA3AAAANwAAAAAA", "base64"));',
+    "await mkdir(extractDirectory);",
+    "await extractZipModule.default(zipPath, { dir: extractDirectory });",
+    'if (await readFile(join(extractDirectory, "probe.txt"), "utf8") !== "prime-continuim\\n") throw new Error("hardened extract-zip smoke failed");',
+    `for (const packageName of ${JSON.stringify(REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS)}) {`,
+    "  const loaded = require(packageName);",
+    '  if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function")) throw new Error(`reviewed package entrypoint did not load: ${packageName}`);',
+    "}",
+    `for (const fileName of ${JSON.stringify(REVIEWED_RUNTIME_PROVIDER_CHUNKS)}) {`,
+    '  const loaded = await import(new URL(`./bundle/${fileName}`, moduleUrl));',
+    '  if (!loaded || Object.keys(loaded).length < 1) throw new Error(`provider chunk did not load: ${fileName}`);',
+    "}",
+    'const bundleDirectory = fileURLToPath(new URL("./bundle/", moduleUrl));',
+    'const bundleFiles = new Set((await readdir(bundleDirectory)).filter((fileName) => fileName.endsWith(".js")));',
+    'for (const fileName of bundleFiles) {',
+    '  const source = await readFile(new URL(`./bundle/${fileName}`, moduleUrl), "utf8");',
+    '  for (const match of source.matchAll(/(?:from\\s*|import\\s*\\()\\s*["\'](\\.\\/[^"\']+\\.js)["\']/g)) {',
+    '    const dependency = match[1].slice(2);',
+    '    if (!bundleFiles.has(dependency)) throw new Error(`missing local bundle import: ${fileName} -> ${dependency}`);',
+    '  }',
+    '}',
+    'process.stdout.write(JSON.stringify({ node: process.versions.node, modules: process.versions.modules, napi: process.versions.napi, platform: process.platform, arch: process.arch, bundleImportGraphComplete: true, ...(process.versions.electron ? { electron: process.versions.electron, runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1" } : {}) }));',
   ].join("\n");
   const retryWorkerProbeSource = [
     'import { resolve } from "node:path";',
@@ -628,7 +961,17 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     'const expected = JSON.stringify([{ kind: "persist", intentionalStop: false, lifecycle: "recovering", consecutiveFailures: 0 }, { kind: "recover", lifecycle: "recovering" }]);',
     'if (JSON.stringify(events) !== expected) throw new Error(`retry_worker ordering changed: ${JSON.stringify(events)}`);',
     'if (response?.type !== "response" || response.command !== "retry_worker" || response.success !== true) throw new Error("retry_worker response changed");',
-    'process.stdout.write(JSON.stringify({ retryWorkerOrdering: true }));',
+    'const disconnectedWorker = { descriptor: { lifecycle: "ready" }, client: undefined, intentionalStop: false };',
+    'if (supervisor.effectiveWorkerState(disconnectedWorker) !== "recovering") throw new Error("disconnected ready worker still reports ready");',
+    'const stoppingWorker = { descriptor: { lifecycle: "ready", stopRequestedAt: "2026-08-11T00:00:00.000Z" }, client: undefined, intentionalStop: false };',
+    'if (supervisor.effectiveWorkerState(stoppingWorker) !== "stopping") throw new Error("stopping worker state changed");',
+    'const staleDescriptor = { workerId: "worker-stale", rootActiveSessionId: "active-stale", rootSessionId: "session-stale", lifecycle: "stopping", stopRequestedAt: "2026-08-11T00:00:00.000Z", pid: 424242, processStartId: "dead-generation" };',
+    'const staleWorker = { descriptor: staleDescriptor, client: undefined, recovery: undefined, intentionalStop: true, summaries: new Map() };',
+    'supervisor.workers.set(staleDescriptor.workerId, staleWorker);',
+    'supervisor.processIdentity = () => "gone";',
+    'supervisor.scheduleWorkerStopFinalization = (candidate) => { supervisor.workers.delete(candidate.descriptor.workerId); candidate.stopFinalization = Promise.resolve(); };',
+    'if ((await supervisor.reclaimStaleWorkerRegistration(staleWorker)) !== true || supervisor.workers.has(staleDescriptor.workerId)) throw new Error("stale worker registration was not reclaimed");',
+    'process.stdout.write(JSON.stringify({ retryWorkerOrdering: true, disconnectedWorkerState: true, staleWorkerReclaimed: true }));',
   ].join("\n");
   const daemonClientSource = [
     "const [moduleUrl, socketPath] = process.argv.slice(2);",
@@ -670,7 +1013,7 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     ]);
     const probe = await commandRunner(
       runtimeExecutable,
-      [probePath, entrypoints.moduleUrl, entrypoints.packageJson],
+      [probePath, entrypoints.moduleUrl, entrypoints.packageJson, scratchDirectory],
       {
         cwd: runtimeDirectory,
         env: cleanRuntimeEnvironment(process.env, { electronRunAsNode }),
@@ -682,6 +1025,9 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
       throw buildError("Runtime smoke process target does not match the build target.");
     }
     assertMinimumNodeVersion(runtimeVersions.node, options.policy.minimumNodeVersion);
+    if (runtimeVersions.bundleImportGraphComplete !== true) {
+      throw buildError("Prime Agent runtime bundle import graph was not proven complete.");
+    }
 
     const retryWorkerProbe = await commandRunner(
       runtimeExecutable,
@@ -698,8 +1044,12 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     } catch (error) {
       throw buildError("Prime Agent retry_worker smoke helper returned invalid JSON.", error);
     }
-    if (retryWorkerResult?.retryWorkerOrdering !== true) {
-      throw buildError("Prime Agent retry_worker smoke did not prove tombstone clearing before recovery.");
+    if (
+      retryWorkerResult?.retryWorkerOrdering !== true ||
+      retryWorkerResult?.disconnectedWorkerState !== true ||
+      retryWorkerResult?.staleWorkerReclaimed !== true
+    ) {
+      throw buildError("Prime Agent worker recovery smoke did not prove current self-healing semantics.");
     }
 
     const smokeAgentDirectory = join(scratchDirectory, "agent");
@@ -751,6 +1101,117 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   }
 }
 
+export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
+  const runtimeExecutable = await requireAbsoluteRealFile(
+    options.runtimeExecutable,
+    "browser smoke runtime executable",
+  );
+  const commandRunner = options.commandRunner ?? runCommand;
+  if (typeof commandRunner !== "function") throw buildError("Browser smoke command runner is invalid.");
+  const entrypoints = await resolveVerifiedEntrypoints(runtimeDirectory, options.policy);
+  const scratchDirectory = await mkdtemp(join(tmpdir(), "prime-continuim-browser-smoke-"));
+  const stateDirectory = join(scratchDirectory, "state");
+  const screenshotPath = join(scratchDirectory, "browser-smoke.png");
+  const session = `runtime-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
+  await mkdir(stateDirectory, { mode: 0o700 });
+  const environment = {
+    ...cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
+    PLAYWRIGHT_MCP_TIMEOUT_ACTION: String(BROWSER_SMOKE_ACTION_TIMEOUT_MS),
+    // The verified daemon shim maps this smoke-only marker to Playwright's
+    // private font-readiness bypass inside the child that takes the screenshot.
+    PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY: "1",
+    PRIME_CONTINUIM_BROWSER_EXECUTABLE: runtimeExecutable,
+    PRIME_CONTINUIM_BROWSER_BRIDGE: entrypoints.browserBridge,
+    PRIME_CONTINUIM_BROWSER_STATE_DIR: stateDirectory,
+    PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID: `smoke-${session}`,
+  };
+  const invoke = (args, timeoutMs = 25_000) => commandRunner(
+    runtimeExecutable,
+    [entrypoints.browserBridge, `--session=${session}`, ...args],
+    { cwd: scratchDirectory, env: environment, timeoutMs },
+  );
+  let opened = false;
+  try {
+    const doctor = await commandRunner(runtimeExecutable, [entrypoints.browserBridge, "doctor", "--json"], {
+      cwd: scratchDirectory,
+      env: environment,
+      timeoutMs: 25_000,
+    });
+    let doctorResult;
+    try {
+      doctorResult = JSON.parse(String(doctor.stdout));
+    } catch (error) {
+      throw buildError("Browser bridge doctor returned invalid JSON.", error);
+    }
+    if (
+      JSON.stringify(Object.keys(doctorResult).sort()) !==
+        JSON.stringify(["bridgeVersion", "controller", "engine", "protocol", "ready"].sort()) ||
+      doctorResult.protocol !== PINNED_BROWSER_BRIDGE.protocol ||
+      doctorResult.bridgeVersion !== 1 ||
+      doctorResult.ready !== true ||
+      doctorResult.controller !== `playwright-core/${PINNED_BROWSER_BRIDGE.playwrightCoreVersion}` ||
+      doctorResult.engine !== PINNED_BROWSER_BRIDGE.engine
+    ) throw buildError("Browser bridge doctor returned an unexpected identity.");
+
+    const page = encodeURIComponent([
+      "<!doctype html><title>Prime browser smoke</title>",
+      '<button type="button" onclick="this.textContent=\'After\'">Before</button>',
+      '<input aria-label="Name">',
+    ].join(""));
+    await invoke(["open", `data:text/html,${page}`]);
+    opened = true;
+    const snapshot = await invoke(["snapshot"]);
+    const snapshotText = String(snapshot.stdout);
+    const reference = /button\s+"Before"[^\n]*\[ref=(e\d+)\]/.exec(snapshotText)?.[1] ??
+      /\[ref=(e\d+)\][^\n]*Before/.exec(snapshotText)?.[1];
+    if (!reference) throw buildError("Browser smoke did not receive a stable snapshot reference.");
+    const found = await invoke(["find", "Before"]);
+    if (!String(found.stdout).includes("Before")) throw buildError("Browser smoke find did not observe page content.");
+    await invoke(["click", reference]);
+    const read = await invoke(["eval", "document.querySelector('button')?.textContent"]);
+    if (!String(read.stdout).includes("After")) throw buildError("Browser smoke interaction was not observable.");
+    // Screenshot capture is the only smoke operation that waits on the
+    // compositor. Keep its outer custody deadline above Playwright's bounded
+    // action deadline without slowing any production browser interaction.
+    await invoke(["screenshot", `--filename=${screenshotPath}`], BROWSER_SMOKE_SCREENSHOT_TIMEOUT_MS);
+    const screenshot = await readFile(screenshotPath);
+    if (screenshot.byteLength < 8 || !screenshot.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
+      throw buildError("Browser smoke screenshot is not a PNG.");
+    }
+    await invoke(["close"]);
+    opened = false;
+    await assertBrowserSmokeStateRetired(stateDirectory);
+    return Object.freeze({
+      verified: true,
+      protocol: PINNED_BROWSER_BRIDGE.protocol,
+      controller: `playwright-core/${PINNED_BROWSER_BRIDGE.playwrightCoreVersion}`,
+      engine: PINNED_BROWSER_BRIDGE.engine,
+      operations: Object.freeze(["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"]),
+    });
+  } finally {
+    if (opened) await invoke(["close"], 10_000).catch(() => undefined);
+    await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function assertBrowserSmokeStateRetired(stateDirectory) {
+  const pending = [stateDirectory];
+  let inspected = 0;
+  while (pending.length) {
+    const directory = pending.pop();
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      inspected += 1;
+      if (inspected > 4_096) throw buildError("Browser smoke state exceeded its cleanup inspection bound.");
+      if (
+        entry.name === "browser.json" || entry.name === "launch.json" || entry.name === "profile" ||
+        entry.name.startsWith("launch.owner-") || entry.name.includes(".candidate-")
+      ) throw buildError(`Browser smoke retained private lifecycle state: ${entry.name}`);
+      if (entry.isDirectory()) pending.push(join(directory, entry.name));
+    }
+  }
+}
+
 export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersion, smoke }) {
   const entries = await collectRuntimeFiles(runtimeDirectory);
   if (entries.some((entry) => entry.path === "companions" || entry.path.startsWith("companions/"))) {
@@ -783,6 +1244,7 @@ export async function createRuntimeManifest({ runtimeDirectory, inputs, npmVersi
     packageLockSha256: inputs.lockfileSha256,
     installPolicy: inputs.policy.install,
     entrypoints: inputs.policy.entrypoints,
+    browserBridge: inputs.policy.browserBridge,
     daemon: inputs.policy.daemon,
     sources: inputs.sources.assets.map(({ packageName, fileName, url, size, sha256, integrity }) => ({
       packageName,
@@ -821,6 +1283,7 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
     manifest.runtimeBuildId !== options.policy?.runtimeBuildId ||
     !jsonEqual(manifest.installPolicy, options.policy?.install) ||
     !jsonEqual(manifest.entrypoints, options.policy?.entrypoints) ||
+    !jsonEqual(manifest.browserBridge, options.policy?.browserBridge) ||
     !jsonEqual(manifest.daemon, options.policy?.daemon) ||
     Object.prototype.hasOwnProperty.call(manifest, "codexAppServer")
   ) {
@@ -834,6 +1297,7 @@ export async function verifyBuiltRuntime(runtimeDirectory, options = {}) {
     !manifest.libc ||
     !runtimeVersionRecordIsValid(manifest.buildRuntime, { expectedNpm: options.policy?.npmVersion }) ||
     !runtimeVersionRecordIsValid(manifest.smokeRuntime, { requireNpm: false }) ||
+    manifest.smokeRuntime.bundleImportGraphComplete !== true ||
     manifest.smokeRuntime.platform !== manifest.platform ||
     manifest.smokeRuntime.arch !== manifest.arch
   ) {
@@ -892,12 +1356,46 @@ export async function resolveVerifiedEntrypoints(runtimeDirectory, policy) {
   const root = await realpath(runtimeDirectory);
   const modulePath = await requireContainedRealFile(root, policy.entrypoints.module, "Prime Agent module");
   const cli = await requireContainedRealFile(root, policy.entrypoints.cli, "Prime Agent CLI");
+  const browserBridge = await requireContainedRealFile(root, policy.entrypoints.browserBridge, "browser bridge");
+  const browserHost = await requireContainedRealFile(root, policy.entrypoints.browserHost, "browser host");
+  const browserLauncher = await requireContainedRealFile(root, policy.entrypoints.browserLauncher, "browser launcher");
+  const browserLauncherWindows = await requireContainedRealFile(
+    root,
+    policy.entrypoints.browserLauncherWindows,
+    "Windows browser launcher",
+  );
+  const browserSkill = await requireContainedRealFile(root, policy.entrypoints.browserSkill, "browser skill");
+  if (process.platform !== "win32") await access(browserLauncher, fsConstants.X_OK);
   const packageJson = await requireContainedRealFile(root, "node_modules/prime-agent/package.json", "Prime Agent package");
+  const playwrightPackageJson = await requireContainedRealFile(
+    root,
+    "node_modules/playwright-core/package.json",
+    "Playwright package",
+  );
   const packageValue = await readJson(packageJson);
+  const playwrightPackageValue = await readJson(playwrightPackageJson);
   if (packageValue.name !== "prime-agent" || packageValue.version !== policy.releaseVersion) {
     throw buildError("Installed Prime Agent package identity is invalid.");
   }
-  return Object.freeze({ root, modulePath, moduleUrl: pathToFileURL(modulePath).href, cli, packageJson });
+  if (
+    playwrightPackageValue.name !== "playwright-core" ||
+    playwrightPackageValue.version !== policy.browserBridge.playwrightCoreVersion
+  ) {
+    throw buildError("Installed Playwright controller identity is invalid.");
+  }
+  return Object.freeze({
+    root,
+    modulePath,
+    moduleUrl: pathToFileURL(modulePath).href,
+    cli,
+    packageJson,
+    browserBridge,
+    browserHost,
+    browserLauncher,
+    browserLauncherWindows,
+    browserSkill,
+    playwrightPackageJson,
+  });
 }
 
 export async function writeCurrentPointer(outputRoot, finalDirectory, manifest, manifestSha256) {
@@ -1052,7 +1550,8 @@ export async function runCommand(command, args, options = {}) {
       if (timedOut) return rejectRun(buildError(`${basename(command)} timed out.`));
       if (outputBytes > MAX_COMMAND_OUTPUT_BYTES) return rejectRun(buildError(`${basename(command)} output exceeded its limit.`));
       if (code !== 0) {
-        return rejectRun(buildError(`${basename(command)} failed (${code ?? signal ?? "unknown"}): ${stderr.trim().slice(-4_096)}`));
+        const diagnostic = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n").slice(-4_096);
+        return rejectRun(buildError(`${basename(command)} failed (${code ?? signal ?? "unknown"}): ${diagnostic}`));
       }
       resolveRun({ stdout, stderr });
     });
@@ -1091,6 +1590,7 @@ export function cleanRuntimeEnvironment(source, { electronRunAsNode }) {
       normalized === "PRIME_AGENT_LAUNCHER_PATH" ||
       normalized === "NODE_OPTIONS" ||
       normalized === "NODE_PATH" ||
+      normalized === "NAPI_RS_NATIVE_LIBRARY_PATH" ||
       normalized === "ELECTRON_RUN_AS_NODE"
     ) {
       continue;
@@ -1119,7 +1619,7 @@ async function collectRuntimeFiles(root, options = {}) {
       if (child.isDirectory()) {
         await visit(absolutePath, relativePath);
       } else if (child.isFile()) {
-        if (RUNTIME_METADATA_FILES.has(relativePath)) continue;
+        if (options.includeRuntimeMetadata !== true && RUNTIME_METADATA_FILES.has(relativePath)) continue;
         const details = await stat(absolutePath);
         entries.push({ path: relativePath, size: details.size, sha256: await sha256File(absolutePath) });
       } else {

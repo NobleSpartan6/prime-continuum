@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { nodeRuntimeStatus } from "../../src/hostd/probe";
 
 describe("host runtime probe", () => {
-  it.each(["22.8.0", "22.22.3", "24.18.1"])("accepts supported Node.js %s", (version) => {
+  it.each(["22.12.0", "22.22.3", "24.18.1"])("accepts supported Node.js %s", (version) => {
     expect(nodeRuntimeStatus(version)).toEqual({
       available: true,
       status: "ready",
@@ -10,12 +10,12 @@ describe("host runtime probe", () => {
     });
   });
 
-  it.each(["21.99.0", "22.7.9"])("rejects unsupported Node.js %s", (version) => {
+  it.each(["21.99.0", "22.8.0", "22.11.9"])("rejects unsupported Node.js %s", (version) => {
     expect(nodeRuntimeStatus(version)).toMatchObject({
       available: false,
       status: "error",
       version: `Node.js ${version}`,
-      diagnostic: "Prime Agent 0.7.1 requires Node.js 22.8 or newer.",
+      diagnostic: "Prime Continuim's hardened Prime Agent 0.7.2 runtime requires Node.js 22.12 or newer.",
     });
   });
 

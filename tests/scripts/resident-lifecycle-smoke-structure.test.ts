@@ -197,23 +197,37 @@ function materializeDurableProjectionAssertions(): {
 describe('resident lifecycle smoke structure', () => {
   it('separates core ready health from optional candidate-evaluation warmup', () => {
     const capabilities = materializeExpectedCapabilitySets()
+    const readiness = smokeSource.slice(
+      smokeSource.indexOf('async function waitForResidentReadiness('),
+      smokeSource.indexOf('function assertReadyRuntimeHealth(', smokeSource.indexOf('async function waitForResidentReadiness(')),
+    )
     expect(capabilities.base).toEqual([
       'resident_control_projection_v1',
       'resident_lifecycle_v1',
       'runtime_integrity_v1',
       'runtime_model_catalog_v1',
+      'runtime_oauth_attempt_v1',
       'runtime_oauth_v1',
       'snapshot_chunks_v1',
     ])
-    expect(capabilities.warmed).toEqual(['candidate_evaluation_probe_v1'])
+    expect(capabilities.warmed).toEqual(
+      process.platform === 'win32' ? ['candidate_evaluation_probe_v1'] : [],
+    )
+    expect(readiness).toContain('EXPECTED_WARMED_CAPABILITIES.every')
+    expect(readiness).not.toContain('lastHealth.capabilities.includes(CANDIDATE_EVALUATION_CAPABILITY)')
+    expect(smokeSource).toContain('const residentDaemonSocketRoot = await realpath(tmpdir());')
+    expect(smokeSource).toContain('residentDaemonEndpoint(dataDirectory, residentDaemonSocketRoot)')
   })
 
   it('resolves every outer smoke and generated daemon-audit global', () => {
     const daemonAuditPath = resolve(temporaryRoot, 'daemon-audit.mjs')
-    writeFileSync(daemonAuditPath, materializeDaemonAuditSource(), { encoding: 'utf8', mode: 0o600 })
+    const daemonAudit = materializeDaemonAuditSource()
+    writeFileSync(daemonAuditPath, daemonAudit, { encoding: 'utf8', mode: 0o600 })
 
     expect(unresolvedNameDiagnostics(smokePath)).toEqual([])
     expect(unresolvedNameDiagnostics(daemonAuditPath)).toEqual([])
+    expect(daemonAudit).toContain('const waitForProcessIdentities = async () => {')
+    expect(daemonAudit).toContain('const currentProcessIdentities = await waitForProcessIdentities();')
   })
 
   it('detects the missing node:net import that makes readiness time out', () => {

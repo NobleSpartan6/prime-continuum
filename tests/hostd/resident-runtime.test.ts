@@ -11,6 +11,7 @@ import {
   buildResidentDaemonStartInvocation,
   sanitizeResidentDaemonEnvironment,
   validateResidentDaemonHello,
+  validateResidentDaemonRetirementHello,
   validateResidentSessionBinding,
 } from "../../src/hostd/resident-runtime";
 
@@ -22,16 +23,19 @@ function validHello(): Record<string, unknown> {
     type: "daemon_hello",
     socketPath: "\\\\.\\pipe\\prime-agent-daemon",
     protocol: { name: "prime-agent.daemon", version: 7 },
-    schemaId: "protocol-7-schema-13-816309b1cd50",
-    schemaRevision: 13,
-    appVersion: "0.7.1",
+    schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+    schemaRevision: 16,
+    appVersion: "0.7.2",
     runtime: {
-      buildId: "95afd31-dirty",
+      buildId: "83a0f9f-dirty",
       executablePath: "C:\\Prime Agent\\prime-agent.exe",
       entrypointPath: "C:\\Prime Agent\\cli.js",
     },
     supervisorGeneration: "supervisor-generation-1",
     supervisorPid: 42,
+    supervisorOwnerToken: "owner-token-1",
+    supervisorProcessStartId: "process-start-1",
+    supervisorSocketPath: "\\\\.\\pipe\\prime-agent-daemon",
     clientId: "daemon-client:test",
     serverCapabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES, "session_input_admission"],
   };
@@ -49,23 +53,23 @@ function expectContractError(operation: () => unknown, code: string): ResidentRu
 }
 
 describe("resident Prime Agent runtime pin", () => {
-  it("pins the immutable v0.7.1 release asset and verified checksum", () => {
+  it("pins the immutable v0.7.2 release asset and verified checksum", () => {
     expect(PINNED_PRIME_AGENT_RUNTIME).toEqual({
       repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-      releaseTag: "v0.7.1",
-      releaseVersion: "0.7.1",
+      releaseTag: "v0.7.2",
+      releaseVersion: "0.7.2",
       packageName: "prime-agent",
-      assetFileName: "prime-agent-0.7.1.tgz",
+      assetFileName: "prime-agent-0.7.2.tgz",
       assetUrl:
-        "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
-      sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
-      expectedAppVersion: "0.7.1",
-      runtimeBuildId: "95afd31-dirty",
+        "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
+      sha256: "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
+      expectedAppVersion: "0.7.2",
+      runtimeBuildId: "83a0f9f-dirty",
       daemon: {
         protocolName: "prime-agent.daemon",
         protocolVersion: 7,
-        schemaRevision: 13,
-        schemaId: "protocol-7-schema-13-816309b1cd50",
+        schemaRevision: 16,
+        schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
       },
     });
     expect(REQUIRED_RESIDENT_DAEMON_CAPABILITIES).toEqual([
@@ -86,14 +90,14 @@ describe("resident daemon compatibility", () => {
     const compatibility = validateResidentDaemonHello(validHello());
 
     expect(compatibility).toEqual({
-      releaseVersion: "0.7.1",
-      appVersion: "0.7.1",
+      releaseVersion: "0.7.2",
+      appVersion: "0.7.2",
       protocolName: "prime-agent.daemon",
       protocolVersion: 7,
-      schemaRevision: 13,
-      schemaId: "protocol-7-schema-13-816309b1cd50",
+      schemaRevision: 16,
+      schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
       capabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES, "session_input_admission"],
-      runtimeBuildId: "95afd31-dirty",
+      runtimeBuildId: "83a0f9f-dirty",
       supervisorGeneration: "supervisor-generation-1",
     });
     expect(compatibility).not.toHaveProperty("socketPath");
@@ -105,9 +109,9 @@ describe("resident daemon compatibility", () => {
   it.each([
     ["protocol name", { protocol: { name: "other.daemon", version: 7 } }, "PRIME_RUNTIME_PROTOCOL_NAME_MISMATCH"],
     ["protocol version", { protocol: { name: "prime-agent.daemon", version: 8 } }, "PRIME_RUNTIME_PROTOCOL_VERSION_MISMATCH"],
-    ["app version", { appVersion: "0.7.2" }, "PRIME_RUNTIME_APP_VERSION_MISMATCH"],
-    ["schema revision", { schemaRevision: 14 }, "PRIME_RUNTIME_SCHEMA_REVISION_MISMATCH"],
-    ["schema identity", { schemaId: "protocol-7-schema-14-other" }, "PRIME_RUNTIME_SCHEMA_ID_MISMATCH"],
+    ["app version", { appVersion: "0.7.1" }, "PRIME_RUNTIME_APP_VERSION_MISMATCH"],
+    ["schema revision", { schemaRevision: 15 }, "PRIME_RUNTIME_SCHEMA_REVISION_MISMATCH"],
+    ["schema identity", { schemaId: "protocol-7-schema-15-other" }, "PRIME_RUNTIME_SCHEMA_ID_MISMATCH"],
   ])("fails fast on a %s mismatch", (_label, override, code) => {
     expectContractError(() => validateResidentDaemonHello({ ...validHello(), ...override }), code);
   });
@@ -143,7 +147,7 @@ describe("resident daemon compatibility", () => {
   it("binds an accepted hello to the exact requested socket path", () => {
     expect(
       validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\prime-agent-daemon" }),
-    ).toMatchObject({ appVersion: "0.7.1" });
+    ).toMatchObject({ appVersion: "0.7.2" });
     expectContractError(
       () => validateResidentDaemonHello(validHello(), { expectedSocketPath: "\\\\.\\pipe\\other-daemon" }),
       "PRIME_RUNTIME_SOCKET_MISMATCH",
@@ -156,7 +160,7 @@ describe("resident daemon compatibility", () => {
         expectedExecutablePath: "C:\\Prime Agent\\prime-agent.exe",
         expectedEntrypointPath: "C:\\Prime Agent\\cli.js",
       }),
-    ).toMatchObject({ runtimeBuildId: "95afd31-dirty" });
+    ).toMatchObject({ runtimeBuildId: "83a0f9f-dirty" });
     expectContractError(
       () =>
         validateResidentDaemonHello(validHello(), {
@@ -187,6 +191,50 @@ describe("resident daemon compatibility", () => {
     expectContractError(
       () => validateResidentDaemonHello({ ...validHello(), serverCapabilities: ["attach_snapshot", 42] }),
       "PRIME_RUNTIME_HELLO_INVALID",
+    );
+  });
+
+  it("binds incompatible retirement recognition to one exact supervisor owner", () => {
+    const retirementSocket = resolve(tmpdir(), "prime-agent-retirement.sock");
+    const prior = {
+      ...validHello(),
+      socketPath: retirementSocket,
+      appVersion: "0.7.0",
+      schemaRevision: 12,
+      schemaId: "protocol-7-schema-12-prior",
+      runtime: {
+        buildId: "verified-prior-build",
+        executablePath: resolve("Prime Agent prior", "prime-agent"),
+        entrypointPath: resolve("Prime Agent prior", "cli.js"),
+      },
+      supervisorSocketPath: retirementSocket,
+    };
+
+    expect(
+      validateResidentDaemonRetirementHello(prior, retirementSocket),
+    ).toMatchObject({
+      appVersion: "0.7.0",
+      runtimeBuildId: "verified-prior-build",
+      supervisorGeneration: "supervisor-generation-1",
+      supervisorPid: 42,
+      supervisorOwnerToken: "owner-token-1",
+      supervisorProcessStartId: "process-start-1",
+      supervisorSocketPath: retirementSocket,
+      clientId: "daemon-client:test",
+    });
+    expectContractError(
+      () => validateResidentDaemonRetirementHello(
+        { ...prior, supervisorProcessStartId: undefined },
+        retirementSocket,
+      ),
+      "PRIME_RUNTIME_HELLO_INVALID",
+    );
+    expectContractError(
+      () => validateResidentDaemonRetirementHello(
+        { ...prior, supervisorSocketPath: resolve(tmpdir(), "other-daemon.sock") },
+        retirementSocket,
+      ),
+      "PRIME_RUNTIME_SOCKET_MISMATCH",
     );
   });
 });
@@ -220,7 +268,13 @@ describe("resident launch and create plans", () => {
         windowsHide: true,
         detached: true,
         cwd: daemonWorkingDirectory,
-        env: { Path: "C:\\Windows", ELECTRON_RUN_AS_NODE: "1" },
+        env: {
+          Path: "C:\\Windows",
+          ELECTRON_RUN_AS_NODE: "1",
+          PYTHONDONTWRITEBYTECODE: "1",
+          PRIME_AGENT_TELEMETRY: "0",
+          DO_NOT_TRACK: "1",
+        },
         stdio: "ignore",
       },
     });
@@ -229,6 +283,21 @@ describe("resident launch and create plans", () => {
     expect(invocation.argv.join(" ")).not.toContain("cmd /c");
     expect(invocation.argv.join(" ")).not.toContain("powershell");
     expect(Object.isFrozen(invocation.argv)).toBe(true);
+  });
+
+  it("adds the verified browser skill as fixed argv without shell interpolation", () => {
+    const browserSkill = resolve("Prime Agent & tools", "bridge skills", "playwright-cli", "SKILL.md");
+    const invocation = buildResidentDaemonStartInvocation({
+      executable: resolve("Prime Agent & tools", "node"),
+      cliEntrypoint: resolve("Prime Agent & tools", "cli.js"),
+      socketPath: resolve(tmpdir(), "prime-agent-browser-skill.sock"),
+      daemonWorkingDirectory: resolve("Prime Agent & tools", "data"),
+      environment: {},
+      additionalSkillPath: browserSkill,
+    });
+
+    expect(invocation.argv.slice(-2)).toEqual(["--skill", browserSkill]);
+    expect(invocation.spawn.shell).toBe(false);
   });
 
   it("launches a verified package CLI entrypoint through an explicit Node executable", () => {
@@ -260,7 +329,7 @@ describe("resident launch and create plans", () => {
         windowsHide: true,
         detached: true,
         cwd: daemonWorkingDirectory,
-        env: {},
+        env: { PYTHONDONTWRITEBYTECODE: "1", PRIME_AGENT_TELEMETRY: "0", DO_NOT_TRACK: "1" },
         stdio: "ignore",
       },
     });
@@ -297,9 +366,16 @@ describe("resident launch and create plans", () => {
         PRIME_AGENT_LAUNCHER_PATH: "C:\\spoofed.exe",
         NODE_OPTIONS: "--require=C:\\attacker.cjs",
         node_path: "C:\\shadow-modules",
+        NAPI_RS_NATIVE_LIBRARY_PATH: "C:\\attacker-native.node",
         ELECTRON_RUN_AS_NODE: "0",
       }),
-    ).toEqual({ Path: "C:\\Windows", PRIME_API_KEY: "provider-secret" });
+    ).toEqual({
+      Path: "C:\\Windows",
+      PRIME_API_KEY: "provider-secret",
+      PYTHONDONTWRITEBYTECODE: "1",
+      PRIME_AGENT_TELEMETRY: "0",
+      DO_NOT_TRACK: "1",
+    });
   });
 
   it("creates resident work through DaemonClient semantics, never client-owned RPC semantics", () => {
@@ -321,7 +397,7 @@ describe("resident launch and create plans", () => {
     });
     expect(request).toEqual({
       type: "create",
-      config: { cwd: workspaceDirectory },
+      config: { cwd: workspaceDirectory, telemetryDisabled: true },
       lifecycle: "resident",
       noSession: false,
       sessionPath: "C:\\sessions & history\\thread.jsonl",
@@ -342,7 +418,7 @@ describe("resident launch and create plans", () => {
       }),
     ).toEqual({
       type: "create",
-      config: { cwd: "/srv/prime/project" },
+      config: { cwd: "/srv/prime/project", telemetryDisabled: true },
       lifecycle: "resident",
       noSession: false,
       continueRecent: true,
@@ -359,7 +435,7 @@ describe("resident launch and create plans", () => {
 
     expect(request).toEqual({
       type: "create",
-      config: { cwd: OWNED_WORKSPACE_DIRECTORY },
+      config: { cwd: OWNED_WORKSPACE_DIRECTORY, telemetryDisabled: true },
       lifecycle: "client_owned",
       noSession: false,
       sessionPath: OWNED_SESSION_PATH,
@@ -467,7 +543,7 @@ describe("durable resident bindings", () => {
       () =>
         validateResidentSessionBinding({
           ...value,
-          runtime: { ...value.runtime, appVersion: "0.7.2" },
+          runtime: { ...value.runtime, appVersion: "0.7.1" },
         }),
       "PRIME_RUNTIME_BINDING_INVALID",
     );

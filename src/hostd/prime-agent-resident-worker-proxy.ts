@@ -242,8 +242,9 @@ class ResidentWorkerBridge {
           options: Readonly<{
             closeClientOnDispose: true;
             sendClientEnv: false;
-            supportsExtensionUi: false;
+            supportsExtensionUi: true;
             ownedSession: boolean;
+            telemetryDisabled: true;
             recoverDaemon: () => Promise<void>;
           }>,
         ): Promise<PrimeDaemonAgentConnectionPublic> {
@@ -281,16 +282,18 @@ class ResidentWorkerBridge {
     options: Readonly<{
       closeClientOnDispose: true;
       sendClientEnv: false;
-      supportsExtensionUi: false;
+      supportsExtensionUi: true;
       ownedSession: boolean;
+      telemetryDisabled: true;
       recoverDaemon: () => Promise<void>;
     }>,
   ): Promise<WorkerDaemonConnectionProxy> {
     if (
       options.closeClientOnDispose !== true ||
       options.sendClientEnv !== false ||
-      options.supportsExtensionUi !== false ||
+      options.supportsExtensionUi !== true ||
       typeof options.ownedSession !== "boolean" ||
+      options.telemetryDisabled !== true ||
       typeof options.recoverDaemon !== "function"
     ) {
       throw new TypeError("Resident worker attach options differ from the fixed public contract");
@@ -314,8 +317,9 @@ class ResidentWorkerBridge {
           activeSessionId,
           closeClientOnDispose: true,
           sendClientEnv: false,
-          supportsExtensionUi: false,
+          supportsExtensionUi: true,
           ownedSession: options.ownedSession,
+          telemetryDisabled: true,
         },
         {
           timeoutMs: ATTACH_OPERATION_TIMEOUT_MS,
@@ -948,6 +952,19 @@ class WorkerDaemonConnectionProxy implements PrimeDaemonAgentConnectionPublic {
     );
   }
 
+  async getResourceSnapshot(): Promise<unknown> {
+    this.assertLive();
+    return this.bridge.invoke(
+      "connection.get_resource_snapshot",
+      { connectionId: this.connectionId },
+      {
+        timeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+        mutation: false,
+        resourceKey: connectionResource(this.connectionId),
+      },
+    );
+  }
+
   async getAvailableModels(): Promise<unknown> {
     this.assertLive();
     return this.bridge.invoke(
@@ -1038,6 +1055,24 @@ class WorkerDaemonConnectionProxy implements PrimeDaemonAgentConnectionPublic {
     await this.bridge.invoke(
       "connection.abort",
       { connectionId: this.connectionId },
+      {
+        timeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+        mutation: true,
+        resourceKey: connectionResource(this.connectionId),
+      },
+    );
+  }
+
+  async respondToExtensionUiRequest(
+    requestIdValue: string,
+    responseValue: Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }>,
+  ): Promise<void> {
+    this.assertLive();
+    const requestId = boundedIdentifier(requestIdValue, "extension UI request ID");
+    const response = normalizeExtensionUiResponse(responseValue);
+    await this.bridge.invoke(
+      "connection.respond_extension_ui",
+      { connectionId: this.connectionId, requestId, response },
       {
         timeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
         mutation: true,
@@ -1149,6 +1184,26 @@ function validateHostdBundlePath(value: string): string {
 
 function daemonCommandMayMutate(command: Readonly<object>): boolean {
   return !isRecord(command) || command.type !== "list";
+}
+
+function normalizeExtensionUiResponse(
+  value: Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }>,
+): Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }> {
+  if ("cancelled" in value && value.cancelled === true && Object.keys(value).length === 1) {
+    return Object.freeze({ cancelled: true as const });
+  }
+  if (
+    "value" in value &&
+    typeof value.value === "string" &&
+    value.value.length <= RESIDENT_WORKER_LIMITS.maxExtensionUiValueCharacters &&
+    Object.keys(value).length === 1
+  ) {
+    return Object.freeze({ value: value.value });
+  }
+  if ("confirmed" in value && typeof value.confirmed === "boolean" && Object.keys(value).length === 1) {
+    return Object.freeze({ confirmed: value.confirmed });
+  }
+  throw new TypeError("Extension UI response is invalid");
 }
 
 function proxyRoundTripTimeout(upstreamTimeoutMs: number): number {

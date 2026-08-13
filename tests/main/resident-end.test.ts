@@ -377,7 +377,7 @@ describe('DesktopControlService resident end boundary', () => {
       .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('restarts and reconciles an unknown end by status only without replay or minting a new identity', async () => {
+  it('restarts without replay, then lets the user retry the same unknown End after the host proves no record', async () => {
     const directory = await testDirectory()
     const firstConnection = new TestConnection((method) => {
       if (method === 'health.get') return health()
@@ -394,10 +394,11 @@ describe('DesktopControlService resident end boundary', () => {
       .rejects.toMatchObject({ code: 'resident.end_outcome_unknown' })
     await first.disconnect()
 
-    const secondConnection = new TestConnection((method) => {
+    const secondConnection = new TestConnection((method, params) => {
       if (method === 'health.get') return health()
       if (method === 'resident.lifecycle.status') return { status: null }
       if (method === 'thread.snapshot') return liveSnapshot()
+      if (method === 'resident.end') return endStatus(params as Record<string, unknown>, 'ending')
       throw new Error(`Restart must not replay ${method}`)
     })
     connectLocalHostd.mockResolvedValue(secondConnection)
@@ -416,6 +417,15 @@ describe('DesktopControlService resident end boundary', () => {
       expect.objectContaining({ kind: 'end', operationId: prepared.operationId, state: 'outcome_unknown' }),
     ])
     expect(secondConnection.requests.filter(({ method }) => method === 'resident.end')).toEqual([])
+
+    const retry = await restarted.prepareResidentEnd({
+      ...identity,
+      resumeOperationId: prepared.operationId,
+    })
+    expect(retry.operationId).toBe(prepared.operationId)
+    await expect(restarted.endResident({ confirmationToken: retry.confirmationToken, consent: true }))
+      .resolves.toMatchObject({ operationId: prepared.operationId, phase: 'ending' })
+    expect(secondConnection.requests.filter(({ method }) => method === 'resident.end')).toHaveLength(1)
   })
 
   it('permits the exact same operation only from host-proven pre-effect ending', async () => {

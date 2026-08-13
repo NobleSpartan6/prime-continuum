@@ -421,6 +421,48 @@ describe("HostService handoff availability", () => {
     await service.close();
   });
 
+  it("does not repurpose approval scope for native dialog responses", async () => {
+    const { service, store, pairingAuthority, relayDevice } = await temporaryService();
+    const host = await store.getHost();
+    const approvalGrant = await pairingAuthority.changeDeviceScopes({
+      expectedHostId: host.hostId,
+      expectedHostIdentityEpoch: relayDevice.hostIdentityEpoch,
+      fingerprint: relayDevice.fingerprint,
+      expectedGrantVersion: relayDevice.grantVersion,
+      scopes: ["approval.resolve"],
+    });
+    const approvalChannel = await registerTestChannel(pairingAuthority, host.hostId, approvalGrant, 21);
+    const command: CommandEnvelope = {
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId: relayDevice.deviceId,
+      commandId: "relay-extension-ui-scope-canary",
+      expectedHostId: host.hostId,
+      threadId: "test-thread",
+      issuedAt: "2026-08-12T12:00:00.000Z",
+      expectedExecutionGenerationId: "test-execution-1",
+      command: {
+        kind: "extension_ui.respond",
+        requestId: "dialog-one",
+        requestDigest: "a".repeat(64),
+        method: "confirm",
+        response: { kind: "confirmed", confirmed: true },
+      },
+    };
+
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "relay-extension-ui-scope-denied",
+      method: "command.submit",
+      payload: { command },
+    }, { transport: "relay", channel: approvalChannel.lease });
+
+    expect(response).toMatchObject({ ok: false, error: { code: "REMOTE_SCOPE_DENIED" } });
+    expect((await store.reconcileCommands([command])).unknown).toEqual([
+      { deviceId: command.deviceId, commandId: command.commandId },
+    ]);
+    await service.close();
+  });
+
   it("reveals resident control state only through a current authenticated projection-read channel", async () => {
     const { service, store, pairingAuthority, relayDevice, workspaceDirectory } = await temporaryService();
     const host = await store.getHost();
@@ -577,6 +619,8 @@ async function pairTestDevice(authority: PairingAuthority, hostId: string): Prom
       "thread.follow_up",
       "thread.start",
       "model.select",
+      "approval.resolve",
+      "extension_ui.respond",
       "run_location.change",
     ],
     ttlSeconds: 300,

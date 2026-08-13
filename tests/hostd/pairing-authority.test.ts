@@ -281,7 +281,7 @@ describe("PairingAuthority", () => {
     expect(findDevice(await fixture.authority.getSnapshot(), device.fingerprint).grantVersion).toBe(1);
   });
 
-  it("keeps the complete nine-scope durable grant aligned with the test-only transcript boundary", async () => {
+  it("keeps the complete durable scope grant aligned with the test-only transcript boundary", async () => {
     const fixture = await temporaryAuthority();
     const scopes: RemoteDeviceScope[] = [...REMOTE_DEVICE_SCOPES].sort();
     expect(scopes).toHaveLength(REMOTE_DEVICE_SCOPE_COUNT);

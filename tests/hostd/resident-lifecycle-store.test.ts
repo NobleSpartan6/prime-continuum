@@ -286,6 +286,50 @@ describe("HostStore resident provisioning lifecycle", () => {
     });
   });
 
+  it("lets durable End supersede a settled prompt proof barrier without replay or restart poison", async () => {
+    const fixture = await createFixture();
+    const active = legacyBinding(fixture, "end-after-settled-prompt");
+    await fixture.store.persistResidentSessionBinding(active);
+    const command = promptCommand(
+      fixture.hostId,
+      "settled-prompt-before-end",
+      "test-thread",
+      "test-execution-1",
+    );
+    await fixture.store.admitCommand(command, true);
+    const dispatch = await fixture.store.beginResidentDispatch(command);
+    await fixture.store.finalizeResidentDispatch(dispatch, {
+      status: "running",
+      message: "Prime accepted the prompt before its final idle proof arrived",
+    });
+    expect(await readdir(fixture.store.paths.residentDispatchAttempts)).toHaveLength(1);
+
+    const endInput = await endOperationInput(fixture, "end-supersedes-settled-prompt", "9");
+    expect(await fixture.store.prepareResidentEnd(endInput, active)).toMatchObject({ phase: "ending" });
+    expect(await readdir(fixture.store.paths.residentDispatchAttempts)).toEqual([]);
+    const superseded = (await fixture.store.reconcileCommands([command])).receipts[0];
+    expect(superseded).toMatchObject({
+      status: "uncertain",
+      error: {
+        code: "RESIDENT_COMMAND_SUPERSEDED_BY_END",
+        retryable: false,
+        details: {
+          endOperationId: endInput.operationId,
+          replayed: false,
+        },
+      },
+    });
+
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toBeUndefined();
+    expect(await restarted.getResidentLifecycleStatus(endInput.operationId)).toMatchObject({ phase: "ending" });
+    expect((await restarted.reconcileCommands([command])).receipts[0]).toEqual(superseded);
+    expect(await readdir(restarted.paths.residentDispatchAttempts)).toEqual([]);
+
+    const killLease = await restarted.beginResidentKill(endInput);
+    expect(await acknowledgeKill(restarted, killLease)).toMatchObject({ phase: "completed" });
+  });
+
   it("ends valid opaque 4K daemon identities without exposing them in the public disposition", async () => {
     const fixture = await createFixture();
     const activeSessionId = `[daemon]/active?${"a".repeat(4_080)}`;

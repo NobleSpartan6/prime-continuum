@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "releaseVersion": "0.7.1",
-  "runtimeBuildId": "95afd31-dirty",
-  "minimumNodeVersion": "22.8.0",
+  "releaseVersion": "0.7.2",
+  "runtimeBuildId": "83a0f9f-dirty",
+  "minimumNodeVersion": "22.12.0",
   "npmVersion": "10.9.8",
   "lockfileVersion": 3,
   "lockPackageEntries": 202,
@@ -16,17 +16,152 @@
   "packaging": {
     "excludedBasenames": [
       ".gitkeep"
+    ],
+    "excludedSuffixes": [
+      ".d.ts",
+      ".d.mts",
+      ".d.cts",
+      ".map"
+    ],
+    "reviewedPrunedDirectories": [
+      {
+        "relativePath": "node_modules/@mistralai/mistralai/src",
+        "package": "@mistralai/mistralai",
+        "version": "2.6.1",
+        "packageJsonSha256": "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587",
+        "fileCount": 1173,
+        "totalBytes": 3225460,
+        "treeSha256": "0c91eac7b18ed1988ecde01d2fb184abd2e4bf9950b22e248f89fe826af19570"
+      },
+      {
+        "relativePath": "node_modules/@mistralai/mistralai/examples",
+        "package": "@mistralai/mistralai",
+        "version": "2.6.1",
+        "packageJsonSha256": "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587",
+        "fileCount": 33,
+        "totalBytes": 53098,
+        "treeSha256": "da24af65ab0423b3ef4657dc4338a620733fb93a8ce34f8f3881b5f97b14253a"
+      },
+      {
+        "relativePath": "node_modules/openai/src",
+        "package": "openai",
+        "version": "6.47.0",
+        "packageJsonSha256": "58936a8b912670945aff7e72a2c5cf435a36448215c7a3ed06569816198be88b",
+        "fileCount": 305,
+        "totalBytes": 2701229,
+        "treeSha256": "d113ee08904222ce6566aa83dab146f9a32a23ff29eb0c80eeb98bb6f1691253"
+      },
+      {
+        "relativePath": "node_modules/zod/src",
+        "package": "zod",
+        "version": "4.4.3",
+        "packageJsonSha256": "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e",
+        "fileCount": 286,
+        "totalBytes": 2237613,
+        "treeSha256": "69c0cc8db91a7c1072e20f4843863510c86a57975f86f46f2f927aa756111965"
+      },
+      {
+        "relativePath": "node_modules/@anthropic-ai/sdk/src",
+        "package": "@anthropic-ai/sdk",
+        "version": "0.91.1",
+        "packageJsonSha256": "28aaef57dd52864476e417dac7b0b389ca65b9e4f3ee42631e450a9c1a654f82",
+        "fileCount": 108,
+        "totalBytes": 849702,
+        "treeSha256": "196379af890a46c70704840e2eda7dbb9a4d341e45fe9892dbd7034eb9bfec35"
+      },
+      {
+        "relativePath": "node_modules/prime-agent/examples",
+        "package": "prime-agent",
+        "version": "0.7.2",
+        "packageJsonSha256": "0b45bc86527fcdb73dae76d319f6f50f6d40827a63614303664a57e8fe41c8cf",
+        "fileCount": 120,
+        "totalBytes": 920809,
+        "treeSha256": "ef04b9d444749c2e67f85caf5d3b5543c477756046adbdc611d7c4deea1c1849"
+      },
+      {
+        "relativePath": "node_modules/cmake-ts/src",
+        "package": "cmake-ts",
+        "version": "1.0.2",
+        "packageJsonSha256": "a351b1724f7c219bbe3abaf6e8557558565953464b760e4dbe0694d2165d0db6",
+        "fileCount": 26,
+        "totalBytes": 71551,
+        "treeSha256": "f1de2a37e85c5dbade19d727f177c9ec3e3d42c50952862dba98d12fd7b535a3"
+      },
+      {
+        "relativePath": "node_modules/zeromq/src",
+        "package": "zeromq",
+        "version": "6.5.0",
+        "packageJsonSha256": "9fa3e9fd40a74cdace0c4fbed3821ab5fff68e91340f16b39e567edbcbab435e",
+        "fileCount": 47,
+        "totalBytes": 229916,
+        "treeSha256": "b78dc3f71311e1bddefad17fe0db0694abadee66641a53ac5e62a1f3b9b684e2"
+      },
+      {
+        "relativePath": "node_modules/data-uri-to-buffer/src",
+        "package": "data-uri-to-buffer",
+        "version": "4.0.1",
+        "packageJsonSha256": "ad4f90a737ab5d8af4dad265e9218456e3779ca5beb70df38dd5feecf80121dd",
+        "fileCount": 1,
+        "totalBytes": 1785,
+        "treeSha256": "dbb9f6843ac7532c491c3b7d53bdf3f356c2432a4e5f2c2310509e155623a199"
+      },
+      {
+        "relativePath": "node_modules/@mistralai/mistralai/packages",
+        "package": "@mistralai/mistralai",
+        "version": "2.6.1",
+        "packageJsonSha256": "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587",
+        "fileCount": 224,
+        "totalBytes": 523201,
+        "treeSha256": "db88bccded8005daaf593e5b3155ef2c4a2ee18f9c7d8ccda7a86bceaac25bde"
+      },
+      {
+        "relativePath": "node_modules/@mistralai/mistralai/tests",
+        "package": "@mistralai/mistralai",
+        "version": "2.6.1",
+        "packageJsonSha256": "b6fad3f7b92ba6e659b3964dfc90a6a7607866f62dd1d93273c7eed39d165587",
+        "fileCount": 16,
+        "totalBytes": 105898,
+        "treeSha256": "6d78be7e61f91e0d7d129852fde93968d87398f0fe7d63a2024bd7689801a238"
+      },
+      {
+        "relativePath": "node_modules/highlight.js/scss",
+        "package": "highlight.js",
+        "version": "10.7.3",
+        "packageJsonSha256": "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf",
+        "fileCount": 100,
+        "totalBytes": 134675,
+        "treeSha256": "d7dd896e7977d12dcb4c504b94ec5293fc5fc5c50ce903533039967086ea7700"
+      },
+      {
+        "relativePath": "node_modules/highlight.js/styles",
+        "package": "highlight.js",
+        "version": "10.7.3",
+        "packageJsonSha256": "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf",
+        "fileCount": 100,
+        "totalBytes": 134675,
+        "treeSha256": "88ccb109d9fbd658b000acfdd7372215d909d7f7519b650b3406585832e2ff20"
+      }
     ]
   },
   "entrypoints": {
     "module": "node_modules/prime-agent/dist/index.js",
-    "cli": "node_modules/prime-agent/dist/bundle/cli.js"
+    "cli": "node_modules/prime-agent/dist/bundle/cli.js",
+    "browserBridge": "bridge/browser-bridge.mjs",
+    "browserHost": "bridge/browser-host.cjs",
+    "browserLauncher": "bridge/playwright-cli",
+    "browserLauncherWindows": "bridge/playwright-cli.cmd",
+    "browserSkill": "bridge/skills/playwright-cli/SKILL.md"
+  },
+  "browserBridge": {
+    "protocol": "prime-continuim.browser.v1",
+    "playwrightCoreVersion": "1.63.0-alpha-2026-08-05",
+    "engine": "verified-electron-host"
   },
   "daemon": {
     "protocolName": "prime-agent.daemon",
     "protocolVersion": 7,
-    "schemaRevision": 13,
-    "schemaId": "protocol-7-schema-13-816309b1cd50",
+    "schemaRevision": 16,
+    "schemaId": "protocol-7-schema-16-1bcb9e7f1a49",
     "requiredCapabilities": [
       "attach_snapshot",
       "event_sequence",
@@ -36,9 +171,18 @@
     ]
   },
   "criticalPackages": {
+    "extract-zip": {
+      "packageName": "@electron-internal/extract-zip",
+      "version": "1.0.5",
+      "integrity": "sha512-+bqFCP98pLI0Tt0XQo1TmlXtwjWchISndDOxCkEcIuUgXWpBnLyRI+2DU+mesvnMMX6L1XDqYNA0lXNDHd/yiA=="
+    },
+    "playwright-core": {
+      "version": "1.63.0-alpha-2026-08-05",
+      "integrity": "sha512-YussvUybTfBtyYbGXWh43f+5kNP03wg98M6mu4DphYET7PSbNVajsdLGjWE1xrsjqOw32i2wFlRP7U5mcOpMZg=="
+    },
     "prime-agent": {
-      "version": "0.7.1",
-      "integrity": "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ=="
+      "version": "0.7.2",
+      "integrity": "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg=="
     },
     "zeromq": {
       "version": "6.5.0",

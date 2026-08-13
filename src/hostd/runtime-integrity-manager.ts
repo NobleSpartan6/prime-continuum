@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import type { BigIntStats } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, fstatSync, openSync, readSync, type BigIntStats } from "node:fs";
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -38,6 +40,8 @@ const MAX_RUNTIME_FILE_MANIFEST_BYTES = 16 * 1024 * 1024;
 const MAX_RUNTIME_FILE_BYTES = 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES = 256 * 1024;
 const RUNTIME_FILE_CONCURRENCY = 16;
+const MACOS_CLONE_TOOL = "/bin/cp";
+const MACOS_XATTR_TOOL = "/usr/bin/xattr";
 const MAX_RUNTIME_REPAIR_QUARANTINES = 2;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
@@ -70,6 +74,7 @@ const RuntimeManifestSchema = z.object({
   smokeRuntime: RuntimeVersionSchema.extend({
     platform: BoundedStringSchema,
     arch: BoundedStringSchema,
+    bundleImportGraphComplete: z.literal(true),
   }).strict(),
   sourcesSha256: Sha256Schema,
   policySha256: Sha256Schema,
@@ -84,6 +89,16 @@ const RuntimeManifestSchema = z.object({
   entrypoints: z.object({
     module: BoundedStringSchema,
     cli: BoundedStringSchema,
+    browserBridge: BoundedStringSchema,
+    browserHost: BoundedStringSchema,
+    browserLauncher: BoundedStringSchema,
+    browserLauncherWindows: BoundedStringSchema,
+    browserSkill: BoundedStringSchema,
+  }).strict(),
+  browserBridge: z.object({
+    protocol: z.literal("prime-continuim.browser.v1"),
+    playwrightCoreVersion: z.literal("1.63.0-alpha-2026-08-05"),
+    engine: z.literal("verified-electron-host"),
   }).strict(),
   daemon: z.object({
     protocolName: BoundedStringSchema,
@@ -140,14 +155,13 @@ type RuntimeManifest = z.infer<typeof RuntimeManifestSchema>;
 type InstalledPointer = z.infer<typeof InstalledPointerSchema>;
 
 export interface RuntimeHostIdentity {
-  readonly kind: "electron-run-as-node";
-  readonly electronVersion: string;
+  readonly kind: "node";
   readonly nodeVersion: string;
   readonly modulesAbi: string;
   readonly napiVersion: string;
   readonly platform: string;
   readonly arch: string;
-  readonly runAsNode: true;
+  readonly executableSha256: string;
 }
 
 export interface InstalledRuntimeIntegrityIdentity extends InstalledPointer {
@@ -170,12 +184,22 @@ export interface VerifiedInstalledRuntimeHandle {
   readonly [verifiedInstalledRuntimeHandleBrand]: never;
   /** Path-free identity suitable for comparison and diagnostics. */
   readonly identity: InstalledRuntimeIntegrityIdentity;
-  /** Absolute path of the identity-checked Electron RunAsNode host. */
+  /** Absolute path of the identity-checked standalone Node host. */
   readonly executable: string;
+  /** Exact independently attested Electron executable used only by the browser bridge. */
+  readonly browserExecutable: string;
   /** Absolute file URL of the verified Prime Agent module entrypoint. */
   readonly moduleUrl: string;
   /** Absolute path of the verified Prime Agent CLI entrypoint. */
   readonly cliEntrypoint: string;
+  /** Absolute path of the attested browser bridge program. */
+  readonly browserBridge: string;
+  /** Absolute path of the attested POSIX browser launcher. */
+  readonly browserLauncher: string;
+  /** Absolute path of the attested Windows browser launcher. */
+  readonly browserLauncherWindows: string;
+  /** Absolute path of the attested resident browser skill. */
+  readonly browserSkill: string;
 }
 
 export const RUNTIME_INTEGRITY_CANCELLED = "RUNTIME_INTEGRITY_CANCELLED" as const;
@@ -268,10 +292,21 @@ export interface RuntimeIntegrityManagerOptions {
   readonly attestation: EmbeddedRuntimeAttestation;
   readonly ownershipLease: HostOwnershipLease;
   readonly hostRuntime?: RuntimeHostIdentity;
+  readonly browserExecutable?: string;
+  /** Deterministic test seam; production always hashes browserExecutable directly. */
+  readonly browserExecutableSha256?: string;
   readonly faultInjector?: (point: RuntimeIntegrityFaultPoint) => void | Promise<void>;
   readonly writeCurrent?: (path: string, value: InstalledPointer) => Promise<void>;
   readonly onProgress?: (phase: RuntimeIntegrityProgressPhase) => void;
+  /** Deterministic test seam. Production uses the root-owned macOS clone tool only for a macOS runtime. */
+  readonly cloneRuntimeTree?: RuntimeTreeCloner;
 }
+
+export type RuntimeTreeCloner = (
+  sourceDirectory: string,
+  destinationDirectory: string,
+  signal: AbortSignal,
+) => Promise<boolean>;
 
 interface RuntimeFileEntry {
   readonly path: string;
@@ -292,10 +327,12 @@ export class RuntimeIntegrityManager {
   private readonly paths: HostDataPaths;
   private readonly attestation: EmbeddedRuntimeAttestation;
   private readonly hostRuntime: RuntimeHostIdentity;
+  private readonly browserExecutable: string;
   private readonly ownershipLease: HostOwnershipLease;
   private readonly faultInjector?: RuntimeIntegrityManagerOptions["faultInjector"];
   private readonly writeCurrent: NonNullable<RuntimeIntegrityManagerOptions["writeCurrent"]>;
   private readonly onProgress?: RuntimeIntegrityManagerOptions["onProgress"];
+  private readonly cloneRuntimeTree?: RuntimeTreeCloner;
   private ensurePromise?: Promise<InstalledRuntimeIntegrityIdentity>;
   private repairPromise?: Promise<InstalledRuntimeIntegrityIdentity>;
   private publicationPoison?: RuntimeIntegrityPublicationPoisonedError;
@@ -311,10 +348,26 @@ export class RuntimeIntegrityManager {
     this.attestation = options.attestation;
     this.ownershipLease = options.ownershipLease;
     this.hostRuntime = options.hostRuntime ?? currentRuntimeHostIdentity();
+    this.browserExecutable = boundedAbsoluteRuntimeLocation(
+      options.browserExecutable ?? process.execPath,
+      "browser Electron executable",
+    );
     this.faultInjector = options.faultInjector;
     this.writeCurrent = options.writeCurrent ?? ((path, value) => atomicWriteJson(path, value));
     this.onProgress = options.onProgress;
+    this.cloneRuntimeTree = options.cloneRuntimeTree ?? (
+      process.platform === "darwin" && this.attestation.runtime.platform === "darwin"
+        ? cloneMacOSRuntimeTree
+        : undefined
+    );
     assertHostRuntime(this.hostRuntime, this.attestation);
+    const browserExecutableSha256 = options.browserExecutableSha256 ?? hashExecutable(this.browserExecutable);
+    if (
+      browserExecutableSha256 !== this.attestation.guiRuntime.executableSha256 ||
+      browserExecutableSha256 === this.hostRuntime.executableSha256
+    ) {
+      throw new Error("Browser Electron executable does not match the embedded runtime attestation");
+    }
     if (this.attestation.assurance !== "development-integrity") {
       throw new Error("The unsigned runtime integrity manager refuses production-authenticated claims");
     }
@@ -795,7 +848,30 @@ export class RuntimeIntegrityManager {
       await this.faultInjector?.("before_copy");
       throwIfRuntimeIntegrityCancelled(signal);
       try {
-        await verifyRuntimeDirectory(sourceDirectory, this.attestation, stagingDirectory, signal);
+        let cloned = false;
+        if (this.cloneRuntimeTree) {
+          // The clone is an optimization, never an authority shortcut. Hash the
+          // complete source before invoking the system tool, and hash it again
+          // after the tool retires so a moving packaged seed cannot be
+          // promoted through a successful destination verification alone.
+          await verifyRuntimeDirectory(sourceDirectory, this.attestation, undefined, signal);
+          try {
+            cloned = await this.cloneRuntimeTree(sourceDirectory, stagingDirectory, signal);
+          } catch (error) {
+            if (error instanceof RuntimeIntegrityCancelledError || signal.aborted) throw error;
+            cloned = false;
+          }
+          throwIfRuntimeIntegrityCancelled(signal);
+          if (cloned) {
+            await verifyRuntimeDirectory(sourceDirectory, this.attestation, undefined, signal);
+            await normalizeAndSyncClonedRuntimeTree(stagingDirectory, this.attestation, signal);
+          } else {
+            await recreateEmptyStagingDirectory(stagingDirectory, signal);
+          }
+        }
+        if (!cloned) {
+          await verifyRuntimeDirectory(sourceDirectory, this.attestation, stagingDirectory, signal);
+        }
       } catch (error) {
         throw classifyRuntimeRepairFailure(
           errorCodeInChain(error, "ENOENT") ? "packaged_seed_unavailable" : "packaged_seed_invalid",
@@ -937,11 +1013,24 @@ export class RuntimeIntegrityManager {
     const finalDirectory = this.finalDirectory();
     const moduleEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.module, "module");
     const cliEntrypoint = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.cli, "CLI");
+    const browserBridge = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.browserBridge, "browser bridge");
+    const browserLauncher = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.browserLauncher, "browser launcher");
+    const browserLauncherWindows = this.entrypointLocation(
+      finalDirectory,
+      this.attestation.entrypoints.browserLauncherWindows,
+      "Windows browser launcher",
+    );
+    const browserSkill = this.entrypointLocation(finalDirectory, this.attestation.entrypoints.browserSkill, "browser skill");
     return Object.freeze({
       identity,
       executable,
+      browserExecutable: this.browserExecutable,
       moduleUrl: pathToFileURL(moduleEntrypoint).href,
       cliEntrypoint,
+      browserBridge,
+      browserLauncher,
+      browserLauncherWindows,
+      browserSkill,
     }) as VerifiedInstalledRuntimeHandle;
   }
 
@@ -1006,19 +1095,45 @@ function throwIfRuntimeIntegrityCancelled(signal: AbortSignal): void {
 
 export function currentRuntimeHostIdentity(): RuntimeHostIdentity {
   const { electron: electronVersion, node: nodeVersion, modules: modulesAbi, napi: napiVersion } = process.versions;
-  if (!electronVersion || !nodeVersion || !modulesAbi || !napiVersion || process.env.ELECTRON_RUN_AS_NODE !== "1") {
-    throw new Error("Runtime installation requires an exact Electron RunAsNode host");
+  if (electronVersion || !nodeVersion || !modulesAbi || !napiVersion) {
+    throw new Error("Runtime installation requires an exact standalone Node host");
   }
   return {
-    kind: "electron-run-as-node",
-    electronVersion,
+    kind: "node",
     nodeVersion,
     modulesAbi,
     napiVersion,
     platform: process.platform,
     arch: process.arch,
-    runAsNode: true,
+    executableSha256: hashExecutable(process.execPath),
   };
+}
+
+function hashExecutable(executable: string): string {
+  const descriptor = openSync(executable, "r");
+  try {
+    const before = fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.size <= 0n || before.size > 512n * 1024n * 1024n) {
+      throw new Error("Runtime host executable is outside its bounded size");
+    }
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(256 * 1024);
+    let position = 0n;
+    while (position < before.size) {
+      const requested = Number((before.size - position) < BigInt(buffer.byteLength) ? before.size - position : BigInt(buffer.byteLength));
+      const bytesRead = readSync(descriptor, buffer, 0, requested, Number(position));
+      if (bytesRead <= 0) throw new Error("Runtime host executable ended before its recorded size");
+      digest.update(buffer.subarray(0, bytesRead));
+      position += BigInt(bytesRead);
+    }
+    const after = fstatSync(descriptor, { bigint: true });
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) {
+      throw new Error("Runtime host executable changed while it was hashed");
+    }
+    return digest.digest("hex");
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export function parseRuntimeFileManifest(
@@ -1121,12 +1236,24 @@ async function verifyRuntimeDirectory(
   for (const requiredPath of [
     manifest.entrypoints.module,
     manifest.entrypoints.cli,
+    manifest.entrypoints.browserBridge,
+    manifest.entrypoints.browserHost,
+    manifest.entrypoints.browserLauncher,
+    manifest.entrypoints.browserLauncherWindows,
+    manifest.entrypoints.browserSkill,
     "node_modules/prime-agent/package.json",
+    "node_modules/playwright-core/package.json",
   ]) {
     if (!payloadPaths.has(requiredPath)) throw new Error(`Runtime image is missing a required entrypoint file: ${requiredPath}`);
   }
   const expectedDirectories = runtimeDirectorySet(files, signal);
   await assertExactRuntimeNamespace(directory, files, expectedDirectories, signal);
+  if (process.platform !== "win32") {
+    const launcher = await lstat(join(directory, ...manifest.entrypoints.browserLauncher.split("/")));
+    if (!launcher.isFile() || (launcher.mode & 0o111) === 0) {
+      throw new Error("Runtime browser launcher is not executable");
+    }
+  }
 
   if (copyDestination) {
     await assertPlainDirectory(copyDestination, "runtime staging image", signal);
@@ -1206,6 +1333,168 @@ async function mapConcurrentOrdered<T, R>(
   await Promise.all(workers);
   if (failed) throw failure;
   return results;
+}
+
+async function cloneMacOSRuntimeTree(
+  sourceDirectory: string,
+  destinationDirectory: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  throwIfRuntimeIntegrityCancelled(signal);
+  if (
+    !await isTrustedMacOSSystemTool(MACOS_CLONE_TOOL) ||
+    !await isTrustedMacOSSystemTool(MACOS_XATTR_TOOL)
+  ) return false;
+  const cloned = await runMacOSRuntimeUtility(
+    MACOS_CLONE_TOOL,
+    ["-c", "-R", `${sourceDirectory}${sep}.`, destinationDirectory],
+    signal,
+  );
+  if (!cloned) return false;
+  // clonefile preserves extended attributes. The byte-copy installer did not,
+  // and retaining quarantine/provenance metadata can change launch behavior,
+  // so clear all cloned attributes before any image is considered successful.
+  return await runMacOSRuntimeUtility(
+    MACOS_XATTR_TOOL,
+    ["-c", "-r", destinationDirectory],
+    signal,
+  );
+}
+
+async function runMacOSRuntimeUtility(
+  executable: string,
+  args: readonly string[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  throwIfRuntimeIntegrityCancelled(signal);
+  const completed = await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (result: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn(
+        executable,
+        args,
+        {
+          cwd: sep,
+          env: { LANG: "C", LC_ALL: "C" },
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+    } catch {
+      finish(false);
+      return;
+    }
+    child.once("error", () => finish(false));
+    child.once("close", (code, terminationSignal) => {
+      finish(code === 0 && terminationSignal === null);
+    });
+  });
+  // Do not signal an opaque OS process by PID on cancellation. The bounded
+  // clone normally retires in milliseconds; waiting for its owned ChildProcess
+  // close avoids PID-reuse risk and guarantees no helper remains before
+  // staging cleanup begins.
+  throwIfRuntimeIntegrityCancelled(signal);
+  return completed;
+}
+
+async function isTrustedMacOSSystemTool(path: string): Promise<boolean> {
+  try {
+    const metadata = await lstat(path, { bigint: true });
+    return (
+      metadata.isFile() &&
+      !metadata.isSymbolicLink() &&
+      metadata.uid === 0n &&
+      metadata.nlink === 1n &&
+      (metadata.mode & 0o022n) === 0n &&
+      (metadata.mode & 0o111n) !== 0n
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function recreateEmptyStagingDirectory(path: string, signal?: AbortSignal): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  const current = await lstat(path, { bigint: true });
+  if (!current.isDirectory() || current.isSymbolicLink()) {
+    throw new Error("Runtime clone staging root is not a plain directory");
+  }
+  await rm(path, { recursive: true, force: false });
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  await mkdir(path, { recursive: false, mode: 0o700 });
+  await assertPlainDirectory(path, "runtime staging image", signal);
+}
+
+async function normalizeAndSyncClonedRuntimeTree(
+  directory: string,
+  attestation: EmbeddedRuntimeAttestation,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal) throwIfRuntimeIntegrityCancelled(signal);
+  const [manifestBytes, fileManifestBytes] = await Promise.all([
+    readBoundedRegularFile(join(directory, "runtime.json"), MAX_RUNTIME_MANIFEST_BYTES, "runtime manifest", signal),
+    readBoundedRegularFile(join(directory, "files.sha256"), MAX_RUNTIME_FILE_MANIFEST_BYTES, "runtime file manifest", signal),
+  ]);
+  if (
+    sha256(manifestBytes) !== attestation.manifest.sha256 ||
+    sha256(fileManifestBytes) !== attestation.tree.filesSha256
+  ) {
+    throw new Error("Cloned runtime metadata does not match the embedded attestation");
+  }
+  const manifest = RuntimeManifestSchema.parse(parseJson(manifestBytes, "runtime manifest"));
+  assertManifestMatchesAttestation(manifest, attestation);
+  const files = parseRuntimeFileManifest(fileManifestBytes, attestation.tree.fileCount, signal);
+  const directories = runtimeDirectorySet(files, signal);
+  await assertExactRuntimeNamespace(directory, files, directories, signal);
+
+  await chmod(directory, 0o700);
+  const shallowestFirst = [...directories].sort((left, right) => {
+    const depth = left.split("/").length - right.split("/").length;
+    return depth || compareRuntimePaths(left, right);
+  });
+  for (const path of shallowestFirst) {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
+    const absolute = join(directory, ...path.split("/"));
+    await chmod(absolute, 0o700);
+    await assertPlainDirectory(absolute, "cloned runtime directory", signal);
+  }
+
+  const filePaths = [
+    ...files.map((entry) => entry.path),
+    "files.sha256",
+    "runtime.json",
+  ];
+  await mapConcurrentOrdered(filePaths, RUNTIME_FILE_CONCURRENCY, async (path) => {
+    if (signal) throwIfRuntimeIntegrityCancelled(signal);
+    const absolute = join(directory, ...path.split("/"));
+    await chmod(absolute, isBrowserLauncherPath(absolute) ? 0o700 : 0o600);
+    const pathBefore = await requirePlainRegularFile(absolute, "cloned runtime file", signal);
+    // Windows rejects fsync on a read-only file handle with EPERM. The cloned
+    // staging image is private and has already been normalized writable for
+    // its owner, so request write access for durability without mutating it.
+    const handle = await open(absolute, process.platform === "win32" ? "r+" : "r");
+    try {
+      const opened = await handle.stat({ bigint: true });
+      assertSameRuntimeFileIdentity(pathBefore, opened, "Cloned runtime file changed before sync");
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
+      await handle.sync();
+      if (signal) throwIfRuntimeIntegrityCancelled(signal);
+      const openedAfter = await handle.stat({ bigint: true });
+      const pathAfter = await requirePlainRegularFile(absolute, "cloned runtime file", signal);
+      assertSameRuntimeFileIdentity(opened, openedAfter, "Cloned runtime file changed while syncing");
+      assertSameRuntimeFileIdentity(opened, pathAfter, "Cloned runtime file path changed while syncing");
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    return undefined;
+  }, signal);
+  await syncRuntimeTreeDirectories(directory, directories, signal);
 }
 
 async function cleanupAbandonedStaging(stagingRoot: string, signal?: AbortSignal): Promise<void> {
@@ -1420,6 +1709,9 @@ async function hashRegularFileOnce(
       }
       await destination.close();
       destination = undefined;
+      if (process.platform !== "win32" && isBrowserLauncherPath(destinationPath as string)) {
+        await chmod(destinationPath as string, 0o700);
+      }
       await requirePlainRegularFile(destinationPath as string, "runtime staging file", signal);
     }
     if (signal) throwIfRuntimeIntegrityCancelled(signal);
@@ -1435,6 +1727,11 @@ async function hashRegularFileOnce(
   } finally {
     await source.close().catch(() => undefined);
   }
+}
+
+function isBrowserLauncherPath(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  return normalized.endsWith("/bridge/playwright-cli");
 }
 
 async function copyAndHashRegularFile(
@@ -1557,6 +1854,15 @@ function assertManifestMatchesAttestation(
     manifest.packageLockSha256 !== attestation.manifest.packageLockSha256 ||
     !jsonEqual(manifest.tree, attestation.tree) ||
     !jsonEqual(manifest.entrypoints, attestation.entrypoints) ||
+    !jsonEqual(manifest.browserBridge, {
+      protocol: attestation.browserBridge.protocol,
+      playwrightCoreVersion: attestation.browserBridge.playwrightCoreVersion,
+      engine: attestation.browserBridge.engine,
+    }) ||
+    attestation.browserBridge.smoke.verified !== true ||
+    !jsonEqual(attestation.browserBridge.smoke.operations, [
+      "doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close",
+    ]) ||
     !jsonEqual(manifest.daemon, attestation.daemon) ||
     !jsonEqual(manifest.nativeAddons, attestation.nativeAddons)
   ) {
@@ -1569,6 +1875,11 @@ function assertManifestMatchesAttestation(
   for (const entrypoint of [
     manifest.entrypoints.module,
     manifest.entrypoints.cli,
+    manifest.entrypoints.browserBridge,
+    manifest.entrypoints.browserHost,
+    manifest.entrypoints.browserLauncher,
+    manifest.entrypoints.browserLauncherWindows,
+    manifest.entrypoints.browserSkill,
   ]) {
     if (!isSafeRuntimePath(entrypoint)) throw new Error("Runtime manifest contains an unsafe entrypoint");
   }
@@ -1617,7 +1928,7 @@ function installedPointerFromAttestation(attestation: EmbeddedRuntimeAttestation
 }
 
 function assertHostRuntime(identity: RuntimeHostIdentity, attestation: EmbeddedRuntimeAttestation): void {
-  if (!jsonEqual(identity, attestation.hostRuntime) || identity.runAsNode !== true) {
+  if (!jsonEqual(identity, attestation.hostRuntime) || identity.kind !== "node") {
     throw new Error("Current host runtime does not match the embedded runtime attestation");
   }
 }

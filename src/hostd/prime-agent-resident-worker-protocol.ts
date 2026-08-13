@@ -7,6 +7,7 @@ export const RESIDENT_WORKER_LIMITS = Object.freeze({
   maxControlMessageBytes: 8 * 1024 * 1024,
   maxSnapshotBytes: 50 * 1024 * 1024,
   maxEventBytes: 50 * 1024 * 1024,
+  maxResourceSnapshotBytes: 8 * 1024 * 1024,
   maxModelCatalogBytes: 8 * 1024 * 1024,
   maxDaemonResponseBytes: 8 * 1024 * 1024,
   maxHelloBytes: 64 * 1024,
@@ -21,6 +22,7 @@ export const RESIDENT_WORKER_LIMITS = Object.freeze({
   maxPromptCharacters: 65_536,
   maxProviderCharacters: 128,
   maxModelCharacters: 512,
+  maxExtensionUiValueCharacters: 65_536,
   maxRequestTimeoutMs: 24 * 60 * 60 * 1_000,
   workerReadyTimeoutMs: 15_000,
   recoveryTimeoutMs: 30_000,
@@ -38,11 +40,13 @@ export type ResidentWorkerOperation =
   | "connection.attach"
   | "connection.get_initial_snapshot"
   | "connection.wait_for_idle"
+  | "connection.get_resource_snapshot"
   | "connection.get_available_models"
   | "connection.set_model"
   | "connection.promote_to_resident"
   | "connection.prompt"
   | "connection.abort"
+  | "connection.respond_extension_ui"
   | "connection.dispose";
 
 export const RESIDENT_WORKER_OPERATIONS: ReadonlySet<ResidentWorkerOperation> = new Set([
@@ -54,11 +58,13 @@ export const RESIDENT_WORKER_OPERATIONS: ReadonlySet<ResidentWorkerOperation> = 
   "connection.attach",
   "connection.get_initial_snapshot",
   "connection.wait_for_idle",
+  "connection.get_resource_snapshot",
   "connection.get_available_models",
   "connection.set_model",
   "connection.promote_to_resident",
   "connection.prompt",
   "connection.abort",
+  "connection.respond_extension_ui",
   "connection.dispose",
 ]);
 
@@ -363,6 +369,8 @@ export function residentWorkerOperationResultBound(operation: ResidentWorkerOper
   switch (operation) {
     case "connection.get_initial_snapshot":
       return RESIDENT_WORKER_LIMITS.maxSnapshotBytes;
+    case "connection.get_resource_snapshot":
+      return RESIDENT_WORKER_LIMITS.maxResourceSnapshotBytes;
     case "connection.get_available_models":
       return RESIDENT_WORKER_LIMITS.maxModelCatalogBytes;
     case "client.request":

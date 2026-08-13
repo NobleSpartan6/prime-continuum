@@ -4,9 +4,16 @@ import { assertPinnedDevelopmentNodeRuntime } from './development-node-runtime.m
 import { acquireWorkflowLock, WorkflowLockError } from './workflow-lock-lib.mjs'
 import { getWorkflowLockPath } from './workflow-lock-lib.mjs'
 import {
+  createDevelopmentBuildPlan,
+  createDevelopmentHostBuildPlan,
   createDevelopmentWorkflowPlan,
   createPreviewWorkflowPlan,
 } from './development-workflow-plan.mjs'
+import {
+  createMacosDmgBuilderPlan,
+  createMacosPackagingBuilderPlan,
+  createMacosPackagingEnvironment,
+} from './macos-packaging-policy.mjs'
 import { rejectActiveWorkflowChild, WorkflowChildLeaseError } from './workflow-child-lease-lib.mjs'
 import { runSupervisedWorkflowStep } from './workflow-supervised-step-lib.mjs'
 import { createWorkflowStepEnvironment } from './workflow-step-environment.mjs'
@@ -30,15 +37,21 @@ function createWorkflows(releaseOptions = {}) {
     nodeStep('Build the attested host service', 'scripts/build-hostd.mjs', ['--attestation', 'out/main/runtime-attestation.json']),
   ]
 
+  const directoryPackagingSteps = process.platform === 'darwin'
+    ? [
+        ...createMacosPackagingBuilderPlan({ arch: process.arch }).map(materializeMacosPackagingStep),
+        nodeStep('Verify the macOS application directory', 'scripts/verify-macos-package.mjs'),
+      ]
+    : [
+        ...createWindowsPackagingBuilderPlan({ directoryOnly: true }).map(materializeWindowsPackagingStep),
+        nodeStep('Verify the Windows application package', 'scripts/verify-windows-package.mjs'),
+      ]
+
   return {
   dev: createDevelopmentWorkflowPlan(PROJECT_ROOT).map(materializePlannedStep),
   preview: createPreviewWorkflowPlan().map(materializePlannedStep),
-  build: [
-    pnpmStep('Build the relay server', ['--filter', '@prime-agent/relay-server', 'build']),
-    pnpmStep('Build the desktop application', ['exec', 'electron-vite', 'build']),
-    nodeStep('Build the host service', 'scripts/build-hostd.mjs'),
-  ],
-  'build:hostd': [nodeStep('Build the host service', 'scripts/build-hostd.mjs')],
+  build: createDevelopmentBuildPlan(PROJECT_ROOT).map(materializePlannedStep),
+  'build:hostd': createDevelopmentHostBuildPlan(PROJECT_ROOT).map(materializePlannedStep),
   'build:hostd:release': [
     nodeStep('Build the attested host service', 'scripts/build-hostd.mjs', ['--attestation', 'out/main/runtime-attestation.json']),
   ],
@@ -56,10 +69,17 @@ function createWorkflows(releaseOptions = {}) {
     ...releaseBuildSteps,
     nodeStep('Verify host runtime initialization', 'scripts/verify-hostd-runtime-initialization.mjs'),
     nodeStep('Verify resident host lifecycle', 'scripts/verify-hostd-resident-lifecycle.mjs'),
-    ...createWindowsPackagingBuilderPlan({ directoryOnly: true }).map(materializeWindowsPackagingStep),
-    nodeStep('Verify the Windows application package', 'scripts/verify-windows-package.mjs'),
+    ...directoryPackagingSteps,
   ],
-  dist: [
+  dist: process.platform === 'darwin' ? [
+    nodeStep('Build the Prime Agent runtime', 'scripts/build-prime-agent-runtime.mjs'),
+    ...releaseBuildSteps,
+    nodeStep('Verify host runtime initialization', 'scripts/verify-hostd-runtime-initialization.mjs'),
+    nodeStep('Verify resident host lifecycle', 'scripts/verify-hostd-resident-lifecycle.mjs'),
+    ...createMacosDmgBuilderPlan({ arch: process.arch }).map(materializeMacosPackagingStep),
+    nodeStep('Verify the macOS application directory', 'scripts/verify-macos-package.mjs'),
+    nodeStep('Verify and checksum the macOS DMG', 'scripts/verify-macos-dmg.mjs'),
+  ] : [
     nodeStep('Build the Prime Agent runtime', 'scripts/build-prime-agent-runtime.mjs'),
     ...releaseBuildSteps,
     nodeStep('Verify host runtime initialization', 'scripts/verify-hostd-runtime-initialization.mjs'),
@@ -78,6 +98,12 @@ async function main() {
   const workflows = createWorkflows(releaseOptions)
   if (!workflow || !Object.hasOwn(workflows, workflow)) {
     throw new Error(`Usage: node scripts/run-workflow.mjs <${Object.keys(workflows).join('|')}>`)
+  }
+  if (workflow === 'package' && process.platform !== 'win32' && process.platform !== 'darwin') {
+    throw new Error(`Prime Continuim directory packaging is not reviewed for ${process.platform}.`)
+  }
+  if (workflow === 'dist' && process.platform !== 'win32' && process.platform !== 'darwin') {
+    throw new Error(`Prime Continuim installer packaging is not reviewed for ${process.platform}.`)
   }
   assertPinnedDevelopmentNodeRuntime({ projectRoot: PROJECT_ROOT })
   const lock = await acquireWorkflowLock({ workflow, projectRoot: PROJECT_ROOT })
@@ -146,6 +172,15 @@ function materializeWindowsPackagingStep(step) {
   return step.kind === 'node'
     ? nodeStep(step.label, step.script, step.args)
     : pnpmStep(step.label, step.args, UNSIGNED_WINDOWS_ENV, true)
+}
+
+function materializeMacosPackagingStep(step) {
+  return step.kind === 'node'
+    ? nodeStep(step.label, step.script, step.args)
+    // Keep the POSIX-only PATH policy behind the macOS package/dist branch.
+    // Importing this runner or planning `pnpm build` on Windows must never
+    // evaluate a Windows process.execPath as a macOS executable path.
+    : pnpmStep(step.label, step.args, createMacosPackagingEnvironment(process.env), true)
 }
 
 function pnpmStep(label, args, environment = {}, replaceEnvironment = false, environmentBoundary) {

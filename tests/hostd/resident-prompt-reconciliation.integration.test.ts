@@ -21,7 +21,10 @@ import {
   HostStore,
   type ResidentPromptReconciliationLease,
 } from "../../src/hostd/store";
-import { VerifiedResidentGateway } from "../../src/hostd/verified-resident-gateway";
+import {
+  VerifiedResidentGateway,
+  type VerifiedResidentGatewayOptions,
+} from "../../src/hostd/verified-resident-gateway";
 import {
   PROTOCOL_VERSION,
   type CommandEnvelope,
@@ -29,9 +32,16 @@ import {
 } from "../../src/shared/protocol";
 
 const temporaryDirectories: string[] = [];
+const gatewaysForCleanup: VerifiedResidentGateway[] = [];
 
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await Promise.allSettled(gatewaysForCleanup.splice(0).map((gateway) => gateway.close()));
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 25,
+  })));
 });
 
 describe("verified resident prompt idle reconciliation", () => {
@@ -70,7 +80,13 @@ describe("verified resident prompt idle reconciliation", () => {
     let attempt = 0;
     const fixture = await serviceFixture(async (lease, options) => {
       attempt += 1;
-      if (attempt === 1) throw new Error("transient idle observation failure");
+      if (attempt === 1) {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+          "The acknowledged prompt terminal event has not converged yet.",
+          { retryable: true },
+        );
+      }
       const idle = projection(lease.binding, "proof-retry-idle", 1);
       await options.publishProjection(lease.binding, idle);
       return evidence(lease, idle);
@@ -89,6 +105,112 @@ describe("verified resident prompt idle reconciliation", () => {
     expect(fixture.adapter.submit).toHaveBeenCalledOnce();
 
     await fixture.service.close();
+  });
+
+  it("autonomously retries a branded late terminal proof without replaying the prompt", async () => {
+    let attempt = 0;
+    let retryCallback: (() => void) | undefined;
+    let retryDelayMs: number | undefined;
+    const retryTimer = setTimeout(() => undefined, 60_000);
+    retryTimer.unref();
+    const fixture = await serviceFixture(
+      async (lease, options) => {
+        attempt += 1;
+        if (attempt === 1) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+            "The acknowledged prompt terminal event has not converged yet.",
+            { retryable: true },
+          );
+        }
+        const idle = projection(lease.binding, "proof-autonomous-retry-idle", 2);
+        await options.publishProjection(lease.binding, idle);
+        return evidence(lease, idle);
+      },
+      {
+        schedulePromptReconciliationRetry: (callback, delayMs) => {
+          retryCallback = callback;
+          retryDelayMs = delayMs;
+          return retryTimer;
+        },
+        cancelPromptReconciliationRetry: (timer) => clearTimeout(timer),
+      },
+    );
+    const command = promptCommand(fixture.hostId, "proof-autonomous-retry-prompt");
+
+    await expect(submitCommand(fixture.service, command, "proof-autonomous-retry-submit")).resolves.toMatchObject({
+      status: "running",
+    });
+    await vi.waitFor(() => expect(retryCallback).toBeTypeOf("function"));
+    expect(retryDelayMs).toBe(250);
+    clearTimeout(retryTimer);
+    retryCallback?.();
+    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledTimes(2));
+    await vi.waitFor(async () => expect(
+      (await fixture.store.reconcileCommands([command])).receipts[0]?.status,
+    ).toBe("completed"));
+    expect(fixture.adapter.submit).toHaveBeenCalledOnce();
+    expect(await fixture.store.listResidentPromptReconciliationLeases()).toEqual([]);
+
+    await fixture.service.close();
+  });
+
+  it("suppresses unclassified reconciliation failures across readiness polls", async () => {
+    const fixture = await serviceFixture(async () => {
+      throw new Error("unexpected reconciliation implementation defect");
+    });
+    const command = promptCommand(fixture.hostId, "proof-nonretryable-prompt");
+
+    await expect(submitCommand(fixture.service, command, "proof-nonretryable-submit")).resolves.toMatchObject({
+      status: "running",
+    });
+    await vi.waitFor(() => expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledOnce());
+    await Promise.all([
+      fixture.gateway.capabilityReady(),
+      fixture.gateway.capabilityReady(),
+      fixture.gateway.capabilityReady(),
+    ]);
+    await new Promise((resolveTurn) => setTimeout(resolveTurn, 300));
+    expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledOnce();
+    expect(fixture.adapter.submit).toHaveBeenCalledOnce();
+    expect((await fixture.store.reconcileCommands([command])).receipts[0]?.status).toBe("running");
+
+    await fixture.service.close();
+  });
+
+  it("cancels an autonomous reconciliation retry before closing", async () => {
+    let retryCallback: (() => void) | undefined;
+    const retryTimer = setTimeout(() => undefined, 60_000);
+    retryTimer.unref();
+    const cancelRetry = vi.fn((timer: ReturnType<typeof setTimeout>) => clearTimeout(timer));
+    const fixture = await serviceFixture(
+      async () => {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+          "The acknowledged prompt terminal event has not converged yet.",
+          { retryable: true },
+        );
+      },
+      {
+        schedulePromptReconciliationRetry: (callback) => {
+          retryCallback = callback;
+          return retryTimer;
+        },
+        cancelPromptReconciliationRetry: cancelRetry,
+      },
+    );
+    const command = promptCommand(fixture.hostId, "proof-close-cancels-retry");
+
+    await expect(submitCommand(fixture.service, command, "proof-close-cancels-submit")).resolves.toMatchObject({
+      status: "running",
+    });
+    await vi.waitFor(() => expect(retryCallback).toBeTypeOf("function"));
+    await fixture.service.close();
+    expect(cancelRetry).toHaveBeenCalledWith(retryTimer);
+    retryCallback?.();
+    await new Promise((resolveTurn) => setImmediate(resolveTurn));
+    expect(fixture.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledOnce();
+    expect(fixture.adapter.submit).toHaveBeenCalledOnce();
   });
 
   it("discovers an acknowledged running lock after host restart and performs only the read-only proof", async () => {
@@ -123,6 +245,80 @@ describe("verified resident prompt idle reconciliation", () => {
     expect(await restartedStore.listResidentPromptReconciliationLeases()).toEqual([]);
 
     await fixture.gateway.close();
+  });
+
+  it("survives adapter and HostStore restarts without replaying prompt admission or duplicating proof", async () => {
+    const base = await initializedStore();
+    const priorIdle = projection(base.binding, "proof-restart-cycle", 1);
+    await base.store.publishResidentProjectionSnapshot(base.binding, priorIdle);
+    const command = promptCommand(base.hostId, "proof-multi-restart-no-replay");
+    expect((await base.store.admitCommand(command, true)).receipt.status).toBe("admitted");
+    const dispatch = await base.store.beginResidentDispatch(command);
+    await base.store.finalizeResidentDispatch(dispatch, {
+      status: "running",
+      message: "Prime Agent acknowledged the one permitted prompt admission",
+    });
+
+    const firstAdapter = gatewayFixture(
+      base.store,
+      async () => {
+        throw new Error("simulated adapter loss before idle proof");
+      },
+      undefined,
+      () => priorIdle,
+    );
+    await expect(firstAdapter.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await firstAdapter.gateway.capabilityReady()).toBe(true));
+    await vi.waitFor(() => expect(
+      firstAdapter.adapter.reconcileAcknowledgedPromptIdle,
+    ).toHaveBeenCalledOnce());
+    expect((await base.store.reconcileCommands([command])).receipts[0]?.status).toBe("running");
+    expect(firstAdapter.adapter.submit).not.toHaveBeenCalled();
+    await firstAdapter.gateway.close();
+
+    const restartedStore = new HostStore(base.directory);
+    await restartedStore.initialize();
+    const completedIdle = projection(base.binding, "proof-restart-cycle", 2);
+    const recoveredAdapter = gatewayFixture(
+      restartedStore,
+      async (lease, options) => {
+        await options.publishProjection(lease.binding, completedIdle);
+        return evidence(lease, completedIdle);
+      },
+      undefined,
+      () => priorIdle,
+    );
+    await Promise.all([
+      recoveredAdapter.gateway.capabilityReady(),
+      recoveredAdapter.gateway.capabilityReady(),
+      recoveredAdapter.gateway.capabilityReady(),
+    ]);
+    await vi.waitFor(async () => expect(await recoveredAdapter.gateway.capabilityReady()).toBe(true));
+    await vi.waitFor(async () => expect(
+      (await restartedStore.reconcileCommands([command])).receipts[0]?.status,
+    ).toBe("completed"));
+    expect(recoveredAdapter.adapter.reconcileAcknowledgedPromptIdle).toHaveBeenCalledOnce();
+    expect(recoveredAdapter.adapter.submit).not.toHaveBeenCalled();
+    expect(await restartedStore.listResidentPromptReconciliationLeases()).toEqual([]);
+    await recoveredAdapter.gateway.close();
+
+    const completedStore = new HostStore(base.directory);
+    await completedStore.initialize();
+    const postCompletionAdapter = gatewayFixture(
+      completedStore,
+      async () => {
+        throw new Error("completed proof must never be rediscovered");
+      },
+      undefined,
+      () => completedIdle,
+    );
+    await expect(postCompletionAdapter.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await postCompletionAdapter.gateway.capabilityReady()).toBe(true));
+    await Promise.resolve();
+    expect(postCompletionAdapter.adapter.reconcileAcknowledgedPromptIdle).not.toHaveBeenCalled();
+    expect(postCompletionAdapter.adapter.submit).not.toHaveBeenCalled();
+    expect((await completedStore.reconcileCommands([command])).receipts[0]?.status).toBe("completed");
+    await postCompletionAdapter.gateway.close();
   });
 
   it("proves a retained healthy prompt idle while an unrelated durable binding is missing", async () => {
@@ -214,12 +410,19 @@ type ReconcileHandler = (
   options: PrimeAgentResidentAdapterOptions,
 ) => Promise<ResidentPromptIdleAuthorityEvidence>;
 
-async function serviceFixture(reconcile: ReconcileHandler) {
+type PromptRetryOptions = Pick<
+  VerifiedResidentGatewayOptions,
+  "schedulePromptReconciliationRetry" | "cancelPromptReconciliationRetry"
+>;
+
+async function serviceFixture(reconcile: ReconcileHandler, gatewayOptions: PromptRetryOptions = {}) {
   const base = await initializedStore();
-  const gateway = gatewayFixture(base.store, reconcile);
+  const gateway = gatewayFixture(base.store, reconcile, undefined, undefined, gatewayOptions);
   const service = new HostService(base.store, gateway.gateway);
   await expect(gateway.gateway.capabilityReady()).resolves.toBe(false);
-  await vi.waitFor(async () => expect(await gateway.gateway.capabilityReady()).toBe(true));
+  await vi.waitFor(async () => expect(await gateway.gateway.capabilityReady()).toBe(true), {
+    timeout: 5_000,
+  });
   return { ...base, ...gateway, service };
 }
 
@@ -252,6 +455,7 @@ function gatewayFixture(
     async (candidate) => ({ binding: candidate }) as ResidentRuntimeConnection,
   attachProjection: (binding: ResidentSessionBinding) => ResidentProjectionSnapshot =
     (candidate) => projection(candidate, `attach-${candidate.threadId}`, 0),
+  gatewayOptions: PromptRetryOptions = {},
 ) {
   let adapterOptions!: PrimeAgentResidentAdapterOptions;
   const adapter = {
@@ -283,7 +487,9 @@ function gatewayFixture(
       return adapter;
     },
     moduleLoaderFactory: () => async () => ({}),
+    ...gatewayOptions,
   });
+  gatewaysForCleanup.push(gateway);
   return { gateway, adapter, runtimeHandles };
 }
 

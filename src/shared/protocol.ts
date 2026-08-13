@@ -9,6 +9,38 @@ import {
   type RuntimeOAuthAttemptTerminalV1,
   type RuntimeOAuthAttemptV1,
 } from "./runtime-oauth-attempt";
+export {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+  THREAD_HANDOFF_CAPABILITY,
+} from "./capabilities";
+import {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  RESIDENT_CONTROL_PROJECTION_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+  THREAD_HANDOFF_CAPABILITY,
+} from "./capabilities";
 
 /**
  * Public host protocol version. This is intentionally distinct from Prime
@@ -52,23 +84,6 @@ export const CapabilitySchema = z
   .min(4)
   .max(96)
   .regex(capabilityPattern, "Capabilities must be versioned snake_case names");
-
-export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
-export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" as const;
-export const RUNTIME_INTEGRITY_REPAIR_CAPABILITY = "runtime_integrity_repair_v1" as const;
-export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
-export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
-export const RUNTIME_OAUTH_ATTEMPT_CAPABILITY = "runtime_oauth_attempt_v1" as const;
-export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;
-export const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1" as const;
-export const RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY =
-  "resident_registered_workspace_lifecycle_v1" as const;
-export const RESIDENT_CONTROL_PROJECTION_CAPABILITY = "resident_control_projection_v1" as const;
-export const THREAD_HANDOFF_CAPABILITY = "thread_handoff_v1" as const;
-/** Trusted-local probe only; executable self-evaluation remains workspace-scoped. */
-export const CANDIDATE_EVALUATION_PROBE_CAPABILITY = "candidate_evaluation_probe_v1" as const;
-export const PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY =
-  "prime_continuim_self_build_evaluation_v1" as const;
 
 /** Tiny invalidation only; clients must fetch the bounded authoritative snapshot. */
 export const ThreadChangedEventPayloadSchema = z
@@ -252,6 +267,20 @@ export const ResidentControlQuiescenceSchema = z.discriminatedUnion("state", [
 ]);
 export type ResidentControlQuiescence = z.infer<typeof ResidentControlQuiescenceSchema>;
 
+export const ResidentBrowserExecutionSchema = z.discriminatedUnion("readiness", [
+  z.object({ readiness: z.literal("unavailable") }).strict(),
+  z
+    .object({
+      readiness: z.literal("ready"),
+      protocol: z.literal("prime-continuim.browser.v1"),
+      surface: z.literal("playwright-cli"),
+      controller: z.literal("playwright-core/1.63.0-alpha-2026-08-05"),
+      engine: z.literal("verified-electron-host"),
+    })
+    .strict(),
+]);
+export type ResidentBrowserExecution = z.infer<typeof ResidentBrowserExecutionSchema>;
+
 /**
  * Bounded generation-scoped read model for cross-device control discovery.
  * `controlSequence` is Store-owned and monotonic for this exact thread
@@ -268,6 +297,13 @@ export const ResidentControlProjectionSnapshotSchema = z
     controlSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     changedAt: IsoDateTimeSchema,
     authorityCursor: SessionCursorSchema,
+    /** Exact-thread command readiness; host-global capabilities never imply this state. */
+    // Pre-readiness v1 projections omitted this field. They remain readable
+    // only as explicitly unavailable evidence; a current HostStore must prove
+    // the exact live binding again before publishing `ready`.
+    commandReadiness: z.enum(["ready", "unavailable"]).default("unavailable"),
+    /** Exact-binding execution proof; catalog skill discovery alone never makes this ready. */
+    browserExecution: ResidentBrowserExecutionSchema.default({ readiness: "unavailable" }),
     operation: ResidentControlOperationSchema.optional(),
     quiescence: ResidentControlQuiescenceSchema,
   })
@@ -492,6 +528,66 @@ export const ScheduleSummarySchema = z.object({
 });
 export type ScheduleSummary = z.infer<typeof ScheduleSummarySchema>;
 
+export const RuntimeResourceSourceKindSchema = z
+  .object({
+    scope: z.enum(["user", "project", "temporary"]),
+    origin: z.enum(["package", "top-level"]),
+  })
+  .strict();
+export type RuntimeResourceSourceKind = z.infer<typeof RuntimeResourceSourceKindSchema>;
+
+export const RuntimeNamedResourceSchema = z
+  .object({
+    name: z.string().min(1).max(255).regex(/^[^\0\r\n]+$/),
+    description: z.string().max(4_096).optional(),
+    sourceKind: RuntimeResourceSourceKindSchema.optional(),
+  })
+  .strict();
+export type RuntimeNamedResource = z.infer<typeof RuntimeNamedResourceSchema>;
+
+export const RuntimeResourceCollisionSchema = z
+  .object({
+    resourceType: z.enum(["extension", "skill", "prompt", "theme"]),
+    name: z.string().min(1).max(255).regex(/^[^\0\r\n]+$/),
+  })
+  .strict();
+export type RuntimeResourceCollision = z.infer<typeof RuntimeResourceCollisionSchema>;
+
+/**
+ * Secret- and path-free inventory of resources loaded by the exact resident
+ * Prime Agent session. Raw diagnostics are reduced to counts and collision
+ * identities because their free-form text and source records may contain local
+ * filesystem paths.
+ */
+export const RuntimeResourceInventorySchema = z
+  .object({
+    skills: z.array(RuntimeNamedResourceSchema).max(2_000),
+    prompts: z.array(RuntimeNamedResourceSchema).max(2_000),
+    themes: z.array(RuntimeNamedResourceSchema).max(1_000),
+    extensions: z
+      .object({
+        count: z.number().int().nonnegative().max(2_000),
+        sourceKinds: z
+          .array(RuntimeResourceSourceKindSchema)
+          .max(6)
+          .refine(
+            (items) => new Set(items.map((item) => `${item.scope}:${item.origin}`)).size === items.length,
+            "Extension source kinds must be unique",
+          ),
+      })
+      .strict(),
+    contextFileCount: z.number().int().nonnegative().max(2_000),
+    diagnostics: z
+      .object({
+        warningCount: z.number().int().nonnegative().max(2_000),
+        errorCount: z.number().int().nonnegative().max(2_000),
+        collisions: z.array(RuntimeResourceCollisionSchema).max(2_000),
+      })
+      .strict(),
+  })
+  .strict();
+export type RuntimeResourceInventory = z.infer<typeof RuntimeResourceInventorySchema>;
+
 /** Stable host-owned subset of Prime Agent state. Upstream local DTOs stop here. */
 export const RuntimeSessionSummarySchema = z.object({
   runtime: z.literal("prime_agent"),
@@ -513,6 +609,7 @@ export const RuntimeSessionSummarySchema = z.object({
   compactionCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   queuedActionCount: z.number().int().nonnegative().max(1_000_000),
   activeToolNames: z.array(z.string().min(1).max(255)).max(128),
+  resourceInventory: RuntimeResourceInventorySchema.optional(),
   context: z
     .object({
       usedTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -915,6 +1012,81 @@ export const InProgressStreamSchema = z.object({
 });
 export type InProgressStream = z.infer<typeof InProgressStreamSchema>;
 
+export const LatestTurnOutcomeSchema = z
+  .object({
+    outcomeVersion: z.literal(1),
+    commandId: IdSchema,
+    receiptId: IdSchema,
+    observedAt: IsoDateTimeSchema,
+    observedCursor: SessionCursorSchema,
+    terminalAssistant: z
+      .object({
+        blockId: IdSchema,
+        stopReason: z.enum(["stop", "length", "error", "aborted"]),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type LatestTurnOutcome = z.infer<typeof LatestTurnOutcomeSchema>;
+
+const ExtensionUiRequestAuthorityFields = {
+  interactionVersion: z.literal(1),
+  hostId: IdSchema,
+  threadId: IdSchema,
+  executionGenerationId: IdSchema,
+  bindingFingerprint: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+  requestId: IdSchema,
+  requestDigest: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+  receivedAt: IsoDateTimeSchema,
+  timeoutMs: z.number().int().positive().max(24 * 60 * 60 * 1_000).optional(),
+};
+
+/**
+ * Ephemeral, path-free view of a dialog owned by one exact live Prime Agent
+ * attachment. HostStore never persists a non-empty value; hostd overlays the
+ * current connection's bounded requests while serving a fresh snapshot.
+ */
+export const ResidentExtensionUiRequestSchema = z.discriminatedUnion("method", [
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("select"),
+      title: z.string().min(1).max(1_024),
+      options: z
+        .array(z.string().max(4_096))
+        .min(1)
+        .max(128)
+        .refine((items) => new Set(items).size === items.length, "Select options must be unique"),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("confirm"),
+      title: z.string().min(1).max(1_024),
+      message: z.string().max(8_192),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("input"),
+      title: z.string().min(1).max(1_024),
+      placeholder: z.string().max(4_096).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...ExtensionUiRequestAuthorityFields,
+      method: z.literal("editor"),
+      title: z.string().min(1).max(1_024),
+      prefill: z.string().max(65_536).optional(),
+    })
+    .strict(),
+]);
+export type ResidentExtensionUiRequest = z.infer<typeof ResidentExtensionUiRequestSchema>;
+
 export const ThreadProjectionSnapshotSchema = z
   .object({
     snapshotVersion: z.literal(SNAPSHOT_VERSION),
@@ -923,12 +1095,15 @@ export const ThreadProjectionSnapshotSchema = z
     transcriptBlockIndex: z.array(TranscriptBlockIndexEntrySchema).max(20_000),
     materializedRecentBlocks: z.array(TranscriptBlockSchema).max(2_000),
     inProgressStream: InProgressStreamSchema.optional(),
+    latestTurnOutcome: LatestTurnOutcomeSchema.optional(),
     queueState: QueueStateSchema,
     approvals: z.array(ApprovalSummarySchema).max(1_000),
     childAgents: z.array(ChildAgentSummarySchema).max(1_000),
     goals: z.array(GoalSummarySchema).max(1_000),
     schedules: z.array(ScheduleSummarySchema).max(1_000),
     runtime: RuntimeSessionSummarySchema.optional(),
+    residentControl: ResidentControlProjectionSnapshotSchema.optional(),
+    residentExtensionUiRequests: z.array(ResidentExtensionUiRequestSchema).max(16).optional(),
     residentLifecycle: ResidentLifecycleDispositionSchema.optional(),
     git: GitSummarySchema,
     evidence: EvidenceSummarySchema,
@@ -952,6 +1127,83 @@ export const ThreadProjectionSnapshotSchema = z
         path: ["latestCursor", "executionGenerationId"],
         message: "The latest cursor must belong to the current execution generation",
       });
+    }
+    const latestTurnOutcome = snapshot.latestTurnOutcome;
+    if (latestTurnOutcome) {
+      if (
+        latestTurnOutcome.observedCursor.threadId !== snapshot.thread.threadId ||
+        latestTurnOutcome.observedCursor.executionGenerationId !==
+          snapshot.thread.currentLocation.executionGenerationId
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedCursor"],
+          message: "The latest turn outcome must belong to the projected thread generation",
+        });
+      }
+      if (
+        latestTurnOutcome.observedCursor.generation === snapshot.latestCursor.generation &&
+        latestTurnOutcome.observedCursor.sequence > snapshot.latestCursor.sequence
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedCursor", "sequence"],
+          message: "The latest turn outcome cannot be newer than the projected cursor",
+        });
+      }
+      if (Date.parse(latestTurnOutcome.observedAt) > Date.parse(snapshot.generatedAt)) {
+        context.addIssue({
+          code: "custom",
+          path: ["latestTurnOutcome", "observedAt"],
+          message: "The latest turn outcome cannot be observed after snapshot generation",
+        });
+      }
+      const terminalAssistant = latestTurnOutcome.terminalAssistant;
+      if (terminalAssistant) {
+        const block = snapshot.materializedRecentBlocks.find(
+          (candidate) => candidate.blockId === terminalAssistant.blockId,
+        );
+        if (
+          !block ||
+          block.kind !== "assistant" ||
+          Date.parse(block.createdAt) > Date.parse(latestTurnOutcome.observedAt)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["latestTurnOutcome", "terminalAssistant"],
+            message: "The terminal assistant outcome must reference an observed assistant block",
+          });
+        }
+      }
+    }
+    const residentControl = snapshot.residentControl;
+    if (
+      residentControl &&
+      (residentControl.hostId !== snapshot.thread.currentLocation.hostId ||
+        residentControl.threadId !== snapshot.thread.threadId ||
+        residentControl.executionGenerationId !== snapshot.thread.currentLocation.executionGenerationId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["residentControl"],
+        message: "Resident control readiness must belong to the exact projected host thread generation",
+      });
+    }
+    for (const request of snapshot.residentExtensionUiRequests ?? []) {
+      if (
+        !residentControl ||
+        request.hostId !== snapshot.thread.currentLocation.hostId ||
+        request.threadId !== snapshot.thread.threadId ||
+        request.executionGenerationId !== snapshot.thread.currentLocation.executionGenerationId ||
+        request.bindingFingerprint !== residentControl.bindingFingerprint
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["residentExtensionUiRequests"],
+          message: "Extension UI request must belong to the exact live resident control authority",
+        });
+        break;
+      }
     }
     const residentLifecycle = snapshot.residentLifecycle;
     if (!residentLifecycle) return;
@@ -982,6 +1234,7 @@ export const ThreadProjectionSnapshotSchema = z
       snapshot.childAgents.length !== 0 ||
       snapshot.goals.length !== 0 ||
       snapshot.schedules.length !== 0 ||
+      (snapshot.residentExtensionUiRequests?.length ?? 0) !== 0 ||
       snapshot.pendingAttention.length !== 0;
     if (liveStateRemains) {
       context.addIssue({
@@ -1699,6 +1952,7 @@ export const REMOTE_DEVICE_SCOPES = Object.freeze([
   "thread.start",
   "model.select",
   "approval.resolve",
+  "extension_ui.respond",
   "run_location.change",
   "host.admin",
 ] as const);
@@ -1779,7 +2033,17 @@ const TextCommandFields = {
   text: z.string().min(1).max(65_536),
 };
 
-export const CommandPayloadSchema = z.discriminatedUnion("kind", [
+export const ExtensionUiDialogMethodSchema = z.enum(["select", "confirm", "input", "editor"]);
+export type ExtensionUiDialogMethod = z.infer<typeof ExtensionUiDialogMethodSchema>;
+
+export const ExtensionUiDialogResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cancelled") }).strict(),
+  z.object({ kind: z.literal("value"), value: z.string().max(65_536) }).strict(),
+  z.object({ kind: z.literal("confirmed"), confirmed: z.boolean() }).strict(),
+]);
+export type ExtensionUiDialogResponse = z.infer<typeof ExtensionUiDialogResponseSchema>;
+
+export const CommandPayloadSchema = z.union([
   z.object({ kind: z.literal("prompt"), ...TextCommandFields }).strict(),
   z.object({ kind: z.literal("steer"), ...TextCommandFields }).strict(),
   z.object({ kind: z.literal("follow_up"), ...TextCommandFields }).strict(),
@@ -1799,6 +2063,27 @@ export const CommandPayloadSchema = z.discriminatedUnion("kind", [
       comment: z.string().max(4_096).optional(),
     })
     .strict(),
+  z
+    .object({
+      kind: z.literal("extension_ui.respond"),
+      requestId: IdSchema,
+      requestDigest: z.string().length(64).regex(/^[a-f0-9]{64}$/),
+      method: ExtensionUiDialogMethodSchema,
+      response: ExtensionUiDialogResponseSchema,
+    })
+    .strict()
+    .superRefine((command, context) => {
+      if (
+        (command.method === "confirm" && command.response.kind === "value") ||
+        (command.method !== "confirm" && command.response.kind === "confirmed")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["response"],
+          message: "Extension UI response does not match its dialog method",
+        });
+      }
+    }),
 ]);
 export type CommandPayload = z.infer<typeof CommandPayloadSchema>;
 

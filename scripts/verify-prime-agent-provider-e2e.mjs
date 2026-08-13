@@ -67,7 +67,7 @@ const END_DEADLINE_MS = 5 * 60_000;
 const HELPER_DEADLINE_MS = 60_000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_JOURNAL_RECORDS = 20_000;
-// The pinned v0.7.1 image currently contains 20,764 files. Preserve room for
+// The pinned v0.7.2 image currently contains 20,764 files. Preserve room for
 // bounded runtime growth without weakening exact per-file/tree equality.
 const MAX_TREE_FILES = 25_000;
 const MAX_TREE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -88,7 +88,6 @@ const COMPOSER_SELECTOR = "#thread-composer";
 const PRIMARY_ACTION_SELECTOR = "#resident-turn-primary";
 const VISIBLE_ASSISTANT_BODY_SELECTOR = "#thread-transcript .message--assistant.message--streaming .message__body";
 const INSPECTOR_OPEN_SELECTOR = 'button[aria-label="Open inspector"]';
-const END_CONFIRMATION_SELECTOR = '.resident-end-dialog__confirmation input[type="checkbox"]';
 const UIA_CLOSE_HELPER_SOURCE = String.raw`
 using System;
 using System.Collections.Generic;
@@ -520,10 +519,8 @@ try {
     await controller.clickVisible(INSPECTOR_OPEN_SELECTOR, 30_000);
   }
   await controller.clickVisibleText("button", "Runtime", 30_000);
-  await controller.clickVisibleText("button", "End resident session…", 30_000);
-  await controller.clickVisible(END_CONFIRMATION_SELECTOR, 30_000);
   runState.endOutcomeUncertain = true;
-  await controller.clickVisibleText("button", "End resident session", 30_000);
+  await controller.clickVisibleText("button", "End session", 30_000);
   const terminalProjection = await controller.waitForSnapshot({ threadId: THREAD_ID }, (snapshot) =>
     snapshot?.residentLifecycle?.state === "ended" && snapshot?.runtime === undefined,
   END_DEADLINE_MS);
@@ -629,10 +626,16 @@ async function verifyInstalledCandidate() {
   const installedRoot = dirname(installedExecutable);
   const installedArchive = await canonicalRegularFile(join(installedRoot, "resources", "app.asar"));
   const installedHostd = await canonicalRegularFile(join(installedRoot, "resources", "hostd", "hostd.cjs"));
+  const installedHostNode = await canonicalRegularFile(join(installedRoot, "resources", "host-runtime", "node.exe"));
+  const installedHostNodeLicense = await canonicalRegularFile(join(installedRoot, "resources", "host-runtime", "LICENSE"));
+  const installedBrowserExecutable = await canonicalRegularFile(join(installedRoot, "resources", "browser-runtime", "electron.exe"));
   const installedRuntimeSeed = await canonicalDirectory(join(installedRoot, "resources", "runtime-seed"));
   const installedRuntimePointer = await canonicalRegularFile(join(installedRuntimeSeed, "current.json"));
   const candidateArchive = await canonicalRegularFile(join(CANDIDATE_UNPACKED_ROOT, "resources", "app.asar"));
   const candidateHostd = await canonicalRegularFile(join(CANDIDATE_UNPACKED_ROOT, "resources", "hostd", "hostd.cjs"));
+  const candidateHostNode = await canonicalRegularFile(join(CANDIDATE_UNPACKED_ROOT, "resources", "host-runtime", "node.exe"));
+  const candidateHostNodeLicense = await canonicalRegularFile(join(CANDIDATE_UNPACKED_ROOT, "resources", "host-runtime", "LICENSE"));
+  const candidateBrowserExecutable = await canonicalRegularFile(join(CANDIDATE_UNPACKED_ROOT, "resources", "browser-runtime", "electron.exe"));
   const candidateRuntimeSeed = await canonicalDirectory(join(CANDIDATE_UNPACKED_ROOT, "resources", "runtime-seed"));
   const candidateRuntimePointer = await canonicalRegularFile(join(candidateRuntimeSeed, "current.json"));
   const [
@@ -642,6 +645,12 @@ async function verifyInstalledCandidate() {
     candidateArchiveSha256,
     hostdSha256,
     candidateHostdSha256,
+    installedHostNodeSha256,
+    candidateHostNodeSha256,
+    installedHostNodeLicenseSha256,
+    candidateHostNodeLicenseSha256,
+    installedBrowserExecutableSha256,
+    candidateBrowserExecutableSha256,
     installedRuntimePointerSha256,
     candidateRuntimePointerSha256,
     installedRuntimeTree,
@@ -653,6 +662,12 @@ async function verifyInstalledCandidate() {
     sha256File(candidateArchive),
     sha256File(installedHostd),
     sha256File(candidateHostd),
+    sha256File(installedHostNode),
+    sha256File(candidateHostNode),
+    sha256File(installedHostNodeLicense),
+    sha256File(candidateHostNodeLicense),
+    sha256File(installedBrowserExecutable),
+    sha256File(candidateBrowserExecutable),
     sha256File(installedRuntimePointer),
     sha256File(candidateRuntimePointer),
     digestBoundedRegularFileTree(installedRuntimeSeed, { maxFiles: MAX_TREE_FILES, maxBytes: MAX_TREE_BYTES }),
@@ -662,6 +677,11 @@ async function verifyInstalledCandidate() {
     installedExecutableSha256 !== candidateExecutableSha256 ||
     applicationArchiveSha256 !== candidateArchiveSha256 ||
     hostdSha256 !== candidateHostdSha256 ||
+    installedHostNodeSha256 !== candidateHostNodeSha256 ||
+    installedHostNodeLicenseSha256 !== candidateHostNodeLicenseSha256 ||
+    installedBrowserExecutableSha256 !== candidateBrowserExecutableSha256 ||
+    installedExecutableSha256 === installedHostNodeSha256 ||
+    installedBrowserExecutableSha256 === installedHostNodeSha256 ||
     installedRuntimePointerSha256 !== candidateRuntimePointerSha256 ||
     installedRuntimeTree.sha256 !== candidateRuntimeTree.sha256 ||
     installedRuntimeTree.fileCount !== candidateRuntimeTree.fileCount ||
@@ -697,6 +717,12 @@ async function verifyInstalledCandidate() {
     pointer.treeSha256 !== attestation.tree.sha256 ||
     pointer.filesSha256 !== attestation.tree.filesSha256
   ) fail("candidate", "CANDIDATE_INVALID");
+  if (attestation.hostRuntime.kind !== "node" || attestation.hostRuntime.executableSha256 !== installedHostNodeSha256) {
+    fail("candidate", "CANDIDATE_INVALID");
+  }
+  if (attestation.guiRuntime.kind !== "electron" || attestation.guiRuntime.executableSha256 !== installedBrowserExecutableSha256) {
+    fail("candidate", "CANDIDATE_INVALID");
+  }
 
   const candidateFiles = [
     [installedExecutable, installedExecutableSha256],
@@ -705,6 +731,12 @@ async function verifyInstalledCandidate() {
     [candidateArchive, candidateArchiveSha256],
     [installedHostd, hostdSha256],
     [candidateHostd, candidateHostdSha256],
+    [installedHostNode, installedHostNodeSha256],
+    [candidateHostNode, candidateHostNodeSha256],
+    [installedHostNodeLicense, installedHostNodeLicenseSha256],
+    [candidateHostNodeLicense, candidateHostNodeLicenseSha256],
+    [installedBrowserExecutable, installedBrowserExecutableSha256],
+    [candidateBrowserExecutable, candidateBrowserExecutableSha256],
     [installedRuntimePointer, installedRuntimePointerSha256],
     [candidateRuntimePointer, candidateRuntimePointerSha256],
     [installer, installerSha256],
@@ -717,6 +749,8 @@ async function verifyInstalledCandidate() {
     installedRoot,
     installedArchive,
     installedHostd,
+    installedHostNode,
+    installedBrowserExecutable,
     installedRuntimeSeed,
     attestation,
     verificationTrees: Object.freeze([
@@ -976,12 +1010,12 @@ function isolatedEnvironments(fixture) {
   base.TEMP = fixture.temporaryDirectory;
   base.TMP = fixture.temporaryDirectory;
   const desktop = Object.freeze({ ...base });
-  const runAsNode = credentialStrippedEnvironment(base, { electronRunAsNode: true, packageSmoke: true });
-  return Object.freeze({ desktop, hostd: runAsNode.environment });
+  const hostNode = credentialStrippedEnvironment(base, { electronRunAsNode: false, packageSmoke: true });
+  return Object.freeze({ desktop, hostd: hostNode.environment });
 }
 
 async function startOwnedHostd(candidate, fixture, environment) {
-  const child = spawn(candidate.installedExecutable, [
+  const child = spawn(candidate.installedHostNode, [
     fixture.wrapperPath,
     candidate.installedHostd,
     "serve",
@@ -991,6 +1025,8 @@ async function startOwnedHostd(candidate, fixture, environment) {
     fixture.dataDirectory,
     "--runtime-seed",
     candidate.installedRuntimeSeed,
+    "--browser-executable",
+    candidate.installedBrowserExecutable,
   ], {
     cwd: candidate.installedRoot,
     detached: false,

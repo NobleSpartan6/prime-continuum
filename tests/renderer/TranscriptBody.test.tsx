@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { TranscriptBody } from '../../src/renderer/src/TranscriptBody'
+import { loadMarkdownTranscriptBody, TranscriptBody } from '../../src/renderer/src/TranscriptBody'
 
 afterEach(cleanup)
 
@@ -20,7 +20,7 @@ describe('TranscriptBody', () => {
     expect(code?.textContent).toBe(body)
   })
 
-  it('renders fenced code and diff lines without flattening their semantics', () => {
+  it('renders fenced code and diff lines without flattening their semantics', async () => {
     const body = [
       'The patch is intentionally small:',
       '',
@@ -32,6 +32,7 @@ describe('TranscriptBody', () => {
     ].join('\n')
     const { container } = render(<TranscriptBody body={body} kind="assistant" />)
 
+    await waitFor(() => expect(container.querySelector('pre > code.language-diff')).not.toBeNull())
     const code = container.querySelector('pre > code.language-diff')
     expect(code).not.toBeNull()
     expect(code).toHaveTextContent('const mode = "legacy"')
@@ -39,7 +40,7 @@ describe('TranscriptBody', () => {
     expect(container.querySelector('.transcript-body__diff-line--addition')).toHaveTextContent('+const mode = "continuim"')
   })
 
-  it('renders headings, lists, links, paragraphs, and inline code as document structure', () => {
+  it('renders headings, lists, links, paragraphs, and inline code as document structure', async () => {
     const body = [
       '## Verification',
       '',
@@ -52,7 +53,7 @@ describe('TranscriptBody', () => {
     ].join('\n')
     const { container } = render(<TranscriptBody body={body} kind="assistant" />)
 
-    expect(screen.getByRole('heading', { level: 2, name: 'Verification' })).toBeVisible()
+    expect(await screen.findByRole('heading', { level: 2, name: 'Verification' })).toBeVisible()
     expect(screen.getByRole('list')).toBeVisible()
     expect(screen.getAllByRole('listitem')).toHaveLength(2)
     expect(container.querySelector('p')).toHaveTextContent('The resident remains authoritative.')
@@ -70,7 +71,20 @@ describe('TranscriptBody', () => {
     expect(css).toMatch(/\.transcript-body p\s*{[^}]*white-space:\s*pre-wrap;/s)
   })
 
-  it('omits raw HTML and strips unsafe link protocols instead of adding them to the DOM', () => {
+  it('keeps host-projected text readable and escaped if the deferred markdown chunk cannot load', async () => {
+    const recovered = await loadMarkdownTranscriptBody(async () => {
+      throw new Error('chunk unavailable')
+    })
+    const RecoveredTranscriptBody = recovered.default
+    const body = '<img src=x onerror="window.__transcriptExploit=true">\nDurable result'
+    const { container } = render(<RecoveredTranscriptBody body={body} kind="assistant" />)
+
+    expect(container.querySelector('[data-transcript-renderer="plain"]')?.textContent).toBe(body)
+    expect(container.querySelector('img, [onerror]')).toBeNull()
+    expect(container.innerHTML).not.toMatch(/<img/i)
+  })
+
+  it('omits raw HTML and strips unsafe link protocols instead of adding them to the DOM', async () => {
     const body = [
       '# Safe content',
       '',
@@ -82,7 +96,7 @@ describe('TranscriptBody', () => {
     ].join('\n')
     const { container } = render(<TranscriptBody body={body} kind="user" />)
 
-    expect(screen.getByRole('heading', { name: 'Safe content' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Safe content' })).toBeVisible()
     expect(container.querySelector('script, img, [onclick], [onerror]')).toBeNull()
     expect(container.innerHTML).not.toMatch(/<script|onclick=|onerror=/i)
     expect(screen.queryByRole('link', { name: 'Unsafe link' })).not.toBeInTheDocument()

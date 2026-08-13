@@ -19,12 +19,75 @@ import {
   ResidentControlProjectionSnapshotSchema,
   ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
+  RuntimeSessionSummarySchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
   ThreadProjectionSnapshotSchema,
 } from "../../src/shared/protocol";
 
 describe("host protocol schemas", () => {
+  it("admits only the path-free resident resource inventory contract", () => {
+    const runtime = {
+      runtime: "prime_agent" as const,
+      residency: "resident" as const,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      retryAttempt: 0,
+      steeringMode: "all" as const,
+      followUpMode: "one-at-a-time" as const,
+      messageCount: 0,
+      compactionCount: 0,
+      queuedActionCount: 0,
+      activeToolNames: ["ipython"],
+      resourceInventory: {
+        skills: [{
+          name: "playwright-cli",
+          description: "Automate browser interactions.",
+          sourceKind: { scope: "project" as const, origin: "package" as const },
+        }],
+        prompts: [],
+        themes: [],
+        extensions: {
+          count: 1,
+          sourceKinds: [{ scope: "project" as const, origin: "top-level" as const }],
+        },
+        contextFileCount: 1,
+        diagnostics: {
+          warningCount: 1,
+          errorCount: 0,
+          collisions: [{ resourceType: "skill" as const, name: "playwright-cli" }],
+        },
+      },
+    };
+
+    expect(RuntimeSessionSummarySchema.parse(runtime)).toEqual(runtime);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        skills: [{ ...runtime.resourceInventory.skills[0], filePath: "/private/SKILL.md" }],
+      },
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        credential: "must-not-cross",
+      },
+    }).success).toBe(false);
+    expect(RuntimeSessionSummarySchema.safeParse({
+      ...runtime,
+      resourceInventory: {
+        ...runtime.resourceInventory,
+        diagnostics: {
+          ...runtime.resourceInventory.diagnostics,
+          message: "Private diagnostic text",
+        },
+      },
+    }).success).toBe(false);
+  });
+
   it("binds runtime retry to one host and one retryable failed integrity snapshot", () => {
     const runtimeIntegrity = {
       contractVersion: 1 as const,
@@ -191,6 +254,14 @@ describe("host protocol schemas", () => {
       bindingFingerprint: "a".repeat(64),
       controlSequence: 7,
       changedAt: "2026-08-08T12:01:00.000Z",
+      commandReadiness: "ready" as const,
+      browserExecution: {
+        readiness: "ready" as const,
+        protocol: "prime-continuim.browser.v1" as const,
+        surface: "playwright-cli" as const,
+        controller: "playwright-core/1.63.0-alpha-2026-08-05" as const,
+        engine: "verified-electron-host" as const,
+      },
       authorityCursor: {
         threadId: "thread-1",
         executionGenerationId: "execution-2",
@@ -208,6 +279,12 @@ describe("host protocol schemas", () => {
       quiescence: { state: "stop_owned" as const },
     };
     expect(ResidentControlProjectionSnapshotSchema.parse(projection)).toEqual(projection);
+    const { commandReadiness: _commandReadiness, browserExecution: _browserExecution, ...legacy } = projection;
+    expect(ResidentControlProjectionSnapshotSchema.parse(legacy)).toEqual({
+      ...legacy,
+      commandReadiness: "unavailable",
+      browserExecution: { readiness: "unavailable" },
+    });
     expect(HostIpcResponseSchema.safeParse({
       protocolVersion: PROTOCOL_VERSION,
       requestId: request.requestId,
@@ -276,6 +353,60 @@ describe("host protocol schemas", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts only bounded generation-scoped latest turn outcomes", () => {
+    const source = threadSnapshot();
+    const assistantBlock = {
+      blockId: "assistant-terminal",
+      kind: "assistant" as const,
+      text: "Complete.",
+      createdAt: source.generatedAt,
+      sequence: source.latestCursor.sequence,
+    };
+    const latestTurnOutcome = {
+      outcomeVersion: 1 as const,
+      commandId: "prompt-command",
+      receiptId: "prompt-receipt",
+      observedAt: source.generatedAt,
+      observedCursor: source.latestCursor,
+      terminalAssistant: { blockId: assistantBlock.blockId, stopReason: "stop" as const },
+    };
+    const valid = {
+      ...source,
+      transcriptBlockIndex: [{
+        blockId: assistantBlock.blockId,
+        kind: assistantBlock.kind,
+        sequence: assistantBlock.sequence,
+        byteLength: 9,
+        materialized: true,
+      }],
+      materializedRecentBlocks: [assistantBlock],
+      latestTurnOutcome,
+    };
+    expect(ThreadProjectionSnapshotSchema.safeParse(valid).success).toBe(true);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: {
+        ...latestTurnOutcome,
+        observedCursor: { ...latestTurnOutcome.observedCursor, executionGenerationId: "other-execution" },
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: { ...latestTurnOutcome, observedAt: "2026-08-06T00:00:01.000Z" },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: {
+        ...latestTurnOutcome,
+        terminalAssistant: { ...latestTurnOutcome.terminalAssistant, blockId: "missing-block" },
+      },
+    }).success).toBe(false);
+    expect(ThreadProjectionSnapshotSchema.safeParse({
+      ...valid,
+      latestTurnOutcome: { ...latestTurnOutcome, promptText: "must never be projected" },
+    }).success).toBe(false);
   });
 
   it("accepts only a self-consistent opaque resident end disposition", () => {
@@ -453,9 +584,9 @@ describe("host protocol schemas", () => {
     ]);
   });
 
-  it("publishes one immutable exact nine-scope vocabulary without accepting aliases or duplicates", () => {
+  it("publishes one immutable exact ten-scope vocabulary without accepting aliases or duplicates", () => {
     expect(Object.isFrozen(REMOTE_DEVICE_SCOPES)).toBe(true);
-    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(9);
+    expect(REMOTE_DEVICE_SCOPE_COUNT).toBe(10);
     expect(REMOTE_DEVICE_SCOPES).toEqual([
       "projection.read",
       "thread.follow_up",
@@ -464,6 +595,7 @@ describe("host protocol schemas", () => {
       "thread.start",
       "model.select",
       "approval.resolve",
+      "extension_ui.respond",
       "run_location.change",
       "host.admin",
     ]);

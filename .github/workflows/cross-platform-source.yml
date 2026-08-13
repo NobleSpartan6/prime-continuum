@@ -54,11 +54,23 @@ jobs:
       - name: Install the frozen dependency graph
         run: pnpm install --frozen-lockfile --ignore-scripts
 
+      - name: Prepare the verified Electron sandbox on Linux
+        if: runner.os == 'Linux'
+        run: |
+          node scripts/ensure-electron-runtime.mjs
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+
       - name: Typecheck Node, renderer, and relay boundaries
         run: pnpm typecheck
 
       - name: Run the complete root and relay source test suite
         run: pnpm test
 
+      - name: Build the desktop, host-service, and relay source on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum pnpm build
+
       - name: Build the desktop, host-service, and relay source
+        if: runner.os != 'Linux'
         run: pnpm build

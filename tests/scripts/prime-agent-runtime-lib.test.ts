@@ -5,16 +5,18 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as runtimeLib from "../../scripts/prime-agent-runtime-lib.mjs";
 import {
   PrimeAgentRuntimeBuildError,
   acquireBuildLock,
+  applyPinnedPrimeAgentSecurityPatches,
   cleanBuildEnvironment,
   cleanRuntimeEnvironment,
   createRuntimeManifest,
   loadRuntimeInputs,
   pruneRuntimePackagingNoise,
+  pruneReviewedRuntimeDirectories,
   removeObsoleteRuntimeInstalls,
   resolveVerifiedEntrypoints,
   smokeRuntime,
@@ -43,25 +45,26 @@ describe("Prime Agent runtime build policy", () => {
     const inputs = await loadRuntimeInputs();
     expect(inputs.sources.release).toEqual({
       repository: "https://github.com/PrimeIntellect-ai/prime-agent",
-      tag: "v0.7.1",
-      version: "0.7.1",
-      commit: "95afd319a78ae017a41241d50b013d656a0685ce",
+      tag: "v0.7.2",
+      version: "0.7.2",
+      commit: "83a0f9f9566219551fcb6ffaf7f519a815749a58",
     });
     expect(inputs.policy).toMatchObject({
-      releaseVersion: "0.7.1",
-      runtimeBuildId: "95afd31-dirty",
+      releaseVersion: "0.7.2",
+      runtimeBuildId: "83a0f9f-dirty",
       criticalPackages: {
         "prime-agent": {
-          version: "0.7.1",
-          integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+          version: "0.7.2",
+          integrity: "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg==",
         },
       },
     });
     expect(inputs.packageJson).toMatchObject({
-      version: "0.7.1",
+      version: "0.7.2",
       dependencies: {
+        "extract-zip": "npm:@electron-internal/extract-zip@1.0.5",
         "prime-agent":
-          "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
+          "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
       },
     });
     expect(inputs.sources).not.toHaveProperty("codexAppServer");
@@ -69,16 +72,21 @@ describe("Prime Agent runtime build policy", () => {
     expect(inputs.sources.assets).toHaveLength(4);
     expect(inputs.sources.assets[0]).toEqual({
       packageName: "prime-agent",
-      fileName: "prime-agent-0.7.1.tgz",
-      url: "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.1/prime-agent-0.7.1.tgz",
-      size: 9_323_519,
-      sha256: "d68612c83239caafab72cc76c55ac572bfd07a059ea8fbd2a3ddbe1f2b55dcdb",
-      integrity: "sha512-BOT+mqCYeDpKYabk3HVP5T7HomlBUWiQOXZGnX/DYZwT4xvdQSeF7itt/tCU8nv82/30N7VJw5YdXssEyD3qGQ==",
+      fileName: "prime-agent-0.7.2.tgz",
+      url: "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
+      size: 9_387_295,
+      sha256: "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
+      integrity: "sha512-kRAuworIlI55Lwh1O5Mofc8jNvhtmYB89dBy6h+LHXWTw8SbJ9dQ3+/mmgrhzlpuvBy7LNmLpQIzA0KLfyJarg==",
     });
     expect(inputs.sources.assets.every((asset: { url: string }) => !asset.url.includes("openai/codex"))).toBe(true);
     expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
     expect(Object.keys(inputs.lockfile.packages)).toHaveLength(202);
+    expect(inputs.lockfile.packages["node_modules/extract-zip"]).toMatchObject({
+      name: "@electron-internal/extract-zip",
+      version: "1.0.5",
+    });
+    expect(Object.keys(inputs.lockfile.packages).filter((path) => path.endsWith("/node_modules/extract-zip"))).toEqual([]);
     const zeromq = inputs.lockfile.packages["node_modules/zeromq"];
     expect(zeromq).toMatchObject({ version: "6.5.0" });
     if (!zeromq) throw new Error("The pinned zeromq package is missing from the runtime lock.");
@@ -94,6 +102,21 @@ describe("Prime Agent runtime build policy", () => {
       }),
     ).toThrow(PrimeAgentRuntimeBuildError);
 
+    const nestedVulnerableLock = structuredClone(inputs.lockfile);
+    nestedVulnerableLock.packages["node_modules/prime-agent/node_modules/extract-zip"] = {
+      version: "2.0.1",
+      resolved: "https://registry.npmjs.org/extract-zip/-/extract-zip-2.0.1.tgz",
+      integrity: "sha512-GDhU9ntwuKyGXdZBUgTIe+vXnWj0fppUEtMDL0+idd5Sta8TGpHssn/eusA9mrPr9qNDym6SxAYZjNvCn/9RBg==",
+    };
+    const nestedPolicy = structuredClone(inputs.policy);
+    nestedPolicy.lockPackageEntries += 1;
+    expect(() => validateRuntimeInputs({
+      packageJson: inputs.packageJson,
+      lockfile: nestedVulnerableLock,
+      sources: inputs.sources,
+      policy: nestedPolicy,
+    })).toThrow("Hardened extract-zip substitution drifted");
+
     for (const side of ["sources", "policy"] as const) {
       const legacySources = structuredClone(inputs.sources) as Record<string, unknown>;
       const legacyPolicy = structuredClone(inputs.policy) as Record<string, unknown>;
@@ -107,6 +130,17 @@ describe("Prime Agent runtime build policy", () => {
     }
   });
 
+  it("fails closed before patching an unreviewed Prime Agent bundle", async () => {
+    const root = await makeTemporaryDirectory();
+    const bundle = join(root, "node_modules", "prime-agent", "dist", "bundle");
+    await mkdir(bundle, { recursive: true });
+    await writeFile(join(bundle, "chunk-CAY2X72A.js"), "// ../../node_modules/extract-zip/index.js\n// dist/main.js\n");
+
+    await expect(applyPinnedPrimeAgentSecurityPatches(root)).rejects.toThrow(
+      "Prime Agent bundle security patch source drifted",
+    );
+  });
+
   it("removes inherited execution roles and Node preload injection", () => {
     expect(
       cleanRuntimeEnvironment(
@@ -117,6 +151,7 @@ describe("Prime Agent runtime build policy", () => {
           PRIME_AGENT_BUILD_ID: "spoofed",
           NODE_OPTIONS: "--import=attacker.mjs",
           NODE_PATH: "shadow-modules",
+          NAPI_RS_NATIVE_LIBRARY_PATH: "attacker.node",
           ELECTRON_RUN_AS_NODE: "0",
         },
         { electronRunAsNode: true },
@@ -151,17 +186,103 @@ describe("Prime Agent runtime build policy", () => {
 });
 
 describe("Prime Agent runtime asset download liveness", () => {
+  it("retries a bounded pre-body UND_ERR_SOCKET failure and still verifies exact bytes", async () => {
+    const cache = await temporaryDirectory("prime-runtime-fetch-retry-");
+    const bytes = Buffer.from("pinned asset");
+    const inputs = downloadInputs(bytes);
+    const delays: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls < 3) {
+        const socketError = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+        throw Object.assign(new TypeError("fetch failed"), { cause: socketError });
+      }
+      return new Response(bytes, { status: 200 });
+    }) as typeof fetch;
+
+    const verified = await verifyReleaseAssets(inputs as never, cache, {
+      fetchImpl,
+      sleep: async (milliseconds: number) => { delays.push(milliseconds); },
+    });
+
+    expect(calls).toBe(3);
+    expect(delays).toEqual([250, 500]);
+    expect(await readFile(verified[0]!)).toEqual(bytes);
+  });
+
+  it("stops after three pre-body socket attempts", async () => {
+    const cache = await temporaryDirectory("prime-runtime-fetch-retry-limit-");
+    const delays: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      const socketError = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+      throw Object.assign(new TypeError("fetch failed"), { cause: socketError });
+    }) as typeof fetch;
+
+    await expect(verifyReleaseAssets(downloadInputs(Buffer.from("pinned asset")) as never, cache, {
+      fetchImpl,
+      sleep: async (milliseconds: number) => { delays.push(milliseconds); },
+    })).rejects.toThrow("fetch failed");
+    expect(calls).toBe(3);
+    expect(delays).toEqual([250, 500]);
+    expect(await readdir(cache)).toEqual([]);
+  });
+
+  it("does not retry HTTP or integrity failures", async () => {
+    const bytes = Buffer.from("pinned asset");
+    const sleep = async () => { throw new Error("must not retry"); };
+
+    const httpCache = await temporaryDirectory("prime-runtime-fetch-http-");
+    let httpCalls = 0;
+    await expect(verifyReleaseAssets(downloadInputs(bytes) as never, httpCache, {
+      fetchImpl: (async () => {
+        httpCalls += 1;
+        return new Response("missing", { status: 404 });
+      }) as typeof fetch,
+      sleep,
+    })).rejects.toThrow("Could not download asset.tgz: HTTP 404");
+    expect(httpCalls).toBe(1);
+    expect(await readdir(httpCache)).toEqual([]);
+
+    const digestCache = await temporaryDirectory("prime-runtime-fetch-digest-");
+    let digestCalls = 0;
+    await expect(verifyReleaseAssets(downloadInputs(bytes) as never, digestCache, {
+      fetchImpl: (async () => {
+        digestCalls += 1;
+        return new Response(Buffer.from("broken asset"), { status: 200 });
+      }) as typeof fetch,
+      sleep,
+    })).rejects.toThrow("Downloaded bytes did not match the pinned asset.tgz digest");
+    expect(digestCalls).toBe(1);
+    expect(await readdir(digestCache)).toEqual([]);
+  });
+
   it("aborts a release fetch that never produces response headers", async () => {
     const cache = await temporaryDirectory("prime-runtime-fetch-timeout-");
     const inputs = downloadInputs(Buffer.from("pinned asset"));
-    const fetchImpl = (() => new Promise<Response>(() => undefined)) as typeof fetch;
+    let markFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolveStarted) => { markFetchStarted = resolveStarted; });
+    const fetchImpl = (() => {
+      markFetchStarted();
+      return new Promise<Response>(() => undefined);
+    }) as typeof fetch;
+    vi.useFakeTimers();
+    try {
+      const rejection = expect(verifyReleaseAssets(inputs as never, cache, {
+        fetchImpl,
+        totalTimeoutMs: 25,
+        noProgressTimeoutMs: 10,
+      })).rejects.toThrow("Download timed out for asset.tgz; check the network or proxy and retry");
 
-    await expect(verifyReleaseAssets(inputs as never, cache, {
-      fetchImpl,
-      totalTimeoutMs: 25,
-      noProgressTimeoutMs: 10,
-    })).rejects.toThrow("Download timed out for asset.tgz; check the network or proxy and retry")
-    expect(await readdir(cache)).toEqual([]);
+      await fetchStarted;
+      await vi.advanceTimersByTimeAsync(25);
+      await rejection;
+      expect(await readdir(cache)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts a response body that stops making progress", async () => {
@@ -213,7 +334,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs,
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     });
     await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).resolves.toMatchObject({
@@ -222,6 +343,14 @@ describe("Prime Agent runtime tree attestation", () => {
 
     const manifestPath = join(root, "runtime.json");
     const manifestText = await readFile(manifestPath, "utf8");
+    const incompleteSmokeManifest = JSON.parse(manifestText) as Record<string, any>;
+    delete incompleteSmokeManifest.smokeRuntime.bundleImportGraphComplete;
+    await writeFile(manifestPath, `${JSON.stringify(incompleteSmokeManifest, null, 2)}\n`);
+    await expect(verifyBuiltRuntime(root, { inputs, policy: inputs.policy })).rejects.toThrow(
+      "Runtime manifest build or smoke identity is invalid",
+    );
+    await writeFile(manifestPath, manifestText);
+
     const tamperedManifest = JSON.parse(manifestText) as Record<string, any>;
     tamperedManifest.daemon.schemaId = "protocol-tampered";
     await writeFile(manifestPath, `${JSON.stringify(tamperedManifest, null, 2)}\n`);
@@ -255,7 +384,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs: fixtureInputs(),
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     })).rejects.toThrow("must not contain a companion backend");
   });
@@ -293,6 +422,64 @@ describe("Prime Agent runtime tree attestation", () => {
     );
   });
 
+  it("gives the verified browser smoke a bounded action timeout for slower Linux hosts", async () => {
+    const root = await makeRuntimeFixture("runtime-browser-smoke-timeout");
+    const runtimeExecutable = await realpath(process.execPath);
+    const calls: Array<{ args: string[]; options: SmokeRunnerOptions }> = [];
+    const commandRunner = async (
+      command: string,
+      args: string[],
+      options: SmokeRunnerOptions,
+    ): Promise<{ stdout: string; stderr: string }> => {
+      expect(command).toBe(runtimeExecutable);
+      expect(options.env?.PLAYWRIGHT_MCP_TIMEOUT_ACTION).toBe("30000");
+      expect(options.env?.PRIME_CONTINUIM_BROWSER_SMOKE_SKIP_FONT_READY).toBe("1");
+      expect(options.env?.PW_TEST_SCREENSHOT_NO_FONTS_READY).toBeUndefined();
+      calls.push({ args, options });
+      const operation = args[1] === "doctor" ? "doctor" : args[2];
+      if (operation === "doctor") {
+        return {
+          stdout: JSON.stringify({
+            bridgeVersion: 1,
+            controller: "playwright-core/1.63.0-alpha-2026-08-05",
+            engine: "verified-electron-host",
+            protocol: "prime-continuim.browser.v1",
+            ready: true,
+          }),
+          stderr: "",
+        };
+      }
+      if (operation === "snapshot") return { stdout: '- button "Before" [ref=e1]\n', stderr: "" };
+      if (operation === "find") return { stdout: 'button "Before"\n', stderr: "" };
+      if (operation === "eval") return { stdout: '"After"\n', stderr: "" };
+      if (operation === "screenshot") {
+        const filename = args.find((argument) => argument.startsWith("--filename="))?.slice("--filename=".length);
+        if (!filename) throw new Error("browser smoke screenshot filename missing");
+        await writeFile(filename, Buffer.from("89504e470d0a1a0a", "hex"));
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await expect(runtimeLib.smokeBrowserBridge(root, {
+      runtimeExecutable,
+      policy: fixtureInputs().policy,
+      commandRunner,
+    })).resolves.toMatchObject({
+      verified: true,
+      operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
+    });
+    expect(calls).toHaveLength(8);
+    const screenshotCall = calls.find(({ args }) => args[2] === "screenshot");
+    expect(screenshotCall?.options.timeoutMs).toBe(40_000);
+  });
+
+  it("retains bounded stdout and stderr when a runtime command fails", async () => {
+    await expect(runtimeLib.runCommand(process.execPath, [
+      "--eval",
+      "process.stderr.write('visible stderr'); process.stdout.write('visible stdout'); process.exit(7)",
+    ], { timeoutMs: 5_000 })).rejects.toThrow(/visible stderr[\s\S]*visible stdout/);
+  });
+
   it("rejects unattested empty directories and converges without changing attested bytes", async () => {
     const root = await makeRuntimeFixture("runtime-empty-namespace");
     const inputs = fixtureInputs();
@@ -301,7 +488,7 @@ describe("Prime Agent runtime tree attestation", () => {
       inputs,
       npmVersion: "10.9.8",
       smoke: {
-        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch },
+        runtimeVersions: { node: "22.22.3", modules: "127", napi: "10", platform: process.platform, arch: process.arch, bundleImportGraphComplete: true },
       },
     });
     const manifestPath = join(root, "runtime.json");
@@ -338,6 +525,16 @@ describe("Prime Agent runtime tree attestation", () => {
       [
         "export class DaemonSupervisor {",
         "  workers = new Map();",
+        "  isWorkerStopping(worker) { return worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined; }",
+        "  effectiveWorkerState(worker) { if (this.isWorkerStopping(worker)) return \"stopping\"; if (worker.descriptor.lifecycle === \"ready\" && worker.client === undefined) return \"recovering\"; return worker.descriptor.lifecycle; }",
+        "  async reclaimStaleWorkerRegistration(worker) {",
+        "    if (worker.client !== undefined || worker.recovery !== undefined || worker.descriptor.stopRequestedAt === undefined) return false;",
+        "    if (!['gone', 'replaced'].includes(this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId))) return false;",
+        "    this.scheduleWorkerStopFinalization(worker);",
+        "    if (worker.stopFinalization) await worker.stopFinalization;",
+        "    if (this.workers.get(worker.descriptor.workerId) === worker) throw new Error('still cleaning');",
+        "    return true;",
+        "  }",
         "  async handleCommand(client, command) {",
         "    const worker = [...this.workers.values()].find((candidate) => candidate.descriptor.rootActiveSessionId === command.activeSessionId);",
         "    this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);",
@@ -400,6 +597,8 @@ describe("Prime Agent runtime tree attestation", () => {
       if (helperName === "runtime-probe.mjs") {
         expect(args[1]).toBe(entrypoints.moduleUrl);
         expect(helperSource).toContain("await import(moduleUrl)");
+        expect(helperSource).toContain('"@mistralai/mistralai"');
+        expect(helperSource).toContain('"openai-codex-responses-MURTF24R.js"');
         return {
           stdout: JSON.stringify({
             node: "22.22.3",
@@ -407,6 +606,7 @@ describe("Prime Agent runtime tree attestation", () => {
             napi: "10",
             platform: process.platform,
             arch: process.arch,
+            bundleImportGraphComplete: true,
           }),
           stderr: "",
         };
@@ -415,6 +615,8 @@ describe("Prime Agent runtime tree attestation", () => {
         expect(args[1]).toBe(pathToFileURL(await realpath(daemonSupervisorPath)).href);
         expect(helperSource).toContain('type: "retry_worker"');
         expect(helperSource).toContain('stopRequestedAt: candidate.descriptor.stopRequestedAt');
+        expect(helperSource).toContain('effectiveWorkerState(disconnectedWorker)');
+        expect(helperSource).toContain('reclaimStaleWorkerRegistration(staleWorker)');
         const result = await execFileAsync(command, args, {
           cwd: options.cwd,
           env: options.env,
@@ -463,7 +665,14 @@ describe("Prime Agent runtime tree attestation", () => {
       ): Promise<{ stdout: string; stderr: string }> => {
         const result = await commandRunner(command, args, options);
         if (basename(args[0] ?? "") !== "runtime-retry-worker-probe.mjs") return result;
-        return { ...result, stdout: JSON.stringify({ retryWorkerOrdering: false }) };
+        return {
+          ...result,
+          stdout: JSON.stringify({
+            retryWorkerOrdering: false,
+            disconnectedWorkerState: true,
+            staleWorkerReclaimed: true,
+          }),
+        };
       };
       await expect(
         smokeRuntime(root, {
@@ -472,7 +681,7 @@ describe("Prime Agent runtime tree attestation", () => {
           policy: inputs.policy,
           commandRunner: invalidRetryRunner,
         }),
-      ).rejects.toThrow("did not prove tombstone clearing before recovery");
+      ).rejects.toThrow("did not prove current self-healing semantics");
 
       const invalidHelloRunner = async (
         command: string,
@@ -631,13 +840,191 @@ describe("Prime Agent package seed selection", () => {
     await mkdir(packageDirectory, { recursive: true });
     await Promise.all([
       writeFile(join(packageDirectory, ".gitkeep"), ""),
+      writeFile(join(packageDirectory, "runtime.d.ts"), "export {};\n"),
+      writeFile(join(packageDirectory, "runtime.js.map"), "{}\n"),
       writeFile(join(packageDirectory, "runtime.js"), "export {};\n"),
     ]);
 
-    await expect(pruneRuntimePackagingNoise(root, { packaging: { excludedBasenames: [".gitkeep"] } })).resolves.toEqual([
+    await expect(pruneRuntimePackagingNoise(root, {
+      packaging: {
+        excludedBasenames: [".gitkeep"],
+        excludedSuffixes: [".d.ts", ".d.mts", ".d.cts", ".map"],
+      },
+    })).resolves.toEqual([
       "node_modules/fixture/.gitkeep",
+      "node_modules/fixture/runtime.d.ts",
+      "node_modules/fixture/runtime.js.map",
     ]);
     expect(await readdir(packageDirectory)).toEqual(["runtime.js"]);
+  });
+
+  it("prunes only an exact reviewed package directory after validating its complete identity", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await mkdir(join(target, "nested"), { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "a.ts"), "export const a = 1;\n"),
+      writeFile(join(target, "nested", "b.ts"), "export const b = 2;\n"),
+    ]);
+    const entries = [
+      { path: "a.ts", bytes: "export const a = 1;\n" },
+      { path: "nested/b.ts", bytes: "export const b = 2;\n" },
+    ].map((entry) => ({
+      ...entry,
+      size: Buffer.byteLength(entry.bytes),
+      sha256: createHash("sha256").update(entry.bytes).digest("hex"),
+    }));
+    const treeSource = entries.map((entry) => `${entry.sha256} ${entry.size} ${entry.path}\n`).join("");
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: entries.length,
+          totalBytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+          treeSha256: createHash("sha256").update(treeSource).digest("hex"),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).resolves.toEqual([
+      "node_modules/fixture/src",
+    ]);
+    await expect(realpath(target)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(packageDirectory, "package.json"), "utf8")).resolves.toBe(packageJson);
+  });
+
+  it("fails closed without pruning when a reviewed directory identity drifts", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await mkdir(target, { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "runtime.ts"), "changed\n"),
+    ]);
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: 7,
+          treeSha256: "a".repeat(64),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).rejects.toThrow(
+      "Reviewed runtime prune target drifted",
+    );
+    await expect(readFile(join(target, "runtime.ts"), "utf8")).resolves.toBe("changed\n");
+  });
+
+  it("includes runtime-shaped package files in the reviewed directory identity", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const target = join(packageDirectory, "src");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    const runtimeSource = "export const runtime = true;\n";
+    await mkdir(target, { recursive: true });
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(target, "runtime.ts"), runtimeSource),
+      writeFile(join(target, "runtime.json"), "unreviewed\n"),
+    ]);
+    const runtimeSha256 = createHash("sha256").update(runtimeSource).digest("hex");
+    const treeSource = `${runtimeSha256} ${Buffer.byteLength(runtimeSource)} runtime.ts\n`;
+    const policy = {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: Buffer.byteLength(runtimeSource),
+          treeSha256: createHash("sha256").update(treeSource).digest("hex"),
+        }],
+      },
+    };
+
+    await expect(pruneReviewedRuntimeDirectories(root, policy)).rejects.toThrow(
+      "Reviewed runtime prune target drifted",
+    );
+    await expect(readFile(join(target, "runtime.json"), "utf8")).resolves.toBe("unreviewed\n");
+  });
+
+  it("validates every reviewed directory before removing any of them", async () => {
+    const root = await makeTemporaryDirectory();
+    const makeEntry = async (packageName: string, contents: string, treeSha256?: string) => {
+      const packageDirectory = join(root, "node_modules", packageName);
+      const target = join(packageDirectory, "src");
+      const packageJson = `${JSON.stringify({ name: packageName, version: "1.0.0" })}\n`;
+      await mkdir(target, { recursive: true });
+      await Promise.all([
+        writeFile(join(packageDirectory, "package.json"), packageJson),
+        writeFile(join(target, "index.ts"), contents),
+      ]);
+      const sha256 = createHash("sha256").update(contents).digest("hex");
+      const treeSource = `${sha256} ${Buffer.byteLength(contents)} index.ts\n`;
+      return {
+        relativePath: `node_modules/${packageName}/src`,
+        package: packageName,
+        version: "1.0.0",
+        packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+        fileCount: 1,
+        totalBytes: Buffer.byteLength(contents),
+        treeSha256: treeSha256 ?? createHash("sha256").update(treeSource).digest("hex"),
+      };
+    };
+    const first = await makeEntry("first", "first\n");
+    const second = await makeEntry("second", "second\n", "a".repeat(64));
+
+    await expect(pruneReviewedRuntimeDirectories(root, {
+      packaging: { reviewedPrunedDirectories: [first, second] },
+    })).rejects.toThrow("Reviewed runtime prune target drifted");
+    await expect(readFile(join(root, "node_modules", "first", "src", "index.ts"), "utf8")).resolves.toBe("first\n");
+    await expect(readFile(join(root, "node_modules", "second", "src", "index.ts"), "utf8")).resolves.toBe("second\n");
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a symlinked reviewed directory without deleting its target", async () => {
+    const root = await makeTemporaryDirectory();
+    const packageDirectory = join(root, "node_modules", "fixture");
+    const outside = join(root, "outside");
+    const packageJson = '{"name":"fixture","version":"1.0.0"}\n';
+    await Promise.all([
+      mkdir(packageDirectory, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(packageDirectory, "package.json"), packageJson),
+      writeFile(join(outside, "keep.ts"), "keep\n"),
+      symlink(outside, join(packageDirectory, "src"), "dir"),
+    ]);
+
+    await expect(pruneReviewedRuntimeDirectories(root, {
+      packaging: {
+        reviewedPrunedDirectories: [{
+          relativePath: "node_modules/fixture/src",
+          package: "fixture",
+          version: "1.0.0",
+          packageJsonSha256: createHash("sha256").update(packageJson).digest("hex"),
+          fileCount: 1,
+          totalBytes: 5,
+          treeSha256: "a".repeat(64),
+        }],
+      },
+    })).rejects.toThrow("not a plain package directory");
+    await expect(readFile(join(outside, "keep.ts"), "utf8")).resolves.toBe("keep\n");
   });
 
   it("keeps only the selected content-addressed install", async () => {
@@ -711,12 +1098,21 @@ async function makeRuntimeFixture(name: string): Promise<string> {
   const prime = join(root, "node_modules", "prime-agent");
   await mkdir(join(prime, "dist", "bundle"), { recursive: true });
   await mkdir(join(root, "node_modules", "zeromq", "build", "fixture"), { recursive: true });
+  await mkdir(join(root, "node_modules", "playwright-core"), { recursive: true });
+  await mkdir(join(root, "bridge", "skills", "playwright-cli"), { recursive: true });
   await Promise.all([
     writeFile(join(root, "package.json"), '{"name":"fixture"}\n'),
     writeFile(join(root, "package-lock.json"), '{"lockfileVersion":3}\n'),
     writeFile(join(prime, "package.json"), '{"name":"prime-agent","version":"0.7.1"}\n'),
     writeFile(join(prime, "dist", "index.js"), "export class DaemonClient {}\n"),
     writeFile(join(prime, "dist", "bundle", "cli.js"), "process.exitCode = 0;\n"),
+    writeFile(join(root, "node_modules", "playwright-core", "package.json"), '{"name":"playwright-core","version":"1.63.0-alpha-2026-08-05"}\n'),
+    writeFile(join(root, "bridge", "browser-bridge.mjs"), "export const bridge = true;\n"),
+    writeFile(join(root, "bridge", "browser-doctor-host.cjs"), "module.exports = {};\n"),
+    writeFile(join(root, "bridge", "browser-host.cjs"), "module.exports = {};\n"),
+    writeFile(join(root, "bridge", "playwright-cli"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }),
+    writeFile(join(root, "bridge", "playwright-cli.cmd"), "@exit /b 0\r\n"),
+    writeFile(join(root, "bridge", "skills", "playwright-cli", "SKILL.md"), "# Browser\n"),
     writeFile(join(root, "node_modules", "zeromq", "build", "fixture", "addon.node"), "native-fixture"),
   ]);
   return root;
@@ -741,10 +1137,23 @@ function fixtureInputs() {
       installStrategy: "hoisted",
       targetNativePrebuildsOnly: true,
     },
-    packaging: { excludedBasenames: [".gitkeep"] },
+    packaging: {
+      excludedBasenames: [".gitkeep"],
+      excludedSuffixes: [".d.ts", ".d.mts", ".d.cts", ".map"],
+    },
     entrypoints: {
       module: "node_modules/prime-agent/dist/index.js",
       cli: "node_modules/prime-agent/dist/bundle/cli.js",
+      browserBridge: "bridge/browser-bridge.mjs",
+      browserHost: "bridge/browser-host.cjs",
+      browserLauncher: "bridge/playwright-cli",
+      browserLauncherWindows: "bridge/playwright-cli.cmd",
+      browserSkill: "bridge/skills/playwright-cli/SKILL.md",
+    },
+    browserBridge: {
+      protocol: "prime-continuim.browser.v1",
+      playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+      engine: "verified-electron-host",
     },
     daemon: {
       protocolName: "prime-agent.daemon",

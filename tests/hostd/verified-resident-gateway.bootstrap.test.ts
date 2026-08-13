@@ -1,5 +1,7 @@
+import { realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PrimeAgentGateway, PrimeAgentProjectionChange } from "../../src/hostd/gateway";
 import type {
@@ -32,6 +34,7 @@ import {
   VerifiedResidentGateway,
   residentDaemonEndpoint,
   residentDaemonWorkingDirectory,
+  type VerifiedBrowserReadinessProbeInput,
 } from "../../src/hostd/verified-resident-gateway";
 import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
@@ -322,6 +325,27 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     await fixture.gateway.close();
   });
 
+  it("publishes an immediate live-only invalidation without persisting dialog state", async () => {
+    const durableBinding = binding("thread-dialog", "execution-dialog", "active-dialog");
+    const fixture = await gatewayFixture([durableBinding]);
+    const changes: PrimeAgentProjectionChange[] = [];
+    const unsubscribe = fixture.gateway.subscribeProjectionChanges((change) => changes.push(change));
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    vi.mocked(fixture.store.publishResidentProjectionSnapshot).mockClear();
+
+    fixture.adapterOptions.publishEphemeralProjectionChange?.(durableBinding);
+
+    expect(changes).toContainEqual({
+      threadId: "thread-dialog",
+      executionGenerationId: "execution-dialog",
+    });
+    expect(fixture.store.publishResidentProjectionSnapshot).not.toHaveBeenCalled();
+    unsubscribe();
+    await fixture.gateway.close();
+  });
+
   it("proves only the exact prepared binding without retiring a healthy replacement", async () => {
     const current = binding("thread-a", "execution-a", "active-current");
     const stale = {
@@ -474,6 +498,7 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     expect(firstUnix).toBe(secondUnix);
     expect(Buffer.byteLength(firstUnix, "utf8")).toBeLessThanOrEqual(100);
     expect(firstUnix).toMatch(/[\\/]pc-[0-9a-f]{16}[\\/]d\.sock$/);
+    expect(dirname(dirname(firstUnix))).toBe(realpathSync.native(resolve(tmpdir())));
     expect(residentDaemonWorkingDirectory("/var/lib/prime-continuim/hostd")).toMatch(
       /[\\/]resident-daemon$/,
     );
@@ -500,6 +525,74 @@ describe("VerifiedResidentGateway bootstrap gates", () => {
     expect(closed).toBe(true);
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
   });
+
+  it("re-probes browser execution once after backoff and upgrades the exact live binding", async () => {
+    const durableBinding = binding("thread-browser", "execution-browser", "active-browser");
+    let now = 1_000;
+    let retryCallback: (() => void) | undefined;
+    const retryTimer = setTimeout(() => undefined, 60_000);
+    retryTimer.unref();
+    const browserReadinessProbe = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const fixture = await gatewayFixture([durableBinding], {}, {
+      browserHandle: true,
+      browserReadinessProbe,
+      now: () => now,
+      scheduleBrowserReadinessRetry: (callback) => {
+        retryCallback = callback;
+        return retryTimer;
+      },
+      cancelBrowserReadinessRetry: clearTimeout,
+    });
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    await vi.waitFor(() => expect(browserReadinessProbe).toHaveBeenCalledOnce());
+    await new Promise((resolveTurn) => setImmediate(resolveTurn));
+    await expect(fixture.gateway.isResidentBrowserExecutionReady(durableBinding)).resolves.toBe(false);
+    expect(browserReadinessProbe).toHaveBeenCalledOnce();
+    expect(fixture.adapterOptions.browserSkill).toMatch(/[\\/]bridge[\\/]skills[\\/]playwright-cli[\\/]SKILL\.md$/);
+    expect(fixture.adapterOptions.environment).toMatchObject({
+      ELECTRON_RUN_AS_NODE: "1",
+      PRIME_CONTINUIM_BROWSER_EXECUTABLE: expect.any(String),
+      PRIME_CONTINUIM_BROWSER_BRIDGE: expect.any(String),
+      PRIME_CONTINUIM_BROWSER_STATE_DIR: expect.any(String),
+    });
+
+    const invalidation = vi.fn();
+    const unsubscribe = fixture.gateway.subscribeProjectionChanges(invalidation);
+    now += 30_001;
+    expect(retryCallback).toBeTypeOf("function");
+    retryCallback?.();
+    await vi.waitFor(() => expect(browserReadinessProbe).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(invalidation).toHaveBeenCalledOnce());
+    await vi.waitFor(async () => {
+      expect(await fixture.gateway.isResidentBrowserExecutionReady(durableBinding)).toBe(true);
+    });
+    unsubscribe();
+    await fixture.gateway.close();
+  });
+
+  it("does not block core resident readiness on a deferred browser doctor", async () => {
+    const durableBinding = binding("thread-browser-deferred", "execution-browser-deferred", "active-browser-deferred");
+    const doctor = deferred<boolean>();
+    const fixture = await gatewayFixture([durableBinding], {}, {
+      browserHandle: true,
+      browserReadinessProbe: vi.fn(() => doctor.promise),
+    });
+
+    await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
+    await vi.waitFor(async () => expect(await fixture.gateway.capabilityReady()).toBe(true));
+    expect(fixture.adapterFactory).toHaveBeenCalledOnce();
+    await expect(fixture.gateway.isResidentBrowserExecutionReady(durableBinding)).resolves.toBe(false);
+
+    doctor.resolve(true);
+    await vi.waitFor(async () => {
+      expect(await fixture.gateway.isResidentBrowserExecutionReady(durableBinding)).toBe(true);
+    });
+    await fixture.gateway.close();
+  });
 });
 
 async function gatewayFixture(
@@ -516,6 +609,11 @@ async function gatewayFixture(
       prepareAndVerify(): Promise<void>;
       assertStillSecure(): Promise<void>;
     };
+    readonly browserHandle?: boolean;
+    readonly browserReadinessProbe?: (input: VerifiedBrowserReadinessProbeInput) => Promise<boolean>;
+    readonly now?: () => number;
+    readonly scheduleBrowserReadinessRetry?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+    readonly cancelBrowserReadinessRetry?: (timer: ReturnType<typeof setTimeout>) => void;
   } = {},
 ) {
   const root = await canonicalTemporaryDirectory("prime-resident-gateway-bootstrap-test-");
@@ -524,6 +622,7 @@ async function gatewayFixture(
   let projectedBindings = [...(fixtureOptions.projectedBindings ?? bindings)];
   const store = {
     paths: { root },
+    getHost: vi.fn(async () => ({ hostId: "host-local" })),
     listResidentSessionBindings: vi.fn(async () => [...currentBindings]),
     getResidentSessionBinding: vi.fn(async (threadId: string, executionGenerationId: string) =>
       currentBindings.find(
@@ -558,7 +657,7 @@ async function gatewayFixture(
     }),
   } as unknown as HostStore;
   const runtimeHandles = {
-    acquireVerifiedRuntimeHandle: vi.fn(async () => verifiedHandle(root)),
+    acquireVerifiedRuntimeHandle: vi.fn(async () => verifiedHandle(root, fixtureOptions.browserHandle)),
   } satisfies VerifiedRuntimeHandleProvider;
   let adapterOptions!: PrimeAgentResidentAdapterOptions;
   const {
@@ -609,6 +708,10 @@ async function gatewayFixture(
     adapterFactory,
     moduleLoaderFactory: fixtureOptions.moduleLoaderFactory ?? (() => async () => ({})),
     credentialSecurity: fixtureOptions.credentialSecurity,
+    browserReadinessProbe: fixtureOptions.browserReadinessProbe,
+    now: fixtureOptions.now,
+    scheduleBrowserReadinessRetry: fixtureOptions.scheduleBrowserReadinessRetry,
+    cancelBrowserReadinessRetry: fixtureOptions.cancelBrowserReadinessRetry,
   });
   return {
     gateway,
@@ -672,12 +775,20 @@ function connectionFor(bindingValue: ResidentSessionBinding): ResidentRuntimeCon
   return { binding: bindingValue } as ResidentRuntimeConnection;
 }
 
-function verifiedHandle(root: string): VerifiedInstalledRuntimeHandle {
+function verifiedHandle(root: string, browser = false): VerifiedInstalledRuntimeHandle {
   return {
     identity: {},
     executable: join(root, "node.exe"),
+    browserExecutable: join(root, "electron.exe"),
     moduleUrl: new URL(`file:///${join(root, "dist", "index.js").replaceAll("\\", "/")}`).href,
     cliEntrypoint: join(root, "dist", "bundle", "cli.js"),
+    ...(browser ? {
+      browserBridge: join(root, "bridge", "browser-bridge.mjs"),
+      browserHost: join(root, "bridge", "browser-host.cjs"),
+      browserLauncher: join(root, "bridge", "playwright-cli"),
+      browserLauncherWindows: join(root, "bridge", "playwright-cli.cmd"),
+      browserSkill: join(root, "bridge", "skills", "playwright-cli", "SKILL.md"),
+    } : {}),
   } as unknown as VerifiedInstalledRuntimeHandle;
 }
 

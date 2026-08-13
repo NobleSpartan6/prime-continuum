@@ -14,7 +14,12 @@ import { runSupervisedWorkflowStep } from '../../scripts/workflow-supervised-ste
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, {
+    recursive: true,
+    force: true,
+    maxRetries: process.platform === 'win32' ? 8 : 0,
+    retryDelay: 50,
+  })))
 })
 
 describe('workflow child supervision', () => {
@@ -251,50 +256,60 @@ setInterval(() => undefined, 1000)
       detached: true,
     })
     let supervisorPid: number | undefined
+    let supervisedChildPid: number | undefined
     const childPid = orphan.pid!
 
-    await expect(runSupervisedWorkflowStep({
-      workflow: 'dev',
-      lock: main,
-      step: {
-        executable: process.execPath,
-        args: ['--eval', 'setInterval(() => undefined, 1000)'],
-        cwd: root,
-        environment: process.env,
-      },
-      createLease: async (options) => {
-        supervisorPid = options.supervisorPid
-        const real = await createWorkflowChildLease(options)
-        return {
-          ...real,
-          setChildPid: async () => {
-            await real.setChildPid(childPid)
-            process.kill(options.supervisorPid, 'SIGKILL')
-          },
-        }
-      },
-      teardownTimeoutMs: 2_000,
-    })).rejects.toThrow('supervisor exited without confirming child-tree completion')
+    try {
+      await expect(runSupervisedWorkflowStep({
+        workflow: 'dev',
+        lock: main,
+        step: {
+          executable: process.execPath,
+          args: ['--eval', 'setInterval(() => undefined, 1000)'],
+          cwd: root,
+          environment: process.env,
+        },
+        createLease: async (options) => {
+          supervisorPid = options.supervisorPid
+          const real = await createWorkflowChildLease(options)
+          return {
+            ...real,
+            setChildPid: async (pid) => {
+              supervisedChildPid = pid
+              await real.setChildPid(childPid)
+              process.kill(options.supervisorPid, 'SIGKILL')
+            },
+          }
+        },
+        teardownTimeoutMs: 2_000,
+      })).rejects.toThrow('supervisor exited without confirming child-tree completion')
 
-    expect(supervisorPid).toEqual(expect.any(Number))
-    expect(childPid).toEqual(expect.any(Number))
-    expect(isProcessAlive(supervisorPid!)).toBe(false)
-    expect(isProcessAlive(childPid!)).toBe(true)
-    await expect(rejectActiveWorkflowChild({
-      lockPath,
-      lockToken: main.owner.token,
-      workflow: 'dist',
-    })).rejects.toBeInstanceOf(WorkflowChildLeaseError)
+      expect(supervisorPid).toEqual(expect.any(Number))
+      expect(supervisedChildPid).toEqual(expect.any(Number))
+      expect(childPid).toEqual(expect.any(Number))
+      expect(isProcessAlive(supervisorPid!)).toBe(false)
+      expect(isProcessAlive(childPid!)).toBe(true)
+      await expect(rejectActiveWorkflowChild({
+        lockPath,
+        lockToken: main.owner.token,
+        workflow: 'dist',
+      })).rejects.toBeInstanceOf(WorkflowChildLeaseError)
 
-    process.kill(childPid, 'SIGKILL')
-    await waitForProcessesToExit([childPid])
-    await rejectActiveWorkflowChild({
-      lockPath,
-      lockToken: main.owner.token,
-      workflow: 'dist',
-    })
-    await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
-    await main.release()
+      await terminateTestProcessTree(childPid)
+      await waitForExit(orphan)
+      await rejectActiveWorkflowChild({
+        lockPath,
+        lockToken: main.owner.token,
+        workflow: 'dist',
+      })
+      await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
+    } finally {
+      if (supervisedChildPid !== undefined) await terminateTestProcessTree(supervisedChildPid)
+      await terminateTestProcessTree(childPid)
+      await waitForExit(orphan)
+      if (supervisorPid !== undefined) await waitForProcessesToExit([supervisorPid])
+      await main.release()
+    }
   }, 15_000)
 
   it.skipIf(process.platform !== 'win32')(
@@ -418,6 +433,32 @@ async function waitForProcessesToExit(pids: number[]) {
 
 function isProcessAlive(pid: number) {
   try { process.kill(pid, 0); return true } catch { return false }
+}
+
+async function terminateTestProcessTree(pid: number) {
+  if (!isProcessAlive(pid)) return
+  if (process.platform === 'win32') {
+    const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows'
+    const killer = spawn(join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      killer.once('error', rejectPromise)
+      killer.once('exit', (code) => {
+        if (code === 0 || !isProcessAlive(pid)) resolvePromise()
+        else rejectPromise(new Error(`taskkill failed to retire test process tree ${pid} (exit ${code}).`))
+      })
+    })
+    await waitForProcessesToExit([pid])
+    return
+  }
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+  await waitForProcessesToExit([pid])
 }
 
 function delay(milliseconds: number) {

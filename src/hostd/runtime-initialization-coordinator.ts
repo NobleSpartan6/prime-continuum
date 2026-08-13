@@ -49,6 +49,7 @@ export type RuntimeIntegrityManagerFactory = (
 export interface RuntimeInitializationCoordinatorOptions {
   readonly paths: HostDataPaths;
   readonly envelope: EmbeddedRuntimeAttestationEnvelope;
+  readonly browserExecutable?: string;
   readonly managerFactory?: RuntimeIntegrityManagerFactory;
   readonly schedule?: (work: () => void) => void;
   readonly now?: () => Date;
@@ -67,6 +68,7 @@ export interface RuntimeInitializationCoordinatorOptions {
 export class RuntimeInitializationCoordinator {
   private readonly paths: HostDataPaths;
   private readonly envelope: EmbeddedRuntimeAttestationEnvelope;
+  private readonly browserExecutable: string;
   private readonly target: RuntimeIntegrityTarget;
   private readonly managerFactory: RuntimeIntegrityManagerFactory;
   private readonly schedule: (work: () => void) => void;
@@ -87,6 +89,7 @@ export class RuntimeInitializationCoordinator {
   constructor(options: RuntimeInitializationCoordinatorOptions) {
     this.paths = options.paths;
     this.envelope = options.envelope;
+    this.browserExecutable = options.browserExecutable ?? process.execPath;
     this.managerFactory = options.managerFactory ?? ((managerOptions) => new RuntimeIntegrityManager(managerOptions));
     this.schedule = options.schedule ?? ((work) => setImmediate(work));
     this.now = options.now ?? (() => new Date());
@@ -289,6 +292,7 @@ export class RuntimeInitializationCoordinator {
         paths: this.paths,
         attestation: this.envelope.attestation,
         ownershipLease: lease,
+        browserExecutable: this.browserExecutable,
         onProgress: (phase) => {
           const currentLease = this.lease;
           if (!currentLease) return;

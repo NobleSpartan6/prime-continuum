@@ -32,7 +32,7 @@ describe('desktop HUD transparent-area click-through', () => {
     expect(isHudPointTransparent(document, 30, 30)).toBe(true)
   })
 
-  it('pins a focused popup interactive and resets click-through on blur and cleanup', () => {
+  it('pins a focused popup interactive and resets click-through on blur and cleanup', async () => {
     document.body.innerHTML = `
       <main data-hud-click-through="transparent">
         <section data-hud-interactive="true"><button type="button">Open</button></section>
@@ -50,24 +50,61 @@ describe('desktop HUD transparent-area click-through', () => {
 
     expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false)
     window.dispatchEvent(new MouseEvent('pointermove', { clientX: 4, clientY: 4 }))
-    expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(true)
+    await vi.waitFor(() => expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(true))
 
     popupField.focus()
     expect(isHudPopupFocusPinned(document)).toBe(true)
     window.dispatchEvent(new MouseEvent('pointermove', { clientX: 4, clientY: 4 }))
-    expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false)
+    await vi.waitFor(() => expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false))
 
     popupField.blur()
     window.dispatchEvent(new Event('blur'))
     expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false)
     window.dispatchEvent(new MouseEvent('pointermove', { clientX: 4, clientY: 4 }))
-    expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(true)
+    await vi.waitFor(() => expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(true))
 
     cleanup()
     expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false)
     const callsAfterCleanup = setIgnoreMouseEvents.mock.calls.length
     window.dispatchEvent(new MouseEvent('pointermove', { clientX: 4, clientY: 4 }))
     expect(setIgnoreMouseEvents).toHaveBeenCalledTimes(callsAfterCleanup)
+  })
+
+  it('coalesces high-frequency pointer hit tests to the latest point in one frame', () => {
+    document.body.innerHTML = '<main data-hud-click-through="transparent" />'
+    const transparent = document.querySelector('main')!
+    const elementFromPoint = vi.fn<Document['elementFromPoint']>().mockReturnValue(transparent)
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: elementFromPoint })
+    let nextFrameId = 0
+    const frames = new Map<number, FrameRequestCallback>()
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      const frameId = ++nextFrameId
+      frames.set(frameId, callback)
+      return frameId
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((frameId) => {
+      frames.delete(frameId)
+    })
+    const setIgnoreMouseEvents = vi.fn()
+    const cleanup = installHudClickThrough({ document, window, setIgnoreMouseEvents })
+
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 2, clientY: 3 }))
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 20, clientY: 30 }))
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 200, clientY: 300 }))
+
+    expect(frames.size).toBe(1)
+    expect(elementFromPoint).not.toHaveBeenCalled()
+    const [[frameId, frame]] = frames
+    frames.delete(frameId)
+    frame(performance.now())
+    expect(elementFromPoint).toHaveBeenCalledOnce()
+    expect(elementFromPoint).toHaveBeenLastCalledWith(200, 300)
+
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 4, clientY: 5 }))
+    expect(frames.size).toBe(1)
+    cleanup()
+    expect(frames.size).toBe(0)
+    expect(setIgnoreMouseEvents).toHaveBeenLastCalledWith(false)
   })
 
   it('retries a rejected native un-ignore request and always recovers on teardown', async () => {

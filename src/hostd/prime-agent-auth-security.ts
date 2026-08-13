@@ -201,7 +201,7 @@ export function resolvePrimeAgentRuntimeDirectory(
 
 /**
  * Protects the one Prime Agent directory shared by catalog, OAuth, and resident
- * workers. Prime Agent v0.7.1 intentionally stores OAuth credentials in
+ * workers. Prime Agent v0.7.2 intentionally stores OAuth credentials in
  * auth.json; this boundary keeps that upstream file scoped to the host account
  * without inventing a second credential/runtime authority.
  */

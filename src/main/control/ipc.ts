@@ -130,7 +130,13 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
           throw new ControlError('ipc.untrusted_sender', 'The native request did not come from the app UI.')
         }
         assertBoundedIpcInput(rawInput)
-        const input = schema.parse(rawInput)
+        const parsed = schema.safeParse(rawInput)
+        if (!parsed.success) {
+          // Zod diagnostics may echo renderer-controlled strings. Keep every
+          // generic IPC schema rejection fixed and path-free.
+          throw new ControlError('ipc.invalid_payload', 'The native request payload is invalid.')
+        }
+        const input = parsed.data
         return { ok: true, value: await operation(input as never) }
       } catch (error) {
         return { ok: false, error: toStructuredError(error) }
@@ -227,6 +233,21 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     CandidateEvaluationPreflightRequestSchema,
     (input: Parameters<DesktopControlService['candidateEvaluationSnapshot']>[0]) =>
       service.candidateEvaluationSnapshot(input)
+  )
+  handle(
+    IPC.preselectResidentWorkspace,
+    z.undefined(),
+    () => service.preselectResidentWorkspace()
+  )
+  handle(
+    IPC.completeResidentWorkspacePreselection,
+    z.object({ preselectionToken: id }).strict(),
+    (input: { preselectionToken: string }) => service.completeResidentWorkspacePreselection(input.preselectionToken)
+  )
+  handle(
+    IPC.cancelResidentWorkspacePreselection,
+    z.object({ preselectionToken: id }).strict(),
+    (input: { preselectionToken: string }) => service.cancelResidentWorkspacePreselection(input.preselectionToken)
   )
   handle(
     IPC.selectResidentWorkspace,

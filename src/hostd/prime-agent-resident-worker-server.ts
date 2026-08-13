@@ -41,6 +41,7 @@ interface WorkerDaemonClient {
 interface WorkerDaemonConnection {
   getInitialSnapshot(): Promise<unknown>;
   waitForIdle?(): Promise<void>;
+  getResourceSnapshot?(): Promise<unknown>;
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
   promoteToResident?(): Promise<void>;
@@ -49,6 +50,10 @@ interface WorkerDaemonConnection {
     options?: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ): Promise<void>;
   abort?(): Promise<void>;
+  respondToExtensionUiRequest?(
+    requestId: string,
+    response: Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }>,
+  ): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
 }
@@ -62,8 +67,9 @@ export interface ResidentWorkerRuntimeModule {
       options: Readonly<{
         closeClientOnDispose: true;
         sendClientEnv: false;
-        supportsExtensionUi: false;
+        supportsExtensionUi: true;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<WorkerDaemonConnection>;
@@ -356,6 +362,7 @@ export class ResidentRuntimeWorkerServer {
           "sendClientEnv",
           "supportsExtensionUi",
           "ownedSession",
+          "telemetryDisabled",
         ], operation);
         const connectionId = boundedIdentifier(input.connectionId, "worker connection ID");
         this.lastConnectionOrdinal = requireNextOrdinal(
@@ -372,8 +379,9 @@ export class ResidentRuntimeWorkerServer {
         if (
           input.closeClientOnDispose !== true ||
           input.sendClientEnv !== false ||
-          input.supportsExtensionUi !== false ||
-          typeof input.ownedSession !== "boolean"
+          input.supportsExtensionUi !== true ||
+          typeof input.ownedSession !== "boolean" ||
+          input.telemetryDisabled !== true
         ) {
           throw new ResidentWorkerProtocolError("Resident worker attach options differ from the fixed public contract");
         }
@@ -393,8 +401,9 @@ export class ResidentRuntimeWorkerServer {
           const connection = await runtime.DaemonAgentConnection.attach(clientRecord.client, activeSessionId, {
             closeClientOnDispose: true,
             sendClientEnv: false,
-            supportsExtensionUi: false,
+            supportsExtensionUi: true,
             ownedSession: input.ownedSession,
+            telemetryDisabled: true,
             recoverDaemon: () => this.requestHostRecovery(connectionId),
           });
           if (attaching.abandoned) {
@@ -432,6 +441,13 @@ export class ResidentRuntimeWorkerServer {
         if (typeof record.connection.waitForIdle !== "function") throw new Error("Public idle barrier is unavailable");
         await record.connection.waitForIdle.call(record.connection);
         return { result: null };
+      }
+      case "connection.get_resource_snapshot": {
+        const [, record] = this.requireConnectionPayload(payload, operation);
+        if (typeof record.connection.getResourceSnapshot !== "function") {
+          throw new Error("Resource inventory is unavailable");
+        }
+        return { result: await record.connection.getResourceSnapshot.call(record.connection) };
       }
       case "connection.get_available_models": {
         const [, record] = this.requireConnectionPayload(payload, operation);
@@ -498,6 +514,22 @@ export class ResidentRuntimeWorkerServer {
         if (typeof record.connection.abort !== "function") throw new Error("Abort admission is unavailable");
         markMutationInvoked();
         await record.connection.abort.call(record.connection);
+        return { result: null };
+      }
+      case "connection.respond_extension_ui": {
+        const input = strictRecord(payload, ["connectionId", "requestId", "response"], operation);
+        const [, record] = this.requireConnection(input.connectionId);
+        if (typeof record.connection.respondToExtensionUiRequest !== "function") {
+          throw new Error("Extension UI response is unavailable");
+        }
+        const extensionRequestId = boundedIdentifier(input.requestId, "extension UI request ID");
+        const response = validateExtensionUiResponse(input.response);
+        markMutationInvoked();
+        await record.connection.respondToExtensionUiRequest.call(
+          record.connection,
+          extensionRequestId,
+          response,
+        );
         return { result: null };
       }
       case "connection.dispose": {
@@ -814,6 +846,7 @@ function operationMayMutate(
   if (
     operation === "connection.prompt" ||
     operation === "connection.abort" ||
+    operation === "connection.respond_extension_ui" ||
     operation === "connection.set_model" ||
     operation === "connection.promote_to_resident"
   ) {
@@ -821,6 +854,31 @@ function operationMayMutate(
   }
   if (operation !== "client.request" || !isRecord(payload.command)) return false;
   return payload.command.type !== "list";
+}
+
+function validateExtensionUiResponse(
+  value: unknown,
+): Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }> {
+  const record = strictRecord(value, ["cancelled", "value", "confirmed"], "extension UI response");
+  if (record.cancelled === true && record.value === undefined && record.confirmed === undefined) {
+    return Object.freeze({ cancelled: true as const });
+  }
+  if (
+    record.cancelled === undefined &&
+    typeof record.value === "string" &&
+    record.value.length <= RESIDENT_WORKER_LIMITS.maxExtensionUiValueCharacters &&
+    record.confirmed === undefined
+  ) {
+    return Object.freeze({ value: record.value });
+  }
+  if (
+    record.cancelled === undefined &&
+    record.value === undefined &&
+    typeof record.confirmed === "boolean"
+  ) {
+    return Object.freeze({ confirmed: record.confirmed });
+  }
+  throw new ResidentWorkerProtocolError("Extension UI response is invalid");
 }
 
 function residentWorkerFailureOutcome(

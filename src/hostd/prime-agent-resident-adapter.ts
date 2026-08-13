@@ -6,6 +6,12 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { CommandEnvelopeSchema, type CommandEnvelope } from "../shared/protocol";
 import {
+  ExtensionUiDialogResponseSchema,
+  ResidentExtensionUiRequestSchema,
+  type ExtensionUiDialogResponse,
+  type ResidentExtensionUiRequest,
+} from "../shared/protocol";
+import {
   GatewayError,
   residentCommandEnvelopeFingerprint,
   type GatewayAdmission,
@@ -13,9 +19,13 @@ import {
   type PrimeAgentGateway,
 } from "./gateway";
 import {
+  MAX_RESIDENT_PROJECTION_CHILDREN,
   ResidentProjectionError,
   normalizeResidentProjectionSnapshot,
+  residentChildAgentSummaryFromSessionEvent,
+  residentTerminalAssistantMarkerFromSessionEvent,
   type ResidentProjectionSnapshot,
+  type ResidentTerminalAssistantMarker,
 } from "./resident-projection";
 import {
   ResidentRuntimeContractError,
@@ -24,11 +34,13 @@ import {
   buildResidentDaemonStartInvocation,
   validateResidentAbortIdleReconciliationRequest,
   validateResidentDaemonHello,
+  validateResidentDaemonRetirementHello,
   validateResidentGenerationDispatchLease,
   validateResidentPromptIdleReconciliationRequest,
   validateResidentOwnedSessionCreateInput,
   validateResidentSessionBinding,
   type ResidentDaemonStartInvocation,
+  type ResidentDaemonRetirementTarget,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentAbortIdleReconciliationRequest,
   type ResidentDispatchOperation,
@@ -55,11 +67,13 @@ import {
   validateResidentAbortReconciliationLease,
   validateResidentPromptReconciliationLease,
   validateResidentKillLeaseEnvelope,
+  validateExtensionUiResponseLease,
   type ResidentAbortReconciliationLease,
   type ResidentDispatchLease,
   type ResidentKillInvocationAuthorizer,
   type ResidentKillLease,
   type ResidentPromptReconciliationLease,
+  type ExtensionUiResponseLease,
 } from "./store";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 750;
@@ -77,8 +91,12 @@ const MAX_AUTHORITATIVE_MODEL_SNAPSHOT_READS = 40;
 const MODEL_SELECTION_RECONCILIATION_POLL_MS = 50;
 const MODEL_SELECTION_EPHEMERAL_DISPOSE_GRACE_MS = 100;
 const MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS = 4;
+const MAX_TERMINAL_EVENT_PROJECTION_ATTEMPTS = 8;
+const TERMINAL_EVENT_PROJECTION_BACKOFF_MS = 25;
 const RESIDENT_PROJECTION_COALESCE_MS = 100;
 const PROMPT_ADMISSION_CANCEL_GRACE_MS = 2_000;
+const DAEMON_RETIREMENT_POLL_MS = 25;
+const MAX_DAEMON_RETIREMENT_PROBES = 512;
 const ResidentOwnedRuntimeCandidateBrand: unique symbol = Symbol("ResidentOwnedRuntimeCandidate");
 const UNVERIFIED_OWNED_CLEANUP_ATTEMPT = Object.freeze({
   disposition: "attempted_unverified" as const,
@@ -318,19 +336,25 @@ export interface PrimeDaemonClientPublic {
 /** Narrow structural view of the pinned package's public connection export. */
 export interface PrimeDaemonAgentConnectionPublic {
   getInitialSnapshot(): Promise<unknown>;
-  /** v0.7.1 waits for the action pump, agent, and server-side event queue to become idle. */
+  /** Read-only resource discovery for this exact attached resident session. */
+  getResourceSnapshot(): Promise<unknown>;
+  /** v0.7.2 waits for the action pump, agent, and server-side event queue to become idle. */
   waitForIdle?(): Promise<void>;
   /** Pinned public AgentConnection methods; guarded at the mutation boundary. */
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
-  /** v0.7.1 resolves prompt when the worker accepts/owns it, not at turn completion. */
+  /** v0.7.2 resolves prompt when the worker accepts/owns it, not at turn completion. */
   prompt?(
     message: string,
     options?: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ): Promise<void>;
-  /** v0.7.1 resolves abort when requestAbort() is accepted, not when stopping completes. */
+  /** v0.7.2 resolves abort when requestAbort() is accepted, not when stopping completes. */
   abort?(): Promise<void>;
-  /** v0.7.1 promotes one client-owned worker to ordinary resident lifetime. */
+  respondToExtensionUiRequest?(
+    requestId: string,
+    response: Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }>,
+  ): Promise<void>;
+  /** v0.7.2 promotes one client-owned worker to ordinary resident lifetime. */
   promoteToResident(): Promise<void>;
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void;
   dispose(): Promise<void>;
@@ -345,8 +369,9 @@ export interface PrimeAgentPublicModule {
       options: Readonly<{
         closeClientOnDispose: true;
         sendClientEnv: false;
-        supportsExtensionUi: false;
+        supportsExtensionUi: true;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<PrimeDaemonAgentConnectionPublic>;
@@ -369,13 +394,17 @@ export type ResidentDaemonSpawn = (
 ) => ResidentDaemonLauncher;
 
 export interface PrimeAgentResidentAdapterOptions {
+  /** Immutable verified host identity used only in path-free live projections. */
+  readonly hostId: string;
   readonly socketPath: string;
   /** Absolute, verified Node-compatible executable for the pinned runtime. */
   readonly executable: string;
-  /** Absolute, verified v0.7.1 dist/bundle/cli.js entrypoint. */
+  /** Absolute, verified v0.7.2 dist/bundle/cli.js entrypoint. */
   readonly cliEntrypoint: string;
   /** Absolute, writable host-owned directory used instead of ambient cwd. */
   readonly daemonWorkingDirectory: string;
+  /** Exact verified browser skill document packaged with this runtime. */
+  readonly browserSkill?: string;
   readonly environment?: Readonly<NodeJS.ProcessEnv>;
   /** Must resolve only after the package archive and install tree are verified. */
   readonly loadRuntimeModule: PrimeAgentPublicModuleLoader;
@@ -394,6 +423,8 @@ export interface PrimeAgentResidentAdapterOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  /** Invalidate only the service overlay; this callback must never persist the dialogs. */
+  readonly publishEphemeralProjectionChange?: (binding: ResidentSessionBinding) => void;
   readonly spawnFactory?: ResidentDaemonSpawn;
   readonly connectTimeoutMs?: number;
   readonly startupTimeoutMs?: number;
@@ -403,6 +434,7 @@ export interface PrimeAgentResidentAdapterOptions {
 }
 
 interface ResolvedOptions {
+  readonly hostId: string;
   readonly invocation: ResidentDaemonStartInvocation;
   readonly socketPath: string;
   readonly loadRuntimeModule: PrimeAgentPublicModuleLoader;
@@ -417,6 +449,7 @@ interface ResolvedOptions {
     binding: ResidentSessionBinding,
     projection: ResidentProjectionSnapshot,
   ) => Promise<void>;
+  readonly publishEphemeralProjectionChange: (binding: ResidentSessionBinding) => void;
   readonly spawnFactory: ResidentDaemonSpawn;
   readonly connectTimeoutMs: number;
   readonly startupTimeoutMs: number;
@@ -428,6 +461,12 @@ interface ResolvedOptions {
 interface OpenClient {
   readonly client: PrimeDaemonClientPublic;
   readonly compatibility: ResidentRuntimeCompatibility;
+}
+
+interface IncompatibleOpenClient {
+  readonly client: PrimeDaemonClientPublic;
+  readonly incompatibility: ResidentRuntimeContractError;
+  readonly retirementTarget: ResidentDaemonRetirementTarget;
 }
 
 class DaemonUnavailableError extends Error {
@@ -521,10 +560,12 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       socketPath: options.socketPath,
       daemonWorkingDirectory: options.daemonWorkingDirectory,
       environment: options.environment,
+      additionalSkillPath: options.browserSkill,
     });
     this.options = Object.freeze({
+      hostId: options.hostId,
       invocation,
-      socketPath: invocation.argv.at(-1)!,
+      socketPath: invocation.argv[4]!,
       loadRuntimeModule: options.loadRuntimeModule,
       persistBinding: options.persistBinding,
       authorizeResidentKillInvocation: options.authorizeResidentKillInvocation ?? (async () => {
@@ -535,6 +576,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       }),
       publishProjection: options.publishProjection,
       publishModelSelectionProjection: options.publishModelSelectionProjection,
+      publishEphemeralProjectionChange: options.publishEphemeralProjectionChange ?? (() => undefined),
       spawnFactory: options.spawnFactory ?? defaultResidentDaemonSpawn,
       connectTimeoutMs: boundedTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, "connectTimeoutMs"),
       startupTimeoutMs: boundedTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, "startupTimeoutMs"),
@@ -1077,7 +1119,69 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
         this.options.requestTimeoutMs,
         "list",
       );
-      const summary = findExactAvailableResidentSession(response.data, binding);
+      const sessions = parseLiveSessionList(response.data);
+      const matchingSessions = sessions.filter(
+        (candidate) => candidate.activeSessionId === binding.activeSessionId,
+      );
+      if (matchingSessions.length > 1) {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_RESPONSE_INVALID",
+          "Prime Agent returned an ambiguous resident active-session identity.",
+          { details: { activeSessionId: binding.activeSessionId } },
+        );
+      }
+      const summary = matchingSessions[0];
+      if (!summary) {
+        const replacement = sessions.find(
+          (candidate) =>
+            candidate.sessionId === binding.sessionId ||
+            (binding.sessionFile !== undefined && candidate.sessionFile === binding.sessionFile),
+        );
+        if (replacement) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_SESSION_MISMATCH",
+            "The saved Prime Agent session is active under a different runtime identity.",
+            { details: { activeSessionId: binding.activeSessionId } },
+          );
+        }
+
+        // Prime passivates idle workers while retaining their saved transcript.
+        // A definitive exact-list absence proves there is no runtime left to
+        // kill. Consume the user's one-use Store authority and complete the
+        // durable end without inventing or replaying an upstream mutation.
+        this.assertOpen();
+        try {
+          await this.options.authorizeResidentKillInvocation(lease);
+        } catch (error) {
+          throw invalidResidentLifecycleAuthority(error);
+        }
+        this.forceCloseResidentTransport(binding.activeSessionId);
+        return Object.freeze({
+          acknowledgementVersion: 1,
+          operation: "end",
+          activeSessionId: binding.activeSessionId,
+          sessionId: binding.sessionId,
+        });
+      }
+      if (summary.lifecycle === "archived") {
+        // Archived is Prime's definitive no-live-root state. Verify the full
+        // saved-session identity, consume the same one-use Store authority,
+        // and settle locally without inventing a kill or inviting a retry.
+        assertSummaryMatchesBinding(summary, binding);
+        this.assertOpen();
+        try {
+          await this.options.authorizeResidentKillInvocation(lease);
+        } catch (error) {
+          throw invalidResidentLifecycleAuthority(error);
+        }
+        this.forceCloseResidentTransport(binding.activeSessionId);
+        return Object.freeze({
+          acknowledgementVersion: 1,
+          operation: "end",
+          activeSessionId: binding.activeSessionId,
+          sessionId: binding.sessionId,
+        });
+      }
       assertSummaryMatchesBinding(summary, binding);
 
       // Store authorization is deliberately delayed until after every external
@@ -1137,6 +1241,18 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     return connection?.isLive() ?? false;
   }
 
+  listResidentExtensionUiRequests(bindingValue: ResidentSessionBinding): readonly ResidentExtensionUiRequest[] {
+    const binding = validateResidentSessionBinding(bindingValue);
+    const connection = this.connections.get(binding.activeSessionId);
+    if (
+      !connection ||
+      residentDispatchAuthorityFingerprint(connection.binding) !== residentDispatchAuthorityFingerprint(binding)
+    ) {
+      return Object.freeze([]);
+    }
+    return connection.listExtensionUiRequests();
+  }
+
   reconcileAcknowledgedPromptIdle(
     leaseValue: ResidentPromptReconciliationLease,
   ): Promise<ResidentPromptIdleAuthorityEvidence> {
@@ -1171,6 +1287,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       reconciliationVersion: 1,
       dispatchAttemptId: lease.attemptId,
       binding: lease.binding,
+      settlementCursor: lease.settlementCursor,
     });
   }
 
@@ -1215,6 +1332,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     const command = CommandEnvelopeSchema.parse(commandValue);
     if (command.command.kind === "prompt" || command.command.kind === "abort") {
       return this.submitResidentDispatch(command, context?.residentDispatch);
+    }
+    if (command.command.kind === "extension_ui.respond") {
+      return this.submitExtensionUiResponse(command, context?.extensionUiResponse);
     }
     if (command.command.kind !== "model.select") {
       return Promise.reject(
@@ -1290,6 +1410,77 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       Object.freeze({ command: Object.freeze(command), binding: durableBinding, result }),
     );
     return result;
+  }
+
+  private submitExtensionUiResponse(
+    command: CommandEnvelope,
+    leaseValue: ExtensionUiResponseLease | undefined,
+  ): Promise<GatewayAdmission> {
+    if (command.command.kind !== "extension_ui.respond") {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_COMMAND_REQUIRED",
+        "This dispatch path accepts only extension UI responses",
+      ));
+    }
+    const responseCommand = command.command;
+    let lease: ExtensionUiResponseLease;
+    try {
+      if (!leaseValue) throw new Error("missing lease");
+      lease = validateExtensionUiResponseLease(leaseValue);
+    } catch (error) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_DURABLE_AUTHORITY_REQUIRED",
+        "Extension UI response requires exact durable no-replay authority",
+        false,
+        false,
+        { cause: error },
+      ));
+    }
+    if (!isDeepStrictEqual(lease.command, command)) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_AUTHORITY_MISMATCH",
+        "Extension UI response changed after durable admission",
+      ));
+    }
+    const connection = this.connections.get(lease.binding.activeSessionId);
+    if (!connection || !isDeepStrictEqual(connection.binding, lease.binding)) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_RESPONSE_BINDING_MISMATCH",
+        "The live Prime Agent connection no longer owns this dialog",
+        false,
+      ));
+    }
+    const request = connection.listExtensionUiRequests().find(
+      (candidate) =>
+        candidate.requestId === responseCommand.requestId &&
+        candidate.requestDigest === responseCommand.requestDigest &&
+        candidate.method === responseCommand.method &&
+        candidate.bindingFingerprint === lease.bindingFingerprint,
+    );
+    if (!request) {
+      return Promise.reject(new GatewayError(
+        "EXTENSION_UI_REQUEST_EXPIRED",
+        "The extension UI request disappeared before its response was sent",
+        false,
+      ));
+    }
+    return connection.respondToExtensionUiRequest(request, responseCommand.response).then(() => ({
+      disposition: "handled" as const,
+      message: "Prime Agent acknowledged the dialog response",
+    })).catch((error: unknown) => {
+      if (error instanceof ResidentRuntimeContractError) {
+        throw new GatewayError(error.code, error.message, error.retryable, error.code === "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN", {
+          cause: error,
+        });
+      }
+      throw new GatewayError(
+        "EXTENSION_UI_RESPONSE_OUTCOME_UNKNOWN",
+        "Prime Agent did not provide a definitive dialog response acknowledgement",
+        false,
+        true,
+        { cause: error },
+      );
+    });
   }
 
   private submitResidentDispatch(
@@ -1474,10 +1665,13 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     const runtimeModule = await this.loadModule();
     this.lifecycle.transition("validating_daemon");
     try {
-      const opened = await this.openValidatedClient(runtimeModule);
-      opened.client.close();
-      this.lifecycle.transition("ready");
-      return opened.compatibility;
+      const inspected = await this.openClientForEnsure(runtimeModule);
+      if ("compatibility" in inspected) {
+        inspected.client.close();
+        this.lifecycle.transition("ready");
+        return inspected.compatibility;
+      }
+      await this.retireIncompatibleDaemon(runtimeModule, inspected);
     } catch (error) {
       if (!(error instanceof DaemonUnavailableError)) throw error;
       if (!error.definitiveAbsence) {
@@ -1516,6 +1710,228 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     } finally {
       if (!launcher.exited && !ready) launcher.child.kill();
     }
+  }
+
+  private async openClientForEnsure(
+    runtimeModule: PrimeAgentPublicModule,
+  ): Promise<OpenClient | IncompatibleOpenClient> {
+    const client = new runtimeModule.DaemonClient(this.options.socketPath);
+    try {
+      await client.connect(this.options.connectTimeoutMs);
+    } catch (error) {
+      client.close();
+      throw new DaemonUnavailableError(error);
+    }
+
+    let hello: unknown;
+    try {
+      hello = client.hello ?? (await client.waitForHello(this.options.connectTimeoutMs));
+    } catch (error) {
+      client.close();
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_HELLO_INVALID",
+        "Prime Agent connected without completing a structurally verified daemon handshake.",
+        { details: { cause: errorMessage(error) }, cause: error },
+      );
+    }
+
+    try {
+      return {
+        client,
+        compatibility: validateResidentDaemonHello(hello, {
+          expectedSocketPath: this.options.socketPath,
+          expectedExecutablePath: this.options.invocation.executable,
+          expectedEntrypointPath: this.options.invocation.argv[0],
+        }),
+      };
+    } catch (error) {
+      if (!(error instanceof ResidentRuntimeContractError)) {
+        client.close();
+        throw error;
+      }
+      try {
+        const retirementTarget = validateResidentDaemonRetirementHello(hello, this.options.socketPath);
+        return { client, incompatibility: error, retirementTarget };
+      } catch {
+        client.close();
+        throw error;
+      }
+    }
+  }
+
+  private async retireIncompatibleDaemon(
+    runtimeModule: PrimeAgentPublicModule,
+    opened: IncompatibleOpenClient,
+  ): Promise<void> {
+    let shutdownAcknowledged = false;
+    let ambiguousShutdownError: unknown;
+    try {
+      await this.requireEmptyIncompatibleDaemon(opened);
+      let response: unknown;
+      try {
+        // Session inventory was proven empty on this exact client and owner.
+        // Never force retirement; an ordinary refusal preserves the predecessor.
+        response = await opened.client.request({ type: "shutdown" }, this.options.requestTimeoutMs);
+      } catch (error) {
+        ambiguousShutdownError = error;
+      }
+      if (response !== undefined) {
+        try {
+          assertBoundedJson(response, 64 * 1024, "shutdown response");
+          if (
+            isRecord(response) &&
+            response.type === "response" &&
+            response.command === "shutdown" &&
+            response.success === false
+          ) {
+            throw new ResidentRuntimeContractError(
+              "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+              "The incompatible Prime Agent daemon refused graceful retirement.",
+              {
+                retryable: true,
+                details: {
+                  reason: "shutdown_refused",
+                  incompatibility: opened.incompatibility.code,
+                },
+              },
+            );
+          }
+          if (
+            !isRecord(response) ||
+            response.type !== "response" ||
+            response.command !== "shutdown" ||
+            response.success !== true
+          ) {
+            throw invalidResponse("shutdown");
+          }
+          shutdownAcknowledged = true;
+        } catch (error) {
+          if (
+            error instanceof ResidentRuntimeContractError &&
+            error.code === "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED"
+          ) {
+            throw error;
+          }
+          ambiguousShutdownError = error;
+        }
+      }
+    } finally {
+      opened.client.close();
+    }
+
+    const retired = await this.waitForExactEndpointRetirement(runtimeModule);
+    if (retired) return;
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+      "The incompatible Prime Agent daemon did not prove bounded endpoint retirement.",
+      {
+        retryable: true,
+        details: {
+          reason: "endpoint_retirement_unproven",
+          shutdownAcknowledged,
+          incompatibility: opened.incompatibility.code,
+          ...(ambiguousShutdownError ? { cause: errorMessage(ambiguousShutdownError) } : {}),
+        },
+        cause: ambiguousShutdownError ?? opened.incompatibility,
+      },
+    );
+  }
+
+  private async requireEmptyIncompatibleDaemon(opened: IncompatibleOpenClient): Promise<void> {
+    let response: unknown;
+    try {
+      response = await opened.client.request(
+        { type: "list", includeClientOwned: true },
+        this.options.requestTimeoutMs,
+      );
+    } catch (cause) {
+      throw incompatibleDaemonRetirementFailure(
+        opened,
+        "session_inventory_unproven",
+        "The incompatible Prime Agent daemon session inventory could not be proven empty.",
+        cause,
+      );
+    }
+
+    try {
+      assertBoundedJson(response, 64 * 1024, "incompatible daemon list response");
+      if (
+        !isRecord(response) ||
+        response.type !== "response" ||
+        response.command !== "list" ||
+        response.success !== true ||
+        !isRecord(response.data) ||
+        JSON.stringify(Object.keys(response.data).sort()) !==
+          JSON.stringify(["busyClientOwnedSessionCount", "sessions"]) ||
+        !Array.isArray(response.data.sessions) ||
+        response.data.sessions.length > MAX_LIVE_SESSIONS ||
+        !Number.isSafeInteger(response.data.busyClientOwnedSessionCount) ||
+        (response.data.busyClientOwnedSessionCount as number) < 0 ||
+        (response.data.busyClientOwnedSessionCount as number) > MAX_LIVE_SESSIONS
+      ) {
+        throw invalidResponse("list");
+      }
+      if (
+        response.data.sessions.length !== 0 ||
+        response.data.busyClientOwnedSessionCount !== 0
+      ) {
+        throw incompatibleDaemonRetirementFailure(
+          opened,
+          "sessions_present",
+          "The incompatible Prime Agent daemon still owns sessions and was preserved.",
+          undefined,
+          {
+            sessionCount: response.data.sessions.length,
+            busyClientOwnedSessionCount: response.data.busyClientOwnedSessionCount as number,
+          },
+        );
+      }
+      const currentTarget = validateResidentDaemonRetirementHello(
+        opened.client.hello,
+        this.options.socketPath,
+      );
+      if (!isDeepStrictEqual(currentTarget, opened.retirementTarget)) {
+        throw incompatibleDaemonRetirementFailure(
+          opened,
+          "owner_identity_changed",
+          "The incompatible Prime Agent daemon changed ownership identity during retirement review.",
+        );
+      }
+    } catch (cause) {
+      if (
+        cause instanceof ResidentRuntimeContractError &&
+        cause.code === "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED"
+      ) throw cause;
+      throw incompatibleDaemonRetirementFailure(
+        opened,
+        "session_inventory_unproven",
+        "The incompatible Prime Agent daemon session inventory could not be proven empty.",
+        cause,
+      );
+    }
+  }
+
+  private async waitForExactEndpointRetirement(runtimeModule: PrimeAgentPublicModule): Promise<boolean> {
+    const deadline = Date.now() + this.options.startupTimeoutMs;
+    const maximumProbes = Math.min(
+      MAX_DAEMON_RETIREMENT_PROBES,
+      Math.max(1, Math.ceil(this.options.startupTimeoutMs / DAEMON_RETIREMENT_POLL_MS)),
+    );
+    for (let probe = 0; probe < maximumProbes && Date.now() <= deadline; probe += 1) {
+      this.assertOpen();
+      const client = new runtimeModule.DaemonClient(this.options.socketPath);
+      try {
+        await client.connect(this.options.connectTimeoutMs);
+      } catch (error) {
+        if (isDefinitiveEndpointAbsence(error)) return true;
+      } finally {
+        client.close();
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await this.options.wait(Math.min(DAEMON_RETIREMENT_POLL_MS, remaining));
+    }
+    return false;
   }
 
   private async openValidatedClient(
@@ -1561,8 +1977,9 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     return runtimeModule.DaemonAgentConnection.attach(client, activeSessionId, {
       closeClientOnDispose: true,
       sendClientEnv: false,
-      supportsExtensionUi: false,
+      supportsExtensionUi: true,
       ownedSession,
+      telemetryDisabled: true,
       // Do not re-enter the adapter operation queue: recovery may be invoked
       // by static attach while create/attach itself owns that queue.
       recoverDaemon: async () => void (await this.ensureDaemonSingleFlight()),
@@ -1584,6 +2001,7 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     }
     const connection = new ManagedResidentRuntimeConnection({
       binding,
+      hostId: this.options.hostId,
       client,
       attached,
       requestTimeoutMs: this.options.requestTimeoutMs,
@@ -1591,10 +2009,11 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
       wait: this.options.wait,
       expectedSocketPath: this.options.socketPath,
       expectedExecutablePath: this.options.invocation.executable,
-      expectedEntrypointPath: this.options.invocation.argv[0],
+      expectedEntrypointPath: this.options.invocation.argv[0]!,
       persistBinding: this.options.persistBinding,
       publishProjection: this.options.publishProjection,
       publishModelSelectionProjection: this.options.publishModelSelectionProjection,
+      publishEphemeralProjectionChange: this.options.publishEphemeralProjectionChange,
       readStableSelectedModelProjection: (selectionBinding, providerId, modelId) =>
         this.readStableSelectedModelProjection(selectionBinding, providerId, modelId),
       initialProjection,
@@ -1867,10 +2286,13 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private abortTail: Promise<void> = Promise.resolve();
   private residentIdleReconciliationTail: Promise<void> = Promise.resolve();
+  private extensionUiResponseTail: Promise<void> = Promise.resolve();
   private promptIdleReconciliationRecord: PromptIdleReconciliationRecord | undefined;
   private abortIdleReconciliationRecord: AbortIdleReconciliationRecord | undefined;
   private residentIdleReconciliationCancellation: ResidentIdleReconciliationCancellation | undefined;
   private readonly residentDispatchAttempts = new Map<string, ResidentDispatchAttemptRecord>();
+  /** Event ordinal immediately before each same-process prompt invocation. */
+  private readonly promptTerminalEventBaselines = new Map<string, number>();
   private readonly settledResidentDispatchAttemptIds = new Set<string>();
   private readonly retiredResidentDispatchFence = new RetiredResidentDispatchFence();
   private readonly queuedPromptAdmissions: PromptAdmissionAttempt[] = [];
@@ -1878,6 +2300,24 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private uncertainPromptAdmission: PromptAdmissionAttempt | undefined;
   private cancelledPromptAdmission: PromptAdmissionAttempt | undefined;
   private authoritativeProjectionValue: ResidentProjectionSnapshot | undefined;
+  private readonly observedChildAgents = new Map<string, ResidentProjectionSnapshot["childAgents"][number]>();
+  private readonly extensionUiRequests = new Map<string, ResidentExtensionUiRequest>();
+  private readonly extensionUiExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly retiredExtensionUiRequests = new Map<string, Readonly<{
+    requestDigest: string;
+    method: ResidentExtensionUiRequest["method"];
+  }>>();
+  private readonly extensionUiResponseAttempts = new Map<string, Readonly<{
+    requestDigest: string;
+    responseDigest: string;
+    result: Promise<void>;
+  }>>();
+  private upstreamEventOrdinal = 0;
+  private latestTerminalAssistantEvent: Readonly<{
+    ordinal: number;
+    marker: ResidentTerminalAssistantMarker;
+  }> | undefined;
+  private readonly upstreamEventWaiters = new Set<() => void>();
   private readonly retiredAuthoritativeCursorGenerations = new Set<string>();
   private projectionRefreshRequested = false;
   private projectionRefreshPromise: Promise<void> | undefined;
@@ -1890,6 +2330,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   constructor(
     private readonly options: Readonly<{
       binding: ResidentSessionBinding;
+      hostId: string;
       client: PrimeDaemonClientPublic;
       attached: PrimeDaemonAgentConnectionPublic;
       requestTimeoutMs: number;
@@ -1908,6 +2349,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
         binding: ResidentSessionBinding,
         projection: ResidentProjectionSnapshot,
       ) => Promise<void>;
+      publishEphemeralProjectionChange: (binding: ResidentSessionBinding) => void;
       readStableSelectedModelProjection: (
         binding: ResidentSessionBinding,
         providerId: string,
@@ -1920,6 +2362,9 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   ) {
     this.bindingValue = options.binding;
     this.authoritativeProjectionValue = options.initialProjection;
+    for (const child of options.initialProjection?.childAgents ?? []) {
+      this.rememberObservedChildAgent(child);
+    }
     this.lifecycle = new LifecycleController(options.now, "ready", options.binding);
     this.unsubscribeUpstream = options.attached.subscribe((event) => {
       const operation = this.eventTail.then(() => this.handleUpstreamEvent(event));
@@ -1948,6 +2393,105 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       this.options.client.isConnected !== false &&
       this.lifecycle.get().state === "ready"
     );
+  }
+
+  listExtensionUiRequests(): readonly ResidentExtensionUiRequest[] {
+    if (!this.isLive()) return Object.freeze([]);
+    const currentTime = this.options.now().getTime();
+    for (const [requestId, request] of this.extensionUiRequests) {
+      if (
+        request.timeoutMs !== undefined &&
+        currentTime >= Date.parse(request.receivedAt) + request.timeoutMs
+      ) {
+        this.extensionUiRequests.delete(requestId);
+        this.retireExtensionUiRequest(request);
+        this.clearExtensionUiExpiryTimer(requestId);
+        this.options.publishEphemeralProjectionChange(this.binding);
+      }
+    }
+    return Object.freeze([...this.extensionUiRequests.values()]);
+  }
+
+  respondToExtensionUiRequest(
+    requestValue: ResidentExtensionUiRequest,
+    responseValue: ExtensionUiDialogResponse,
+  ): Promise<void> {
+    let request: ResidentExtensionUiRequest;
+    let response: ExtensionUiDialogResponse;
+    try {
+      request = ResidentExtensionUiRequestSchema.parse(requestValue);
+      response = ExtensionUiDialogResponseSchema.parse(responseValue);
+      if (
+        request.method === "select" &&
+        response.kind === "value" &&
+        !request.options.includes(response.value)
+      ) {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+          "The selected value is not one of the exact dialog options.",
+        );
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const responseDigest = normalizedJsonDigest(response);
+    const existing = this.extensionUiResponseAttempts.get(request.requestId);
+    if (existing) {
+      if (
+        existing.requestDigest !== request.requestDigest ||
+        existing.responseDigest !== responseDigest
+      ) {
+        return Promise.reject(new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+          "This extension UI response identity is already bound to different immutable bytes.",
+          { retryable: false },
+        ));
+      }
+      return existing.result;
+    }
+    const current = this.extensionUiRequests.get(request.requestId);
+    if (
+      !this.isLive() ||
+      !current ||
+      !isDeepStrictEqual(current, request) ||
+      current.bindingFingerprint !== residentDispatchAuthorityFingerprint(this.binding)
+    ) {
+      return Promise.reject(new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+        "The extension UI request is no longer owned by this exact live resident connection.",
+        { retryable: false, details: { requestId: request.requestId } },
+      ));
+    }
+    // Store already crossed its durable no-replay boundary before the adapter
+    // receives this call. Remove visibility synchronously, before this response
+    // queues behind any prior dialog mutation.
+    this.extensionUiRequests.delete(request.requestId);
+    this.retireExtensionUiRequest(request);
+    this.clearExtensionUiExpiryTimer(request.requestId);
+    this.options.publishEphemeralProjectionChange(this.binding);
+    const result = this.extensionUiResponseTail.then(() =>
+      this.respondToExtensionUiRequestOnce(request, response),
+    );
+    this.extensionUiResponseTail = result.then(() => undefined, () => undefined);
+    const record = Object.freeze({
+      requestDigest: request.requestDigest,
+      responseDigest,
+      result,
+    });
+    this.extensionUiResponseAttempts.set(request.requestId, record);
+    void result.then(
+      () => {
+        if (this.extensionUiResponseAttempts.get(request.requestId) === record) {
+          this.extensionUiResponseAttempts.delete(request.requestId);
+        }
+      },
+      () => {
+        if (this.extensionUiResponseAttempts.get(request.requestId) === record) {
+          this.extensionUiResponseAttempts.delete(request.requestId);
+        }
+      },
+    );
+    return result;
   }
 
   selectModel(
@@ -2038,8 +2582,9 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       return existing.result;
     }
 
+    const terminalEventBaseline = this.promptTerminalEventBaselines.get(request.dispatchAttemptId);
     const result = this.enqueueResidentIdleReconciliation(() =>
-      this.reconcileAcknowledgedPromptIdleOnce(request),
+      this.reconcileAcknowledgedPromptIdleOnce(request, terminalEventBaseline),
     );
     const record = Object.freeze({ request, result });
     this.promptIdleReconciliationRecord = record;
@@ -2102,6 +2647,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.locallyClosed = true;
     this.projectionRefreshRequested = false;
     this.unsubscribeUpstream();
+    this.clearExtensionUiRequests();
     closeDaemonClientQuietly(this.options.client);
     this.cancelResidentIdleReconciliation();
     this.lifecycle.transition("closed", { binding: this.binding });
@@ -2247,6 +2793,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       if (!dispatchAttemptId) return;
       this.settledResidentDispatchAttemptIds.delete(dispatchAttemptId);
       if (!this.residentDispatchAttempts.delete(dispatchAttemptId)) continue;
+      this.promptTerminalEventBaselines.delete(dispatchAttemptId);
       this.retiredResidentDispatchFence.add(dispatchAttemptId);
     }
   }
@@ -2292,8 +2839,50 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     return result;
   }
 
+  private async respondToExtensionUiRequestOnce(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<void> {
+    if (
+      !this.isLive() ||
+      request.threadId !== this.binding.threadId ||
+      request.executionGenerationId !== this.binding.executionGenerationId ||
+      request.bindingFingerprint !== residentDispatchAuthorityFingerprint(this.binding)
+    ) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+        "The extension UI request is no longer owned by this exact live resident connection.",
+        { retryable: false, details: { requestId: request.requestId } },
+      );
+    }
+    const respond = this.options.attached.respondToExtensionUiRequest;
+    if (typeof respond !== "function") {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_MODULE_INVALID",
+        "The verified Prime Agent connection does not expose extension UI response admission.",
+      );
+    }
+    const upstreamResponse = extensionUiResponseForUpstream(request.method, response);
+    let invocation: Promise<void>;
+    try {
+      invocation = respond.call(this.options.attached, request.requestId, upstreamResponse);
+    } catch (error) {
+      throw unknownExtensionUiResponseOutcome(request.requestId, error);
+    }
+    try {
+      await awaitResidentMutationInvocation(
+        invocation,
+        this.options.requestTimeoutMs,
+        "extension UI response",
+      );
+    } catch (error) {
+      throw unknownExtensionUiResponseOutcome(request.requestId, error);
+    }
+  }
+
   private async reconcileAcknowledgedPromptIdleOnce(
     request: ResidentPromptIdleReconciliationRequest,
+    terminalEventBaseline: number | undefined,
   ): Promise<ResidentPromptIdleAuthorityEvidence> {
     const expectedBinding = this.assertPromptIdleReconciliationAuthority(request);
     const waitForIdle = this.options.attached.waitForIdle;
@@ -2307,8 +2896,23 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     const cancellation = createResidentIdleReconciliationCancellation();
     this.residentIdleReconciliationCancellation = cancellation;
     try {
+      if (terminalEventBaseline !== undefined) {
+        return await this.reconcilePromptFromTerminalEvent(
+          request,
+          expectedBinding,
+          terminalEventBaseline,
+          cancellation,
+        );
+      }
+      // Recovery is reserved for a process that did not observe this prompt's
+      // admission. Bound the wrapper so a daemon's 24-hour public timeout can
+      // never become the host reconciliation deadline.
       await Promise.race([
-        waitForIdle.call(this.options.attached),
+        awaitResidentMutationInvocation(
+          waitForIdle.call(this.options.attached),
+          this.options.requestTimeoutMs,
+          "prompt idle recovery",
+        ),
         cancellation.promise,
       ]);
     } catch (error) {
@@ -2335,7 +2939,8 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     await this.drainResidentEventAndProjectionWork();
     this.assertPromptIdleReconciliationAuthority(request);
 
-    const projection = await readStableResidentProjection(this.options.attached, expectedBinding);
+    const stableProjection = await readStableResidentProjection(this.options.attached, expectedBinding);
+    const projection = stableProjection ? this.overlayObservedChildAgents(stableProjection) : undefined;
     if (!projection) {
       throw new ResidentRuntimeContractError(
         "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
@@ -2364,6 +2969,59 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       binding: expectedBinding,
       projection,
     });
+  }
+
+  private async reconcilePromptFromTerminalEvent(
+    request: ResidentPromptIdleReconciliationRequest,
+    expectedBinding: ResidentSessionBinding,
+    terminalEventBaseline: number,
+    cancellation: ResidentIdleReconciliationCancellation,
+  ): Promise<ResidentPromptIdleAuthorityEvidence> {
+    let observedOrdinal = terminalEventBaseline;
+    for (
+      let attempt = 0;
+      attempt < MAX_TERMINAL_EVENT_PROJECTION_ATTEMPTS;
+      attempt += 1
+    ) {
+      this.assertPromptIdleReconciliationAuthority(request);
+      const terminal = this.latestTerminalAssistantEvent;
+      if (terminal && terminal.ordinal > terminalEventBaseline) {
+        const stableProjection = await readStableResidentProjection(this.options.attached, expectedBinding);
+        const projection = stableProjection ? this.overlayObservedChildAgents(stableProjection) : undefined;
+        if (
+          projection &&
+          residentProjectionCursorAdvances(
+            request.settlementCursor,
+            projection.cursor,
+            this.retiredAuthoritativeCursorGenerations,
+          ) &&
+          projection.terminalAssistant &&
+          isDeepStrictEqual(projection.terminalAssistant, terminal.marker) &&
+          residentProjectionProvesIdle(projection)
+        ) {
+          await publishProjection(this.options.publishProjection, expectedBinding, projection);
+          this.assertPromptIdleReconciliationAuthority(request);
+          this.acceptAuthoritativeProjection(projection);
+          return Object.freeze({
+            evidenceVersion: 1,
+            dispatchAttemptId: request.dispatchAttemptId,
+            binding: expectedBinding,
+            projection,
+            terminalAssistant: Object.freeze({
+              blockId: requireTerminalAssistantBlockId(projection, request.dispatchAttemptId),
+              stopReason: projection.terminalAssistant.stopReason,
+            }),
+          });
+        }
+      }
+      observedOrdinal = this.upstreamEventOrdinal;
+      await this.waitForUpstreamEventOrBackoffAfter(observedOrdinal, cancellation);
+    }
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+      "Prime Agent's terminal event did not converge to a stable authoritative idle projection.",
+      { retryable: true, details: { dispatchAttemptId: request.dispatchAttemptId } },
+    );
   }
 
   private assertPromptIdleReconciliationAuthority(
@@ -2403,7 +3061,11 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.residentIdleReconciliationCancellation = cancellation;
     try {
       await Promise.race([
-        waitForIdle.call(this.options.attached),
+        awaitResidentMutationInvocation(
+          waitForIdle.call(this.options.attached),
+          this.options.requestTimeoutMs,
+          "Stop idle recovery",
+        ),
         cancellation.promise,
       ]);
     } catch (error) {
@@ -2489,6 +3151,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       } finally {
         this.readAuthorityDisposed = true;
         this.unsubscribeUpstream();
+        this.clearExtensionUiRequests();
       }
     }
     // A hostile or buggy public waitForIdle Promise may ignore client close.
@@ -2536,14 +3199,19 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.projectionRefreshRequested = false;
     const expectedBinding = this.binding;
     if (!this.isLive()) return;
-    const projection = await readStableResidentProjection(this.options.attached, expectedBinding);
-    if (!projection) {
+    const observation = await readStableOrLatestActiveResidentProjection(
+      this.options.attached,
+      expectedBinding,
+      this.authoritativeProjectionValue,
+    );
+    if (!observation) {
       // A continuously advancing cursor is normal while a model streams. Do
       // not publish a torn multi-RPC projection and do not fail the resident
       // connection; retain one dirty bit and retry after the bounded backoff.
       this.projectionRefreshRequested = true;
       return;
     }
+    const projection = observation.projection;
     if (
       this.locallyClosed ||
       this.terminalAction ||
@@ -2552,8 +3220,18 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     ) {
       return;
     }
-    await publishProjection(this.options.publishProjection, expectedBinding, projection);
-    this.acceptAuthoritativeProjection(projection);
+    const liveProjection = this.overlayObservedChildAgents(projection);
+    const current = this.authoritativeProjectionValue;
+    if (!observation.stable && current && !residentProjectionCursorAdvances(
+      current.cursor,
+      liveProjection.cursor,
+      this.retiredAuthoritativeCursorGenerations,
+    )) {
+      if (!isDeepStrictEqual(current, liveProjection)) this.projectionRefreshRequested = true;
+      return;
+    }
+    await publishProjection(this.options.publishProjection, expectedBinding, liveProjection);
+    this.acceptAuthoritativeProjection(liveProjection);
   }
 
   private async drainProjectionRefresh(): Promise<void> {
@@ -2654,6 +3332,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
       this.promptAdmissionTail,
       this.abortTail,
       this.modelMutationTail,
+      this.extensionUiResponseTail,
     ]).then(operation).then(
       () => {
         if (this.locallyClosed) return;
@@ -2722,6 +3401,10 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     admission.baselineCursor = copyResidentProjectionCursor(
       this.authoritativeProjectionValue?.cursor,
     );
+    // Capture before the one and only invocation so an immediately completed
+    // provider turn remains eligible even if Store schedules reconciliation
+    // after its terminal event has already crossed this subscription.
+    this.promptTerminalEventBaselines.set(lease.dispatchAttemptId, this.upstreamEventOrdinal);
     let invocation: Promise<void>;
     try {
       invocation = prompt.call(
@@ -2969,9 +3652,28 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
   private async handleUpstreamEvent(event: unknown): Promise<void> {
     if (this.locallyClosed || this.terminalAction) return;
     if (!isRecord(event) || typeof event.type !== "string") throw invalidResponse("connection event");
+    this.upstreamEventOrdinal += 1;
+    if (event.type === "extension_ui_request") {
+      this.acceptExtensionUiRequest(event.request);
+      return;
+    }
+    if (event.type === "session_event") {
+      const marker = residentTerminalAssistantMarkerFromSessionEvent(event.event);
+      if (marker) {
+        this.latestTerminalAssistantEvent = Object.freeze({
+          ordinal: this.upstreamEventOrdinal,
+          marker,
+        });
+      }
+      const child = residentChildAgentSummaryFromSessionEvent(event.event);
+      if (child) this.rememberObservedChildAgent(child);
+    }
+    for (const resolve of this.upstreamEventWaiters) resolve();
+    this.upstreamEventWaiters.clear();
     switch (event.type) {
       case "connection_status": {
         if (event.status === "reconnecting") {
+          this.clearExtensionUiRequests();
           this.resyncValidated = false;
           this.lifecycle.transition("reconnecting", { binding: this.binding });
           return;
@@ -2998,11 +3700,21 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
           expectedExecutablePath: this.options.expectedExecutablePath,
           expectedEntrypointPath: this.options.expectedEntrypointPath,
         });
-        const projection = normalizeProjection(event.snapshot, this.binding);
-        await publishProjection(this.options.publishProjection, this.binding, projection);
+        // Keep reconnection authority on the established event fence: the
+        // resource inventory was already validated for this exact connection
+        // and is refreshed by the normal authoritative projection reader.
+        // Adding another upstream await here would leave the connection on its
+        // old binding after a public idle barrier has already completed.
+        const projection = carryForwardResourceInventory(
+          normalizeProjection(event.snapshot, this.binding),
+          this.authoritativeProjectionValue,
+        );
+        for (const child of projection.childAgents) this.rememberObservedChildAgent(child);
+        const resyncedProjection = this.overlayObservedChildAgents(projection);
+        await publishProjection(this.options.publishProjection, this.binding, resyncedProjection);
         await this.refreshRuntimeBinding(compatibility);
         this.resyncValidated = true;
-        this.acceptAuthoritativeProjection(projection);
+        this.acceptAuthoritativeProjection(resyncedProjection);
         return;
       }
       case "session_replaced":
@@ -3029,6 +3741,132 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     }
   }
 
+  private acceptExtensionUiRequest(value: unknown): void {
+    const request = normalizeExtensionUiRequest(
+      value,
+      this.binding,
+      this.options.hostId,
+      this.options.now(),
+    );
+    if (!request) return;
+    const existing = this.extensionUiRequests.get(request.requestId);
+    if (existing) {
+      if (
+        existing.requestDigest !== request.requestDigest ||
+        existing.method !== request.method ||
+        existing.hostId !== request.hostId ||
+        existing.threadId !== request.threadId ||
+        existing.executionGenerationId !== request.executionGenerationId ||
+        existing.bindingFingerprint !== request.bindingFingerprint
+      ) {
+        throw invalidResponse("extension UI request identity");
+      }
+      return;
+    }
+    const retired = this.retiredExtensionUiRequests.get(request.requestId);
+    if (retired) {
+      if (retired.requestDigest === request.requestDigest && retired.method === request.method) return;
+      throw invalidResponse("retired extension UI request identity");
+    }
+    if (this.extensionUiRequests.size >= 16) {
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_RESPONSE_INVALID",
+        "Prime Agent exceeded the bounded extension UI request limit.",
+      );
+    }
+    this.extensionUiRequests.set(request.requestId, request);
+    this.scheduleExtensionUiExpiry(request);
+    this.options.publishEphemeralProjectionChange(this.binding);
+  }
+
+  private scheduleExtensionUiExpiry(request: ResidentExtensionUiRequest): void {
+    if (request.timeoutMs === undefined) return;
+    const remaining = Math.max(0, Date.parse(request.receivedAt) + request.timeoutMs - this.options.now().getTime());
+    const timer = setTimeout(() => {
+      if (this.extensionUiExpiryTimers.get(request.requestId) !== timer) return;
+      this.extensionUiExpiryTimers.delete(request.requestId);
+      if (!isDeepStrictEqual(this.extensionUiRequests.get(request.requestId), request)) return;
+      this.extensionUiRequests.delete(request.requestId);
+      this.retireExtensionUiRequest(request);
+      this.options.publishEphemeralProjectionChange(this.binding);
+    }, remaining);
+    timer.unref?.();
+    this.extensionUiExpiryTimers.set(request.requestId, timer);
+  }
+
+  private clearExtensionUiExpiryTimer(requestId: string): void {
+    const timer = this.extensionUiExpiryTimers.get(requestId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.extensionUiExpiryTimers.delete(requestId);
+  }
+
+  private clearExtensionUiRequests(): void {
+    const hadRequests = this.extensionUiRequests.size > 0;
+    for (const timer of this.extensionUiExpiryTimers.values()) clearTimeout(timer);
+    this.extensionUiExpiryTimers.clear();
+    for (const request of this.extensionUiRequests.values()) this.retireExtensionUiRequest(request);
+    this.extensionUiRequests.clear();
+    if (hadRequests) this.options.publishEphemeralProjectionChange(this.binding);
+  }
+
+  private retireExtensionUiRequest(request: ResidentExtensionUiRequest): void {
+    this.retiredExtensionUiRequests.set(request.requestId, Object.freeze({
+      requestDigest: request.requestDigest,
+      method: request.method,
+    }));
+    if (this.retiredExtensionUiRequests.size <= 256) return;
+    const oldest = this.retiredExtensionUiRequests.keys().next().value as string | undefined;
+    if (oldest) this.retiredExtensionUiRequests.delete(oldest);
+  }
+
+  private async waitForUpstreamEventOrBackoffAfter(
+    ordinal: number,
+    cancellation: ResidentIdleReconciliationCancellation,
+  ): Promise<void> {
+    if (this.upstreamEventOrdinal > ordinal) return Promise.resolve();
+    let resolveEvent!: () => void;
+    const event = new Promise<void>((resolve) => {
+      resolveEvent = resolve;
+      this.upstreamEventWaiters.add(resolve);
+    });
+    try {
+      await Promise.race([
+        event,
+        cancellation.promise,
+        this.options.wait(TERMINAL_EVENT_PROJECTION_BACKOFF_MS),
+      ]);
+    } finally {
+      this.upstreamEventWaiters.delete(resolveEvent);
+    }
+  }
+
+  private overlayObservedChildAgents(
+    projection: ResidentProjectionSnapshot,
+  ): ResidentProjectionSnapshot {
+    for (const child of projection.childAgents) this.rememberObservedChildAgent(child);
+    if (this.observedChildAgents.size === 0) return projection;
+    const children = new Map(this.observedChildAgents);
+    // A fresh exact snapshot is authoritative for duplicate identities. The
+    // retained event cache fills only children omitted by that snapshot.
+    for (const child of projection.childAgents) children.set(child.agentId, child);
+    const boundedChildren = [...children.values()].slice(-MAX_RESIDENT_PROJECTION_CHILDREN);
+    return Object.freeze({ ...projection, childAgents: Object.freeze(boundedChildren) });
+  }
+
+  private rememberObservedChildAgent(
+    child: ResidentProjectionSnapshot["childAgents"][number],
+  ): void {
+    if (
+      !this.observedChildAgents.has(child.agentId) &&
+      this.observedChildAgents.size >= MAX_RESIDENT_PROJECTION_CHILDREN
+    ) {
+      const oldestAgentId = this.observedChildAgents.keys().next().value as string | undefined;
+      if (oldestAgentId) this.observedChildAgents.delete(oldestAgentId);
+    }
+    this.observedChildAgents.set(child.agentId, child);
+  }
+
   private async refreshRuntimeBinding(compatibility: ResidentRuntimeCompatibility): Promise<void> {
     if (sameRuntimeCompatibility(this.binding.runtime, compatibility)) return;
     const refreshed = freezeBinding({ ...this.binding, runtime: compatibility });
@@ -3048,6 +3886,7 @@ class ManagedResidentRuntimeConnection implements ResidentRuntimeConnection {
     this.locallyClosed = true;
     this.projectionRefreshRequested = false;
     this.unsubscribeUpstream();
+    this.clearExtensionUiRequests();
     this.options.client.close();
     this.cancelResidentIdleReconciliation();
     this.lifecycle.transition("failed", { binding: this.binding, error: normalized.toJSON() });
@@ -3152,6 +3991,24 @@ function residentProjectionProvesIdle(projection: ResidentProjectionSnapshot): b
   );
 }
 
+function requireTerminalAssistantBlockId(
+  projection: ResidentProjectionSnapshot,
+  dispatchAttemptId: string,
+): string {
+  const blockId = projection.terminalAssistantBlockId;
+  if (
+    !blockId ||
+    !projection.transcript.some((block) => block.blockId === blockId && block.kind === "assistant")
+  ) {
+    throw new ResidentRuntimeContractError(
+      "PRIME_RUNTIME_PROMPT_IDLE_NOT_OBSERVED",
+      "Prime Agent's terminal event did not materialize an exact assistant block.",
+      { retryable: true, details: { dispatchAttemptId } },
+    );
+  }
+  return blockId;
+}
+
 function promptAdmissionStatusError(status: "cancelled" | "unsupported"): Error {
   return Object.assign(new Error(`Prime Agent prompt admission ${status}.`), { status });
 }
@@ -3182,6 +4039,115 @@ function unknownResidentMutationOutcome(
       details: { operation, dispatchAttemptId, outcome: "unknown" },
       cause,
     },
+  );
+}
+
+function unknownExtensionUiResponseOutcome(
+  requestId: string,
+  cause: unknown,
+): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    "Prime Agent may have accepted the extension UI response, but no definitive acknowledgement was received.",
+    {
+      retryable: false,
+      details: { operation: "extension_ui_response", requestId, outcome: "unknown" },
+      cause,
+    },
+  );
+}
+
+function extensionUiResponseForUpstream(
+  method: ResidentExtensionUiRequest["method"],
+  response: ExtensionUiDialogResponse,
+): Readonly<{ cancelled: true } | { value: string } | { confirmed: boolean }> {
+  if (response.kind === "cancelled") return Object.freeze({ cancelled: true as const });
+  if (method === "confirm" && response.kind === "confirmed") {
+    return Object.freeze({ confirmed: response.confirmed });
+  }
+  if (method !== "confirm" && response.kind === "value") {
+    return Object.freeze({ value: response.value });
+  }
+  throw new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_DISPATCH_LEASE_INVALID",
+    "The extension UI response does not match its exact dialog method.",
+    { retryable: false },
+  );
+}
+
+function normalizeExtensionUiRequest(
+  value: unknown,
+  binding: ResidentSessionBinding,
+  hostId: string,
+  receivedAt: Date,
+): ResidentExtensionUiRequest | undefined {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.method !== "string") {
+    throw invalidResponse("extension UI request");
+  }
+  if (!['select', 'confirm', 'input', 'editor'].includes(value.method)) return undefined;
+  if (!isRecord(value.payload)) throw invalidResponse("extension UI request payload");
+  const title = value.payload.title;
+  if (typeof title !== "string") throw invalidResponse("extension UI request title");
+  const timeoutMs = value.payload.timeout;
+  const common = {
+    interactionVersion: 1 as const,
+    hostId,
+    threadId: binding.threadId,
+    executionGenerationId: binding.executionGenerationId,
+    bindingFingerprint: residentDispatchAuthorityFingerprint(binding),
+    requestId: value.id,
+    receivedAt: receivedAt.toISOString(),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  };
+  let candidate: Record<string, unknown>;
+  switch (value.method) {
+    case "select":
+      candidate = { ...common, method: "select", title, options: value.payload.options as string[] };
+      break;
+    case "confirm":
+      candidate = { ...common, method: "confirm", title, message: value.payload.message as string };
+      break;
+    case "input":
+      candidate = {
+        ...common,
+        method: "input",
+        title,
+        ...(value.payload.placeholder === undefined ? {} : { placeholder: value.payload.placeholder as string }),
+      };
+      break;
+    case "editor":
+      candidate = {
+        ...common,
+        method: "editor",
+        title,
+        ...(value.payload.prefill === undefined ? {} : { prefill: value.payload.prefill as string }),
+      };
+      break;
+    default:
+      return undefined;
+  }
+  const requestDigest = normalizedJsonDigest({
+    activeSessionId: binding.activeSessionId,
+    requestId: value.id,
+    method: value.method,
+    payload: value.payload,
+  });
+  const parsed = ResidentExtensionUiRequestSchema.safeParse({ ...candidate, requestDigest });
+  if (!parsed.success) throw invalidResponse("extension UI request", parsed.error.issues[0]?.message);
+  return Object.freeze(parsed.data);
+}
+
+function normalizedJsonDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(sortExtensionUiJson(value))).digest("hex");
+}
+
+function sortExtensionUiJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortExtensionUiJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => [key, sortExtensionUiJson((value as Record<string, unknown>)[key])]),
   );
 }
 
@@ -3556,22 +4522,89 @@ async function readStableResidentProjection(
   connection: PrimeDaemonAgentConnectionPublic,
   binding: ResidentSessionBinding,
 ): Promise<ResidentProjectionSnapshot | undefined> {
-  let previous: ResidentProjectionSnapshot | undefined;
-  for (let read = 0; read < MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS; read += 1) {
-    const snapshot = await connection.getInitialSnapshot();
-    const projection = normalizeProjection(snapshot, binding);
-    if (previous && isDeepStrictEqual(previous, projection)) return projection;
-    previous = projection;
+  return readResidentProjectionSeries(connection, binding, false);
+}
+
+/**
+ * Ordinary supervision may conservatively publish the latest bounded active
+ * observation when a streaming cursor never yields a quiet pair. It must
+ * never use an unstable observation to claim idle or complete a mutation.
+ */
+async function readStableOrLatestActiveResidentProjection(
+  connection: PrimeDaemonAgentConnectionPublic,
+  binding: ResidentSessionBinding,
+  previousProjection?: ResidentProjectionSnapshot,
+): Promise<Readonly<{ projection: ResidentProjectionSnapshot; stable: boolean }> | undefined> {
+  const observations = await readResidentProjectionSeriesWithStability(
+    connection,
+    binding,
+    previousProjection,
+  );
+  if (!observations) return undefined;
+  if (observations.stable || residentProjectionProvesActiveOwnership(observations.projection)) {
+    return observations;
   }
   return undefined;
+}
+
+async function readResidentProjectionSeries(
+  connection: PrimeDaemonAgentConnectionPublic,
+  binding: ResidentSessionBinding,
+  allowLatestActive: boolean,
+): Promise<ResidentProjectionSnapshot | undefined> {
+  const observations = await readResidentProjectionSeriesWithStability(connection, binding);
+  if (!observations) return undefined;
+  return observations.stable || (allowLatestActive && residentProjectionProvesActiveOwnership(observations.projection))
+    ? observations.projection
+    : undefined;
+}
+
+async function readResidentProjectionSeriesWithStability(
+  connection: PrimeDaemonAgentConnectionPublic,
+  binding: ResidentSessionBinding,
+  previousProjection?: ResidentProjectionSnapshot,
+): Promise<Readonly<{ projection: ResidentProjectionSnapshot; stable: boolean }> | undefined> {
+  let previous: ResidentProjectionSnapshot | undefined;
+  let latestSnapshot: unknown;
+  let stable = false;
+  for (let read = 0; read < MAX_AUTHORITATIVE_RESIDENT_SNAPSHOT_READS; read += 1) {
+    latestSnapshot = await connection.getInitialSnapshot();
+    const projection = carryForwardResourceInventory(
+      normalizeProjection(latestSnapshot, binding),
+      previousProjection,
+    );
+    if (previous && isDeepStrictEqual(previous, projection)) {
+      previous = projection;
+      stable = true;
+      break;
+    }
+    previous = projection;
+  }
+  if (!previous || latestSnapshot === undefined) return undefined;
+
+  // Skills, prompts, and extensions are attachment-scoped but can be costly to
+  // enumerate. A live active observation carries the already validated
+  // inventory so streaming and RLM child events are not held behind discovery.
+  // Stable (quiet) observations still refresh it once, preserving eventual
+  // resource accuracy without repeating the read for every cursor sample.
+  if (
+    previousProjection?.runtime.resourceInventory &&
+    residentProjectionProvesActiveOwnership(previous)
+  ) {
+    return Object.freeze({ projection: previous, stable });
+  }
+  const resources = await connection.getResourceSnapshot();
+  const projection = normalizeProjection(latestSnapshot, binding, resources);
+  return Object.freeze({ projection, stable });
 }
 
 function normalizeProjection(
   snapshot: unknown,
   binding: ResidentSessionBinding,
+  resources?: unknown,
 ): ResidentProjectionSnapshot {
   try {
-    return normalizeResidentProjectionSnapshot(snapshot, binding);
+    return normalizeResidentProjectionSnapshot(snapshot, binding, resources);
   } catch (error) {
     if (error instanceof ResidentProjectionError) {
       throw new ResidentRuntimeContractError(
@@ -3582,6 +4615,18 @@ function normalizeProjection(
     }
     throw error;
   }
+}
+
+function carryForwardResourceInventory(
+  projection: ResidentProjectionSnapshot,
+  previous: ResidentProjectionSnapshot | undefined,
+): ResidentProjectionSnapshot {
+  const resourceInventory = previous?.runtime.resourceInventory;
+  if (!resourceInventory) return projection;
+  return Object.freeze({
+    ...projection,
+    runtime: Object.freeze({ ...projection.runtime, resourceInventory }),
+  });
 }
 
 function sanitizeAvailableModels(value: unknown): readonly SanitizedResidentModelIdentity[] {
@@ -3661,7 +4706,12 @@ async function readStableModelSelectionProjection(
       }
       continue;
     }
-    const projection = normalizeProjection(round.snapshot, binding);
+    const resources = await beforeModelSelectionDeadline(
+      deadline,
+      () => connection.getResourceSnapshot(),
+      "model selection resource inventory",
+    );
+    const projection = normalizeProjection(round.snapshot, binding, resources);
     if (
       round.selected &&
       previous &&
@@ -4148,6 +5198,30 @@ function invalidResponse(command: string, issue?: string): ResidentRuntimeContra
     "PRIME_RUNTIME_RESPONSE_INVALID",
     `Prime Agent returned an invalid ${command} response.`,
     { details: { command, ...(issue ? { issue: issue.slice(0, 1_024) } : {}) } },
+  );
+}
+
+function incompatibleDaemonRetirementFailure(
+  opened: IncompatibleOpenClient,
+  reason: string,
+  message: string,
+  cause?: unknown,
+  details: Readonly<Record<string, string | number | boolean>> = {},
+): ResidentRuntimeContractError {
+  return new ResidentRuntimeContractError(
+    "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    message,
+    {
+      retryable: true,
+      details: {
+        reason,
+        incompatibility: opened.incompatibility.code,
+        supervisorGeneration: opened.retirementTarget.supervisorGeneration,
+        ...details,
+        ...(cause === undefined ? {} : { cause: errorMessage(cause) }),
+      },
+      ...(cause === undefined ? {} : { cause }),
+    },
   );
 }
 

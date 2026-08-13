@@ -90,14 +90,14 @@ export function nodeRuntimeStatus(version = process.versions.node): ProbeToolSta
     return { available: false, status: "error", diagnostic: "The host Node.js version is invalid." };
   }
   const [major = 0, minor = 0] = version.split(".").map((part) => Number.parseInt(part, 10));
-  const supported = major > 22 || (major === 22 && minor >= 8);
+  const supported = major > 22 || (major === 22 && minor >= 12);
   return supported
     ? { available: true, status: "ready", version: `Node.js ${version}` }
     : {
         available: false,
         status: "error",
         version: `Node.js ${version}`,
-        diagnostic: "Prime Agent 0.7.1 requires Node.js 22.8 or newer.",
+        diagnostic: "Prime Continuim's hardened Prime Agent 0.7.2 runtime requires Node.js 22.12 or newer.",
       };
 }
 

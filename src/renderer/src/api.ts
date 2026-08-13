@@ -1,24 +1,6 @@
 import {
-  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
-  CandidateEvaluationPreflightSchema,
-  CandidateEvaluationSnapshotSchema,
-  CandidateEvaluationStatusSchema,
-  InProgressStreamSchema,
-  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
-  PRIME_AGENT_COMMAND_CAPABILITY,
-  RESIDENT_LIFECYCLE_CAPABILITY,
-  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
-  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
-  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
-  RUNTIME_MODEL_CATALOG_CAPABILITY,
-  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
-  RUNTIME_OAUTH_CAPABILITY,
-  ResidentLifecycleLookupResultSchema,
-  ResidentLifecycleStatusSchema,
-  ResidentLifecycleDispositionSchema,
-  RuntimeIntegritySnapshotSchema,
-  RuntimeModelCatalogSnapshotSchema,
-  THREAD_HANDOFF_CAPABILITY,
+  type ExtensionUiDialogResponse,
+  type ResidentExtensionUiRequest,
   type ResidentLifecycleStatus,
   type CandidateEvaluationPreflight,
   type CandidateEvaluationPreflightRequest,
@@ -28,8 +10,34 @@ import {
   type CandidateEvaluationStatus,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
+  type RuntimeResourceInventory,
+  type ResidentBrowserExecution,
 } from '../../shared/protocol'
+import {
+  CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
+  PRIME_AGENT_COMMAND_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
+  RESIDENT_LIFECYCLE_CAPABILITY,
+  RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
+  RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
+  RUNTIME_INTEGRITY_RETRY_CAPABILITY,
+  RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
+  RUNTIME_OAUTH_CAPABILITY,
+  THREAD_HANDOFF_CAPABILITY,
+} from '../../shared/capabilities'
+import {
+  parseInProgressStream,
+  parseResidentExtensionUiRequest,
+  parseResidentBrowserExecution,
+  parseResidentLifecycleDisposition,
+  parseResidentLifecycleLookupResult,
+  parseResidentLifecycleStatus,
+  parseRuntimeResourceInventory,
+} from './protocol-guards'
 import type { HudMode, HudState, HudTarget } from '../../shared/window-control'
+import { sanitizeResidentDisplayText } from '../../shared/resident-display'
 
 export type ConnectionState = 'online' | 'reconnecting' | 'offline'
 export type RuntimeModelCatalog = RuntimeModelCatalogSnapshot
@@ -42,6 +50,19 @@ export type ComposerReceiptState =
   | 'waiting_for_connection'
   | 'uncertain'
   | 'rejected'
+
+const RESIDENT_LIFECYCLE_WARMUP_GRACE_MS = 15_000
+
+// Mutation-only validators stay behind the action boundary. Startup uses the
+// small path-free guards above and does not fetch OAuth, hashing, or candidate
+// evaluation schemas before the user asks for those capabilities.
+const loadProtocolSchemas = () => import('../../shared/protocol')
+
+function requireResidentLifecycleStatus(value: unknown): ResidentLifecycleStatus {
+  const parsed = parseResidentLifecycleStatus(value)
+  if (!parsed.success) throw new Error('The native service returned an invalid resident lifecycle status.')
+  return parsed.data
+}
 
 export type HostRuntimeReadiness =
   | {
@@ -163,13 +184,17 @@ export interface ChangeSummary {
 export interface AgentSummary {
   id: string
   name: string
+  sessionName?: string
   role: string
   status: 'pending' | 'queued' | 'running' | 'waiting' | 'complete' | 'failed' | 'cancelled'
   hostName: string
   parentId?: string
+  activeSessionId?: string
   model?: string
   activity?: string
   durationMs?: number
+  answerPreview?: string
+  repliedSinceTask?: boolean
   toolUseCount?: number
   tokenCount?: number
   recap?: string
@@ -215,6 +240,8 @@ export interface RuntimeSessionSummary {
   messageCount: number
   compactionCount: number
   activeToolNames: string[]
+  /** Path-free resources discovered by this exact resident Prime Agent session. */
+  resourceInventory?: RuntimeResourceInventory
   context?: {
     usedTokens: number
     maxTokens?: number
@@ -223,6 +250,10 @@ export interface RuntimeSessionSummary {
 
 export interface RuntimeSummary {
   session?: RuntimeSessionSummary
+  /** Exact-generation resident command readiness. Undefined means the projection was absent or foreign. */
+  residentControlReadiness?: 'ready' | 'unavailable'
+  /** Exact-binding browser execution proof. Skill discovery alone never populates this field. */
+  browserExecution?: ResidentBrowserExecution
   /** True only when retained-agent data is reported, including an authoritative empty list. */
   agentsReported?: boolean
   /** Undefined means the selected host snapshot did not project this capability. */
@@ -244,6 +275,42 @@ export interface EvidenceSummary {
   duration?: string
 }
 
+export interface OutcomeCursorSummary {
+  threadId: string
+  executionGenerationId: string
+  generation: string
+  sequence: number
+}
+
+/** Exact host-owned completion evidence for the latest acknowledged resident turn. */
+export interface LatestTurnOutcomeSummary {
+  outcomeVersion: 1
+  commandId: string
+  receiptId: string
+  observedAt: string
+  observedCursor: OutcomeCursorSummary
+  terminalAssistant?: {
+    blockId: string
+    stopReason: 'stop' | 'length' | 'error' | 'aborted'
+  }
+}
+
+/** Freshness of the exact selected thread snapshot, never mutation authority. */
+export interface SnapshotAuthoritySummary {
+  source: 'live' | 'cached'
+  generatedAt: string
+  cursor: OutcomeCursorSummary
+}
+
+/** Aggregate Git facts only. The native snapshot does not disclose a file list. */
+export interface GitAggregateSummary {
+  stagedFiles: number
+  unstagedFiles: number
+  untrackedFiles: number
+  changedFileCount: number
+  knownDetail: false
+}
+
 export interface WorkbenchSnapshot {
   selectedProjectId: string
   selectedThreadId: string
@@ -255,10 +322,18 @@ export interface WorkbenchSnapshot {
   agents: AgentSummary[]
   evidence: EvidenceSummary[]
   runtime: RuntimeSummary
+  /** Exact latest acknowledged turn outcome when the host reported one. */
+  latestTurnOutcome?: LatestTurnOutcomeSummary
+  /** Exact snapshot lineage and whether it was freshly materialized from the connected host. */
+  snapshotAuthority?: SnapshotAuthoritySummary
+  /** Aggregate change counts from the selected snapshot; paths are never invented. */
+  gitSummary?: GitAggregateSummary
   /** Current local setup only; never contains a folder, socket, executable, or data-root path. */
   localSetup?: LocalSetupSummary
   /** Bounded, path-free desktop ledger for fresh resident lifecycle recovery. */
   residentLifecycleOperations: ResidentLifecycleOperationSummary[]
+  /** Exact live Prime Agent dialog requests for the selected resident attachment. */
+  residentExtensionUiRequests?: ResidentExtensionUiRequest[]
   operations: {
     submitCommands: boolean
     startResidentTurn?: boolean
@@ -415,6 +490,12 @@ export type ResidentWorkspaceSelection =
       referenceExecutionGenerationId: string
     })
 
+export interface ResidentWorkspacePreselection {
+  preselectionToken: string
+  suggestedName: string
+  expiresAt: string
+}
+
 export type ResidentWorkspaceSelectionInput =
   | { kind?: 'local_path'; resumeOperationId?: string }
   | {
@@ -497,6 +578,11 @@ export type ResidentModelSelectionResult =
   | { state: 'rejected'; message: string; retryable: boolean }
   | { state: 'uncertain'; message: string; retryable: false }
 
+export type ResidentExtensionUiResponseResult =
+  | { state: 'completed'; message: string }
+  | { state: 'rejected'; message: string; retryable: boolean }
+  | { state: 'uncertain'; message: string; retryable: false }
+
 export interface RuntimeOAuthRequest {
   hostId: string
   providerId: string
@@ -530,11 +616,18 @@ export interface RendererApi {
   activateComputer(expectedHostId: string): Promise<WorkbenchSnapshot>
   loadRuntimeModelCatalog(hostId: string): Promise<RuntimeModelCatalogSnapshot>
   selectResidentModel(request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult>
+  respondToResidentExtensionUi?(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<ResidentExtensionUiResponseResult>
   startRuntimeOAuth?(
     request: RuntimeOAuthRequest,
     onProgress: (progress: RuntimeOAuthProgress) => void,
   ): Promise<RuntimeOAuthResult>
   cancelRuntimeOAuth?(request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null>
+  preselectResidentWorkspace(): Promise<ResidentWorkspacePreselection>
+  completeResidentWorkspacePreselection(preselectionToken: string): Promise<ResidentWorkspaceSelection>
+  cancelResidentWorkspacePreselection(preselectionToken: string): Promise<void>
   selectResidentWorkspace(input?: ResidentWorkspaceSelectionInput): Promise<ResidentWorkspaceSelection>
   provisionResident(input: {
     selectionToken: string
@@ -628,1165 +721,6 @@ export function residentProvisionMayHaveDurableOperation(value: unknown): boolea
 type NativePrimeBridge = object
 
 const delay = (milliseconds: number) => new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds))
-const previewSimulation = (message: string) => `Preview simulation · ${message}`
-
-const seedTranscript: TranscriptBlock[] = [
-  {
-    id: 'block-1',
-    kind: 'checkpoint',
-    time: '9:42 AM',
-    body: previewSimulation('resumed from a visual-QA checkpoint; no host snapshot was read.'),
-    detail: previewSimulation('fixture transcript replaced in memory; no commands were replayed'),
-  },
-  {
-    id: 'block-2',
-    kind: 'user',
-    author: 'You',
-    time: '9:44 AM',
-    body: 'Implement the seamless remote workbench. Keep the thread durable across reconnects and make handoff semantics explicit.',
-  },
-  {
-    id: 'block-3',
-    kind: 'assistant',
-    author: 'Prime Agent',
-    time: '9:45 AM',
-    body: 'I’m aligning the renderer around one durable thread. The project, transcript, composer, approvals, and evidence stay in place while only the run location changes.',
-    detail: 'Working in the renderer and coordinating two child agents.',
-  },
-  {
-    id: 'block-4',
-    kind: 'tool',
-    author: 'Renderer checks',
-    time: '9:48 AM',
-    body: 'pnpm test -- renderer',
-    detail: previewSimulation('fixture passing receipt; no host check ran'),
-    receipt: 'preview_simulation_receipt',
-  },
-  {
-    id: 'block-5',
-    kind: 'assistant',
-    author: 'Prime Agent',
-    time: '9:49 AM',
-    body: 'The cached transcript is still available while the SSH path reconnects. I’ll reconcile this turn by command ID before sending anything again.',
-    detail: 'Connection state is separate from the running task.',
-  },
-]
-
-export const previewSnapshot: WorkbenchSnapshot = {
-  selectedProjectId: 'project-prime',
-  selectedThreadId: 'thread-seamless',
-  residentLifecycleOperations: [],
-  operations: {
-    submitCommands: true,
-    startResidentTurn: false,
-    stopResidentTurn: true,
-    crossHostHandoff: true,
-    modelCatalog: true,
-  },
-  hosts: [
-    {
-      id: 'host-local',
-      name: 'This computer',
-      kind: 'local',
-      connection: 'online',
-      connectionPath: 'Local socket',
-      latencyMs: 2,
-      compatibility: 'compatible',
-    },
-    {
-      id: 'host-devbox',
-      name: 'devbox',
-      kind: 'ssh',
-      connection: 'reconnecting',
-      connectionPath: 'SSH',
-      lastSynchronized: '12 s ago',
-      compatibility: 'compatible',
-    },
-    {
-      id: 'host-gpu',
-      name: 'GPU workstation',
-      kind: 'paired',
-      connection: 'offline',
-      connectionPath: 'Relay',
-      lastSynchronized: '18 min ago',
-      compatibility: 'update_available',
-    },
-  ],
-  projects: [
-    {
-      id: 'project-prime',
-      name: 'Prime Continuim',
-      repository: 'prime-agent-native',
-      hostIds: ['host-local', 'host-devbox'],
-      branch: 'feat/seamless-remote',
-      dirtyFiles: 6,
-    },
-    {
-      id: 'project-control',
-      name: 'Control plane',
-      repository: 'prime-control-plane',
-      hostIds: ['host-devbox'],
-      branch: 'main',
-      dirtyFiles: 0,
-    },
-    {
-      id: 'project-training',
-      name: 'Training runs',
-      repository: 'prime-training',
-      hostIds: ['host-gpu'],
-      branch: 'experiments/q3',
-      dirtyFiles: 2,
-    },
-  ],
-  threads: [
-    {
-      id: 'thread-seamless',
-      projectId: 'project-prime',
-      title: 'Seamless remote experience',
-      recap: 'Building the unified workbench and durable reconnect flow.',
-      hostId: 'host-devbox',
-      status: 'running',
-      updatedAt: 'Now',
-      unread: true,
-      transcript: seedTranscript,
-    },
-    {
-      id: 'thread-protocol',
-      projectId: 'project-prime',
-      title: 'Frame protocol boundaries',
-      recap: 'Backpressure and snapshot framing are ready for review.',
-      hostId: 'host-local',
-      status: 'needs_approval',
-      updatedAt: '8 min',
-      transcript: [
-        {
-          id: 'protocol-1',
-          kind: 'assistant',
-          author: 'Prime Agent',
-          time: '9:31 AM',
-          body: 'The bounded frame parser is ready. I need approval before running the interoperability harness against the local daemon.',
-          detail: 'Approval is required on This computer.',
-        },
-      ],
-    },
-    {
-      id: 'thread-gpu',
-      projectId: 'project-training',
-      title: 'Benchmark attention kernel',
-      recap: 'The host is offline; the most recent snapshot is still available.',
-      hostId: 'host-gpu',
-      status: 'running',
-      updatedAt: '18 min',
-      transcript: [
-        {
-          id: 'gpu-1',
-          kind: 'notice',
-          time: '9:14 AM',
-          body: 'The GPU workstation is offline. This cached transcript remains available.',
-          detail: 'The task may still be running on the host.',
-        },
-        {
-          id: 'gpu-2',
-          kind: 'assistant',
-          author: 'Prime Agent',
-          time: '9:12 AM',
-          body: 'The first benchmark batch completed with stable memory use. I started the larger context sweep before the relay path disconnected.',
-        },
-      ],
-    },
-    {
-      id: 'thread-complete',
-      projectId: 'project-prime',
-      title: 'Audit SSH discovery',
-      recap: 'Concrete aliases resolve through OpenSSH without reading keys.',
-      hostId: 'host-devbox',
-      status: 'complete',
-      updatedAt: 'Yesterday',
-      transcript: [
-        {
-          id: 'ssh-1',
-          kind: 'assistant',
-          author: 'Prime Agent',
-          time: 'Yesterday',
-          body: 'SSH discovery now preserves aliases as authority and delegates effective configuration to OpenSSH.',
-          detail: '12 aliases discovered · wildcard entries excluded',
-        },
-      ],
-    },
-  ],
-  attention: [
-    {
-      id: 'attention-1',
-      threadId: 'thread-protocol',
-      kind: 'approval',
-      title: 'Review interoperability command',
-      hostName: 'This computer',
-    },
-    {
-      id: 'attention-2',
-      threadId: 'thread-gpu',
-      kind: 'failed',
-      title: 'GPU workstation went offline',
-      hostName: 'GPU workstation',
-    },
-  ],
-  changes: [
-    { path: 'src/renderer/src/App.tsx', additions: 418, deletions: 0, status: 'added' },
-    { path: 'src/renderer/src/styles.css', additions: 532, deletions: 0, status: 'added' },
-    { path: 'src/renderer/src/api.ts', additions: 226, deletions: 0, status: 'added' },
-    { path: 'tests/renderer/App.test.tsx', additions: 94, deletions: 0, status: 'added' },
-  ],
-  agents: [
-    { id: 'agent-1', name: 'Workbench lead', role: 'Retained subagent', status: 'running', hostName: 'devbox' },
-    { id: 'agent-2', parentId: 'agent-1', name: 'Renderer', role: 'Interface implementation', status: 'running', hostName: 'This computer', toolUseCount: 18, tokenCount: 24_120 },
-    { id: 'agent-3', parentId: 'agent-1', name: 'Protocol', role: 'Snapshots and command journal', status: 'waiting', hostName: 'devbox', toolUseCount: 7, tokenCount: 11_804 },
-  ],
-  evidence: [
-    { id: 'evidence-1', label: 'Visual-QA renderer checks', detail: 'Internal fixture · passing', status: 'passed' },
-    { id: 'evidence-2', label: 'Visual-QA type check', detail: 'Internal fixture · passing', status: 'passed' },
-    { id: 'evidence-3', label: 'Visual-QA reconnect trace', detail: 'Internal fixture · awaiting path recovery', status: 'running' },
-  ],
-  runtime: {
-    agentsReported: true,
-    session: {
-      residency: 'resident',
-      appVersion: '0.18.4',
-      activeSessionId: 'session-seamless-remote',
-      sessionId: 'session-seamless-remote',
-      sessionName: 'Seamless remote experience',
-      model: 'GPT-5.6 Sol',
-      thinkingLevel: 'High',
-      isStreaming: true,
-      isCompacting: false,
-      isBashRunning: false,
-      retryAttempt: 0,
-      queuedActionCount: 2,
-      messageCount: seedTranscript.length,
-      compactionCount: 1,
-      activeToolNames: ['renderer'],
-      context: { usedTokens: 32_000, maxTokens: 200_000 },
-    },
-    queue: { pendingCount: 1, paused: false },
-    goals: [
-      {
-        id: 'goal-continuity',
-        objective: 'Implement the seamless remote workbench',
-        state: 'active',
-      },
-    ],
-    schedules: [
-      {
-        id: 'schedule-review',
-        label: 'Review overnight verification',
-        state: 'active',
-        nextRunAt: '2026-08-07T09:00:00.000Z',
-      },
-    ],
-  },
-  composerReceipt: { state: 'waiting_for_connection', message: previewSimulation('waiting for a fixture connection') },
-}
-
-export type PreviewVisualState =
-  | 'reconnecting'
-  | 'idle'
-  | 'model-selection'
-  | 'prime-oauth'
-  | 'prompt-admission'
-  | 'prompt-awaiting-idle-proof'
-  | 'stop-awaiting-idle-proof'
-  | 'nonretryable-uncertainty'
-  | 'resident-start'
-  | 'ssh-registered-workspace'
-  | 'resident-recovery'
-  | 'resident-end-review'
-  | 'resident-end-pending'
-  | 'candidate-evaluation-review'
-  | 'hud-expanded'
-  | 'hud-buddy'
-
-const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
-  'reconnecting',
-  'idle',
-  'model-selection',
-  'prime-oauth',
-  'prompt-admission',
-  'prompt-awaiting-idle-proof',
-  'stop-awaiting-idle-proof',
-  'nonretryable-uncertainty',
-  'resident-start',
-  'ssh-registered-workspace',
-  'resident-recovery',
-  'resident-end-review',
-  'resident-end-pending',
-  'candidate-evaluation-review',
-  'hud-expanded',
-  'hud-buddy',
-])
-
-function previewVisualStateFromSearch(search: string): PreviewVisualState {
-  const candidate = new URLSearchParams(search).get('visualState')
-  return candidate && PREVIEW_VISUAL_STATES.has(candidate as PreviewVisualState)
-    ? candidate as PreviewVisualState
-    : 'reconnecting'
-}
-
-function previewSnapshotForVisualState(visualState: PreviewVisualState): WorkbenchSnapshot {
-  const snapshot = structuredClone(previewSnapshot)
-  if (visualState === 'reconnecting') return snapshot
-
-  if (visualState === 'prime-oauth') {
-    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
-    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
-    if (!thread || !host || !snapshot.runtime.session) return snapshot
-    snapshot.selectedProjectId = thread.projectId
-    snapshot.selectedThreadId = thread.id
-    thread.remoteId = 'thread-prime-oauth-preview'
-    thread.workspaceId = 'workspace-prime-oauth-preview'
-    thread.executionGenerationId = 'execution-prime-oauth-preview'
-    thread.status = 'idle'
-    host.kind = 'local'
-    host.connection = 'online'
-    host.connectionPath = 'Local socket'
-    host.latencyMs = 2
-    delete host.lastSynchronized
-    snapshot.attention = []
-    snapshot.runtime.session = {
-      ...snapshot.runtime.session,
-      activeSessionId: 'session-prime-oauth-preview',
-      sessionId: 'session-prime-oauth-preview',
-      sessionName: thread.title,
-      isStreaming: false,
-      isBashRunning: false,
-      queuedActionCount: 0,
-    }
-    snapshot.runtime.queue = { pendingCount: 0, paused: false }
-    snapshot.operations = {
-      submitCommands: true,
-      startResidentTurn: true,
-      stopResidentTurn: false,
-      crossHostHandoff: false,
-      modelCatalog: true,
-      runtimeOAuth: true,
-    }
-    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
-    return snapshot
-  }
-
-  if (visualState === 'ssh-registered-workspace') {
-    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-seamless')
-    const project = snapshot.projects.find((candidate) => candidate.id === 'project-prime')
-    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-devbox')
-    if (!thread || !project || !host || !snapshot.runtime.session) return snapshot
-    snapshot.selectedProjectId = project.id
-    snapshot.selectedThreadId = thread.id
-    thread.remoteId = 'thread-seamless-remote'
-    thread.workspaceId = 'workspace-prime-devbox'
-    thread.executionGenerationId = 'execution-registered-workspace-preview'
-    thread.status = 'idle'
-    host.kind = 'ssh'
-    host.connection = 'online'
-    host.connectionPath = 'SSH'
-    host.latencyMs = 24
-    delete host.activationRequired
-    delete host.lastSynchronized
-    snapshot.attention = []
-    snapshot.runtime.session = {
-      ...snapshot.runtime.session,
-      residency: 'client_owned',
-      sessionName: thread.title,
-      isStreaming: false,
-      isCompacting: false,
-      isBashRunning: false,
-      queuedActionCount: 0,
-    }
-    delete snapshot.runtime.session.activeSessionId
-    delete snapshot.runtime.session.sessionId
-    snapshot.runtime.queue = { pendingCount: 0, paused: false }
-    snapshot.operations = {
-      submitCommands: true,
-      startResidentTurn: true,
-      stopResidentTurn: false,
-      crossHostHandoff: false,
-      provisionResident: true,
-      endResident: true,
-    }
-    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
-    return snapshot
-  }
-
-  if (visualState === 'resident-start' || visualState === 'resident-recovery') {
-    const host = snapshot.hosts[0]
-    if (host) {
-      host.kind = 'local'
-      host.connection = 'online'
-      host.connectionPath = 'Local socket'
-      host.latencyMs = 2
-      delete host.lastSynchronized
-    }
-    snapshot.selectedProjectId = ''
-    snapshot.selectedThreadId = ''
-    snapshot.projects = []
-    snapshot.threads = []
-    snapshot.attention = []
-    snapshot.runtime = {}
-    snapshot.operations = {
-      submitCommands: false,
-      startResidentTurn: false,
-      stopResidentTurn: false,
-      crossHostHandoff: false,
-      provisionResident: true,
-    }
-    if (visualState === 'resident-start') {
-      const runtimeReadiness: HostRuntimeReadiness = {
-        kind: 'reported',
-        freshness: 'live',
-        observedAt: '2026-08-07T12:00:00.000Z',
-        status: 'ready',
-        assurance: 'development-integrity',
-      }
-      snapshot.localSetup = { stage: 'choose_workspace', runtimeReadiness }
-      if (host) host.runtimeReadiness = runtimeReadiness
-    }
-    snapshot.composerReceipt = { state: 'idle', message: 'Ready to start a resident thread' }
-    snapshot.residentLifecycleOperations = visualState === 'resident-recovery'
-      ? [{
-          kind: 'provision',
-          operationId: 'resident-preview-recovery',
-          expectedHostId: host?.id ?? 'local-preview',
-          projectId: 'project-preview-recovery',
-          workspaceId: 'workspace-preview-recovery',
-          threadId: 'thread-preview-recovery',
-          executionGenerationId: 'execution-preview-recovery',
-          projectDisplayName: 'Continuim desktop',
-          threadTitle: 'Resident setup',
-          createdAt: '2026-08-07T12:00:00.000Z',
-          updatedAt: '2026-08-07T12:01:00.000Z',
-          state: 'requires_reselection',
-        }]
-      : []
-    return snapshot
-  }
-
-  if (visualState === 'resident-end-review' || visualState === 'resident-end-pending') {
-    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
-    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
-    if (!thread || !host || !snapshot.runtime.session) return snapshot
-    snapshot.selectedProjectId = thread.projectId
-    snapshot.selectedThreadId = thread.id
-    thread.status = 'idle'
-    thread.workspaceId = 'workspace-preview-end'
-    thread.executionGenerationId = 'execution-preview-end'
-    host.connection = 'online'
-    host.connectionPath = 'Local socket'
-    host.latencyMs = 2
-    delete host.lastSynchronized
-    snapshot.runtime.session = {
-      ...snapshot.runtime.session,
-      residency: 'resident',
-      activeSessionId: 'active-preview-end',
-      sessionId: 'session-preview-end',
-      sessionName: thread.title,
-      isStreaming: false,
-      isCompacting: false,
-      isBashRunning: false,
-      queuedActionCount: 0,
-    }
-    snapshot.runtime.queue = { pendingCount: 0, paused: false }
-    snapshot.operations = {
-      ...snapshot.operations,
-      submitCommands: visualState === 'resident-end-review',
-      startResidentTurn: visualState === 'resident-end-review',
-      stopResidentTurn: false,
-      provisionResident: true,
-      endResident: visualState === 'resident-end-review',
-    }
-    snapshot.residentLifecycleOperations = visualState === 'resident-end-pending'
-      ? [{
-          kind: 'end',
-          operationId: 'resident-preview-end',
-          expectedHostId: host.id,
-          projectId: thread.projectId,
-          workspaceId: thread.workspaceId,
-          threadId: thread.id,
-          executionGenerationId: thread.executionGenerationId,
-          sourceCursor: {
-            threadId: thread.id,
-            executionGenerationId: thread.executionGenerationId,
-            generation: 'daemon-preview-end',
-            sequence: 4,
-          },
-          createdAt: '2026-08-07T12:00:00.000Z',
-          updatedAt: '2026-08-07T12:00:01.000Z',
-          state: 'submitted',
-          lastStatus: {
-            version: 1,
-            kind: 'end',
-            operationId: 'resident-preview-end',
-            phase: 'ending',
-            expectedHostId: host.id,
-            projectId: thread.projectId,
-            workspaceId: thread.workspaceId,
-            threadId: thread.id,
-            executionGenerationId: thread.executionGenerationId,
-            preparedAt: '2026-08-07T12:00:00.000Z',
-            updatedAt: '2026-08-07T12:00:01.000Z',
-          },
-        }]
-      : []
-    snapshot.composerReceipt = visualState === 'resident-end-pending'
-      ? {
-          state: 'sent',
-          operation: 'end',
-          message: 'Ending resident session · Prime Continuim will not send another kill automatically',
-        }
-      : { state: 'idle', message: 'Ready for a new prompt' }
-    return snapshot
-  }
-
-  if (visualState === 'candidate-evaluation-review') {
-    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
-    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
-    if (!thread || !host) return snapshot
-    snapshot.selectedProjectId = thread.projectId
-    snapshot.selectedThreadId = thread.id
-    thread.status = 'idle'
-    thread.workspaceId = 'candidate-preview-workspace'
-    thread.executionGenerationId = 'candidate-preview-generation'
-    host.kind = 'local'
-    host.connection = 'online'
-    host.connectionPath = 'Local socket'
-    host.latencyMs = 2
-    delete host.lastSynchronized
-    snapshot.runtime = {}
-    snapshot.operations = {
-      submitCommands: false,
-      startResidentTurn: false,
-      stopResidentTurn: false,
-      crossHostHandoff: false,
-      candidateEvaluationProbe: true,
-    }
-    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
-    return snapshot
-  }
-
-  const selectedThread = snapshot.threads.find((thread) => thread.id === snapshot.selectedThreadId)
-  const selectedHost = snapshot.hosts.find((host) => host.id === selectedThread?.hostId)
-  const session = snapshot.runtime.session
-  if (!selectedThread || !selectedHost || !session) return snapshot
-
-  selectedHost.connection = 'online'
-  selectedHost.connectionPath = 'SSH'
-  selectedHost.latencyMs = 24
-  delete selectedHost.lastSynchronized
-  session.isStreaming = false
-  session.isCompacting = false
-  session.isBashRunning = false
-  session.queuedActionCount = 0
-  snapshot.runtime.queue = { pendingCount: 0, paused: false }
-  snapshot.operations.submitCommands = true
-  snapshot.operations.startResidentTurn = false
-  snapshot.operations.stopResidentTurn = false
-
-  const previewUpdate = selectedThread.transcript.find((block) => block.id === 'block-5')
-  const setPreviewUpdate = (body: string, detail: string) => {
-    if (!previewUpdate) return
-    previewUpdate.body = previewSimulation(body)
-    previewUpdate.detail = previewSimulation(detail)
-  }
-
-  if (
-    visualState === 'idle' ||
-    visualState === 'model-selection' ||
-    visualState === 'hud-expanded' ||
-    visualState === 'hud-buddy'
-  ) {
-    if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
-      selectedThread.workspaceId = 'workspace-preview-hud'
-      selectedThread.executionGenerationId = 'execution-preview-hud'
-    }
-    selectedThread.status = 'idle'
-    snapshot.operations.startResidentTurn = true
-    if (visualState === 'model-selection') {
-      snapshot.operations.modelCatalog = true
-      snapshot.operations.selectResidentModel = true
-    }
-    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
-    setPreviewUpdate(
-      'fixture resident session is attached and ready for another prompt',
-      'no prompt was sent to a host',
-    )
-    return snapshot
-  }
-
-  if (visualState === 'prompt-admission') {
-    selectedThread.status = 'idle'
-    // The local draft remains editable while this exact submission is being
-    // admitted; only the submit action is fenced by the sending receipt.
-    snapshot.operations.startResidentTurn = true
-    snapshot.composerReceipt = {
-      state: 'sending',
-      operation: 'prompt',
-      message: 'Host received the prompt · awaiting durable admission',
-    }
-    setPreviewUpdate(
-      'fixture prompt crossed the connection and is awaiting durable host admission',
-      'Prime Agent does not own this fixture prompt yet',
-    )
-    return snapshot
-  }
-
-  if (visualState === 'prompt-awaiting-idle-proof') {
-    selectedThread.status = 'running'
-    session.isStreaming = true
-    session.queuedActionCount = 1
-    snapshot.runtime.queue = { pendingCount: 1, paused: false }
-    snapshot.operations.stopResidentTurn = true
-    snapshot.composerReceipt = {
-      state: 'sent',
-      operation: 'prompt',
-      message: 'Prime Agent owns this prompt · waiting for authoritative idle proof',
-    }
-    setPreviewUpdate(
-      'fixture prompt was acknowledged by Prime Agent',
-      'the preview retains ownership until an exact idle proof',
-    )
-    return snapshot
-  }
-
-  if (visualState === 'stop-awaiting-idle-proof') {
-    // The projection may report idle before the exact Stop receipt completes.
-    // Retained command ownership must keep the Stop surface visible meanwhile.
-    selectedThread.status = 'idle'
-    snapshot.composerReceipt = {
-      state: 'sent',
-      operation: 'abort',
-      message: 'Stop accepted · waiting for authoritative idle proof',
-    }
-    setPreviewUpdate(
-      'fixture Stop request was acknowledged at a safe boundary',
-      'the Stop remains nonterminal until exact idle proof',
-    )
-    return snapshot
-  }
-
-  selectedThread.status = 'idle'
-  snapshot.composerReceipt = {
-    state: 'uncertain',
-    operation: 'abort',
-    retryable: false,
-    message: 'Outcome unknown · recovery required; this Stop will not be replayed',
-  }
-  setPreviewUpdate(
-    'fixture Stop outcome cannot be proven after the command boundary',
-    'Prime Agent will not replay this Stop without exact recovery evidence',
-  )
-  return snapshot
-}
-
-const discoveredComputers: DiscoveredComputer[] = [
-  {
-    alias: 'devbox',
-    effectiveTarget: 'ebene@devbox.internal:22',
-    fingerprint: 'Visual QA fixture; no live host key was checked.',
-    protocol: 'SSH · Ed25519 host key',
-    platform: 'Ubuntu 24.04',
-    architecture: 'arm64',
-    diskFree: '186 GB free',
-    gitVersion: 'Git 2.45.2',
-    pythonStatus: 'Python 3.12 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.1',
-    hostServiceVersion: 'Not installed',
-    requiresInstall: true,
-    installCommand: 'No signed host-service installer is available in this build.',
-    recentProjects: ['~/work/prime-agent-native', '~/work/control-plane'],
-    probeComplete: true,
-    installAvailable: false,
-    installDeferredReason: 'The signed Continuim host-service installer is not bundled in this build.',
-  },
-  {
-    alias: 'build-linux',
-    effectiveTarget: 'builder@10.24.8.17:2222',
-    fingerprint: 'Visual QA fixture; no live host key was checked.',
-    protocol: 'SSH via corp-bastion · Ed25519 host key',
-    platform: 'Debian 13',
-    architecture: 'x86_64',
-    diskFree: '92 GB free',
-    gitVersion: 'Git 2.47.1',
-    pythonStatus: 'Python 3.13 · IPython ready',
-    agentVersion: 'Prime Agent 0.7.1',
-    hostServiceVersion: 'Host service 0.1.0 · running',
-    requiresInstall: false,
-    installCommand:
-      "ssh build-linux 'prime-agent-hostd install --version 0.1.0 --user --verify-signature'",
-    recentProjects: ['~/src/prime-agent-native'],
-    probeComplete: true,
-    installAvailable: true,
-  },
-]
-
-const previewRuntimeModelCatalog: RuntimeModelCatalogSnapshot = RuntimeModelCatalogSnapshotSchema.parse({
-  runtime: 'prime_agent',
-  releaseVersion: '0.7.1',
-  observedAt: '2026-08-07T12:00:00.000Z',
-  providers: [
-    {
-      providerId: 'openai-codex',
-      displayName: 'ChatGPT Plus/Pro (Codex Subscription)',
-      oauthSupported: true,
-      oauthUsesCallbackServer: true,
-      configured: true,
-      authSource: 'stored',
-      modelCount: 3,
-      availableModelCount: 3,
-    },
-    {
-      providerId: 'anthropic',
-      displayName: 'Anthropic (Claude Pro/Max)',
-      oauthSupported: true,
-      oauthUsesCallbackServer: true,
-      configured: false,
-      modelCount: 2,
-      availableModelCount: 0,
-    },
-    {
-      providerId: 'github-copilot',
-      displayName: 'GitHub Copilot',
-      oauthSupported: true,
-      configured: false,
-      modelCount: 1,
-      availableModelCount: 0,
-    },
-    {
-      providerId: 'prime-inference',
-      displayName: 'Prime Inference',
-      oauthSupported: false,
-      configured: true,
-      authSource: 'prime_cli',
-      modelCount: 5,
-      availableModelCount: 5,
-    },
-    {
-      providerId: 'google',
-      displayName: 'Google Gemini',
-      oauthSupported: false,
-      configured: false,
-      modelCount: 1,
-      availableModelCount: 0,
-    },
-    {
-      providerId: 'xai',
-      displayName: 'xAI',
-      oauthSupported: false,
-      configured: false,
-      modelCount: 1,
-      availableModelCount: 0,
-    },
-  ],
-  models: [
-    { providerId: 'openai-codex', modelId: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
-    { providerId: 'openai-codex', modelId: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
-    { providerId: 'openai-codex', modelId: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', api: 'openai-codex-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: true, usingOAuth: true },
-    { providerId: 'anthropic', modelId: 'claude-opus-5', name: 'Claude Opus 5', api: 'anthropic-messages', reasoning: true, input: ['text', 'image'], contextWindow: 1_000_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
-    { providerId: 'anthropic', modelId: 'claude-sonnet-5', name: 'Claude Sonnet 5', api: 'anthropic-messages', reasoning: true, input: ['text', 'image'], contextWindow: 1_000_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
-    { providerId: 'github-copilot', modelId: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', api: 'openai-responses', reasoning: true, input: ['text', 'image'], contextWindow: 272_000, maxOutputTokens: 128_000, available: false, usingOAuth: false },
-    { providerId: 'prime-inference', modelId: 'moonshotai/kimi-k3', name: 'Kimi K3', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 1_048_576, available: true, usingOAuth: false },
-    { providerId: 'prime-inference', modelId: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 384_000, available: true, usingOAuth: false },
-    { providerId: 'prime-inference', modelId: 'qwen/qwen3.7-flash', name: 'Qwen3.7 Flash', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_000_000, maxOutputTokens: 65_536, available: true, usingOAuth: false },
-    { providerId: 'prime-inference', modelId: 'z-ai/glm-5.2', name: 'GLM 5.2', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 1_048_576, maxOutputTokens: 262_144, available: true, usingOAuth: false },
-    { providerId: 'prime-inference', modelId: 'minimax/minimax-m3', name: 'MiniMax M3', api: 'openai-completions', reasoning: true, input: ['text'], contextWindow: 524_288, maxOutputTokens: 512_000, available: true, usingOAuth: false },
-    { providerId: 'google', modelId: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', api: 'google-generative-ai', reasoning: true, input: ['text', 'image'], contextWindow: 1_048_576, maxOutputTokens: 65_536, available: false, usingOAuth: false },
-    { providerId: 'xai', modelId: 'grok-4.5', name: 'Grok 4.5', api: 'openai-completions', reasoning: true, input: ['text', 'image'], contextWindow: 500_000, maxOutputTokens: 500_000, available: false, usingOAuth: false },
-  ],
-})
-
-const previewCandidateEvaluationBoundary = {
-  securitySandbox: false,
-  mainFilesystemIsolation: false,
-  providerBackedEvaluation: false,
-  autonomousPromotion: false,
-  candidateControlledEvaluation: true,
-  packageOrInstallerGate: false,
-  authenticated: false,
-  integrity: 'sha256-correlation-only-not-authentication' as const,
-}
-
-const previewCandidateEvaluationReview: CandidateEvaluationReviewIdentity = {
-  headCommit: 'a'.repeat(40),
-  gitIndexSha256: '1'.repeat(64),
-  gitIndexBytes: 1_024,
-  packageManifestSha256: '2'.repeat(64),
-  lockfileSha256: '3'.repeat(64),
-  lockfileBytes: 32_768,
-  nodeVersionPinSha256: '4'.repeat(64),
-  selfBuildEntrypointSha256: '5'.repeat(64),
-  launcherBootstrapSha256: 'a'.repeat(64),
-  launcherBootstrapFileCount: 9,
-  runtimePointerSha256: '6'.repeat(64),
-  nodePackageManifestSha256: '7'.repeat(64),
-  nodeExecutableSha256: '8'.repeat(64),
-  pnpmCliSha256: '9'.repeat(64),
-  reviewAggregateSha256: '0'.repeat(64),
-}
-
-const previewCandidateEvaluationAuthority: CandidateEvaluationPreflightRequest = {
-  expectedHostId: 'host-local',
-  threadId: 'thread-protocol',
-  expectedExecutionGenerationId: 'candidate-preview-generation',
-}
-
-const previewCandidateEvaluationPreflight = CandidateEvaluationPreflightSchema.parse({
-  preflightVersion: 1,
-  ...previewCandidateEvaluationAuthority,
-  observedAt: '2026-08-09T12:00:00.000Z',
-  boundary: previewCandidateEvaluationBoundary,
-  status: 'ready',
-  capability: PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
-  review: previewCandidateEvaluationReview,
-  executor: {
-    kind: 'canonical_self_build',
-    gateProcessContainment: 'windows_job',
-    requiredNodeVersion: '24.14.0',
-    requiredPnpmVersion: '11.9.0',
-    verification: 'passive-structure-before-consent;canonical-toolchain-inside-evaluation',
-    launcherSource: 'workspace-dependency-tree-candidate-controlled',
-  },
-})
-
-const previewCandidateEvaluationSnapshot = CandidateEvaluationSnapshotSchema.parse({
-  snapshotVersion: 1,
-  ...previewCandidateEvaluationAuthority,
-  generatedAt: '2026-08-09T12:00:01.000Z',
-  repeatEffectsWarningRequired: false,
-  evaluations: [],
-})
-
-class BrowserPreviewApi implements RendererApi {
-  readonly environment: 'native' | 'preview'
-  private previewHudState: HudState = { state: 'closed' }
-  private readonly hudListeners = new Set<(state: HudState) => void>()
-
-  constructor(private readonly visualState: PreviewVisualState = 'reconnecting') {
-    this.environment = visualState === 'candidate-evaluation-review' ||
-      visualState === 'model-selection' ||
-      visualState === 'prime-oauth' ||
-      visualState === 'ssh-registered-workspace'
-      ? 'native'
-      : 'preview'
-    if (visualState === 'hud-expanded' || visualState === 'hud-buddy') {
-      this.previewHudState = {
-        state: visualState === 'hud-buddy' ? 'buddy' : 'expanded',
-        target: {
-          expectedHostId: 'host-devbox',
-          threadId: 'thread-seamless',
-          expectedExecutionGenerationId: 'execution-preview-hud',
-        },
-        ignoresMouseEvents: false,
-      }
-    }
-  }
-
-  async loadWorkbench(): Promise<WorkbenchSnapshot> {
-    await delay(120)
-    return previewSnapshotForVisualState(this.visualState)
-  }
-
-  private publishHudState(state: HudState): HudState {
-    this.previewHudState = state
-    for (const listener of this.hudListeners) listener(state)
-    return state
-  }
-
-  async hudOpen(target: HudTarget): Promise<HudState> {
-    return this.publishHudState({ state: 'expanded', target, ignoresMouseEvents: false })
-  }
-
-  async hudState(): Promise<HudState> {
-    return this.previewHudState
-  }
-
-  async hudSetMode(mode: HudMode): Promise<HudState> {
-    if (this.previewHudState.state === 'closed') return this.previewHudState
-    return this.publishHudState({
-      state: mode,
-      target: this.previewHudState.target,
-      ignoresMouseEvents: false,
-    })
-  }
-
-  async hudClose(): Promise<HudState> {
-    return this.publishHudState({ state: 'closed' })
-  }
-
-  async hudReturnToWorkbench(): Promise<void> {
-    // Browser preview has no native workbench window to focus.
-  }
-
-  async hudSetIgnoreMouseEvents(ignore: boolean): Promise<HudState> {
-    if (this.previewHudState.state === 'closed') return this.previewHudState
-    return this.publishHudState({ ...this.previewHudState, ignoresMouseEvents: ignore })
-  }
-
-  onHudState(listener: (state: HudState) => void): () => void {
-    this.hudListeners.add(listener)
-    return () => this.hudListeners.delete(listener)
-  }
-
-  async retryLocalSetup(): Promise<void> {
-    throw new Error('Local setup retry is available only in the native desktop app.')
-  }
-
-  async repairLocalRuntime(): Promise<void> {
-    throw new Error('Local runtime repair is available only in the native desktop app.')
-  }
-
-  async selectThread(_threadId: string): Promise<void> {
-    // Browser preview data is already materialized in memory. The native
-    // adapter overrides this boundary with an authoritative host request.
-  }
-
-  async activateComputer(_expectedHostId: string): Promise<WorkbenchSnapshot> {
-    throw new Error('Connecting a saved computer is available only in the native desktop app.')
-  }
-
-  async loadRuntimeModelCatalog(_hostId: string): Promise<RuntimeModelCatalogSnapshot> {
-    await delay(180)
-    const catalog = structuredClone(previewRuntimeModelCatalog)
-    if (this.visualState === 'prime-oauth') {
-      const provider = catalog.providers.find((candidate) => candidate.providerId === 'openai-codex')
-      if (provider) {
-        provider.configured = false
-        provider.availableModelCount = 0
-        delete provider.authSource
-      }
-      for (const model of catalog.models) {
-        if (model.providerId !== 'openai-codex') continue
-        model.available = false
-        model.usingOAuth = false
-      }
-    }
-    return catalog
-  }
-
-  async selectResidentModel(_request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult> {
-    throw new Error('Resident model selection is available only in the native desktop app.')
-  }
-
-  async startRuntimeOAuth(
-    _request: RuntimeOAuthRequest,
-    _onProgress: (progress: RuntimeOAuthProgress) => void,
-  ): Promise<RuntimeOAuthResult> {
-    throw new Error('Prime Agent sign-in is available only in the native desktop app.')
-  }
-
-  async cancelRuntimeOAuth(_request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null> {
-    throw new Error('Prime Agent sign-in is available only in the native desktop app.')
-  }
-
-  async selectResidentWorkspace(
-    _input: ResidentWorkspaceSelectionInput = {},
-  ): Promise<ResidentWorkspaceSelection> {
-    if (_input.kind === 'registered_workspace') {
-      const exactVisualAuthority = this.visualState === 'ssh-registered-workspace' &&
-        _input.projectId === 'project-prime' &&
-        _input.workspaceId === 'workspace-prime-devbox' &&
-        _input.referenceThreadId === 'thread-seamless-remote' &&
-        _input.referenceExecutionGenerationId === 'execution-registered-workspace-preview'
-      if (!exactVisualAuthority) {
-        throw new Error('Saved-workspace resident provisioning is available only for its exact internal visual-QA authority.')
-      }
-      return {
-        kind: 'registered_workspace',
-        selectionToken: 'preview-registered-workspace-selection-token',
-        operationId: _input.resumeOperationId ?? 'resident-preview-registered-create',
-        expectedHostId: 'host-devbox',
-        suggestedName: 'Prime Continuim',
-        projectId: _input.projectId,
-        workspaceId: _input.workspaceId,
-        referenceThreadId: _input.referenceThreadId,
-        referenceExecutionGenerationId: _input.referenceExecutionGenerationId,
-        expiresAt: '2099-08-07T12:05:00.000Z',
-      }
-    }
-    if (this.visualState === 'resident-start' || this.visualState === 'resident-recovery') {
-      return {
-        selectionToken: 'preview-selection-token',
-        operationId: _input.resumeOperationId ?? 'resident-preview-create',
-        expectedHostId: previewSnapshot.hosts[0]?.id ?? 'local-preview',
-        suggestedName: 'Continuim desktop',
-        expiresAt: '2099-08-07T12:05:00.000Z',
-      }
-    }
-    throw new Error('Resident workspace selection is available only in the native desktop app.')
-  }
-
-  async provisionResident(_input: {
-    selectionToken: string
-    projectDisplayName: string
-    threadTitle: string
-    sessionName?: string
-  }): Promise<ResidentLifecycleStatus> {
-    throw new Error('Resident provisioning is unavailable in the browser preview.')
-  }
-
-  async prepareResidentEnd(_input: {
-    expectedHostId: string
-    projectId: string
-    workspaceId: string
-    threadId: string
-    executionGenerationId: string
-    resumeOperationId?: string
-  }): Promise<ResidentEndPreparation> {
-    if (this.visualState === 'resident-end-review') {
-      return {
-        confirmationToken: 'preview-end-confirmation',
-        operationId: _input.resumeOperationId ?? 'resident-preview-end',
-        expectedHostId: _input.expectedHostId,
-        threadId: _input.threadId,
-        executionGenerationId: _input.executionGenerationId,
-        expiresAt: '2099-08-07T12:05:00.000Z',
-      }
-    }
-    throw new Error('Resident session ending is unavailable in the browser preview.')
-  }
-
-  async endResident(_input: { confirmationToken: string; consent: true }): Promise<ResidentLifecycleStatus> {
-    throw new Error('Resident session ending is unavailable in the browser preview.')
-  }
-
-  async residentLifecycleStatus(_input: {
-    expectedHostId: string
-    operationId: string
-  }): Promise<ResidentLifecycleStatus | null> {
-    return null
-  }
-
-  async candidateEvaluationPreflight(
-    input: CandidateEvaluationPreflightRequest,
-  ): Promise<CandidateEvaluationPreflight> {
-    if (
-      this.visualState !== 'candidate-evaluation-review' ||
-      !candidateEvaluationAuthorityMatches(input, previewCandidateEvaluationAuthority)
-    ) throw new Error('Candidate evaluation preflight is available only in its internal visual-QA state.')
-    return structuredClone(previewCandidateEvaluationPreflight)
-  }
-
-  async candidateEvaluationSnapshot(
-    input: CandidateEvaluationPreflightRequest,
-  ): Promise<CandidateEvaluationSnapshot> {
-    if (
-      this.visualState !== 'candidate-evaluation-review' ||
-      !candidateEvaluationAuthorityMatches(input, previewCandidateEvaluationAuthority)
-    ) throw new Error('Candidate evaluation history is available only in its internal visual-QA state.')
-    return structuredClone(previewCandidateEvaluationSnapshot)
-  }
-
-  async startCandidateEvaluation(_input: CandidateEvaluationStartRequest): Promise<CandidateEvaluationStatus> {
-    throw new Error('The visual-QA renderer never invokes candidate code.')
-  }
-
-  async discoverComputers(): Promise<DiscoveredComputer[]> {
-    await delay(180)
-    return structuredClone(discoveredComputers)
-  }
-
-  async probeComputer(input: { alias?: string; hostname?: string; user?: string }): Promise<DiscoveredComputer> {
-    await delay(420)
-    const selected = discoveredComputers.find((computer) => computer.alias === input.alias)
-    if (selected) return structuredClone(selected)
-
-    const hostname = input.hostname?.trim() || 'manual-host.example.com'
-    const user = input.user?.trim() || 'developer'
-    return {
-      ...structuredClone(discoveredComputers[0]!),
-      alias: hostname,
-      effectiveTarget: `${user}@${hostname}:22`,
-      fingerprint: 'Visual QA fixture; no live host key was checked.',
-      recentProjects: [],
-      probeComplete: true,
-      installAvailable: true,
-    }
-  }
-
-  async addComputer(input: {
-    alias: string
-    installHostService: boolean
-    installCommandAcknowledged: boolean
-  }): Promise<{ host: HostSummary }> {
-    await delay(520)
-    return {
-      host: {
-        id: `host-${input.alias}`,
-        name: input.alias,
-        kind: 'ssh',
-        connection: 'online',
-        connectionPath: 'SSH',
-        latencyMs: 34,
-        compatibility: 'compatible',
-      },
-    }
-  }
-
-  async sendComposer(request: ComposerRequest): Promise<{ state: ComposerReceiptState; message: string; retryable?: boolean }> {
-    await delay(240)
-    return { state: 'sent', message: previewSimulation('prompt not sent to a host') }
-  }
-
-  async abortThread(_threadId: string): Promise<{ state: ComposerReceiptState; message: string }> {
-    await delay(180)
-    return { state: 'sent', message: previewSimulation('stop request not sent to a host') }
-  }
-
-  async planHandoff(input: {
-    threadId: string
-    destinationHostId: string
-    behaviorIfRunning: 'interrupt' | 'wait_for_idle'
-  }): Promise<HandoffPlan> {
-    await delay(220)
-    const sourceThread = previewSnapshot.threads.find((thread) => thread.id === input.threadId)
-    const source = previewSnapshot.hosts.find((host) => host.id === sourceThread?.hostId)
-    const destination = previewSnapshot.hosts.find((host) => host.id === input.destinationHostId)
-
-    return {
-      handoffId: 'preview_simulation_handoff_01J8WR50M5WQ',
-      sourceHostId: source?.id ?? 'host-devbox',
-      sourceName: source?.name ?? 'devbox',
-      destinationHostId: destination?.id ?? input.destinationHostId,
-      destinationName: destination?.name ?? 'This computer',
-      repository: 'prime-agent-native',
-      destinationProject: 'Prime Continuim',
-      branch: 'feat/seamless-remote',
-      dirtyFiles: 6,
-      untrackedFiles: 2,
-      transferSize: '4.8 MB',
-      repositoryMatch: 'exact',
-      runtimeLosses: ['Python variables', 'Running subprocesses', 'Active child processes'],
-      warnings: [
-        previewSimulation('no host checkpoint or transfer will run'),
-        'Secrets and ignored files are excluded from the fixture transfer.',
-      ],
-    }
-  }
-
-  async startHandoff(
-    input: { handoffId: string; behaviorIfRunning: 'interrupt' | 'wait_for_idle' },
-    onProgress: (phase: HandoffPhase, message: string) => void,
-  ): Promise<{ destinationHostId: string; receiptId: string }> {
-    const phases: Array<[HandoffPhase, string]> = [
-      ['quiescing', previewSimulation(input.behaviorIfRunning === 'interrupt' ? 'simulating an interrupted turn' : 'simulating a completed turn')],
-      ['checkpointing', previewSimulation('simulating a source checkpoint; no checkpoint is created')],
-      ['transferring', previewSimulation('simulating a 4.8 MB state transfer; no bytes are sent')],
-      ['materializing', previewSimulation('simulating a destination worktree; no files are created')],
-      ['verifying', previewSimulation('simulating hash and Git-status checks')],
-      ['switching_authority', previewSimulation('simulating an authority switch; host authority is unchanged')],
-      ['complete', previewSimulation('fixture handoff complete; no host state changed')],
-    ]
-    for (const [phase, message] of phases) {
-      await delay(260)
-      onProgress(phase, message)
-    }
-    return { destinationHostId: 'host-local', receiptId: 'preview_simulation_handoff_receipt_01J8WR8NB2' }
-  }
-}
 
 type UnknownRecord = Record<string, unknown>
 
@@ -1836,6 +770,9 @@ function sameRuntimeIntegrityLineage(
   )
 }
 
+const DISPLAY_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+const CLOCK_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
+
 function displayTime(value: unknown): string {
   const dateValue = asString(value)
   if (!dateValue || !Number.isFinite(Date.parse(dateValue))) return ''
@@ -1844,13 +781,13 @@ function displayTime(value: unknown): string {
   if (delta >= 0 && delta < 60_000) return 'Now'
   if (delta >= 0 && delta < 60 * 60_000) return `${Math.max(1, Math.floor(delta / 60_000))} min`
   if (delta >= 0 && delta < 24 * 60 * 60_000) return `${Math.max(1, Math.floor(delta / (60 * 60_000)))} h`
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date)
+  return DISPLAY_DATE_FORMATTER.format(date)
 }
 
 function clockTime(value: unknown): string {
   const dateValue = asString(value)
   if (!dateValue || !Number.isFinite(Date.parse(dateValue))) return ''
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(dateValue))
+  return CLOCK_TIME_FORMATTER.format(new Date(dateValue))
 }
 
 function formatBytes(value: unknown): string {
@@ -2108,6 +1045,10 @@ function localSetupFromNative(input: {
       }
     }
     if (liveReadiness.status === 'ready' && !input.residentLifecycleAdvertised) {
+      const runtimeReadyAt = liveReadiness.observedAt ? Date.parse(liveReadiness.observedAt) : Number.NaN
+      if (Number.isFinite(runtimeReadyAt) && Date.now() - runtimeReadyAt < RESIDENT_LIFECYCLE_WARMUP_GRACE_MS) {
+        return { stage: 'preparing_runtime', runtimeReadiness: liveReadiness }
+      }
       return {
         stage: 'needs_attention',
         runtimeReadiness: liveReadiness,
@@ -2316,6 +1257,35 @@ function residentWorkspaceSelectionFromNative(value: unknown): ResidentWorkspace
   return { selectionToken, operationId, expectedHostId, suggestedName, expiresAt }
 }
 
+const RESIDENT_WORKSPACE_PRESELECTION_KEYS = new Set([
+  'preselectionToken',
+  'suggestedName',
+  'expiresAt',
+])
+
+function residentWorkspacePreselectionFromNative(value: unknown): ResidentWorkspacePreselection {
+  const raw = asRecord(value)
+  const preselectionToken = asString(raw?.preselectionToken)
+  const suggestedName = asString(raw?.suggestedName)
+  const expiresAt = asString(raw?.expiresAt)
+  if (
+    !raw ||
+    Object.keys(raw).some((key) => !RESIDENT_WORKSPACE_PRESELECTION_KEYS.has(key)) ||
+    !preselectionToken ||
+    preselectionToken.length > 512 ||
+    /[\0\r\n]/.test(preselectionToken) ||
+    !suggestedName ||
+    suggestedName.length > 255 ||
+    /[\0\r\n/\\]/.test(suggestedName) ||
+    /^[A-Za-z]:/.test(suggestedName) ||
+    !expiresAt ||
+    !Number.isFinite(Date.parse(expiresAt))
+  ) {
+    throw new Error('The native service returned an invalid path-free early workspace choice.')
+  }
+  return { preselectionToken, suggestedName, expiresAt }
+}
+
 const RESIDENT_END_PREPARATION_KEYS = new Set([
   'confirmationToken',
   'operationId',
@@ -2407,7 +1377,7 @@ function nativeTranscriptBlock(raw: UnknownRecord): TranscriptBlock | undefined 
     kind,
     author: kind === 'user' ? 'You' : kind === 'assistant' ? 'Prime Agent' : kind === 'tool' ? 'Host tool' : undefined,
     time: clockTime(raw.createdAt),
-    body: text,
+    body: sanitizeResidentDisplayText(text),
   }
 }
 
@@ -2415,16 +1385,56 @@ function nativeInProgressTranscriptBlock(
   value: unknown,
   materializedBlockIds: ReadonlySet<string>,
 ): TranscriptBlock | undefined {
-  const parsed = InProgressStreamSchema.safeParse(value)
+  const parsed = parseInProgressStream(value)
   if (!parsed.success || materializedBlockIds.has(parsed.data.blockId)) return undefined
   return {
     id: parsed.data.blockId,
     kind: 'assistant',
     author: 'Prime Agent',
     time: clockTime(parsed.data.startedAt),
-    body: parsed.data.text,
+    body: sanitizeResidentDisplayText(parsed.data.text),
     streaming: true,
   }
+}
+
+function retainedTranscriptAgents(
+  blocks: readonly TranscriptBlock[],
+  existingAgents: readonly AgentSummary[],
+  hostName: string,
+): AgentSummary[] {
+  const existingNames = new Set(existingAgents.flatMap((agent) => [agent.sessionName, agent.name].filter(Boolean)))
+  const delegations = new Map<string, { model?: string; blockId: string }>()
+  const retained = new Map<string, AgentSummary>()
+
+  for (const block of blocks) {
+    const delegation = /(?:^|\n)Delegated to ([^\n·]+?)(?: · ([^\n]+))?$/.exec(block.body)
+    if (delegation?.[1]) {
+      const name = delegation[1].trim()
+      delegations.set(name, {
+        ...(delegation[2]?.trim() ? { model: delegation[2].trim() } : {}),
+        blockId: block.id,
+      })
+    }
+
+    const reply = /^Agent message\nFrom ([^\n]+)(?:\n([\s\S]*))?$/.exec(block.body)
+    if (!reply?.[1]) continue
+    const name = reply[1].trim()
+    if (existingNames.has(name)) continue
+    const delegationEvidence = delegations.get(name)
+    retained.set(name, {
+      id: `transcript-agent-${delegationEvidence?.blockId ?? block.id}`,
+      name,
+      sessionName: name,
+      role: 'Retained subagent',
+      status: 'complete',
+      hostName,
+      ...(delegationEvidence?.model ? { model: delegationEvidence.model } : {}),
+      ...(reply[2]?.trim() ? { answerPreview: reply[2].trim() } : {}),
+      repliedSinceTask: true,
+    })
+  }
+
+  return [...retained.values()]
 }
 
 interface NativeProjectionInput {
@@ -2440,6 +1450,107 @@ interface NativeProjectionInput {
   deviceId?: string
   mutationAuthorityReady?: boolean
   activationRequiredHostId?: string
+  connectionGeneration?: number
+  authoritativeMaterialization?: {
+    connectionGeneration: number
+    hostId: string
+    threadId: string
+    executionGenerationId: string
+  }
+}
+
+function outcomeCursorFromNative(value: unknown): OutcomeCursorSummary | undefined {
+  const cursor = asRecord(value)
+  const threadId = asString(cursor?.threadId)
+  const executionGenerationId = asString(cursor?.executionGenerationId)
+  const generation = asString(cursor?.generation)
+  const sequence = asNumber(cursor?.sequence)
+  if (
+    !threadId ||
+    !executionGenerationId ||
+    !generation ||
+    sequence === undefined ||
+    !Number.isSafeInteger(sequence) ||
+    sequence < 0
+  ) return undefined
+  return { threadId, executionGenerationId, generation, sequence }
+}
+
+function latestTurnOutcomeFromNative(
+  value: unknown,
+  latestCursor: OutcomeCursorSummary,
+  snapshotGeneratedAt: string,
+  materializedRecentBlocks: unknown,
+): LatestTurnOutcomeSummary | undefined {
+  const outcome = asRecord(value)
+  if (!outcome || outcome.outcomeVersion !== 1) return undefined
+  const commandId = asString(outcome.commandId)
+  const receiptId = asString(outcome.receiptId)
+  const observedAt = asString(outcome.observedAt)
+  const observedCursor = outcomeCursorFromNative(outcome.observedCursor)
+  if (
+    !commandId ||
+    !receiptId ||
+    !observedAt ||
+    !Number.isFinite(Date.parse(observedAt)) ||
+    !observedCursor ||
+    observedCursor.threadId !== latestCursor.threadId ||
+    observedCursor.executionGenerationId !== latestCursor.executionGenerationId ||
+    (observedCursor.generation === latestCursor.generation && observedCursor.sequence > latestCursor.sequence) ||
+    Date.parse(observedAt) > Date.parse(snapshotGeneratedAt)
+  ) return undefined
+
+  const terminal = asRecord(outcome.terminalAssistant)
+  if (!terminal) {
+    return { outcomeVersion: 1, commandId, receiptId, observedAt, observedCursor }
+  }
+  const blockId = asString(terminal.blockId)
+  const stopReason = asString(terminal.stopReason)
+  if (
+    !blockId ||
+    (stopReason !== 'stop' && stopReason !== 'length' && stopReason !== 'error' && stopReason !== 'aborted')
+  ) return undefined
+  const terminalBlock = records(materializedRecentBlocks).find((block) => asString(block.blockId) === blockId)
+  if (
+    !terminalBlock ||
+    asString(terminalBlock.kind) !== 'assistant' ||
+    !asString(terminalBlock.createdAt) ||
+    !Number.isFinite(Date.parse(asString(terminalBlock.createdAt)!)) ||
+    Date.parse(asString(terminalBlock.createdAt)!) > Date.parse(observedAt)
+  ) return undefined
+  return {
+    outcomeVersion: 1,
+    commandId,
+    receiptId,
+    observedAt,
+    observedCursor,
+    terminalAssistant: { blockId, stopReason },
+  }
+}
+
+function gitAggregateFromNative(value: unknown): GitAggregateSummary | undefined {
+  const git = asRecord(value)
+  const stagedFiles = asNumber(git?.stagedFiles)
+  const unstagedFiles = asNumber(git?.unstagedFiles)
+  const untrackedFiles = asNumber(git?.untrackedFiles)
+  if (
+    stagedFiles === undefined ||
+    unstagedFiles === undefined ||
+    untrackedFiles === undefined ||
+    !Number.isSafeInteger(stagedFiles) ||
+    !Number.isSafeInteger(unstagedFiles) ||
+    !Number.isSafeInteger(untrackedFiles) ||
+    stagedFiles < 0 ||
+    unstagedFiles < 0 ||
+    untrackedFiles < 0
+  ) return undefined
+  return {
+    stagedFiles,
+    unstagedFiles,
+    untrackedFiles,
+    changedFileCount: stagedFiles + unstagedFiles + untrackedFiles,
+    knownDetail: false,
+  }
 }
 
 const RESIDENT_LIFECYCLE_OPERATION_STATES = new Set<ResidentLifecycleOperationState>([
@@ -2475,7 +1586,7 @@ function residentLifecycleOperationsFromNative(
       const state = asString(entry.state) as ResidentLifecycleOperationState | undefined
       const parsedStatus = entry.lastStatus === undefined
         ? undefined
-        : ResidentLifecycleStatusSchema.safeParse(entry.lastStatus)
+        : parseResidentLifecycleStatus(entry.lastStatus)
       const sourceCursor = nativeSessionCursor(entry.sourceCursor)
       if (
         !operationId ||
@@ -2607,6 +1718,14 @@ function snapshotCursorGeneration(value: unknown): string | undefined {
 
 function protocolThreadId(thread: ThreadSummary): string {
   return thread.remoteId ?? thread.id
+}
+
+function residentThreadBindingKey(
+  hostId: string,
+  threadId: string,
+  executionGenerationId: string,
+): string {
+  return JSON.stringify([hostId, threadId, executionGenerationId])
 }
 
 function catalogGenerationLineages(
@@ -2813,6 +1932,36 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     snapshotLocationGenerationId && snapshotLocationGenerationId === snapshotCursorGenerationId
       ? snapshotLocationGenerationId
       : undefined
+  const snapshotCursor = outcomeCursorFromNative(threadSnapshot?.latestCursor)
+  const snapshotGeneratedAt = asString(threadSnapshot?.generatedAt)
+  const exactMaterialization = input.authoritativeMaterialization
+  const snapshotIsLive = Boolean(
+    exactMaterialization &&
+    input.connectionGeneration === exactMaterialization.connectionGeneration &&
+    activePhase === 'online' &&
+    activeHostId === exactMaterialization.hostId &&
+    asString(snapshotLocation?.hostId) === exactMaterialization.hostId &&
+    asString(snapshotThread?.threadId) === exactMaterialization.threadId &&
+    snapshotExecutionGenerationId === exactMaterialization.executionGenerationId
+  )
+  const snapshotAuthority = snapshotCursor && snapshotGeneratedAt && Number.isFinite(Date.parse(snapshotGeneratedAt))
+    ? {
+        source: snapshotIsLive ? 'live' as const : 'cached' as const,
+        generatedAt: snapshotGeneratedAt,
+        cursor: snapshotCursor,
+      }
+    : undefined
+  const latestTurnOutcome = snapshotCursor
+    && snapshotGeneratedAt
+    && Number.isFinite(Date.parse(snapshotGeneratedAt))
+    ? latestTurnOutcomeFromNative(
+        threadSnapshot?.latestTurnOutcome,
+        snapshotCursor,
+        snapshotGeneratedAt,
+        threadSnapshot?.materializedRecentBlocks,
+      )
+    : undefined
+  const gitSummary = gitAggregateFromNative(threadSnapshot?.git)
 
   const rawHosts = records(catalog?.hosts)
   const singleHost = asRecord(catalog?.host)
@@ -2905,7 +2054,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     threadSnapshot?.inProgressStream,
     new Set(recentBlocks.map((block) => block.id)),
   )
-  const parsedResidentLifecycle = ResidentLifecycleDispositionSchema.safeParse(threadSnapshot?.residentLifecycle)
+  const parsedResidentLifecycle = parseResidentLifecycleDisposition(threadSnapshot?.residentLifecycle)
   const rawThreads = records(catalog?.threads)
   if (rawThreads.length === 0 && snapshotThread) rawThreads.push(snapshotThread)
   const threadIdCounts = new Map<string, number>()
@@ -2959,6 +2108,23 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     }
   })
 
+  const threadByResidentBinding = new Map<string, ThreadSummary>()
+  for (const thread of threads) {
+    if (!thread.executionGenerationId) continue
+    const key = residentThreadBindingKey(
+      thread.hostId,
+      protocolThreadId(thread),
+      thread.executionGenerationId,
+    )
+    // Preserve Array.find's first-match behavior if malformed catalog bytes
+    // repeat one exact binding. Validation remains fail-closed downstream.
+    if (!threadByResidentBinding.has(key)) threadByResidentBinding.set(key, thread)
+  }
+  const hostNameById = new Map<string, string>()
+  for (const host of hosts) {
+    if (!hostNameById.has(host.id)) hostNameById.set(host.id, host.name)
+  }
+
   const snapshotRendererThreadId = threads.find(
     (thread) => protocolThreadId(thread) === snapshotThreadId && thread.hostId === materializedHostId,
   )?.id
@@ -2976,7 +2142,9 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const activeHostHasAuthority = Boolean(
     activeHostId && hosts.some((host) => host.id === activeHostId && host.connection === 'online'),
   )
-  const hostName = hosts.find((host) => host.id === selectedThread?.hostId)?.name ?? 'Execution host'
+  const hostName = selectedThread
+    ? hostNameById.get(selectedThread.hostId) ?? 'Execution host'
+    : 'Execution host'
   const selectedSnapshotIsMaterialized = Boolean(
     snapshotThreadId &&
     selectedThread &&
@@ -2990,7 +2158,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   )
 
   const childAgents = selectedSnapshotIsMaterialized ? records(threadSnapshot?.childAgents) : []
-  const agents: AgentSummary[] = childAgents.map((agent, index) => {
+  const reportedChildAgents: AgentSummary[] = childAgents.map((agent, index) => {
     const state = asString(agent.state)
     const status: AgentSummary['status'] =
       state === 'pending' ||
@@ -3021,15 +2189,21 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       status,
       hostName,
       ...(asString(agent.parentAgentId) ? { parentId: asString(agent.parentAgentId) } : {}),
+      ...(asString(agent.activeSessionId) ? { activeSessionId: asString(agent.activeSessionId) } : {}),
+      ...(asString(agent.sessionName) ? { sessionName: asString(agent.sessionName) } : {}),
       ...(asString(agent.model) ? { model: asString(agent.model) } : {}),
       ...(activity ? { activity } : {}),
       ...(asNumber(agent.durationMs) !== undefined ? { durationMs: asNumber(agent.durationMs) } : {}),
+      ...(asString(agent.answerPreview) ? { answerPreview: asString(agent.answerPreview) } : {}),
+      ...(typeof agent.repliedSinceTask === 'boolean' ? { repliedSinceTask: agent.repliedSinceTask } : {}),
       ...(asNumber(agent.toolUseCount) !== undefined ? { toolUseCount: asNumber(agent.toolUseCount) } : {}),
       ...(asNumber(agent.tokenCount) !== undefined ? { tokenCount: asNumber(agent.tokenCount) } : {}),
       ...(asString(agent.recap) ? { recap: asString(agent.recap) } : {}),
       ...(asString(agent.error) ? { error: asString(agent.error) } : {}),
     }
   })
+  const transcriptAgents = retainedTranscriptAgents(recentBlocks, reportedChildAgents, hostName)
+  const agents = [...reportedChildAgents, ...transcriptAgents]
 
   const runtime: RuntimeSummary = {}
   if (selectedSnapshotIsMaterialized) {
@@ -3038,6 +2212,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       const residency = asString(rawSession.residency)
       const rawContext = asRecord(rawSession.context)
       const usedTokens = asNumber(rawContext?.usedTokens)
+      const resourceInventory = parseRuntimeResourceInventory(rawSession.resourceInventory)
       runtime.session = {
         residency: residency === 'resident' || residency === 'client_owned' ? residency : 'unknown',
         ...(asString(rawSession.appVersion) ? { appVersion: asString(rawSession.appVersion) } : {}),
@@ -3057,6 +2232,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         activeToolNames: Array.isArray(rawSession.activeToolNames)
           ? rawSession.activeToolNames.filter((tool): tool is string => typeof tool === 'string')
           : [],
+        ...(resourceInventory.success ? { resourceInventory: resourceInventory.data } : {}),
         ...(usedTokens !== undefined
           ? { context: {
               usedTokens,
@@ -3066,7 +2242,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       }
     }
 
-    if (runtime.session || childAgents.length > 0) runtime.agentsReported = true
+    if (runtime.session || agents.length > 0) runtime.agentsReported = true
 
     const rawQueue = asRecord(threadSnapshot?.queueState)
     if (rawQueue && Array.isArray(rawQueue.pendingCommandIds)) {
@@ -3180,11 +2356,13 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     const receiptHostId = asString(receipt.hostId)
     const receiptThreadId = asString(receipt.threadId)
     const receiptExecutionGenerationId = asString(receipt.executionGenerationId)
-    const matchingThread = threads.find((thread) =>
-      thread.hostId === receiptHostId &&
-      protocolThreadId(thread) === receiptThreadId &&
-      thread.executionGenerationId === receiptExecutionGenerationId,
-    )
+    const matchingThread = receiptHostId && receiptThreadId && receiptExecutionGenerationId
+      ? threadByResidentBinding.get(residentThreadBindingKey(
+          receiptHostId,
+          receiptThreadId,
+          receiptExecutionGenerationId,
+        ))
+      : undefined
     if (!matchingThread) continue
     const error = asRecord(receipt.error)
     const errorCode = asString(error?.code)?.slice(0, 64)
@@ -3207,7 +2385,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       threadId: matchingThread.id,
       kind: 'failed',
       title: 'Outcome unknown · Prime Agent did not replay this command',
-      hostName: hosts.find((host) => host.id === matchingThread.hostId)?.name ?? 'Execution host',
+      hostName: hostNameById.get(matchingThread.hostId) ?? 'Execution host',
       ...(errorCode && errorMessage && errorRetryable !== undefined
         ? {
             diagnostic: {
@@ -3238,11 +2416,13 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         ? 'abort'
         : undefined
     if (!operation || !entryHostId || entryHostId !== commandHostId) continue
-    const matchingThread = threads.find((thread) =>
-      thread.hostId === entryHostId &&
-      protocolThreadId(thread) === commandThreadId &&
-      thread.executionGenerationId === commandGenerationId
-    )
+    const matchingThread = commandThreadId && commandGenerationId
+      ? threadByResidentBinding.get(residentThreadBindingKey(
+          entryHostId,
+          commandThreadId,
+          commandGenerationId,
+        ))
+      : undefined
     if (!matchingThread) continue
     if (
       commandDeviceId && commandId && commandThreadId && commandGenerationId &&
@@ -3261,7 +2441,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
       title: operation === 'prompt'
         ? 'Prompt outcome unknown · reconnect to reconcile this exact command'
         : 'Outcome unknown · recovery required; this Stop will not be replayed',
-      hostName: hosts.find((host) => host.id === entryHostId)?.name ?? 'Execution host',
+      hostName: hostNameById.get(entryHostId) ?? 'Execution host',
     })
   }
   const pendingEntries = selectedThread
@@ -3331,7 +2511,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
             ? { operation: 'abort' as const }
             : {}),
       }
-    : { state: 'idle', message: hosts.find((host) => host.id === selectedThread?.hostId)?.connection === 'online' ? 'Ready to send' : 'Waiting for connection' }
+    : {
+        state: 'idle',
+        message: selectedThread && hosts.find((host) => host.id === selectedThread.hostId)?.connection === 'online'
+          ? 'Ready to send'
+          : 'Waiting for connection',
+      }
 
   const residentLifecycleOperations = residentLifecycleOperationsFromNative(
     input.residentLifecycleOperations,
@@ -3352,12 +2537,66 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     selectedThread.executionGenerationId &&
     selectedProject?.hostIds.includes(selectedThread.hostId),
   )
+  const rawResidentControl = asRecord(threadSnapshot?.residentControl)
+  const residentControlIsExact = Boolean(
+    selectedSnapshotIsMaterialized &&
+    rawResidentControl &&
+    asString(rawResidentControl.hostId) === selectedThread?.hostId &&
+    asString(rawResidentControl.threadId) === (selectedThread ? protocolThreadId(selectedThread) : undefined) &&
+    asString(rawResidentControl.executionGenerationId) === selectedThread?.executionGenerationId,
+  )
+  const browserExecution = parseResidentBrowserExecution(rawResidentControl?.browserExecution)
+  if (residentControlIsExact && browserExecution.success) {
+    runtime.browserExecution = browserExecution.data
+  }
+  const residentControlReady = Boolean(
+    residentControlIsExact &&
+    asString(rawResidentControl?.commandReadiness) === 'ready',
+  )
+  if (residentControlIsExact) {
+    runtime.residentControlReadiness = residentControlReady ? 'ready' : 'unavailable'
+  }
+  const residentExtensionUiRequests: ResidentExtensionUiRequest[] = []
+  const rawExtensionUiRequests = threadSnapshot?.residentExtensionUiRequests
+  const residentBindingFingerprint = asString(rawResidentControl?.bindingFingerprint)
+  if (
+    snapshotIsLive &&
+    advertisedCapabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) &&
+    residentControlIsExact &&
+    residentBindingFingerprint &&
+    Array.isArray(rawExtensionUiRequests) &&
+    rawExtensionUiRequests.length <= 16
+  ) {
+    const seen = new Set<string>()
+    for (const candidate of rawExtensionUiRequests) {
+      const parsed = parseResidentExtensionUiRequest(candidate)
+      if (!parsed.success) continue
+      const request = parsed.data
+      if (
+        request.hostId !== selectedThread?.hostId ||
+        request.threadId !== (selectedThread ? protocolThreadId(selectedThread) : undefined) ||
+        request.executionGenerationId !== selectedThread?.executionGenerationId ||
+        request.bindingFingerprint !== residentBindingFingerprint
+      ) continue
+      const identity = canonicalRendererJson([
+        request.executionGenerationId,
+        request.bindingFingerprint,
+        request.requestId,
+        request.requestDigest,
+        request.method,
+      ])
+      if (seen.has(identity)) continue
+      seen.add(identity)
+      residentExtensionUiRequests.push(request)
+    }
+  }
   const residentSessionReady = Boolean(
     input.mutationAuthorityReady !== false &&
     selectedHostHasAuthority &&
     activePhase === 'online' &&
     selectedSnapshotIsMaterialized &&
     advertisedCapabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+    residentControlReady &&
     runtime.session?.residency === 'resident' &&
     runtime.session.activeSessionId &&
     runtime.session.sessionId &&
@@ -3395,9 +2634,30 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
   const residentEndReady = Boolean(
     (localResidentLifecycleReady || registeredWorkspaceLifecycleReady) &&
     selectedResidentLineageIsExact &&
-    runtime.session?.residency === 'resident' &&
-    runtime.session.activeSessionId &&
-    runtime.session.sessionId &&
+    (
+      (
+        runtime.session?.residency === 'resident' &&
+        runtime.session.activeSessionId &&
+        runtime.session.sessionId
+      ) ||
+      (
+        localResidentLifecycleReady &&
+        selectedResidentEnd !== undefined &&
+        selectedThread !== undefined &&
+        selectedResidentEnd.projectId === selectedThread.projectId &&
+        selectedResidentEnd.workspaceId === selectedThread.workspaceId &&
+        (
+          (
+            selectedResidentEnd.lastStatus?.kind === 'end' &&
+            selectedResidentEnd.lastStatus.phase === 'ending'
+          ) ||
+          (
+            selectedResidentEnd.state === 'outcome_unknown' &&
+            selectedResidentEnd.lastStatus === undefined
+          )
+        )
+      )
+    ) &&
     selectedThread?.residentLifecycle?.state !== 'ended',
   )
   const localSetup = localSetupFromNative({
@@ -3431,9 +2691,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     !residentTurnActive &&
     !retainedPromptOwned &&
     !promptDispatchPending &&
-    !abortCommandPending &&
-    selectedThread?.status !== 'waiting' &&
-    selectedThread?.status !== 'needs_approval',
+    !abortCommandPending,
   )
   const activeAccountHostReady = Boolean(
     activeHostHasAuthority && (!selectedThread || selectedHostHasAuthority),
@@ -3463,8 +2721,12 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     agents,
     evidence,
     runtime,
+    ...(latestTurnOutcome ? { latestTurnOutcome } : {}),
+    ...(snapshotAuthority ? { snapshotAuthority } : {}),
+    ...(gitSummary ? { gitSummary } : {}),
     ...(localSetup ? { localSetup } : {}),
     residentLifecycleOperations,
+    residentExtensionUiRequests,
     operations: {
       submitCommands: residentSessionReady,
       startResidentTurn: residentTurnStartReady,
@@ -3499,11 +2761,14 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
               ? 'uncertain'
               : 'sent',
           operation: 'end',
+          ...(selectedResidentEnd.lastStatus?.phase === 'ending' ? { retryable: true } : {}),
           message: selectedResidentEnd.lastStatus?.phase === 'quarantined'
             ? 'End outcome unknown · this resident session stays locked for inspection'
             : selectedResidentEnd.lastStatus?.phase === 'completed'
               ? 'Resident session ended · saved thread remains available'
-              : 'Ending resident session · Prime Continuim will not send another kill automatically',
+              : selectedResidentEnd.lastStatus?.phase === 'ending'
+                ? 'Ready to finish · Prime Agent has not received an End request'
+                : 'Finishing session · checking for completion',
         }
       : composerReceipt,
   }
@@ -3598,9 +2863,26 @@ interface ResidentModelSelectionAuthority {
   connectionGeneration: number
 }
 
+interface ResidentExtensionUiResponseAuthority {
+  localThreadId: string
+  remoteThreadId: string
+  expectedHostId: string
+  expectedExecutionGenerationId: string
+  bindingFingerprint: string
+  requestId: string
+  requestDigest: string
+  method: ResidentExtensionUiRequest['method']
+  connectionGeneration: number
+}
+
 interface ActiveResidentModelSelection {
   bindingKey: string
   result: Promise<ResidentModelSelectionResult>
+}
+
+interface ResidentExtensionUiResponseAttempt {
+  responseFingerprint: string
+  promise: Promise<ResidentExtensionUiResponseResult>
 }
 
 interface RuntimeOAuthAuthority {
@@ -3633,6 +2915,7 @@ type ResidentLifecycleWorkspaceKind = 'local_path' | 'registered_workspace'
 interface ResidentLifecycleAuthority {
   expectedHostId: string
   generation: number
+  connectionKind: 'local' | 'ssh'
   workspaceKind: ResidentLifecycleWorkspaceKind
   capabilityRequired: boolean
 }
@@ -3646,6 +2929,12 @@ interface ResidentWorkspaceReference {
 
 interface RetainedResidentWorkspaceSelection {
   selection: ResidentWorkspaceSelection
+  connectionGeneration: number
+}
+
+interface RetainedResidentWorkspacePreselection {
+  preselection: ResidentWorkspacePreselection
+  expectedHostId: string
   connectionGeneration: number
 }
 
@@ -3740,6 +3029,7 @@ export class NativeRendererApi implements RendererApi {
   private readonly installPlans = new Map<string, UnknownRecord>()
   private readonly discoveredComputers = new Map<string, DiscoveredComputer>()
   private readonly residentWorkspaceSelections = new Map<string, RetainedResidentWorkspaceSelection>()
+  private readonly residentWorkspacePreselections = new Map<string, RetainedResidentWorkspacePreselection>()
   private readonly residentEndPreparations = new Map<string, RetainedResidentEndPreparation>()
   private readonly consumedRegisteredWorkspaceSelectionTokens = new Set<string>()
   private readonly pendingResidentMaterializations = new Set<string>()
@@ -3773,6 +3063,7 @@ export class NativeRendererApi implements RendererApi {
   private authoritativeRefreshGeneration?: number
   private authoritativeRefreshPromise?: Promise<void>
   private activeResidentModelSelection?: ActiveResidentModelSelection
+  private readonly residentExtensionUiResponseAttempts = new Map<string, ResidentExtensionUiResponseAttempt>()
   private activeRuntimeOAuth?: ActiveRuntimeOAuth
   private mutationAuthorityReadyHostId?: string
   private mutationAuthorityHydrationGeneration?: number
@@ -3832,6 +3123,7 @@ export class NativeRendererApi implements RendererApi {
   async candidateEvaluationPreflight(
     input: CandidateEvaluationPreflightRequest,
   ): Promise<CandidateEvaluationPreflight> {
+    const { CandidateEvaluationPreflightSchema } = await loadProtocolSchemas()
     const preflight = CandidateEvaluationPreflightSchema.parse(
       await this.call<unknown>('candidateEvaluationPreflight', input),
     )
@@ -3842,6 +3134,7 @@ export class NativeRendererApi implements RendererApi {
   async startCandidateEvaluation(
     input: CandidateEvaluationStartRequest,
   ): Promise<CandidateEvaluationStatus> {
+    const { CandidateEvaluationStatusSchema } = await loadProtocolSchemas()
     const status = CandidateEvaluationStatusSchema.parse(
       await this.call<unknown>('startCandidateEvaluation', input),
     )
@@ -3856,6 +3149,7 @@ export class NativeRendererApi implements RendererApi {
   async candidateEvaluationSnapshot(
     input: CandidateEvaluationPreflightRequest,
   ): Promise<CandidateEvaluationSnapshot> {
+    const { CandidateEvaluationSnapshotSchema } = await loadProtocolSchemas()
     const snapshot = CandidateEvaluationSnapshotSchema.parse(
       await this.call<unknown>('candidateEvaluationSnapshot', input),
     )
@@ -3909,6 +3203,8 @@ export class NativeRendererApi implements RendererApi {
       )
         ? asString(asRecord(this.connection)?.hostId)
         : undefined,
+      connectionGeneration: this.connectionGeneration,
+      authoritativeMaterialization: this.authoritativeMaterializationProof(),
     })
     const selectedThread = this.projection.threads.find((thread) => thread.id === this.projection?.selectedThreadId)
     if (
@@ -4248,6 +3544,7 @@ export class NativeRendererApi implements RendererApi {
     this.handoffDestinations.clear()
     this.handoffSources.clear()
     this.residentWorkspaceSelections.clear()
+    this.residentWorkspacePreselections.clear()
     this.residentEndPreparations.clear()
     this.consumedRegisteredWorkspaceSelectionTokens.clear()
     this.pendingResidentMaterializations.clear()
@@ -4899,7 +4196,7 @@ export class NativeRendererApi implements RendererApi {
 
   private applyPendingResidentMaterializations(): void {
     this.residentLifecycleOperations = records(this.residentLifecycleOperations).map((entry) => {
-      const parsedStatus = ResidentLifecycleStatusSchema.safeParse(entry.lastStatus)
+      const parsedStatus = parseResidentLifecycleStatus(entry.lastStatus)
       return this.pendingResidentMaterializations.has(residentLifecycleMaterializationKey(entry)) &&
         residentLifecycleNeedsProjectionMaterialization(parsedStatus.success ? parsedStatus.data : undefined)
           ? { ...entry, state: 'terminal_refresh_pending' }
@@ -4950,7 +4247,7 @@ export class NativeRendererApi implements RendererApi {
     if (selectionGeneration !== this.threadSelectionGeneration) throw new StaleHostAuthorityError()
     const currentThread = this.projectedResidentThread(status)
     const snapshotLocation = asRecord(asRecord(asRecord(snapshot)?.thread)?.currentLocation)
-    const endDisposition = ResidentLifecycleDispositionSchema.safeParse(
+    const endDisposition = parseResidentLifecycleDisposition(
       asRecord(snapshot)?.residentLifecycle,
     )
     if (
@@ -5159,6 +4456,7 @@ export class NativeRendererApi implements RendererApi {
     ) {
       throw new StaleHostAuthorityError()
     }
+    const { RuntimeModelCatalogSnapshotSchema } = await loadProtocolSchemas()
     return RuntimeModelCatalogSnapshotSchema.parse(raw)
   }
 
@@ -5231,7 +4529,7 @@ export class NativeRendererApi implements RendererApi {
     if (
       !expectedHostId ||
       request.hostId !== expectedHostId ||
-      asString(connection?.phase) !== 'online' ||
+      !['online', 'degraded'].includes(asString(connection?.phase) ?? '') ||
       asString(target?.kind) !== 'local' ||
       asString(connection?.path) !== 'local_socket' ||
       this.mutationAuthorityReadyHostId !== expectedHostId ||
@@ -5735,6 +5033,272 @@ export class NativeRendererApi implements RendererApi {
     return this.projection?.runtime.session?.model === `${request.providerId}/${request.modelId}`
   }
 
+  async respondToResidentExtensionUi(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+  ): Promise<ResidentExtensionUiResponseResult> {
+    const { ExtensionUiDialogResponseSchema, ResidentExtensionUiRequestSchema } = await loadProtocolSchemas()
+    const parsedRequest = ResidentExtensionUiRequestSchema.safeParse(request)
+    const parsedResponse = ExtensionUiDialogResponseSchema.safeParse(response)
+    if (!parsedRequest.success || !parsedResponse.success) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question or response is no longer valid.',
+      }
+    }
+    if (
+      (parsedRequest.data.method === 'confirm' && parsedResponse.data.kind === 'value') ||
+      (parsedRequest.data.method !== 'confirm' && parsedResponse.data.kind === 'confirmed')
+    ) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This response does not match the Prime Agent question.',
+      }
+    }
+
+    let authority: ResidentExtensionUiResponseAuthority
+    try {
+      authority = this.captureResidentExtensionUiResponseAuthority(parsedRequest.data)
+    } catch {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question is no longer active on the selected session.',
+      }
+    }
+    const attemptKey = canonicalRendererJson([
+      authority.expectedHostId,
+      authority.remoteThreadId,
+      authority.expectedExecutionGenerationId,
+      authority.bindingFingerprint,
+      authority.requestId,
+      authority.requestDigest,
+      authority.method,
+    ])
+    const responseFingerprint = canonicalRendererJson(parsedResponse.data)
+    const existing = this.residentExtensionUiResponseAttempts.get(attemptKey)
+    if (existing) {
+      return existing.responseFingerprint === responseFingerprint
+        ? existing.promise
+        : Promise.resolve({
+            state: 'rejected',
+            retryable: false,
+            message: 'A different response is already being delivered for this Prime Agent question.',
+          })
+    }
+    const attempt = this.performResidentExtensionUiResponse(
+      parsedRequest.data,
+      parsedResponse.data,
+      authority,
+    )
+    const tracked = { responseFingerprint, promise: attempt }
+    this.residentExtensionUiResponseAttempts.set(attemptKey, tracked)
+    void attempt.then(() => {
+      if (this.residentExtensionUiResponseAttempts.get(attemptKey) !== tracked) return
+      this.residentExtensionUiResponseAttempts.delete(attemptKey)
+    }, () => {
+      if (this.residentExtensionUiResponseAttempts.get(attemptKey) === tracked) {
+        this.residentExtensionUiResponseAttempts.delete(attemptKey)
+      }
+    })
+    return attempt
+  }
+
+  private captureResidentExtensionUiResponseAuthority(
+    request: ResidentExtensionUiRequest,
+  ): ResidentExtensionUiResponseAuthority {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === projection.selectedThreadId)
+    const remoteThreadId = thread ? protocolThreadId(thread) : undefined
+    const connection = asRecord(this.connection)
+    const residentControl = asRecord(asRecord(this.threadSnapshot)?.residentControl)
+    const materialization = this.authoritativeMaterializationProof()
+    const currentRequest = projection?.residentExtensionUiRequests?.find((candidate) =>
+      candidate.requestId === request.requestId &&
+      candidate.requestDigest === request.requestDigest &&
+      candidate.method === request.method
+    )
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (
+      !this.workbenchLoaded ||
+      !projection ||
+      projection.snapshotAuthority?.source !== 'live' ||
+      !thread ||
+      !remoteThreadId ||
+      !thread.executionGenerationId ||
+      request.hostId !== thread.hostId ||
+      request.threadId !== remoteThreadId ||
+      request.executionGenerationId !== thread.executionGenerationId ||
+      !currentRequest ||
+      canonicalRendererJson(currentRequest) !== canonicalRendererJson(request) ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.hostId) !== thread.hostId ||
+      this.mutationAuthorityReadyHostId !== thread.hostId ||
+      !capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) ||
+      !capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) ||
+      !materialization ||
+      materialization.connectionGeneration !== this.connectionGeneration ||
+      materialization.hostId !== thread.hostId ||
+      materialization.threadId !== remoteThreadId ||
+      materialization.executionGenerationId !== thread.executionGenerationId ||
+      asString(residentControl?.hostId) !== thread.hostId ||
+      asString(residentControl?.threadId) !== remoteThreadId ||
+      asString(residentControl?.executionGenerationId) !== thread.executionGenerationId ||
+      asString(residentControl?.bindingFingerprint) !== request.bindingFingerprint ||
+      asString(residentControl?.commandReadiness) !== 'ready'
+    ) throw new StaleHostAuthorityError()
+
+    return {
+      localThreadId: thread.id,
+      remoteThreadId,
+      expectedHostId: thread.hostId,
+      expectedExecutionGenerationId: thread.executionGenerationId,
+      bindingFingerprint: request.bindingFingerprint,
+      requestId: request.requestId,
+      requestDigest: request.requestDigest,
+      method: request.method,
+      connectionGeneration: this.connectionGeneration,
+    }
+  }
+
+  private residentExtensionUiResponseAuthorityIsCurrent(
+    authority: ResidentExtensionUiResponseAuthority,
+  ): boolean {
+    const projection = this.projection
+    const thread = projection?.threads.find((candidate) => candidate.id === projection.selectedThreadId)
+    const connection = asRecord(this.connection)
+    const residentControl = asRecord(asRecord(this.threadSnapshot)?.residentControl)
+    const materialization = this.authoritativeMaterializationProof()
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    return Boolean(
+      projection &&
+      projection.snapshotAuthority?.source === 'live' &&
+      authority.connectionGeneration === this.connectionGeneration &&
+      thread?.id === authority.localThreadId &&
+      thread.hostId === authority.expectedHostId &&
+      protocolThreadId(thread) === authority.remoteThreadId &&
+      thread.executionGenerationId === authority.expectedExecutionGenerationId &&
+      projection.residentExtensionUiRequests?.some((request) =>
+        request.hostId === authority.expectedHostId &&
+        request.threadId === authority.remoteThreadId &&
+        request.executionGenerationId === authority.expectedExecutionGenerationId &&
+        request.bindingFingerprint === authority.bindingFingerprint &&
+        request.requestId === authority.requestId &&
+        request.requestDigest === authority.requestDigest &&
+        request.method === authority.method
+      ) &&
+      asString(connection?.phase) === 'online' &&
+      asString(connection?.hostId) === authority.expectedHostId &&
+      this.mutationAuthorityReadyHostId === authority.expectedHostId &&
+      capabilities.includes(PRIME_AGENT_COMMAND_CAPABILITY) &&
+      capabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY) &&
+      materialization?.connectionGeneration === authority.connectionGeneration &&
+      materialization.hostId === authority.expectedHostId &&
+      materialization.threadId === authority.remoteThreadId &&
+      materialization.executionGenerationId === authority.expectedExecutionGenerationId &&
+      asString(residentControl?.hostId) === authority.expectedHostId &&
+      asString(residentControl?.threadId) === authority.remoteThreadId &&
+      asString(residentControl?.executionGenerationId) === authority.expectedExecutionGenerationId &&
+      asString(residentControl?.bindingFingerprint) === authority.bindingFingerprint &&
+      asString(residentControl?.commandReadiness) === 'ready'
+    )
+  }
+
+  private async performResidentExtensionUiResponse(
+    request: ResidentExtensionUiRequest,
+    response: ExtensionUiDialogResponse,
+    authority: ResidentExtensionUiResponseAuthority,
+  ): Promise<ResidentExtensionUiResponseResult> {
+    if (!this.residentExtensionUiResponseAuthorityIsCurrent(authority)) {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: 'This Prime Agent question is no longer active on the selected session.',
+      }
+    }
+    const commandId = createStableId('command')
+    const clientCommand = {
+      deviceId: this.deviceId,
+      commandId,
+      expectedHostId: authority.expectedHostId,
+      threadId: authority.remoteThreadId,
+      kind: 'extension_ui.respond',
+      payload: {
+        requestId: request.requestId,
+        requestDigest: request.requestDigest,
+        method: request.method,
+        response,
+      },
+      delivery: 'live_only',
+      expectedExecutionGenerationId: authority.expectedExecutionGenerationId,
+      issuedAt: this.nextComposerIssuedAt(authority.expectedHostId, authority.remoteThreadId),
+    }
+    let invoked = false
+    let receipt: UnknownRecord | undefined
+    try {
+      receipt = asRecord(await this.callAtInvocationBoundary<unknown>(
+        'submitCommand',
+        clientCommand,
+        () => { invoked = true },
+      ))
+    } catch (error) {
+      if (!invoked) {
+        return {
+          state: 'rejected',
+          retryable: true,
+          message: error instanceof Error ? error.message : 'Prime Agent responses are unavailable in this build.',
+        }
+      }
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: error instanceof Error
+          ? `${error.message} Prime Continuim will not send this response again.`
+          : 'Response outcome unknown. Prime Continuim will not send it again.',
+      }
+    }
+    if (
+      !receipt ||
+      asString(receipt.deviceId) !== this.deviceId ||
+      asString(receipt.commandId) !== commandId ||
+      asString(receipt.hostId) !== authority.expectedHostId ||
+      asString(receipt.threadId) !== authority.remoteThreadId ||
+      asString(receipt.executionGenerationId) !== authority.expectedExecutionGenerationId
+    ) {
+      return {
+        state: 'uncertain',
+        retryable: false,
+        message: 'The host returned a receipt for another command authority. Prime Continuim will not send this response again.',
+      }
+    }
+    const status = asString(receipt.status)
+    const error = asRecord(receipt.error)
+    const detail = asString(receipt.detail) ?? asString(receipt.message) ?? asString(error?.message)
+    if (status === 'completed') {
+      return { state: 'completed', message: detail ?? 'Response delivered to Prime Agent.' }
+    }
+    if (status === 'rejected' || status === 'failed' || status === 'cancelled') {
+      return {
+        state: 'rejected',
+        retryable: false,
+        message: detail ?? 'Prime Agent rejected this response.',
+      }
+    }
+    return {
+      state: 'uncertain',
+      retryable: false,
+      message: detail
+        ? `${detail} Prime Continuim will not send this response again.`
+        : 'Response outcome unknown. Prime Continuim will not send it again.',
+    }
+  }
+
   private residentLifecycleAuthority(options: {
     requireCapability: boolean
     expectedWorkspaceKind?: ResidentLifecycleWorkspaceKind
@@ -5748,20 +5312,23 @@ export class NativeRendererApi implements RendererApi {
     const capabilities = Array.isArray(connection?.capabilities)
       ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
       : []
-    const workspaceKind: ResidentLifecycleWorkspaceKind | undefined =
+    const connectionKind: ResidentLifecycleAuthority['connectionKind'] | undefined =
       targetKind === 'local' && path === 'local_socket'
-        ? 'local_path'
+        ? 'local'
         : targetKind === 'ssh' && path === 'ssh'
-          ? 'registered_workspace'
+          ? 'ssh'
           : undefined
-    const requiredCapability = workspaceKind === 'registered_workspace'
+    const workspaceKind = options.expectedWorkspaceKind ??
+      (connectionKind === 'local' ? 'local_path' : connectionKind === 'ssh' ? 'registered_workspace' : undefined)
+    const requiredCapability = connectionKind === 'ssh'
       ? RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY
       : RESIDENT_LIFECYCLE_CAPABILITY
     if (
       !expectedHostId ||
       phase !== 'online' ||
+      !connectionKind ||
       !workspaceKind ||
-      (options.expectedWorkspaceKind !== undefined && workspaceKind !== options.expectedWorkspaceKind) ||
+      (workspaceKind === 'local_path' && connectionKind !== 'local') ||
       this.mutationAuthorityReadyHostId !== expectedHostId ||
       (options.requireCapability && !capabilities.includes(requiredCapability))
     ) {
@@ -5772,6 +5339,7 @@ export class NativeRendererApi implements RendererApi {
     return {
       expectedHostId,
       generation: this.connectionGeneration,
+      connectionKind,
       workspaceKind,
       capabilityRequired: options.requireCapability,
     }
@@ -5779,12 +5347,12 @@ export class NativeRendererApi implements RendererApi {
 
   private assertResidentLifecycleAuthority(authority: ResidentLifecycleAuthority): void {
     const connection = asRecord(this.connection)
-    const targetKind = authority.workspaceKind === 'local_path' ? 'local' : 'ssh'
-    const path = authority.workspaceKind === 'local_path' ? 'local_socket' : 'ssh'
+    const targetKind = authority.connectionKind
+    const path = authority.connectionKind === 'local' ? 'local_socket' : 'ssh'
     const capabilities = Array.isArray(connection?.capabilities)
       ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
       : []
-    const requiredCapability = authority.workspaceKind === 'local_path'
+    const requiredCapability = authority.connectionKind === 'local'
       ? RESIDENT_LIFECYCLE_CAPABILITY
       : RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY
     if (
@@ -5883,6 +5451,88 @@ export class NativeRendererApi implements RendererApi {
     // renderer evidence and must remain check-only.
     const mode = residentProvisionResumeMode(operation)
     return reference && operation.state === 'requires_reselection' ? undefined : mode
+  }
+
+  async preselectResidentWorkspace(): Promise<ResidentWorkspacePreselection> {
+    const connection = asRecord(this.connection)
+    const hostId = asString(connection?.hostId)
+    const runtimeReadiness = asRecord(connection?.runtimeReadiness)
+    const runtimeSnapshot = asRecord(runtimeReadiness?.snapshot)
+    const phase = asString(runtimeSnapshot?.phase)
+    const runtimeHasProgress = asString(runtimeReadiness?.kind) === 'reported' &&
+      asString(runtimeReadiness?.hostId) === hostId &&
+      asString(runtimeSnapshot?.status) === 'initializing' &&
+      ['validating_seed', 'copying', 'verifying', 'publishing'].includes(phase ?? '')
+    if (
+      !hostId ||
+      asString(connection?.phase) !== 'online' ||
+      asString(asRecord(connection?.target)?.kind) !== 'local' ||
+      asString(connection?.path) !== 'local_socket' ||
+      !runtimeHasProgress
+    ) {
+      throw new Error('Workspace choice is available after verified runtime preparation starts.')
+    }
+    const generation = this.connectionGeneration
+    const preselection = residentWorkspacePreselectionFromNative(
+      await this.call<unknown>('preselectResidentWorkspace'),
+    )
+    const current = asRecord(this.connection)
+    if (
+      generation !== this.connectionGeneration ||
+      !['online', 'degraded'].includes(asString(current?.phase) ?? '') ||
+      asString(current?.hostId) !== hostId ||
+      asString(asRecord(current?.target)?.kind) !== 'local' ||
+      asString(current?.path) !== 'local_socket' ||
+      Date.parse(preselection.expiresAt) <= Date.now()
+    ) throw new StaleHostAuthorityError()
+    this.residentWorkspacePreselections.clear()
+    this.residentWorkspacePreselections.set(preselection.preselectionToken, {
+      preselection,
+      expectedHostId: hostId,
+      connectionGeneration: generation,
+    })
+    return { ...preselection }
+  }
+
+  async completeResidentWorkspacePreselection(
+    preselectionToken: string,
+  ): Promise<ResidentWorkspaceSelection> {
+    const retained = this.residentWorkspacePreselections.get(preselectionToken)
+    if (!retained || Date.parse(retained.preselection.expiresAt) <= Date.now()) {
+      this.residentWorkspacePreselections.delete(preselectionToken)
+      throw new Error('Choose the workspace folder again before continuing.')
+    }
+    const authority = this.residentLifecycleAuthority({
+      requireCapability: true,
+      expectedWorkspaceKind: 'local_path',
+    })
+    if (
+      authority.expectedHostId !== retained.expectedHostId ||
+      authority.generation !== retained.connectionGeneration
+    ) throw new StaleHostAuthorityError()
+
+    // Main consumes this token at the invocation boundary. Drop the renderer
+    // copy first so a rejected or interrupted reply is never replayed.
+    this.residentWorkspacePreselections.delete(preselectionToken)
+    const nativeSelection = residentWorkspaceSelectionFromNative(
+      await this.call<unknown>('completeResidentWorkspacePreselection', { preselectionToken }),
+    )
+    this.assertResidentLifecycleAuthority(authority)
+    if (
+      nativeSelection.expectedHostId !== authority.expectedHostId ||
+      Date.parse(nativeSelection.expiresAt) <= Date.now()
+    ) throw new StaleHostAuthorityError()
+    const selection: ResidentWorkspaceSelection = { ...nativeSelection, kind: 'local_path' }
+    this.residentWorkspaceSelections.set(selection.selectionToken, {
+      selection,
+      connectionGeneration: authority.generation,
+    })
+    return { ...selection }
+  }
+
+  async cancelResidentWorkspacePreselection(preselectionToken: string): Promise<void> {
+    this.residentWorkspacePreselections.delete(preselectionToken)
+    await this.call<void>('cancelResidentWorkspacePreselection', { preselectionToken })
   }
 
   async selectResidentWorkspace(
@@ -6014,7 +5664,7 @@ export class NativeRendererApi implements RendererApi {
     let status: ResidentLifecycleStatus | undefined
     let statusAccepted = false
     try {
-      status = ResidentLifecycleStatusSchema.parse(
+      status = requireResidentLifecycleStatus(
         await this.callAtInvocationBoundary<unknown>(
           'provisionResident',
           selection.kind === 'registered_workspace'
@@ -6078,10 +5728,17 @@ export class NativeRendererApi implements RendererApi {
       operation.executionGenerationId === input.executionGenerationId,
     )
     if (input.resumeOperationId) {
+      const resumeIsPreDispatch = Boolean(
+        exactEndOperation?.lastStatus?.kind === 'end' &&
+        exactEndOperation.lastStatus.phase === 'ending',
+      )
+      const resumeIsMissingStatus = Boolean(
+        exactEndOperation?.state === 'outcome_unknown' &&
+        exactEndOperation.lastStatus === undefined,
+      )
       if (
         exactEndOperation?.operationId !== input.resumeOperationId ||
-        exactEndOperation.lastStatus?.kind !== 'end' ||
-        exactEndOperation.lastStatus.phase !== 'ending'
+        (!resumeIsPreDispatch && !resumeIsMissingStatus)
       ) throw new StaleHostAuthorityError()
     } else if (exactEndOperation) {
       throw new Error('Review the existing resident end operation before starting another one.')
@@ -6144,7 +5801,7 @@ export class NativeRendererApi implements RendererApi {
     let status: ResidentLifecycleStatus | undefined
     let statusAccepted = false
     try {
-      status = ResidentLifecycleStatusSchema.parse(
+      status = requireResidentLifecycleStatus(
         await this.call<unknown>('endResident', input),
       )
       this.assertResidentLifecycleAuthority(authority)
@@ -6184,7 +5841,7 @@ export class NativeRendererApi implements RendererApi {
   }): Promise<ResidentLifecycleStatus | null> {
     const authority = this.residentLifecycleAuthority({ requireCapability: false })
     if (input.expectedHostId !== authority.expectedHostId) throw new StaleHostAuthorityError()
-    const result = ResidentLifecycleLookupResultSchema.parse(
+    const result = parseResidentLifecycleLookupResult(
       await this.call<unknown>('residentLifecycleStatus', input),
     )
     this.assertResidentLifecycleAuthority(authority)
@@ -6239,6 +5896,7 @@ export class NativeRendererApi implements RendererApi {
         ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
         : []
       const readiness = asRecord(connection?.runtimeReadiness)
+      const { RuntimeIntegritySnapshotSchema } = await loadProtocolSchemas()
       const previousSnapshot = RuntimeIntegritySnapshotSchema.safeParse(readiness?.snapshot)
       if (
         !expectedHostId ||
@@ -6324,6 +5982,7 @@ export class NativeRendererApi implements RendererApi {
       ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
       : []
     const readiness = asRecord(connection?.runtimeReadiness)
+    const { RuntimeIntegritySnapshotSchema } = await loadProtocolSchemas()
     const previousSnapshot = RuntimeIntegritySnapshotSchema.safeParse(readiness?.snapshot)
     if (
       !expectedHostId ||
@@ -7197,36 +6856,11 @@ export class NativeRendererApi implements RendererApi {
 
 let singletonApi: RendererApi | undefined
 
-export const INTERNAL_VISUAL_QA_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1'
-
-export function isInternalVisualQaRequest(input: {
-  protocol: string
-  hostname: string
-  userAgent: string
-  search: string
-}): boolean {
-  return input.protocol === 'http:' &&
-    input.hostname === '127.0.0.1' &&
-    input.userAgent === INTERNAL_VISUAL_QA_USER_AGENT &&
-    new URLSearchParams(input.search).has('visualState')
-}
-
 export function createRendererApi(options: { allowConnectionInitiation?: boolean } = {}): RendererApi {
   if (!singletonApi) {
     const nativeBridge = Reflect.get(window, 'prime') as NativePrimeBridge | undefined
-    const internalVisualQa = isInternalVisualQaRequest({
-      protocol: window.location.protocol,
-      hostname: window.location.hostname,
-      userAgent: window.navigator.userAgent,
-      search: window.location.search,
-    })
     if (nativeBridge) singletonApi = new NativeRendererApi(nativeBridge, options)
-    else if (internalVisualQa) singletonApi = new BrowserPreviewApi(previewVisualStateFromSearch(window.location.search))
     else throw new Error('Prime Continuim requires its desktop control bridge. Close this window and reopen the installed desktop app.')
   }
   return singletonApi
-}
-
-export function createPreviewRendererApi(visualState: PreviewVisualState = 'reconnecting'): RendererApi {
-  return new BrowserPreviewApi(visualState)
 }

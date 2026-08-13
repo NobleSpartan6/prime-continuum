@@ -49,10 +49,11 @@ describe('bundled hostd startup deadline policy', () => {
       base: [
         'resident_control_projection_v1',
         'runtime_integrity_v1',
+        'runtime_oauth_attempt_v1',
         'snapshot_chunks_v1',
       ],
       warmed: [
-        'candidate_evaluation_probe_v1',
+        ...(process.platform === 'win32' ? ['candidate_evaluation_probe_v1'] : []),
         'resident_lifecycle_v1',
         'runtime_model_catalog_v1',
         'runtime_oauth_v1',

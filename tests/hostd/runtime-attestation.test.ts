@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
@@ -11,9 +12,14 @@ import {
   createEmbeddedRuntimeAttestationRecord,
   extractEmbeddedRuntimeAttestation,
   parseRuntimeAttestation,
+  readElectronRuntimeIdentity,
+  readNodeRuntimeIdentity,
   serializeRuntimeAttestation,
   type RuntimeAttestation,
 } from "../../scripts/runtime-attestation-lib.mjs";
+import { resolvePinnedDevelopmentNodeExecutable } from "../../scripts/development-node-runtime.mjs";
+
+const require = createRequire(import.meta.url);
 
 const attestation = {
   schemaVersion: 1,
@@ -44,6 +50,20 @@ const attestation = {
   entrypoints: {
     module: "node_modules/prime-agent/dist/index.js",
     cli: "node_modules/prime-agent/dist/bundle/cli.js",
+    browserBridge: "bridge/browser-bridge.mjs",
+    browserHost: "bridge/browser-host.cjs",
+    browserLauncher: "bridge/playwright-cli",
+    browserLauncherWindows: "bridge/playwright-cli.cmd",
+    browserSkill: "bridge/skills/playwright-cli/SKILL.md",
+  },
+  browserBridge: {
+    protocol: "prime-continuim.browser.v1",
+    playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+    engine: "verified-electron-host",
+    smoke: {
+      verified: true,
+      operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
+    },
   },
   daemon: {
     protocolName: "prime-agent.daemon",
@@ -53,19 +73,40 @@ const attestation = {
     requiredCapabilities: ["attach_snapshot"],
   },
   nativeAddons: [{ path: "node_modules/native/addon.node", size: 12, sha256: "7".repeat(64) }],
-  hostRuntime: {
-    kind: "electron-run-as-node",
+  guiRuntime: {
+    kind: "electron",
     electronVersion: "43.3.0",
     nodeVersion: "24.18.1",
     modulesAbi: "148",
     napiVersion: "10",
     platform: "win32",
     arch: "x64",
-    runAsNode: true,
+    executableSha256: "8".repeat(64),
+  },
+  hostRuntime: {
+    kind: "node",
+    nodeVersion: "24.14.0",
+    modulesAbi: "137",
+    napiVersion: "10",
+    platform: "win32",
+    arch: "x64",
+    executableSha256: "9".repeat(64),
   },
 } as const satisfies RuntimeAttestation;
 
 describe("release runtime attestation", () => {
+  it("independently identifies the GUI Electron and exact pinned standalone host Node", async () => {
+    const [guiRuntime, hostRuntime] = await Promise.all([
+      readElectronRuntimeIdentity(resolve(require("electron"))),
+      readNodeRuntimeIdentity(resolvePinnedDevelopmentNodeExecutable(resolve("."))),
+    ]);
+    expect(guiRuntime).toMatchObject({ kind: "electron", electronVersion: "43.3.0" });
+    expect(hostRuntime).toMatchObject({ kind: "node", nodeVersion: "24.14.0" });
+    expect(guiRuntime.executableSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(hostRuntime.executableSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(hostRuntime.executableSha256).not.toBe(guiRuntime.executableSha256);
+  });
+
   it("round-trips one canonical bounded record", () => {
     const bytes = serializeRuntimeAttestation(attestation);
     const record = createEmbeddedRuntimeAttestationRecord(bytes);
@@ -105,6 +146,16 @@ describe("release runtime attestation", () => {
     const bytes = Buffer.from(`${JSON.stringify(legacy, null, 2)}\n`, "utf8");
     const record = `PRIME_CONTINUIM_RUNTIME_ATTESTATION_V1:${bytes.toString("base64")}`;
     expect(() => parseEmbeddedRuntimeAttestationRecord(record)).toThrow("invalid identity");
+  });
+
+  it("rejects a host executable identity that aliases the GUI executable", () => {
+    expect(() => serializeRuntimeAttestation({
+      ...attestation,
+      hostRuntime: {
+        ...attestation.hostRuntime,
+        executableSha256: attestation.guiRuntime.executableSha256,
+      },
+    } as RuntimeAttestation)).toThrow("must be unequal");
   });
 
   it("embeds the exact ASAR attestation bytes into a release hostd bundle", async () => {

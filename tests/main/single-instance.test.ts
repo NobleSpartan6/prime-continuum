@@ -55,6 +55,10 @@ describe('Electron single-instance lifecycle', () => {
     expect(fixture.hudInitialize).toHaveBeenCalledOnce()
     expect(fixture.browserWindows).toHaveLength(1)
     expect(fixture.browserWindows[0]?.loadFile).toHaveBeenCalledOnce()
+    expect(fixture.browserWindows[0]?.options).toMatchObject({ minWidth: 720, minHeight: 520 })
+    if (process.platform === 'darwin') {
+      expect(fixture.browserWindows[0]?.options).toMatchObject({ titleBarStyle: 'hiddenInset' })
+    }
 
     hudInitialization.resolve()
     await hudInitialization.promise
@@ -77,8 +81,8 @@ function installIndexMocks(ownsLock: boolean, hudInitialization: Promise<void> =
 
   const browserWindows: FakeBrowserWindow[] = []
   class BrowserWindow extends FakeBrowserWindow {
-    constructor() {
-      super()
+    constructor(options?: Record<string, unknown>) {
+      super(options)
       browserWindows.push(this)
     }
   }
@@ -124,6 +128,7 @@ function installIndexMocks(ownsLock: boolean, hudInitialization: Promise<void> =
     registerHudIpc: vi.fn(() => vi.fn()),
   }))
   vi.doMock('../../src/main/orderly-quit', () => ({ installOrderlyQuitDrain: vi.fn(() => vi.fn()) }))
+  vi.doMock('../../src/main/native-menu', () => ({ installNativeMenu: vi.fn() }))
   vi.doMock('../../src/main/window-paths', () => ({ resolvePreloadEntry: vi.fn(() => 'preload.cjs') }))
   vi.doMock('../../src/main/window-security', () => ({ secureWebPreferences: vi.fn(() => ({})) }))
 
@@ -131,6 +136,7 @@ function installIndexMocks(ownsLock: boolean, hudInitialization: Promise<void> =
 }
 
 class FakeBrowserWindow {
+  readonly options: Record<string, unknown>
   readonly restore = vi.fn()
   readonly show = vi.fn()
   readonly focus = vi.fn()
@@ -151,6 +157,10 @@ class FakeBrowserWindow {
       on: vi.fn(),
       webRequest: { onBeforeRequest: vi.fn() },
     },
+  }
+
+  constructor(options: Record<string, unknown> = {}) {
+    this.options = options
   }
 }
 

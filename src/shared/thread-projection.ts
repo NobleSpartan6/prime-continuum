@@ -59,6 +59,14 @@ export function applyThreadProjectionDelta(
     case "transcript.append": {
       const alreadyIndexed = snapshot.transcriptBlockIndex.some((entry) => entry.blockId === delta.block.blockId);
       const alreadyMaterialized = snapshot.materializedRecentBlocks.some((block) => block.blockId === delta.block.blockId);
+      const materializedRecentBlocks = alreadyMaterialized
+        ? snapshot.materializedRecentBlocks
+        : [...snapshot.materializedRecentBlocks, delta.block].slice(-MAX_MATERIALIZED_BLOCKS);
+      const terminalAssistant = snapshot.latestTurnOutcome?.terminalAssistant;
+      const latestTurnOutcome = snapshot.latestTurnOutcome && terminalAssistant &&
+        !materializedRecentBlocks.some((block) => block.blockId === terminalAssistant.blockId)
+        ? withoutTerminalAssistant(snapshot.latestTurnOutcome)
+        : snapshot.latestTurnOutcome;
       return {
         ...base,
         transcriptBlockIndex: alreadyIndexed
@@ -73,9 +81,8 @@ export function applyThreadProjectionDelta(
                 materialized: true,
               },
             ].slice(-MAX_TRANSCRIPT_INDEX_ENTRIES),
-        materializedRecentBlocks: alreadyMaterialized
-          ? snapshot.materializedRecentBlocks
-          : [...snapshot.materializedRecentBlocks, delta.block].slice(-MAX_MATERIALIZED_BLOCKS),
+        materializedRecentBlocks,
+        ...(latestTurnOutcome ? { latestTurnOutcome } : {}),
       };
     }
     case "transcript.stream": {
@@ -109,6 +116,13 @@ export function applyThreadProjectionDelta(
       };
     }
   }
+}
+
+function withoutTerminalAssistant(
+  outcome: NonNullable<ThreadProjectionSnapshot["latestTurnOutcome"]>,
+): NonNullable<ThreadProjectionSnapshot["latestTurnOutcome"]> {
+  const { terminalAssistant: _terminalAssistant, ...withoutTerminal } = outcome;
+  return withoutTerminal;
 }
 
 function assertDeltaAuthority(snapshot: ThreadProjectionSnapshot, delta: ThreadProjectionDelta): void {

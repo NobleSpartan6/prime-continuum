@@ -72,19 +72,38 @@ function validHello(overrides: Record<string, unknown> = {}): Record<string, unk
     type: "daemon_hello",
     socketPath: DAEMON_SOCKET,
     protocol: { name: "prime-agent.daemon", version: 7 },
-    schemaId: "protocol-7-schema-13-816309b1cd50",
-    schemaRevision: 13,
-    appVersion: "0.7.1",
+    schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+    schemaRevision: 16,
+    appVersion: "0.7.2",
     runtime: {
-      buildId: "95afd31-dirty",
+      buildId: "83a0f9f-dirty",
       executablePath: RUNTIME_NODE,
       entrypointPath: RUNTIME_CLI,
     },
     supervisorGeneration: "supervisor-1",
+    supervisorPid: 42,
+    supervisorOwnerToken: "owner-token-1",
+    supervisorProcessStartId: "process-start-1",
+    supervisorSocketPath: DAEMON_SOCKET,
     clientId: "client-test",
     serverCapabilities: [...REQUIRED_RESIDENT_DAEMON_CAPABILITIES],
     ...overrides,
   };
+}
+
+function incompatibleUpgradeHello(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return validHello({
+    appVersion: "0.7.0",
+    schemaId: "protocol-7-schema-12-prior",
+    schemaRevision: 12,
+    runtime: {
+      buildId: "verified-prior-build",
+      executablePath: resolve("test-runtime-prior", "node.exe"),
+      entrypointPath: resolve("test-runtime-prior", "prime-agent", "dist", "bundle", "cli.js"),
+    },
+    supervisorGeneration: "supervisor-prior",
+    ...overrides,
+  });
 }
 
 function liveSummary(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -111,6 +130,7 @@ function liveSummary(overrides: Record<string, unknown> = {}): Record<string, un
 function validSnapshot(options: {
   state?: Record<string, unknown>;
   messages?: unknown[];
+  children?: unknown[];
   cursorGeneration?: string;
   cursorSequence?: number;
 } = {}): Record<string, unknown> {
@@ -154,9 +174,58 @@ function validSnapshot(options: {
       ...options.state,
     },
     messages,
-    children: [],
+    children: options.children ?? [],
     lastEventSequence: cursorSequence,
     lastEventCursor: { generation: cursorGeneration, sequence: cursorSequence },
+  };
+}
+
+function terminalAssistantMessage(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: "The resident turn is complete." }],
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-5",
+    usage: {
+      input: 10,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 30,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 1_786_100_000_000,
+    ...overrides,
+  };
+}
+
+function rlmChild(
+  status: "queued" | "running" | "done" | "error" | "cancelled" = "running",
+): Record<string, unknown> {
+  return {
+    id: "sub-settlement-1",
+    parentId: "parent-settlement-1",
+    sessionName: "settlement-reviewer",
+    model: "openai/gpt-5",
+    label: "Review settlement authority",
+    status,
+    sessionDir: SESSION_DIRECTORY,
+    activity: status === "running" ? { kind: "executing", toolName: "exec" } : undefined,
+  };
+}
+
+function validResourceSnapshot(): Record<string, unknown> {
+  return {
+    contextFiles: [],
+    skills: [],
+    prompts: [],
+    extensions: [],
+    themes: [],
+    diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
   };
 }
 
@@ -205,6 +274,7 @@ interface HarnessState {
     binding: ResidentSessionBinding;
     projection: ResidentProjectionSnapshot;
   }>;
+  resourceSnapshotCalls: number;
   modelProjectionCalls: Array<{
     command: CommandEnvelope;
     binding: ResidentSessionBinding;
@@ -212,6 +282,7 @@ interface HarnessState {
   }>;
   waitForIdleCalls: number;
   requestHandler?: (command: Readonly<object>) => Promise<unknown> | unknown;
+  waitForHelloHandler?: () => Promise<unknown> | unknown;
   closeHandler?: () => void;
   persistHandler?: (binding: ResidentSessionBinding) => Promise<void>;
   publishProjectionHandler?: (
@@ -238,6 +309,8 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined;
   }>;
   abortCalls: number;
+  extensionUiResponseCalls: Array<{ requestId: string; response: Readonly<Record<string, unknown>> }>;
+  ephemeralProjectionChanges: ResidentSessionBinding[];
   promoteCalls: number;
   availableModelsHandler?: () => Promise<unknown> | unknown;
   setModelHandler?: (providerId: string, modelId: string) => Promise<unknown> | unknown;
@@ -246,6 +319,10 @@ interface HarnessState {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }> | undefined,
   ) => Promise<void> | void;
   abortHandler?: () => Promise<void> | void;
+  extensionUiResponseHandler?: (
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ) => Promise<void> | void;
   promoteHandler?: () => Promise<void> | void;
   promoteAvailable: boolean;
   attachHandler?: (attachmentOrdinal: number) => Promise<void> | void;
@@ -253,6 +330,7 @@ interface HarnessState {
   disposeHandler?: () => Promise<void>;
   recoverDuringAttach?: boolean;
   authorizeResidentKillInvocation?: ResidentKillInvocationAuthorizer;
+  now?: () => Date;
 }
 
 function createHarness(overrides: Partial<HarnessState> = {}) {
@@ -274,6 +352,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     launcherUnrefs: 0,
     persistCalls: [],
     projectionCalls: [],
+    resourceSnapshotCalls: 0,
     modelProjectionCalls: [],
     waitForIdleCalls: 0,
     authoritativeRoundCalls: 0,
@@ -281,6 +360,8 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     setModelCalls: [],
     promptCalls: [],
     abortCalls: 0,
+    extensionUiResponseCalls: [],
+    ephemeralProjectionChanges: [],
     promoteCalls: 0,
     promoteAvailable: true,
     ...overrides,
@@ -304,6 +385,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
 
     async waitForHello(): Promise<unknown> {
       state.chronology.push("hello");
+      if (state.waitForHelloHandler) return state.waitForHelloHandler();
       return this.hello;
     }
 
@@ -382,6 +464,10 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
             ? state.snapshotHandler(attachmentOrdinal)
             : validSnapshot();
         },
+        getResourceSnapshot: async () => {
+          state.resourceSnapshotCalls += 1;
+          return validResourceSnapshot();
+        },
         waitForIdle: async () => {
           state.waitForIdleCalls += 1;
           state.chronology.push("wait:idle");
@@ -413,6 +499,13 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
           state.abortCalls += 1;
           state.chronology.push("abort");
           await state.abortHandler?.();
+        },
+        respondToExtensionUiRequest: async (
+          requestId: string,
+          response: Readonly<Record<string, unknown>>,
+        ) => {
+          state.extensionUiResponseCalls.push({ requestId, response });
+          await state.extensionUiResponseHandler?.(requestId, response);
         },
         promoteToResident: state.promoteAvailable
           ? async () => {
@@ -460,6 +553,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
   };
 
   const adapter = new PrimeAgentResidentAdapter({
+    hostId: "host-local",
     socketPath: DAEMON_SOCKET,
     executable: RUNTIME_NODE,
     cliEntrypoint: RUNTIME_CLI,
@@ -487,6 +581,9 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
         await state.publishModelSelectionProjectionHandler(command, projectionBinding, projection);
       }
     },
+    publishEphemeralProjectionChange: (projectionBinding) => {
+      state.ephemeralProjectionChanges.push(projectionBinding);
+    },
     authorizeResidentKillInvocation: state.authorizeResidentKillInvocation,
     spawnFactory: (executable, argv, options) => {
       state.spawnCalls.push({ executable, argv, options });
@@ -497,7 +594,7 @@ function createHarness(overrides: Partial<HarnessState> = {}) {
     startupTimeoutMs: 100,
     requestTimeoutMs: 100,
     wait: async (milliseconds) => void (await state.waitHandler?.(milliseconds)),
-    now: () => new Date("2026-08-06T17:00:00.000Z"),
+    now: state.now ?? (() => new Date("2026-08-06T17:00:00.000Z")),
   });
 
   const emit = async (event: unknown): Promise<void> => {
@@ -609,11 +706,18 @@ function residentDispatchLease(
 function promptIdleReconciliationRequest(
   durableBinding: ResidentSessionBinding,
   dispatchAttemptId = "dispatch-prompt-idle-1",
+  settlementCursor: Readonly<{ generation?: string; sequence?: number }> = {},
 ): ResidentPromptIdleReconciliationRequest {
   return validateResidentPromptIdleReconciliationRequest({
     reconciliationVersion: 1,
     dispatchAttemptId,
     binding: durableBinding,
+    settlementCursor: {
+      threadId: durableBinding.threadId,
+      executionGenerationId: durableBinding.executionGenerationId,
+      generation: settlementCursor.generation ?? "events-1",
+      sequence: settlementCursor.sequence ?? 4,
+    },
   });
 }
 
@@ -671,7 +775,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     const { adapter, state } = createHarness();
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
 
     expect(state.spawnCalls).toHaveLength(0);
     expect(state.chronology).toEqual(["connect", "client:close"]);
@@ -700,7 +804,13 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
           windowsHide: true,
           detached: true,
           cwd: DAEMON_WORKING_DIRECTORY,
-          env: { Path: "C:\\Windows", ELECTRON_RUN_AS_NODE: "1" },
+          env: {
+            Path: "C:\\Windows",
+            ELECTRON_RUN_AS_NODE: "1",
+            PYTHONDONTWRITEBYTECODE: "1",
+            PRIME_AGENT_TELEMETRY: "0",
+            DO_NOT_TRACK: "1",
+          },
           stdio: "ignore",
         },
       },
@@ -710,14 +820,264 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     await adapter.close();
   });
 
-  it("fails closed on an incompatible live daemon without launching a replacement", async () => {
-    const { adapter, state } = createHarness({ hello: validHello({ appVersion: "0.7.2" }) });
+  it("gracefully retires a structurally verified incompatible daemon before launching its replacement", async () => {
+    let state!: HarnessState;
+    const harness = createHarness({
+      hello: incompatibleUpgradeHello(),
+      connectOutcomes: ["ok", "fail", "ok", "ok"],
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [], busyClientOwnedSessionCount: 0 },
+          };
+        }
+        if ((command as { type?: string }).type !== "shutdown") throw new Error("unexpected request");
+        state.hello = validHello();
+        return { type: "response", command: "shutdown", success: true };
+      },
+    });
+    state = harness.state;
     const invocation = buildHarnessInvocation();
 
-    await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_APP_VERSION_MISMATCH");
+    const results = await Promise.all([
+      harness.adapter.ensureDaemon(invocation),
+      harness.adapter.ensureDaemon(invocation),
+    ]);
 
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({ appVersion: "0.7.2" });
+    expect(results[1]).toMatchObject({ appVersion: "0.7.2" });
+    expect(state.requests).toEqual([
+      { type: "list", includeClientOwned: true },
+      { type: "shutdown" },
+    ]);
+    expect(state.requests[1]).not.toHaveProperty("force");
+    expect(state.spawnCalls).toHaveLength(1);
+    expect(harness.adapter.getLifecycle().state).toBe("ready");
+    await harness.adapter.close();
+  });
+
+  it("preserves an incompatible daemon when its exact list still contains an active session", async () => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type !== "list") throw new Error("shutdown must not be requested");
+        return {
+          type: "response",
+          command: "list",
+          success: true,
+          data: { sessions: [liveSummary()], busyClientOwnedSessionCount: 0 },
+        };
+      },
+    });
+    const invocation = buildHarnessInvocation();
+
+    const error = await expectRuntimeError(
+      adapter.ensureDaemon(invocation),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({
+      reason: "sessions_present",
+      sessionCount: 1,
+      busyClientOwnedSessionCount: 0,
+    });
+    expect(state.requests).toEqual([{ type: "list", includeClientOwned: true }]);
     expect(state.spawnCalls).toHaveLength(0);
-    expect(adapter.getLifecycle().state).toBe("failed");
+    await adapter.close();
+  });
+
+  it("preserves an incompatible daemon when hidden client-owned work is reported busy", async () => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type !== "list") throw new Error("shutdown must not be requested");
+        return {
+          type: "response",
+          command: "list",
+          success: true,
+          data: { sessions: [], busyClientOwnedSessionCount: 1 },
+        };
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.ensureDaemon(buildHarnessInvocation()),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({
+      reason: "sessions_present",
+      sessionCount: 0,
+      busyClientOwnedSessionCount: 1,
+    });
+    expect(state.requests).toEqual([{ type: "list", includeClientOwned: true }]);
+    expect(state.spawnCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it.each([
+    ["invalid", () => ({ type: "response", command: "list", success: true, data: { sessions: "unknown" } })],
+    ["timeout", () => { throw new Error("Timed out waiting for list response"); }],
+  ])("preserves an incompatible daemon when its session inventory is %s", async (_label, listResponse) => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type !== "list") throw new Error("shutdown must not be requested");
+        return listResponse();
+      },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.ensureDaemon(buildHarnessInvocation()),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({ reason: "session_inventory_unproven" });
+    expect(state.requests).toEqual([{ type: "list", includeClientOwned: true }]);
+    expect(state.spawnCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("preserves an incompatible daemon when exact owner identity changes after the empty list proof", async () => {
+    let state!: HarnessState;
+    const harness = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type !== "list") throw new Error("shutdown must not be requested");
+        state.hello = incompatibleUpgradeHello({ supervisorGeneration: "supervisor-replaced" });
+        return {
+          type: "response",
+          command: "list",
+          success: true,
+          data: { sessions: [], busyClientOwnedSessionCount: 0 },
+        };
+      },
+    });
+    state = harness.state;
+
+    const error = await expectRuntimeError(
+      harness.adapter.ensureDaemon(buildHarnessInvocation()),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({ reason: "owner_identity_changed" });
+    expect(state.requests).toEqual([{ type: "list", includeClientOwned: true }]);
+    expect(state.spawnCalls).toHaveLength(0);
+    await harness.adapter.close();
+  });
+
+  it("preserves an empty incompatible daemon that refuses graceful shutdown", async () => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => (command as { type?: string }).type === "list"
+        ? {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [], busyClientOwnedSessionCount: 0 },
+          }
+        : {
+            type: "response",
+            command: "shutdown",
+            success: false,
+            error: "shutdown refused",
+          },
+    });
+
+    const error = await expectRuntimeError(
+      adapter.ensureDaemon(buildHarnessInvocation()),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({ reason: "shutdown_refused" });
+    expect(state.requests).toEqual([
+      { type: "list", includeClientOwned: true },
+      { type: "shutdown" },
+    ]);
+    expect(state.spawnCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("accepts observed endpoint retirement when the graceful shutdown acknowledgement is dropped", async () => {
+    let state!: HarnessState;
+    const harness = createHarness({
+      hello: incompatibleUpgradeHello(),
+      connectOutcomes: ["ok", "fail", "ok"],
+      requestHandler: (command) => {
+        if ((command as { type?: string }).type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [], busyClientOwnedSessionCount: 0 },
+          };
+        }
+        state.hello = validHello();
+        throw new Error("connection closed before shutdown acknowledgement");
+      },
+    });
+    state = harness.state;
+    const invocation = buildHarnessInvocation();
+
+    await expect(harness.adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
+
+    expect(state.requests).toEqual([
+      { type: "list", includeClientOwned: true },
+      { type: "shutdown" },
+    ]);
+    expect(state.spawnCalls).toHaveLength(1);
+    await harness.adapter.close();
+  });
+
+  it("does not launch when an incompatible daemon keeps accepting connections after shutdown", async () => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(),
+      requestHandler: (command) => (command as { type?: string }).type === "list"
+        ? {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [], busyClientOwnedSessionCount: 0 },
+          }
+        : { type: "response", command: "shutdown", success: true },
+    });
+    const invocation = buildHarnessInvocation();
+
+    const error = await expectRuntimeError(
+      adapter.ensureDaemon(invocation),
+      "PRIME_RUNTIME_DAEMON_RETIREMENT_FAILED",
+    );
+
+    expect(error.details).toMatchObject({
+      reason: "endpoint_retirement_unproven",
+      shutdownAcknowledged: true,
+    });
+    expect(state.requests).toEqual([
+      { type: "list", includeClientOwned: true },
+      { type: "shutdown" },
+    ]);
+    expect(state.spawnCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it.each([
+    ["missing client identity", { clientId: undefined }],
+    ["different endpoint", { socketPath: resolve(tmpdir(), "other-prime-continuim.sock") }],
+    ["missing supervisor owner", { supervisorOwnerToken: undefined }],
+  ])("never targets an incompatible handshake with %s", async (_label, helloOverride) => {
+    const { adapter, state } = createHarness({
+      hello: incompatibleUpgradeHello(helloOverride),
+    });
+    const invocation = buildHarnessInvocation();
+
+    await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_HELLO_INVALID");
+
+    expect(state.requests).toHaveLength(0);
+    expect(state.spawnCalls).toHaveLength(0);
     await adapter.close();
   });
 
@@ -731,6 +1091,22 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     await adapter.close();
   });
 
+  it("never requests retirement when a connected endpoint times out before a verified hello", async () => {
+    const { adapter, state } = createHarness({
+      hello: undefined,
+      waitForHelloHandler: () => {
+        throw new Error("Timed out waiting for daemon hello");
+      },
+    });
+    const invocation = buildHarnessInvocation();
+
+    await expectRuntimeError(adapter.ensureDaemon(invocation), "PRIME_RUNTIME_HELLO_INVALID");
+
+    expect(state.requests).toHaveLength(0);
+    expect(state.spawnCalls).toHaveLength(0);
+    await adapter.close();
+  });
+
   it("accepts a valid external winner even when the local launcher exits nonzero", async () => {
     const { adapter, state } = createHarness({
       connectOutcomes: ["fail", "fail", "ok"],
@@ -738,7 +1114,7 @@ describe("PrimeAgentResidentAdapter daemon ownership", () => {
     });
     const invocation = buildHarnessInvocation();
 
-    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.1" });
+    await expect(adapter.ensureDaemon(invocation)).resolves.toMatchObject({ appVersion: "0.7.2" });
 
     expect(state.spawnCalls).toHaveLength(1);
     expect(adapter.getLifecycle().state).toBe("ready");
@@ -766,7 +1142,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
 
     expect(state.requests).toEqual([{
       type: "create",
-      config: { cwd: WORKSPACE_DIRECTORY },
+      config: { cwd: WORKSPACE_DIRECTORY, telemetryDisabled: true },
       lifecycle: "client_owned",
       noSession: false,
       name: "Prime Continuim",
@@ -777,8 +1153,9 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: true,
+        telemetryDisabled: true,
       },
     });
     expect(candidate).toMatchObject({
@@ -790,7 +1167,7 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
       sessionId: "session-1",
       sessionFile: SESSION_FILE,
       boundAt: "2026-08-06T17:00:00.000Z",
-      runtime: { runtimeBuildId: "95afd31-dirty" },
+      runtime: { runtimeBuildId: "83a0f9f-dirty" },
     });
     expect(Object.isFrozen(candidate)).toBe(true);
     expect(Object.isFrozen(candidate.runtime)).toBe(true);
@@ -1175,6 +1552,125 @@ describe("PrimeAgentResidentAdapter client-owned escrow", () => {
   });
 });
 
+describe("PrimeAgentResidentAdapter extension UI", () => {
+  it("normalizes only the four bounded dialog methods on their exact live attachment", async () => {
+    const { adapter, emit } = createHarness();
+    await adapter.attachResident(binding());
+    const dialogs = [
+      { id: "request-select", method: "select", payload: { title: "Choose", options: ["A", "B"] } },
+      { id: "request-confirm", method: "confirm", payload: { title: "Continue?", message: "Run it", timeout: 5_000 } },
+      { id: "request-input", method: "input", payload: { title: "Name", placeholder: "value" } },
+      { id: "request-editor", method: "editor", payload: { title: "Edit", prefill: "line one" } },
+    ] as const;
+    for (const request of dialogs) await emit({ type: "extension_ui_request", request });
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-notify", method: "notify", payload: { message: "ignored" } },
+    });
+
+    const requests = adapter.listResidentExtensionUiRequests(binding());
+    expect(requests.map((request) => request.method)).toEqual(["select", "confirm", "input", "editor"]);
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        hostId: "host-local",
+        threadId: "thread-1",
+        executionGenerationId: "generation-1",
+        requestId: "request-select",
+        method: "select",
+        options: ["A", "B"],
+      }),
+      expect.objectContaining({ requestId: "request-confirm", method: "confirm", timeoutMs: 5_000 }),
+    ]));
+    expect(requests.every((request) => /^[a-f0-9]{64}$/.test(request.requestDigest))).toBe(true);
+    expect(requests.every((request) => /^[a-f0-9]{64}$/.test(request.bindingFingerprint))).toBe(true);
+  });
+
+  it("keeps the first timestamp for duplicate events and retires timed-out dialog truthfully", async () => {
+    let current = new Date("2026-08-06T17:00:00.000Z");
+    const { adapter, emit, state } = createHarness({ now: () => current });
+    const connection = await adapter.attachResident(binding());
+    const request = {
+      id: "request-timeout",
+      method: "input",
+      payload: { title: "Value", timeout: 1_000 },
+    } as const;
+    await emit({ type: "extension_ui_request", request });
+    current = new Date("2026-08-06T17:00:00.500Z");
+    await emit({ type: "extension_ui_request", request });
+    expect(adapter.listResidentExtensionUiRequests(binding())).toHaveLength(1);
+    const liveRequest = adapter.listResidentExtensionUiRequests(binding())[0];
+    expect(liveRequest?.receivedAt).toBe("2026-08-06T17:00:00.000Z");
+
+    current = new Date("2026-08-06T17:00:01.000Z");
+    expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+    if (!liveRequest) throw new Error("timed dialog fixture missing");
+    await expect(connection.respondToExtensionUiRequest(liveRequest, { kind: "value", value: "late" }))
+      .rejects.toMatchObject({ code: "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED" });
+    expect(state.extensionUiResponseCalls).toEqual([]);
+    await emit({ type: "extension_ui_request", request });
+    expect(await adapter.isLive("thread-1", "generation-1")).toBe(true);
+    expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+    await emit({
+      type: "extension_ui_request",
+      request: { ...request, payload: { ...request.payload, title: "Changed" } },
+    });
+    expect(await adapter.isLive("thread-1", "generation-1")).toBe(false);
+  });
+
+  it("publishes dialog expiry even when no projection read occurs", async () => {
+    vi.useFakeTimers();
+    try {
+      const { adapter, emit, state } = createHarness();
+      await adapter.attachResident(binding());
+      await emit({
+        type: "extension_ui_request",
+        request: { id: "request-timer", method: "input", payload: { title: "Value", timeout: 1_000 } },
+      });
+      expect(adapter.listResidentExtensionUiRequests(binding())).toHaveLength(1);
+      expect(state.ephemeralProjectionChanges).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(adapter.listResidentExtensionUiRequests(binding())).toEqual([]);
+      expect(state.ephemeralProjectionChanges).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires queued dialogs synchronously before invoking either upstream response", async () => {
+    const firstResponse = deferred();
+    const { adapter, emit, state } = createHarness({
+      extensionUiResponseHandler: async (requestId) => {
+        if (requestId === "request-a") await firstResponse.promise;
+      },
+    });
+    const connection = await adapter.attachResident(binding());
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-a", method: "input", payload: { title: "First" } },
+    });
+    await emit({
+      type: "extension_ui_request",
+      request: { id: "request-b", method: "input", payload: { title: "Second" } },
+    });
+    const [requestA, requestB] = connection.listExtensionUiRequests();
+    if (!requestA || !requestB) throw new Error("extension UI queue fixture missing");
+
+    const responseA = connection.respondToExtensionUiRequest(requestA, { kind: "value", value: "A" });
+    expect(connection.listExtensionUiRequests().map((request) => request.requestId)).toEqual(["request-b"]);
+    await vi.waitFor(() => expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a"]));
+
+    const responseB = connection.respondToExtensionUiRequest(requestB, { kind: "value", value: "B" });
+    expect(connection.listExtensionUiRequests()).toEqual([]);
+    expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a"]);
+
+    firstResponse.resolve();
+    await expect(Promise.all([responseA, responseB])).resolves.toEqual([undefined, undefined]);
+    expect(state.extensionUiResponseCalls.map((call) => call.requestId)).toEqual(["request-a", "request-b"]);
+  });
+});
+
 describe("PrimeAgentResidentAdapter session lifecycle", () => {
   it("accepts only one exact Store lease and invokes one independent list-fenced root kill", async () => {
     const authority = await issueResidentKillLease();
@@ -1250,7 +1746,75 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     await adapter.close();
   });
 
-  it("rejects an exact archived session before Store authorization and never invokes kill", async () => {
+  it("completes an explicitly authorized end when Prime already passivated the exact runtime", async () => {
+    const authority = await issueResidentKillLease("resident-end-already-passivated");
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      authority.store.authorizeResidentKillInvocation(lease));
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [] },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expect(adapter.endResidentSession(authority.lease)).resolves.toEqual({
+      acknowledgementVersion: 1,
+      operation: "end",
+      activeSessionId: authority.binding.activeSessionId,
+      sessionId: authority.binding.sessionId,
+    });
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
+    await adapter.close();
+  });
+
+  it("does not retire a saved session that is active under a different runtime identity", async () => {
+    const authority = await issueResidentKillLease("resident-end-rehydrated-elsewhere");
+    const authorize = vi.fn((lease: ResidentKillLease) =>
+      authority.store.authorizeResidentKillInvocation(lease));
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: authorize,
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: {
+              sessions: [liveSummary({
+                activeSessionId: "replacement-active-session",
+                sessionId: authority.binding.sessionId,
+                sessionFile: authority.binding.sessionFile,
+                cwd: authority.binding.workspaceDirectory,
+              })],
+            },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_SESSION_MISMATCH",
+    });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
+    await authority.store.failResidentKillBeforeEffect(authority.lease);
+    await adapter.close();
+  });
+
+  it("settles an exact archived session under one-use Store authority without invoking kill", async () => {
     const authority = await issueResidentKillLease("resident-end-archived");
     const authorize = vi.fn((lease: ResidentKillLease) =>
       authority.store.authorizeResidentKillInvocation(lease));
@@ -1275,12 +1839,18 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
       },
     });
 
-    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
-      code: "PRIME_RUNTIME_SESSION_NOT_FOUND",
+    await expect(adapter.endResidentSession(authority.lease)).resolves.toEqual({
+      acknowledgementVersion: 1,
+      operation: "end",
+      activeSessionId: authority.binding.activeSessionId,
+      sessionId: authority.binding.sessionId,
     });
-    expect(authorize).not.toHaveBeenCalled();
+    expect(authorize).toHaveBeenCalledOnce();
     expect(state.requests.map((request) => (request as { type?: string }).type)).toEqual(["list"]);
-    await authority.store.failResidentKillBeforeEffect(authority.lease);
+    await expect(adapter.endResidentSession(authority.lease)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_LIFECYCLE_AUTHORITY_INVALID",
+    });
+    expect(state.requests.some((request) => (request as { type?: string }).type === "kill")).toBe(false);
     await adapter.close();
   });
 
@@ -1464,7 +2034,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     expect(state.requests).toEqual([{ type: "list" }]);
     expect(state.attachCalls).toEqual([{
       activeSessionId: "active-1",
-      options: expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
+      options: expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
     }]);
     expect(state.chronology.filter((entry) => entry === "snapshot")).toHaveLength(2);
     expect(state.disposeCalls).toBe(1);
@@ -1498,7 +2068,7 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
 
     expect(state.requests[0]).toEqual({
       type: "create",
-      config: { cwd: WORKSPACE_DIRECTORY },
+      config: { cwd: WORKSPACE_DIRECTORY, telemetryDisabled: true },
       lifecycle: "resident",
       noSession: false,
       name: "Prime Continuim",
@@ -1520,8 +2090,9 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: false,
+        telemetryDisabled: true,
       },
     });
     expect(state.persistCalls[0]).toMatchObject({
@@ -1804,6 +2375,307 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     await adapter.close();
   });
 
+  it("proves same-process prompt idle from a terminal event observed before reconciliation", async () => {
+    const terminal = terminalAssistantMessage();
+    let phase: "initial" | "terminal" = "initial";
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => phase === "initial"
+        ? validSnapshot({ cursorSequence: 4 })
+        : validSnapshot({ messages: [terminal], cursorSequence: 5 }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-fast-terminal-before-reconciliation",
+    );
+    await connection.prompt("Complete immediately.", dispatch);
+
+    phase = "terminal";
+    await emit({ type: "session_event", event: { type: "message_end", message: terminal } });
+    const evidence = await connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId),
+    );
+    expect(evidence).toMatchObject({
+      dispatchAttemptId: dispatch.dispatchAttemptId,
+      projection: {
+        cursor: { generation: "events-1", sequence: 5 },
+        terminalAssistant: { stopReason: "stop" },
+      },
+      terminalAssistant: {
+        blockId: expect.any(String),
+        stopReason: "stop",
+      },
+    });
+
+    expect(state.waitForIdleCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("retries a lagging post-terminal snapshot without falling back to the public idle barrier", async () => {
+    const terminal = terminalAssistantMessage();
+    let phase: "initial" | "terminal" = "initial";
+    let terminalReads = 0;
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => {
+        if (phase === "initial") return validSnapshot({ cursorSequence: 4 });
+        terminalReads += 1;
+        const cursorSequence = terminalReads <= 4 ? 4 + terminalReads : 9;
+        return validSnapshot({ messages: [terminal], cursorSequence });
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-terminal-snapshot-lag",
+    );
+    await connection.prompt("Complete before the snapshot cache catches up.", dispatch);
+
+    phase = "terminal";
+    await emit({ type: "session_event", event: { type: "message_end", message: terminal } });
+    await expect(connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId),
+    )).resolves.toMatchObject({
+      projection: { cursor: { generation: "events-1", sequence: 9 } },
+    });
+
+    expect(terminalReads).toBeGreaterThanOrEqual(6);
+    expect(state.waitForIdleCalls).toBe(0);
+    expect(state.promptCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("cancels reconciliation during reconnect, then settles the same prompt once after validated resync", async () => {
+    const terminal = terminalAssistantMessage();
+    const reconciliationBackoff = deferred();
+    let phase: "initial" | "terminal" = "initial";
+    const { adapter, state, emit } = createHarness({
+      waitHandler: (milliseconds) => milliseconds === 25
+        ? reconciliationBackoff.promise
+        : undefined,
+      snapshotHandler: () => phase === "initial"
+        ? validSnapshot({ cursorSequence: 4 })
+        : validSnapshot({ messages: [terminal], cursorSequence: 5 }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-reconcile-through-resync",
+    );
+    await connection.prompt("Reconnect while this result is pending.", dispatch);
+    const request = promptIdleReconciliationRequest(
+      connection.binding,
+      dispatch.dispatchAttemptId,
+    );
+    const interrupted = connection.reconcileAcknowledgedPromptIdle(request);
+    await Promise.resolve();
+
+    await emit({ type: "connection_status", status: "reconnecting" });
+    await expect(interrupted).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    await emit({ type: "session_resynced", snapshot: validSnapshot({ cursorSequence: 4 }) });
+    await emit({ type: "connection_status", status: "connected" });
+
+    phase = "terminal";
+    await emit({ type: "session_event", event: { type: "message_end", message: terminal } });
+    await expect(connection.reconcileAcknowledgedPromptIdle(request)).resolves.toMatchObject({
+      dispatchAttemptId: dispatch.dispatchAttemptId,
+      projection: { cursor: { generation: "events-1", sequence: 5 } },
+    });
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.waitForIdleCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("retains one observed RLM child and terminal proof across a validated cursor-generation rollover", async () => {
+    const terminal = terminalAssistantMessage();
+    let phase: "initial" | "terminal" = "initial";
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => phase === "initial"
+        ? validSnapshot({ cursorGeneration: "events-1", cursorSequence: 4 })
+        : validSnapshot({
+            messages: [terminal],
+            cursorGeneration: "events-2",
+            cursorSequence: 1,
+          }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-terminal-before-generation-rollover",
+    );
+    await connection.prompt("Delegate one bounded review, then finish.", dispatch);
+    await emit({
+      type: "session_event",
+      event: { type: "rlm_child_update", child: rlmChild("done") },
+    });
+    phase = "terminal";
+    await emit({ type: "session_event", event: { type: "message_end", message: terminal } });
+
+    await emit({ type: "connection_status", status: "reconnecting" });
+    await emit({
+      type: "session_resynced",
+      snapshot: validSnapshot({
+        messages: [terminal],
+        cursorGeneration: "events-2",
+        cursorSequence: 0,
+      }),
+    });
+    await emit({ type: "connection_status", status: "connected" });
+
+    await expect(connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId),
+    )).resolves.toMatchObject({
+      projection: {
+        cursor: { generation: "events-2", sequence: 1 },
+        childAgents: [{ agentId: "sub-settlement-1", state: "complete" }],
+      },
+    });
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.waitForIdleCalls).toBe(0);
+    expect(state.projectionCalls.at(-1)?.projection.childAgents).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("settles repeated prompts independently while exact retries and child updates remain non-replayed", async () => {
+    const firstTerminal = terminalAssistantMessage({ timestamp: 1_786_100_000_001 });
+    const secondTerminal = terminalAssistantMessage({ timestamp: 1_786_100_000_002 });
+    let phase: "initial" | "first" | "second" = "initial";
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => phase === "initial"
+        ? validSnapshot({ cursorSequence: 4 })
+        : phase === "first"
+          ? validSnapshot({ messages: [firstTerminal], cursorSequence: 5 })
+          : validSnapshot({ messages: [firstTerminal, secondTerminal], cursorSequence: 6 }),
+    });
+    const connection = await adapter.createResident(createInput());
+    const firstDispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-repeated-prompt-1",
+    );
+    await connection.prompt("Run one child review.", firstDispatch);
+    await emit({
+      type: "session_event",
+      event: { type: "rlm_child_update", child: rlmChild("running") },
+    });
+    phase = "first";
+    await emit({ type: "session_event", event: { type: "message_end", message: firstTerminal } });
+    await connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, firstDispatch.dispatchAttemptId),
+    );
+
+    await expect(connection.prompt("Run one child review.", firstDispatch)).resolves.toMatchObject({
+      operation: "prompt",
+      disposition: "accepted",
+    });
+    const secondDispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-repeated-prompt-2",
+    );
+    await connection.prompt("Use the retained review and finish.", secondDispatch);
+    await emit({
+      type: "session_event",
+      event: { type: "rlm_child_update", child: rlmChild("done") },
+    });
+    phase = "second";
+    await emit({ type: "session_event", event: { type: "message_end", message: secondTerminal } });
+    const secondEvidence = await connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(
+        connection.binding,
+        secondDispatch.dispatchAttemptId,
+        { sequence: 5 },
+      ),
+    );
+
+    expect(state.promptCalls.map(({ message }) => message)).toEqual([
+      "Run one child review.",
+      "Use the retained review and finish.",
+    ]);
+    expect(secondEvidence.projection.childAgents).toEqual([
+      expect.objectContaining({ agentId: "sub-settlement-1", state: "complete" }),
+    ]);
+    expect(state.waitForIdleCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("fails closed on execution-generation replacement without replaying prompt or reconciliation", async () => {
+    const { adapter, state } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const originalDispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-before-execution-generation-replacement",
+    );
+    await connection.prompt("Admit only on the original execution generation.", originalDispatch);
+    const replacementBinding = binding({ executionGenerationId: "generation-2" });
+
+    await expect(connection.prompt(
+      "Never replay on the replacement generation.",
+      residentDispatchLease(
+        "prompt",
+        replacementBinding,
+        "dispatch-after-execution-generation-replacement",
+      ),
+    )).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_DISPATCH_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    await expect(connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(
+        replacementBinding,
+        originalDispatch.dispatchAttemptId,
+      ),
+    )).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+
+    expect(state.promptCalls).toHaveLength(1);
+    expect(state.waitForIdleCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("cancels a terminal-event waiter when the exact connection begins reconnecting", async () => {
+    const { adapter, state, emit } = createHarness();
+    const connection = await adapter.createResident(createInput());
+    const dispatch = residentDispatchLease(
+      "prompt",
+      connection.binding,
+      "dispatch-terminal-waiter-reconnect",
+    );
+    await connection.prompt("Wait for a terminal result.", dispatch);
+    const reconciliation = connection.reconcileAcknowledgedPromptIdle(
+      promptIdleReconciliationRequest(connection.binding, dispatch.dispatchAttemptId),
+    );
+    await Promise.resolve();
+
+    await emit({ type: "connection_status", status: "reconnecting" });
+    await expect(reconciliation).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_PROMPT_RECONCILIATION_AUTHORITY_CHANGED",
+      retryable: false,
+    });
+    expect(state.waitForIdleCalls).toBe(0);
+
+    // A later event must not revive or publish from the cancelled waiter.
+    await emit({ type: "session_event", event: { type: "agent_end" } });
+    expect(state.projectionCalls).toHaveLength(1);
+    await connection.detach();
+    await adapter.close();
+  });
+
   it("never infers idle from an abort acknowledgement and deduplicates the explicit no-event barrier", async () => {
     const { adapter, state } = createHarness();
     const connection = await adapter.createResident(createInput());
@@ -1832,6 +2704,47 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     // authorize an active-to-idle rewrite at this unchanged upstream cursor.
     expect(state.projectionCalls).toHaveLength(1);
 
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("bounds a never-resolving Stop idle barrier without replaying abort or mutating authority", async () => {
+    const neverSettles = new Promise<void>(() => undefined);
+    const { adapter, state } = createHarness({ waitForIdleHandler: () => neverSettles });
+    const connection = await adapter.createResident(createInput());
+    const originalBinding = connection.binding;
+    const persistCount = state.persistCalls.length;
+    const projectionCount = state.projectionCalls.length;
+    const dispatch = residentDispatchLease(
+      "abort",
+      originalBinding,
+      "dispatch-abort-bounded-idle-recovery",
+    );
+    await expect(connection.abort(dispatch)).resolves.toMatchObject({
+      operation: "abort",
+      disposition: "accepted",
+    });
+    const request = abortIdleReconciliationRequest(
+      originalBinding,
+      dispatch.dispatchAttemptId,
+    );
+
+    await expect(connection.reconcileAcknowledgedAbortIdle(request)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_REQUEST_FAILED",
+      retryable: true,
+      details: { dispatchAttemptId: dispatch.dispatchAttemptId },
+    });
+    await expect(connection.reconcileAcknowledgedAbortIdle(request)).rejects.toMatchObject({
+      code: "PRIME_RUNTIME_REQUEST_FAILED",
+      retryable: true,
+    });
+
+    expect(state.abortCalls).toBe(1);
+    expect(state.waitForIdleCalls).toBe(2);
+    expect(state.projectionCalls).toHaveLength(projectionCount);
+    expect(state.persistCalls).toHaveLength(persistCount);
+    expect(connection.binding).toEqual(originalBinding);
+    expect(connection.getLifecycle().state).toBe("ready");
     await connection.detach();
     await adapter.close();
   });
@@ -2327,7 +3240,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     projectionPhase = "active";
     await emit({ type: "session_event", event: { type: "message_update" } });
     await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
       cursor: { generation: "events-1", sequence: 5 },
       runtime: { isStreaming: true },
@@ -2453,7 +3366,7 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     projectionPhase = "active";
     await emit({ type: "session_event", event: { type: "agent_end" } });
     await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     await expect(
       connection.abort(
@@ -2745,6 +3658,102 @@ describe("PrimeAgentResidentAdapter generation-bound resident dispatch", () => {
     expect(state.projectionCalls[1]?.projection.runtime.recap).toBe("Stream is quiet.");
     expect(streamingReads).toBe(10);
     expect(state.disposeCalls).toBe(0);
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("publishes live RLM child state without rediscovering attachment resources", async () => {
+    let phase: "initial" | "active" = "initial";
+    let activeReads = 0;
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => {
+        if (phase === "initial") return validSnapshot({ cursorSequence: 4 });
+        activeReads += 1;
+        return validSnapshot({
+          cursorSequence: 4 + activeReads,
+          state: {
+            isStreaming: true,
+            sessionActions: {
+              queuedCount: 0,
+              steering: [],
+              followUps: [],
+              active: { kind: "turn", phase: "running" },
+            },
+            goal: {
+              active: true,
+              status: "active",
+              goalId: "goal-live-1",
+              objective: "Improve the harness",
+              tokensUsed: 120,
+              timeUsedSeconds: 4,
+              continuationsUsed: 0,
+              updatedAt: 1_786_100_001_000,
+            },
+          },
+        });
+      },
+    });
+    const connection = await adapter.createResident(createInput());
+    expect(state.resourceSnapshotCalls).toBe(1);
+    phase = "active";
+    await emit({
+      type: "session_event",
+      event: {
+        type: "rlm_child_update",
+        child: {
+          id: "sub-live-1",
+          parentId: "parent-live-1",
+          sessionName: "harness-reviewer",
+          model: "openai/gpt-5",
+          label: "Review the harness",
+          status: "running",
+          sessionDir: SESSION_DIRECTORY,
+          activity: { kind: "executing", toolName: "exec" },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+
+    expect(activeReads).toBe(4);
+    expect(state.resourceSnapshotCalls).toBe(1);
+    expect(state.projectionCalls.at(-1)?.projection).toMatchObject({
+      cursor: { generation: "events-1", sequence: 8 },
+      runtime: { isStreaming: true },
+      goal: { goalId: "goal-live-1", objective: "Improve the harness", state: "active" },
+      childAgents: [{ agentId: "sub-live-1", title: "Review the harness", state: "running" }],
+    });
+    await connection.detach();
+    await adapter.close();
+  });
+
+  it("lets a fresh child snapshot supersede an older event and retains that newer state through omission", async () => {
+    let phase: "initial" | "fresh" | "omitted" = "initial";
+    const { adapter, state, emit } = createHarness({
+      snapshotHandler: () => phase === "initial"
+        ? validSnapshot({ cursorSequence: 4 })
+        : phase === "fresh"
+          ? validSnapshot({ children: [rlmChild("done")], cursorSequence: 5 })
+          : validSnapshot({ children: [], cursorSequence: 6 }),
+    });
+    const connection = await adapter.createResident(createInput());
+
+    phase = "fresh";
+    await emit({
+      type: "session_event",
+      event: { type: "rlm_child_update", child: rlmChild("running") },
+    });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(2));
+    expect(state.projectionCalls.at(-1)?.projection.childAgents).toEqual([
+      expect.objectContaining({ agentId: "sub-settlement-1", state: "complete" }),
+    ]);
+
+    phase = "omitted";
+    await emit({ type: "session_event", event: { type: "agent_end" } });
+    await vi.waitFor(() => expect(state.projectionCalls).toHaveLength(3));
+    expect(state.projectionCalls.at(-1)?.projection.childAgents).toEqual([
+      expect.objectContaining({ agentId: "sub-settlement-1", state: "complete" }),
+    ]);
+
     await connection.detach();
     await adapter.close();
   });

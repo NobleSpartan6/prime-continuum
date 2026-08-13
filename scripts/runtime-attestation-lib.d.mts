@@ -7,8 +7,10 @@ export interface RuntimeAttestation {
   readonly manifest: Readonly<Record<string, unknown>>;
   readonly tree: Readonly<Record<string, unknown>>;
   readonly entrypoints: Readonly<Record<string, unknown>>;
+  readonly browserBridge: Readonly<Record<string, unknown>>;
   readonly daemon: Readonly<Record<string, unknown>>;
   readonly nativeAddons: readonly Readonly<Record<string, unknown>>[];
+  readonly guiRuntime: Readonly<Record<string, unknown>>;
   readonly hostRuntime: Readonly<Record<string, unknown>>;
 }
 
@@ -17,6 +19,8 @@ export const MAX_RUNTIME_ATTESTATION_BYTES: number;
 export function createRuntimeAttestation(options: {
   runtimeRoot?: string;
   electronExecutable: string;
+  hostNodeExecutable: string;
+  hostNodeVersion?: string;
   templateDirectory?: string;
 }): Promise<RuntimeAttestation>;
 export function serializeRuntimeAttestation(attestation: RuntimeAttestation): Buffer;
@@ -28,7 +32,9 @@ export function assertRuntimeAttestationMatches(attestation: RuntimeAttestation,
   manifest: Record<string, any>;
   manifestBytes: Uint8Array;
   fileManifestBytes: Uint8Array;
-  runtimeVersions: Record<string, unknown>;
+  guiRuntime: Record<string, unknown>;
+  hostRuntime: Record<string, unknown>;
   inputs: { policy: Record<string, any> };
 }): void;
 export function readElectronRuntimeIdentity(executablePath: string): Promise<Record<string, unknown>>;
+export function readNodeRuntimeIdentity(executablePath: string): Promise<Record<string, unknown>>;

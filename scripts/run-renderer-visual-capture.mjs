@@ -11,7 +11,16 @@ const resultPath = join(outputDirectory, 'capture-result.json')
 const errorPath = join(outputDirectory, 'capture-error.txt')
 const environment = { ...process.env }
 const expectedTargets = [
+  ['desktop-agent-launchpad', 1600, 1000, 'launchpad', undefined],
+  ['mobile-agent-launchpad-390', 390, 844, 'launchpad', undefined],
   ['desktop-idle', 1600, 1000, 'idle', undefined],
+  ['desktop-investigation', 1600, 1000, 'idle', undefined],
+  ['desktop-rlm-activity', 1200, 800, 'rlm-activity', undefined],
+  ['desktop-extension-question', 1200, 800, 'extension-ui-confirm', undefined],
+  ['mobile-extension-question-390', 390, 844, 'extension-ui-confirm', undefined],
+  ['mobile-idle-390', 390, 844, 'idle', undefined],
+  ['compact-idle-320', 320, 704, 'idle', undefined],
+  ['mobile-inspector-390', 390, 844, 'idle', undefined],
   ['model-selection-dialog-390', 390, 844, 'model-selection', undefined],
   ['model-selection-dialog-short-320', 320, 256, 'model-selection', undefined],
   ['prime-oauth-dialog-390', 390, 844, 'prime-oauth', undefined],
@@ -26,13 +35,12 @@ const expectedTargets = [
   ['ssh-registered-workspace-dialog-short-320', 320, 256, 'ssh-registered-workspace', undefined],
   ['resident-dialog-390', 390, 844, 'resident-start', undefined],
   ['resident-dialog-short-320', 320, 256, 'resident-start', undefined],
-  ['resident-end-dialog-390', 390, 844, 'resident-end-review', undefined],
-  ['resident-end-dialog-short-320', 320, 256, 'resident-end-review', undefined],
   ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
   ['candidate-evaluation-dialog-390', 390, 844, 'candidate-evaluation-review', undefined],
   ['candidate-evaluation-dialog-short-320', 320, 256, 'candidate-evaluation-review', undefined],
   ['hud-expanded', 620, 380, 'hud-expanded', 'hud'],
+  ['hud-expanded-320', 320, 240, 'hud-expanded', 'hud'],
   ['hud-buddy', 184, 64, 'hud-buddy', 'hud'],
 ]
 const obsoleteCaptures = [
@@ -47,11 +55,13 @@ const obsoleteCaptures = [
   'codex-signed-out-short-320.png',
   'codex-ready-390.png',
   'codex-ready-short-320.png',
+  'resident-end-dialog-390.png',
+  'resident-end-dialog-short-320.png',
 ]
 
-// Electron's RunAsNode mode is required by the packaged hostd launcher, but a
-// developer shell can retain it after a runtime smoke. Visual capture must use
-// the real Electron main process regardless of that ambient state.
+// Hostd owns a separate pinned Node executable, but a developer shell can
+// still retain RunAsNode after a browser smoke. Visual capture must use the
+// real Electron main process regardless of that ambient state.
 delete environment.ELECTRON_RUN_AS_NODE
 
 await Promise.all([
@@ -99,7 +109,13 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     result.visualState !== visualState ||
     result.surface !== surface ||
     result.stateEvidence?.expectedTextPresent !== true ||
-    (name.startsWith('desktop-') && name !== 'desktop-idle' && result.stateEvidence?.composerStatusVisible !== true) ||
+    (name.startsWith('desktop-') && name !== 'desktop-idle' && name !== 'desktop-end-pending-390' && name !== 'desktop-extension-question' && result.stateEvidence?.composerStatusVisible !== true) ||
+    (name === 'desktop-end-pending-390' && result.stateEvidence?.composerStatusVisible !== false) ||
+    ((name === 'desktop-extension-question' || name === 'mobile-extension-question-390') && (
+      result.stateEvidence?.extensionQuestionVisible !== true ||
+      result.stateEvidence?.extensionComposerSuppressed !== true ||
+      result.stateEvidence?.extensionConfirmEnabled !== true
+    )) ||
     ((name === 'resident-dialog-390' || name === 'resident-dialog-short-320') && result.stateEvidence?.residentDialogOpen !== true) ||
     (name === 'resident-dialog-short-320' && result.stateEvidence?.residentDialogContentReachable !== true) ||
     (name.startsWith('ssh-registered-workspace-dialog-') && (
@@ -112,7 +128,7 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
       result.stateEvidence?.residentThreadInputCount !== 1 ||
       result.stateEvidence?.residentThreadTitleOnlyInput !== true ||
       result.stateEvidence?.residentThreadTitleVisible !== true ||
-      result.stateEvidence?.residentProvisionActionText !== 'Create resident thread' ||
+      result.stateEvidence?.residentProvisionActionText !== 'Start agent' ||
       result.stateEvidence?.residentProvisionActionEnabled !== true ||
       result.stateEvidence?.residentProvisionActionVisible !== true ||
       result.stateEvidence?.residentProvisionUnsubmitted !== true ||
@@ -124,8 +140,8 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
       result.stateEvidence?.residentBackgroundWorkbenchLocked !== true ||
       result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionVisible !== true ||
       result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionEnabled !== true ||
-      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionText !== 'New resident thread in this workspace' ||
-      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.helperText !== 'Uses this saved host-owned workspace. You’ll name only the new thread.' ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.actionText !== 'New agent' ||
+      result.stateEvidence?.registeredWorkspaceTriggerEvidence?.helperText !== 'Uses this saved workspace.' ||
       result.stateEvidence?.registeredWorkspaceTriggerEvidence?.forbiddenActionCopyPresent !== false ||
       result.stateEvidence?.registeredWorkspaceTriggerEvidence?.sidebarBounded !== true ||
       result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogBounded !== true ||
@@ -136,8 +152,6 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
       !(result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogScrollHeight >
         result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogClientHeight)
     )) ||
-    ((name === 'resident-end-dialog-390' || name === 'resident-end-dialog-short-320') && result.stateEvidence?.residentEndDialogOpen !== true) ||
-    (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
     ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||
     (name === 'candidate-evaluation-dialog-short-320' && result.stateEvidence?.candidateEvaluationDialogContentReachable !== true) ||
     ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-')) && (
@@ -152,11 +166,16 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
       result.stateEvidence?.modelsSurfaceScrollTop !== 0
     )) ||
     (name === 'resident-recovery-short-320' && result.stateEvidence?.emptyMainScrollable !== true)
+    || ((name === 'mobile-agent-launchpad-390' || name === 'mobile-idle-390' || name === 'compact-idle-320' || name === 'mobile-inspector-390') &&
+      result.stateEvidence?.responsiveTopbarBounded !== true)
+    || ((name === 'mobile-idle-390' || name === 'compact-idle-320') &&
+      result.stateEvidence?.horizontalTaskStarters !== true)
+    || (name === 'mobile-inspector-390' && result.stateEvidence?.responsiveDrawerBounded !== true)
     || (name.startsWith('hud-') && (
       result.stateEvidence?.hudSurfaceVisible !== true ||
       result.stateEvidence?.hudStatusVisible !== true ||
       result.stateEvidence?.hudHostTransparent !== true ||
-      result.stateEvidence?.hudMode !== name.slice('hud-'.length)
+      result.stateEvidence?.hudMode !== (visualState === 'hud-buddy' ? 'buddy' : 'expanded')
     ))
   ) {
     throw new Error(`Renderer visual capture returned invalid evidence for ${name}`)

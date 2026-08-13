@@ -3,7 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "author": "Prime Continuim contributors",
+  "license": "MIT",
   "description": "Prime Continuim — a native control surface for durable Prime Agent coding sessions",
+  "homepage": "https://github.com/NobleSpartan6/prime-continuum#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NobleSpartan6/prime-continuum.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NobleSpartan6/prime-continuum/issues"
+  },
+  "keywords": [
+    "prime-agent",
+    "rlm",
+    "coding-agent",
+    "electron"
+  ],
   "main": "./out/main/index.js",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
@@ -30,8 +45,10 @@
     "verify:hostd-runtime:smoke": "node scripts/verify-hostd-runtime-initialization.mjs",
     "verify:hostd-resident-lifecycle:smoke": "node scripts/verify-hostd-resident-lifecycle.mjs",
     "verify:prime-agent-provider:e2e": "node scripts/verify-prime-agent-provider-e2e.mjs",
+    "verify:prime-agent-tool-dogfood": "node scripts/verify-prime-agent-tool-dogfood.mjs",
     "verify:windows-appcontainer-probe:receipt": "node scripts/verify-windows-appcontainer-probe.mjs",
     "verify:renderer-visual": "node scripts/run-workflow.mjs verify:renderer-visual",
+    "verify:macos-distribution-readiness": "node scripts/verify-macos-distribution-readiness.mjs",
     "self-build": "node scripts/self-build.mjs",
     "verify:self-build-receipt": "node scripts/self-build.mjs --verify-receipt",
     "preview": "node scripts/run-workflow.mjs preview",
@@ -76,7 +93,8 @@
     "asar": true,
     "electronFuses": {
       "enableEmbeddedAsarIntegrityValidation": true,
-      "onlyLoadAppFromAsar": true
+      "onlyLoadAppFromAsar": true,
+      "runAsNode": false
     },
     "files": [
       "out/**/*",
@@ -89,6 +107,22 @@
       {
         "from": "out/hostd/hostd.cjs",
         "to": "hostd/hostd.cjs"
+      },
+      {
+        "from": "node_modules/node",
+        "to": "host-runtime",
+        "filter": [
+          "bin/node",
+          "node.exe",
+          "LICENSE"
+        ]
+      },
+      {
+        "from": "node_modules/electron/dist",
+        "to": "browser-runtime",
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "out/runtime",
@@ -129,9 +163,39 @@
       "uninstallerIcon": "build/icon.ico",
       "uninstallDisplayName": "${productName} ${version}"
     },
+    "dmg": {
+      "artifactName": "Prime-Continuim-${version}-macos-${arch}.${ext}",
+      "backgroundColor": "#0b0f0d",
+      "format": "UDZO",
+      "iconSize": 96,
+      "iconTextSize": 12,
+      "internetEnabled": false,
+      "shrink": true,
+      "sign": false,
+      "title": "Prime Continuim ${version}",
+      "window": {
+        "width": 560,
+        "height": 360
+      },
+      "writeUpdateInfo": false
+    },
     "mac": {
       "target": "dmg",
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "NSDesktopFolderUsageDescription": "Prime Continuim accesses a Desktop workspace only after you choose it.",
+        "NSDocumentsFolderUsageDescription": "Prime Continuim accesses a Documents workspace only after you choose it.",
+        "NSDownloadsFolderUsageDescription": "Prime Continuim accesses a Downloads workspace only after you choose it.",
+        "NSNetworkVolumesUsageDescription": "Prime Continuim accesses a workspace on a network volume only after you choose it.",
+        "NSRemovableVolumesUsageDescription": "Prime Continuim accesses a workspace on a removable volume only after you choose it."
+      },
+      "identity": "-",
+      "notarize": false,
+      "signIgnore": [
+        "Contents/Resources/browser-runtime/",
+        "Contents/Resources/host-runtime/",
+        "Contents/Resources/runtime-seed/"
+      ]
     },
     "linux": {
       "target": [

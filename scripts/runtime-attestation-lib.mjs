@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { open, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   RUNTIME_TEMPLATE_DIRECTORY,
   cleanRuntimeEnvironment,
   loadRuntimeInputs,
   runCommand,
+  smokeBrowserBridge,
   verifyBuiltRuntime,
   verifyOnlySelectedRuntimeInstall,
 } from "./prime-agent-runtime-lib.mjs";
+import { readPinnedDevelopmentNodeVersion } from "./development-node-runtime.mjs";
 
 export const RUNTIME_ATTESTATION_RECORD_PREFIX = "PRIME_CONTINUIM_RUNTIME_ATTESTATION_V1:";
 export const MAX_RUNTIME_ATTESTATION_BYTES = 256 * 1024;
@@ -17,11 +19,15 @@ const MAX_POINTER_BYTES = 64 * 1024;
 const MAX_FILE_MANIFEST_BYTES = 16 * 1024 * 1024;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const VERSION_PATTERN = /^[0-9A-Za-z.+_-]{1,64}$/;
+const MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024;
 
 export async function createRuntimeAttestation(options = {}) {
   const runtimeRoot = resolve(options.runtimeRoot ?? join(process.cwd(), "out", "runtime"));
   const electronExecutable = await requireAbsoluteRegularFile(options.electronExecutable, "Electron executable");
+  const hostNodeExecutable = await requireAbsoluteRegularFile(options.hostNodeExecutable, "Host Node executable");
+  invariant(electronExecutable !== hostNodeExecutable, "GUI Electron and host Node must be different executable files.");
   const inputs = await loadRuntimeInputs(options.templateDirectory ?? RUNTIME_TEMPLATE_DIRECTORY);
+  const expectedHostNodeVersion = options.hostNodeVersion ?? readPinnedDevelopmentNodeVersion(resolve(import.meta.dirname, ".."));
   const pointerBytes = await readBoundedFile(join(runtimeRoot, "current.json"), MAX_POINTER_BYTES, "runtime pointer");
   const pointer = parseJson(pointerBytes, "runtime pointer");
   validateRuntimePointer(pointer, inputs.policy);
@@ -29,11 +35,19 @@ export async function createRuntimeAttestation(options = {}) {
   const runtimeDirectory = dirname(manifestPath);
   await verifyOnlySelectedRuntimeInstall(runtimeRoot, runtimeDirectory);
   const verified = await verifyBuiltRuntime(runtimeDirectory, { inputs, policy: inputs.policy });
-  const [manifestBytes, fileManifestBytes, hostRuntime] = await Promise.all([
+  const [manifestBytes, fileManifestBytes, guiRuntime, hostRuntime] = await Promise.all([
     readBoundedFile(manifestPath, MAX_RUNTIME_ATTESTATION_BYTES, "runtime manifest"),
     readBoundedFile(join(runtimeDirectory, "files.sha256"), MAX_FILE_MANIFEST_BYTES, "runtime file manifest"),
     readElectronRuntimeIdentity(electronExecutable),
+    readNodeRuntimeIdentity(hostNodeExecutable),
   ]);
+  invariant(hostRuntime.nodeVersion === expectedHostNodeVersion, `Host Node must be the exact pinned v${expectedHostNodeVersion} runtime.`);
+  invariant(guiRuntime.executableSha256 !== hostRuntime.executableSha256, "GUI Electron and host Node executable identities must be unequal.");
+  invariant(guiRuntime.platform === hostRuntime.platform && guiRuntime.arch === hostRuntime.arch, "GUI Electron and host Node must target the same platform and architecture.");
+  const browserSmoke = await smokeBrowserBridge(runtimeDirectory, {
+    runtimeExecutable: electronExecutable,
+    policy: inputs.policy,
+  });
 
   const attestation = {
     schemaVersion: 1,
@@ -57,8 +71,16 @@ export async function createRuntimeAttestation(options = {}) {
     },
     tree: verified.manifest.tree,
     entrypoints: verified.manifest.entrypoints,
+    browserBridge: {
+      ...verified.manifest.browserBridge,
+      smoke: {
+        verified: browserSmoke.verified,
+        operations: browserSmoke.operations,
+      },
+    },
     daemon: verified.manifest.daemon,
     nativeAddons: verified.manifest.nativeAddons,
+    guiRuntime,
     hostRuntime,
   };
 
@@ -68,7 +90,8 @@ export async function createRuntimeAttestation(options = {}) {
     manifest: verified.manifest,
     manifestBytes,
     fileManifestBytes,
-    runtimeVersions: hostRuntime,
+    guiRuntime,
+    hostRuntime,
     inputs,
   });
   return Object.freeze(attestation);
@@ -117,7 +140,7 @@ export function extractEmbeddedRuntimeAttestation(bundle) {
 
 export function assertRuntimeAttestationMatches(attestation, context) {
   validateRuntimeAttestation(attestation);
-  const { pointer, manifest, manifestBytes, fileManifestBytes, runtimeVersions, inputs } = context;
+  const { pointer, manifest, manifestBytes, fileManifestBytes, guiRuntime, hostRuntime, inputs } = context;
   validateRuntimePointer(pointer, inputs.policy);
   const expectedRuntime = {
     name: "prime-agent",
@@ -134,16 +157,6 @@ export function assertRuntimeAttestationMatches(attestation, context) {
     policySha256: manifest.policySha256,
     packageLockSha256: manifest.packageLockSha256,
   };
-  const expectedHostRuntime = {
-    kind: "electron-run-as-node",
-    electronVersion: runtimeVersions.electronVersion ?? runtimeVersions.electron,
-    nodeVersion: runtimeVersions.nodeVersion ?? runtimeVersions.node,
-    modulesAbi: runtimeVersions.modulesAbi ?? runtimeVersions.modules,
-    napiVersion: runtimeVersions.napiVersion ?? runtimeVersions.napi,
-    platform: runtimeVersions.platform,
-    arch: runtimeVersions.arch,
-    runAsNode: runtimeVersions.runAsNode === true || runtimeVersions.runAsNode === "1",
-  };
 
   invariant(attestation.schemaVersion === 1, "Runtime attestation schema drifted.");
   invariant(attestation.product === "Prime Continuim", "Runtime attestation product drifted.");
@@ -158,31 +171,73 @@ export function assertRuntimeAttestationMatches(attestation, context) {
   invariant(jsonEqual(attestation.tree, manifest.tree), "Runtime attestation tree does not match the seed.");
   invariant(sha256(fileManifestBytes) === manifest.tree.filesSha256, "Runtime file-manifest digest is stale.");
   invariant(jsonEqual(attestation.entrypoints, manifest.entrypoints), "Runtime attestation entrypoints drifted.");
+  invariant(jsonEqual({
+    protocol: attestation.browserBridge.protocol,
+    playwrightCoreVersion: attestation.browserBridge.playwrightCoreVersion,
+    engine: attestation.browserBridge.engine,
+  }, manifest.browserBridge), "Runtime browser bridge identity drifted.");
+  invariant(
+    attestation.browserBridge.smoke?.verified === true &&
+      jsonEqual(attestation.browserBridge.smoke.operations, [
+        "doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close",
+      ]),
+    "Runtime browser bridge smoke evidence drifted.",
+  );
   invariant(jsonEqual(attestation.daemon, manifest.daemon), "Runtime attestation daemon contract drifted.");
   invariant(jsonEqual(attestation.nativeAddons, manifest.nativeAddons), "Runtime native-addon allowlist drifted.");
-  invariant(jsonEqual(attestation.hostRuntime, expectedHostRuntime), "Runtime host process identity drifted.");
+  invariant(jsonEqual(attestation.guiRuntime, guiRuntime), "GUI Electron executable identity drifted.");
+  invariant(jsonEqual(attestation.hostRuntime, hostRuntime), "Runtime host process identity drifted.");
+  invariant(attestation.guiRuntime.executableSha256 !== attestation.hostRuntime.executableSha256, "GUI Electron and host Node executable identities must be unequal.");
 }
 
 export async function readElectronRuntimeIdentity(executablePath) {
   const executable = await requireAbsoluteRegularFile(executablePath, "Electron executable");
   const source = [
     "const value = {",
-    '  kind: "electron-run-as-node",',
+    '  kind: "electron",',
     "  electronVersion: process.versions.electron,",
     "  nodeVersion: process.versions.node,",
     "  modulesAbi: process.versions.modules,",
     "  napiVersion: process.versions.napi,",
     "  platform: process.platform,",
     "  arch: process.arch,",
-    '  runAsNode: process.env.ELECTRON_RUN_AS_NODE === "1",',
     "};",
     "process.stdout.write(JSON.stringify(value));",
   ].join("\n");
-  const result = await runCommand(executable, ["-e", source], {
-    env: cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
-    timeoutMs: 10_000,
-  });
-  const identity = parseJson(Buffer.from(result.stdout, "utf8"), "Electron runtime identity");
+  const [result, executableSha256] = await Promise.all([
+    runCommand(executable, ["-e", source], {
+      env: cleanRuntimeEnvironment(process.env, { electronRunAsNode: true }),
+      timeoutMs: 10_000,
+    }),
+    sha256Executable(executable, "Electron executable"),
+  ]);
+  const identity = { ...parseJson(Buffer.from(result.stdout, "utf8"), "Electron runtime identity"), executableSha256 };
+  validateGuiRuntime(identity);
+  return identity;
+}
+
+export async function readNodeRuntimeIdentity(executablePath) {
+  const executable = await requireAbsoluteRegularFile(executablePath, "Host Node executable");
+  const source = [
+    'if (process.versions.electron) throw new Error("host executable unexpectedly exposes Electron");',
+    "const value = {",
+    '  kind: "node",',
+    "  nodeVersion: process.versions.node,",
+    "  modulesAbi: process.versions.modules,",
+    "  napiVersion: process.versions.napi,",
+    "  platform: process.platform,",
+    "  arch: process.arch,",
+    "};",
+    "process.stdout.write(JSON.stringify(value));",
+  ].join("\n");
+  const [result, executableSha256] = await Promise.all([
+    runCommand(executable, ["-e", source], {
+      env: cleanRuntimeEnvironment(process.env, { electronRunAsNode: false }),
+      timeoutMs: 10_000,
+    }),
+    sha256Executable(executable, "Host Node executable"),
+  ]);
+  const identity = { ...parseJson(Buffer.from(result.stdout, "utf8"), "Host Node runtime identity"), executableSha256 };
   validateHostRuntime(identity);
   return identity;
 }
@@ -198,8 +253,10 @@ function validateRuntimeAttestation(value) {
     "manifest",
     "tree",
     "entrypoints",
+    "browserBridge",
     "daemon",
     "nativeAddons",
+    "guiRuntime",
     "hostRuntime",
   ];
   assertExactKeys(value, expectedKeys, "runtime attestation");
@@ -231,9 +288,40 @@ function validateRuntimeAttestation(value) {
   assertBoundedInteger(value.tree.totalBytes, 1, 8 * 1024 * 1024 * 1024, "tree.totalBytes");
 
   assertRecord(value.entrypoints, "runtime attestation entrypoints");
-  assertExactKeys(value.entrypoints, ["module", "cli"], "runtime attestation entrypoints");
+  assertExactKeys(
+    value.entrypoints,
+    ["module", "cli", "browserBridge", "browserHost", "browserLauncher", "browserLauncherWindows", "browserSkill"],
+    "runtime attestation entrypoints",
+  );
   assertSafeRelativePath(value.entrypoints.module, "entrypoints.module");
   assertSafeRelativePath(value.entrypoints.cli, "entrypoints.cli");
+  assertSafeRelativePath(value.entrypoints.browserBridge, "entrypoints.browserBridge");
+  assertSafeRelativePath(value.entrypoints.browserHost, "entrypoints.browserHost");
+  assertSafeRelativePath(value.entrypoints.browserLauncher, "entrypoints.browserLauncher");
+  assertSafeRelativePath(value.entrypoints.browserLauncherWindows, "entrypoints.browserLauncherWindows");
+  assertSafeRelativePath(value.entrypoints.browserSkill, "entrypoints.browserSkill");
+
+  assertRecord(value.browserBridge, "runtime attestation browser bridge");
+  assertExactKeys(
+    value.browserBridge,
+    ["protocol", "playwrightCoreVersion", "engine", "smoke"],
+    "runtime attestation browser bridge",
+  );
+  invariant(value.browserBridge.protocol === "prime-continuim.browser.v1", "Runtime browser bridge protocol is invalid.");
+  invariant(
+    value.browserBridge.playwrightCoreVersion === "1.63.0-alpha-2026-08-05",
+    "Runtime browser bridge controller identity is invalid.",
+  );
+  invariant(value.browserBridge.engine === "verified-electron-host", "Runtime browser bridge engine is invalid.");
+  assertRecord(value.browserBridge.smoke, "runtime attestation browser bridge smoke");
+  assertExactKeys(value.browserBridge.smoke, ["verified", "operations"], "runtime attestation browser bridge smoke");
+  invariant(value.browserBridge.smoke.verified === true, "Runtime browser bridge smoke is not verified.");
+  invariant(
+    jsonEqual(value.browserBridge.smoke.operations, [
+      "doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close",
+    ]),
+    "Runtime browser bridge smoke operations are invalid.",
+  );
 
   assertRecord(value.daemon, "runtime attestation daemon");
   assertExactKeys(value.daemon, ["protocolName", "protocolVersion", "schemaRevision", "schemaId", "requiredCapabilities"], "runtime attestation daemon");
@@ -260,17 +348,30 @@ function validateRuntimeAttestation(value) {
     assertBoundedInteger(addon.size, 1, 1024 * 1024 * 1024, "nativeAddons[].size");
     assertSha256(addon.sha256, "nativeAddons[].sha256");
   }
+  validateGuiRuntime(value.guiRuntime);
   validateHostRuntime(value.hostRuntime);
+  invariant(value.guiRuntime.executableSha256 !== value.hostRuntime.executableSha256, "GUI Electron and host Node executable identities must be unequal.");
+  invariant(value.guiRuntime.platform === value.hostRuntime.platform && value.guiRuntime.arch === value.hostRuntime.arch, "GUI Electron and host Node targets must match.");
+}
+
+function validateGuiRuntime(value) {
+  assertRecord(value, "GUI Electron identity");
+  assertExactKeys(value, ["kind", "electronVersion", "nodeVersion", "modulesAbi", "napiVersion", "platform", "arch", "executableSha256"], "GUI Electron identity");
+  invariant(value.kind === "electron", "GUI runtime must be Electron.");
+  for (const key of ["electronVersion", "nodeVersion", "modulesAbi", "napiVersion", "platform", "arch"]) {
+    invariant(typeof value[key] === "string" && VERSION_PATTERN.test(value[key]), `GUI Electron ${key} is invalid.`);
+  }
+  assertSha256(value.executableSha256, "GUI Electron executable digest");
 }
 
 function validateHostRuntime(value) {
   assertRecord(value, "runtime host identity");
-  assertExactKeys(value, ["kind", "electronVersion", "nodeVersion", "modulesAbi", "napiVersion", "platform", "arch", "runAsNode"], "runtime host identity");
-  invariant(value.kind === "electron-run-as-node", "Runtime host must be Electron RunAsNode.");
-  for (const key of ["electronVersion", "nodeVersion", "modulesAbi", "napiVersion", "platform", "arch"]) {
+  assertExactKeys(value, ["kind", "nodeVersion", "modulesAbi", "napiVersion", "platform", "arch", "executableSha256"], "runtime host identity");
+  invariant(value.kind === "node", "Runtime host must be standalone Node.");
+  for (const key of ["nodeVersion", "modulesAbi", "napiVersion", "platform", "arch"]) {
     invariant(typeof value[key] === "string" && VERSION_PATTERN.test(value[key]), `Runtime host ${key} is invalid.`);
   }
-  invariant(value.runAsNode === true, "Runtime host must require ELECTRON_RUN_AS_NODE=1.");
+  assertSha256(value.executableSha256, "Runtime host executable digest");
 }
 
 function validateRuntimePointer(pointer, policy) {
@@ -307,6 +408,30 @@ async function requireAbsoluteRegularFile(path, label) {
   const metadata = await stat(resolved);
   invariant(metadata.isFile() && metadata.size > 0, `${label} must be a non-empty regular file.`);
   return resolved;
+}
+
+async function sha256Executable(path, label) {
+  const handle = await open(path, "r");
+  try {
+    const before = await handle.stat();
+    invariant(before.isFile() && before.size > 0 && before.size <= MAX_EXECUTABLE_BYTES, `${label} is outside its executable size bound.`);
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(256 * 1024);
+    let position = 0;
+    while (position < before.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, before.size - position), position);
+      invariant(bytesRead > 0, `${label} ended before its recorded size.`);
+      digest.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const probe = Buffer.allocUnsafe(1);
+    const { bytesRead: growthBytes } = await handle.read(probe, 0, 1, before.size);
+    const after = await handle.stat();
+    invariant(growthBytes === 0 && before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeMs === after.mtimeMs, `${label} changed while it was hashed.`);
+    return digest.digest("hex");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readBoundedFile(path, maxBytes, label) {

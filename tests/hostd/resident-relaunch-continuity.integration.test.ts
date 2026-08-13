@@ -19,6 +19,7 @@ import { normalizeResidentProjectionSnapshot } from "../../src/hostd/resident-pr
 import { HostStore } from "../../src/hostd/store";
 
 const THREAD_ID = "test-thread";
+const HOST_ID = "host-local";
 const EXECUTION_GENERATION_ID = "test-execution-1";
 const ACTIVE_SESSION_ID = "resident-active-session-continuity-1";
 const SESSION_ID = "resident-session-continuity-1";
@@ -131,8 +132,9 @@ class SharedFakePrimeDaemon {
         options: Readonly<{
           closeClientOnDispose: true;
           sendClientEnv: false;
-          supportsExtensionUi: false;
-          ownedSession: false;
+          supportsExtensionUi: true;
+          ownedSession: boolean;
+          telemetryDisabled: true;
           recoverDaemon: () => Promise<void>;
         }>,
       ): Promise<PrimeDaemonAgentConnectionPublic> => {
@@ -150,6 +152,14 @@ class SharedFakePrimeDaemon {
             daemon.chronology.push(`daemon:snapshot:${activeSessionId}`);
             return session.snapshot;
           },
+          getResourceSnapshot: async () => ({
+            contextFiles: [],
+            skills: [],
+            prompts: [],
+            extensions: [],
+            themes: [],
+            diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+          }),
           subscribe: () => () => undefined,
           promoteToResident: async () => undefined,
           dispose: async () => {
@@ -309,6 +319,7 @@ function createAdapter(
   paths: RuntimePaths,
 ): PrimeAgentResidentAdapter {
   return new PrimeAgentResidentAdapter({
+    hostId: HOST_ID,
     ...paths,
     environment: {},
     loadRuntimeModule: async () => runtimeModule,
@@ -363,11 +374,11 @@ describe("resident continuity across hostd/store relaunch", () => {
         name: "prime-agent.daemon",
         version: 7,
       },
-      schemaId: "protocol-7-schema-13-816309b1cd50",
-      schemaRevision: 13,
-      appVersion: "0.7.1",
+      schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+      schemaRevision: 16,
+      appVersion: "0.7.2",
       runtime: {
-        buildId: "95afd31-dirty",
+        buildId: "83a0f9f-dirty",
         executablePath: paths.executable,
         entrypointPath: paths.cliEntrypoint,
       },
@@ -483,8 +494,8 @@ describe("resident continuity across hostd/store relaunch", () => {
     }).toEqual(firstPublishedProjection);
     expect(daemon.attachActiveSessionIds).toEqual([ACTIVE_SESSION_ID, exactBinding.activeSessionId]);
     expect(daemon.attachOptions).toEqual([
-      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
-      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true }),
+      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
+      expect.objectContaining({ ownedSession: false, closeClientOnDispose: true, telemetryDisabled: true }),
     ]);
     expect(daemon.createCount).toBe(1);
     expect(daemon.listCount).toBe(1);

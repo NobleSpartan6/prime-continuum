@@ -22,8 +22,14 @@ describe("orderly application quit", () => {
 
     gate.resolve();
     await flushMicrotasks();
-    expect(cleanup).toHaveBeenCalledOnce();
     expect(app.quit).toHaveBeenCalledOnce();
+    expect(cleanup).not.toHaveBeenCalled();
+
+    // IPC and other renderer-facing resources remain live until Electron has
+    // actually committed the quit and closed its windows.
+    app.emit("will-quit");
+    app.emit("will-quit");
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 
   it("leaves the app running after an unconfirmed drain and permits a later retry", async () => {
@@ -40,6 +46,7 @@ describe("orderly application quit", () => {
     expect(first.preventDefault).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "helper still live" }));
     expect(app.quit).not.toHaveBeenCalled();
+    expect(app.listenerCount("will-quit")).toBe(1);
 
     const retry = quitEvent();
     app.emit("before-quit", retry.event);

@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AtomicWriteAmbiguousCommitError, atomicWriteJson } from "../../src/hostd/atomic-files";
 import {
@@ -21,9 +23,11 @@ import {
   type RuntimeIntegrityProgressPhase,
   type RuntimeHostIdentity,
   type RuntimeIntegrityFaultPoint,
+  type RuntimeTreeCloner,
 } from "../../src/hostd/runtime-integrity-manager";
 
 const temporaryDirectories: string[] = [];
+const execFileAsync = promisify(execFile);
 const DIGEST = "a".repeat(64);
 const FINAL_VERIFICATION_FAILURES = [
   {
@@ -66,6 +70,100 @@ describe("runtime integrity manager", () => {
     await rm(fixture.seedRoot, { recursive: true, force: true });
     await expect(createManager(fixture).ensureInstalled()).resolves.toEqual(installed);
   });
+
+  it("uses a successful clone only behind both full source proofs and normalizes the installed image", async () => {
+    const fixture = await createFixture();
+    const cloneRuntimeTree = vi.fn(async (source: string, destination: string) => {
+      await copyDirectoryContents(source, destination);
+      return true;
+    });
+
+    await expect(createManager(fixture, { cloneRuntimeTree }).ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(cloneRuntimeTree).toHaveBeenCalledTimes(1);
+    const finalDirectory = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    const ordinary = await lstat(join(finalDirectory, ...fixture.payloads[0]!.path.split("/")));
+    const launcher = await lstat(join(finalDirectory, "bridge", "playwright-cli"));
+    if (process.platform !== "win32") expect(ordinary.mode & 0o777).toBe(0o600);
+    expect(ordinary.nlink).toBe(1);
+    if (process.platform !== "win32") expect(launcher.mode & 0o777).toBe(0o700);
+    expect(launcher.nlink).toBe(1);
+  });
+
+  it("clears a partial unavailable clone before using the existing verified copy path", async () => {
+    const fixture = await createFixture();
+    const cloneRuntimeTree = vi.fn(async (_source: string, destination: string) => {
+      await writeFile(join(destination, "partial-clone.txt"), "must not survive fallback");
+      return false;
+    });
+
+    await expect(createManager(fixture, { cloneRuntimeTree }).ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+      treeSha256: fixture.attestation.tree.sha256,
+    });
+    expect(cloneRuntimeTree).toHaveBeenCalledTimes(1);
+    const finalDirectory = join(fixture.paths.runtimeInstalls, fixture.finalInstallName);
+    await expect(readFile(join(finalDirectory, "partial-clone.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+  });
+
+  it("fails closed when a successful clone returns corrupt bytes", async () => {
+    const fixture = await createFixture();
+    const cloneRuntimeTree = vi.fn(async (source: string, destination: string) => {
+      await copyDirectoryContents(source, destination);
+      await writeFile(join(destination, ...fixture.payloads[0]!.path.split("/")), "corrupt clone");
+      return true;
+    });
+
+    await expect(createManager(fixture, { cloneRuntimeTree }).ensureInstalled(fixture.seedRoot)).rejects.toThrow(
+      "Runtime payload digest mismatch",
+    );
+    await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([]);
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+  });
+
+  it("waits for an admitted clone to retire before honoring cancellation and cleaning staging", async () => {
+    const fixture = await createFixture();
+    const ownership = createHostOwnershipLease(async () => undefined, { generation: "c".repeat(64) });
+    const cloneRuntimeTree = vi.fn(async (source: string, destination: string) => {
+      await copyDirectoryContents(source, destination);
+      ownership.closeAdmission();
+      return true;
+    });
+
+    await expect(createManager(fixture, {
+      cloneRuntimeTree,
+      ownershipLease: ownership.lease,
+    }).ensureInstalled(fixture.seedRoot)).rejects.toBeInstanceOf(RuntimeIntegrityCancelledError);
+    expect(cloneRuntimeTree).toHaveBeenCalledTimes(1);
+    await expect(readFile(fixture.paths.runtimeCurrent)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(fixture.paths.runtimeInstalls)).toEqual([]);
+    expect(await readdir(fixture.paths.runtimeStaging)).toEqual([]);
+  });
+
+  it.runIf(process.platform === "darwin")(
+    "uses the root-owned macOS clone tools and strips inherited extended attributes",
+    async () => {
+      const fixture = await createFixture("darwin-clone", { platform: "darwin", arch: process.arch });
+      const sourcePayload = join(fixture.seedImage, ...fixture.payloads[0]!.path.split("/"));
+      await execFileAsync("/usr/bin/xattr", ["-w", "com.primecontinuim.clone-test", "present", sourcePayload]);
+
+      await expect(createManager(fixture).ensureInstalled(fixture.seedRoot)).resolves.toMatchObject({
+        treeSha256: fixture.attestation.tree.sha256,
+      });
+      const installedPayload = join(
+        fixture.paths.runtimeInstalls,
+        fixture.finalInstallName,
+        ...fixture.payloads[0]!.path.split("/"),
+      );
+      await expect(execFileAsync(
+        "/usr/bin/xattr",
+        ["-p", "com.primecontinuim.clone-test", installedPayload],
+      )).rejects.toBeDefined();
+      expect(await readFile(installedPayload)).toEqual(fixture.payloads[0]!.bytes);
+    },
+  );
 
   it("issues a host-only launch handle only after a fresh full-tree verification", async () => {
     const fixture = await createFixture();
@@ -283,7 +381,15 @@ describe("runtime integrity manager", () => {
       attestation: { ...fixture.attestation, assurance: "production-authenticated" },
       ownershipLease: createTestOwnershipLease(),
       hostRuntime: fixture.hostRuntime,
+      browserExecutableSha256: fixture.attestation.guiRuntime.executableSha256,
     })).toThrow("refuses production-authenticated");
+    expect(() => new RuntimeIntegrityManager({
+      paths: fixture.paths,
+      attestation: fixture.attestation,
+      ownershipLease: createTestOwnershipLease(),
+      hostRuntime: fixture.hostRuntime,
+      browserExecutableSha256: "a".repeat(64),
+    })).toThrow("Browser Electron executable");
   });
 
   it("rejects a directory junction or symbolic-link replacement", async () => {
@@ -828,7 +934,10 @@ interface Fixture {
   readonly payloads: readonly { path: string; bytes: Buffer }[];
 }
 
-async function createFixture(variant = ""): Promise<Fixture> {
+async function createFixture(
+  variant = "",
+  target: { platform: string; arch: string } = { platform: "win32", arch: "x64" },
+): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "prime-runtime-integrity-"));
   temporaryDirectories.push(root);
   const seedRoot = join(root, "seed");
@@ -836,7 +945,13 @@ async function createFixture(variant = ""): Promise<Fixture> {
   const sourceInstallName = "fixture-image";
   const seedImage = join(seedRoot, "installs", sourceInstallName);
   const payloads = [
+    { path: "bridge/browser-bridge.mjs", bytes: Buffer.from("export const bridge = true;\n") },
+    { path: "bridge/browser-host.cjs", bytes: Buffer.from("module.exports = {};\n") },
+    { path: "bridge/playwright-cli", bytes: Buffer.from("#!/bin/sh\nexit 0\n") },
+    { path: "bridge/playwright-cli.cmd", bytes: Buffer.from("@exit /b 0\r\n") },
+    { path: "bridge/skills/playwright-cli/SKILL.md", bytes: Buffer.from("# Verified browser\n") },
     { path: "node_modules/native/addon.node", bytes: Buffer.from(`native-addon-fixture${variant}`) },
+    { path: "node_modules/playwright-core/package.json", bytes: Buffer.from('{"name":"playwright-core","version":"1.63.0-alpha-2026-08-05"}\n') },
     { path: "node_modules/prime-agent/dist/bundle/cli.js", bytes: Buffer.from("export const cli = true;\n") },
     { path: "node_modules/prime-agent/dist/index.js", bytes: Buffer.from("export const api = true;\n") },
     { path: "node_modules/prime-agent/package.json", bytes: Buffer.from('{"name":"prime-agent","version":"0.7.0"}\n') },
@@ -866,11 +981,18 @@ async function createFixture(variant = ""): Promise<Fixture> {
       commit: "fixture",
     },
     runtimeBuildId: variant ? `fixture-build-${variant}` : "fixture-build",
-    platform: "win32",
-    arch: "x64",
+    platform: target.platform,
+    arch: target.arch,
     libc: "none",
     buildRuntime: { node: "22.22.3", modules: "127", napi: "10", npm: "10.9.8" },
-    smokeRuntime: { node: "22.22.3", modules: "127", napi: "10", platform: "win32", arch: "x64" },
+    smokeRuntime: {
+      node: "22.22.3",
+      modules: "127",
+      napi: "10",
+      platform: target.platform,
+      arch: target.arch,
+      bundleImportGraphComplete: true,
+    },
     sourcesSha256: "1".repeat(64),
     policySha256: "2".repeat(64),
     packageLockSha256: "3".repeat(64),
@@ -884,7 +1006,17 @@ async function createFixture(variant = ""): Promise<Fixture> {
     entrypoints: {
       module: "node_modules/prime-agent/dist/index.js",
       cli: "node_modules/prime-agent/dist/bundle/cli.js",
+      browserBridge: "bridge/browser-bridge.mjs",
+      browserHost: "bridge/browser-host.cjs",
+      browserLauncher: "bridge/playwright-cli",
+      browserLauncherWindows: "bridge/playwright-cli.cmd",
+      browserSkill: "bridge/skills/playwright-cli/SKILL.md",
     },
+    browserBridge: {
+      protocol: "prime-continuim.browser.v1",
+      playwrightCoreVersion: "1.63.0-alpha-2026-08-05",
+      engine: "verified-electron-host",
+    } as const,
     daemon: {
       protocolName: "prime-agent.daemon",
       protocolVersion: 7,
@@ -905,14 +1037,13 @@ async function createFixture(variant = ""): Promise<Fixture> {
   };
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const hostRuntime = {
-    kind: "electron-run-as-node",
-    electronVersion: "43.3.0",
-    nodeVersion: "24.18.1",
-    modulesAbi: "148",
+    kind: "node",
+    nodeVersion: "24.14.0",
+    modulesAbi: "137",
     napiVersion: "10",
-    platform: "win32",
-    arch: "x64",
-    runAsNode: true,
+    platform: target.platform,
+    arch: target.arch,
+    executableSha256: "9".repeat(64),
   } as const;
   const attestation = {
     schemaVersion: 1,
@@ -923,8 +1054,8 @@ async function createFixture(variant = ""): Promise<Fixture> {
       name: "prime-agent",
       releaseVersion: "0.7.0",
       runtimeBuildId: manifest.runtimeBuildId,
-      platform: "win32",
-      arch: "x64",
+      platform: target.platform,
+      arch: target.arch,
       libc: "none",
     },
     manifest: {
@@ -936,8 +1067,25 @@ async function createFixture(variant = ""): Promise<Fixture> {
     },
     tree,
     entrypoints: manifest.entrypoints,
+    browserBridge: {
+      ...manifest.browserBridge,
+      smoke: {
+        verified: true,
+        operations: ["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"],
+      },
+    },
     daemon: manifest.daemon,
     nativeAddons,
+    guiRuntime: {
+      kind: "electron",
+      electronVersion: "43.3.0",
+      nodeVersion: "24.18.1",
+      modulesAbi: "148",
+      napiVersion: "10",
+      platform: "win32",
+      arch: "x64",
+      executableSha256: "8".repeat(64),
+    },
     hostRuntime,
   } as const satisfies EmbeddedRuntimeAttestation;
   const finalInstallName = [
@@ -954,13 +1102,14 @@ async function createFixture(variant = ""): Promise<Fixture> {
     await mkdir(join(destination, ".."), { recursive: true });
     await writeFile(destination, payload.bytes);
   }
+  await chmod(join(seedImage, "bridge", "playwright-cli"), 0o755);
   await writeFile(join(seedImage, "files.sha256"), filesText);
   await writeFile(join(seedImage, "runtime.json"), manifestBytes);
   await writeFile(join(seedRoot, "current.json"), `${JSON.stringify({
     schemaVersion: 1,
     releaseVersion: "0.7.0",
-    platform: "win32",
-    arch: "x64",
+    platform: target.platform,
+    arch: target.arch,
     treeSha256: tree.sha256,
     manifestSha256: attestation.manifest.sha256,
     runtimeManifest: attestation.manifest.relativePath,
@@ -986,6 +1135,7 @@ function createManager(
     writeCurrent?: (path: string, value: Parameters<typeof atomicWriteJson>[1] & Record<string, unknown>) => Promise<void>;
     hostRuntime?: RuntimeHostIdentity;
     onProgress?: (phase: RuntimeIntegrityProgressPhase) => void;
+    cloneRuntimeTree?: RuntimeTreeCloner;
   } = {},
 ): RuntimeIntegrityManager {
   return new RuntimeIntegrityManager({
@@ -993,10 +1143,27 @@ function createManager(
     attestation: fixture.attestation,
     ownershipLease: options.ownershipLease ?? createTestOwnershipLease(),
     hostRuntime: options.hostRuntime ?? fixture.hostRuntime,
+    browserExecutableSha256: fixture.attestation.guiRuntime.executableSha256,
     faultInjector: options.faultInjector,
     writeCurrent: options.writeCurrent,
     onProgress: options.onProgress,
+    cloneRuntimeTree: options.cloneRuntimeTree,
   });
+}
+
+async function copyDirectoryContents(source: string, destination: string): Promise<void> {
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    const from = join(source, entry.name);
+    const to = join(destination, entry.name);
+    if (entry.isDirectory()) {
+      await mkdir(to, { mode: 0o755 });
+      await copyDirectoryContents(from, to);
+    } else if (entry.isFile()) {
+      await copyFile(from, to);
+    } else {
+      throw new Error(`Unexpected fixture clone entry: ${from}`);
+    }
+  }
 }
 
 function createTestOwnershipLease(assertOwned: () => Promise<void> = async () => undefined): HostOwnershipLease {

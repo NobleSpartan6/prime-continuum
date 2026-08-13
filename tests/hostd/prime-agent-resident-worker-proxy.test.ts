@@ -34,8 +34,9 @@ interface ProxyModule {
       options: Readonly<{
         closeClientOnDispose: true;
         sendClientEnv: false;
-        supportsExtensionUi: false;
+        supportsExtensionUi: true;
         ownedSession: boolean;
+        telemetryDisabled: true;
         recoverDaemon: () => Promise<void>;
       }>,
     ): Promise<PrimeDaemonAgentConnectionPublic & { promoteToResident(): Promise<void> }>;
@@ -53,9 +54,14 @@ interface RuntimeFixtureOptions {
     options: Readonly<{ queueIfBusy?: boolean; signal?: AbortSignal }>,
   ) => Promise<void>;
   readonly snapshot?: () => Promise<unknown>;
+  readonly resources?: () => Promise<unknown>;
   readonly models?: () => Promise<unknown>;
   readonly dispose?: () => Promise<void>;
   readonly promote?: () => Promise<void>;
+  readonly respondToExtensionUi?: (
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ) => Promise<void>;
 }
 
 interface RuntimeFixtureState {
@@ -98,6 +104,7 @@ class FakeConnection {
   disposeCalls = 0;
   abortCalls = 0;
   promotionCalls = 0;
+  readonly extensionUiResponses: Array<{ requestId: string; response: Readonly<Record<string, unknown>> }> = [];
 
   constructor(client: FakeClient, options: RuntimeFixtureOptions) {
     this.client = client;
@@ -110,6 +117,17 @@ class FakeConnection {
 
   async waitForIdle(): Promise<void> {
     await this.options.waitForIdle?.(this);
+  }
+
+  async getResourceSnapshot(): Promise<unknown> {
+    return this.options.resources?.() ?? Object.freeze({
+      contextFiles: [],
+      skills: [],
+      prompts: [],
+      extensions: [],
+      themes: [],
+      diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+    });
   }
 
   async getAvailableModels(): Promise<unknown> {
@@ -134,6 +152,14 @@ class FakeConnection {
 
   async abort(): Promise<void> {
     this.abortCalls += 1;
+  }
+
+  async respondToExtensionUiRequest(
+    requestId: string,
+    response: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
+    this.extensionUiResponses.push({ requestId, response });
+    await this.options.respondToExtensionUi?.(requestId, response);
   }
 
   subscribe(listener: (event: unknown) => void | Promise<void>): () => void {
@@ -368,8 +394,9 @@ async function attach(
   const connection = await module.DaemonAgentConnection.attach(client, "active-session", {
     closeClientOnDispose: true,
     sendClientEnv: false,
-    supportsExtensionUi: false,
+    supportsExtensionUi: true,
     ownedSession,
+    telemetryDisabled: true,
     recoverDaemon,
   });
   return { client, connection };
@@ -423,13 +450,31 @@ describe("Prime Agent resident Worker proxy", () => {
       options: {
         closeClientOnDispose: true,
         sendClientEnv: false,
-        supportsExtensionUi: false,
+        supportsExtensionUi: true,
         ownedSession: true,
+        telemetryDisabled: true,
       },
     });
     await connection.promoteToResident();
     expect(fixture.state.connection.promotionCalls).toBe(1);
 
+    await connection.dispose();
+    await loader.close();
+  });
+
+  it("forwards one bounded extension UI response through the resident Worker", async () => {
+    const fixture = runtimeFixture();
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await connection.respondToExtensionUiRequest?.("request-1", { confirmed: true });
+
+    expect(fixture.state.connection.extensionUiResponses).toEqual([
+      { requestId: "request-1", response: { confirmed: true } },
+    ]);
+    await expect(
+      connection.respondToExtensionUiRequest?.("request-2", { value: "x".repeat(65_537) }),
+    ).rejects.toThrow("Extension UI response is invalid");
     await connection.dispose();
     await loader.close();
   });
@@ -451,6 +496,32 @@ describe("Prime Agent resident Worker proxy", () => {
     order.push("wait-response");
 
     expect(order).toEqual(["event", "wait-response"]);
+    await connection.dispose();
+    await loader.close();
+  });
+
+  it("reads the exact attached session resource snapshot without classifying it as a mutation", async () => {
+    const resourceSnapshot = Object.freeze({
+      contextFiles: [],
+      skills: [{ name: "playwright-cli", filePath: "/private/skill/SKILL.md" }],
+      prompts: [],
+      extensions: [],
+      themes: [],
+      diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+    });
+    const resources = vi.fn(async () => resourceSnapshot);
+    const fixture = runtimeFixture({ resources });
+    const { loader, module, harness } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.getResourceSnapshot()).resolves.toEqual(resourceSnapshot);
+    expect(resources).toHaveBeenCalledOnce();
+    expect(harness.worker().hostMessages).toContainEqual(expect.objectContaining({
+      type: "request",
+      operation: "connection.get_resource_snapshot",
+      payload: expect.objectContaining({ connectionId: "connection:1" }),
+    }));
+
     await connection.dispose();
     await loader.close();
   });
@@ -600,6 +671,18 @@ describe("Prime Agent resident Worker proxy", () => {
       ResidentWorkerTransportError,
     );
     await eventProxy.loader.close();
+  });
+
+  it("preflights cyclic resource snapshots inside the Worker", async () => {
+    const cyclicResources: Record<string, unknown> = {};
+    cyclicResources.self = cyclicResources;
+    const fixture = runtimeFixture({ resources: async () => cyclicResources });
+    const { loader, module } = await loadProxy(fixture.runtime);
+    const { connection } = await attach(module);
+
+    await expect(connection.getResourceSnapshot()).rejects.toBeInstanceOf(ResidentWorkerTransportError);
+
+    await loader.close();
   });
 
   it("normalizes and bounds upstream errors before posting them", async () => {

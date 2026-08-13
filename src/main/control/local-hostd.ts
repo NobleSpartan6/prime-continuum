@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { access } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { access, lstat, open, readFile, realpath } from 'node:fs/promises'
 import { createConnection, type Socket } from 'node:net'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -20,16 +21,36 @@ const packageSmokeHostdChildren = new Set<ChildProcess>()
 const localHostdStarts = new Map<string, Promise<void>>()
 
 export interface BundledHostdPaths {
+  readonly attestation: string
+  readonly browserExecutable: string
+  readonly hostExecutable: string
   readonly hostdScript: string
   readonly runtimeSeed: string
 }
 
 export function bundledHostdPaths(
   app: Pick<App, 'isPackaged' | 'getAppPath'>,
-  resourcesPath = process.resourcesPath
+  resourcesPath = process.resourcesPath,
+  platform: NodeJS.Platform = process.platform,
 ): BundledHostdPaths {
   const applicationRoot = app.isPackaged ? path.resolve(resourcesPath) : path.resolve(app.getAppPath())
+  const appRoot = path.resolve(app.getAppPath())
+  const hostExecutableSegments = platform === 'win32' ? ['node.exe'] : ['bin', 'node']
+  const browserExecutableSegments = platform === 'win32'
+    ? ['electron.exe']
+    : platform === 'darwin'
+      ? ['Electron.app', 'Contents', 'MacOS', 'Electron']
+      : ['electron']
   return Object.freeze({
+    attestation: app.isPackaged
+      ? path.join(appRoot, 'out', 'main', 'runtime-attestation.json')
+      : path.join(appRoot, 'node_modules', '.cache', 'prime-continuim', 'development-runtime-attestation.json'),
+    browserExecutable: app.isPackaged
+      ? path.join(applicationRoot, 'browser-runtime', ...browserExecutableSegments)
+      : process.execPath,
+    hostExecutable: app.isPackaged
+      ? path.join(applicationRoot, 'host-runtime', ...hostExecutableSegments)
+      : path.join(applicationRoot, 'node_modules', 'node', ...hostExecutableSegments),
     hostdScript: app.isPackaged
       ? path.join(applicationRoot, 'hostd', 'hostd.cjs')
       : path.join(applicationRoot, 'out', 'hostd', 'hostd.cjs'),
@@ -52,7 +73,9 @@ export function bundledHostdServeArguments(
     '--data-dir',
     dataDirectory,
     '--runtime-seed',
-    paths.runtimeSeed
+    paths.runtimeSeed,
+    '--browser-executable',
+    paths.browserExecutable
   ])
 }
 
@@ -73,6 +96,18 @@ export function bundledHostdLaunchArguments(
     : serveArguments
 }
 
+export function bundledHostdInvocation(
+  paths: BundledHostdPaths,
+  endpoint: string,
+  dataDirectory: string,
+  packageSmoke: boolean,
+): Readonly<{ executable: string; args: readonly string[] }> {
+  return Object.freeze({
+    executable: paths.hostExecutable,
+    args: bundledHostdLaunchArguments(paths, endpoint, dataDirectory, packageSmoke),
+  })
+}
+
 export function bundledHostdEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const childEnvironment = { ...environment }
   for (const name of Object.keys(childEnvironment)) {
@@ -81,8 +116,109 @@ export function bundledHostdEnvironment(environment: NodeJS.ProcessEnv = process
       delete childEnvironment[name]
     }
   }
-  childEnvironment.ELECTRON_RUN_AS_NODE = '1'
   return childEnvironment
+}
+
+export async function verifyBundledHostExecutables(paths: BundledHostdPaths): Promise<void> {
+  const [hostMetadata, browserMetadata, attestationMetadata, hostRealPath, browserRealPath] = await Promise.all([
+    lstat(paths.hostExecutable),
+    lstat(paths.browserExecutable),
+    lstat(paths.attestation),
+    realpath(paths.hostExecutable),
+    realpath(paths.browserExecutable),
+  ])
+  for (const [label, metadata] of [['host Node', hostMetadata], ['browser Electron', browserMetadata]] as const) {
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 1 || metadata.size > 512 * 1024 * 1024) {
+      throw new Error(`The bundled ${label} executable is not a bounded regular file.`)
+    }
+  }
+  if (!attestationMetadata.isFile() || attestationMetadata.isSymbolicLink() || attestationMetadata.size < 1 || attestationMetadata.size > 256 * 1024) {
+    throw new Error('The bundled runtime attestation is not a bounded regular file.')
+  }
+  if (hostRealPath === browserRealPath) throw new Error('The browser Electron and host Node executable paths must be distinct.')
+  const bytes = await readFile(paths.attestation)
+  if (bytes.byteLength !== attestationMetadata.size) throw new Error('The bundled runtime attestation changed while it was read.')
+  let value: unknown
+  try {
+    value = JSON.parse(bytes.toString('utf8')) as unknown
+  } catch (cause) {
+    throw new Error('The bundled runtime attestation is not valid JSON.', { cause })
+  }
+  if (!isRecord(value) || !isRecord(value.guiRuntime) || !isRecord(value.hostRuntime)) {
+    throw new Error('The bundled runtime attestation has no executable identities.')
+  }
+  if (
+    JSON.stringify(Object.keys(value.guiRuntime).sort()) !== JSON.stringify(['arch', 'electronVersion', 'executableSha256', 'kind', 'modulesAbi', 'napiVersion', 'nodeVersion', 'platform']) ||
+    JSON.stringify(Object.keys(value.hostRuntime).sort()) !== JSON.stringify(['arch', 'executableSha256', 'kind', 'modulesAbi', 'napiVersion', 'nodeVersion', 'platform']) ||
+    value.guiRuntime.kind !== 'electron' ||
+    value.hostRuntime.kind !== 'node' ||
+    typeof value.guiRuntime.executableSha256 !== 'string' ||
+    typeof value.hostRuntime.executableSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.guiRuntime.executableSha256) ||
+    !/^[a-f0-9]{64}$/.test(value.hostRuntime.executableSha256) ||
+    value.guiRuntime.executableSha256 === value.hostRuntime.executableSha256 ||
+    value.guiRuntime.platform !== value.hostRuntime.platform ||
+    value.guiRuntime.arch !== value.hostRuntime.arch
+  ) {
+    throw new Error('The bundled runtime attestation executable identities are invalid.')
+  }
+  const [actualBrowserDigest, actualHostDigest] = await Promise.all([
+    hashExecutable(paths.browserExecutable),
+    hashExecutable(paths.hostExecutable),
+  ])
+  if (actualBrowserDigest !== value.guiRuntime.executableSha256) {
+    throw new Error('The bundled browser Electron executable does not match its runtime attestation.')
+  }
+  if (actualHostDigest !== value.hostRuntime.executableSha256) {
+    throw new Error('The bundled host Node executable does not match its runtime attestation.')
+  }
+}
+
+export async function verifyBundledHostExecutable(
+  paths: BundledHostdPaths,
+  guiExecutable = process.execPath,
+): Promise<void> {
+  const [hostMetadata, attestationMetadata, hostRealPath, guiRealPath] = await Promise.all([
+    lstat(paths.hostExecutable),
+    lstat(paths.attestation),
+    realpath(paths.hostExecutable),
+    realpath(guiExecutable),
+  ])
+  if (!hostMetadata.isFile() || hostMetadata.isSymbolicLink() || hostMetadata.size < 1 || hostMetadata.size > 512 * 1024 * 1024) {
+    throw new Error('The bundled host Node executable is not a bounded regular file.')
+  }
+  if (!attestationMetadata.isFile() || attestationMetadata.isSymbolicLink() || attestationMetadata.size < 1 || attestationMetadata.size > 256 * 1024) {
+    throw new Error('The bundled runtime attestation is not a bounded regular file.')
+  }
+  if (hostRealPath === guiRealPath) throw new Error('The GUI Electron and host Node executable paths must be distinct.')
+  const bytes = await readFile(paths.attestation)
+  if (bytes.byteLength !== attestationMetadata.size) throw new Error('The bundled runtime attestation changed while it was read.')
+  let value: unknown
+  try {
+    value = JSON.parse(bytes.toString('utf8')) as unknown
+  } catch (cause) {
+    throw new Error('The bundled runtime attestation is not valid JSON.', { cause })
+  }
+  if (!isRecord(value) || !isRecord(value.guiRuntime) || !isRecord(value.hostRuntime)) {
+    throw new Error('The bundled runtime attestation has no executable identities.')
+  }
+  if (
+    JSON.stringify(Object.keys(value.guiRuntime).sort()) !== JSON.stringify(['arch', 'electronVersion', 'executableSha256', 'kind', 'modulesAbi', 'napiVersion', 'nodeVersion', 'platform']) ||
+    JSON.stringify(Object.keys(value.hostRuntime).sort()) !== JSON.stringify(['arch', 'executableSha256', 'kind', 'modulesAbi', 'napiVersion', 'nodeVersion', 'platform']) ||
+    value.guiRuntime.kind !== 'electron' ||
+    value.hostRuntime.kind !== 'node' ||
+    typeof value.guiRuntime.executableSha256 !== 'string' ||
+    typeof value.hostRuntime.executableSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.guiRuntime.executableSha256) ||
+    !/^[a-f0-9]{64}$/.test(value.hostRuntime.executableSha256) ||
+    value.guiRuntime.executableSha256 === value.hostRuntime.executableSha256
+  ) {
+    throw new Error('The bundled runtime attestation executable identities are invalid.')
+  }
+  const actualHostDigest = await hashExecutable(paths.hostExecutable)
+  if (actualHostDigest !== value.hostRuntime.executableSha256) {
+    throw new Error('The bundled host Node executable does not match its runtime attestation.')
+  }
 }
 
 export function hostdDataDirectory(): string {
@@ -182,23 +318,31 @@ export async function startBundledHostd(
   }
   const paths = bundledHostdPaths(app)
   try {
-    await access(paths.hostdScript)
+    await Promise.all([access(paths.attestation), access(paths.browserExecutable), access(paths.hostExecutable), access(paths.hostdScript)])
   } catch (cause) {
-    throw new ControlError('hostd.bundle_missing', 'The bundled local host service is unavailable.', {
-      details: { hostdScript: paths.hostdScript },
+    throw new ControlError('hostd.bundle_missing', 'The bundled local host service or its pinned Node runtime is unavailable.', {
+      details: { hostExecutable: paths.hostExecutable, hostdScript: paths.hostdScript },
+      cause
+    })
+  }
+  try {
+    await verifyBundledHostExecutables(paths)
+  } catch (cause) {
+    throw new ControlError('hostd.runtime_identity_invalid', 'The bundled host runtimes failed exact identity verification.', {
+      details: { hostExecutable: paths.hostExecutable, browserExecutable: paths.browserExecutable },
       cause
     })
   }
   const packageSmoke = process.env.PRIME_CONTINUIM_PACKAGE_SMOKE === '1'
-  const launchArguments = bundledHostdLaunchArguments(
+  const invocation = bundledHostdInvocation(
     paths,
     target.endpoint,
     target.dataDirectory,
     packageSmoke
   )
   const child = spawn(
-    process.execPath,
-    launchArguments,
+    invocation.executable,
+    invocation.args,
     {
       detached: !packageSmoke,
       shell: false,
@@ -372,4 +516,34 @@ async function delay(milliseconds: number): Promise<void> {
     const timer = setTimeout(resolve, milliseconds)
     timer.unref?.()
   })
+}
+
+async function hashExecutable(executable: string): Promise<string> {
+  const handle = await open(executable, 'r')
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.size < 1 || before.size > 512 * 1024 * 1024) {
+      throw new Error('The bundled executable is outside its size bound.')
+    }
+    const digest = createHash('sha256')
+    const buffer = Buffer.allocUnsafe(256 * 1024)
+    let position = 0
+    while (position < before.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, before.size - position), position)
+      if (bytesRead <= 0) throw new Error('The bundled executable ended before its recorded size.')
+      digest.update(buffer.subarray(0, bytesRead))
+      position += bytesRead
+    }
+    const after = await handle.stat()
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      throw new Error('The bundled executable changed while it was hashed.')
+    }
+    return digest.digest('hex')
+  } finally {
+    await handle.close()
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

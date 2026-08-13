@@ -41,6 +41,88 @@ afterEach(async () => {
 });
 
 describe("HostService durable runtime OAuth attempt boundary", () => {
+  it("invalidates the cached model catalog when exact OAuth completion is observed", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-catalog-refresh-"));
+    temporaryDirectories.push(directory);
+    const hostStore = new HostStore(directory);
+    const attemptStore = new OAuthAttemptStore(hostStore.paths);
+    let configured = false;
+    const invalidate = vi.fn();
+    const service = new HostService(hostStore, undefined, undefined, {
+      runtimeOAuthAttemptStore: attemptStore,
+      runtimeModelCatalogProvider: {
+        async read() {
+          throw new Error("Catalog reads are outside this regression");
+        },
+        invalidate,
+      },
+      runtimeOAuthComposition: {
+        getProvider(providerId) {
+          return providerId === "openai-codex"
+            ? {
+                id: providerId,
+                name: "ChatGPT Plus/Pro (Codex Subscription)",
+                async login() {
+                  return { access: "secret", refresh: "secret", expires: Date.now() + 60_000 };
+                },
+              }
+            : undefined;
+        },
+        async set() {
+          configured = true;
+        },
+        async drainErrors() {
+          return [];
+        },
+        async reload() {
+          return undefined;
+        },
+        async getAuthStatus() {
+          return { configured };
+        },
+      },
+    });
+    try {
+      await service.initialize(testOwnershipLease());
+      await vi.waitFor(async () => {
+        expect((await readHealth(service, TRUSTED_USER_SESSION, "catalog-refresh-ready")).capabilities)
+          .toContain(RUNTIME_OAUTH_CAPABILITY);
+      });
+      const hostId = (await hostStore.getHost()).hostId;
+      const attempt = createRuntimeOAuthAttemptV1({
+        version: 1,
+        expectedHostId: hostId,
+        providerId: "openai-codex",
+        operationId: "69696969-3434-4567-8123-696969696969",
+        requestedAt: new Date().toISOString(),
+      });
+      const started = await service.handle({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId: "catalog-refresh-start",
+        method: "oauth.attempt.start",
+        payload: { authorityId: "desktop-authority-catalog", attempt },
+      }, TRUSTED_USER_SESSION);
+      if (!started.ok) throw new Error(JSON.stringify(started.error));
+      expect(invalidate).not.toHaveBeenCalled();
+
+      await vi.waitFor(async () => {
+        const status = await service.handle({
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: `catalog-refresh-status-${invalidate.mock.calls.length}`,
+          method: "oauth.attempt.status",
+          payload: { attempt },
+        }, TRUSTED_USER_SESSION);
+        expect(status).toMatchObject({
+          ok: true,
+          result: { record: { phase: "completed" } },
+        });
+      });
+      expect(invalidate).toHaveBeenCalled();
+    } finally {
+      await service.close();
+    }
+  });
+
   it("advertises the two-cap start contract and completes start, status, cancel, and ack exactly once", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prime-hostd-oauth-attempt-effects-"));
     temporaryDirectories.push(directory);

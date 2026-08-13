@@ -21,6 +21,7 @@ import {
   parseRuntimeAttestation,
 } from "./runtime-attestation-lib.mjs";
 import { createPrimeAgentSmokeCustody } from "./prime-agent-smoke-custody-lib.mjs";
+import { resolvePinnedDevelopmentNodeExecutable } from "./development-node-runtime.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOSTD_PATH = resolve(REPO_ROOT, "out", "hostd", "hostd.cjs");
@@ -80,16 +81,18 @@ const EXPECTED_BASE_CAPABILITIES = Object.freeze([
   RESIDENT_LIFECYCLE_CAPABILITY,
   "runtime_integrity_v1",
   "runtime_model_catalog_v1",
+  "runtime_oauth_attempt_v1",
   RUNTIME_OAUTH_CAPABILITY,
   "snapshot_chunks_v1",
 ].sort());
 const EXPECTED_WARMED_CAPABILITIES = Object.freeze([
-  CANDIDATE_EVALUATION_CAPABILITY,
+  ...(process.platform === "win32" ? [CANDIDATE_EVALUATION_CAPABILITY] : []),
 ].sort());
 
 const require = createRequire(import.meta.url);
-const electronExecutable = resolve(require("electron"));
-const temporaryRoot = await mkdtemp(join(tmpdir(), "prime-continuim-resident-lifecycle-smoke-"));
+const hostNodeExecutable = resolvePinnedDevelopmentNodeExecutable(REPO_ROOT);
+const browserExecutable = resolve(require("electron"));
+const temporaryRoot = await mkdtemp(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pc-resident-smoke-"));
 const hostdWrapperPath = join(temporaryRoot, "hostd-smoke-wrapper.cjs");
 const daemonAuditPath = join(temporaryRoot, "daemon-audit.mjs");
 const fauxLedgerPath = join(temporaryRoot, "faux-provider-ledger.jsonl");
@@ -102,8 +105,9 @@ await Promise.all([
 ]);
 const dataDirectory = await realpath(requestedDataDirectory);
 const workspaceDirectory = await realpath(requestedWorkspaceDirectory);
+const residentDaemonSocketRoot = await realpath(tmpdir());
 const hostEndpoint = localHostEndpoint(dataDirectory);
-const residentEndpoint = residentDaemonEndpoint(dataDirectory);
+const residentEndpoint = residentDaemonEndpoint(dataDirectory, residentDaemonSocketRoot);
 
 const attestationBytes = await readFile(ATTESTATION_PATH);
 const attestation = parseRuntimeAttestation(attestationBytes);
@@ -115,7 +119,7 @@ if (attestation.runtime.platform !== process.platform || attestation.runtime.arc
   throw new Error("Runtime attestation does not target this smoke platform and architecture");
 }
 await assertExactSeedRoot(RUNTIME_SEED_ROOT);
-await stat(electronExecutable);
+await Promise.all([stat(hostNodeExecutable), stat(browserExecutable)]);
 const hostdModule = require(HOSTD_PATH);
 const primeAgentCustody = await createPrimeAgentSmokeCustody({
   hostDataRoot: dataDirectory,
@@ -130,7 +134,7 @@ await Promise.all([
   writeFile(daemonAuditPath, daemonAuditSource(), { encoding: "utf8", mode: 0o600, flag: "wx" }),
 ]);
 
-const credentialFree = credentialFreeRunAsNodeEnvironment(process.env);
+const credentialFree = credentialFreeHostNodeEnvironment(process.env);
 const createdAt = new Date().toISOString();
 let hostdChild;
 let runtimeRoot;
@@ -1059,7 +1063,7 @@ process.stdout.write(`${JSON.stringify(successReport, null, 2)}\n`);
 
 async function startReleaseHostd(environment) {
   const child = spawn(
-    electronExecutable,
+    hostNodeExecutable,
     [
       hostdWrapperPath,
       HOSTD_PATH,
@@ -1070,6 +1074,8 @@ async function startReleaseHostd(environment) {
       dataDirectory,
       "--runtime-seed",
       RUNTIME_SEED_ROOT,
+      "--browser-executable",
+      browserExecutable,
     ],
     {
       cwd: REPO_ROOT,
@@ -1108,7 +1114,7 @@ async function waitForResidentReadiness(child, expectCommandCapability) {
         runtime?.status === "ready" &&
         lastHealth.capabilities?.includes(RESIDENT_LIFECYCLE_CAPABILITY) &&
         lastHealth.capabilities.includes(RUNTIME_OAUTH_CAPABILITY) &&
-        lastHealth.capabilities.includes(CANDIDATE_EVALUATION_CAPABILITY) &&
+        EXPECTED_WARMED_CAPABILITIES.every((capability) => lastHealth.capabilities.includes(capability)) &&
         lastHealth.capabilities.includes(RESIDENT_COMMAND_CAPABILITY) === expectCommandCapability
       ) {
         assertReadyRuntimeHealth(lastHealth, expectCommandCapability);
@@ -2235,7 +2241,7 @@ async function inspectResidentDaemon(installedRuntimeRoot, action, environment) 
   assertPathWithin(installedRuntimeRoot, daemonClientPath);
   const expectedProcessIdentities = action === "shutdown" ? daemonProcessIdentities : [];
   const result = await runProcess(
-    electronExecutable,
+    hostNodeExecutable,
     [
       daemonAuditPath,
       pathToFileURL(daemonClientPath).href,
@@ -2760,7 +2766,7 @@ function assertChildAlive(processHandle) {
   throw new Error(`Release hostd exited before readiness: ${processHandle.stderrTail.toString("utf8")}`);
 }
 
-function credentialFreeRunAsNodeEnvironment(source) {
+function credentialFreeHostNodeEnvironment(source) {
   const environment = {};
   let strippedCredentialVariableCount = 0;
   for (const [name, value] of Object.entries(source)) {
@@ -2784,7 +2790,6 @@ function credentialFreeRunAsNodeEnvironment(source) {
     }
     environment[name] = value;
   }
-  environment.ELECTRON_RUN_AS_NODE = "1";
   environment.PRIME_CONTINUIM_PACKAGE_SMOKE = "1";
   return Object.freeze({
     environment: Object.freeze(environment),
@@ -2805,7 +2810,7 @@ function localHostEndpoint(directory) {
   return join(directory, "hostd.sock");
 }
 
-function residentDaemonEndpoint(directory) {
+function residentDaemonEndpoint(directory, socketRoot = tmpdir()) {
   const root = resolve(directory);
   const identity = createHash("sha256")
     .update(process.platform === "win32" ? root.toLowerCase() : root)
@@ -2813,7 +2818,7 @@ function residentDaemonEndpoint(directory) {
     .slice(0, 16);
   return process.platform === "win32"
     ? `\\\\.\\pipe\\prime-continuim-resident-${identity}`
-    : join(resolve(tmpdir()), `pc-${identity}`, "d.sock");
+    : join(resolve(socketRoot), `pc-${identity}`, "d.sock");
 }
 
 async function assertExactSeedRoot(root) {
@@ -3153,6 +3158,19 @@ function daemonAuditSource() {
     '  if (keys.size !== identities.length) throw new Error("resident daemon process identities were not unique");',
     "  return identities.sort((left, right) => left.role.localeCompare(right.role) || left.pid - right.pid || left.processStartId.localeCompare(right.processStartId));",
     "};",
+    "const waitForProcessIdentities = async () => {",
+    "  const deadline = Date.now() + 10_000;",
+    "  let lastError;",
+    "  while (Date.now() < deadline) {",
+    "    try { return await captureProcessIdentities(); }",
+    "    catch (error) {",
+    "      if (error?.message !== \"resident daemon did not retain one exact supervisor owner\") throw error;",
+    "      lastError = error;",
+    "      await delay(50);",
+    "    }",
+    "  }",
+    "  throw lastError ?? new Error(\"resident daemon process identity publication did not converge\");",
+    "};",
     "const parseExpectedProcessIdentities = () => {",
     "  const identities = JSON.parse(expectedIdentitiesJson ?? \"[]\");",
     '  if (!Array.isArray(identities) || identities.length > MAX_PROCESS_IDENTITIES) throw new Error("expected daemon process identities changed their bound");',
@@ -3221,7 +3239,7 @@ function daemonAuditSource() {
     "    }",
     "  }",
     '  if (!client) throw new Error(`resident daemon did not accept audit connection: ${lastError instanceof Error ? lastError.message : String(lastError)}`);',
-    "  const currentProcessIdentities = await captureProcessIdentities();",
+    "  const currentProcessIdentities = await waitForProcessIdentities();",
     '  if (action === "shutdown") {',
     "    const expectedProcessIdentities = parseExpectedProcessIdentities();",
     "    const processIdentities = mergeProcessIdentities(expectedProcessIdentities, currentProcessIdentities);",

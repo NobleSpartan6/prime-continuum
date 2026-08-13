@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
+import { basename, isAbsolute } from 'node:path'
+
+const cli = process.env.PRIME_CONTINUIM_INTERNAL_PNPM_CLI
+if (!cli || !isAbsolute(cli) || !basename(cli).toLowerCase().includes('pnpm') || /[\0\r\n]/.test(cli)) {
+  console.error('Prime Continuim packaging requires the exact parent pnpm CLI.')
+  process.exit(1)
+}
+const result = spawnSync(process.execPath, [cli, ...process.argv.slice(2)], {
+  env: process.env,
+  stdio: 'inherit',
+  windowsHide: true,
+})
+if (result.error) {
+  console.error(result.error.message)
+  process.exit(1)
+}
+process.exit(result.status ?? 1)

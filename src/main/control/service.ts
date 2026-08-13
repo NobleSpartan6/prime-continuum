@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
+import { lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { App } from 'electron'
@@ -13,6 +14,7 @@ import {
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  RESIDENT_EXTENSION_UI_CAPABILITY,
   PROTOCOL_VERSION as HOST_PROTOCOL_VERSION,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY,
@@ -85,6 +87,7 @@ import type {
   ResidentLifecycleOperationView,
   ResidentProvisionOperationView,
   ResidentProvisionInput,
+  ResidentWorkspacePreselection,
   ResidentWorkspaceSelection,
   ResidentWorkspaceSelectionInput,
   RuntimeOAuthSessionView,
@@ -226,6 +229,19 @@ interface ResidentProvisionMetadata {
   readonly sessionName?: string
 }
 
+interface ResidentWorkspacePreselectionRecord {
+  readonly preselectionToken: string
+  readonly authority: CapturedProjectionAuthority
+  readonly workspaceDirectory: string
+  readonly workspaceIdentity: LocalWorkspaceIdentity
+  readonly preselection: ResidentWorkspacePreselection
+}
+
+interface LocalWorkspaceIdentity {
+  readonly device: bigint
+  readonly inode: bigint
+}
+
 interface ResidentWorkspaceSelectionRecordBase {
   readonly selectionToken: string
   readonly authority: CapturedProjectionAuthority
@@ -244,6 +260,7 @@ interface ResidentWorkspaceSelectionRecordBase {
 interface LocalResidentWorkspaceSelectionRecord extends ResidentWorkspaceSelectionRecordBase {
   readonly provisionMode: 'local_path'
   readonly workspaceDirectory: string
+  readonly workspaceIdentity?: LocalWorkspaceIdentity
 }
 
 interface RegisteredResidentWorkspaceSelectionRecord extends ResidentWorkspaceSelectionRecordBase {
@@ -280,6 +297,8 @@ interface ResidentEndConfirmationRecord {
   readonly identity: Omit<ResidentEndPreparationInput, 'resumeOperationId'>
   readonly sourceCursor: SessionCursor
   readonly createdAt: string
+  /** The user explicitly retried the same operation after the host proved it had no durable record. */
+  readonly retryMissingStatus?: true
 }
 
 interface ResidentLifecycleStatusMerge {
@@ -288,6 +307,12 @@ interface ResidentLifecycleStatusMerge {
 }
 
 type RetiredResidentSelectionReason = 'expired' | 'superseded' | 'authority_changed' | 'terminal'
+type RetiredResidentPreselectionReason =
+  | 'expired'
+  | 'superseded'
+  | 'authority_changed'
+  | 'cancelled'
+  | 'consumed'
 type RetiredResidentEndConfirmationReason = 'expired' | 'superseded' | 'authority_changed' | 'consumed'
 
 interface ServiceOptions {
@@ -320,6 +345,15 @@ const TARGET_BINDING_LIMIT = 128
 const RESIDENT_SELECTION_TTL_MS = 5 * 60_000
 const RESIDENT_SELECTION_LIMIT = 32
 const RETIRED_RESIDENT_SELECTION_LIMIT = 64
+const RESIDENT_PRESELECTION_TTL_MS = 5 * 60_000
+const RESIDENT_PRESELECTION_LIMIT = 8
+const RETIRED_RESIDENT_PRESELECTION_LIMIT = 32
+const RUNTIME_PRESELECTION_PHASES = new Set<Extract<RuntimeIntegritySnapshot, { status: 'initializing' }>['phase']>([
+  'validating_seed',
+  'copying',
+  'verifying',
+  'publishing',
+])
 const RESIDENT_LIFECYCLE_LEDGER_LIMIT = 128
 const RESIDENT_END_CONFIRMATION_TTL_MS = 2 * 60_000
 const RESIDENT_END_CONFIRMATION_LIMIT = 32
@@ -367,6 +401,8 @@ export class DesktopControlService extends EventEmitter {
   private readonly threadChangeRefreshes = new Map<string, ThreadChangeRefresh>()
   private readonly residentWorkspaceSelections = new Map<string, ResidentWorkspaceSelectionRecord>()
   private readonly retiredResidentSelections = new Map<string, RetiredResidentSelectionReason>()
+  private readonly residentWorkspacePreselections = new Map<string, ResidentWorkspacePreselectionRecord>()
+  private readonly retiredResidentPreselections = new Map<string, RetiredResidentPreselectionReason>()
   private readonly residentEndConfirmations = new Map<string, ResidentEndConfirmationRecord>()
   private readonly retiredResidentEndConfirmations = new Map<string, RetiredResidentEndConfirmationReason>()
   private readonly residentEndMutationTails = new Map<string, Promise<void>>()
@@ -448,8 +484,8 @@ export class DesktopControlService extends EventEmitter {
     return await this.latency.measure('cache.bootstrap', async () => {
       // These reads touch distinct stores and do not depend on one another;
       // target authority is not derived until the complete initial view has
-      // settled. The already-validated command ledger is reused to classify
-      // the initial outbox instead of adding a second disk-read waterfall.
+      // settled. They establish deterministic storage failure ordering before
+      // the authority-fenced view below performs its final reads.
       const [
         initialCommandIdentitiesResult,
         durableUncertainReceiptsResult,
@@ -473,8 +509,7 @@ export class DesktopControlService extends EventEmitter {
       if (initialCommandIdentitiesResult.status === 'rejected') throw initialCommandIdentitiesResult.reason
       if (durableUncertainReceiptsResult.status === 'rejected') throw durableUncertainReceiptsResult.reason
       if (initialCacheResult.status === 'rejected') throw initialCacheResult.reason
-      const initialCommandIdentities = initialCommandIdentitiesResult.value
-      const durableUncertainReceipts = durableUncertainReceiptsResult.value
+      const initialDurableUncertainReceipts = durableUncertainReceiptsResult.value
       const initialCache = initialCacheResult.value
       if (!this.target && initialCache.lastTarget) {
         this.target = initialCache.lastTarget
@@ -489,7 +524,6 @@ export class DesktopControlService extends EventEmitter {
       }
       if (initialRawOutboxResult.status === 'rejected') throw initialRawOutboxResult.reason
       if (initialResidentLifecycleLedgerResult.status === 'rejected') throw initialResidentLifecycleLedgerResult.reason
-      const initialRawOutbox = initialRawOutboxResult.value
       const initialResidentLifecycleLedger = initialResidentLifecycleLedgerResult.value
 
       // Cache, outbox, and connection must describe one authority. A concurrent
@@ -498,22 +532,23 @@ export class DesktopControlService extends EventEmitter {
         const generation = this.reconnectGeneration
         const activeHostId = this.authorityHostId
         const activeTarget = this.target
-        // Outbox classification and resident lifecycle recovery use independent
-        // stores; the authority fence below rejects any concurrent target change.
-        const [cache, outbox, residentLifecycleLedger] = await Promise.all([
+        const connectionBeforeRead = this.getConnectionState()
+        // Always read the final authority view again. A connection may finish
+        // reconciling and remove an acknowledged resident command after the
+        // initial parallel read but before it publishes `online`. Reusing that
+        // initial outbox would leave the renderer showing a completed turn as
+        // Running until the next app restart.
+        const [cache, outbox, residentLifecycleLedger, durableUncertainReceipts] = await Promise.all([
           retry === 0 ? Promise.resolve(initialCache) : this.readCache(),
-          retry === 0
-            ? this.readOutboxClassification(true, {
-                raw: initialRawOutbox,
-                ledger: initialCommandIdentities,
-              })
-            : this.readOutboxClassification(true),
+          this.readOutboxClassification(true),
           retry === 0 ? Promise.resolve(initialResidentLifecycleLedger) : this.residentLifecycleLedger.read(),
+          retry === 0 ? Promise.resolve(initialDurableUncertainReceipts) : this.durableUncertainReceipts.read(),
         ])
         const residentLifecycle = normalizeResidentLifecycleLedger(residentLifecycleLedger)
         const connection = this.getConnectionState()
         if (
           generation === this.reconnectGeneration &&
+          JSON.stringify(connectionBeforeRead) === JSON.stringify(connection) &&
           activeHostId === this.authorityHostId &&
           sameOptionalTarget(activeTarget, this.target) &&
           sameOptionalTarget(activeTarget, connection.target) &&
@@ -624,6 +659,7 @@ export class DesktopControlService extends EventEmitter {
 
   private async connectTarget(target: ConnectionTarget, expectedHostId?: string): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspacePreselections('authority_changed')
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     try {
@@ -690,6 +726,7 @@ export class DesktopControlService extends EventEmitter {
 
   async reconnect(): Promise<ConnectionState> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspacePreselections('authority_changed')
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     try {
@@ -718,6 +755,7 @@ export class DesktopControlService extends EventEmitter {
 
   async disconnect(): Promise<void> {
     this.beginOAuthConnectionTransition()
+    this.revokeResidentWorkspacePreselections('authority_changed')
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     try {
@@ -1161,6 +1199,7 @@ export class DesktopControlService extends EventEmitter {
           )
           accepted = { ...accepted, desktop }
         }
+        this.scheduleRuntimeOAuthTerminalCapabilityRefresh(authority, accepted)
         return this.presentRuntimeOAuthAttempt(accepted)
       })
     } finally {
@@ -1209,6 +1248,7 @@ export class DesktopControlService extends EventEmitter {
         )
         accepted = { ...accepted, desktop }
       }
+      this.scheduleRuntimeOAuthTerminalCapabilityRefresh(authority, accepted)
       return this.presentRuntimeOAuthAttempt(accepted)
     })
   }
@@ -1279,6 +1319,7 @@ export class DesktopControlService extends EventEmitter {
       if (!accepted.host) {
         throw new ControlError('runtime.oauth_session_untracked', 'The durable sign-in session is no longer available.')
       }
+      this.scheduleRuntimeOAuthTerminalCapabilityRefresh(authority, accepted)
       return this.presentRuntimeOAuthAttempt(accepted)
     })
   }
@@ -1293,6 +1334,118 @@ export class DesktopControlService extends EventEmitter {
       }
       return await this.selectLocalResidentWorkspace(normalized.resumeOperationId)
     })
+  }
+
+  async preselectResidentWorkspace(): Promise<ResidentWorkspacePreselection> {
+    return await this.latency.measure('resident.workspace.preselect', async () => {
+      const authority = this.captureLocalResidentPreselectionAuthority()
+      if (!this.selectDirectory) {
+        throw new ControlError(
+          'resident.workspace_picker_unavailable',
+          'The native workspace picker is unavailable.'
+        )
+      }
+
+      let selectedDirectory: string | undefined
+      try {
+        selectedDirectory = await this.selectDirectory()
+      } catch {
+        throw new ControlError(
+          'resident.workspace_picker_failed',
+          'The native workspace picker could not be opened.',
+          { retryable: true }
+        )
+      }
+      this.assertResidentPreselectionAuthority(authority, true)
+      if (selectedDirectory === undefined) {
+        throw new ControlError(
+          'resident.workspace_preselection_cancelled',
+          'No workspace folder was selected.'
+        )
+      }
+
+      const { workspaceDirectory, workspaceIdentity } = await resolveSelectedWorkspaceDirectory(selectedDirectory)
+      this.assertResidentPreselectionAuthority(authority, true)
+      this.expireResidentWorkspacePreselections()
+      this.revokeResidentWorkspacePreselections('superseded')
+
+      const preselectionToken = randomUUID()
+      const preselection = Object.freeze({
+        preselectionToken,
+        suggestedName: suggestedWorkspaceName(workspaceDirectory),
+        expiresAt: new Date(Date.now() + RESIDENT_PRESELECTION_TTL_MS).toISOString(),
+      })
+      this.residentWorkspacePreselections.set(preselectionToken, {
+        preselectionToken,
+        authority,
+        workspaceDirectory,
+        workspaceIdentity,
+        preselection,
+      })
+      this.enforceResidentPreselectionLimit()
+      return { ...preselection }
+    })
+  }
+
+  async completeResidentWorkspacePreselection(preselectionToken: string): Promise<ResidentWorkspaceSelection> {
+    const record = this.requireResidentWorkspacePreselection(preselectionToken)
+    const authority = this.captureLocalResidentProvisionAuthority(record.authority.hostId)
+    if (
+      authority.connection !== record.authority.connection ||
+      authority.generation !== record.authority.generation ||
+      !sameTarget(authority.target, record.authority.target)
+    ) {
+      this.retireResidentWorkspacePreselection(preselectionToken, 'authority_changed')
+      throw new ControlError(
+        'resident.workspace_preselection_authority_changed',
+        'The local host connection changed after this workspace was chosen.',
+        { retryable: true }
+      )
+    }
+    this.assertProjectionAuthority(record.authority, 'resident workspace preselection completion')
+
+    // Consume before minting the normal one-use selection. Concurrent or
+    // retried completions can never create a second lifecycle identity.
+    this.retireResidentWorkspacePreselection(preselectionToken, 'consumed')
+    await assertSelectedWorkspaceIdentity(
+      record.workspaceDirectory,
+      record.workspaceIdentity,
+      'The chosen workspace changed while Prime was preparing. Choose the folder again.',
+    )
+    this.assertProjectionAuthority(record.authority, 'resident workspace preselection completion')
+    this.expireResidentWorkspaceSelections()
+    this.revokeResidentWorkspaceSelections('superseded')
+    const selectionToken = randomUUID()
+    const selection = Object.freeze({
+      selectionToken,
+      operationId: `resident-${randomUUID()}`,
+      expectedHostId: authority.hostId,
+      suggestedName: record.preselection.suggestedName,
+      expiresAt: new Date(Date.now() + RESIDENT_SELECTION_TTL_MS).toISOString(),
+    })
+    this.residentWorkspaceSelections.set(selectionToken, {
+      provisionMode: 'local_path',
+      selectionToken,
+      authority,
+      workspaceDirectory: record.workspaceDirectory,
+      workspaceIdentity: record.workspaceIdentity,
+      selection,
+      projectId: `project-${randomUUID()}`,
+      workspaceId: `workspace-${randomUUID()}`,
+      threadId: `thread-${randomUUID()}`,
+      executionGenerationId: `execution-${randomUUID()}`,
+      createdAt: now(),
+      durableOperationPossible: false,
+    })
+    this.enforceResidentSelectionLimit()
+    return { ...selection }
+  }
+
+  cancelResidentWorkspacePreselection(preselectionToken: string): void {
+    this.expireResidentWorkspacePreselections()
+    if (this.residentWorkspacePreselections.has(preselectionToken)) {
+      this.retireResidentWorkspacePreselection(preselectionToken, 'cancelled')
+    }
   }
 
   private async selectLocalResidentWorkspace(
@@ -1348,6 +1501,7 @@ export class DesktopControlService extends EventEmitter {
         )
       }
       this.expireResidentWorkspaceSelections()
+      this.revokeResidentWorkspacePreselections('superseded')
       this.revokeResidentWorkspaceSelections('superseded')
 
       const selectionToken = randomUUID()
@@ -1405,6 +1559,7 @@ export class DesktopControlService extends EventEmitter {
     this.assertProjectionAuthority(authority, 'registered resident workspace selection')
 
     this.expireResidentWorkspaceSelections()
+    this.revokeResidentWorkspacePreselections('superseded')
     this.revokeResidentWorkspaceSelections('superseded')
 
     const selectionToken = randomUUID()
@@ -1459,7 +1614,16 @@ export class DesktopControlService extends EventEmitter {
       if (record.provisionMetadata && !sameResidentProvisionMetadata(record.provisionMetadata, metadata)) {
         throw new ControlError(
           'resident.provision_identity_conflict',
-          'This workspace selection was already bound to different provisioning details.'
+          'This setup already has names from its original attempt.',
+          {
+            details: {
+              expectedProjectDisplayName: record.provisionMetadata.projectDisplayName,
+              expectedThreadTitle: record.provisionMetadata.threadTitle,
+              ...(record.provisionMetadata.sessionName === undefined
+                ? {}
+                : { expectedSessionName: record.provisionMetadata.sessionName }),
+            },
+          },
         )
       }
       record.provisionMetadata ??= metadata
@@ -1497,8 +1661,9 @@ export class DesktopControlService extends EventEmitter {
       let operationId = `resident-end-${randomUUID()}`
       let createdAt = now()
       let expectedSourceCursor: SessionCursor | undefined
+      let retryMissingStatus = false
       if (normalized.resumeOperationId) {
-        const entry = ledger.entries.find(
+        let entry = ledger.entries.find(
           (candidate) =>
             candidate.expectedHostId === normalized.expectedHostId &&
             candidate.operationId === normalized.resumeOperationId
@@ -1515,11 +1680,37 @@ export class DesktopControlService extends EventEmitter {
             'The resident end operation belongs to a different thread lineage.'
           )
         }
-        if (
+        if (entry.state === 'outcome_unknown' && entry.lastStatus === undefined) {
+          const raw = await authority.connection.request(
+            'resident.lifecycle.status',
+            {
+              expectedHostId: normalized.expectedHostId,
+              operationId: entry.operationId,
+            },
+            { timeoutMs: 30_000 },
+          )
+          this.assertProjectionAuthority(authority, 'resident end retry review')
+          const lookup = ResidentLifecycleLookupResultSchema.parse(raw)
+          if (lookup.status) {
+            const status = await this.acceptResidentLifecycleStatus(
+              lookup.status,
+              authority,
+              entry.operationId,
+            )
+            entry = {
+              ...entry,
+              state: residentLifecycleStateForStatus(status),
+              lastStatus: status,
+            }
+          } else {
+            retryMissingStatus = true
+          }
+        }
+        if (!retryMissingStatus && (
           entry.state !== 'submitted' ||
           entry.lastStatus?.kind !== 'end' ||
           entry.lastStatus.phase !== 'ending'
-        ) {
+        )) {
           throw new ControlError(
             'resident.end_resume_not_allowed',
             'This end operation may only be checked for durable status; it cannot send another end request.'
@@ -1576,6 +1767,7 @@ export class DesktopControlService extends EventEmitter {
         },
         sourceCursor,
         createdAt,
+        ...(retryMissingStatus ? { retryMissingStatus: true } : {}),
       })
       this.enforceResidentEndConfirmationLimit()
       return { ...confirmation }
@@ -2288,7 +2480,10 @@ export class DesktopControlService extends EventEmitter {
             : host.terminal?.body.resolution === 'persistence_failed'
               ? 'OAUTH_PERSISTENCE_UNCONFIRMED'
               : 'OAUTH_PROVIDER_FAILED',
-          retryable: host.terminal?.body.resolution !== 'expired',
+          // Expiry is terminal for this exact attempt, not for the provider.
+          // Once its durable result is acknowledged the user may safely start
+          // a fresh sign-in, matching the live broker's retryable expiry view.
+          retryable: true,
         }
       : host.phase === 'outcome_unknown'
         ? { code: 'OAUTH_PERSISTENCE_UNCONFIRMED', retryable: true }
@@ -2301,6 +2496,24 @@ export class DesktopControlService extends EventEmitter {
       ...(host.phase === 'completed' ? { configured: true as const } : {}),
       ...(terminalError ? { error: Object.freeze(terminalError) } : {}),
     })
+  }
+
+  private scheduleRuntimeOAuthTerminalCapabilityRefresh(
+    authority: CapturedProjectionAuthority,
+    accepted: AcceptedRuntimeOAuthAttempt,
+  ): void {
+    if (!accepted.host?.terminal || !accepted.desktop.hostAckConfirmedAt) return
+    // OAuth start eligibility is deliberately withdrawn while an attempt owns
+    // the provider. Once the exact terminal successor is acknowledged, sample
+    // health immediately instead of leaving Retry/Connect stale for up to the
+    // 15-second steady-state poll interval.
+    this.scheduleHealthPoll(
+      authority.connection,
+      authority.target,
+      authority.hostId,
+      authority.generation,
+      0,
+    )
   }
 
   private async reconcileRuntimeOAuthAttemptsAfterConnect(
@@ -2514,6 +2727,16 @@ export class DesktopControlService extends EventEmitter {
         'command.capability_unavailable',
         'Prime Agent commands are unavailable until this host reports a verified resident runtime.',
         { retryable: true, details: { hostId, capability: PRIME_AGENT_COMMAND_CAPABILITY } }
+      )
+    }
+    if (
+      command.kind === 'extension_ui.respond' &&
+      !this.authorityCapabilities.includes(RESIDENT_EXTENSION_UI_CAPABILITY)
+    ) {
+      throw new ControlError(
+        'command.extension_ui_capability_unavailable',
+        'This host does not support native Prime Agent dialogs. Refresh after updating the host.',
+        { retryable: true, details: { hostId, capability: RESIDENT_EXTENSION_UI_CAPABILITY } },
       )
     }
 
@@ -2755,6 +2978,7 @@ export class DesktopControlService extends EventEmitter {
     generation: number,
     expectedHostId?: string
   ): Promise<ConnectionState> {
+    this.revokeResidentWorkspacePreselections('authority_changed')
     this.revokeResidentWorkspaceSelections('authority_changed')
     this.revokeResidentEndConfirmations('authority_changed')
     this.stopHealthPolling()
@@ -3003,6 +3227,7 @@ export class DesktopControlService extends EventEmitter {
     connection.once('close', (error: unknown) => {
       this.cancelThreadChangeRefreshesForConnection(connection)
       if (this.connection !== connection) return
+      this.revokeResidentWorkspacePreselections('authority_changed')
       this.stopHealthPolling()
       this.stopNonterminalReconciliation()
       this.connection = undefined
@@ -3188,6 +3413,7 @@ export class DesktopControlService extends EventEmitter {
     target: ConnectionTarget,
     hostId: string,
     generation: number,
+    requestedDelayMs?: number,
   ): void {
     this.stopHealthPolling()
     if (!this.isActiveConnection(connection, target, hostId, generation)) return
@@ -3210,9 +3436,9 @@ export class DesktopControlService extends EventEmitter {
       expectedWarmedCapabilities.some((capability) => !this.authorityCapabilities.includes(capability))
     )
     if (warmingOptionalRuntimeCapabilities) this.healthCapabilityWarmupPollsRemaining -= 1
-    const delayMs = initializing || warmingOptionalRuntimeCapabilities
+    const delayMs = requestedDelayMs ?? (initializing || warmingOptionalRuntimeCapabilities
       ? HEALTH_POLL_INITIALIZING_MS
-      : HEALTH_POLL_STEADY_MS
+      : HEALTH_POLL_STEADY_MS)
     this.healthPollTimer = setTimeout(() => {
       this.healthPollTimer = undefined
       void this.pollHealth(connection, target, hostId, generation)
@@ -3344,7 +3570,16 @@ export class DesktopControlService extends EventEmitter {
           )
         }
         const rawReceipt = receipts[0]
-        if (!rawReceipt) continue
+        if (!rawReceipt) {
+          if (unknown.length === 1 && isExtensionUiResponseClientCommand(entry.command)) {
+            // The host has no durable admission for this live-only response.
+            // Retire the local envelope without submitting it; the still-live
+            // request may be answered explicitly with a fresh command.
+            await this.removeOutbox([outboxIdentity(authority.hostId, entry.command)])
+            madeProgress = true
+          }
+          continue
+        }
         assertReceiptMatchesCommand(rawReceipt, entry.command)
         const receipt: CommandReceipt = { ...rawReceipt, hostId: authority.hostId }
         await this.recordDurableUncertainReceipt(receipt, entry.command)
@@ -3436,6 +3671,13 @@ export class DesktopControlService extends EventEmitter {
     this.authorityCapabilities = observation.capabilities
     this.authorityRuntimeReadiness = observation.runtimeReadiness
     this.authorityHealthLineage = observation.lineage
+    if (
+      observation.runtimeReadiness.kind !== 'reported' ||
+      observation.runtimeReadiness.snapshot.status === 'failed' ||
+      observation.runtimeReadiness.snapshot.status === 'unavailable'
+    ) {
+      this.revokeResidentWorkspacePreselections('authority_changed')
+    }
     const { capabilities: _capabilities, runtimeReadiness: _runtimeReadiness, ...base } = this.state
     const next = { ...base, ...this.authorityObservationState() }
     if (semanticChange) this.setState(next)
@@ -3571,23 +3813,90 @@ export class DesktopControlService extends EventEmitter {
         { retryable: true }
       )
     }
+    const readiness = this.authorityRuntimeReadiness
+    if (
+      readiness?.kind !== 'reported' ||
+      readiness.hostId !== authority.hostId ||
+      readiness.snapshot.status !== 'ready'
+    ) {
+      throw new ControlError(
+        'resident.runtime_not_ready',
+        'Resident workspace setup remains unavailable until the verified runtime is ready.',
+        { retryable: true }
+      )
+    }
     return authority
+  }
+
+  private captureLocalResidentPreselectionAuthority(): CapturedProjectionAuthority {
+    const authority = this.captureProjectionAuthority()
+    this.assertResidentPreselectionAuthority(authority, true)
+    return authority
+  }
+
+  private assertResidentPreselectionAuthority(
+    expected: CapturedProjectionAuthority,
+    allowReady: boolean,
+  ): void {
+    const authority = this.captureProjectionAuthority()
+    if (
+      (this.state.phase !== 'online' && this.state.phase !== 'degraded') ||
+      authority.target.kind !== 'local' ||
+      this.state.path !== 'local_socket'
+    ) {
+      throw new ControlError(
+        'resident.workspace_preselection_unavailable',
+        'Workspace preselection requires the live private service on this computer.',
+        { retryable: true }
+      )
+    }
+    if (
+      authority.hostId !== expected.hostId ||
+      authority.connection !== expected.connection ||
+      authority.generation !== expected.generation ||
+      !sameTarget(authority.target, expected.target)
+    ) {
+      throw new ControlError(
+        'resident.workspace_preselection_authority_changed',
+        'The local host connection changed while this workspace was being chosen.',
+        { retryable: true }
+      )
+    }
+    const readiness = this.authorityRuntimeReadiness
+    const eligibleInitializing = readiness?.kind === 'reported' &&
+      readiness.hostId === authority.hostId &&
+      readiness.snapshot.status === 'initializing' &&
+      RUNTIME_PRESELECTION_PHASES.has(readiness.snapshot.phase)
+    const eligibleReady = allowReady && readiness?.kind === 'reported' &&
+      readiness.hostId === authority.hostId &&
+      readiness.snapshot.status === 'ready'
+    if (!eligibleInitializing && !eligibleReady) {
+      throw new ControlError(
+        'resident.workspace_preselection_not_ready',
+        'Choose a workspace after verified runtime preparation has started.',
+        { retryable: true }
+      )
+    }
+    this.assertProjectionAuthority(expected, 'resident workspace preselection')
   }
 
   private captureRegisteredResidentWorkspaceAuthority(
     expectedHostId?: string,
   ): CapturedProjectionAuthority {
     const authority = this.captureResidentLifecycleBaseAuthority(expectedHostId)
-    if (authority.target.kind !== 'ssh') {
+    if (authority.target.kind !== 'local' && authority.target.kind !== 'ssh') {
       throw new ControlError(
-        'resident.registered_workspace_ssh_required',
-        'Saved-workspace resident provisioning is available only on a verified SSH host.'
+        'resident.registered_workspace_host_required',
+        'Saved-workspace resident provisioning requires a verified host.'
       )
     }
-    if (!this.authorityCapabilities.includes(RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY)) {
+    const capability = authority.target.kind === 'local'
+      ? RESIDENT_LIFECYCLE_CAPABILITY
+      : RESIDENT_REGISTERED_WORKSPACE_LIFECYCLE_CAPABILITY
+    if (!this.authorityCapabilities.includes(capability)) {
       throw new ControlError(
         'resident.registered_workspace_unavailable',
-        'The connected SSH host does not expose saved-workspace resident lifecycle control.',
+        'The connected host does not expose saved-workspace resident lifecycle control.',
         { retryable: true }
       )
     }
@@ -3919,6 +4228,50 @@ export class DesktopControlService extends EventEmitter {
     )
   }
 
+  private requireResidentWorkspacePreselection(
+    preselectionToken: string,
+  ): ResidentWorkspacePreselectionRecord {
+    this.expireResidentWorkspacePreselections()
+    const record = this.residentWorkspacePreselections.get(preselectionToken)
+    if (record) return record
+    const reason = this.retiredResidentPreselections.get(preselectionToken)
+    if (reason === 'expired') {
+      throw new ControlError(
+        'resident.workspace_preselection_expired',
+        'The early workspace choice expired. Choose the folder again.'
+      )
+    }
+    if (reason === 'superseded') {
+      throw new ControlError(
+        'resident.workspace_preselection_superseded',
+        'A newer early workspace choice replaced this one.'
+      )
+    }
+    if (reason === 'authority_changed') {
+      throw new ControlError(
+        'resident.workspace_preselection_authority_changed',
+        'The local host connection changed after this workspace was chosen.',
+        { retryable: true }
+      )
+    }
+    if (reason === 'cancelled') {
+      throw new ControlError(
+        'resident.workspace_preselection_cancelled',
+        'This early workspace choice was cancelled.'
+      )
+    }
+    if (reason === 'consumed') {
+      throw new ControlError(
+        'resident.workspace_preselection_consumed',
+        'This early workspace choice was already continued.'
+      )
+    }
+    throw new ControlError(
+      'resident.workspace_preselection_unknown',
+      'The early workspace choice is unavailable. Choose the folder again.'
+    )
+  }
+
   private async requireLocalResidentWorkspaceRecoveryEntry(
     operationId: string,
     authority: CapturedProjectionAuthority,
@@ -4063,7 +4416,7 @@ export class DesktopControlService extends EventEmitter {
       if (error instanceof ControlError && error.code.startsWith('protocol.')) throw error
       throw new ControlError(
         'resident.registered_workspace_projection_failed',
-        'The saved workspace could not be refreshed from this SSH host.',
+        'The saved workspace could not be refreshed from this host.',
         { retryable: true }
       )
     }
@@ -4117,7 +4470,7 @@ export class DesktopControlService extends EventEmitter {
       if (error instanceof ControlError && error.code.startsWith('protocol.')) throw error
       throw new ControlError(
         'resident.registered_workspace_projection_failed',
-        'The saved workspace thread could not be refreshed from this SSH host.',
+        'The saved workspace thread could not be refreshed from this host.',
         { retryable: true }
       )
     }
@@ -4176,6 +4529,43 @@ export class DesktopControlService extends EventEmitter {
       if (Date.parse(record.selection.expiresAt) <= timestamp) {
         this.retireResidentWorkspaceSelection(record.selectionToken, 'expired')
       }
+    }
+  }
+
+  private expireResidentWorkspacePreselections(): void {
+    const timestamp = Date.now()
+    for (const record of [...this.residentWorkspacePreselections.values()]) {
+      if (Date.parse(record.preselection.expiresAt) <= timestamp) {
+        this.retireResidentWorkspacePreselection(record.preselectionToken, 'expired')
+      }
+    }
+  }
+
+  private revokeResidentWorkspacePreselections(reason: RetiredResidentPreselectionReason): void {
+    for (const preselectionToken of [...this.residentWorkspacePreselections.keys()]) {
+      this.retireResidentWorkspacePreselection(preselectionToken, reason)
+    }
+  }
+
+  private retireResidentWorkspacePreselection(
+    preselectionToken: string,
+    reason: RetiredResidentPreselectionReason,
+  ): void {
+    this.residentWorkspacePreselections.delete(preselectionToken)
+    this.retiredResidentPreselections.delete(preselectionToken)
+    this.retiredResidentPreselections.set(preselectionToken, reason)
+    while (this.retiredResidentPreselections.size > RETIRED_RESIDENT_PRESELECTION_LIMIT) {
+      const oldest = this.retiredResidentPreselections.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retiredResidentPreselections.delete(oldest)
+    }
+  }
+
+  private enforceResidentPreselectionLimit(): void {
+    while (this.residentWorkspacePreselections.size > RESIDENT_PRESELECTION_LIMIT) {
+      const oldest = this.residentWorkspacePreselections.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.retireResidentWorkspacePreselection(oldest, 'superseded')
     }
   }
 
@@ -4412,6 +4802,21 @@ export class DesktopControlService extends EventEmitter {
           )
         }
         if (
+          record.retryMissingStatus === true &&
+          existing.kind === 'end' &&
+          existing.state === 'outcome_unknown' &&
+          existing.lastStatus === undefined &&
+          sameSessionCursor(existing.sourceCursor, record.sourceCursor)
+        ) {
+          const entries = [...current.entries]
+          entries[existingIndex] = {
+            ...existing,
+            updatedAt: entry.updatedAt,
+            state: 'submitted',
+          }
+          return { version: 1, entries }
+        }
+        if (
           existing.kind !== 'end' ||
           existing.state !== 'submitted' ||
           existing.lastStatus?.kind !== 'end' ||
@@ -4441,6 +4846,14 @@ export class DesktopControlService extends EventEmitter {
       throw new ControlError('resident.provision_metadata_missing', 'Resident provisioning details are missing.')
     }
     this.assertResidentSelectionAuthority(record, 'resident provisioning')
+    if (record.provisionMode === 'local_path' && record.workspaceIdentity) {
+      await assertSelectedWorkspaceIdentity(
+        record.workspaceDirectory,
+        record.workspaceIdentity,
+        'The selected workspace changed before setup was confirmed. Choose the folder again.',
+      )
+      this.assertResidentSelectionAuthority(record, 'resident provisioning')
+    }
     await this.recordResidentLifecycleSubmission(record, metadata)
     this.assertResidentSelectionAuthority(record, 'resident provisioning')
 
@@ -5404,18 +5817,19 @@ export class DesktopControlService extends EventEmitter {
         details: { expectedHostId: authority.hostId, receivedHostId: snapshot.thread.currentLocation.hostId },
       })
     }
+    const durableSnapshot = stripEphemeralExtensionUiRequests(snapshot)
     let accepted = false
     await this.cache.update((current) => {
       this.assertProjectionAuthority(authority, 'thread snapshot')
       const cache = normalizeCache(current)
       const previous = cache.entries[authority.hostId]
-      const decision = threadSnapshotProjectionDecision(previous, snapshot)
+      const decision = threadSnapshotProjectionDecision(previous, durableSnapshot)
       if (!decision.accept) return cache
       accepted = true
       return replaceProjectionEntry(cache, authority.hostId, {
         ...previous,
         hostId: authority.hostId,
-        lastSnapshot: snapshot,
+        lastSnapshot: durableSnapshot,
         retiredExecutionGenerations: decision.retiredExecutionGenerations,
         retiredCursorGenerations: decision.retiredCursorGenerations,
         updatedAt: now(),
@@ -5716,6 +6130,7 @@ export class DesktopControlService extends EventEmitter {
     const durableEntries: ScopedOutboxEntry[] = []
     const durableReceipts: CommandReceipt[] = []
     const explicitlyUnknownWaitingEntries: ScopedOutboxEntry[] = []
+    const unknownLiveOnlyResponses: ScopedOutboxEntry[] = []
 
     for (const entry of pending) {
       if (!this.isActiveConnection(connection, authority.target, hostId, authority.generation)) {
@@ -5773,6 +6188,8 @@ export class DesktopControlService extends EventEmitter {
           }
           if (entry.state === 'waiting_for_connection' && isExplicitOfflineFollowUp(entry.command)) {
             explicitlyUnknownWaitingEntries.push(entry)
+          } else if (isExtensionUiResponseClientCommand(entry.command)) {
+            unknownLiveOnlyResponses.push(entry)
           }
         }
       } catch (error) {
@@ -5789,6 +6206,7 @@ export class DesktopControlService extends EventEmitter {
       this.emit('host-event', { type: 'command.receipt', payload: receipt })
     }
     await this.removeOutbox(durableEntries.map((entry) => outboxIdentity(hostId, entry.command)))
+    await this.removeOutbox(unknownLiveOnlyResponses.map((entry) => outboxIdentity(hostId, entry.command)))
 
     for (const entry of explicitlyUnknownWaitingEntries) {
       try {
@@ -6234,6 +6652,54 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
       providerId: payload.providerId,
       modelId: payload.modelId,
     }
+  } else if (normalizedKind === 'extension_ui.respond') {
+    const requestId = payload.requestId
+    const requestDigest = payload.requestDigest
+    const method = payload.method
+    const response = payload.response
+    if (
+      typeof requestId !== 'string' ||
+      typeof requestDigest !== 'string' ||
+      (method !== 'select' && method !== 'confirm' && method !== 'input' && method !== 'editor') ||
+      !isRecord(response)
+    ) {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response is missing its exact request identity.',
+      )
+    }
+    let normalizedResponse:
+      | { kind: 'cancelled' }
+      | { kind: 'value'; value: string }
+      | { kind: 'confirmed'; confirmed: boolean }
+    if (response.kind === 'cancelled') {
+      normalizedResponse = { kind: 'cancelled' }
+    } else if (response.kind === 'value' && typeof response.value === 'string') {
+      normalizedResponse = { kind: 'value', value: response.value }
+    } else if (response.kind === 'confirmed' && typeof response.confirmed === 'boolean') {
+      normalizedResponse = { kind: 'confirmed', confirmed: response.confirmed }
+    } else {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response has an invalid value.',
+      )
+    }
+    if (
+      (method === 'confirm' && normalizedResponse.kind === 'value') ||
+      (method !== 'confirm' && normalizedResponse.kind === 'confirmed')
+    ) {
+      throw new ControlError(
+        'command.extension_ui_response_invalid',
+        'This dialog response does not match the exact dialog method.',
+      )
+    }
+    command = {
+      kind: 'extension_ui.respond',
+      requestId,
+      requestDigest,
+      method,
+      response: normalizedResponse,
+    }
   } else {
     throw new ControlError('command.unsupported_kind', 'This command kind is not supported by the host protocol.', {
       details: { kind: input.kind }
@@ -6253,7 +6719,8 @@ function adaptCommand(input: ClientCommand): CommandEnvelope {
 }
 
 function isUrgentCommand(kind: string): boolean {
-  return kind === 'approval.resolve' || kind === 'thread.cancel' || kind === 'thread.abort'
+  return kind === 'approval.resolve' || kind === 'extension_ui.respond' ||
+    kind === 'thread.cancel' || kind === 'thread.abort'
 }
 
 function isDefinitiveCommandIdentityError(error: unknown): boolean {
@@ -6293,6 +6760,10 @@ function isPromptClientCommand(command: ClientCommand): boolean {
 
 function isAbortClientCommand(command: ClientCommand): boolean {
   return command.kind === 'abort' || command.kind === 'thread.abort' || command.kind === 'thread.cancel'
+}
+
+function isExtensionUiResponseClientCommand(command: ClientCommand): boolean {
+  return command.kind === 'extension_ui.respond'
 }
 
 function residentCommandOperation(command: ClientCommand): 'prompt' | 'abort' | undefined {
@@ -6726,7 +7197,7 @@ function normalizeCache(value: unknown): CacheEnvelope {
       entries[legacyHostId] = {
         hostId: legacyHostId,
         ...(catalogMatches ? { catalog: legacyCatalog.data } : {}),
-        ...(snapshotMatches ? { lastSnapshot: legacySnapshot.data } : {}),
+        ...(snapshotMatches ? { lastSnapshot: stripEphemeralExtensionUiRequests(legacySnapshot.data) } : {}),
         ...(typeof raw.updatedAt === 'string' ? { updatedAt: raw.updatedAt } : {}),
       }
     }
@@ -6756,6 +7227,13 @@ function normalizeCache(value: unknown): CacheEnvelope {
     ...(typeof raw.lastTargetUpdatedAt === 'string' ? { lastTargetUpdatedAt: raw.lastTargetUpdatedAt } : {}),
     ...(activeHostId ? { activeHostId } : {})
   }
+}
+
+/** Prime Agent dialogs belong only to the exact live connection that emitted them. */
+function stripEphemeralExtensionUiRequests(snapshot: ThreadProjectionSnapshot): ThreadProjectionSnapshot {
+  if (!("residentExtensionUiRequests" in snapshot)) return snapshot
+  const { residentExtensionUiRequests: _ephemeral, ...durable } = snapshot
+  return ThreadProjectionSnapshotSchema.parse(durable)
 }
 
 function visibleCacheForAuthority(cache: CacheEnvelope, hostId: string | undefined): CacheEnvelope {
@@ -6974,7 +7452,7 @@ function asCachedHostProjection(value: unknown, hostId: string): CachedHostProje
   return {
     hostId,
     ...(catalogMatches ? { catalog: catalog.data } : {}),
-    ...(snapshotMatches ? { lastSnapshot: snapshot.data } : {}),
+    ...(snapshotMatches ? { lastSnapshot: stripEphemeralExtensionUiRequests(snapshot.data) } : {}),
     ...(
       isRecord(value.retiredExecutionGenerations)
         ? { retiredExecutionGenerations: cloneRetiredExecutionGenerations(value.retiredExecutionGenerations) }
@@ -7156,6 +7634,47 @@ function normalizeSelectedWorkspaceDirectory(value: unknown): string {
     )
   }
   return normalized
+}
+
+async function resolveSelectedWorkspaceDirectory(value: unknown): Promise<{
+  workspaceDirectory: string
+  workspaceIdentity: LocalWorkspaceIdentity
+}> {
+  const selected = normalizeSelectedWorkspaceDirectory(value)
+  try {
+    const workspaceDirectory = await realpath(selected)
+    const metadata = await lstat(workspaceDirectory, { bigint: true })
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('not a plain directory')
+    return {
+      workspaceDirectory,
+      workspaceIdentity: { device: metadata.dev, inode: metadata.ino },
+    }
+  } catch {
+    throw new ControlError(
+      'resident.workspace_selection_invalid',
+      'The selected workspace folder could not be verified.'
+    )
+  }
+}
+
+async function assertSelectedWorkspaceIdentity(
+  workspaceDirectory: string,
+  expected: LocalWorkspaceIdentity,
+  message: string,
+): Promise<void> {
+  try {
+    const canonical = await realpath(workspaceDirectory)
+    const metadata = await lstat(canonical, { bigint: true })
+    if (
+      canonical !== workspaceDirectory ||
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      metadata.dev !== expected.device ||
+      metadata.ino !== expected.inode
+    ) throw new Error('workspace identity changed')
+  } catch {
+    throw new ControlError('resident.workspace_selection_changed', message)
+  }
 }
 
 function suggestedWorkspaceName(workspaceDirectory: string): string {

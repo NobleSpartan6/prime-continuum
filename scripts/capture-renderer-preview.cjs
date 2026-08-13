@@ -18,6 +18,21 @@ const errorPath = join(outputDirectory, 'capture-error.txt')
 const visualQaUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1'
 const targets = [
   {
+    name: 'desktop-agent-launchpad',
+    width: 1600,
+    height: 1000,
+    visualState: 'launchpad',
+    expectedText: 'What should we build?',
+  },
+  {
+    name: 'mobile-agent-launchpad-390',
+    width: 390,
+    height: 844,
+    visualState: 'launchpad',
+    expectedText: 'What should we build?',
+    expectResponsiveTopbar: true,
+  },
+  {
     name: 'desktop-idle',
     width: 1600,
     height: 1000,
@@ -25,12 +40,75 @@ const targets = [
     expectedText: 'Ready for a new prompt',
   },
   {
+    name: 'desktop-investigation',
+    width: 1600,
+    height: 1000,
+    visualState: 'idle',
+    expectedText: 'Investigate an issue',
+    openInspector: true,
+    selectTaskStarter: 'Investigate an issue',
+  },
+  {
+    name: 'desktop-rlm-activity',
+    width: 1200,
+    height: 800,
+    visualState: 'rlm-activity',
+    expectedText: 'RLM delegation',
+    openInspector: true,
+    selectRuntimeTab: true,
+  },
+  {
+    name: 'desktop-extension-question',
+    width: 1200,
+    height: 800,
+    visualState: 'extension-ui-confirm',
+    expectedText: 'Use the verified migration plan?',
+    expectExtensionQuestion: true,
+  },
+  {
+    name: 'mobile-extension-question-390',
+    width: 390,
+    height: 844,
+    visualState: 'extension-ui-confirm',
+    expectedText: 'Use the verified migration plan?',
+    expectResponsiveTopbar: true,
+    expectExtensionQuestion: true,
+  },
+  {
+    name: 'mobile-idle-390',
+    width: 390,
+    height: 844,
+    visualState: 'idle',
+    expectedText: 'Ready for a new prompt',
+    expectResponsiveTopbar: true,
+    expectHorizontalTaskStarters: true,
+  },
+  {
+    name: 'compact-idle-320',
+    width: 320,
+    height: 704,
+    visualState: 'idle',
+    expectedText: 'Ready for a new prompt',
+    expectResponsiveTopbar: true,
+    expectHorizontalTaskStarters: true,
+  },
+  {
+    name: 'mobile-inspector-390',
+    width: 390,
+    height: 844,
+    visualState: 'idle',
+    expectedText: 'Ready for a new prompt',
+    openInspector: true,
+    expectResponsiveTopbar: true,
+    expectResponsiveDrawer: true,
+  },
+  {
     name: 'model-selection-dialog-390',
     width: 390,
     height: 844,
     visualState: 'model-selection',
     expectedText: 'Choose a model for this thread’s next prompt. This changes the resident session only; it does not send a prompt. “Available” means Prime Agent reports provider access, not that an inference smoke test passed.',
-    expectModelAction: 'Use model GPT-5.6 Terra',
+    expectModelAction: 'Use model GPT-5.6 Luna',
     openModelsDialog: true,
   },
   {
@@ -48,7 +126,7 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'prime-oauth',
-    expectedText: 'Prime Agent 0.7.1 stores OAuth credentials in its host-only auth.json, protected by this operating-system account’s file permissions.',
+    expectedText: 'Sign-in opens in your browser; this view never receives the authorization URL or credential.',
     expectOAuthAction: 'Connect ChatGPT',
     selectProviderId: 'openai-codex',
     openModelsDialog: true,
@@ -58,7 +136,7 @@ const targets = [
     width: 320,
     height: 256,
     visualState: 'prime-oauth',
-    expectedText: 'Prime Agent 0.7.1 stores OAuth credentials in its host-only auth.json, protected by this operating-system account’s file permissions.',
+    expectedText: 'Sign-in opens in your browser; this view never receives the authorization URL or credential.',
     expectOAuthAction: 'Connect ChatGPT',
     selectProviderId: 'openai-codex',
     openModelsDialog: true,
@@ -86,7 +164,7 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'stop-awaiting-idle-proof',
-    expectedText: 'Stop accepted · waiting for authoritative idle proof',
+    expectedText: 'Waiting for authoritative idle proof',
     expectStatusVisible: true,
     expectCompactStatus: true,
   },
@@ -104,23 +182,23 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'resident-end-pending',
-    expectedText: 'Ending resident session · Prime Continuim will not send another kill automatically',
-    expectStatusVisible: true,
-    expectCompactStatus: true,
+    expectedText: 'End saved',
+    expectCompactComposer: true,
+    expectStatusHidden: true,
   },
   {
     name: 'resident-start-1600',
     width: 1600,
     height: 1000,
     visualState: 'resident-start',
-    expectedText: 'Choose workspace folder',
+    expectedText: 'Choose folder',
   },
   {
     name: 'ssh-registered-workspace-dialog-390',
     width: 390,
     height: 844,
     visualState: 'ssh-registered-workspace',
-    expectedText: 'New resident thread in this workspace',
+    expectedText: 'Start another task',
     expectedRegisteredProject: 'Prime Continuim',
     openRegisteredResidentDialog: true,
   },
@@ -129,7 +207,7 @@ const targets = [
     width: 320,
     height: 256,
     visualState: 'ssh-registered-workspace',
-    expectedText: 'New resident thread in this workspace',
+    expectedText: 'Start another task',
     expectedRegisteredProject: 'Prime Continuim',
     openRegisteredResidentDialog: true,
     expectShortRegisteredResidentDialog: true,
@@ -139,7 +217,7 @@ const targets = [
     width: 390,
     height: 844,
     visualState: 'resident-start',
-    expectedText: 'Start resident thread',
+    expectedText: 'Start agent',
     openResidentDialog: true,
   },
   {
@@ -147,40 +225,23 @@ const targets = [
     width: 320,
     height: 256,
     visualState: 'resident-start',
-    expectedText: 'Start resident thread',
+    expectedText: 'Start agent',
     openResidentDialog: true,
     expectShortResidentDialog: true,
-  },
-  {
-    name: 'resident-end-dialog-390',
-    width: 390,
-    height: 844,
-    visualState: 'resident-end-review',
-    expectedText: 'End resident session?',
-    openResidentEndDialog: true,
-  },
-  {
-    name: 'resident-end-dialog-short-320',
-    width: 320,
-    height: 256,
-    visualState: 'resident-end-review',
-    expectedText: 'End resident session?',
-    openResidentEndDialog: true,
-    expectShortResidentEndDialog: true,
   },
   {
     name: 'resident-recovery-320',
     width: 320,
     height: 704,
     visualState: 'resident-recovery',
-    expectedText: 'Workspace confirmation needed',
+    expectedText: 'Reconnect workspace',
   },
   {
     name: 'resident-recovery-short-320',
     width: 320,
     height: 256,
     visualState: 'resident-recovery',
-    expectedText: 'Workspace confirmation needed',
+    expectedText: 'Reconnect workspace',
     expectScrollableEmpty: true,
   },
   {
@@ -210,12 +271,21 @@ const targets = [
     expectHud: 'expanded',
   },
   {
+    name: 'hud-expanded-320',
+    width: 320,
+    height: 240,
+    visualState: 'hud-expanded',
+    surface: 'hud',
+    expectedText: 'Seamless remote experience',
+    expectHud: 'expanded',
+  },
+  {
     name: 'hud-buddy',
     width: 184,
     height: 64,
     visualState: 'hud-buddy',
     surface: 'hud',
-    expectedText: 'Seamless remote experience',
+    expectedText: 'Using renderer',
     expectHud: 'buddy',
   },
 ]
@@ -236,12 +306,27 @@ async function waitForSurface(browserWindow, target) {
       `Boolean(document.querySelector(${JSON.stringify(selector)}))`,
     )
     if (found) {
+      if (target.visualState === 'launchpad') {
+        const launchpadReady = await browserWindow.webContents.executeJavaScript(
+          `document.body.innerText.includes(${JSON.stringify(target.expectedText)})`,
+        )
+        if (!launchpadReady) {
+          await delay(25)
+          continue
+        }
+      }
       await delay(75)
       return
     }
     await delay(25)
   }
-  throw new Error(`Timed out waiting for ${selector}`)
+  const diagnostics = await browserWindow.webContents.executeJavaScript(`(() => ({
+    readyState: document.readyState,
+    bodyText: document.body?.innerText?.slice(0, 500) ?? '',
+    bodyHtml: document.body?.innerHTML?.slice(0, 1_000) ?? '',
+    scripts: [...document.scripts].map((script) => script.src || 'inline').slice(0, 8),
+  }))()`)
+  throw new Error(`Timed out waiting for ${selector}: ${JSON.stringify(diagnostics)}`)
 }
 
 async function startRendererServer() {
@@ -310,7 +395,77 @@ async function capture(target, rendererOrigin) {
     if (target.visualState) rendererUrl.searchParams.set('visualState', target.visualState)
     if (target.surface) rendererUrl.searchParams.set('surface', target.surface)
     await browserWindow.loadURL(rendererUrl.href)
+    if (target.visualState === 'launchpad' && target.width <= 390) {
+      // Hidden macOS Electron windows can occasionally expose complete DOM
+      // geometry before their compositor surface paints. Keep the real window
+      // offscreen while requiring an actual paint for launchpad evidence.
+      browserWindow.setPosition(-10_000, -10_000, false)
+      browserWindow.showInactive()
+    }
     await waitForSurface(browserWindow, target)
+    if (target.openInspector || target.selectTaskStarter) {
+      const workbenchActions = await browserWindow.webContents.executeJavaScript(`(() => {
+        const inspector = document.querySelector('button[aria-label="Open inspector"], button[aria-label="Close inspector"]')
+        const inspectorOpen = document.querySelector('.app-shell')?.getAttribute('data-inspector-open') === 'true'
+        const starter = [...document.querySelectorAll('.task-starters button')]
+          .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.selectTaskStarter)})
+        if (${Boolean(target.openInspector)} && !inspectorOpen && inspector instanceof HTMLButtonElement) inspector.click()
+        if (${Boolean(target.selectTaskStarter)} && starter instanceof HTMLButtonElement) starter.click()
+        return {
+          inspectorFound: inspector instanceof HTMLButtonElement,
+          starterFound: starter instanceof HTMLButtonElement,
+        }
+      })()`)
+      invariant(!target.openInspector || workbenchActions.inspectorFound, `${target.name} did not expose the inspector action`)
+      invariant(!target.selectTaskStarter || workbenchActions.starterFound, `${target.name} did not expose the task starter`)
+      let workbenchInteraction
+      const interactionDeadline = Date.now() + 10_000
+      while (Date.now() < interactionDeadline) {
+        workbenchInteraction = await browserWindow.webContents.executeJavaScript(`(() => {
+          const starter = [...document.querySelectorAll('.task-starters button')]
+            .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(target.selectTaskStarter)})
+          const composer = document.querySelector('#thread-composer')
+          return {
+            inspectorOpen: document.querySelector('.app-shell')?.getAttribute('data-inspector-open') === 'true',
+            starterSelected: starter?.getAttribute('aria-pressed') === 'true',
+            composerPrefilled: composer instanceof HTMLTextAreaElement && composer.value.includes('Investigate the reported issue in this workspace'),
+          }
+        })()`)
+        if (
+          (!target.openInspector || workbenchInteraction.inspectorOpen) &&
+          (!target.selectTaskStarter || (workbenchInteraction.starterSelected && workbenchInteraction.composerPrefilled))
+        ) break
+        await delay(25)
+      }
+      invariant(!target.openInspector || workbenchInteraction?.inspectorOpen, `${target.name} did not open the inspector`)
+      invariant(!target.selectTaskStarter || (
+        workbenchInteraction?.starterSelected && workbenchInteraction?.composerPrefilled
+      ), `${target.name} did not prefill the selected task starter`)
+      await delay(500)
+    }
+    if (target.selectRuntimeTab) {
+      const runtimeTabEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
+        const tab = document.querySelector('#inspector-tab-session')
+        if (tab instanceof HTMLButtonElement) tab.click()
+        return { found: tab instanceof HTMLButtonElement }
+      })()`)
+      invariant(runtimeTabEvidence.found, `${target.name} did not expose the Session inspector tab`)
+      const runtimeDeadline = Date.now() + 10_000
+      let runtimeVisible = false
+      while (Date.now() < runtimeDeadline) {
+        runtimeVisible = await browserWindow.webContents.executeJavaScript(
+          `Boolean(document.querySelector('#inspector-panel-session .rlm-map'))`,
+        )
+        if (runtimeVisible) break
+        await delay(25)
+      }
+      invariant(runtimeVisible, `${target.name} did not render the agent hierarchy`)
+      await browserWindow.webContents.executeJavaScript(`(() => {
+        const hierarchy = document.querySelector('#inspector-panel-session .runtime-subsection--rlm')
+        hierarchy?.scrollIntoView({ block: 'start', inline: 'nearest' })
+      })()`)
+      await delay(150)
+    }
     if (target.openModelsDialog) {
       // Paint the real native surface offscreen, then use the visible composer
       // action that a person would use. The model actions themselves remain
@@ -376,7 +531,7 @@ async function capture(target, rendererOrigin) {
         await delay(25)
       }
       await delay(300)
-      if (target.expectShortModelsDialog) {
+      if (target.expectModelAction || target.expectShortModelsDialog) {
         const shortModelScrollEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
           const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
           const catalog = dialog?.querySelector('.model-catalog')
@@ -390,7 +545,11 @@ async function capture(target, rendererOrigin) {
           const catalogRect = catalog.getBoundingClientRect()
           const actionRect = action.getBoundingClientRect()
           if (actionRect.top < catalogRect.top || actionRect.bottom > catalogRect.bottom) {
-            const centeredOffset = actionRect.top - catalogRect.top - Math.max(0, (catalog.clientHeight - actionRect.height) / 2)
+            const centeredOffset = ${JSON.stringify(Boolean(target.expectShortModelsDialog))}
+              ? actionRect.top - catalogRect.top - Math.max(0, (catalog.clientHeight - actionRect.height) / 2)
+              : actionRect.top < catalogRect.top
+                ? actionRect.top - catalogRect.top - 12
+                : actionRect.bottom - catalogRect.bottom + 12
             const maximumScrollTop = Math.max(0, catalog.scrollHeight - catalog.clientHeight)
             catalog.scrollTop = Math.min(maximumScrollTop, Math.max(0, catalog.scrollTop + centeredOffset))
           }
@@ -442,7 +601,7 @@ async function capture(target, rendererOrigin) {
       await delay(250)
       await browserWindow.webContents.executeJavaScript(`(() => {
         const button = [...(document.querySelector('#project-sidebar')?.querySelectorAll('button') ?? [])]
-          .find((candidate) => candidate.textContent?.trim() === 'New resident thread in this workspace')
+          .find((candidate) => candidate.getAttribute('aria-label') === 'New resident thread in this workspace')
         if (!(button instanceof HTMLButtonElement)) return false
         button.scrollIntoView({ block: 'nearest', inline: 'nearest' })
         return true
@@ -453,7 +612,7 @@ async function capture(target, rendererOrigin) {
         const catalog = sidebar?.querySelector('.sidebar__scroll')
         const workbench = document.querySelector('.transcript__scroller')
         const button = [...(sidebar?.querySelectorAll('button') ?? [])]
-          .find((candidate) => candidate.textContent?.trim() === 'New resident thread in this workspace')
+          .find((candidate) => candidate.getAttribute('aria-label') === 'New resident thread in this workspace')
         const helper = sidebar?.querySelector('#registered-resident-action-description')
         const sidebarRect = sidebar?.getBoundingClientRect()
         const catalogRect = catalog?.getBoundingClientRect()
@@ -521,11 +680,11 @@ async function capture(target, rendererOrigin) {
       invariant(
         registeredWorkspaceTriggerEvidence.actionVisible &&
         registeredWorkspaceTriggerEvidence.actionEnabled &&
-        registeredWorkspaceTriggerEvidence.actionText === 'New resident thread in this workspace',
-        `${target.name} did not expose the exact saved-workspace action: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
+        registeredWorkspaceTriggerEvidence.actionText === 'New agent',
+        `${target.name} did not expose the saved-workspace New agent action: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
       )
       invariant(
-        registeredWorkspaceTriggerEvidence.helperText === 'Uses this saved host-owned workspace. You’ll name only the new thread.' &&
+        registeredWorkspaceTriggerEvidence.helperText === 'Uses this saved workspace.' &&
         !registeredWorkspaceTriggerEvidence.forbiddenActionCopyPresent,
         `${target.name} did not preserve the exact path-free saved-workspace helper: ${JSON.stringify(registeredWorkspaceTriggerEvidence)}`,
       )
@@ -579,7 +738,7 @@ async function capture(target, rendererOrigin) {
       browserWindow.showInactive()
       await browserWindow.webContents.executeJavaScript(`(() => {
         const button = [...document.querySelectorAll('button')]
-          .find((candidate) => candidate.textContent?.includes('Choose workspace folder'))
+          .find((candidate) => candidate.getAttribute('aria-label') === 'Choose workspace folder')
         if (!(button instanceof HTMLButtonElement)) throw new Error('Resident workspace action was not found')
         button.click()
       })()`)
@@ -594,38 +753,6 @@ async function capture(target, rendererOrigin) {
       // Hidden Electron windows still advance dialog enter animations, but a
       // paint can lag the imperative showModal() state. Capture only after the
       // 180ms sheet transition and the following compositor frame.
-      await delay(300)
-    }
-    if (target.openResidentEndDialog) {
-      browserWindow.setPosition(-10_000, -10_000, false)
-      browserWindow.showInactive()
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const runtimeTab = [...document.querySelectorAll('[role="tab"]')]
-          .find((candidate) => candidate.textContent?.trim() === 'Runtime')
-        if (!(runtimeTab instanceof HTMLButtonElement)) throw new Error('Runtime inspector tab was not found')
-        runtimeTab.click()
-      })()`)
-      const actionDeadline = Date.now() + 10_000
-      while (Date.now() < actionDeadline) {
-        const actionReady = await browserWindow.webContents.executeJavaScript(
-          `Boolean(document.querySelector('button.resident-end-trigger:not([disabled])'))`,
-        )
-        if (actionReady) break
-        await delay(25)
-      }
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const button = document.querySelector('button.resident-end-trigger:not([disabled])')
-        if (!(button instanceof HTMLButtonElement)) throw new Error('Resident end action was not found')
-        button.click()
-      })()`)
-      const dialogDeadline = Date.now() + 10_000
-      while (Date.now() < dialogDeadline) {
-        const open = await browserWindow.webContents.executeJavaScript(
-          `Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]'))`,
-        )
-        if (open) break
-        await delay(25)
-      }
       await delay(300)
     }
     if (target.openCandidateEvaluationDialog) {
@@ -671,16 +798,36 @@ async function capture(target, rendererOrigin) {
       : target.visualState === 'resident-start' || target.visualState === 'resident-recovery'
         ? '.empty-workbench'
         : '.app-shell'
-    const layout = await browserWindow.webContents.executeJavaScript(`({
-      innerWidth: window.innerWidth,
-      innerHeight: window.innerHeight,
-      documentClientWidth: document.documentElement.clientWidth,
-      documentScrollWidth: document.documentElement.scrollWidth,
-      bodyClientWidth: document.body.clientWidth,
-      bodyScrollWidth: document.body.scrollWidth,
-      surfaceClientWidth: document.querySelector(${JSON.stringify(selector)})?.clientWidth,
-      surfaceScrollWidth: document.querySelector(${JSON.stringify(selector)})?.scrollWidth,
-    })`)
+    const layout = await browserWindow.webContents.executeJavaScript(`(() => {
+      const surface = document.querySelector(${JSON.stringify(selector)})
+      const overflowers = [...document.querySelectorAll('body *')].flatMap((element) => {
+        if (!(element instanceof HTMLElement) || element.offsetParent === null || element.classList.contains('sr-only')) return []
+        const rect = element.getBoundingClientRect()
+        if (rect.right <= window.innerWidth + 1 && element.scrollWidth <= element.clientWidth + 1) return []
+        return [{
+          element: element.tagName.toLowerCase(),
+          className: typeof element.className === 'string' ? element.className.slice(0, 96) : '',
+          id: element.id,
+          role: element.getAttribute('role'),
+          left: Math.round(rect.left),
+          right: Math.round(rect.right),
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          overflow: Math.max(Math.round(rect.right - window.innerWidth), element.scrollWidth - element.clientWidth),
+        }]
+      }).sort((left, right) => right.overflow - left.overflow).slice(0, 12)
+      return {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        documentClientWidth: document.documentElement.clientWidth,
+        documentScrollWidth: document.documentElement.scrollWidth,
+        bodyClientWidth: document.body.clientWidth,
+        bodyScrollWidth: document.body.scrollWidth,
+        surfaceClientWidth: surface?.clientWidth,
+        surfaceScrollWidth: surface?.scrollWidth,
+        overflowers,
+      }
+    })()`)
     invariant(layout.innerWidth === target.width, `${target.name} rendered at ${layout.innerWidth}px instead of ${target.width}px`)
     invariant(
       layout.documentScrollWidth <= layout.documentClientWidth && layout.bodyScrollWidth <= layout.bodyClientWidth,
@@ -705,15 +852,15 @@ async function capture(target, rendererOrigin) {
       const residentDialogInputs = [...(residentDialog?.querySelectorAll('input:not([type="hidden"])') ?? [])]
       const residentThreadTitle = residentDialog?.querySelector('#resident-thread-title')
       const residentThreadTitleRect = residentThreadTitle?.getBoundingClientRect()
-      const residentFixedProject = residentDialog?.querySelector('.form-field__fixed-value')
+      const residentFixedProject = residentDialog?.querySelector('.resident-provision__workspace strong')
       const residentFixedProjectRect = residentFixedProject?.getBoundingClientRect()
       const residentProvisionAction = [...(residentDialog?.querySelectorAll('.sheet__footer button') ?? [])]
-        .find((candidate) => candidate.textContent?.trim() === 'Create resident thread')
+        .find((candidate) => candidate.textContent?.trim() === 'Start agent')
       const residentProvisionActionRect = residentProvisionAction?.getBoundingClientRect()
       const residentDialogError = residentDialog?.querySelector('#resident-provision-error')
       const residentDialogDescription = residentDialog?.querySelector('#resident-provision-description')
-      const residentPrivacy = residentDialog?.querySelector('.resident-provision__privacy')
-      const residentSavedProjectLabel = residentDialog?.querySelector('.form-field__label')
+      const residentPrivacy = residentDialog?.querySelector('.resident-provision__workspace div > span')
+      const residentSavedProjectLabel = residentDialog?.querySelector('.resident-provision__workspace small')
       const residentThreadTitleLabel = residentDialog?.querySelector('label[for="resident-thread-title"]')
       const backgroundCatalog = document.querySelector('.sidebar__scroll')
       const backgroundWorkbench = document.querySelector('.transcript__scroller')
@@ -733,10 +880,6 @@ async function capture(target, rendererOrigin) {
         rect.top >= Math.max(0, containerRect.top) &&
         rect.bottom <= Math.min(window.innerHeight, containerRect.bottom)
       )
-      const residentEndDialog = document.querySelector('dialog[aria-labelledby="resident-end-title"]')
-      const residentEndDialogScroll = residentEndDialog?.querySelector('.sheet__scroll')
-      const residentEndDialogScrollStyle = residentEndDialogScroll ? window.getComputedStyle(residentEndDialogScroll) : undefined
-      const residentEndDialogFooterRect = residentEndDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
       const candidateEvaluationDialog = document.querySelector('dialog[aria-labelledby="candidate-evaluation-dialog-title"]')
       const candidateEvaluationDialogScroll = candidateEvaluationDialog?.querySelector('.sheet__scroll')
       const candidateEvaluationDialogScrollStyle = candidateEvaluationDialogScroll ? window.getComputedStyle(candidateEvaluationDialogScroll) : undefined
@@ -766,10 +909,38 @@ async function capture(target, rendererOrigin) {
       const hudSurface = document.querySelector(${JSON.stringify(target.expectHud ? `.hud-${target.expectHud}` : '.hud-never')})
       const bodyStyle = window.getComputedStyle(document.body)
       const rootStyle = window.getComputedStyle(document.documentElement)
+      const topbarLeading = document.querySelector('.topbar__leading')
+      const topbarThread = document.querySelector('.topbar__thread')
+      const topbarControls = document.querySelector('.topbar__controls')
+      const topbarTitle = document.querySelector('.topbar__thread-copy h1')
+      const topbarBrand = document.querySelector('.topbar__brand-name')
+      const topbarLeadingRect = topbarLeading?.getBoundingClientRect()
+      const topbarThreadRect = topbarThread?.getBoundingClientRect()
+      const topbarControlsRect = topbarControls?.getBoundingClientRect()
+      const topbarTitleRect = topbarTitle?.getBoundingClientRect()
+      const topbarBrandStyle = topbarBrand ? window.getComputedStyle(topbarBrand) : undefined
+      const taskStarters = document.querySelector('.task-starters')
+      const taskStartersStyle = taskStarters ? window.getComputedStyle(taskStarters) : undefined
+      const responsiveInspector = document.querySelector('.inspector')
+      const responsiveInspectorRect = responsiveInspector?.getBoundingClientRect()
+      const responsiveInspectorStyle = responsiveInspector ? window.getComputedStyle(responsiveInspector) : undefined
+      const extensionQuestion = document.querySelector('.prime-interaction')
+      const extensionQuestionRect = extensionQuestion?.getBoundingClientRect()
+      const extensionConfirm = [...(extensionQuestion?.querySelectorAll('button') ?? [])]
+        .find((candidate) => candidate.textContent?.trim() === 'Confirm')
       return {
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
         composerStatusVisible: Boolean(status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0),
+        extensionQuestionVisible: Boolean(
+          extensionQuestionRect &&
+          extensionQuestionRect.width > 0 &&
+          extensionQuestionRect.height > 0 &&
+          extensionQuestionRect.left >= 0 &&
+          extensionQuestionRect.right <= window.innerWidth
+        ),
+        extensionComposerSuppressed: !document.querySelector('.composer'),
+        extensionConfirmEnabled: extensionConfirm instanceof HTMLButtonElement && !extensionConfirm.disabled,
         residentDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-provision-title"]')),
         residentDialogModal: Boolean(residentDialog?.matches(':modal')),
         residentDialogDisplay: residentDialogStyle?.display,
@@ -783,11 +954,11 @@ async function capture(target, rendererOrigin) {
         residentDialogText: residentDialog?.textContent?.trim(),
         registeredResidentDialogExactCopy: Boolean(
           residentDialogDescription?.textContent?.trim() ===
-            'Prime Agent will start this thread in the saved host-owned workspace. Only the new thread title can be changed here.' &&
-          residentSavedProjectLabel?.textContent?.trim() === 'Saved project' &&
-          residentThreadTitleLabel?.textContent?.trim() === 'Thread title' &&
+            'Name the task. Prime Agent runs it here.' &&
+          residentSavedProjectLabel?.textContent?.trim() === 'Runs in' &&
+          residentThreadTitleLabel?.textContent?.trim() === 'Task name' &&
           residentPrivacy?.textContent?.trim() ===
-            'Prime Continuim uses the saved project and workspace identity reported by this verified SSH host. No filesystem location is selected or shown.'
+            'Access stays on the verified host'
         ),
         registeredResidentForbiddenCopyPresent: /(?:\\bpath\\b|\\bfolder\\b|picker|handoff|mobile)/i.test(relevantRegisteredCopy),
         residentFixedProjectText: residentFixedProject?.textContent?.trim(),
@@ -828,16 +999,6 @@ async function capture(target, rendererOrigin) {
           residentDialogFooterRect &&
           residentDialogFooterRect.height > 0 &&
           residentDialogFooterRect.bottom <= window.innerHeight
-        ),
-        residentEndDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]')),
-        residentEndDialogContentReachable: Boolean(
-          residentEndDialogScroll &&
-          residentEndDialogScrollStyle &&
-          (residentEndDialogScrollStyle.overflowY === 'auto' || residentEndDialogScrollStyle.overflowY === 'scroll') &&
-          residentEndDialogScroll.clientHeight >= 48 &&
-          residentEndDialogFooterRect &&
-          residentEndDialogFooterRect.height > 0 &&
-          residentEndDialogFooterRect.bottom <= window.innerHeight
         ),
         candidateEvaluationDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="candidate-evaluation-dialog-title"]')),
         candidateEvaluationDialogContentReachable: Boolean(
@@ -883,6 +1044,34 @@ async function capture(target, rendererOrigin) {
         hudMode: document.querySelector('.hud-buddy') ? 'buddy' : document.querySelector('.hud-expanded') ? 'expanded' : undefined,
         hudStatusVisible: Boolean(document.querySelector('.hud-status')),
         hudHostTransparent: bodyStyle.backgroundColor === 'rgba(0, 0, 0, 0)' && rootStyle.backgroundColor === 'rgba(0, 0, 0, 0)',
+        responsiveTopbarBounded: Boolean(
+          topbarLeadingRect &&
+          topbarThreadRect &&
+          topbarControlsRect &&
+          topbarTitleRect &&
+          topbarLeadingRect.right <= topbarThreadRect.left + 1 &&
+          topbarThreadRect.right <= topbarControlsRect.left + 1 &&
+          topbarTitleRect.width > 0 &&
+          topbarTitleRect.left >= topbarThreadRect.left &&
+          topbarTitleRect.right <= topbarThreadRect.right + 1 &&
+          topbarBrandStyle?.display === 'none'
+        ),
+        horizontalTaskStarters: Boolean(
+          taskStarters &&
+          taskStartersStyle?.display === 'flex' &&
+          ['auto', 'scroll'].includes(taskStartersStyle.overflowX) &&
+          taskStarters.scrollWidth > taskStarters.clientWidth
+        ),
+        responsiveDrawerBounded: Boolean(
+          responsiveInspectorRect &&
+          document.querySelector('.app-shell')?.getAttribute('data-inspector-open') === 'true' &&
+          responsiveInspectorStyle?.visibility === 'visible' &&
+          responsiveInspectorRect.width > 0 &&
+          responsiveInspectorRect.left >= 0 &&
+          responsiveInspectorRect.right <= window.innerWidth &&
+          responsiveInspector?.textContent?.includes('Review') &&
+          responsiveInspector.textContent.includes('Outcome')
+        ),
       }
     })()`)
     if (registeredWorkspaceTriggerEvidence) {
@@ -897,6 +1086,20 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectCompactStatus) {
       invariant(stateEvidence.compactComposer, `${target.name} did not render the compact resident composer`)
+    }
+    if (target.expectCompactComposer) {
+      invariant(stateEvidence.compactComposer, `${target.name} did not render the compact resident composer`)
+    }
+    if (target.expectStatusHidden) {
+      invariant(!stateEvidence.composerStatusVisible, `${target.name} duplicated its resident-state copy`)
+    }
+    if (target.expectExtensionQuestion) {
+      invariant(
+        stateEvidence.extensionQuestionVisible &&
+        stateEvidence.extensionComposerSuppressed &&
+        stateEvidence.extensionConfirmEnabled,
+        `${target.name} did not keep the Prime Agent question singular and actionable: ${JSON.stringify(stateEvidence)}`,
+      )
     }
     if (target.openResidentDialog) {
       invariant(stateEvidence.residentDialogOpen, `${target.name} did not open the resident setup dialog`)
@@ -917,7 +1120,7 @@ async function capture(target, rendererOrigin) {
         `${target.name} did not keep the fixed project and sole thread-title field visible: ${JSON.stringify(stateEvidence)}`,
       )
       invariant(
-        stateEvidence.residentProvisionActionText === 'Create resident thread' &&
+        stateEvidence.residentProvisionActionText === 'Start agent' &&
         stateEvidence.residentProvisionActionEnabled &&
         stateEvidence.residentProvisionActionVisible &&
         stateEvidence.residentProvisionUnsubmitted,
@@ -942,12 +1145,6 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectShortResidentDialog) {
       invariant(stateEvidence.residentDialogContentReachable, `${target.name} did not keep the resident form and actions reachable`)
-    }
-    if (target.openResidentEndDialog) {
-      invariant(stateEvidence.residentEndDialogOpen, `${target.name} did not open the resident end review`)
-    }
-    if (target.expectShortResidentEndDialog) {
-      invariant(stateEvidence.residentEndDialogContentReachable, `${target.name} did not keep the resident end review and actions reachable`)
     }
     if (target.openCandidateEvaluationDialog) {
       invariant(stateEvidence.candidateEvaluationDialogOpen, `${target.name} did not open the candidate evaluation review`)
@@ -982,6 +1179,15 @@ async function capture(target, rendererOrigin) {
       invariant(stateEvidence.hudMode === target.expectHud, `${target.name} rendered the wrong HUD mode`)
       invariant(stateEvidence.hudStatusVisible, `${target.name} hid its redundant HUD status`)
       invariant(stateEvidence.hudHostTransparent, `${target.name} did not preserve a transparent native host layer`)
+    }
+    if (target.expectResponsiveTopbar) {
+      invariant(stateEvidence.responsiveTopbarBounded, `${target.name} allowed responsive topbar regions to overlap: ${JSON.stringify(stateEvidence)}`)
+    }
+    if (target.expectHorizontalTaskStarters) {
+      invariant(stateEvidence.horizontalTaskStarters, `${target.name} did not preserve a compact horizontal task starter rail`)
+    }
+    if (target.expectResponsiveDrawer) {
+      invariant(stateEvidence.responsiveDrawerBounded, `${target.name} did not keep the responsive inspector drawer within the viewport`)
     }
     const image = await browserWindow.webContents.capturePage()
     const outputPath = join(outputDirectory, `${target.name}.png`)

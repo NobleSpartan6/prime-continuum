@@ -47,6 +47,16 @@ export function readPinnedDevelopmentPnpmVersion(projectRoot) {
   return match[1]
 }
 
+export function resolvePinnedDevelopmentNodeExecutable(projectRoot, platform = process.platform) {
+  if (!projectRoot) throw new TypeError('projectRoot is required')
+  if (platform !== 'win32' && platform !== 'darwin' && platform !== 'linux' && platform !== 'aix') {
+    throw new DevelopmentNodeRuntimeError(`Prime Continuim has no pinned host Node layout for ${platform}.`)
+  }
+  return platform === 'win32'
+    ? resolve(projectRoot, 'node_modules', 'node', 'node.exe')
+    : resolve(projectRoot, 'node_modules', 'node', 'bin', 'node')
+}
+
 export function assertPinnedDevelopmentNodeRuntime({
   projectRoot,
   actualVersion = process.version,

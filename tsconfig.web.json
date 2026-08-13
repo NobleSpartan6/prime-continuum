@@ -23,10 +23,14 @@
   "include": [
     "src/renderer/src/**/*.ts",
     "src/renderer/src/**/*.tsx",
+    "src/shared/capabilities.ts",
     "src/shared/protocol.ts",
     "src/shared/codex-oauth.ts",
     "src/shared/runtime-oauth-attempt.ts",
+    "src/shared/resident-display.ts",
     "src/shared/sha256.ts",
-    "src/shared/window-control.ts"
+    "src/shared/window-control.ts",
+    "src/shared/native-shell.ts",
+    "tests/renderer/protocol-guards.test.ts"
   ]
 }

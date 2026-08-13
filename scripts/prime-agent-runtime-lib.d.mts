@@ -16,8 +16,16 @@ export interface RuntimeInputs {
 
 export interface RuntimeSmokeResult {
   runtimeExecutable: string;
-  runtimeVersions: Record<string, string>;
+  runtimeVersions: Record<string, string | boolean>;
   hello: JsonRecord;
+}
+
+export interface BrowserBridgeSmokeResult {
+  verified: true;
+  protocol: string;
+  controller: string;
+  engine: string;
+  operations: readonly string[];
 }
 
 export const REPO_ROOT: string;
@@ -38,6 +46,7 @@ export function verifyReleaseAssets(inputs: RuntimeInputs, cacheDirectory: strin
   fetchImpl?: typeof fetch;
   totalTimeoutMs?: number;
   noProgressTimeoutMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
   platform?: NodeJS.Platform;
   arch?: string;
 }): Promise<readonly string[]>;
@@ -47,12 +56,22 @@ export function installLockedRuntime(options: {
   stagingDirectory: string;
   npmCli: string;
 }): Promise<string>;
+export function applyPinnedPrimeAgentSecurityPatches(runtimeDirectory: string): Promise<Readonly<{
+  relativePath: string;
+  sourceSha256: string;
+  patchedSha256: string;
+}>>;
 export function pruneRuntimePackagingNoise(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
+export function pruneReviewedRuntimeDirectories(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
 export function pruneRuntimeForTarget(runtimeDirectory: string): Promise<void>;
 export function smokeRuntime(
   runtimeDirectory: string,
   options?: JsonRecord,
 ): Promise<Readonly<RuntimeSmokeResult>>;
+export function smokeBrowserBridge(
+  runtimeDirectory: string,
+  options?: JsonRecord,
+): Promise<Readonly<BrowserBridgeSmokeResult>>;
 export function createRuntimeManifest(options: {
   runtimeDirectory: string;
   inputs: JsonRecord;

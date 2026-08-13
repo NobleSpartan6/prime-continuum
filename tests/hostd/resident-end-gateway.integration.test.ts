@@ -110,15 +110,16 @@ describe("VerifiedResidentGateway resident end materialization", () => {
     });
   });
 
-  it("retires the exact attached read transport before issuing kill authority", async () => {
+  it("drops the exact attached read transport without waiting for graceful drain before kill", async () => {
     const fixture = await gatewayFixture("success");
     await expect(fixture.gateway.capabilityReady()).resolves.toBe(false);
     await vi.waitFor(() => expect(fixture.attachResident).toHaveBeenCalledOnce());
 
     const ending = fixture.gateway.endResident(fixture.request);
     await fixture.dispatchMarked.promise;
-    expect(fixture.detachAttached).toHaveBeenCalledOnce();
-    expect(fixture.order.indexOf("connection.detach")).toBeLessThan(
+    expect(fixture.detachResidentSession).toHaveBeenCalledOnce();
+    expect(fixture.detachAttached).not.toHaveBeenCalled();
+    expect(fixture.order.indexOf("adapter.detach")).toBeLessThan(
       fixture.order.indexOf("adapter.end"),
     );
     fixture.finishKill.resolve(undefined);
@@ -180,6 +181,7 @@ async function gatewayFixture(outcome: "success" | "unknown") {
   const adapterClose = vi.fn(async () => undefined);
   const order: string[] = [];
   const detachAttached = vi.fn(async () => { order.push("connection.detach"); });
+  const detachResidentSession = vi.fn(async () => { order.push("adapter.detach"); });
   const attachResident = vi.fn(async (candidate: ResidentSessionBinding) => {
     order.push("connection.attach");
     return { binding: candidate, detach: detachAttached } as never;
@@ -213,6 +215,7 @@ async function gatewayFixture(outcome: "success" | "unknown") {
       createOwnedCandidate: vi.fn(),
       readStableResidentProjection: vi.fn(),
       endResidentSession,
+      detachResidentSession,
       attachResident,
       reconcileAcknowledgedPromptIdle: vi.fn(),
       reconcileAcknowledgedAbortIdle: vi.fn(),
@@ -245,6 +248,7 @@ async function gatewayFixture(outcome: "success" | "unknown") {
     adapterClose,
     attachResident,
     detachAttached,
+    detachResidentSession,
     order,
   };
 }

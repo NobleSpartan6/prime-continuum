@@ -1,5 +1,30 @@
 # Prime Continuim agent instructions
 
+## Prime Agent upstream review
+
+Before changing the Prime Agent adapter, runtime, model or provider surfaces,
+RLM visualization, session lifecycle, or compatibility claims, review the
+current upstream state from the official
+`PrimeIntellect-ai/prime-agent` repository:
+
+1. Fetch the latest stable release metadata and compare it with the exact
+   version pinned by `runtime/prime-agent/package.json` and
+   `runtime/prime-agent/runtime-policy.json`.
+2. Enumerate every Markdown/MDX document at that release tag. Compare the tag
+   with upstream `main`, and read every changed upstream document and changelog
+   entry relevant to the integration.
+3. Record the review and any compatibility decision in
+   `docs/prime-agent-upstream-review.md`. Do not silently ignore an upstream
+   contract change.
+
+Use release assets, not unreleased `main` bytes, for the production runtime.
+Never auto-upgrade or run an upstream installer from the renderer. A version
+change must remain an explicit reviewed transaction: update the exact package
+and policy pins, refresh the lock and reviewed hashes, rebuild the runtime,
+re-attest it, update compatibility docs and migrations, and run the focused
+contract tests before the canonical self-build. If the latest release cannot
+be verified safely, retain the current pin and document the blocker.
+
 ## Canonical self-build
 
 When asked to verify or build the current Prime Continuim candidate, run this
@@ -30,7 +55,7 @@ credentials, caches, or arbitrary private files into the evaluation worktree.
 Verify a receipt before citing it:
 
 ```text
-pnpm verify:self-build-receipt -- .prime-continuim-self-build/receipts/<receipt>.json
+pnpm verify:self-build-receipt .prime-continuim-self-build/receipts/<receipt>.json
 ```
 
 The receipt SHA-256 detects later receipt corruption and correlates evidence; it

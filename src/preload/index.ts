@@ -10,9 +10,29 @@ import {
   type SshProbe
 } from '../main/control/contracts'
 import { HUD_IPC, type HudBridge } from '../shared/window-control'
+import {
+  NATIVE_SHELL_IPC,
+  type NativePlatform,
+  type NativeShellBridge,
+} from '../shared/native-shell'
 
-function invoke<T>(channel: string, input?: unknown): Promise<Result<T>> {
-  return ipcRenderer.invoke(channel, input) as Promise<Result<T>>
+async function invoke<T>(channel: string, input?: unknown): Promise<Result<T>> {
+  try {
+    return await ipcRenderer.invoke(channel, input) as Result<T>
+  } catch {
+    // Rejected invokes indicate that the renderer/main contract itself is no
+    // longer available; operation failures are already returned as Result.
+    // Never expose Electron internals, channel names, or native error details.
+    return {
+      ok: false,
+      error: {
+        code: 'desktop.ipc_unavailable',
+        message: 'The desktop connection closed. Reopen Prime Continuim.',
+        retryable: false,
+        receiptId: 'local-ipc-boundary',
+      },
+    }
+  }
 }
 
 function subscribe<T>(channel: string, listener: (payload: T) => void): () => void {
@@ -43,6 +63,9 @@ const bridge: PrimeBridge = {
   candidateEvaluationPreflight: (input) => invoke(IPC.candidateEvaluationPreflight, input),
   startCandidateEvaluation: (input) => invoke(IPC.startCandidateEvaluation, input),
   candidateEvaluationSnapshot: (input) => invoke(IPC.candidateEvaluationSnapshot, input),
+  preselectResidentWorkspace: () => invoke(IPC.preselectResidentWorkspace),
+  completeResidentWorkspacePreselection: (input) => invoke(IPC.completeResidentWorkspacePreselection, input),
+  cancelResidentWorkspacePreselection: (input) => invoke(IPC.cancelResidentWorkspacePreselection, input),
   selectResidentWorkspace: (input) => invoke(IPC.selectResidentWorkspace, input),
   provisionResident: (input) => invoke(IPC.provisionResident, input),
   prepareResidentEnd: (input) => invoke(IPC.prepareResidentEnd, input),
@@ -70,6 +93,11 @@ const hudBridge: HudBridge = {
   hudReturnToWorkbench: () => ipcRenderer.invoke(HUD_IPC.returnToWorkbench),
   hudSetIgnoreMouseEvents: (ignore) => ipcRenderer.invoke(HUD_IPC.setIgnoreMouseEvents, ignore),
   onHudState: (listener) => subscribe(HUD_IPC.stateChanged, listener)
+}
+
+const nativeShellBridge: NativeShellBridge = {
+  nativePlatform: process.platform as NativePlatform,
+  onNativeShellCommand: (listener) => subscribe(NATIVE_SHELL_IPC.command, listener),
 }
 
 type CompatibilityBridge = {
@@ -104,7 +132,12 @@ const compatibility: CompatibilityBridge = {
   subscribeWorkbench: (listener) => bridge.onSnapshot(listener)
 }
 
-contextBridge.exposeInMainWorld('prime', Object.freeze({ ...bridge, ...hudBridge, ...compatibility }))
+contextBridge.exposeInMainWorld('prime', Object.freeze({
+  ...bridge,
+  ...hudBridge,
+  ...nativeShellBridge,
+  ...compatibility,
+}))
 
-export type RendererPrimeBridge = PrimeBridge & HudBridge & CompatibilityBridge
+export type RendererPrimeBridge = PrimeBridge & HudBridge & NativeShellBridge & CompatibilityBridge
 export type { ClientCommand, ConnectionTarget, HandoffCommitRequest, HandoffPlanRequest }

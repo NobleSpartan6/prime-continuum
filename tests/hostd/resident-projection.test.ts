@@ -5,6 +5,7 @@ import {
   MAX_RESIDENT_PROJECTION_MESSAGES,
   ResidentProjectionError,
   normalizeResidentProjectionSnapshot,
+  residentChildAgentSummaryFromSessionEvent,
 } from "../../src/hostd/resident-projection";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
@@ -173,6 +174,113 @@ function validSnapshot(): SnapshotFixture {
   };
 }
 
+function validResourceSnapshot(): Record<string, unknown> {
+  return {
+    contextFiles: [
+      {
+        path: resolve("private", "context", "AGENTS.md"),
+        artifact: {
+          id: "artifact-context-1",
+          sessionId: "session-1",
+          type: "context_file",
+          logicalPath: "private/context/AGENTS.md",
+          relativePath: "AGENTS.md",
+          mimeType: "text/markdown",
+        },
+      },
+    ],
+    skills: [
+      {
+        name: "playwright-cli",
+        description: "Automate browser interactions.",
+        filePath: resolve("private", "skills", "playwright-cli", "SKILL.md"),
+        sourceInfo: {
+          path: resolve("private", "skills", "playwright-cli", "SKILL.md"),
+          source: "private-package-source",
+          scope: "project",
+          origin: "package",
+          baseDir: resolve("private", "skills"),
+        },
+        artifact: {
+          id: "artifact-skill-1",
+          sessionId: "session-1",
+          type: "skill",
+          logicalPath: "private/skills/playwright-cli/SKILL.md",
+        },
+      },
+    ],
+    prompts: [
+      {
+        name: "harness-review",
+        description: "Review the continual harness.",
+        argumentHint: "[focus]",
+        filePath: resolve("private", "prompts", "harness-review.md"),
+        sourceInfo: {
+          path: resolve("private", "prompts", "harness-review.md"),
+          source: "private-top-level-source",
+          scope: "user",
+          origin: "top-level",
+        },
+      },
+    ],
+    extensions: [
+      {
+        path: resolve("private", "extensions", "permission-gate.ts"),
+        sourceInfo: {
+          path: resolve("private", "extensions", "permission-gate.ts"),
+          source: "private-extension-source",
+          scope: "project",
+          origin: "top-level",
+        },
+      },
+    ],
+    themes: [
+      {
+        name: "Continuim dark",
+        sourcePath: resolve("private", "themes", "continuim.json"),
+        sourceInfo: {
+          path: resolve("private", "themes", "continuim.json"),
+          source: "private-theme-source",
+          scope: "temporary",
+          origin: "package",
+        },
+      },
+      { sourcePath: resolve("private", "themes", "unnamed.json") },
+    ],
+    diagnostics: {
+      skills: [
+        {
+          type: "warning",
+          message: "Private skill warning at /Users/private/skills",
+          path: resolve("private", "skills", "broken", "SKILL.md"),
+        },
+      ],
+      prompts: [
+        {
+          type: "error",
+          message: "credential=must-not-cross",
+          path: resolve("private", "prompts", "broken.md"),
+        },
+      ],
+      extensions: [
+        {
+          type: "collision",
+          message: "Private collision paths must not cross",
+          collision: {
+            resourceType: "extension",
+            name: "permission-gate",
+            winnerPath: resolve("private", "extensions", "winner.ts"),
+            loserPath: resolve("private", "extensions", "loser.ts"),
+            winnerSource: "private-winner-source",
+            loserSource: "private-loser-source",
+          },
+        },
+      ],
+      themes: [],
+    },
+  };
+}
+
 function expectProjectionError(
   operation: () => unknown,
   code: string,
@@ -218,7 +326,7 @@ describe("resident authoritative snapshot normalization", () => {
     });
   });
 
-  it("produces a frozen, bounded host-owned projection from a representative v0.7.1 snapshot", () => {
+  it("produces a frozen, bounded host-owned projection from a representative v0.7.2 snapshot", () => {
     const projection = normalizeResidentProjectionSnapshot(validSnapshot(), validBinding());
 
     expect(projection).toMatchObject({
@@ -234,7 +342,7 @@ describe("resident authoritative snapshot normalization", () => {
       runtime: {
         runtime: "prime_agent",
         residency: "resident",
-        appVersion: "0.7.1",
+        appVersion: "0.7.2",
         activeSessionId: "active-session-1",
         sessionId: "session-1",
         sessionName: "Continuim build",
@@ -314,6 +422,186 @@ describe("resident authoritative snapshot normalization", () => {
     expect(Object.isFrozen(projection.transcript)).toBe(true);
     expect(Object.isFrozen(projection.transcript[0])).toBe(true);
     expect(Object.isFrozen(projection.childAgents[0]?.activity)).toBe(true);
+  });
+
+  it("reduces native RLM protocol output to path-free, human-readable delegation events", () => {
+    const privateRoot = "/Users/operator/Library/Application Support/PrimeAgent/hostd";
+    const childId = "child-opaque-95e";
+    const childActiveSessionId = "active-opaque-019f";
+    const childSessionId = "session-opaque-019f";
+    const messageId = "agentmsg_opaque_019f";
+    const snapshot = validSnapshot();
+    snapshot.state.messageCount = 2;
+    snapshot.state.recap = `Working from ${privateRoot}/sessions/root`;
+    snapshot.state.goal = {
+      ...(snapshot.state.goal as Record<string, unknown>),
+      objective: `Audit ${privateRoot}/workspace`,
+    };
+    snapshot.messages = [
+      {
+        role: "toolResult",
+        toolCallId: "call-rlm",
+        toolName: "rlm",
+        content: [{
+          type: "text",
+          text: `RLMSpawnHandle(agent_id='${childId}', session_dir=PosixPath('${privateRoot}/children/${childId}'), model='openai-codex/gpt-5.6-sol')`,
+        }],
+        isError: false,
+        timestamp: 1_754_500_020_000,
+      },
+      {
+        role: "custom",
+        customType: "agent_message",
+        content: [
+          `[from child:arithmetic-smoke-test]`,
+          "Agent-to-agent message received.",
+          "Source: native RLM",
+          `From: arithmetic-smoke-test, active ${childActiveSessionId}, session ${childSessionId}`,
+          `To: Continuim, active active-session-1, session session-1`,
+          `Message id: ${messageId}`,
+          "",
+          "Result: 4",
+        ].join("\n"),
+        display: true,
+        timestamp: 1_754_500_021_000,
+      },
+    ];
+    snapshot.children = [{
+      id: childId,
+      activeSessionId: childActiveSessionId,
+      sessionName: "arithmetic-smoke-test",
+      model: "openai-codex/gpt-5.6-sol",
+      label: `Inspect ${privateRoot}/workspace`,
+      status: "done",
+      answerPreview: `Result: 4 from ${privateRoot}/result.txt`,
+      repliedSinceTask: true,
+      recap: `Read ${privateRoot}/result.txt`,
+      sessionDir: `${privateRoot}/children/${childId}`,
+    }];
+
+    const projection = normalizeResidentProjectionSnapshot(snapshot, validBinding());
+
+    expect(projection.transcript.map((block) => block.text)).toEqual([
+      "rlm\nDelegated to arithmetic-smoke-test · openai-codex/gpt-5.6-sol",
+      "Agent message\nFrom arithmetic-smoke-test\nResult: 4",
+    ]);
+    expect(projection.childAgents[0]).toMatchObject({
+      title: "Inspect [local path]",
+      answerPreview: "Result: 4 from [local path]",
+      recap: "Read [local path]",
+    });
+    expect(projection.runtime.recap).toBe("Working from [local path]");
+    expect(projection.goal?.objective).toBe("Audit [local path]");
+
+    const serialized = JSON.stringify(projection);
+    expect(serialized).not.toContain(privateRoot);
+    expect(serialized).not.toContain("Application Support");
+    expect(serialized).not.toContain(childSessionId);
+    expect(serialized).not.toContain(messageId);
+    expect(serialized).not.toContain("session_dir");
+    expect(serialized).not.toContain("RLMSpawnHandle");
+  });
+
+  it("publishes a strict path-free resource inventory for the exact resident session", () => {
+    const resources = validResourceSnapshot();
+    const projection = normalizeResidentProjectionSnapshot(validSnapshot(), validBinding(), resources);
+
+    expect(projection.runtime.resourceInventory).toEqual({
+      skills: [
+        {
+          name: "playwright-cli",
+          description: "Automate browser interactions.",
+          sourceKind: { scope: "project", origin: "package" },
+        },
+      ],
+      prompts: [
+        {
+          name: "harness-review",
+          description: "Review the continual harness.",
+          sourceKind: { scope: "user", origin: "top-level" },
+        },
+      ],
+      themes: [
+        {
+          name: "Continuim dark",
+          sourceKind: { scope: "temporary", origin: "package" },
+        },
+      ],
+      extensions: {
+        count: 1,
+        sourceKinds: [{ scope: "project", origin: "top-level" }],
+      },
+      contextFileCount: 1,
+      diagnostics: {
+        warningCount: 1,
+        errorCount: 1,
+        collisions: [{ resourceType: "extension", name: "permission-gate" }],
+      },
+    });
+
+    const serialized = JSON.stringify(projection.runtime.resourceInventory);
+    expect(serialized).not.toContain("/private/");
+    expect(serialized).not.toContain("\\private\\");
+    expect(serialized).not.toContain("must-not-cross");
+    expect(serialized).not.toContain("private-package-source");
+    expect(serialized).not.toContain("artifact-skill-1");
+    expect(serialized).not.toContain("filePath");
+    expect(serialized).not.toContain("sourcePath");
+    expect(serialized).not.toContain("artifact");
+    expect(Object.isFrozen(projection.runtime.resourceInventory)).toBe(true);
+  });
+
+  it("compacts Prime Agent prompt-sized RLM labels without dropping the child", () => {
+    const label = `Inspect the workspace read-only and report the package name. ${"evidence ".repeat(40)}`;
+    const child = {
+      id: "child-long-label",
+      sessionName: "smoke-checker",
+      model: "openai-codex/gpt-5.6-sol",
+      label,
+      status: "done",
+      sessionDir: resolve("private", "child-long-label"),
+    };
+    const snapshot = validSnapshot();
+    snapshot.children = [child];
+
+    const projection = normalizeResidentProjectionSnapshot(snapshot, validBinding());
+    const eventChild = residentChildAgentSummaryFromSessionEvent({
+      type: "rlm_child_update",
+      child,
+    });
+
+    expect(projection.childAgents).toEqual([
+      expect.objectContaining({
+        agentId: "child-long-label",
+        sessionName: "smoke-checker",
+        state: "complete",
+      }),
+    ]);
+    expect(projection.childAgents[0]?.title).toHaveLength(255);
+    expect(projection.childAgents[0]?.title.endsWith("…")).toBe(true);
+    expect(eventChild).toEqual(projection.childAgents[0]);
+  });
+
+  it("rejects malformed or oversized resource snapshots before publication", () => {
+    const malformed = validResourceSnapshot();
+    (malformed.skills as unknown[])[0] = {
+      ...(malformed.skills as Array<Record<string, unknown>>)[0],
+      credential: "must-not-cross",
+    };
+    expectProjectionError(
+      () => normalizeResidentProjectionSnapshot(validSnapshot(), validBinding(), malformed),
+      "PRIME_PROJECTION_INVALID",
+    );
+
+    const oversized = validResourceSnapshot();
+    oversized.skills = Array.from({ length: 2_001 }, (_, index) => ({
+      name: `skill-${index}`,
+      filePath: resolve("private", "skills", `skill-${index}`, "SKILL.md"),
+    }));
+    expectProjectionError(
+      () => normalizeResidentProjectionSnapshot(validSnapshot(), validBinding(), oversized),
+      "PRIME_PROJECTION_LIMIT_EXCEEDED",
+    );
   });
 
   it("preserves the exact private model pair when public display strings collide", () => {

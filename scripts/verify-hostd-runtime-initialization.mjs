@@ -12,6 +12,7 @@ import {
 } from "./runtime-attestation-lib.mjs";
 import { createPrimeAgentSmokeCustody } from "./prime-agent-smoke-custody-lib.mjs";
 import { LOCAL_HOSTD_SMOKE_FIRST_HEALTH_DEADLINE_MS } from "../src/shared/local-host-startup-policy.mjs";
+import { resolvePinnedDevelopmentNodeExecutable } from "./development-node-runtime.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOSTD_PATH = resolve(REPO_ROOT, "out", "hostd", "hostd.cjs");
@@ -26,6 +27,7 @@ const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const BASE_HEALTH_CAPABILITIES = Object.freeze([
   "resident_control_projection_v1",
   "runtime_integrity_v1",
+  "runtime_oauth_attempt_v1",
   "snapshot_chunks_v1",
 ].sort());
 const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
@@ -33,15 +35,15 @@ const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
 const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
 const WARMED_CAPABILITIES = Object.freeze([
-  CANDIDATE_EVALUATION_CAPABILITY,
+  ...(process.platform === "win32" ? [CANDIDATE_EVALUATION_CAPABILITY] : []),
   MODEL_CATALOG_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
 ].sort());
 const EXPECTED_MODEL_CATALOG = Object.freeze({
-  releaseVersion: "0.7.1",
+  releaseVersion: "0.7.2",
   providers: 32,
-  models: 1_173,
+  models: 1_177,
   requiredModels: Object.freeze([
     "gpt-5.6-sol",
     "claude-opus-5",
@@ -59,8 +61,9 @@ const EXPECTED_MODEL_CATALOG = Object.freeze({
 });
 
 const require = createRequire(import.meta.url);
-const electronExecutable = resolve(require("electron"));
-const temporaryRoot = await mkdtemp(join(tmpdir(), "prime-continuim-hostd-runtime-smoke-"));
+const hostNodeExecutable = resolvePinnedDevelopmentNodeExecutable(REPO_ROOT);
+const browserExecutable = resolve(require("electron"));
+const temporaryRoot = await mkdtemp(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pc-host-smoke-"));
 const hostdWrapperPath = join(temporaryRoot, "hostd-smoke-wrapper.cjs");
 const requestedDataDirectory = join(temporaryRoot, "host-data");
 await mkdir(requestedDataDirectory, { recursive: true, mode: 0o700 });
@@ -77,7 +80,7 @@ if (attestation.runtime.platform !== process.platform || attestation.runtime.arc
   throw new Error("Runtime attestation does not target the current smoke platform and architecture");
 }
 await assertExactSeedRoot(SEED_ROOT);
-await stat(electronExecutable);
+await Promise.all([stat(hostNodeExecutable), stat(browserExecutable)]);
 const hostdModule = require(HOSTD_PATH);
 const primeAgentCustody = await createPrimeAgentSmokeCustody({
   hostDataRoot: dataDirectory,
@@ -96,7 +99,8 @@ try {
   }
   successReport = {
     schemaVersion: 1,
-    electronExecutable,
+    hostNodeExecutable,
+    browserExecutable,
     hostdPath: HOSTD_PATH,
     seedRoot: SEED_ROOT,
     cleanInstall,
@@ -165,7 +169,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
   const launchStartedAt = Date.now();
   let stderrTail = Buffer.alloc(0);
   child = spawn(
-    electronExecutable,
+    hostNodeExecutable,
     [
       hostdWrapperPath,
       HOSTD_PATH,
@@ -176,6 +180,8 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
       dataDirectory,
       "--runtime-seed",
       SEED_ROOT,
+      "--browser-executable",
+      browserExecutable,
     ],
     {
       cwd: REPO_ROOT,
@@ -183,7 +189,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
-      env: cleanRunAsNodeEnvironment(process.env),
+      env: cleanHostNodeEnvironment(process.env),
     },
   );
   child.stderr?.on("data", (chunk) => {
@@ -222,7 +228,13 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
 
   const latencies = [first.latencyMs];
   const phases = new Set();
-  if (firstRuntimeStatus === "initializing") phases.add(first.health.runtimeIntegrity.phase);
+  const phaseFirstSeenMs = Object.create(null);
+  const observePhase = (phase) => {
+    if (typeof phase !== "string" || phase.length === 0) return;
+    phases.add(phase);
+    phaseFirstSeenMs[phase] ??= Date.now() - launchStartedAt;
+  };
+  if (firstRuntimeStatus === "initializing") observePhase(first.health.runtimeIntegrity.phase);
   let readyHealth = firstRuntimeStatus === "ready" ? first.health : undefined;
   const readyDeadline = Date.now() + READY_DEADLINE_MS;
   while (!readyHealth && Date.now() < readyDeadline) {
@@ -246,7 +258,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
         `Runtime initialization failed with ${runtime.code} after phases ${[...phases].join(", ") || "none"}; ${stderrTail.toString("utf8")}`,
       );
     }
-    if (runtime?.status === "initializing") phases.add(runtime.phase);
+    if (runtime?.status === "initializing") observePhase(runtime.phase);
     if (runtime?.status === "ready") {
       assertRuntimeHealth(response.health, "ready");
       readyHealth = response.health;
@@ -315,6 +327,7 @@ async function runHostdReadinessPass({ expectCleanInstall }) {
     maxHealthLatencyMs: Math.max(...latencies),
     samples: latencies.length,
     phases: [...phases],
+    phaseFirstSeenMs,
     identity,
     modelCatalog: catalogSummary,
   };
@@ -551,7 +564,7 @@ function assertChildAlive(processHandle, stderrTail) {
   throw new Error(`Release hostd exited before readiness: ${stderrTail.toString("utf8")}`);
 }
 
-function cleanRunAsNodeEnvironment(environment) {
+function cleanHostNodeEnvironment(environment) {
   const result = { ...environment };
   for (const name of Object.keys(result)) {
     const normalized = name.toUpperCase();
@@ -559,7 +572,6 @@ function cleanRunAsNodeEnvironment(environment) {
       delete result[name];
     }
   }
-  result.ELECTRON_RUN_AS_NODE = "1";
   result.PRIME_CONTINUIM_PACKAGE_SMOKE = "1";
   return result;
 }
