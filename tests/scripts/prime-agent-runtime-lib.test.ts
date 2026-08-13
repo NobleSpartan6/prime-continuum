@@ -10,6 +10,7 @@ import * as runtimeLib from "../../scripts/prime-agent-runtime-lib.mjs";
 import {
   PrimeAgentRuntimeBuildError,
   acquireBuildLock,
+  applyPinnedPrimeAgentSecurityPatches,
   cleanBuildEnvironment,
   cleanRuntimeEnvironment,
   createRuntimeManifest,
@@ -61,6 +62,7 @@ describe("Prime Agent runtime build policy", () => {
     expect(inputs.packageJson).toMatchObject({
       version: "0.7.2",
       dependencies: {
+        "extract-zip": "npm:@electron-internal/extract-zip@1.0.5",
         "prime-agent":
           "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz",
       },
@@ -80,6 +82,11 @@ describe("Prime Agent runtime build policy", () => {
     expect(inputs.sources.allowedDownloadHosts).not.toContain("raw.githubusercontent.com");
     expect(inputs.lockfile.lockfileVersion).toBe(3);
     expect(Object.keys(inputs.lockfile.packages)).toHaveLength(202);
+    expect(inputs.lockfile.packages["node_modules/extract-zip"]).toMatchObject({
+      name: "@electron-internal/extract-zip",
+      version: "1.0.5",
+    });
+    expect(Object.keys(inputs.lockfile.packages).filter((path) => path.endsWith("/node_modules/extract-zip"))).toEqual([]);
     const zeromq = inputs.lockfile.packages["node_modules/zeromq"];
     expect(zeromq).toMatchObject({ version: "6.5.0" });
     if (!zeromq) throw new Error("The pinned zeromq package is missing from the runtime lock.");
@@ -95,6 +102,21 @@ describe("Prime Agent runtime build policy", () => {
       }),
     ).toThrow(PrimeAgentRuntimeBuildError);
 
+    const nestedVulnerableLock = structuredClone(inputs.lockfile);
+    nestedVulnerableLock.packages["node_modules/prime-agent/node_modules/extract-zip"] = {
+      version: "2.0.1",
+      resolved: "https://registry.npmjs.org/extract-zip/-/extract-zip-2.0.1.tgz",
+      integrity: "sha512-GDhU9ntwuKyGXdZBUgTIe+vXnWj0fppUEtMDL0+idd5Sta8TGpHssn/eusA9mrPr9qNDym6SxAYZjNvCn/9RBg==",
+    };
+    const nestedPolicy = structuredClone(inputs.policy);
+    nestedPolicy.lockPackageEntries += 1;
+    expect(() => validateRuntimeInputs({
+      packageJson: inputs.packageJson,
+      lockfile: nestedVulnerableLock,
+      sources: inputs.sources,
+      policy: nestedPolicy,
+    })).toThrow("Hardened extract-zip substitution drifted");
+
     for (const side of ["sources", "policy"] as const) {
       const legacySources = structuredClone(inputs.sources) as Record<string, unknown>;
       const legacyPolicy = structuredClone(inputs.policy) as Record<string, unknown>;
@@ -108,6 +130,17 @@ describe("Prime Agent runtime build policy", () => {
     }
   });
 
+  it("fails closed before patching an unreviewed Prime Agent bundle", async () => {
+    const root = await makeTemporaryDirectory();
+    const bundle = join(root, "node_modules", "prime-agent", "dist", "bundle");
+    await mkdir(bundle, { recursive: true });
+    await writeFile(join(bundle, "chunk-CAY2X72A.js"), "// ../../node_modules/extract-zip/index.js\n// dist/main.js\n");
+
+    await expect(applyPinnedPrimeAgentSecurityPatches(root)).rejects.toThrow(
+      "Prime Agent bundle security patch source drifted",
+    );
+  });
+
   it("removes inherited execution roles and Node preload injection", () => {
     expect(
       cleanRuntimeEnvironment(
@@ -118,6 +151,7 @@ describe("Prime Agent runtime build policy", () => {
           PRIME_AGENT_BUILD_ID: "spoofed",
           NODE_OPTIONS: "--import=attacker.mjs",
           NODE_PATH: "shadow-modules",
+          NAPI_RS_NATIVE_LIBRARY_PATH: "attacker.node",
           ELECTRON_RUN_AS_NODE: "0",
         },
         { electronRunAsNode: true },

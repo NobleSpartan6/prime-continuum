@@ -57,6 +57,23 @@ const REVIEWED_RUNTIME_PRUNED_DIRECTORIES = Object.freeze([
   Object.freeze({ relativePath: "node_modules/highlight.js/scss", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "d7dd896e7977d12dcb4c504b94ec5293fc5fc5c50ce903533039967086ea7700" }),
   Object.freeze({ relativePath: "node_modules/highlight.js/styles", package: "highlight.js", version: "10.7.3", packageJsonSha256: "4f657beb931cb9613e5173414855b2a01e698696c0661d21973bfbbd50e184cf", fileCount: 100, totalBytes: 134675, treeSha256: "88ccb109d9fbd658b000acfdd7372215d909d7f7519b650b3406585832e2ff20" }),
 ]);
+const PINNED_EXTRACT_ZIP_REPLACEMENT = Object.freeze({
+  dependency: "npm:@electron-internal/extract-zip@1.0.5",
+  packageName: "@electron-internal/extract-zip",
+  version: "1.0.5",
+  integrity: "sha512-+bqFCP98pLI0Tt0XQo1TmlXtwjWchISndDOxCkEcIuUgXWpBnLyRI+2DU+mesvnMMX6L1XDqYNA0lXNDHd/yiA==",
+});
+const PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH = Object.freeze({
+  relativePath: "node_modules/prime-agent/dist/bundle/chunk-CAY2X72A.js",
+  sourceSha256: "b987b4046d31c4928e306f56eacb1a3a2efb6cac195d03efd6fda3f6a16c6bbf",
+  sourceMarker: "// ../../node_modules/extract-zip/index.js",
+  endMarker: "// dist/main.js",
+  replacement: [
+    "// Prime Continuim: exact v0.7.2 security substitution for GHSA-jmr9-qjv8-65gv.",
+    "var require_extract_zip = () => { const loaded = require(\"extract-zip\"); return loaded.default ?? loaded; };",
+    "",
+  ].join("\n"),
+});
 const REVIEWED_RUNTIME_PROVIDER_CHUNKS = Object.freeze([
   "anthropic-6NOSCFKS.js",
   "azure-openai-responses-FMGB2C5I.js",
@@ -226,9 +243,11 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   }
 
   const prime = lockfile.packages["node_modules/prime-agent"];
+  const extractZip = lockfile.packages["node_modules/extract-zip"];
   const zeromq = lockfile.packages["node_modules/zeromq"];
   const playwrightCore = lockfile.packages["node_modules/playwright-core"];
   for (const [name, entry] of Object.entries({
+    "extract-zip": extractZip,
     "playwright-core": playwrightCore,
     "prime-agent": prime,
     zeromq,
@@ -237,6 +256,20 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
     if (!entry || entry.version !== expected?.version || entry.integrity !== expected?.integrity) {
       throw buildError(`Critical package ${name} drifted from runtime policy.`);
     }
+  }
+  if (
+    packageJson.dependencies?.["extract-zip"] !== PINNED_EXTRACT_ZIP_REPLACEMENT.dependency ||
+    packageJson.overrides?.["extract-zip"] !== PINNED_EXTRACT_ZIP_REPLACEMENT.dependency ||
+    extractZip?.name !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    policy.criticalPackages?.["extract-zip"]?.packageName !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    extractZip?.version !== PINNED_EXTRACT_ZIP_REPLACEMENT.version ||
+    extractZip?.integrity !== PINNED_EXTRACT_ZIP_REPLACEMENT.integrity ||
+    Object.entries(lockfile.packages).some(([packagePath, entry]) =>
+      packagePath !== "node_modules/extract-zip" &&
+      (packagePath.endsWith("/node_modules/extract-zip") || entry?.name === "extract-zip"),
+    )
+  ) {
+    throw buildError("Hardened extract-zip substitution drifted from runtime policy.");
   }
   if (
     policy.install?.ignoreScripts !== true ||
@@ -271,6 +304,31 @@ export function validateRuntimeInputs({ packageJson, lockfile, sources, policy }
   ) {
     throw buildError("Verified browser bridge policy changed without review.");
   }
+}
+
+export async function applyPinnedPrimeAgentSecurityPatches(runtimeDirectory) {
+  const root = resolve(runtimeDirectory);
+  const target = join(root, ...PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.relativePath.split("/"));
+  const details = await lstat(target);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw buildError("Prime Agent bundle security patch target is not a plain file.");
+  }
+  const source = await readFile(target, "utf8");
+  if (sha256Text(source) !== PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceSha256) {
+    throw buildError("Prime Agent bundle security patch source drifted.");
+  }
+  const start = source.indexOf(PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceMarker);
+  const end = source.indexOf(PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.endMarker, start + 1);
+  if (start < 0 || end < 0 || end <= start) {
+    throw buildError("Prime Agent bundle security patch markers drifted.");
+  }
+  const patched = `${source.slice(0, start)}${PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.replacement}${source.slice(end)}`;
+  await writeFile(target, patched, { encoding: "utf8", flag: "w", mode: details.mode & 0o777 });
+  return Object.freeze({
+    relativePath: PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.relativePath,
+    sourceSha256: PINNED_PRIME_AGENT_BUNDLE_EXTRACTOR_PATCH.sourceSha256,
+    patchedSha256: sha256Text(patched),
+  });
 }
 
 export async function verifyReleaseAssets(inputs, cacheDirectory, options = {}) {
@@ -747,6 +805,7 @@ async function assertExactLegacyRuntimeAssetCache(cacheRoot, allowed) {
 }
 
 export async function pruneRuntimeForTarget(runtimeDirectory) {
+  await pruneHardenedExtractZipForTarget(runtimeDirectory);
   const buildDirectory = join(runtimeDirectory, "node_modules", "zeromq", "build");
   const manifestPath = join(buildDirectory, "manifest.json");
   const manifest = await readJson(manifestPath);
@@ -798,6 +857,38 @@ export async function pruneRuntimeForTarget(runtimeDirectory) {
   });
 }
 
+async function pruneHardenedExtractZipForTarget(runtimeDirectory) {
+  const packageDirectory = join(runtimeDirectory, "node_modules", "extract-zip");
+  const packageJson = await readJson(join(packageDirectory, "package.json"));
+  if (
+    packageJson.name !== PINNED_EXTRACT_ZIP_REPLACEMENT.packageName ||
+    packageJson.version !== PINNED_EXTRACT_ZIP_REPLACEMENT.version
+  ) {
+    throw buildError("Hardened extract-zip package identity drifted before target pruning.");
+  }
+  const target = (() => {
+    if (process.platform === "darwin") return "index.darwin-universal.node";
+    if (process.platform === "win32" && ["x64", "arm64"].includes(process.arch)) {
+      return `index.win32-${process.arch}-msvc.node`;
+    }
+    if (process.platform === "linux") {
+      const libc = targetLibcFamily() === "musl" ? "musl" : "gnu";
+      if (["x64", "arm64"].includes(process.arch)) return `index.linux-${process.arch}-${libc}.node`;
+      if (process.arch === "ia32" && libc === "gnu") return "index.linux-ia32-gnu.node";
+      if (process.arch === "arm" && libc === "gnu") return "index.linux-arm-gnueabihf.node";
+    }
+    throw buildError(`Hardened extract-zip has no reviewed prebuild for ${process.platform}-${process.arch}.`);
+  })();
+  const entries = await readdir(packageDirectory, { withFileTypes: true });
+  const nativeAddons = entries.filter((entry) => entry.isFile() && /^index\..+\.node$/.test(entry.name));
+  if (!nativeAddons.some((entry) => entry.name === target)) {
+    throw buildError(`Hardened extract-zip is missing ${target}.`);
+  }
+  await Promise.all(nativeAddons
+    .filter((entry) => entry.name !== target)
+    .map((entry) => rm(join(packageDirectory, entry.name), { force: false })));
+}
+
 export async function smokeRuntime(runtimeDirectory, options = {}) {
   const runtimeExecutable = await requireAbsoluteRealFile(options.runtimeExecutable ?? process.execPath, "runtime executable");
   const electronRunAsNode = options.electronRunAsNode ?? process.env.ELECTRON_RUN_AS_NODE === "1";
@@ -815,12 +906,24 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
   const daemonClientPath = join(scratchDirectory, "runtime-daemon-client.mjs");
   const probeSource = [
     'import { createRequire } from "node:module";',
-    'import { readdir, readFile } from "node:fs/promises";',
-    'import { fileURLToPath } from "node:url";',
-    "const [moduleUrl, packageJsonPath] = process.argv.slice(2);",
+    'import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";',
+    'import { dirname, join } from "node:path";',
+    'import { fileURLToPath, pathToFileURL } from "node:url";',
+    "const [moduleUrl, packageJsonPath, scratchDirectory] = process.argv.slice(2);",
     "const runtime = await import(moduleUrl);",
     'if (typeof runtime.DaemonClient !== "function" || typeof runtime.DaemonAgentConnection?.attach !== "function") throw new Error("missing daemon exports");',
     "const require = createRequire(packageJsonPath);",
+    'const extractZipEntry = require.resolve("extract-zip");',
+    "const extractZipManifest = JSON.parse(await readFile(join(dirname(extractZipEntry), \"package.json\"), \"utf8\"));",
+    'if (extractZipManifest.name !== "@electron-internal/extract-zip" || extractZipManifest.version !== "1.0.5") throw new Error("hardened extract-zip identity changed");',
+    "const extractZipModule = await import(pathToFileURL(extractZipEntry).href);",
+    'if (typeof extractZipModule.default !== "function") throw new Error("hardened extract-zip default API changed");',
+    'const zipPath = join(scratchDirectory, "extract-probe.zip");',
+    'const extractDirectory = join(scratchDirectory, "extract-probe");',
+    'await writeFile(zipPath, Buffer.from("UEsDBAoAAAAAAOi6DF0M/H5NEAAAABAAAAAJAAAAcHJvYmUudHh0cHJpbWUtY29udGludWltClBLAQIeAwoAAAAAAOi6DF0M/H5NEAAAABAAAAAJAAAAAAAAAAEAAACkgQAAAABwcm9iZS50eHRQSwUGAAAAAAEAAQA3AAAANwAAAAAA", "base64"));',
+    "await mkdir(extractDirectory);",
+    "await extractZipModule.default(zipPath, { dir: extractDirectory });",
+    'if (await readFile(join(extractDirectory, "probe.txt"), "utf8") !== "prime-continuim\\n") throw new Error("hardened extract-zip smoke failed");',
     `for (const packageName of ${JSON.stringify(REVIEWED_RUNTIME_PRUNED_PACKAGE_ENTRYPOINTS)}) {`,
     "  const loaded = require(packageName);",
     '  if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function")) throw new Error(`reviewed package entrypoint did not load: ${packageName}`);',
@@ -910,7 +1013,7 @@ export async function smokeRuntime(runtimeDirectory, options = {}) {
     ]);
     const probe = await commandRunner(
       runtimeExecutable,
-      [probePath, entrypoints.moduleUrl, entrypoints.packageJson],
+      [probePath, entrypoints.moduleUrl, entrypoints.packageJson, scratchDirectory],
       {
         cwd: runtimeDirectory,
         env: cleanRuntimeEnvironment(process.env, { electronRunAsNode }),
@@ -1487,6 +1590,7 @@ export function cleanRuntimeEnvironment(source, { electronRunAsNode }) {
       normalized === "PRIME_AGENT_LAUNCHER_PATH" ||
       normalized === "NODE_OPTIONS" ||
       normalized === "NODE_PATH" ||
+      normalized === "NAPI_RS_NATIVE_LIBRARY_PATH" ||
       normalized === "ELECTRON_RUN_AS_NODE"
     ) {
       continue;

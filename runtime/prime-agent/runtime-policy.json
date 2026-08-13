@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "releaseVersion": "0.7.2",
   "runtimeBuildId": "83a0f9f-dirty",
-  "minimumNodeVersion": "22.8.0",
+  "minimumNodeVersion": "22.12.0",
   "npmVersion": "10.9.8",
   "lockfileVersion": 3,
   "lockPackageEntries": 202,
@@ -171,6 +171,11 @@
     ]
   },
   "criticalPackages": {
+    "extract-zip": {
+      "packageName": "@electron-internal/extract-zip",
+      "version": "1.0.5",
+      "integrity": "sha512-+bqFCP98pLI0Tt0XQo1TmlXtwjWchISndDOxCkEcIuUgXWpBnLyRI+2DU+mesvnMMX6L1XDqYNA0lXNDHd/yiA=="
+    },
     "playwright-core": {
       "version": "1.63.0-alpha-2026-08-05",
       "integrity": "sha512-YussvUybTfBtyYbGXWh43f+5kNP03wg98M6mu4DphYET7PSbNVajsdLGjWE1xrsjqOw32i2wFlRP7U5mcOpMZg=="

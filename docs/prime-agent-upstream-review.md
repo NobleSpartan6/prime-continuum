@@ -53,8 +53,24 @@ Reviewed on 2026-08-12.
   depends on: disconnected workers no longer report ready, timed-out stops
   finish cleanup, zombies are not considered alive, and stale registrations
   self-heal when a session is opened or resumed.
+- The release dependency graph still includes `extract-zip@2.0.1`, and the
+  shipped CLI bundle embeds the same implementation. GitHub advisory
+  `GHSA-jmr9-qjv8-65gv` reports an unpatched symlink-target traversal for every
+  published `extract-zip` version. Upstream `main` still declares `^2.0.1`, so
+  there is no verified Prime Agent release to upgrade to for this issue.
+- Continuim therefore retains Prime Agent `v0.7.2` and applies one bounded,
+  hash-gated runtime assembly substitution: every `extract-zip` resolution and
+  the exact embedded bundle block delegate to
+  `@electron-internal/extract-zip@1.0.5`. That Electron-owned package has no
+  runtime dependencies or install script, ships reviewed macOS/Linux/Windows
+  prebuilds, and hardens symlink containment. Runtime assembly rejects source
+  drift, prunes to the target prebuild, performs a real ZIP extraction smoke,
+  and attests the changed runtime tree. The effective minimum Node version is
+  consequently 22.12 rather than upstream's 22.8.
 
 Official sources:
 
 - <https://github.com/PrimeIntellect-ai/prime-agent>
 - <https://github.com/PrimeIntellect-ai/prime-agent/releases/tag/v0.7.2>
+- <https://github.com/advisories/GHSA-jmr9-qjv8-65gv>
+- <https://github.com/electron/extract-zip/releases/tag/v1.0.5>

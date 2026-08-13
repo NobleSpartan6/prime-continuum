@@ -4,10 +4,14 @@
   "private": true,
   "description": "Locked, build-only Prime Agent runtime seed for Prime Continuim",
   "engines": {
-    "node": ">=22.8.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {
+    "extract-zip": "npm:@electron-internal/extract-zip@1.0.5",
     "playwright-core": "1.63.0-alpha-2026-08-05",
     "prime-agent": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.7.2/prime-agent-0.7.2.tgz"
+  },
+  "overrides": {
+    "extract-zip": "npm:@electron-internal/extract-zip@1.0.5"
   }
 }

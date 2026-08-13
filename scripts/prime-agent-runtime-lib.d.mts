@@ -56,6 +56,11 @@ export function installLockedRuntime(options: {
   stagingDirectory: string;
   npmCli: string;
 }): Promise<string>;
+export function applyPinnedPrimeAgentSecurityPatches(runtimeDirectory: string): Promise<Readonly<{
+  relativePath: string;
+  sourceSha256: string;
+  patchedSha256: string;
+}>>;
 export function pruneRuntimePackagingNoise(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
 export function pruneReviewedRuntimeDirectories(runtimeDirectory: string, policy: JsonRecord): Promise<readonly string[]>;
 export function pruneRuntimeForTarget(runtimeDirectory: string): Promise<void>;
