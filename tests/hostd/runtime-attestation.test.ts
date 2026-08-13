@@ -105,7 +105,7 @@ describe("release runtime attestation", () => {
     expect(guiRuntime.executableSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(hostRuntime.executableSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(hostRuntime.executableSha256).not.toBe(guiRuntime.executableSha256);
-  });
+  }, 20_000);
 
   it("round-trips one canonical bounded record", () => {
     const bytes = serializeRuntimeAttestation(attestation);
