@@ -1877,6 +1877,14 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     selectedThread?.status !== 'running' &&
     !canStopResidentTurn,
   )
+  const promptCommandPending = Boolean(
+    composerReceipt.operation === 'prompt' &&
+    (
+      composerReceipt.state === 'sending' ||
+      composerReceipt.state === 'sent' ||
+      composerReceipt.state === 'queued'
+    ),
+  )
   const selectedTaskRun = taskRunPresentation({
     hostName: selectedHost?.name ?? '',
     connection: selectedHost?.connection ?? 'offline',
@@ -1899,7 +1907,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     ),
     activity: {
       live: selectedThread?.status === 'running' || selectedRuntimeHasLiveActivity,
-      fresh: selectedHost?.connection === 'online' && selectedHost.activationRequired !== true,
+      fresh: Boolean(
+        selectedHost?.connection === 'online' &&
+        selectedHost.activationRequired !== true &&
+        snapshot?.snapshotAuthority?.source !== 'cached' &&
+        !promptCommandPending
+      ),
       detail: selectedThread?.status === 'running' || selectedRuntimeHasLiveActivity
         ? agentActivityPresentation(selectedRuntime, snapshot?.agents ?? []).detail
         : undefined,
@@ -3123,7 +3136,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                   <div>
                     <dt>Browser</dt>
                     <dd className={cx(sessionPresentation.browserReadiness === 'ready' && 'hud-session-strip__ready')}>
-                      {sessionPresentation.browserReadiness === 'ready' ? 'Ready' : 'Unavailable'}
+                      {sessionPresentation.browserReadiness === 'ready' ? 'Browser ready' : 'Browser unavailable'}
                     </dd>
                   </div>
                 )}
@@ -4654,10 +4667,11 @@ const Transcript = memo(function Transcript({
         </div>
       </section>
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {hasStreamingBlock ? 'Prime Agent is responding.' : ''}
-      </span>
-      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {hasNewActivity ? 'New transcript activity is available.' : ''}
+        {hasStreamingBlock
+          ? 'Prime Agent is responding.'
+          : hasNewActivity
+            ? 'New transcript activity is available.'
+            : ''}
       </span>
       {hasNewActivity && (
         <div className="transcript-jump">
@@ -4839,7 +4853,7 @@ function SessionContinuity({
       </span>
       <span className="session-continuity__body">
         <span className="session-continuity__summary">
-          <span className="session-continuity__label" role="status" aria-live="polite" aria-atomic="true">
+          <span className="session-continuity__label">
             {continuity.label}
           </span>
           <span aria-hidden="true">·</span>
@@ -5021,9 +5035,11 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
     : receipt.state === 'idle' && !canAct
       ? 'waiting_for_connection'
       : receipt.state
+  const announceComposerReceipt = Boolean(receipt.operation && receipt.state !== 'idle')
   const modelSetupPrimary = presentation.primaryAction?.kind === 'setup_model'
   const modelSetupOwnedByLaunchpad = modelSetupPrimary && launchpadOwnsPrimaryAction
   const modelSetupUnavailable = presentation.kind === 'model_setup' && !modelSetupPrimary
+  const passiveEndReview = endLifecyclePresent && presentation.primaryAction?.kind === 'review_status'
   const primaryLabel = residentEndPreparing
     ? 'Finishing…'
     : presentation.primaryAction?.label ?? (endLifecyclePresent
@@ -5196,7 +5212,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
 
         <div className="composer__actions">
           <div className="composer__secondary-actions">
-            {(endOutcomeUnknown || stopOutcomeUnknown) && onManageSession && (
+            {(endOutcomeUnknown || stopOutcomeUnknown || passiveEndReview) && onManageSession && (
               <button
                 className="button button--quiet"
                 type="button"
@@ -5312,7 +5328,13 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
             )}
           </div>
         </div>
-        <span className="sr-only" id="composer-status" role="status" aria-live="polite" aria-atomic="true">
+        <span
+          className="sr-only"
+          id="composer-status"
+          role={announceComposerReceipt ? 'status' : undefined}
+          aria-live={announceComposerReceipt ? 'polite' : undefined}
+          aria-atomic={announceComposerReceipt ? true : undefined}
+        >
           {validationError ? '' : receiptStatusCopy}
         </span>
       </form>

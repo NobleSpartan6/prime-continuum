@@ -5379,7 +5379,22 @@ dialog.sheet.models-sheet {
 }
 
 .provider-setup-note .provider-setup-note__storage {
+  margin-block-start: 0.35rem;
   color: var(--color-text-muted);
+  font-size: var(--font-caption);
+}
+
+.provider-setup-note__storage summary {
+  display: flex;
+  align-items: center;
+  inline-size: fit-content;
+  min-block-size: 2rem;
+  color: var(--color-text-secondary);
+  font-weight: 600;
+}
+
+.provider-setup-note__storage[open] summary {
+  margin-block-end: 0.1rem;
 }
 
 .provider-setup-note__actions {
@@ -6098,7 +6113,7 @@ body[data-surface="hud"] {
 }
 
 .hud-expanded .composer:focus-within {
-  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--color-focus) 72%, var(--color-control-border));
+  box-shadow: inset 0 0 0 2px var(--color-focus);
 }
 
 .hud-expanded .composer__hint {
@@ -8024,9 +8039,7 @@ body[data-surface="hud"] {
 }
 
 .composer:focus-within {
-  box-shadow:
-    inset 2px 0 var(--color-accent),
-    inset 0 0 0 1px var(--color-control-border);
+  box-shadow: inset 0 0 0 2px var(--color-focus);
 }
 
 .composer textarea {
@@ -8561,8 +8574,8 @@ dialog.sheet::backdrop {
 }
 
 .provider-rail__toolbar button[aria-pressed="true"] {
-  background: transparent;
-  box-shadow: inset 2px 0 var(--color-accent);
+  background: var(--color-surface-accent);
+  box-shadow: none;
 }
 
 .model-row {
@@ -9067,7 +9080,7 @@ dialog.sheet::backdrop {
 
 .composer:focus-within {
   box-shadow:
-    inset 0 0 0 1px color-mix(in oklch, var(--color-focus) 72%, var(--color-control-border)),
+    inset 0 0 0 2px var(--color-focus),
     0 16px 42px oklch(0 0 0 / 0.24);
 }
 

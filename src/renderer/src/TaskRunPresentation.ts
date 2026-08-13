@@ -214,6 +214,7 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
       detail: 'Waiting for resident controls.',
       tone: 'warning',
       iconKey: 'clock',
+      ...(canReview ? { primaryAction: REVIEW_STATUS_ACTION } : {}),
     }
   }
 
@@ -307,7 +308,7 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
     }
   }
 
-  if (input.receipt.operation === 'prompt' && receiptPending && !freshLiveActivity) {
+  if (input.receipt.operation === 'prompt' && receiptPending) {
     return {
       kind: 'starting',
       headline: 'Starting',

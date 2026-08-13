@@ -122,7 +122,7 @@ describe('renderer style contracts', () => {
 
     expect(compactHud).toMatch(/\.hud-session-strip__facts,\s*\.hud-expanded__thread > \.transcript\s*{[^}]*display:\s*none;/s)
     expect(compactHud).toMatch(/\.hud-expanded \.composer-wrap\s*{[^}]*margin-block-start:\s*auto;/s)
-    expect(css).toMatch(/\.hud-expanded \.composer:focus-within\s*{[^}]*inset 0 0 0 1px[^}]*;/s)
+    expect(css).toMatch(/\.hud-expanded \.composer:focus-within\s*{[^}]*inset 0 0 0 2px var\(--color-focus\)[^}]*;/s)
     expect(css).not.toMatch(/\.hud-expanded \.composer:focus-within\s*{[^}]*inset 2px 0/s)
   })
 
@@ -238,9 +238,13 @@ describe('renderer style contracts', () => {
 
   it('keeps the model provider toolbar semantics aligned with its visual breakpoint', async () => {
     const source = await readFile(resolve('src/renderer/src/ModelsDialog.tsx'), 'utf8')
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
 
     expect(source).toContain("useMediaQueryMatch('(max-width: 50rem)')")
     expect(source).not.toContain("useMediaQueryMatch('(max-width: 75rem)')")
+    expect(css).toMatch(/\.provider-rail__toolbar button\[aria-pressed="true"\]\s*{[^}]*background:\s*var\(--color-surface-accent\);[^}]*box-shadow:\s*none;/s)
+    expect(css).not.toMatch(/inset\s+2px\s+0\s+var\(--color-(?:accent|focus)\)/)
+    expect(css).toMatch(/\.composer:focus-within\s*{[^}]*inset 0 0 0 2px var\(--color-focus\)/s)
   })
 
   it('keeps decorative motion behind the reduced-motion preference', async () => {

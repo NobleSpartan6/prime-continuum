@@ -216,10 +216,10 @@ describe('taskRunPresentation', () => {
     )).toEqual(['ready', 'starting', 'working', 'stopping', 'ready'])
   })
 
-  it('promotes an admitted prompt to Working when fresh resident activity arrives', () => {
+  it('promotes current resident activity to Working after the prompt receipt retires', () => {
     const presentation = taskRunPresentation(baseline({
       taskState: 'running',
-      receipt: { state: 'sent', operation: 'prompt' },
+      receipt: { state: 'idle' },
       activity: { live: true, fresh: true },
       authority: { ...baseline().authority, canStart: false, canStop: true },
     }))
@@ -228,6 +228,43 @@ describe('taskRunPresentation', () => {
       kind: 'working',
       headline: 'Working',
       primaryAction: { kind: 'stop' },
+    })
+  })
+
+  it.each(['sending', 'sent', 'queued'] as const)(
+    'keeps a running projection at Starting while the prompt receipt is %s',
+    (receiptState) => {
+    const presentation = taskRunPresentation(baseline({
+      taskState: 'running',
+      receipt: { state: receiptState, operation: 'prompt' },
+      activity: { live: true, fresh: true },
+      authority: { ...baseline().authority, canStart: false, canStop: true },
+    }))
+
+    expect(presentation).toMatchObject({
+      kind: 'starting',
+      headline: 'Starting',
+    })
+    expect(presentation.primaryAction).toBeUndefined()
+    },
+  )
+
+  it('offers one passive Review action for a saved End without mutation controls', () => {
+    const presentation = taskRunPresentation(baseline({
+      endOperationPresent: true,
+      receipt: { state: 'sent', operation: 'end', retryable: true },
+      authority: {
+        ...baseline().authority,
+        mutation: false,
+        canFinishEnd: false,
+        canReview: true,
+      },
+    }))
+
+    expect(presentation).toMatchObject({
+      kind: 'ending',
+      headline: 'End saved',
+      primaryAction: { kind: 'review_status', label: 'Review status' },
     })
   })
 

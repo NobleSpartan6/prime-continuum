@@ -1021,7 +1021,7 @@ describe('Prime Continuim renderer', () => {
     const liveSession = screen.getByRole('region', { name: 'Live agent session' })
     expect(within(liveSession).getByText('GPT-5.6 Sol')).toBeVisible()
     expect(within(liveSession).getByText('2 active')).toBeVisible()
-    expect(within(liveSession).getByText('Ready', { selector: 'dd' })).toBeVisible()
+    expect(within(liveSession).getByText('Browser ready', { selector: 'dd' })).toBeVisible()
 
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
@@ -1033,7 +1033,7 @@ describe('Prime Continuim renderer', () => {
     })
 
     await user.click(screen.getByRole('button', { name: 'Collapse to desktop buddy' }))
-    const buddy = await screen.findByRole('button', { name: /Working: Seamless remote experience\..*Open session HUD/ })
+    const buddy = await screen.findByRole('button', { name: /Starting: Seamless remote experience\..*Open session HUD/ })
     await waitFor(() => expect(buddy).toHaveFocus())
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     await user.click(buddy)
@@ -1331,7 +1331,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     const continuity = await screen.findByRole('region', { name: 'Session status' })
-    expect(within(continuity).getByRole('status')).toHaveTextContent('Restart session')
+    expect(continuity.querySelector('.session-continuity__label')).toHaveTextContent('Restart session')
     expect(within(continuity).getByText(/could not attach this saved session/i)).toBeVisible()
     expect(within(continuity).getByText('Saved thread')).toBeVisible()
     expect(within(continuity).queryByText('Using ipython')).not.toBeInTheDocument()
@@ -1506,8 +1506,9 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('button', { name: /Finish ending/i })).not.toBeInTheDocument()
     expect(api.prepareResidentEnd).not.toHaveBeenCalled()
 
-    await user.click(screen.getByRole('tab', { name: 'Session' }))
+    await user.click(screen.getByRole('button', { name: 'Review status' }))
     const inspector = screen.getByLabelText('Thread inspector')
+    expect(within(inspector).getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
     const card = await within(inspector).findByRole('region', { name: 'End saved' })
     expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
     expect(within(card).queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
@@ -1611,7 +1612,7 @@ describe('Prime Continuim renderer', () => {
 
     await waitFor(() => {
       const terminalStatus = screen.getByRole('region', { name: 'Session status' })
-      expect(within(terminalStatus).getByRole('status')).toHaveTextContent('Session ended')
+      expect(terminalStatus.querySelector('.session-continuity__label')).toHaveTextContent('Session ended')
       expect(within(terminalStatus).getByText(/task, transcript, and workspace files remain available/i)).toBeVisible()
     })
     expect(screen.queryByRole('form', { name: 'Resident session ending' })).not.toBeInTheDocument()
@@ -3465,7 +3466,7 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toHaveTextContent('Reconnect to verify')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
     const continuity = screen.getByRole('region', { name: 'Session status' })
-    expect(within(continuity).getByRole('status')).toHaveTextContent('Reconnecting')
+    expect(continuity.querySelector('.session-continuity__label')).toHaveTextContent('Reconnecting')
     expect(within(continuity).getByText('Saved activity is available while devbox reconnects.')).toBeVisible()
     expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
     const receiptDetails = screen.getByText('Receipt details').closest('details')
@@ -3635,9 +3636,16 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('button', { name: /follow up/i })).not.toBeInTheDocument()
     expect(screen.getByText('Ready', { selector: '.composer__intent' })).toBeVisible()
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    const composerStatus = document.getElementById('composer-status')
+    const continuityStatus = screen.getByRole('region', { name: 'Session status' })
+      .querySelector('.session-continuity__label')
     expect(composer).toHaveAttribute('placeholder', 'Describe the outcome, constraints, and done criteria…')
     expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-status')
     expect(document.getElementById('composer-hint')).toHaveTextContent('Include the outcome, constraints, and done criteria')
+    expect(composerStatus).not.toHaveAttribute('role')
+    expect(composerStatus).not.toHaveAttribute('aria-live')
+    expect(continuityStatus).not.toHaveAttribute('role')
+    expect(continuityStatus).not.toHaveAttribute('aria-live')
     expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toContainElement(composer)
 
     await user.type(composer, 'Summarize the approval boundary.')
@@ -3811,12 +3819,15 @@ describe('Prime Continuim renderer', () => {
     { taskState: 'idle' as const, expectedStatus: 'Ready', expectedDetail: 'Prime Agent is ready for another task.' },
     { taskState: 'waiting' as const, expectedStatus: 'Reply needed', expectedDetail: 'Prime Agent is waiting for more context.' },
     { taskState: 'running' as const, connection: 'reconnecting' as const, expectedStatus: 'Reconnecting', expectedDetail: 'Saved activity is available while Resident workstation reconnects.' },
-  ])('announces $expectedStatus continuity without moving focus', async ({ taskState, connection, expectedStatus, expectedDetail }) => {
+  ])('renders $expectedStatus continuity without duplicating the task-state announcement', async ({ taskState, connection, expectedStatus, expectedDetail }) => {
     render(<App api={createContinuityApi({ taskState, ...(connection ? { connection } : {}) })} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const continuity = screen.getByRole('region', { name: 'Session status' })
 
-    expect(within(continuity).getByRole('status')).toHaveTextContent(expectedStatus)
+    const label = continuity.querySelector('.session-continuity__label')
+    expect(label).toHaveTextContent(expectedStatus)
+    expect(label).not.toHaveAttribute('role')
+    expect(label).not.toHaveAttribute('aria-live')
     expect(within(continuity).getByText(expectedDetail)).toBeVisible()
     expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
     if (connection !== 'reconnecting') {
@@ -3852,7 +3863,7 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const continuity = screen.getByRole('region', { name: 'Session status' })
 
-    expect(within(continuity).getByRole('status')).toHaveTextContent('Working')
+    expect(continuity.querySelector('.session-continuity__label')).toHaveTextContent('Working')
     expect(within(continuity).getAllByText('Preparing the next visible update')).toHaveLength(2)
     expect(continuity).not.toHaveTextContent(/after this window closes|while this client remains attached/i)
   })
@@ -4390,14 +4401,18 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).queryByRole('button', { name: /Connect/ })).not.toBeInTheDocument()
     await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
 
-    expect(within(dialog).getByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
-    expect(within(dialog).getByText(/no authorization URL or credential is exposed to this view/i)).toBeVisible()
+    const connectButton = within(dialog).getByRole('button', { name: 'Connect ChatGPT' })
+    expect(connectButton).toBeEnabled()
+    expect(within(dialog).getByText(/this view never receives the authorization URL or credential/i)).toBeVisible()
     const storageDisclosure = dialog.querySelector('.provider-setup-note__storage')
+    expect(storageDisclosure).not.toHaveAttribute('open')
+    expect(within(dialog).getByText('Credential storage', { selector: 'summary' })).toBeVisible()
+    expect(connectButton.compareDocumentPosition(storageDisclosure!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(storageDisclosure).toHaveTextContent(/Prime Agent 0\.7\.2.*stores OAuth credentials as plaintext.*auth\.json.*operating-system account’s file permissions/i)
     expect(storageDisclosure).toHaveTextContent(/Account availability is refreshed before model selection.*not keychain or keyring storage/i)
     expect(within(dialog).queryByText(/new resident session|restart/i)).not.toBeInTheDocument()
 
-    await user.click(within(dialog).getByRole('button', { name: 'Connect ChatGPT' }))
+    await user.click(connectButton)
     expect(harness.api.startRuntimeOAuth).toHaveBeenCalledWith({
       hostId: 'host-devbox',
       providerId: 'openai-codex',

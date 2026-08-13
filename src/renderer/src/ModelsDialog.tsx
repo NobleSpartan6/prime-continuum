@@ -616,7 +616,7 @@ export default function ModelsDialog({
                   <h3>{selectedProvider?.displayName ?? 'Models reported by this host'}</h3>
                   <p>{scopedAvailableCount} available with current setup · {scopedModelCount} listed by the runtime</p>
                 </div>
-                <span className="catalog-freshness"><span aria-hidden="true" /> Read {formatCatalogTime(catalog.observedAt)}</span>
+                <span className="catalog-freshness"><span aria-hidden="true" /> Updated {formatCatalogTime(catalog.observedAt)}</span>
               </div>
 
               {selectedProvider && !selectedProvider.configured && (
@@ -633,11 +633,8 @@ export default function ModelsDialog({
                       <>
                         <p>
                           {selectedProviderCanConnect
-                            ? <>Connect ChatGPT to this Prime Agent runtime on <bdi>{host.name}</bdi>. The verified sign-in page opens in your system browser; no authorization URL or credential is exposed to this view.</>
+                            ? <>Connect ChatGPT on <bdi>{host.name}</bdi>. Sign-in opens in your browser; this view never receives the authorization URL or credential.</>
                             : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. This desktop can connect ChatGPT only when the trusted local host advertises OAuth support.</>}
-                        </p>
-                        <p className="provider-setup-note__storage">
-                          Prime Agent {catalog.releaseVersion} stores OAuth credentials as plaintext in host-only <code>auth.json</code>, protected by this operating-system account’s file permissions. Account availability is refreshed before model selection; this is not keychain or keyring storage.
                         </p>
                         {selectedProviderCanConnect && (
                           <div className="provider-setup-note__actions">
@@ -652,6 +649,12 @@ export default function ModelsDialog({
                             </button>
                           </div>
                         )}
+                        <details className="provider-setup-note__storage">
+                          <summary>Credential storage</summary>
+                          <p>
+                            Prime Agent {catalog.releaseVersion} stores OAuth credentials as plaintext in host-only <code>auth.json</code>, protected by this operating-system account’s file permissions. Account availability is refreshed before model selection; this is not keychain or keyring storage.
+                          </p>
+                        </details>
                       </>
                     ) : (
                       <p>
