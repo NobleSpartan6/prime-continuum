@@ -194,10 +194,17 @@ describe('remote host payload pure source contract', () => {
 
     const reordered = Buffer.from(`${JSON.stringify(createRemoteHostPayloadInputs())}\n`, 'utf8')
     expectContractCode(() => parseRemoteHostPayloadInputsBytes(reordered), 'payload_inputs_not_canonical')
-    const duplicate = Buffer.from(canonical.toString('utf8').replace('{', '{"schema":"remote-host-payload-inputs/v1",'))
+    const duplicate = Buffer.concat([
+      Buffer.from('{"schema":"remote-host-payload-inputs/v1",', 'utf8'),
+      canonical.subarray(1),
+    ])
     expectContractCode(() => parseRemoteHostPayloadInputsBytes(duplicate), 'payload_inputs_not_canonical')
     expectContractCode(() => parseRemoteHostPayloadInputsBytes(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), canonical])), 'payload_inputs_bom_forbidden')
-    expectContractCode(() => parseRemoteHostPayloadInputsBytes(Buffer.from(canonical.toString('utf8').replace(/\n$/u, '\r\n'))), 'payload_inputs_framing_invalid')
+    const crlfFramed = Buffer.concat([
+      canonical.subarray(0, canonical.length - 1),
+      Buffer.from('\r\n', 'utf8'),
+    ])
+    expectContractCode(() => parseRemoteHostPayloadInputsBytes(crlfFramed), 'payload_inputs_framing_invalid')
   })
 
   it('keeps exact checkout-stable launcher and unit bytes with service-only semantics', async () => {

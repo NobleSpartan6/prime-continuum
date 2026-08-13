@@ -1331,8 +1331,11 @@ function residentEndPreparationFromNative(value: unknown): ResidentEndPreparatio
 }
 
 function createStableId(prefix: string): string {
-  const uuid = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  return `${prefix}:${uuid}`
+  const secureRandom = globalThis.crypto
+  if (!secureRandom || typeof secureRandom.randomUUID !== 'function') {
+    throw new Error('Secure identity generation is unavailable in this renderer.')
+  }
+  return `${prefix}:${secureRandom.randomUUID()}`
 }
 
 function candidateEvaluationAuthorityMatches(

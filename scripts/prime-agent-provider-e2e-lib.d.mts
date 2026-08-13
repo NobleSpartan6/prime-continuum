@@ -83,7 +83,7 @@ export function uniqueExactVisibleModelRowIndex(
   }>[],
   expected: Readonly<{ providerId: string; providerDisplayName: string; modelId: string }>,
 ): number | undefined;
-export function parseVisibleModelRowMetadata(markup: string): Readonly<{
+export function parseVisibleModelRowMetadata(serializedMetadata: string): Readonly<{
   providerDisplayName: string;
   modelId: string;
 }>;

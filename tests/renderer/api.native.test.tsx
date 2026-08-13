@@ -649,6 +649,29 @@ function committedResidentSnapshot(body = 'Authoritative committed resident thre
 }
 
 describe('NativeRendererApi', () => {
+  it('uses Web Crypto for the durable renderer device authority', () => {
+    const randomUUID = vi.fn(() => '00000000-0000-4000-8000-000000000001')
+    vi.stubGlobal('crypto', { randomUUID })
+    try {
+      const api = new NativeRendererApi({})
+      expect((api as unknown as { deviceId: string }).deviceId)
+        .toBe('device:00000000-0000-4000-8000-000000000001')
+      expect(randomUUID).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('fails closed when secure renderer identity generation is unavailable', () => {
+    vi.stubGlobal('crypto', {})
+    try {
+      expect(() => new NativeRendererApi({}))
+        .toThrow('Secure identity generation is unavailable in this renderer.')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('projects only exact live extension UI requests under the advertised resident capability', async () => {
     const harness = await liveExtensionUiHarness(() => Promise.reject(new Error('not invoked')))
     expect(harness.cached.residentExtensionUiRequests).toEqual([])
