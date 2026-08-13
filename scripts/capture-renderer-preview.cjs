@@ -23,6 +23,7 @@ const targets = [
     height: 1000,
     visualState: 'launchpad',
     expectedText: 'Give Prime Agent a goal.',
+    expectLaunchpadContinuitySuppressed: true,
   },
   {
     name: 'mobile-agent-launchpad-390',
@@ -31,6 +32,7 @@ const targets = [
     visualState: 'launchpad',
     expectedText: 'Give Prime Agent a goal.',
     expectResponsiveTopbar: true,
+    expectLaunchpadContinuitySuppressed: true,
   },
   {
     name: 'desktop-idle',
@@ -81,7 +83,7 @@ const targets = [
     visualState: 'idle',
     expectedText: 'Prime Agent is ready for another task.',
     expectResponsiveTopbar: true,
-    expectHorizontalTaskStarters: true,
+    expectBoundedTaskStarters: true,
   },
   {
     name: 'compact-idle-320',
@@ -90,7 +92,33 @@ const targets = [
     visualState: 'idle',
     expectedText: 'Prime Agent is ready for another task.',
     expectResponsiveTopbar: true,
-    expectHorizontalTaskStarters: true,
+    expectBoundedTaskStarters: true,
+  },
+  {
+    name: 'desktop-ended-empty',
+    width: 1600,
+    height: 1000,
+    visualState: 'ended-empty',
+    expectedText: 'No transcript was recorded. Your workspace and files remain available.',
+    expectEndedEmpty: true,
+  },
+  {
+    name: 'ended-empty-390',
+    width: 390,
+    height: 844,
+    visualState: 'ended-empty',
+    expectedText: 'No transcript was recorded. Your workspace and files remain available.',
+    expectResponsiveTopbar: true,
+    expectEndedEmpty: true,
+  },
+  {
+    name: 'ended-empty-320',
+    width: 320,
+    height: 704,
+    visualState: 'ended-empty',
+    expectedText: 'No transcript was recorded. Your workspace and files remain available.',
+    expectResponsiveTopbar: true,
+    expectEndedEmpty: true,
   },
   {
     name: 'mobile-inspector-390',
@@ -497,6 +525,9 @@ async function capture(target, rendererOrigin) {
       browserWindow.showInactive()
       const modelTriggerEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
         const button = document.querySelector('button.model-chip')
+        if (button instanceof HTMLButtonElement) {
+          button.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+        }
         const rect = button?.getBoundingClientRect()
         const style = button ? window.getComputedStyle(button) : undefined
         const visible = Boolean(
@@ -963,6 +994,13 @@ async function capture(target, rendererOrigin) {
       const topbarBrandStyle = topbarBrand ? window.getComputedStyle(topbarBrand) : undefined
       const taskStarters = document.querySelector('.task-starters')
       const taskStartersStyle = taskStarters ? window.getComputedStyle(taskStarters) : undefined
+      const taskStarterButtons = [...(taskStarters?.querySelectorAll('.task-starters__item') ?? [])]
+      const taskStarterRects = taskStarterButtons.map((button) => button.getBoundingClientRect())
+      const taskStartersRect = taskStarters?.getBoundingClientRect()
+      const endedEmpty = document.querySelector('.ended-thread-empty')
+      const endedEmptyHeading = endedEmpty?.querySelector('h2')
+      const endedEmptyAction = endedEmpty?.querySelector('button')
+      const endedEmptyRect = endedEmpty?.getBoundingClientRect()
       const responsiveInspector = document.querySelector('.inspector')
       const responsiveInspectorRect = responsiveInspector?.getBoundingClientRect()
       const responsiveInspectorStyle = responsiveInspector ? window.getComputedStyle(responsiveInspector) : undefined
@@ -1123,11 +1161,33 @@ async function capture(target, rendererOrigin) {
           topbarTitleRect.right <= topbarThreadRect.right + 1 &&
           topbarBrandStyle?.display === 'none'
         ),
-        horizontalTaskStarters: Boolean(
+        boundedTaskStarters: Boolean(
           taskStarters &&
-          taskStartersStyle?.display === 'flex' &&
-          ['auto', 'scroll'].includes(taskStartersStyle.overflowX) &&
-          taskStarters.scrollWidth > taskStarters.clientWidth
+          taskStartersRect &&
+          taskStartersStyle?.display === 'grid' &&
+          taskStartersStyle.gridTemplateColumns.split(' ').length === 2 &&
+          taskStarters.scrollWidth <= taskStarters.clientWidth &&
+          taskStarterButtons.length === 4 &&
+          taskStarterRects.every((rect) =>
+            rect.width > 0 &&
+            rect.height >= 44 &&
+            rect.left >= Math.max(0, taskStartersRect.left) &&
+            rect.right <= Math.min(window.innerWidth, taskStartersRect.right) &&
+            rect.top >= taskStartersRect.top &&
+            rect.bottom <= taskStartersRect.bottom
+          )
+        ),
+        endedEmptyResolved: Boolean(
+          endedEmptyRect &&
+          endedEmptyHeading?.textContent?.trim() === 'Session ended' &&
+          endedEmptyAction?.textContent?.trim() === 'Start another task' &&
+          endedEmptyRect.left >= 0 &&
+          endedEmptyRect.right <= window.innerWidth &&
+          !document.querySelector('.composer-wrap')
+        ),
+        launchpadContinuitySuppressed: Boolean(
+          document.querySelector('.agent-launchpad') &&
+          !document.querySelector('.session-continuity')
         ),
         responsiveDrawerBounded: Boolean(
           responsiveInspectorRect &&
@@ -1270,8 +1330,14 @@ async function capture(target, rendererOrigin) {
     if (target.expectResponsiveTopbar) {
       invariant(stateEvidence.responsiveTopbarBounded, `${target.name} allowed responsive topbar regions to overlap: ${JSON.stringify(stateEvidence)}`)
     }
-    if (target.expectHorizontalTaskStarters) {
-      invariant(stateEvidence.horizontalTaskStarters, `${target.name} did not preserve a compact horizontal task starter rail`)
+    if (target.expectBoundedTaskStarters) {
+      invariant(stateEvidence.boundedTaskStarters, `${target.name} did not keep all four task starters visible in a bounded two-column grid`)
+    }
+    if (target.expectEndedEmpty) {
+      invariant(stateEvidence.endedEmptyResolved, `${target.name} did not render the resolved ended-session empty state`)
+    }
+    if (target.expectLaunchpadContinuitySuppressed) {
+      invariant(stateEvidence.launchpadContinuitySuppressed, `${target.name} duplicated neutral launchpad readiness below the transcript`)
     }
     if (target.expectResponsiveDrawer) {
       invariant(stateEvidence.responsiveDrawerBounded, `${target.name} did not keep the responsive inspector drawer within the viewport`)

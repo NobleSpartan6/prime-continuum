@@ -385,6 +385,7 @@ export type PreviewVisualState =
   | 'resident-recovery'
   | 'resident-end-review'
   | 'resident-end-pending'
+  | 'ended-empty'
   | 'candidate-evaluation-review'
   | 'hud-expanded'
   | 'hud-buddy'
@@ -406,6 +407,7 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'resident-recovery',
   'resident-end-review',
   'resident-end-pending',
+  'ended-empty',
   'candidate-evaluation-review',
   'hud-expanded',
   'hud-buddy',
@@ -552,6 +554,48 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
           state: 'requires_reselection',
         }]
       : []
+    return snapshot
+  }
+
+  if (visualState === 'ended-empty') {
+    const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
+    const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
+    if (!thread || !host || !snapshot.runtime.session) return snapshot
+    snapshot.selectedProjectId = thread.projectId
+    snapshot.selectedThreadId = thread.id
+    thread.status = 'complete'
+    thread.transcript = []
+    thread.workspaceId = 'workspace-preview-ended'
+    thread.executionGenerationId = 'execution-preview-ended'
+    thread.residentLifecycle = {
+      state: 'ended',
+      reason: 'user_end',
+      operationId: 'resident-preview-ended',
+      endedAt: '2026-08-07T12:00:05.000Z',
+    }
+    host.connection = 'online'
+    host.connectionPath = 'Local socket'
+    host.latencyMs = 2
+    delete host.lastSynchronized
+    snapshot.agents = []
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+    }
+    snapshot.runtime.queue = { pendingCount: 0, paused: false }
+    snapshot.operations = {
+      ...snapshot.operations,
+      submitCommands: false,
+      startResidentTurn: false,
+      stopResidentTurn: false,
+      provisionResident: true,
+      endResident: false,
+    }
+    snapshot.residentLifecycleOperations = []
+    snapshot.composerReceipt = { state: 'idle', message: 'Session ended' }
     return snapshot
   }
 

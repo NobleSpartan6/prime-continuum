@@ -118,8 +118,10 @@ describe('renderer style contracts', () => {
     expect(css).toMatch(/\.runtime-oauth-feedback\s*{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*align-items:\s*center;/s)
     expect(css).toMatch(/\.message__receipt summary\s*{[^}]*min-block-size:\s*2rem;[^}]*cursor:\s*pointer;/s)
     expect(css).toMatch(/\.composer-wrap\s*{[^}]*container-name:\s*composer;[^}]*container-type:\s*inline-size;/s)
-    expect(compactComposer).toMatch(/\.task-starters\s*{[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*scroll-snap-type:\s*inline proximity;/s)
-    expect(compactComposer).toMatch(/\.task-starters__item\s*{[^}]*flex:\s*0 0 10\.75rem;[^}]*scroll-snap-align:\s*start;/s)
+    expect(compactComposer).toMatch(/\.task-starters\s*{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[^}]*overflow:\s*hidden;/s)
+    expect(compactComposer).toMatch(/\.task-starters__item\s*{[^}]*min-inline-size:\s*0;[^}]*justify-content:\s*center;/s)
+    expect(compactComposer).not.toMatch(/overflow-x:\s*auto|scroll-snap-type|scroll-snap-align/)
+    expect(css).toMatch(/@media \(max-width:\s*24\.375rem\)\s*{[\s\S]*?\.task-starters__item\s*{[^}]*min-block-size:\s*2\.75rem;/s)
     expect(css).toMatch(/\.task-starters__item > span\s*{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/s)
   })
 

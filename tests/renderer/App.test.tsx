@@ -1692,15 +1692,15 @@ describe('Prime Continuim renderer', () => {
     }
     render(<App api={api} />)
 
-    await screen.findByRole('heading', { name: 'No transcript recorded' })
+    await screen.findByRole('heading', { name: 'Session ended' })
     expect(screen.queryByRole('form', { name: 'Resident session ending' })).not.toBeInTheDocument()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
     const transcript = screen.getByRole('region', { name: 'Thread transcript' })
-    expect(within(transcript).getByRole('heading', { name: 'No transcript recorded' })).toBeVisible()
-    expect(within(transcript).getByText('This session has ended. Its workspace files are still available.')).toBeVisible()
+    expect(within(transcript).getByRole('heading', { name: 'Session ended' })).toBeVisible()
+    expect(within(transcript).getByText('No transcript was recorded. Your workspace and files remain available.')).toBeVisible()
     expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
 
-    await user.click(within(transcript).getByRole('button', { name: 'New agent' }))
+    await user.click(within(transcript).getByRole('button', { name: 'Start another task' }))
     expect(api.selectResidentWorkspace).toHaveBeenCalledWith({
       kind: 'registered_workspace',
       projectId: 'project-prime',
@@ -1739,8 +1739,8 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     const transcript = await screen.findByRole('region', { name: 'Thread transcript' })
-    expect(within(transcript).getByRole('heading', { name: 'No transcript recorded' })).toBeVisible()
-    expect(within(transcript).queryByRole('button', { name: 'New agent' })).not.toBeInTheDocument()
+    expect(within(transcript).getByRole('heading', { name: 'Session ended' })).toBeVisible()
+    expect(within(transcript).queryByRole('button', { name: 'Start another task' })).not.toBeInTheDocument()
     expect(within(transcript).getAllByRole('button')).toHaveLength(1)
     expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
 
@@ -3875,6 +3875,7 @@ describe('Prime Continuim renderer', () => {
     })).toBeVisible()
     expect(document.querySelector('.agent-launchpad__capabilities')).not.toBeInTheDocument()
     expect(document.querySelector('.task-starters')).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Session status' })).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: /Investigate an issue.*Reproduce and resolve root cause/ }))
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
@@ -3887,6 +3888,29 @@ describe('Prime Continuim renderer', () => {
     await user.click(setupModel)
     expect(await screen.findByRole('dialog', { name: 'Models & accounts' })).toBeVisible()
     expect(api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('keeps warning continuity visible when an empty launchpad session needs recovery', async () => {
+    const api = asNativeFixture(createIdleResidentApi())
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = vi.fn(async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread || !snapshot.runtime.session) throw new Error('Expected the selected resident fixture')
+      thread.transcript = []
+      thread.workspaceId = 'workspace-launchpad-recovery'
+      thread.executionGenerationId = 'generation-launchpad-recovery'
+      snapshot.runtime.residentControlReadiness = 'unavailable'
+      snapshot.operations.endResident = true
+      return snapshot
+    })
+
+    render(<App api={api} />)
+
+    expect(await screen.findByRole('heading', { name: 'Session unavailable' })).toBeVisible()
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByText('Session unavailable')).toBeVisible()
+    expect(within(continuity).getByText('End this inactive session to start a new agent. Your task and files stay.')).toBeVisible()
   })
 
   it('opens model setup from the composer instead of submitting without a selected model', async () => {

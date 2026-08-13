@@ -8366,51 +8366,37 @@ body[data-surface="hud"] {
 
 @media (max-width: 48rem) and (min-height: 28.01rem) {
   .task-starters {
-    display: flex;
-    overflow-x: auto;
-    overscroll-behavior-inline: contain;
-    scroll-snap-type: inline proximity;
-    scrollbar-width: none;
-  }
-
-  .task-starters::-webkit-scrollbar {
-    display: none;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
   }
 
   .task-starters__item {
-    flex: 0 0 10.75rem;
+    min-inline-size: 0;
     justify-content: center;
-    scroll-snap-align: start;
   }
 
   .task-starters__item + .task-starters__item {
     border-block-start: 0;
-    border-inline-start: 1px solid var(--color-border);
+    border-inline-start: 0;
   }
 }
 
 @container composer (max-width: 44rem) {
   .task-starters {
-    display: flex;
-    overflow-x: auto;
-    overscroll-behavior-inline: contain;
-    scroll-snap-type: inline proximity;
-    scrollbar-width: none;
-  }
-
-  .task-starters::-webkit-scrollbar {
-    display: none;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
   }
 
   .task-starters__item {
-    flex: 0 0 10.75rem;
+    min-inline-size: 0;
     justify-content: center;
-    scroll-snap-align: start;
   }
 
   .task-starters__item + .task-starters__item {
     border-block-start: 0;
-    border-inline-start: 1px solid var(--color-border);
+    border-inline-start: 0;
   }
 }
 
@@ -9714,6 +9700,14 @@ dialog.sheet::backdrop {
 
   .agent-launchpad__tasks {
     gap: 0;
+  }
+}
+
+@media (max-width: 24.375rem) {
+  .task-starters__item {
+    min-block-size: 2.75rem;
+    padding-inline: 0.4rem;
+    font-size: 0.6875rem;
   }
 }
 

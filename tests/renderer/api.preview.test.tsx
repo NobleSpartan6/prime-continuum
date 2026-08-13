@@ -169,6 +169,15 @@ describe('browser preview evidence labels', () => {
         canStart: false,
         canStop: false,
       },
+      {
+        visualState: 'ended-empty' as const,
+        threadState: 'complete',
+        receiptState: 'idle',
+        operation: undefined,
+        message: 'Session ended',
+        canStart: false,
+        canStop: false,
+      },
     ]
 
     for (const expected of cases) {
@@ -194,6 +203,11 @@ describe('browser preview evidence labels', () => {
       if (expected.visualState === 'idle') expect(snapshot.agents).toEqual([])
       if (expected.visualState === 'rlm-activity') {
         expect(snapshot.agents.some((agent) => agent.status === 'running' || agent.status === 'waiting')).toBe(true)
+      }
+      if (expected.visualState === 'ended-empty') {
+        expect(thread?.transcript).toEqual([])
+        expect(thread?.residentLifecycle?.state).toBe('ended')
+        expect(snapshot.operations.provisionResident).toBe(true)
       }
       if (expected.visualState === 'prime-oauth') {
         expect(snapshot.operations.modelCatalog).toBe(true)

@@ -10,6 +10,7 @@ import {
   createWindowsElectronBuilderArguments,
   createWindowsPackagingBuilderPlan,
   createWindowsPackagingEnvironment,
+  REVIEWED_ELECTRON_BUILDER_VERSION,
   WINDOWS_PACKAGING_DENIED_ENVIRONMENT_KEYS,
 } from '../../scripts/windows-packaging-policy.mjs'
 
@@ -30,6 +31,7 @@ describe('unsigned Windows development packaging policy', () => {
       win: { signAndEditExecutable: false },
     })
     expect(packageJson.build).not.toHaveProperty('publish')
+    expect(packageJson.devDependencies['electron-builder']).toBe(REVIEWED_ELECTRON_BUILDER_VERSION)
     expect(Object.keys(packageJson.build.nsis).sort()).toEqual([
       'createDesktopShortcut',
       'createStartMenuShortcut',
@@ -121,6 +123,7 @@ describe('unsigned Windows development packaging policy', () => {
       'SIGNTOOL_PATH',
       'WINDOWS_KITS_PATH',
       'ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL',
+      'ELECTRON_BUILDER_BINARIES_ALLOW_HTTP',
       'ELECTRON_BUILDER_BINARIES_MIRROR',
       'ELECTRON_BUILDER_BINARIES_CUSTOM_DIR',
       'NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR',
@@ -172,6 +175,11 @@ describe('unsigned Windows development packaging policy', () => {
   })
 
   it.each([
+    {
+      name: 'an unreviewed Electron Builder version',
+      mutate: (packageJson: any) => { packageJson.devDependencies['electron-builder'] = '26.8.1' },
+      message: `devDependencies.electron-builder must remain ${REVIEWED_ELECTRON_BUILDER_VERSION}`,
+    },
     {
       name: 'a parent configuration that can inject nsis.include',
       mutate: (packageJson: any) => { packageJson.build.extends = './unreviewed-electron-builder-parent.mjs' },

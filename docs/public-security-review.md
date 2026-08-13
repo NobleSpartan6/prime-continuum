@@ -40,7 +40,7 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 - The renderer CSP at `src/renderer/index.html:5-8` blocks non-local scripts, objects, and base-URL changes. `src/main/window-security.ts:4-16` enables context isolation and sandboxing while disabling Node integration and webviews.
 - Renderer storage contains only bounded layout preferences and an opaque device identifier; provider credentials are not stored in Web Storage.
 - Common local environment, private-key, certificate, OAuth, Playwright, and generated design-concept files are ignored by `.gitignore:15-31`.
-- The GitHub workflow uses frozen dependencies, pinned action commits, read-only contents permission, typechecking, tests, and a source build on Linux, Windows, and macOS.
+- The GitHub source workflow uses frozen dependencies, pinned action commits, read-only contents permission, typechecking, tests, and a source build on Linux, Windows, and macOS. A separately pinned CodeQL workflow analyzes JavaScript and TypeScript on pull requests, `main`, and a weekly schedule.
 - Copied development skills now have an attribution index and the Apache 2.0 text required by the Playwright CLI skill.
 - GitHub reports the repository as public, with private vulnerability reporting, Dependabot security updates, secret scanning, and push protection enabled.
 - The protected `main` branch requires pull requests, up-to-date Linux, Windows, and macOS source gates, linear history, and resolved review conversations; force-pushes and branch deletion are disabled.
@@ -55,8 +55,8 @@ This is a source review, not a guarantee about Git history, packaged dependency 
 ## Verification performed
 
 - High-signal current-tree scans for private-key headers, common provider-token prefixes, credential-bearing URLs, credential-shaped filenames, and developer-specific home paths found no publishable secret. Matching values in tests were synthetic redaction fixtures.
-- GitHub's repository-history secret scanner and Dependabot API each reported zero open alerts.
-- The installed dependency inventory contained 633 unique name/version entries and no package without a declared license. This is inventory evidence, not legal approval or a final-artifact license scan.
+- GitHub's repository-history secret scanner and Dependabot API each reported zero open alerts. The checked-in CodeQL workflow is source evidence only until its first GitHub run reports a result.
+- The reviewed installed dependency inventory contained no package without a declared license. After the Electron Builder 26.15.3 pin, both the full and production registry-advisory audits reported no known vulnerabilities. This is point-in-time inventory evidence, not legal approval, a security guarantee, or a final-artifact scan.
 - Local Markdown targets in the public repository documents resolved successfully.
 - Every GitHub YAML file parsed successfully.
 - `corepack pnpm typecheck` passed.

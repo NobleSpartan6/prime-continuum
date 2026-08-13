@@ -2,6 +2,7 @@ import { lstat, readdir } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 
 const WINDOWS_ARTIFACT_TEMPLATE = 'Prime-Continuim-${version}-windows-${arch}-setup.${ext}'
+export const REVIEWED_ELECTRON_BUILDER_VERSION = '26.15.3'
 const REVIEWED_BUILD_KEYS = [
   'appId',
   'afterPack',
@@ -88,6 +89,7 @@ export const WINDOWS_PACKAGING_DENIED_ENVIRONMENT_KEYS = Object.freeze([
   'CUSTOM_APP_BUILDER_PATH',
   'DO_KEY_ID',
   'DO_SECRET_KEY',
+  'ELECTRON_BUILDER_BINARIES_ALLOW_HTTP',
   'ELECTRON_BUILDER_BINARIES_CUSTOM_DIR',
   'ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL',
   'ELECTRON_BUILDER_BINARIES_MIRROR',
@@ -190,6 +192,11 @@ export function createWindowsPackagingEnvironment(source = process.env) {
 
 export function assertWindowsInstallerConfiguration(projectPackage, { projectRoot }) {
   assertObject(projectPackage, 'package.json')
+  assertObject(projectPackage.devDependencies, 'package.json devDependencies')
+  invariant(
+    projectPackage.devDependencies['electron-builder'] === REVIEWED_ELECTRON_BUILDER_VERSION,
+    `devDependencies.electron-builder must remain ${REVIEWED_ELECTRON_BUILDER_VERSION}.`,
+  )
   const build = projectPackage.build
   assertObject(build, 'package.json build')
 
