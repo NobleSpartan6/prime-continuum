@@ -80,6 +80,7 @@ const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
 const RUNTIME_PROVIDER_SETUP_CAPABILITY = "runtime_provider_setup_handoff_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
 const EXPECTED_BASE_CAPABILITIES = Object.freeze([
+  "hostd_graceful_retire_v1",
   "resident_control_projection_v1",
   RESIDENT_LIFECYCLE_CAPABILITY,
   "runtime_integrity_v1",
@@ -115,7 +116,8 @@ const residentEndpoint = residentDaemonEndpoint(dataDirectory, residentDaemonSoc
 
 const attestationBytes = await readFile(ATTESTATION_PATH);
 const attestation = parseRuntimeAttestation(attestationBytes);
-const embeddedBytes = extractEmbeddedRuntimeAttestation(await readFile(HOSTD_PATH));
+const hostdBytes = await readFile(HOSTD_PATH);
+const embeddedBytes = extractEmbeddedRuntimeAttestation(hostdBytes);
 if (!embeddedBytes.equals(attestationBytes)) {
   throw new Error("Release hostd does not embed the exact generated runtime attestation bytes");
 }
@@ -1168,6 +1170,7 @@ function assertReadyRuntimeHealth(health, expectCommandCapability) {
     throw new Error("Ready runtime trust identity differs from the embedded attestation");
   }
   if (!Array.isArray(health.capabilities)) throw new Error("Ready health capabilities are invalid");
+  assertTrustedLocalRetirementIdentity(health);
   const hasCommands = health.capabilities.includes(RESIDENT_COMMAND_CAPABILITY);
   if (hasCommands !== expectCommandCapability) {
     throw new Error("Ready health resident command capability differs from exact binding state");
@@ -1196,6 +1199,21 @@ function assertReadyRuntimeHealth(health, expectCommandCapability) {
     throw new Error(`Ready health capabilities changed: ${health.capabilities.join(", ")}`);
   }
   assertPathFree(health, "ready health");
+}
+
+function assertTrustedLocalRetirementIdentity(health) {
+  const identity = health.hostdBuildIdentity;
+  const expected = {
+    contractVersion: 1,
+    bundleSha256: createHash("sha256").update(hostdBytes).digest("hex"),
+    runtimeTrustAnchorId: createHash("sha256").update(attestationBytes).digest("hex"),
+  };
+  if (
+    !health.capabilities.includes("hostd_graceful_retire_v1") ||
+    JSON.stringify(identity) !== JSON.stringify(expected)
+  ) {
+    throw new Error("Trusted-local retirement capability lacks the exact release hostd identity");
+  }
 }
 
 function assertSameRuntimeIdentity(leftHealth, rightHealth) {

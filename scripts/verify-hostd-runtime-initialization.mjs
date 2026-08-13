@@ -25,6 +25,7 @@ const OPTIONAL_CAPABILITIES_DEADLINE_MS = 60_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const BASE_HEALTH_CAPABILITIES = Object.freeze([
+  "hostd_graceful_retire_v1",
   "resident_control_projection_v1",
   "runtime_integrity_v1",
   "runtime_oauth_attempt_v1",
@@ -74,7 +75,8 @@ const endpoint = localEndpoint(dataDirectory);
 await writeFile(hostdWrapperPath, hostdSmokeWrapperSource(), { encoding: "utf8", mode: 0o600, flag: "wx" });
 const attestationBytes = await readFile(ATTESTATION_PATH);
 const attestation = parseRuntimeAttestation(attestationBytes);
-const embeddedBytes = extractEmbeddedRuntimeAttestation(await readFile(HOSTD_PATH));
+const hostdBytes = await readFile(HOSTD_PATH);
+const embeddedBytes = extractEmbeddedRuntimeAttestation(hostdBytes);
 if (!embeddedBytes.equals(attestationBytes)) {
   throw new Error("Release hostd does not embed the exact generated runtime attestation bytes");
 }
@@ -344,6 +346,7 @@ function assertRuntimeHealth(health, expectedStatus, requireWarmedCapabilities =
   if (!Array.isArray(health.capabilities) || health.capabilities.some((capability) => typeof capability !== "string")) {
     throw new Error("Runtime health capabilities are invalid");
   }
+  assertTrustedLocalRetirementIdentity(health);
   const expectedCapabilities = expectedStatus === "ready"
     ? [
         ...BASE_HEALTH_CAPABILITIES,
@@ -383,6 +386,21 @@ function assertRuntimeHealth(health, expectedStatus, requireWarmedCapabilities =
     if (serialized.toLowerCase().includes(forbidden.toLowerCase())) {
       throw new Error("Runtime health exposed a filesystem path");
     }
+  }
+}
+
+function assertTrustedLocalRetirementIdentity(health) {
+  const identity = health.hostdBuildIdentity;
+  const expected = {
+    contractVersion: 1,
+    bundleSha256: createHash("sha256").update(hostdBytes).digest("hex"),
+    runtimeTrustAnchorId: createHash("sha256").update(attestationBytes).digest("hex"),
+  };
+  if (
+    !health.capabilities.includes("hostd_graceful_retire_v1") ||
+    JSON.stringify(identity) !== JSON.stringify(expected)
+  ) {
+    throw new Error("Trusted-local retirement capability lacks the exact release hostd identity");
   }
 }
 
