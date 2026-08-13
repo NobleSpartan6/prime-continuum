@@ -1672,20 +1672,21 @@ describe('Prime Continuim renderer', () => {
         sourceCursor: completed.sourceCursor,
         endedAt: completed.lastStatus!.terminalAt!,
       }
+      thread.transcript = []
       snapshot.operations.provisionResident = true
       return snapshot
     }
     render(<App api={api} />)
 
-    await waitFor(() => {
-      const terminalStatus = screen.getByRole('region', { name: 'Session status' })
-      expect(terminalStatus.querySelector('.session-continuity__label')).toHaveTextContent('Session ended')
-      expect(within(terminalStatus).getByText(/task, transcript, and workspace files remain available/i)).toBeVisible()
-    })
+    await screen.findByRole('heading', { name: 'No transcript recorded' })
     expect(screen.queryByRole('form', { name: 'Resident session ending' })).not.toBeInTheDocument()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
+    const transcript = screen.getByRole('region', { name: 'Thread transcript' })
+    expect(within(transcript).getByRole('heading', { name: 'No transcript recorded' })).toBeVisible()
+    expect(within(transcript).getByText('This session has ended. Its workspace files are still available.')).toBeVisible()
+    expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
 
-    await user.click(await screen.findByRole('button', { name: 'New agent' }))
+    await user.click(within(transcript).getByRole('button', { name: 'New agent' }))
     expect(api.selectResidentWorkspace).toHaveBeenCalledWith({
       kind: 'registered_workspace',
       projectId: 'project-prime',
@@ -1694,6 +1695,43 @@ describe('Prime Continuim renderer', () => {
       referenceExecutionGenerationId: 'generation-end-one',
     })
     expect(await screen.findByRole('dialog', { name: 'Start another task' })).toBeVisible()
+  })
+
+  it('offers one session action when an ended empty thread cannot start another agent', async () => {
+    const user = userEvent.setup()
+    const completed = {
+      ...residentEndOperation('terminal'),
+      lastStatus: residentEndStatus('completed'),
+    }
+    const api = createResidentEndApi(completed)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident end fixture')
+      thread.residentLifecycle = {
+        version: 1,
+        state: 'ended',
+        reason: 'user_end',
+        operationId: completed.operationId,
+        bindingFingerprint: 'a'.repeat(64),
+        sourceCursor: completed.sourceCursor,
+        endedAt: completed.lastStatus!.terminalAt!,
+      }
+      thread.transcript = []
+      snapshot.operations.provisionResident = undefined
+      return snapshot
+    }
+    render(<App api={api} />)
+
+    const transcript = await screen.findByRole('region', { name: 'Thread transcript' })
+    expect(within(transcript).getByRole('heading', { name: 'No transcript recorded' })).toBeVisible()
+    expect(within(transcript).queryByRole('button', { name: 'New agent' })).not.toBeInTheDocument()
+    expect(within(transcript).getAllByRole('button')).toHaveLength(1)
+    expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
+
+    await user.click(within(transcript).getByRole('button', { name: 'View session' }))
+    expect(await screen.findByRole('heading', { name: 'Agent session' })).toBeVisible()
   })
 
   it('hides a stale End recovery notice after the exact thread is authoritatively ended', async () => {

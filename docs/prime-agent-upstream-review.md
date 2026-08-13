@@ -44,11 +44,12 @@ Reviewed on 2026-08-13.
   inventory contains 910,397 bytes. Its canonical `path<TAB>git-blob<TAB>size`
   manifest SHA-256 is
   `c62df36a34c00d53371bca9d22e20f212dd54ac4a4b75d036d574e04db61ae89`.
-- Upstream `main` documentation changes since `v0.7.2`: nine files. Seven add
-  the forward-looking `max` thinking level to AI/model/provider/extension/RPC/
-  SDK/settings documentation; two changelogs describe fullscreen terminal link
-  handling. These changes are not part of the stable `v0.7.2` contract and do
-  not change Continuim's current runtime pin.
+- Upstream `main` documentation changes since `v0.7.2`: nine files. Seven align
+  AI/model/provider/extension/RPC/SDK/settings documentation with the `max`
+  thinking level already present in the `v0.7.2` implementation; two
+  changelogs describe fullscreen terminal link handling. These documentation
+  changes do not require a runtime-pin update. Continuim must still read the
+  exact session-reported available levels instead of hard-coding them.
 - Upstream `main` is eight commits ahead of `v0.7.2`. Two source changes landed
   after the prior review without changing the nine-document delta:
   `5e268e28` adds unreleased context-aware host request contracts, and

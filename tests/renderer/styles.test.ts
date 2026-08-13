@@ -33,6 +33,14 @@ describe('renderer style contracts', () => {
     expect(css).toMatch(/\.agent-launchpad__task\s*{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*border-radius:\s*var\(--radius-md\);/s)
   })
 
+  it('keeps the ended empty state borderless and singular', async () => {
+    const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
+
+    expect(css).toMatch(/\.ended-thread-empty\s*{[^}]*inline-size:\s*min\(100%, 30rem\);[^}]*background:\s*transparent;[^}]*border:\s*0;/s)
+    expect(css).not.toMatch(/\.ended-thread-empty::(?:before|after)/)
+    expect(css).not.toMatch(/\.ended-thread-empty\s*{[^}]*box-shadow:/s)
+  })
+
   it('restores text-field focus outlines in Windows forced-colors mode', async () => {
     const css = await readFile(resolve('src/renderer/src/styles.css'), 'utf8')
     const forcedColors = css.slice(css.indexOf('@media (forced-colors: active)'))
