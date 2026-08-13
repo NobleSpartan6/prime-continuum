@@ -81,10 +81,12 @@ describe('control IPC trusted-window fan-out', () => {
     const startRuntimeOAuth = vi.fn(async () => ({ sessionId: 'oauth-1' }))
     const runtimeOAuthStatus = vi.fn(async () => ({ sessionId: 'oauth-1' }))
     const cancelRuntimeOAuth = vi.fn(async () => ({ sessionId: 'oauth-1' }))
+    const openRuntimeProviderSetup = vi.fn(async () => ({ state: 'opened' }))
     const service = Object.assign(new EventEmitter(), {
       startRuntimeOAuth,
       runtimeOAuthStatus,
       cancelRuntimeOAuth,
+      openRuntimeProviderSetup,
     }) as unknown as DesktopControlService
     const workbenchEvent = {} as IpcMainInvokeEvent
     const hudEvent = {} as IpcMainInvokeEvent
@@ -99,6 +101,7 @@ describe('control IPC trusted-window fan-out', () => {
       [IPC.startRuntimeOAuth, { expectedHostId: 'host-a', providerId: 'openai-codex' }, startRuntimeOAuth],
       [IPC.runtimeOAuthStatus, { expectedHostId: 'host-a', sessionId: 'oauth-1' }, runtimeOAuthStatus],
       [IPC.cancelRuntimeOAuth, { expectedHostId: 'host-a', sessionId: 'oauth-1' }, cancelRuntimeOAuth],
+      [IPC.openRuntimeProviderSetup, { expectedHostId: 'host-a', providerId: 'anthropic' }, openRuntimeProviderSetup],
     ] as const
 
     for (const [channel, input, operation] of cases) {

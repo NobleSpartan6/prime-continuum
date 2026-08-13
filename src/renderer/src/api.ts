@@ -26,6 +26,7 @@ import {
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY,
   THREAD_HANDOFF_CAPABILITY,
 } from '../../shared/capabilities'
 import {
@@ -350,6 +351,8 @@ export interface WorkbenchSnapshot {
     selectResidentThinkingLevel?: boolean
     /** Eligibility only; native OAuth revalidates the exact trusted local host connection. */
     runtimeOAuth?: boolean
+    /** Eligibility only; the native action revalidates the exact trusted local runtime. */
+    runtimeProviderSetup?: boolean
     /** Capability-derived probe availability only; never an action authorization. */
     candidateEvaluationProbe?: boolean
   }
@@ -610,6 +613,16 @@ export type RuntimeOAuthResult =
   | { state: 'failed'; message: string; retryable: boolean }
   | { state: 'uncertain'; message: string; retryable: false }
 
+export interface RuntimeProviderSetupRequest {
+  hostId: string
+  providerId: string
+}
+
+export type RuntimeProviderSetupResult =
+  | { state: 'opened'; message: string; retryable: false }
+  | { state: 'failed_before_launch'; message: string; retryable: true }
+  | { state: 'indeterminate'; message: string; retryable: false }
+
 export interface RendererApi {
   environment: 'native' | 'preview'
   loadWorkbench(): Promise<WorkbenchSnapshot>
@@ -639,6 +652,9 @@ export interface RendererApi {
     onProgress: (progress: RuntimeOAuthProgress) => void,
   ): Promise<RuntimeOAuthResult>
   cancelRuntimeOAuth?(request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null>
+  openRuntimeProviderSetup?(
+    request: RuntimeProviderSetupRequest,
+  ): Promise<RuntimeProviderSetupResult>
   preselectResidentWorkspace(): Promise<ResidentWorkspacePreselection>
   completeResidentWorkspacePreselection(preselectionToken: string): Promise<ResidentWorkspaceSelection>
   cancelResidentWorkspacePreselection(preselectionToken: string): Promise<void>
@@ -2745,6 +2761,15 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     advertisedCapabilities.includes(RUNTIME_OAUTH_ATTEMPT_CAPABILITY) &&
     advertisedCapabilities.includes(RUNTIME_OAUTH_CAPABILITY),
   )
+  const runtimeProviderSetupReady = Boolean(
+    input.mutationAuthorityReady !== false &&
+    activeAccountHostReady &&
+    activePhase === 'online' &&
+    asString(activeTarget?.kind) === 'local' &&
+    asString(rawConnection?.path) === 'local_socket' &&
+    advertisedCapabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY) &&
+    advertisedCapabilities.includes(RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY),
+  )
   return {
     selectedProjectId,
     selectedThreadId,
@@ -2780,6 +2805,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
         : {}),
       ...(thinkingLevelSelectionReady ? { selectResidentThinkingLevel: true } : {}),
       ...(runtimeOAuthReady ? { runtimeOAuth: true } : {}),
+      ...(runtimeProviderSetupReady ? { runtimeProviderSetup: true } : {}),
       ...(selectedHostHasAuthority &&
       selectedSnapshotIsMaterialized &&
       activePhase === 'online' &&
@@ -4495,6 +4521,61 @@ export class NativeRendererApi implements RendererApi {
     }
     const { RuntimeModelCatalogSnapshotSchema } = await loadProtocolSchemas()
     return RuntimeModelCatalogSnapshotSchema.parse(raw)
+  }
+
+  async openRuntimeProviderSetup(
+    request: RuntimeProviderSetupRequest,
+  ): Promise<RuntimeProviderSetupResult> {
+    const generation = this.connectionGeneration
+    const connection = asRecord(this.connection)
+    const target = asRecord(connection?.target)
+    const capabilities = Array.isArray(connection?.capabilities)
+      ? connection.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : []
+    if (
+      asString(connection?.hostId) !== request.hostId ||
+      asString(connection?.phase) !== 'online' ||
+      asString(connection?.path) !== 'local_socket' ||
+      asString(target?.kind) !== 'local' ||
+      !capabilities.includes(RUNTIME_MODEL_CATALOG_CAPABILITY) ||
+      !capabilities.includes(RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY)
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    const raw = await this.call<unknown>('openRuntimeProviderSetup', {
+      expectedHostId: request.hostId,
+      providerId: request.providerId,
+    })
+    const { RuntimeProviderSetupResultSchema } = await loadProtocolSchemas()
+    const result = RuntimeProviderSetupResultSchema.parse(raw)
+    if (
+      generation !== this.connectionGeneration ||
+      asString(asRecord(this.connection)?.hostId) !== request.hostId ||
+      result.expectedHostId !== request.hostId ||
+      result.providerId !== request.providerId
+    ) {
+      throw new StaleHostAuthorityError()
+    }
+    switch (result.state) {
+      case 'opened':
+        return {
+          state: 'opened',
+          message: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+          retryable: false,
+        }
+      case 'failed_before_launch':
+        return {
+          state: 'failed_before_launch',
+          message: 'Prime Agent could not be opened. No window was launched.',
+          retryable: true,
+        }
+      case 'indeterminate':
+        return {
+          state: 'indeterminate',
+          message: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+          retryable: false,
+        }
+    }
   }
 
   startRuntimeOAuth(

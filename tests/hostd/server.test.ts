@@ -2,6 +2,7 @@ import { bootstrapTestWorkspace } from "./test-workspace-fixture";
 import { access, mkdir, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AtomicWriteAmbiguousCommitError } from "../../src/hostd/atomic-files";
 import { encodeJsonFrame, LengthPrefixedJsonDecoder } from "../../src/shared/frame-codec";
@@ -10,10 +11,11 @@ import { createHostOwnershipLease, type HostOwnershipLease } from "../../src/hos
 import { defaultLocalEndpoint } from "../../src/hostd/paths";
 import {
   acquireUnixEndpointOwnership,
+  runFramedSession,
   serveLocalSocket,
   unixEndpointOwnershipLockPath,
 } from "../../src/hostd/server";
-import { HostService } from "../../src/hostd/service";
+import { HostService, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
 import { canonicalTemporaryDirectory } from "../helpers/canonical-temp";
 
@@ -24,6 +26,77 @@ afterEach(async () => {
 });
 
 describe("hostd local transport", () => {
+  it("flushes an accepted retirement response before cooperative endpoint shutdown", async () => {
+    const directory = await canonicalTemporaryDirectory("prime-hostd-retire-server-test-");
+    temporaryDirectories.push(directory);
+    const store = new HostStore(directory);
+    const identity = {
+      contractVersion: 1 as const,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    };
+    const service = new HostService(store, undefined, undefined, { hostdBuildIdentity: identity });
+    await service.initialize();
+    const host = await store.getHost();
+    const endpoint = defaultLocalEndpoint(directory);
+    const server = await serveLocalSocket({ endpoint, dataDir: directory, service });
+
+    const response = await request(endpoint, {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-host-request",
+      method: "host.retire",
+      payload: { expectedHostId: host.hostId, expectedBuildIdentity: identity },
+    });
+    expect(response).toMatchObject({
+      ok: true,
+      method: "host.retire",
+      result: { state: "accepted", expectedHostId: host.hostId },
+    });
+    await expect(server.closed).resolves.toBeUndefined();
+    if (process.platform !== "win32") {
+      await expect(access(endpoint)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("continues accepted retirement when the peer drops during response write", async () => {
+    const directory = await canonicalTemporaryDirectory("prime-hostd-retire-drop-test-");
+    temporaryDirectories.push(directory);
+    const store = new HostStore(directory);
+    const identity = {
+      contractVersion: 1 as const,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    };
+    const service = new HostService(store, undefined, undefined, { hostdBuildIdentity: identity });
+    await service.initialize();
+    const host = await store.getHost();
+    const readable = new PassThrough();
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("simulated peer drop"));
+      },
+    });
+    writable.on("error", () => undefined);
+    const beginRetirement = vi.fn();
+    readable.end(encodeJsonFrame({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-dropped-response",
+      method: "host.retire",
+      payload: { expectedHostId: host.hostId, expectedBuildIdentity: identity },
+    }));
+
+    await runFramedSession(
+      service,
+      readable,
+      writable,
+      TRUSTED_USER_SESSION,
+      undefined,
+      beginRetirement,
+    );
+    expect(beginRetirement).toHaveBeenCalledOnce();
+    await service.close();
+  });
+
   it("serves the same framed protocol over a named pipe or Unix socket", async () => {
     const directory = await canonicalTemporaryDirectory("prime-hostd-server-test-");
     temporaryDirectories.push(directory);

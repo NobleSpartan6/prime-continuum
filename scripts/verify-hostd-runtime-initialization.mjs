@@ -33,9 +33,11 @@ const BASE_HEALTH_CAPABILITIES = Object.freeze([
 const MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
 const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
+const RUNTIME_PROVIDER_SETUP_CAPABILITY = "runtime_provider_setup_handoff_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
 const WARMED_CAPABILITIES = Object.freeze([
   ...(process.platform === "win32" ? [CANDIDATE_EVALUATION_CAPABILITY] : []),
+  ...(process.platform === "darwin" ? [RUNTIME_PROVIDER_SETUP_CAPABILITY] : []),
   MODEL_CATALOG_CAPABILITY,
   RESIDENT_LIFECYCLE_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,

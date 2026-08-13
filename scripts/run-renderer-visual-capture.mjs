@@ -30,6 +30,12 @@ const expectedTargets = [
   ['reasoning-control-dialog-short-320', 320, 256, 'model-selection', undefined],
   ['prime-oauth-dialog-390', 390, 844, 'prime-oauth', undefined],
   ['prime-oauth-dialog-short-320', 320, 256, 'prime-oauth', undefined],
+  ['provider-handoff-unopened-390', 390, 844, 'provider-handoff-unopened', undefined],
+  ['provider-handoff-unopened-short-320', 320, 256, 'provider-handoff-unopened', undefined],
+  ['provider-handoff-opened-390', 390, 844, 'provider-handoff-opened', undefined],
+  ['provider-handoff-opened-short-320', 320, 256, 'provider-handoff-opened', undefined],
+  ['provider-handoff-indeterminate-390', 390, 844, 'provider-handoff-indeterminate', undefined],
+  ['provider-handoff-indeterminate-short-320', 320, 256, 'provider-handoff-indeterminate', undefined],
   ['desktop-prompt-admission', 1200, 800, 'prompt-admission', undefined],
   ['desktop-prompt-proof-390', 390, 844, 'prompt-awaiting-idle-proof', undefined],
   ['desktop-stop-proof-390', 390, 844, 'stop-awaiting-idle-proof', undefined],
@@ -114,7 +120,7 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     result.visualState !== visualState ||
     result.surface !== surface ||
     result.stateEvidence?.expectedTextPresent !== true ||
-    (['desktop-prompt-admission', 'desktop-prompt-proof-390', 'desktop-stop-proof-390', 'desktop-uncertain-320'].includes(name) && result.stateEvidence?.composerStatusVisible !== true) ||
+    (['desktop-prompt-admission', 'desktop-prompt-proof-390', 'desktop-stop-proof-390', 'desktop-uncertain-320'].includes(name) && result.stateEvidence?.taskStatusVisible !== true) ||
     (name === 'desktop-end-pending-390' && result.stateEvidence?.composerStatusVisible !== false) ||
     ((name === 'desktop-extension-question' || name === 'mobile-extension-question-390') && (
       result.stateEvidence?.extensionQuestionVisible !== true ||
@@ -159,13 +165,26 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     )) ||
     ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||
     (name === 'candidate-evaluation-dialog-short-320' && result.stateEvidence?.candidateEvaluationDialogContentReachable !== true) ||
-    ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-')) && (
+    ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-') || name.startsWith('provider-handoff-')) && (
       result.stateEvidence?.modelsDialogOpen !== true ||
       result.stateEvidence?.modelSelectionActionEnabled !== true ||
-      result.stateEvidence?.modelSelectionActionVisible !== true ||
-      result.stateEvidence?.modelSelectionUnchanged !== true
+      result.stateEvidence?.modelSelectionActionVisible !== true
     )) ||
-    ((name === 'model-selection-dialog-short-320' || name === 'prime-oauth-dialog-short-320') && (
+    ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-')) &&
+      result.stateEvidence?.modelSelectionUnchanged !== true) ||
+    (name.startsWith('provider-handoff-') && (
+      result.stateEvidence?.providerSetupLayoutEvidenceOnly !== true ||
+      !String(result.evidenceBoundary ?? '').startsWith('Internal renderer preview: layout only;') ||
+      (name.startsWith('provider-handoff-unopened-')
+        ? result.stateEvidence?.providerSetupActionText !== 'Open Prime Agent' ||
+          result.stateEvidence?.providerSetupRepeatSuppressed !== false ||
+          Boolean(result.stateEvidence?.providerSetupFeedbackText)
+        : result.stateEvidence?.providerSetupActionText !== 'Check account' ||
+          result.stateEvidence?.providerSetupActionPrimary !== true ||
+          result.stateEvidence?.providerSetupRepeatSuppressed !== true ||
+          result.stateEvidence?.providerSetupFeedbackRole !== 'status')
+    )) ||
+    ((name === 'model-selection-dialog-short-320' || name === 'prime-oauth-dialog-short-320' || name.endsWith('-short-320') && name.startsWith('provider-handoff-')) && (
       result.stateEvidence?.modelCatalogScrollable !== true ||
       result.stateEvidence?.modelsDialogScrollTop !== 0 ||
       result.stateEvidence?.modelsSurfaceScrollTop !== 0

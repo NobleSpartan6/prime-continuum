@@ -32,6 +32,8 @@ import type {
   RuntimeOAuthProgress,
   RuntimeOAuthRequest,
   RuntimeOAuthResult,
+  RuntimeProviderSetupRequest,
+  RuntimeProviderSetupResult,
   TranscriptBlock,
   WorkbenchSnapshot,
 } from './api'
@@ -376,6 +378,9 @@ export type PreviewVisualState =
   | 'launchpad'
   | 'model-selection'
   | 'prime-oauth'
+  | 'provider-handoff-unopened'
+  | 'provider-handoff-opened'
+  | 'provider-handoff-indeterminate'
   | 'prompt-admission'
   | 'prompt-awaiting-idle-proof'
   | 'stop-awaiting-idle-proof'
@@ -398,6 +403,9 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'launchpad',
   'model-selection',
   'prime-oauth',
+  'provider-handoff-unopened',
+  'provider-handoff-opened',
+  'provider-handoff-indeterminate',
   'prompt-admission',
   'prompt-awaiting-idle-proof',
   'stop-awaiting-idle-proof',
@@ -424,15 +432,16 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
   const snapshot = structuredClone(previewSnapshot)
   if (visualState === 'reconnecting') return snapshot
 
-  if (visualState === 'prime-oauth') {
+  if (visualState === 'prime-oauth' || isProviderHandoffVisualState(visualState)) {
     const thread = snapshot.threads.find((candidate) => candidate.id === 'thread-protocol')
     const host = snapshot.hosts.find((candidate) => candidate.id === 'host-local')
     if (!thread || !host || !snapshot.runtime.session) return snapshot
+    const fixtureId = visualState === 'prime-oauth' ? 'prime-oauth' : visualState
     snapshot.selectedProjectId = thread.projectId
     snapshot.selectedThreadId = thread.id
-    thread.remoteId = 'thread-prime-oauth-preview'
-    thread.workspaceId = 'workspace-prime-oauth-preview'
-    thread.executionGenerationId = 'execution-prime-oauth-preview'
+    thread.remoteId = `thread-${fixtureId}-preview`
+    thread.workspaceId = `workspace-${fixtureId}-preview`
+    thread.executionGenerationId = `execution-${fixtureId}-preview`
     thread.status = 'idle'
     host.kind = 'local'
     host.connection = 'online'
@@ -442,8 +451,8 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     snapshot.attention = []
     snapshot.runtime.session = {
       ...snapshot.runtime.session,
-      activeSessionId: 'session-prime-oauth-preview',
-      sessionId: 'session-prime-oauth-preview',
+      activeSessionId: `session-${fixtureId}-preview`,
+      sessionId: `session-${fixtureId}-preview`,
       sessionName: thread.title,
       isStreaming: false,
       isBashRunning: false,
@@ -456,7 +465,7 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
       stopResidentTurn: false,
       crossHostHandoff: false,
       modelCatalog: true,
-      runtimeOAuth: true,
+      ...(visualState === 'prime-oauth' ? { runtimeOAuth: true } : { runtimeProviderSetup: true }),
     }
     snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     return snapshot
@@ -870,6 +879,14 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
   return snapshot
 }
 
+function isProviderHandoffVisualState(
+  visualState: PreviewVisualState,
+): visualState is 'provider-handoff-unopened' | 'provider-handoff-opened' | 'provider-handoff-indeterminate' {
+  return visualState === 'provider-handoff-unopened' ||
+    visualState === 'provider-handoff-opened' ||
+    visualState === 'provider-handoff-indeterminate'
+}
+
 const discoveredComputers: DiscoveredComputer[] = [
   {
     alias: 'devbox',
@@ -1056,6 +1073,7 @@ class BrowserPreviewApi implements RendererApi {
     this.environment = visualState === 'candidate-evaluation-review' ||
       visualState === 'model-selection' ||
       visualState === 'prime-oauth' ||
+      isProviderHandoffVisualState(visualState) ||
       visualState === 'ssh-registered-workspace'
       ? 'native'
       : 'preview'
@@ -1139,14 +1157,12 @@ class BrowserPreviewApi implements RendererApi {
     await delay(180)
     const catalog = structuredClone(previewRuntimeModelCatalog)
     if (this.visualState === 'prime-oauth') {
-      const provider = catalog.providers.find((candidate) => candidate.providerId === 'openai-codex')
-      if (provider) {
+      for (const provider of catalog.providers) {
         provider.configured = false
         provider.availableModelCount = 0
         delete provider.authSource
       }
       for (const model of catalog.models) {
-        if (model.providerId !== 'openai-codex') continue
         model.available = false
         model.usingOAuth = false
       }
@@ -1173,6 +1189,31 @@ class BrowserPreviewApi implements RendererApi {
 
   async cancelRuntimeOAuth(_request: RuntimeOAuthRequest): Promise<RuntimeOAuthResult | null> {
     throw new Error('Prime Agent sign-in is available only in the native desktop app.')
+  }
+
+  async openRuntimeProviderSetup(
+    request: RuntimeProviderSetupRequest,
+  ): Promise<RuntimeProviderSetupResult> {
+    if (
+      !isProviderHandoffVisualState(this.visualState) ||
+      request.hostId !== 'host-local' ||
+      request.providerId !== 'anthropic'
+    ) {
+      throw new Error('Provider setup handoff is available only for its exact internal visual-QA authority.')
+    }
+    await delay(120)
+    if (this.visualState === 'provider-handoff-indeterminate') {
+      return {
+        state: 'indeterminate',
+        message: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+        retryable: false,
+      }
+    }
+    return {
+      state: 'opened',
+      message: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+      retryable: false,
+    }
   }
 
   async preselectResidentWorkspace(): Promise<ResidentWorkspacePreselection> {

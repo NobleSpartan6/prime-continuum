@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { ZodError } from "zod";
 import {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  HOSTD_GRACEFUL_RETIRE_CAPABILITY,
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
@@ -20,13 +22,16 @@ import {
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY,
   ThreadProjectionSnapshotSchema,
   ThreadSummarySchema,
   type HostIpcRequest,
   type HostIpcResponse,
+  type HostdBuildIdentity,
   type HostIdentityReadiness,
   type RemoteDeviceScope,
   type RuntimeIntegritySnapshot,
+  type RuntimeProviderSetupResult,
   type StructuredError,
 } from "../shared/protocol";
 import {
@@ -69,6 +74,7 @@ import {
   type ResidentPromptIdleObservedEvent,
 } from "./store";
 import type { RuntimeModelCatalogProvider } from "./runtime-model-catalog";
+import type { RuntimeProviderSetupHandoff } from "./runtime-provider-setup";
 import {
   ResidentProvisionCoordinatorError,
   residentProvisionRequestDigest,
@@ -90,9 +96,11 @@ const HANDOFF_COORDINATOR_WARNING = {
 
 const KNOWN_METHODS = new Set([
   "health.get",
+  "host.retire",
   "runtime.integrity.retry",
   "runtime.integrity.repair",
   "runtime.model_catalog",
+  "runtime.provider_setup.open",
   "oauth.session.start",
   "oauth.session.status",
   "oauth.session.cancel",
@@ -140,10 +148,12 @@ export const SSH_BRIDGE_SESSION: HostSessionContext = Object.freeze({
 
 const DEFAULT_IDENTITY_LOAD_TIMEOUT_MS = 5_000;
 export interface HostServiceOptions {
+  hostdBuildIdentity?: HostdBuildIdentity;
   hostIdentityProvider?: HostIdentityKeyProvider;
   identityLoadTimeoutMs?: number;
   runtimeIntegrityProvider?: RuntimeIntegrityReadinessProvider;
   runtimeModelCatalogProvider?: RuntimeModelCatalogProvider;
+  runtimeProviderSetupHandoff?: RuntimeProviderSetupHandoff;
   runtimeOAuthComposition?: HostOAuthComposition;
   runtimeOAuthAttemptStore?: OAuthAttemptStore;
   candidateEvaluationCoordinator?: CandidateEvaluationCoordinator;
@@ -180,8 +190,10 @@ export class HostService {
   readonly hostIdentityProvider: HostIdentityKeyProvider;
   private closePromise: Promise<void> | undefined;
   private readonly identityLoadTimeoutMs: number;
+  private readonly hostdBuildIdentity: HostdBuildIdentity | undefined;
   private readonly runtimeIntegrityProvider: RuntimeIntegrityReadinessProvider | undefined;
   private readonly runtimeModelCatalogProvider: RuntimeModelCatalogProvider | undefined;
+  private readonly runtimeProviderSetupHandoff: RuntimeProviderSetupHandoff | undefined;
   private readonly runtimeOAuthComposition: HostOAuthComposition | undefined;
   private readonly runtimeOAuthAttemptStore: OAuthAttemptStore | undefined;
   private readonly candidateEvaluationCoordinator: CandidateEvaluationCoordinator | undefined;
@@ -195,6 +207,9 @@ export class HostService {
   private oauthSessionBroker: HostOAuthSessionBroker | undefined;
   private oauthInitializationPromise: Promise<void> | undefined;
   private runtimeOAuthAttemptAdmissionTail: Promise<void> = Promise.resolve();
+  private runtimeProviderSetupActive: Promise<RuntimeProviderSetupResult> | undefined;
+  private activeRequestCount = 0;
+  private retirementAdmissionClosed = false;
   private oauthAttemptStoreReady = false;
   private closing = false;
   private hostIdentityProviderUsed = false;
@@ -212,8 +227,10 @@ export class HostService {
     this.pairingAuthority = pairingAuthority;
     this.hostIdentityProvider = options.hostIdentityProvider ?? new UnavailableHostIdentityKeyProvider();
     this.identityLoadTimeoutMs = options.identityLoadTimeoutMs ?? DEFAULT_IDENTITY_LOAD_TIMEOUT_MS;
+    this.hostdBuildIdentity = options.hostdBuildIdentity;
     this.runtimeIntegrityProvider = options.runtimeIntegrityProvider;
     this.runtimeModelCatalogProvider = options.runtimeModelCatalogProvider;
+    this.runtimeProviderSetupHandoff = options.runtimeProviderSetupHandoff;
     this.runtimeOAuthComposition = options.runtimeOAuthComposition;
     this.runtimeOAuthAttemptStore = options.runtimeOAuthAttemptStore;
     this.candidateEvaluationCoordinator = options.candidateEvaluationCoordinator;
@@ -268,6 +285,26 @@ export class HostService {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     this.closePromise = (async () => {
+      // A local Terminal handoff can still own a freshly verified runtime
+      // handle and a bounded launch observer. Abort and positively drain both
+      // before the integrity coordinator releases that exact authority.
+      const providerSetupClose = Promise.resolve().then(
+        () => this.runtimeProviderSetupHandoff?.close?.(),
+      );
+      const providerSetupActive = this.runtimeProviderSetupActive;
+      const providerSetupResults = await Promise.allSettled([
+        providerSetupClose,
+        ...(providerSetupActive ? [providerSetupActive] : []),
+      ]);
+      const providerSetupFailures = providerSetupResults.flatMap(
+        (result) => result.status === "rejected" ? [result.reason] : [],
+      );
+      if (providerSetupFailures.length > 0) {
+        throw new AggregateError(
+          providerSetupFailures,
+          "Prime Agent account setup did not retire before host shutdown",
+        );
+      }
       // Optional OAuth custody verification warms in parallel with core host
       // startup. Join that bounded work before closing its composition so a
       // late completion can never publish a broker after shutdown begins.
@@ -409,11 +446,19 @@ export class HostService {
     if (!parsed.success) return invalidRequestResponse(value, parsed.error);
     const request = parsed.data;
 
+    this.activeRequestCount += 1;
     try {
       if (!context) {
         throw new HostStoreError(
           "SESSION_CONTEXT_REQUIRED",
           "Every host protocol request must identify its authenticated transport context.",
+        );
+      }
+      if (this.retirementAdmissionClosed) {
+        throw new HostStoreError(
+          "HOST_RETIRE_IN_PROGRESS",
+          "The host service is finishing a verified local retirement.",
+          true,
         );
       }
       const result = await this.authorizeAndDispatch(request, context);
@@ -432,10 +477,18 @@ export class HostService {
         ok: false,
         error: toStructuredError(error),
       });
+    } finally {
+      this.activeRequestCount -= 1;
     }
   }
 
   private async authorizeAndDispatch(request: HostIpcRequest, context: HostSessionContext): Promise<unknown> {
+    if (request.method === "host.retire" && context.transport !== "trusted_user") {
+      throw new PairingAuthorityError(
+        "REMOTE_HOST_RETIRE_FORBIDDEN",
+        "Host service retirement is available only to the trusted local desktop",
+      );
+    }
     if (
       (request.method === "runtime.integrity.retry" || request.method === "runtime.integrity.repair") &&
       context.transport !== "trusted_user"
@@ -465,6 +518,12 @@ export class HostService {
       throw new PairingAuthorityError(
         "REMOTE_CANDIDATE_EVALUATION_FORBIDDEN",
         "Candidate evaluation is available only to the trusted local desktop",
+      );
+    }
+    if (request.method === "runtime.provider_setup.open" && context.transport !== "trusted_user") {
+      throw new PairingAuthorityError(
+        "REMOTE_PROVIDER_SETUP_FORBIDDEN",
+        "Provider account setup can be opened only by the trusted local desktop",
       );
     }
     if (context.transport === "trusted_user") return this.dispatch(request, context);
@@ -577,6 +636,20 @@ export class HostService {
         const modelCatalogCapabilities = modelCatalogReady
           ? [RUNTIME_MODEL_CATALOG_CAPABILITY]
           : [];
+        let runtimeProviderSetupReady = context.transport === "trusted_user" &&
+          modelCatalogReady &&
+          Boolean(this.runtimeProviderSetupHandoff) &&
+          runtimeIntegrity?.status === "ready";
+        if (runtimeProviderSetupReady) {
+          try {
+            runtimeProviderSetupReady = await this.runtimeProviderSetupHandoff!.capabilityReady();
+          } catch {
+            runtimeProviderSetupReady = false;
+          }
+        }
+        const runtimeProviderSetupCapabilities = runtimeProviderSetupReady
+          ? [RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY]
+          : [];
         let oauthAttemptSurfaceReady = context.transport === "trusted_user" &&
           this.oauthAttemptStoreReady &&
           this.oauthSessionBroker !== undefined;
@@ -628,9 +701,13 @@ export class HostService {
           this.candidateEvaluationCoordinator?.capabilityReady()
           ? [CANDIDATE_EVALUATION_PROBE_CAPABILITY]
           : [];
+        const hostRetirementCapabilities = context.transport === "trusted_user" && this.hostdBuildIdentity
+          ? [HOSTD_GRACEFUL_RETIRE_CAPABILITY]
+          : [];
         return {
           protocolVersion: PROTOCOL_VERSION,
           hostdVersion: HOSTD_VERSION,
+          ...(this.hostdBuildIdentity ? { hostdBuildIdentity: this.hostdBuildIdentity } : {}),
           startedAt: this.startedAt,
           checkedAt: new Date().toISOString(),
           serviceState: runtimeIntegrity === undefined ? "ready" : serviceStateForRuntimeIntegrity(runtimeIntegrity),
@@ -643,11 +720,13 @@ export class HostService {
                 ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
+                ...runtimeProviderSetupCapabilities,
                 ...oauthCapabilities,
                 ...oauthAttemptCapabilities,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
                 ...candidateEvaluationCapabilities,
+                ...hostRetirementCapabilities,
               ]
             : [
                 ...HOST_CAPABILITIES,
@@ -656,15 +735,57 @@ export class HostService {
                 ...extensionUiCapabilities,
                 ...residentLifecycleCapabilities,
                 ...modelCatalogCapabilities,
+                ...runtimeProviderSetupCapabilities,
                 ...oauthCapabilities,
                 ...oauthAttemptCapabilities,
                 RUNTIME_INTEGRITY_CAPABILITY,
                 ...runtimeIntegrityRetryCapabilities,
                 ...runtimeIntegrityRepairCapabilities,
                 ...candidateEvaluationCapabilities,
+                ...hostRetirementCapabilities,
               ],
           pairingIdentity: this.pairingIdentity,
           ...(runtimeIntegrity === undefined ? {} : { runtimeIntegrity }),
+        };
+      }
+      case "host.retire": {
+        const host = await this.store.getHost();
+        if (request.payload.expectedHostId !== host.hostId) {
+          throw new HostStoreError(
+            "HOST_RETIRE_AUTHORITY_MISMATCH",
+            "Host retirement was requested for a different host authority.",
+          );
+        }
+        if (
+          !this.hostdBuildIdentity ||
+          !isDeepStrictEqual(request.payload.expectedBuildIdentity, this.hostdBuildIdentity)
+        ) {
+          throw new HostStoreError(
+            "HOST_RETIRE_IDENTITY_MISMATCH",
+            "Host retirement requires the exact build identity reported by this service.",
+          );
+        }
+        if (this.activeRequestCount !== 1) {
+          throw new HostStoreError(
+            "HOST_RETIRE_BUSY",
+            "Host retirement is blocked while another host request is still active.",
+            true,
+          );
+        }
+        // Close admission synchronously before the durable quiescence proof.
+        // The framed server writes this request's response before shutdown.
+        this.retirementAdmissionClosed = true;
+        try {
+          await this.store.assertHostRetirementQuiescent();
+        } catch (error) {
+          this.retirementAdmissionClosed = false;
+          throw error;
+        }
+        return {
+          retirementVersion: 1,
+          state: "accepted",
+          expectedHostId: host.hostId,
+          hostdBuildIdentity: this.hostdBuildIdentity,
         };
       }
       case "runtime.integrity.retry": {
@@ -776,6 +897,77 @@ export class HostService {
         // Concurrent reads still share the provider's single active refresh.
         this.runtimeModelCatalogProvider.invalidate?.();
         return this.runtimeModelCatalogProvider.read();
+      }
+      case "runtime.provider_setup.open": {
+        if (this.runtimeProviderSetupActive) {
+          throw new HostStoreError(
+            "RUNTIME_PROVIDER_SETUP_BUSY",
+            "Prime Agent account setup is already being opened.",
+            true,
+          );
+        }
+        const operation = (async (): Promise<RuntimeProviderSetupResult> => {
+          const host = await this.store.getHost();
+          if (request.payload.expectedHostId !== host.hostId) {
+            throw new HostStoreError(
+              "HOST_AUTHORITY_MISMATCH",
+              "Provider setup was requested from a different host authority.",
+            );
+          }
+          const runtimeIntegrity = this.runtimeIntegrityProvider?.snapshot();
+          if (
+            !this.runtimeProviderSetupHandoff ||
+            !this.runtimeModelCatalogProvider ||
+            runtimeIntegrity?.status !== "ready" ||
+            !(await this.runtimeProviderSetupHandoff.capabilityReady())
+          ) {
+            throw new HostStoreError(
+              "RUNTIME_PROVIDER_SETUP_UNAVAILABLE",
+              "Prime Agent account setup is not available on this host.",
+            );
+          }
+
+          // Re-read the verified runtime catalog immediately before the local
+          // handoff. The provider identifier is used only for admission and
+          // result correlation; it is never interpolated into a command.
+          this.runtimeModelCatalogProvider.invalidate?.();
+          const catalog = await this.runtimeModelCatalogProvider.read();
+          const provider = catalog.providers.find(
+            (candidate) => candidate.providerId === request.payload.providerId,
+          );
+          if (!provider) {
+            throw new HostStoreError(
+              "RUNTIME_PROVIDER_UNKNOWN",
+              "Prime Agent did not report that provider in the current verified catalog.",
+            );
+          }
+          if (provider.providerId === "openai-codex") {
+            throw new HostStoreError(
+              "RUNTIME_PROVIDER_SETUP_NATIVE_OAUTH_REQUIRED",
+              "Use Continuim's native ChatGPT connection flow for this provider.",
+            );
+          }
+          if (provider.configured) {
+            throw new HostStoreError(
+              "RUNTIME_PROVIDER_ALREADY_CONFIGURED",
+              "This provider is already configured in Prime Agent.",
+            );
+          }
+
+          return await this.runtimeProviderSetupHandoff.open({
+            expectedHostId: host.hostId,
+            providerId: provider.providerId,
+            expectedReleaseVersion: catalog.releaseVersion,
+          });
+        })();
+        this.runtimeProviderSetupActive = operation;
+        try {
+          return await operation;
+        } finally {
+          if (this.runtimeProviderSetupActive === operation) {
+            this.runtimeProviderSetupActive = undefined;
+          }
+        }
       }
       case "oauth.session.start":
       case "oauth.session.status":
@@ -1626,6 +1818,8 @@ function scopeForRequest(request: HostIpcRequest): RemoteDeviceScope {
     case "oauth.attempt.status":
     case "oauth.attempt.cancel":
     case "oauth.attempt.acknowledge":
+    case "runtime.provider_setup.open":
+    case "host.retire":
       // Relay requests are rejected before scope evaluation. This branch keeps
       // the protocol switch exhaustive without granting remote account access.
       return "host.admin";

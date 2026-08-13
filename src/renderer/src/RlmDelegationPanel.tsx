@@ -220,6 +220,9 @@ export const RlmDelegationPanel = memo(function RlmDelegationPanel({
     agent.status === 'waiting'
   )).length
   const completedAgents = agents.filter((agent) => agent.status === 'complete').length
+  const agentsNeedingReview = agents.filter((agent) => (
+    agent.status === 'failed' || agent.status === 'cancelled'
+  )).length
   const visibleAgents = useMemo(
     () => parentFirstAgents(agents).slice(0, agentLimit),
     [agentLimit, agents],
@@ -241,6 +244,9 @@ export const RlmDelegationPanel = memo(function RlmDelegationPanel({
         <p className="rlm-map__summary" aria-label="RLM activity summary">
           <span><strong>{activeAgents}</strong> active</span>
           <span><strong>{completedAgents}</strong> complete</span>
+          {agentsNeedingReview > 0 ? (
+            <span className="rlm-map__summary-attention"><strong>{agentsNeedingReview}</strong> need review</span>
+          ) : null}
         </p>
       ) : null}
       <div className="rlm-map" aria-label="Recursive agent hierarchy">

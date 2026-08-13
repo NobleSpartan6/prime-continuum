@@ -45,7 +45,7 @@ export function assertNativeTargetDescriptor(target) {
 
 export function validateNativeObservation(value) {
   assertRecord(value, 'observation_invalid', 'Native observation')
-  const { renderer, bootstrap, selection, snapshot, outcome, children, visible } = value
+  const { renderer, bootstrap, liveRuntime, selection, snapshot, outcome, children, visible } = value
   assertRecord(renderer, 'renderer_invalid', 'Renderer evidence')
   if (
     renderer.protocol !== 'file:' ||
@@ -62,6 +62,40 @@ export function validateNativeObservation(value) {
   }
   requireText(bootstrap.appVersion, 128, 'bootstrap_app_version_invalid', 'Bootstrap app version')
   requireText(bootstrap.hostId, 512, 'bootstrap_host_invalid', 'Bootstrap host identity')
+
+  assertRecord(liveRuntime, 'live_runtime_invalid', 'Live runtime evidence')
+  if (
+    liveRuntime.connectionPath !== 'local_socket' ||
+    liveRuntime.readinessKind !== 'reported' ||
+    liveRuntime.readinessStatus !== 'ready'
+  ) {
+    fail('live_runtime_not_ready', 'The packaged desktop is not attached to a ready verified local runtime.')
+  }
+  assertRecord(liveRuntime.hostdBuildIdentity, 'live_hostd_identity_missing', 'Live hostd identity')
+  if (liveRuntime.hostdBuildIdentity.contractVersion !== 1) {
+    fail('live_hostd_identity_invalid', 'The live hostd identity contract is unsupported.')
+  }
+  requireSha(liveRuntime.hostdBuildIdentity.bundleSha256, 'live_hostd_digest_invalid', 'Live hostd bundle digest')
+  requireSha(liveRuntime.hostdBuildIdentity.runtimeTrustAnchorId, 'live_hostd_trust_invalid', 'Live hostd runtime trust anchor')
+  requireSha(liveRuntime.trustAnchorId, 'live_runtime_trust_invalid', 'Live runtime trust anchor')
+  if (liveRuntime.trustAnchorId !== liveRuntime.hostdBuildIdentity.runtimeTrustAnchorId) {
+    fail('live_runtime_trust_mismatch', 'The live hostd and runtime readiness report different trust anchors.')
+  }
+  assertRecord(liveRuntime.target, 'live_runtime_target_missing', 'Live runtime target')
+  if (liveRuntime.target.runtime !== 'prime-agent') {
+    fail('live_runtime_target_invalid', 'The live runtime target is not Prime Agent.')
+  }
+  for (const [key, label] of [
+    ['releaseVersion', 'release version'],
+    ['runtimeBuildId', 'build identity'],
+    ['platform', 'platform'],
+    ['arch', 'architecture'],
+  ]) requireText(liveRuntime.target[key], 128, `live_runtime_${key}_invalid`, `Live runtime ${label}`)
+  for (const [key, label] of [
+    ['manifestSha256', 'manifest'],
+    ['treeSha256', 'tree'],
+    ['filesSha256', 'file inventory'],
+  ]) requireSha(liveRuntime.target[key], `live_runtime_${key}_invalid`, `Live runtime ${label} digest`)
 
   assertRecord(selection, 'selection_invalid', 'Selected thread evidence')
   const heading = requireText(selection.heading, 255, 'selection_heading_missing', 'Selected thread heading')
@@ -116,6 +150,9 @@ export function validateNativeObservation(value) {
 
   return {
     appVersion: bootstrap.appVersion,
+    hostdBundleSha256: liveRuntime.hostdBuildIdentity.bundleSha256,
+    runtimeTrustAnchorId: liveRuntime.trustAnchorId,
+    runtimeTarget: { ...liveRuntime.target },
     threadId: snapshot.threadId,
     hostId: snapshot.hostId,
     executionGenerationId: snapshot.executionGenerationId,
@@ -153,7 +190,7 @@ export function createNativeLaunchProofEnvelope({
   if (typeof selfBuildReceipt.dirty !== 'boolean') fail('source_dirty_invalid', 'Source dirty state is invalid.')
 
   assertRecord(app, 'app_identity_invalid', 'App identity')
-  for (const key of ['appAsarSha256', 'mainTreeSha256', 'preloadTreeSha256', 'rendererTreeSha256']) {
+  for (const key of ['appAsarSha256', 'hostdBundleSha256', 'mainTreeSha256', 'preloadTreeSha256', 'rendererTreeSha256']) {
     requireSha(app[key], `app_${key}_invalid`, `App ${key}`)
   }
   requireText(app.productName, 128, 'app_product_invalid', 'App product name')
@@ -163,14 +200,26 @@ export function createNativeLaunchProofEnvelope({
 
   assertRecord(runtime, 'runtime_identity_invalid', 'Runtime identity')
   requireText(runtime.releaseVersion, 128, 'runtime_version_invalid', 'Runtime release version')
+  requireText(runtime.runtimeBuildId, 128, 'runtime_build_invalid', 'Runtime build identity')
   requireText(runtime.platform, 32, 'runtime_platform_invalid', 'Runtime platform')
   requireText(runtime.arch, 32, 'runtime_arch_invalid', 'Runtime architecture')
-  for (const key of ['pointerSha256', 'treeSha256', 'manifestSha256']) {
+  for (const key of ['pointerSha256', 'treeSha256', 'manifestSha256', 'filesSha256', 'trustAnchorId']) {
     requireSha(runtime[key], `runtime_${key}_invalid`, `Runtime ${key}`)
   }
 
   const verified = validateNativeObservation(observation)
   if (verified.appVersion !== app.version) fail('app_version_mismatch', 'The native renderer app version does not match the packaged app.')
+  if (verified.hostdBundleSha256 !== app.hostdBundleSha256) {
+    fail('live_hostd_package_mismatch', 'The live local service does not match the packaged hostd bundle.')
+  }
+  if (verified.runtimeTrustAnchorId !== runtime.trustAnchorId) {
+    fail('live_runtime_package_mismatch', 'The live runtime trust anchor does not match the packaged runtime attestation.')
+  }
+  for (const key of ['releaseVersion', 'runtimeBuildId', 'platform', 'arch', 'manifestSha256', 'treeSha256', 'filesSha256']) {
+    if (verified.runtimeTarget[key] !== runtime[key]) {
+      fail('live_runtime_package_mismatch', `The live runtime ${key} does not match the packaged runtime.`)
+    }
+  }
   if (runtime.platform !== app.platform || runtime.arch !== app.arch) {
     fail('runtime_app_target_mismatch', 'The packaged runtime target does not match the app target.')
   }
@@ -188,7 +237,7 @@ export function createNativeLaunchProofEnvelope({
   })
 
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: NATIVE_LAUNCH_PROOF_KIND,
     runId,
     capturedAt,
@@ -204,17 +253,21 @@ export function createNativeLaunchProofEnvelope({
       platform: app.platform,
       arch: app.arch,
       appAsarSha256: app.appAsarSha256,
+      hostdBundleSha256: app.hostdBundleSha256,
       mainTreeSha256: app.mainTreeSha256,
       preloadTreeSha256: app.preloadTreeSha256,
       rendererTreeSha256: app.rendererTreeSha256,
     },
     runtime: {
       releaseVersion: runtime.releaseVersion,
+      runtimeBuildId: runtime.runtimeBuildId,
       platform: runtime.platform,
       arch: runtime.arch,
       pointerSha256: runtime.pointerSha256,
       treeSha256: runtime.treeSha256,
       manifestSha256: runtime.manifestSha256,
+      filesSha256: runtime.filesSha256,
+      trustAnchorId: runtime.trustAnchorId,
     },
     authority: {
       source: 'live',
@@ -240,6 +293,7 @@ export function createNativeLaunchProofEnvelope({
       providerInvoked: false,
       oauthInvoked: false,
       hostSnapshotReadOnly: true,
+      liveHostIdentityVerified: true,
       uiPresentationChanged: true,
       sourceCommitAuthenticated: false,
       packageSignedOrNotarized: false,

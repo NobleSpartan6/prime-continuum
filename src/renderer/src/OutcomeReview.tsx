@@ -7,9 +7,10 @@ import {
   Clock3,
   type LucideIcon,
 } from 'lucide-react'
-import { memo, useId } from 'react'
+import { memo, useId, useState } from 'react'
 
 import type { AgentSummary, EvidenceSummary } from './api'
+import { TranscriptBody } from './TranscriptBody'
 
 export type OutcomeReviewState = 'working' | 'ready' | 'complete' | 'needs_review' | 'unknown'
 
@@ -40,6 +41,8 @@ const OUTCOME_STATE: Record<OutcomeReviewState, { icon: LucideIcon; label: strin
 }
 const NUMBER_FORMATTER = new Intl.NumberFormat()
 const COMPACT_NUMBER_FORMATTER = new Intl.NumberFormat(undefined, { notation: 'compact' })
+const RESULT_DISCLOSURE_CHARACTER_THRESHOLD = 420
+const RESULT_DISCLOSURE_LINE_THRESHOLD = 6
 
 function Icon({ icon: IconComponent, size = 15 }: { icon: LucideIcon; size?: number }) {
   return <IconComponent aria-hidden="true" focusable="false" size={size} strokeWidth={1.75} />
@@ -90,6 +93,24 @@ function compactDuration(seconds: number): string {
   return minuteRemainder > 0 ? `${hours}h ${minuteRemainder}m` : `${hours}h`
 }
 
+function resultNeedsDisclosure(result: string): boolean {
+  return (
+    result.length > RESULT_DISCLOSURE_CHARACTER_THRESHOLD ||
+    result.split('\n').length > RESULT_DISCLOSURE_LINE_THRESHOLD
+  )
+}
+
+function resultPreview(result: string): string {
+  const lineBounded = result
+    .split('\n')
+    .slice(0, RESULT_DISCLOSURE_LINE_THRESHOLD)
+    .join('\n')
+  const characterBounded = lineBounded.length > RESULT_DISCLOSURE_CHARACTER_THRESHOLD
+    ? lineBounded.slice(0, RESULT_DISCLOSURE_CHARACTER_THRESHOLD)
+    : lineBounded
+  return `${characterBounded.trimEnd()}\n\n…`
+}
+
 export const OutcomeReview = memo(function OutcomeReview({
   objective,
   result,
@@ -103,10 +124,13 @@ export const OutcomeReview = memo(function OutcomeReview({
   proofScope,
 }: OutcomeReviewProps) {
   const headingId = useId()
+  const [fullResultOpen, setFullResultOpen] = useState(false)
   const stateMeta = OUTCOME_STATE[state]
   const passedChecks = evidence?.filter((item) => item.status === 'passed').length
   const returnedBranches = childAgents?.filter((agent) => agent.status === 'complete').length
   const branchReturns = childAgents?.filter((agent) => agentResult(agent) !== undefined) ?? []
+  const writtenResult = result?.trim()
+  const resultIsLong = writtenResult ? resultNeedsDisclosure(writtenResult) : false
 
   return (
     <section className="outcome-review" aria-labelledby={headingId} data-outcome-state={state}>
@@ -121,9 +145,35 @@ export const OutcomeReview = memo(function OutcomeReview({
         </span>
       </header>
 
-      <p className={`outcome-review__result${result?.trim() ? '' : ' outcome-review__result--empty'}`}>
-        {result?.trim() || (state === 'working' ? 'Prime Agent is still working.' : 'No written result yet.')}
-      </p>
+      {writtenResult && (!resultIsLong || !fullResultOpen) ? (
+        <div className="outcome-review__result">
+          <TranscriptBody body={resultIsLong ? resultPreview(writtenResult) : writtenResult} kind="assistant" />
+        </div>
+      ) : !writtenResult ? (
+        <p className="outcome-review__result outcome-review__result--empty">
+          {state === 'working' ? 'Prime Agent is still working.' : 'No written result yet.'}
+        </p>
+      ) : null}
+      {writtenResult && resultIsLong ? (
+        <details
+          className="outcome-review__result-disclosure"
+          open={fullResultOpen}
+        >
+          <summary
+            onClick={(event) => {
+              event.preventDefault()
+              setFullResultOpen((open) => !open)
+            }}
+          >
+            {fullResultOpen ? 'Hide full result' : 'View full result'}
+          </summary>
+          {fullResultOpen ? (
+            <div className="outcome-review__result-full">
+              <TranscriptBody body={writtenResult} kind="assistant" />
+            </div>
+          ) : null}
+        </details>
+      ) : null}
 
       {proofScope === 'current_snapshot' ? (
         <p className="outcome-review__proof-scope">Current snapshot proof</p>

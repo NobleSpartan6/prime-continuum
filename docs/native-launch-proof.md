@@ -41,7 +41,8 @@ The command fails closed unless all of these checks pass:
 - exactly one DevTools page is the packaged `file:` renderer inside `app.asar`; preview URLs, preview user agents, HUD surfaces, and non-loopback debugger endpoints are rejected;
 - `app.asar` main, preload, and renderer trees match the supplied passing self-build receipt byte-for-byte;
 - the packaged runtime pointer matches the same receipt's exact release, platform, architecture, tree, manifest, and pointer digest;
-- native bootstrap reports the verified host online;
+- native bootstrap reports an online local-socket host whose exact hostd bundle digest matches the packaged hostd;
+- the live hostd runtime trust anchor and ready runtime target match the packaged attestation's exact release, build identity, platform, architecture, manifest, tree, and file inventory;
 - a read-only `requestSnapshot` succeeds for the cache-selected thread and exact latest cursor;
 - workbench heading, selected sidebar thread, live snapshot title, host, execution generation, and cursor agree;
 - the latest terminal assistant outcome belongs to that same latest cursor and references materialized assistant text;
@@ -55,7 +56,7 @@ Success publishes a new no-replace directory under `out/native-launch-proof/run-
 - `outcome.png` — native Review view with the visible final outcome;
 - `manifest.json` — canonical path-free correlation evidence.
 
-The manifest hashes private host, thread, generation, cursor, assistant text, and child identities rather than recording their raw values. It ties the images to the self-build source commit and candidate-tree digest, the exact packaged app archive and three UI/code trees, and the exact Prime Agent runtime seed. Capture filenames are relative; no local filesystem path is stored.
+The manifest hashes private host, thread, generation, cursor, assistant text, and child identities rather than recording their raw values. It ties the images to the self-build source commit and candidate-tree digest, the exact packaged app archive, hostd bundle, three UI/code trees, and the live and packaged Prime Agent runtime identity. Capture filenames are relative; no local filesystem path is stored.
 
 The screenshots themselves are full native-window images and may visibly contain workspace names, conversation text, or other operator content. Review them before sharing.
 

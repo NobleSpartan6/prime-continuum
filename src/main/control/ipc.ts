@@ -196,6 +196,13 @@ export function registerControlIpc(options: ControlIpcOptions): () => void {
     (input: { expectedHostId: string }) => service.runtimeModelCatalog(input.expectedHostId)
   )
   handle(
+    IPC.openRuntimeProviderSetup,
+    z.object({ expectedHostId: id, providerId: id }).strict(),
+    (input: { expectedHostId: string; providerId: string }) =>
+      service.openRuntimeProviderSetup(input.expectedHostId, input.providerId),
+    isTrustedWorkbenchSender,
+  )
+  handle(
     IPC.startRuntimeOAuth,
     z.object({ expectedHostId: id, providerId: id }).strict(),
     (input: { expectedHostId: string; providerId: string }) =>

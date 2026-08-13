@@ -12,6 +12,9 @@ export declare function assertNativeTargetDescriptor(target: unknown): {
 
 export declare function validateNativeObservation(value: unknown): {
   appVersion: string
+  hostdBundleSha256: string
+  runtimeTrustAnchorId: string
+  runtimeTarget: Record<string, string>
   threadId: string
   hostId: string
   executionGenerationId: string

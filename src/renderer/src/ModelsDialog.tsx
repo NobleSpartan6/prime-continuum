@@ -62,6 +62,7 @@ export interface ModelsDialogProps {
   canSelectResidentModel: boolean
   canSelectResidentThinkingLevel?: boolean
   canConnectRuntimeOAuth: boolean
+  canOpenRuntimeProviderSetup: boolean
   triggerRef: RefObject<HTMLElement | null>
   onClose: () => void
 }
@@ -98,8 +99,15 @@ type RuntimeOAuthView = {
 }
 
 type ProviderSetupFeedback = {
-  kind: 'status' | 'error'
+  kind: 'status' | 'success' | 'caution' | 'error'
   message: string
+}
+
+type ProviderSetupLaunchView = {
+  providerId: string
+  state: 'opening' | 'opened' | 'failed_before_launch' | 'indeterminate'
+  message: string
+  retryable: boolean
 }
 
 export default function ModelsDialog({
@@ -114,6 +122,7 @@ export default function ModelsDialog({
   canSelectResidentModel,
   canSelectResidentThinkingLevel = false,
   canConnectRuntimeOAuth,
+  canOpenRuntimeProviderSetup,
   onClose,
 }: ModelsDialogProps) {
   const [catalog, setCatalog] = useState<RuntimeModelCatalog | null>(null)
@@ -130,13 +139,17 @@ export default function ModelsDialog({
   const [loadAttempt, setLoadAttempt] = useState(0)
   const [providerLoginCopyState, setProviderLoginCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [providerSetupFeedback, setProviderSetupFeedback] = useState<ProviderSetupFeedback | null>(null)
+  const [providerSetupLaunch, setProviderSetupLaunch] = useState<ProviderSetupLaunchView | null>(null)
   const [refreshingProviderId, setRefreshingProviderId] = useState<string | null>(null)
   const providerNavRef = useRef<HTMLDivElement>(null)
   const contentRootRef = useRef<HTMLDivElement>(null)
   const completedSelectionActionRef = useRef<HTMLButtonElement>(null)
+  const providerAccountCheckRef = useRef<HTMLButtonElement>(null)
+  const providerRefreshFocusRef = useRef<string | null>(null)
   const selectionRequestRef = useRef(0)
   const thinkingSelectionRequestRef = useRef(0)
   const oauthRequestRef = useRef(0)
+  const providerSetupRequestRef = useRef(0)
   const providerRefreshRequestRef = useRef(0)
   const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
   const dialogOpenRef = useRef(open)
@@ -187,7 +200,9 @@ export default function ModelsDialog({
     setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
     setProviderLoginCopyState('idle')
     setProviderSetupFeedback(null)
+    setProviderSetupLaunch(null)
     setRefreshingProviderId(null)
+    providerSetupRequestRef.current += 1
     providerRefreshRequestRef.current += 1
     void api.loadRuntimeModelCatalog(host.id)
       .then((nextCatalog) => {
@@ -196,10 +211,8 @@ export default function ModelsDialog({
           const chatGptProvider = nextCatalog.providers.find((provider) =>
             provider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && provider.oauthSupported,
           )
-          // Sol setup should open on the one provider this desktop can connect
-          // safely even when an unrelated runtime provider is already ready.
           setSelectedProviderId(
-            chatGptProvider && !chatGptProvider.configured
+            chatGptProvider && shouldGuideChatGptSetup(nextCatalog)
               ? chatGptProvider.providerId
               : 'all',
           )
@@ -268,7 +281,7 @@ export default function ModelsDialog({
   const chatGptProvider = catalog?.providers.find((provider) =>
     provider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && provider.oauthSupported,
   )
-  const guidedFirstRun = Boolean(chatGptProvider && !chatGptProvider.configured)
+  const guidedFirstRun = Boolean(catalog && chatGptProvider && shouldGuideChatGptSetup(catalog))
   const providerCatalogExpanded = !guidedFirstRun || showAllProviders
   const visibleProviders = catalog
     ? providerCatalogExpanded
@@ -316,6 +329,7 @@ export default function ModelsDialog({
     if (activeElement && activeElement !== document.body && activeElement.isConnected) return
     completedSelectionActionRef.current?.focus()
   }, [selectionCompletedOnHost, thinkingSelectionCompletedOnHost])
+
   const selectionStatusMessage = !selection
     ? ''
     : selection.state === 'selecting'
@@ -363,6 +377,23 @@ export default function ModelsDialog({
     api.startRuntimeOAuth &&
     api.cancelRuntimeOAuth,
   )
+  const selectedProviderCanOpenSetup = Boolean(
+    selectedProvider &&
+    selectedProvider.providerId !== PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID &&
+    !selectedProvider.configured &&
+    host.kind === 'local' &&
+    canOpenRuntimeProviderSetup &&
+    api.openRuntimeProviderSetup,
+  )
+  const selectedProviderSetupLaunch = providerSetupLaunch?.providerId === selectedProvider?.providerId
+    ? providerSetupLaunch
+    : null
+  const providerSetupOpening = selectedProviderSetupLaunch?.state === 'opening'
+  const providerSetupOpened = selectedProviderSetupLaunch?.state === 'opened'
+  const providerSetupIndeterminate = selectedProviderSetupLaunch?.state === 'indeterminate'
+  const providerSetupCanRetry = Boolean(
+    selectedProviderSetupLaunch?.state === 'failed_before_launch' && selectedProviderSetupLaunch.retryable,
+  )
   const oauthStatusMessage = oauth && ['starting', 'awaiting_user', 'committing', 'cancelling', 'completed', 'cancelled'].includes(oauth.state)
     ? oauth.message
     : ''
@@ -371,11 +402,48 @@ export default function ModelsDialog({
     : oauth?.state === 'uncertain'
       ? `${oauth.message} Do not start another sign-in from this dialog. Close it and inspect the Prime Agent account on this computer first.`
       : ''
+  const providerSetupStatusMessage = providerSetupFeedback?.message
+    ?? (providerLoginCopyState === 'copied'
+      ? 'Setup steps copied.'
+      : providerLoginCopyState === 'error'
+        ? 'Unable to copy. Open Prime Agent and run /login.'
+        : selectedProviderSetupLaunch?.message ?? '')
+  const providerSetupStatusKind = providerSetupFeedback?.kind
+    ?? (providerLoginCopyState === 'copied'
+      ? 'success'
+      : providerLoginCopyState === 'error'
+        ? 'error'
+        : selectedProviderSetupLaunch?.state === 'indeterminate'
+          ? 'caution'
+          : selectedProviderSetupLaunch?.state === 'failed_before_launch'
+            ? 'error'
+            : selectedProviderSetupLaunch?.state === 'opened'
+              ? 'success'
+              : 'status')
+
+  useLayoutEffect(() => {
+    if (!providerSetupOpened && !providerSetupIndeterminate) return
+    providerAccountCheckRef.current?.focus()
+  }, [providerSetupIndeterminate, providerSetupOpened])
+
+  useLayoutEffect(() => {
+    const providerId = providerRefreshFocusRef.current
+    if (!providerId) return
+    providerRefreshFocusRef.current = null
+    const providerButton = Array.from(
+      providerNavRef.current?.querySelectorAll<HTMLButtonElement>('[data-provider-filter]') ?? [],
+    ).find((button) => button.dataset.providerId === providerId)
+    const fallbackModelAction = contentRootRef.current?.querySelector<HTMLButtonElement>('.model-row__select:not(:disabled)')
+    const focusTarget = providerButton ?? fallbackModelAction
+    focusTarget?.focus()
+  }, [catalog, selectedProviderId])
 
   const selectProvider = (providerId: string) => {
+    providerSetupRequestRef.current += 1
     setSelectedProviderId(providerId)
     setProviderLoginCopyState('idle')
     setProviderSetupFeedback(null)
+    setProviderSetupLaunch(null)
     setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
   }
 
@@ -385,7 +453,58 @@ export default function ModelsDialog({
       ? 'Open Prime Agent on this computer.'
       : `Open Prime Agent directly on ${host.name}.`
 
+  const openProviderSetup = async () => {
+    if (
+      !open ||
+      !selectedProvider ||
+      !selectedProviderCanOpenSetup ||
+      !api.openRuntimeProviderSetup ||
+      providerSetupOpening ||
+      providerSetupOpened ||
+      providerSetupIndeterminate
+    ) return
+    const providerId = selectedProvider.providerId
+    const providerName = selectedProvider.displayName
+    const requestId = providerSetupRequestRef.current + 1
+    const requestAuthorityKey = oauthAuthorityKey
+    providerSetupRequestRef.current = requestId
+    setProviderLoginCopyState('idle')
+    setProviderSetupFeedback(null)
+    setProviderSetupLaunch({
+      providerId,
+      state: 'opening',
+      message: 'Opening Prime Agent…',
+      retryable: false,
+    })
+    try {
+      const result = await api.openRuntimeProviderSetup({ hostId: host.id, providerId })
+      if (
+        !dialogOpenRef.current ||
+        providerSetupRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setProviderSetupLaunch({ providerId, ...result })
+    } catch (reason: unknown) {
+      if (
+        !dialogOpenRef.current ||
+        providerSetupRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
+      setProviderSetupLaunch({
+        providerId,
+        state: 'indeterminate',
+        message: isStaleHostAuthorityError(reason)
+          ? 'The active computer changed. Close this dialog and reopen Models & accounts.'
+          : `${providerName} setup may already be open. Check your windows first; Prime Continuim won’t repeat this request.`,
+        retryable: false,
+      })
+    }
+  }
+
   const copyProviderSetupSteps = async () => {
+    const requestId = providerSetupRequestRef.current
+    const requestAuthorityKey = oauthAuthorityKey
+    setProviderSetupFeedback(null)
     try {
       if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable')
       const providerName = selectedProvider?.displayName ?? 'the provider'
@@ -398,9 +517,18 @@ export default function ModelsDialog({
           '4. Return to Prime Continuim and select Check account.',
         ].join('\n'),
       )
+      if (
+        !dialogOpenRef.current ||
+        providerSetupRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
       setProviderLoginCopyState('copied')
-      setProviderSetupFeedback(null)
     } catch {
+      if (
+        !dialogOpenRef.current ||
+        providerSetupRequestRef.current !== requestId ||
+        oauthAuthorityRef.current !== requestAuthorityKey
+      ) return
       setProviderLoginCopyState('error')
     }
   }
@@ -425,6 +553,7 @@ export default function ModelsDialog({
       setCatalog(nextCatalog)
       const refreshedProvider = nextCatalog.providers.find((provider) => provider.providerId === providerId)
       if (!refreshedProvider) {
+        providerRefreshFocusRef.current = 'all'
         setSelectedProviderId('all')
         setProviderSetupFeedback({
           kind: 'error',
@@ -432,12 +561,13 @@ export default function ModelsDialog({
         })
         return
       }
+      if (refreshedProvider.configured) providerRefreshFocusRef.current = providerId
       setSelectedProviderId(providerId)
       setProviderSetupFeedback({
-        kind: 'status',
+        kind: refreshedProvider.configured ? 'success' : 'caution',
         message: refreshedProvider.configured
           ? `${providerName} is ready · ${refreshedProvider.availableModelCount} ${refreshedProvider.availableModelCount === 1 ? 'model' : 'models'} available.`
-          : `${providerName} is not configured in ${host.name}'s Continuim profile yet. Finish /login on that host, then check again.`,
+          : 'Not connected yet. Finish /login in Prime Agent, then check again.',
       })
     } catch (reason: unknown) {
       if (
@@ -449,9 +579,7 @@ export default function ModelsDialog({
         kind: 'error',
         message: isStaleHostAuthorityError(reason)
           ? 'The active computer changed. Close this dialog, confirm the computer, then reopen Models & accounts.'
-          : reason instanceof Error
-            ? reason.message
-            : `Unable to check ${providerName} on ${host.name}.`,
+          : `Unable to check the account. Make sure ${host.name} is online, then try again.`,
       })
     } finally {
       if (providerRefreshRequestRef.current === requestId) setRefreshingProviderId(null)
@@ -695,6 +823,7 @@ export default function ModelsDialog({
     selectionRequestRef.current += 1
     thinkingSelectionRequestRef.current += 1
     oauthRequestRef.current += 1
+    providerSetupRequestRef.current += 1
     const oauthRequest = activeOAuthRequestRef.current
     activeOAuthRequestRef.current = null
     if (oauthRequest && api.cancelRuntimeOAuth) void api.cancelRuntimeOAuth(oauthRequest)
@@ -867,17 +996,18 @@ export default function ModelsDialog({
 
               {selectedProvider && !selectedProvider.configured && (
                 <div
-                  className="provider-setup-note"
+                  className={cx('provider-setup-note', !selectedProviderCanConnect && 'provider-setup-note--handoff')}
                   aria-busy={
                     (oauthInProgress && oauth?.providerId === selectedProvider.providerId) ||
+                    providerSetupOpening ||
                     refreshingProviderId === selectedProvider.providerId
                       ? 'true'
                       : undefined
                   }
                 >
-                  <span><Icon icon={LockKeyhole} size={16} /></span>
+                  {selectedProviderCanConnect && <span><Icon icon={LockKeyhole} size={16} /></span>}
                   <div className="provider-setup-note__body">
-                    <strong>{selectedProviderCanConnect ? 'Connect ChatGPT' : 'Finish in Prime Agent'}</strong>
+                    <strong>{selectedProviderCanConnect ? 'Connect ChatGPT' : `Set up ${selectedProvider.displayName}`}</strong>
                     {selectedProviderCanConnect ? (
                       <>
                         <p>
@@ -904,22 +1034,37 @@ export default function ModelsDialog({
                     ) : (
                       <>
                         <p>
-                          Prime Agent {catalog.releaseVersion} keeps this setup interactive. Finish it on <bdi>{host.name}</bdi>; credentials stay there.
+                          {selectedProviderCanOpenSetup
+                            ? <>Open Prime Agent, run <code>/login</code>, and choose {selectedProvider.displayName}. Credentials stay with Prime Agent on <bdi>{host.name}</bdi>.</>
+                            : host.kind === 'ssh'
+                              ? <>Connect to <bdi>{host.name}</bdi>. In the Prime Agent profile used by Continuim, run <code>/login</code> and choose {selectedProvider.displayName}.</>
+                              : <>On <bdi>{host.name}</bdi>, open the Prime Agent profile used by Continuim. Run <code>/login</code> and choose {selectedProvider.displayName}.</>}
                         </p>
-                        <ol className="provider-setup-note__steps">
-                          <li>{providerSetupHostStep}</li>
-                          <li>In the Continuim host profile, run <code>/login</code> and choose {selectedProvider.displayName}.</li>
-                          <li>Follow the OAuth or API-key prompt, then check the account here.</li>
-                        </ol>
                         <div className="provider-setup-note__actions">
-                          <button className="button button--secondary" type="button" onClick={() => void copyProviderSetupSteps()}>
-                            <Icon icon={providerLoginCopyState === 'copied' ? CheckCircle2 : Copy} size={14} />
-                            {providerLoginCopyState === 'copied' ? 'Copied setup steps' : 'Copy setup steps'}
-                          </button>
+                          {selectedProviderCanOpenSetup &&
+                          !providerSetupOpened &&
+                          !providerSetupIndeterminate &&
+                          !(selectedProviderSetupLaunch?.state === 'failed_before_launch' && !selectedProviderSetupLaunch.retryable) ? (
+                            <button
+                              className="button button--primary"
+                              type="button"
+                              disabled={providerSetupOpening || refreshingProviderId !== null}
+                              onClick={() => void openProviderSetup()}
+                            >
+                              <Icon icon={providerSetupOpening ? Loader2 : Bot} size={14} />
+                              {providerSetupOpening ? 'Opening…' : providerSetupCanRetry ? 'Try again' : 'Open Prime Agent'}
+                            </button>
+                          ) : !selectedProviderCanOpenSetup || selectedProviderSetupLaunch?.state === 'failed_before_launch' ? (
+                            <button className="button button--secondary" type="button" onClick={() => void copyProviderSetupSteps()}>
+                              <Icon icon={providerLoginCopyState === 'copied' ? CheckCircle2 : Copy} size={14} />
+                              {providerLoginCopyState === 'copied' ? 'Copied setup steps' : 'Copy setup steps'}
+                            </button>
+                          ) : null}
                           <button
-                            className="button button--quiet"
+                            ref={providerAccountCheckRef}
+                            className={cx('button', providerSetupOpened || providerSetupIndeterminate ? 'button--primary' : 'button--quiet')}
                             type="button"
-                            disabled={refreshingProviderId !== null}
+                            disabled={refreshingProviderId !== null || providerSetupOpening}
                             onClick={() => void refreshProviderAccounts()}
                           >
                             <Icon icon={refreshingProviderId === selectedProvider.providerId ? Loader2 : RefreshCw} size={14} />
@@ -927,46 +1072,31 @@ export default function ModelsDialog({
                           </button>
                         </div>
                         <details className="provider-setup-note__storage">
-                          <summary>Use the Continuim host profile</summary>
+                          <summary>{selectedProviderCanOpenSetup ? 'How setup works' : 'Why this profile matters'}</summary>
                           <p>
-                            A normal Prime Agent terminal may use a different profile. Use the same <code>PRIME_AGENT_CODING_AGENT_DIR</code> as <code>prime-agent-hostd</code>, or this catalog will not see the account. This release cannot open that non-Codex login from the GUI.
+                            {selectedProviderCanOpenSetup
+                              ? 'Prime Continuim opens this host’s verified Prime Agent profile. It does not receive the OAuth URL, API key, or saved credential.'
+                              : 'Prime Continuim can only see accounts stored in the profile used by this host.'}
                           </p>
                         </details>
-                        <p
-                          className={cx('provider-setup-note__feedback', providerLoginCopyState !== 'error' && 'sr-only')}
-                          role="status"
-                          aria-live="polite"
-                          aria-atomic="true"
-                        >
-                          {providerLoginCopyState === 'copied'
-                            ? 'Copied provider setup steps.'
-                            : providerLoginCopyState === 'error'
-                              ? <>Copy unavailable. Enter <code>/login</code> in Prime Agent.</>
-                              : ''}
-                        </p>
                       </>
                     )}
                   </div>
                 </div>
               )}
 
-              <div className={cx('runtime-oauth-feedback', !providerSetupFeedback && 'runtime-oauth-feedback--empty')}>
-                <p
-                  className={cx(
-                    'runtime-oauth-feedback__message',
-                    providerSetupFeedback?.kind === 'error' && 'runtime-oauth-feedback__message--error',
-                    !providerSetupFeedback && 'sr-only',
-                  )}
-                  role={providerSetupFeedback?.kind === 'error' ? 'alert' : 'status'}
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {providerSetupFeedback && (
-                    <Icon icon={providerSetupFeedback.kind === 'error' ? AlertCircle : CheckCircle2} size={14} />
-                  )}
-                  {providerSetupFeedback?.message ?? ''}
-                </p>
-              </div>
+              <p
+                className={cx(
+                  'provider-setup-feedback',
+                  `provider-setup-feedback--${providerSetupStatusKind}`,
+                  !providerSetupStatusMessage && 'sr-only',
+                )}
+                role={providerSetupStatusKind === 'error' ? 'alert' : 'status'}
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {providerSetupStatusMessage}
+              </p>
 
               <div className={cx('runtime-oauth-feedback', !oauth && 'runtime-oauth-feedback--empty')} aria-busy={oauthInProgress ? 'true' : undefined}>
                 <p
@@ -1141,6 +1271,11 @@ function modelMatchesCurrent(providerId: string, modelId: string, modelName: str
     || normalizedCurrentModel === modelName.toLocaleLowerCase()
     || normalizedCurrentModel === `${providerId}/${modelId}`.toLocaleLowerCase()
     || normalizedCurrentModel === `${providerId}:${modelId}`.toLocaleLowerCase()
+}
+
+function shouldGuideChatGptSetup(catalog: RuntimeModelCatalog): boolean {
+  return !catalog.providers.some((provider) => provider.configured) &&
+    !catalog.models.some((model) => model.available)
 }
 
 function formatTokenCapacity(value: number): string {

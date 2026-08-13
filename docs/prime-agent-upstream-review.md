@@ -68,10 +68,15 @@ Reviewed on 2026-08-13.
   interactive TUI flow for both subscription OAuth and stored API keys. The RPC
   command set has no login method, and built-in TUI commands are not exposed by
   `get_commands` or executable through `prompt`. Continuim therefore keeps its
-  verified native OAuth action limited to `openai-codex`; every other provider
-  uses an explicit host handoff and an authoritative catalog recheck. That
-  handoff names the host-owned `PRIME_AGENT_CODING_AGENT_DIR` boundary because
-  an ambient Prime Agent terminal otherwise defaults to a different profile.
+  verified native OAuth action limited to `openai-codex`. On a trusted local
+  macOS host, every other provider can use one explicit handoff that starts the
+  exact verified Prime Agent CLI and host-owned `PRIME_AGENT_CODING_AGENT_DIR`
+  in Terminal without passing `/login` as an argument. A child-process spawn
+  proves only that Prime Agent opened; the user still completes `/login`, and
+  an authoritative catalog recheck is the only account-readiness proof. The
+  handoff is unavailable over SSH and relay and is never retried after an
+  ambiguous launch outcome. An ambient Prime Agent terminal would otherwise
+  default to a different profile.
 - The `v0.7.2` public `DaemonAgentConnection` already exposes
   `setThinkingLevel`, and its live session snapshot reports the exact dynamic
   `availableThinkingLevels` for the selected model. Continuim negotiates this

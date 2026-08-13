@@ -126,6 +126,14 @@ export function parseEmbeddedRuntimeAttestationRecord(record: string): EmbeddedR
   ) {
     throw new Error("The embedded runtime attestation is empty, oversized, or non-canonical");
   }
+  return parseEmbeddedRuntimeAttestationBytes(bytes);
+}
+
+/** Strictly validates the exact bytes used by the embedded hostd record. */
+export function parseEmbeddedRuntimeAttestationBytes(bytes: Buffer): EmbeddedRuntimeAttestationEnvelope {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_RUNTIME_ATTESTATION_BYTES) {
+    throw new Error("The runtime attestation is empty or oversized");
+  }
   let value: unknown;
   try {
     value = JSON.parse(bytes.toString("utf8")) as unknown;

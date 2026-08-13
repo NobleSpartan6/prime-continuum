@@ -28,6 +28,27 @@ function nativeObservation() {
       connectionPhase: 'online',
       hostId: 'host-one',
     },
+    liveRuntime: {
+      connectionPath: 'local_socket',
+      hostdBuildIdentity: {
+        contractVersion: 1,
+        bundleSha256: '8'.repeat(64),
+        runtimeTrustAnchorId: '9'.repeat(64),
+      },
+      readinessKind: 'reported',
+      readinessStatus: 'ready',
+      trustAnchorId: '9'.repeat(64),
+      target: {
+        runtime: 'prime-agent',
+        releaseVersion: '0.7.2',
+        runtimeBuildId: '83a0f9f',
+        platform: 'darwin',
+        arch: 'arm64',
+        manifestSha256: '5'.repeat(64),
+        treeSha256: '4'.repeat(64),
+        filesSha256: '0'.repeat(64),
+      },
+    },
     selection: {
       heading: 'Prime RLM proof',
       sidebarTitle: 'Prime RLM proof',
@@ -122,17 +143,21 @@ describe('native launch-proof evidence', () => {
         platform: 'darwin',
         arch: 'arm64',
         appAsarSha256: 'e'.repeat(64),
+        hostdBundleSha256: '8'.repeat(64),
         mainTreeSha256: 'f'.repeat(64),
         preloadTreeSha256: '1'.repeat(64),
         rendererTreeSha256: '2'.repeat(64),
       },
       runtime: {
         releaseVersion: '0.7.2',
+        runtimeBuildId: '83a0f9f',
         platform: 'darwin',
         arch: 'arm64',
         pointerSha256: '3'.repeat(64),
         treeSha256: '4'.repeat(64),
         manifestSha256: '5'.repeat(64),
+        filesSha256: '0'.repeat(64),
+        trustAnchorId: '9'.repeat(64),
       },
       observation: nativeObservation(),
       captures: [
@@ -150,6 +175,7 @@ describe('native launch-proof evidence', () => {
         providerInvoked: false,
         oauthInvoked: false,
         uiPresentationChanged: true,
+        liveHostIdentityVerified: true,
         sourceCommitAuthenticated: false,
         packageSignedOrNotarized: false,
       },
@@ -160,6 +186,71 @@ describe('native launch-proof evidence', () => {
       .toThrowError(expect.objectContaining({ code: 'manifest_path_leak' }))
     expect(() => assertPathFreeManifest({ leaked: '/etc/private-project' }))
       .toThrowError(expect.objectContaining({ code: 'manifest_path_leak' }))
+  })
+
+  it('rejects a live host or runtime that does not match the packaged candidate', () => {
+    const observation = nativeObservation()
+    const input = {
+      runId: '12345678-1234-4123-8123-123456789abc',
+      capturedAt,
+      selfBuildReceipt: {
+        receiptSha256: 'b'.repeat(64),
+        headCommit: 'c'.repeat(40),
+        dirty: false,
+        sourceTreeSha256: 'd'.repeat(64),
+      },
+      app: {
+        productName: 'Prime Continuim',
+        version: '0.1.0',
+        platform: 'darwin',
+        arch: 'arm64',
+        appAsarSha256: 'e'.repeat(64),
+        hostdBundleSha256: '8'.repeat(64),
+        mainTreeSha256: 'f'.repeat(64),
+        preloadTreeSha256: '1'.repeat(64),
+        rendererTreeSha256: '2'.repeat(64),
+      },
+      runtime: {
+        releaseVersion: '0.7.2',
+        runtimeBuildId: '83a0f9f',
+        platform: 'darwin',
+        arch: 'arm64',
+        pointerSha256: '3'.repeat(64),
+        treeSha256: '4'.repeat(64),
+        manifestSha256: '5'.repeat(64),
+        filesSha256: '0'.repeat(64),
+        trustAnchorId: '9'.repeat(64),
+      },
+      observation,
+      captures: [
+        { kind: 'rlm', file: 'rlm.png', sha256: '6'.repeat(64), bytes: 100, width: 1440, height: 900 },
+        { kind: 'outcome', file: 'outcome.png', sha256: '7'.repeat(64), bytes: 101, width: 1440, height: 900 },
+      ],
+    }
+
+    expect(() => createNativeLaunchProofEnvelope({
+      ...input,
+      observation: {
+        ...observation,
+        liveRuntime: {
+          ...observation.liveRuntime,
+          hostdBuildIdentity: {
+            ...observation.liveRuntime.hostdBuildIdentity,
+            bundleSha256: 'a'.repeat(64),
+          },
+        },
+      },
+    })).toThrowError(expect.objectContaining({ code: 'live_hostd_package_mismatch' }))
+    expect(() => createNativeLaunchProofEnvelope({
+      ...input,
+      observation: {
+        ...observation,
+        liveRuntime: {
+          ...observation.liveRuntime,
+          target: { ...observation.liveRuntime.target, releaseVersion: '0.7.1' },
+        },
+      },
+    })).toThrowError(expect.objectContaining({ code: 'live_runtime_package_mismatch' }))
   })
 
   it('digests artifact entries with the canonical self-build ordering', () => {

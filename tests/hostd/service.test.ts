@@ -1,5 +1,5 @@
 import { bootstrapTestWorkspace } from "./test-workspace-fixture";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,7 +9,7 @@ import {
   deriveNoisePublicKeyFingerprint,
   type DeviceGrantRecord,
 } from "../../src/hostd/pairing/authority";
-import { HostService, TRUSTED_USER_SESSION } from "../../src/hostd/service";
+import { HostService, SSH_BRIDGE_SESSION, TRUSTED_USER_SESSION } from "../../src/hostd/service";
 import { HostStore } from "../../src/hostd/store";
 import {
   PINNED_PRIME_AGENT_RUNTIME,
@@ -46,7 +46,169 @@ describe("HostService handoff availability", () => {
 
     expect(response.ok).toBe(true);
     if (!response.ok || response.method !== "health.get") throw new Error("health request failed");
+    expect(response.result.hostdBuildIdentity).toEqual({
+      contractVersion: 1,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    });
+    expect(response.result.capabilities).toContain("hostd_graceful_retire_v1");
     expect(response.result.capabilities).not.toContain("thread_handoff_v1");
+  });
+
+  it("accepts retirement only for the exact quiescent local host authority", async () => {
+    const { service, store } = await temporaryService();
+    const host = await store.getHost();
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-quiescent-host",
+      method: "host.retire",
+      payload: {
+        expectedHostId: host.hostId,
+        expectedBuildIdentity: {
+          contractVersion: 1,
+          bundleSha256: "a".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    }, TRUSTED_USER_SESSION);
+
+    expect(response).toMatchObject({
+      ok: true,
+      method: "host.retire",
+      result: {
+        retirementVersion: 1,
+        state: "accepted",
+        expectedHostId: host.hostId,
+        hostdBuildIdentity: {
+          bundleSha256: "a".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    });
+    await service.close();
+  });
+
+  it("does not advertise or authorize host retirement over SSH", async () => {
+    const { service, store } = await temporaryService();
+    const host = await store.getHost();
+    const health = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "ssh-health-retirement",
+      method: "health.get",
+      payload: {},
+    }, SSH_BRIDGE_SESSION);
+    expect(health.ok).toBe(true);
+    if (!health.ok || health.method !== "health.get") throw new Error("SSH health request failed");
+    expect(health.result.capabilities).not.toContain("hostd_graceful_retire_v1");
+
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "ssh-retire-host",
+      method: "host.retire",
+      payload: {
+        expectedHostId: host.hostId,
+        expectedBuildIdentity: {
+          contractVersion: 1,
+          bundleSha256: "a".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    }, SSH_BRIDGE_SESSION);
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "REMOTE_HOST_RETIRE_FORBIDDEN" },
+    });
+    await service.close();
+  });
+
+  it("blocks retirement while a resident binding remains active", async () => {
+    const { service, store, workspaceDirectory } = await temporaryService();
+    const host = await store.getHost();
+    await store.persistResidentSessionBinding(serviceResidentBinding(workspaceDirectory));
+
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-active-host",
+      method: "host.retire",
+      payload: {
+        expectedHostId: host.hostId,
+        expectedBuildIdentity: {
+          contractVersion: 1,
+          bundleSha256: "a".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    }, TRUSTED_USER_SESSION);
+
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "HOST_RETIRE_RESIDENT_STATE_ACTIVE" },
+    });
+    const health = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "health-after-blocked-retire",
+      method: "health.get",
+      payload: {},
+    }, TRUSTED_USER_SESSION);
+    expect(health.ok).toBe(true);
+    await service.close();
+  });
+
+  it("blocks retirement while a durable dispatch attempt remains unresolved", async () => {
+    const { service, store } = await temporaryService();
+    const host = await store.getHost();
+    await writeFile(join(store.paths.residentDispatchAttempts, "unresolved.json"), "{}", "utf8");
+
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-dispatching-host",
+      method: "host.retire",
+      payload: {
+        expectedHostId: host.hostId,
+        expectedBuildIdentity: {
+          contractVersion: 1,
+          bundleSha256: "a".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    }, TRUSTED_USER_SESSION);
+
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "HOST_RETIRE_RESIDENT_STATE_ACTIVE" },
+    });
+    await service.close();
+  });
+
+  it("rejects retirement after build identity drift without closing admission", async () => {
+    const { service, store } = await temporaryService();
+    const host = await store.getHost();
+    const response = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "retire-drifted-host",
+      method: "host.retire",
+      payload: {
+        expectedHostId: host.hostId,
+        expectedBuildIdentity: {
+          contractVersion: 1,
+          bundleSha256: "c".repeat(64),
+          runtimeTrustAnchorId: "b".repeat(64),
+        },
+      },
+    }, TRUSTED_USER_SESSION);
+
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "HOST_RETIRE_IDENTITY_MISMATCH" },
+    });
+    const health = await service.handle({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "health-after-identity-drift",
+      method: "health.get",
+      payload: {},
+    }, TRUSTED_USER_SESSION);
+    expect(health.ok).toBe(true);
+    await service.close();
   });
 
   it("returns review data but marks even an otherwise clean handoff plan unavailable", async () => {
@@ -586,6 +748,11 @@ async function temporaryService(): Promise<{
     },
   });
   const serviceWithVerifiedIdentity = new HostService(store, undefined, pairingAuthority, {
+    hostdBuildIdentity: {
+      contractVersion: 1,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    },
     hostIdentityProvider: {
       backend: "test-secure-store",
       async loadExisting({ hostId }) {

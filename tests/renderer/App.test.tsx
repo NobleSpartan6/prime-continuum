@@ -447,7 +447,7 @@ function createContinuityApi(options: {
   return api
 }
 
-function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
+function createModelSelectionHarness(options: { runtimeOAuth?: boolean; runtimeProviderSetup?: boolean } = {}) {
   const api = asNativeFixture(createPreviewRendererApi())
   const loadRuntimeModelCatalog = api.loadRuntimeModelCatalog.bind(api)
   const listeners = new Set<(next: WorkbenchSnapshot) => void>()
@@ -459,7 +459,7 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
   selectedThread.executionGenerationId = 'generation-model-selection-one'
   selectedThread.workspaceId = 'workspace-model-selection-one'
   selectedHost.connection = 'online'
-  if (options.runtimeOAuth) {
+  if (options.runtimeOAuth || options.runtimeProviderSetup) {
     selectedHost.kind = 'local'
     selectedHost.connectionPath = 'Local socket'
   }
@@ -483,6 +483,7 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
     selectResidentModel: true,
     selectResidentThinkingLevel: true,
     ...(options.runtimeOAuth ? { runtimeOAuth: true } : {}),
+    ...(options.runtimeProviderSetup ? { runtimeProviderSetup: true } : {}),
   }
   current.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
   api.loadWorkbench = vi.fn(async () => structuredClone(current))
@@ -1241,6 +1242,34 @@ describe('Prime Continuim renderer', () => {
     expect(harness.api.hudClose).toHaveBeenCalledOnce()
   })
 
+  it('lets a Prime Agent question own the bottom command surface in the HUD', async () => {
+    const harness = createHudHarness({ taskState: 'running' })
+    const thread = harness.snapshot.threads.find((candidate) => candidate.id === harness.target.threadId)
+    if (!thread?.executionGenerationId) throw new Error('Expected the exact HUD resident generation')
+    harness.snapshot.residentExtensionUiRequests = [{
+      interactionVersion: 1,
+      hostId: harness.target.expectedHostId,
+      threadId: thread.remoteId ?? thread.id,
+      executionGenerationId: thread.executionGenerationId,
+      bindingFingerprint: 'a'.repeat(64),
+      requestId: 'extension-question-one',
+      requestDigest: 'b'.repeat(64),
+      receivedAt: '2026-08-05T20:00:02.000Z',
+      method: 'confirm',
+      title: 'Use the verified migration plan?',
+      message: 'Prime Agent needs this decision before it changes the workspace.',
+    }]
+
+    render(<App api={harness.api} surface="hud" />)
+
+    expect(await screen.findByRole('heading', { name: 'Use the verified migration plan?' })).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Thread transcript' })).toBeVisible()
+    expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('form', { name: 'Prime Agent prompt' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('form', { name: 'Prime Agent controls' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeVisible()
+  })
+
   it('isolates and restores drafts when the same HUD thread changes execution generation', async () => {
     const user = userEvent.setup()
     const harness = createHudHarness()
@@ -1418,11 +1447,11 @@ describe('Prime Continuim renderer', () => {
     expect(within(continuity).getByText(/End this inactive session to start a new agent/i)).toBeVisible()
     expect(within(continuity).queryByText('Using ipython')).not.toBeInTheDocument()
     expect(within(continuity).queryByText('No active goal')).not.toBeInTheDocument()
-    expect(await screen.findByText('Session unavailable', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__intent')).not.toBeInTheDocument()
     expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
     expect(await screen.findByTitle('Task state: Session unavailable')).toBeVisible()
     expect(screen.getByRole('button', { name: /Test Thread/i })).toHaveTextContent(/Session unavailable.*Test Thread/i)
-    expect(screen.getByText('Session unavailable', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(screen.getByText(/task, transcript, and workspace files stay/i)).toBeVisible()
     expect(screen.queryByText('Ready to send')).not.toBeInTheDocument()
@@ -1711,6 +1740,31 @@ describe('Prime Continuim renderer', () => {
     expect(await screen.findByRole('dialog', { name: 'Start another task' })).toBeVisible()
   })
 
+  it('shows the ended empty state while the exact terminal End projection catches up', async () => {
+    const completed = {
+      ...residentEndOperation('terminal'),
+      lastStatus: residentEndStatus('completed'),
+    }
+    const api = createResidentEndApi(completed)
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = async () => {
+      const snapshot = await loadWorkbench()
+      const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)
+      if (!thread) throw new Error('Expected the selected resident end fixture')
+      thread.transcript = []
+      snapshot.operations.provisionResident = true
+      return snapshot
+    }
+
+    render(<App api={api} />)
+
+    const transcript = await screen.findByRole('region', { name: 'Thread transcript' })
+    expect(within(transcript).getByRole('heading', { name: 'Session ended' })).toBeVisible()
+    expect(within(transcript).getByText('No transcript was recorded. Your workspace and files remain available.')).toBeVisible()
+    expect(within(transcript).getByRole('button', { name: 'Start another task' })).toBeEnabled()
+    expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
+  })
+
   it('offers one session action when an ended empty thread cannot start another agent', async () => {
     const user = userEvent.setup()
     const completed = {
@@ -1832,7 +1886,8 @@ describe('Prime Continuim renderer', () => {
 
     expect(await screen.findByTitle('Task state: End needs review')).toBeVisible()
     expect(screen.getByRole('button', { name: /End needs review.*Frame protocol boundaries/i })).toBeVisible()
-    expect(screen.getByText('End needs review', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__intent')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('End needs review')).toBeVisible()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
     expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /outcome unknown/i })).not.toBeInTheDocument()
@@ -2794,6 +2849,7 @@ describe('Prime Continuim renderer', () => {
     await user.click(models)
 
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
     await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
 
     expect(harness.api.startRuntimeOAuth).toHaveBeenCalledWith({
@@ -3549,15 +3605,16 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
 
-    expect(await screen.findByText('Stop needs review', { selector: '.composer__intent' })).toBeVisible()
+    const continuity = await screen.findByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByText('Stop needs review')).toBeVisible()
     expect(screen.queryByRole('button', {
       name: 'Stop outcome unknown; inspect the current thread state',
     })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Review status' })).toBeEnabled()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
-    expect(document.querySelector('.composer__connection')).toHaveClass('composer__connection--uncertain')
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(screen.getAllByText('Outcome unknown · recovery required; this Stop will not be replayed').some((element) => !element.classList.contains('sr-only'))).toBe(true)
-    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Stop needs review')).toBeVisible()
+    expect(within(continuity).getByText('Outcome unknown · recovery required; this Stop will not be replayed')).toBeVisible()
     expect(screen.queryByText(/try stop again/i)).not.toBeInTheDocument()
     expect(api.abortThread).not.toHaveBeenCalled()
   })
@@ -3577,7 +3634,8 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
-    expect(screen.getByText('Reconnecting', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__intent')).not.toBeInTheDocument()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(screen.queryByText('Active resident turn', { selector: '.composer__intent' })).not.toBeInTheDocument()
     expect(screen.queryByText(/Prime Agent is working · Stop requests a safe boundary/i)).not.toBeInTheDocument()
     expect(screen.getAllByText(/Saved activity is available while devbox reconnects/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
@@ -3800,12 +3858,11 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
 
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
-    expect(screen.getByText('Working', { selector: '.composer__intent' })).toBeVisible()
-    expect(screen.getByText('Browser auditor · Inspecting the browser harness', {
-      selector: '.composer__connection span',
-    })).toBeVisible()
-    const viewAgents = within(screen.getByRole('region', { name: 'Session status' }))
-      .getByRole('button', { name: 'View agents' })
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByText('Working')).toBeVisible()
+    expect(within(continuity).getByText('Browser auditor · Inspecting the browser harness')).toBeVisible()
+    const viewAgents = within(continuity).getByRole('button', { name: 'View agents' })
     expect(viewAgents).toHaveClass('session-continuity__manage--agents')
     expect(viewAgents.querySelector('.lucide-git-fork')).toBeInTheDocument()
     expect(viewAgents.querySelector('.lucide-ellipsis')).not.toBeInTheDocument()
@@ -3815,7 +3872,7 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
   })
 
-  it('prefills a generic investigation task without sending it', async () => {
+  it('guides an investigation task without drafting or sending it', async () => {
     const user = userEvent.setup()
     const api = createIdleResidentApi()
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
@@ -3826,16 +3883,21 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Investigate an issue' }))
 
-    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
+    expect(composer).toHaveFocus()
+    expect(composer).toHaveValue('')
+    expect(composer).toHaveAttribute(
+      'placeholder',
+      'Describe the issue, reproduction details, expected behavior, and done criteria…',
+    )
     expect(api.sendComposer).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Investigate an issue' })).toHaveAttribute('aria-pressed', 'true')
 
-    await user.type(composer, ' Add one more constraint.')
-    expect((composer as HTMLTextAreaElement).value).toContain('Add one more constraint.')
+    await user.type(composer, 'Add one more constraint.')
+    expect(composer).toHaveValue('Add one more constraint.')
     expect(screen.getByRole('button', { name: 'Investigate an issue' })).toHaveAttribute('aria-pressed', 'false')
   })
 
-  it('prefills a generic RLM delegation task without sending it', async () => {
+  it('guides an RLM delegation task without replacing or sending an existing draft', async () => {
     const user = userEvent.setup()
     const api = createIdleResidentApi()
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
@@ -3843,10 +3905,16 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    await user.type(composer, 'Keep this exact draft.')
 
     await user.click(screen.getByRole('button', { name: 'Delegate a task' }))
 
-    expect((composer as HTMLTextAreaElement).value).toBe('Delegate with RLM: [outcome, constraints, and done criteria].')
+    expect(composer).toHaveFocus()
+    expect(composer).toHaveValue('Keep this exact draft.')
+    expect(composer).toHaveAttribute(
+      'placeholder',
+      'Describe the outcome, constraints, branch boundaries, and done criteria…',
+    )
     expect(api.sendComposer).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Delegate a task' })).toHaveAttribute('aria-pressed', 'true')
   })
@@ -3880,7 +3948,11 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: /Investigate an issue.*Reproduce and resolve root cause/ }))
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
-    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
+    expect(composer).toHaveValue('')
+    expect(composer).toHaveAttribute(
+      'placeholder',
+      'Describe the issue, reproduction details, expected behavior, and done criteria…',
+    )
     expect(api.sendComposer).not.toHaveBeenCalled()
 
     expect(screen.queryByRole('button', { name: 'Open models and accounts to choose a model' })).not.toBeInTheDocument()
@@ -3955,7 +4027,11 @@ describe('Prime Continuim renderer', () => {
 
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
-    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
+    expect(composer).toHaveValue('')
+    expect(composer).toHaveAttribute(
+      'placeholder',
+      'Describe the issue, reproduction details, expected behavior, and done criteria…',
+    )
     expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
     expect(api.sendComposer).not.toHaveBeenCalled()
   })
@@ -4090,7 +4166,8 @@ describe('Prime Continuim renderer', () => {
 
     await screen.findAllByText('Prime Agent execution is not attached in this build.')
     expect(composer).toHaveValue(draft)
-    expect(document.querySelector('.composer__connection')).toHaveClass('composer__connection--rejected')
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Prime Agent execution is not attached in this build.')).toBeVisible()
     expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(draft)).not.toBeInTheDocument()
   })
 
@@ -4117,7 +4194,7 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     await waitFor(() => expect(api.sendComposer).toHaveBeenCalledTimes(1))
-    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Prompt is awaiting durable host admission' })).not.toBeInTheDocument()
     expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toHaveAttribute('aria-busy', 'true')
     expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
@@ -4132,7 +4209,7 @@ describe('Prime Continuim renderer', () => {
       await admission.promise
     })
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument())
-    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
     expect(within(continuity).getByText('Starting')).toBeVisible()
     expect(within(continuity).getByText('Prime Agent owns the task. Waiting for fresh activity.')).toBeVisible()
@@ -4192,7 +4269,7 @@ describe('Prime Continuim renderer', () => {
     const stop = await screen.findByRole('button', { name: 'Stop the active Prime Agent turn' })
     expect(stop).toBeEnabled()
     expect(stop).toHaveTextContent('Stop')
-    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
     expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(prompt)).not.toBeInTheDocument()
 
     await user.click(stop)
@@ -4492,14 +4569,15 @@ describe('Prime Continuim renderer', () => {
     await user.keyboard('{Home}')
     expect(allProviders).toHaveFocus()
 
-    await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
-    expect(within(dialog).getByText('Finish in Prime Agent')).toBeVisible()
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    const manualSetup = within(dialog).getByText('Set up Anthropic (Claude Pro/Max)').closest('.provider-setup-note')!
+    expect(manualSetup).toBeVisible()
     expect(within(dialog).getByText('0 available with current setup · 2 listed by the runtime')).toBeVisible()
     expect(within(dialog).getByText('/login')).toBeVisible()
-    expect(within(dialog).getByText(/keeps this setup interactive/)).toBeVisible()
-    expect(within(dialog).getByText('Connect to devbox with your saved SSH setup.')).toBeVisible()
-    const providerProfileDisclosure = within(dialog).getByText('Use the Continuim host profile', { selector: 'summary' }).closest('details')
-    expect(providerProfileDisclosure).toHaveTextContent(/same PRIME_AGENT_CODING_AGENT_DIR/)
+    expect(manualSetup).toHaveTextContent(/Connect to devbox.*Prime Agent profile used by Continuim/)
+    const providerProfileDisclosure = within(dialog).getByText('Why this profile matters', { selector: 'summary' }).closest('details')
+    expect(providerProfileDisclosure).toHaveTextContent(/can only see accounts stored in the profile used by this host/i)
+    expect(dialog).not.toHaveTextContent('PRIME_AGENT_CODING_AGENT_DIR')
     await user.click(within(dialog).getByRole('button', { name: 'Copy setup steps' }))
     expect(await navigator.clipboard.readText()).toBe(
       [
@@ -4511,12 +4589,12 @@ describe('Prime Continuim renderer', () => {
       ].join('\n'),
     )
     expect(within(dialog).getByRole('button', { name: 'Copied setup steps' })).toBeVisible()
-    expect(within(dialog).getByText('Copied provider setup steps.')).toHaveAttribute('role', 'status')
+    expect(within(dialog).getByText('Setup steps copied.')).toHaveAttribute('role', 'status')
     await user.click(within(dialog).getByRole('button', { name: 'Check account' }))
     await waitFor(() => expect(loadRuntimeModelCatalog).toHaveBeenCalledTimes(2))
-    expect(await within(dialog).findByText('Finish in Prime Agent')).toBeVisible()
+    expect(await within(dialog).findByText('Set up Anthropic (Claude Pro/Max)')).toBeVisible()
     expect(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ })).toHaveAttribute('aria-pressed', 'true')
-    expect(await within(dialog).findByText(/Anthropic \(Claude Pro\/Max\) is not configured in devbox's Continuim profile yet/)).toHaveAttribute('role', 'status')
+    expect(await within(dialog).findByText('Not connected yet. Finish /login in Prime Agent, then check again.')).toHaveAttribute('role', 'status')
     expect(within(dialog).getByRole('button', { name: 'Check account' })).toBeEnabled()
     expect(within(dialog).getByText('No available models match')).toBeVisible()
 
@@ -4536,7 +4614,7 @@ describe('Prime Continuim renderer', () => {
 
   it('hands local provider setup to the exact Prime Agent profile and refreshes without blanking the catalog', async () => {
     const user = userEvent.setup()
-    const harness = createModelSelectionHarness({ runtimeOAuth: true })
+    const harness = createModelSelectionHarness({ runtimeProviderSetup: true })
     const initialCatalog = await harness.api.loadRuntimeModelCatalog('host-devbox')
     const refreshedCatalog = structuredClone(initialCatalog)
     const anthropic = refreshedCatalog.providers.find((provider) => provider.providerId === 'anthropic')!
@@ -4547,6 +4625,12 @@ describe('Prime Continuim renderer', () => {
       if (model.providerId === 'anthropic') model.available = true
     })
     const refresh = deferred<RuntimeModelCatalog>()
+    const launch = deferred<{
+      state: 'opened'
+      message: string
+      retryable: false
+    }>()
+    harness.api.openRuntimeProviderSetup = vi.fn(() => launch.promise)
     harness.api.loadRuntimeModelCatalog = vi.fn()
       .mockResolvedValueOnce(initialCatalog)
       .mockImplementationOnce(() => refresh.promise)
@@ -4555,17 +4639,42 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /Browse all \d+ providers/ }))
-    await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
 
-    expect(within(dialog).getByText('Open Prime Agent on this computer.')).toBeVisible()
-    await user.click(within(dialog).getByRole('button', { name: 'Copy setup steps' }))
-    expect(await navigator.clipboard.readText()).toContain('1. Open Prime Agent on this computer.')
-    expect(await navigator.clipboard.readText()).toContain('same PRIME_AGENT_CODING_AGENT_DIR as prime-agent-hostd')
+    const setup = within(dialog).getByText('Set up Anthropic (Claude Pro/Max)').closest('.provider-setup-note')!
+    const feedback = dialog.querySelector('.provider-setup-feedback')!
+    expect(setup).toHaveClass('provider-setup-note--handoff')
+    expect(setup).toHaveTextContent(/Open Prime Agent, run \/login, and choose Anthropic.*Credentials stay with Prime Agent on devbox/)
+    expect(setup).not.toHaveTextContent('PRIME_AGENT_CODING_AGENT_DIR')
+    expect(feedback).toHaveClass('sr-only')
+
+    await user.click(within(dialog).getByRole('button', { name: 'Open Prime Agent' }))
+    expect(harness.api.openRuntimeProviderSetup).toHaveBeenCalledOnce()
+    expect(harness.api.openRuntimeProviderSetup).toHaveBeenCalledWith({
+      hostId: 'host-devbox',
+      providerId: 'anthropic',
+    })
+    expect(within(dialog).getByRole('button', { name: 'Opening…' })).toBeDisabled()
+    expect(feedback).toHaveTextContent('Opening Prime Agent…')
+    expect(within(dialog).getByRole('button', { name: 'Check account' })).toBeDisabled()
+
+    await act(async () => {
+      launch.resolve({
+        state: 'opened',
+        message: 'Prime Agent opened. Run /login and choose Anthropic, then return here.',
+        retryable: false,
+      })
+      await launch.promise
+    })
+    expect(feedback).toHaveTextContent('Prime Agent opened. Run /login and choose Anthropic, then return here.')
+    expect(feedback).not.toHaveClass('sr-only')
+    expect(within(dialog).queryByRole('button', { name: 'Open Prime Agent' })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Check account' })).toHaveClass('button--primary')
+    expect(within(dialog).getByRole('button', { name: 'Check account' })).toHaveFocus()
 
     await user.click(within(dialog).getByRole('button', { name: 'Check account' }))
     expect(within(dialog).getByRole('button', { name: 'Checking…' })).toBeDisabled()
-    expect(within(dialog).getByText('Finish in Prime Agent')).toBeVisible()
+    expect(within(dialog).getByText('Set up Anthropic (Claude Pro/Max)')).toBeVisible()
     expect(within(dialog).queryByText('Reading the runtime catalog')).not.toBeInTheDocument()
 
     await act(async () => {
@@ -4573,8 +4682,79 @@ describe('Prime Continuim renderer', () => {
       await refresh.promise
     })
     expect(within(dialog).getByText('Anthropic (Claude Pro/Max) is ready · 2 models available.')).toHaveAttribute('role', 'status')
-    expect(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ })).toHaveTextContent('Configured')
-    expect(within(dialog).queryByText('Finish in Prime Agent')).not.toBeInTheDocument()
+    const configuredProvider = within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ })
+    expect(configuredProvider).toHaveTextContent('Configured')
+    expect(configuredProvider).toHaveFocus()
+    expect(within(dialog).queryByText('Set up Anthropic (Claude Pro/Max)')).not.toBeInTheDocument()
+  })
+
+  it('does not repeat an indeterminate local provider handoff', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeProviderSetup: true })
+    harness.api.openRuntimeProviderSetup = vi.fn(async () => ({
+      state: 'indeterminate' as const,
+      message: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+      retryable: false as const,
+    }))
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Open Prime Agent' }))
+
+    expect(await within(dialog).findByText(/Prime Agent may already be open/)).toHaveAttribute('role', 'status')
+    expect(within(dialog).queryByRole('button', { name: /Open Prime Agent|Try again/ })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Check account' })).toHaveClass('button--primary')
+    expect(within(dialog).getByRole('button', { name: 'Check account' })).toHaveFocus()
+    expect(harness.api.openRuntimeProviderSetup).toHaveBeenCalledOnce()
+  })
+
+  it('returns focus to all providers when an account disappears during refresh', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    const initialCatalog = await harness.api.loadRuntimeModelCatalog('host-devbox')
+    const refreshedCatalog = structuredClone(initialCatalog)
+    refreshedCatalog.providers = refreshedCatalog.providers.filter((provider) => provider.providerId !== 'anthropic')
+    refreshedCatalog.models = refreshedCatalog.models.filter((model) => model.providerId !== 'anthropic')
+    harness.api.loadRuntimeModelCatalog = vi.fn()
+      .mockResolvedValueOnce(initialCatalog)
+      .mockResolvedValueOnce(refreshedCatalog)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Check account' }))
+
+    const allProviders = await within(dialog).findByRole('button', { name: /All providers/ })
+    expect(allProviders).toHaveFocus()
+    expect(await within(dialog).findByText(/Anthropic \(Claude Pro\/Max\) is no longer listed/)).toHaveAttribute('role', 'alert')
+  })
+
+  it('offers retry only after provider setup is proven not to have launched', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness({ runtimeProviderSetup: true })
+    harness.api.openRuntimeProviderSetup = vi.fn(async () => ({
+      state: 'failed_before_launch' as const,
+      message: 'Prime Agent could not be opened. No window was launched.',
+      retryable: true as const,
+    }))
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Open Prime Agent' }))
+
+    expect(await within(dialog).findByText('Prime Agent could not be opened. No window was launched.')).toHaveAttribute('role', 'alert')
+    const retry = within(dialog).getByRole('button', { name: 'Try again' })
+    expect(retry).toHaveClass('button--primary')
+    await user.click(retry)
+    expect(harness.api.openRuntimeProviderSetup).toHaveBeenCalledTimes(2)
   })
 
   it('connects ChatGPT to the selected Prime Agent runtime and replaces the catalog only after completion proof', async () => {
@@ -4608,7 +4788,8 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
-    await user.click(await within(dialog).findByRole('button', { name: /Browse all \d+ providers/ }))
+    expect(within(dialog).queryByText('ChatGPT setup recommended')).not.toBeInTheDocument()
+    expect(await within(dialog).findByRole('button', { name: /All providers/ })).toHaveAttribute('aria-pressed', 'true')
     await user.click(await within(dialog).findByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
     expect(within(dialog).queryByRole('button', { name: /Connect/ })).not.toBeInTheDocument()
     await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
@@ -4652,21 +4833,39 @@ describe('Prime Continuim renderer', () => {
     expect(within(dialog).getByText('RLM recommended')).toBeVisible()
   })
 
+  it('keeps the current model first and Sol secondary when the runtime already has usable providers', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    harness.publishCurrentModel('prime-inference/moonshotai/kimi-k3')
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await within(dialog).findByText('Kimi K3')
+
+    expect(within(dialog).queryByText('ChatGPT setup recommended')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /All providers/ })).toHaveAttribute('aria-pressed', 'true')
+    expect([...dialog.querySelectorAll('.model-row__title > strong')].slice(0, 2).map((node) => node.textContent)).toEqual([
+      'Kimi K3',
+      'GPT-5.6 Sol',
+    ])
+  })
+
   it('opens an unconfigured first-run catalog directly on the supported ChatGPT setup path', async () => {
     const user = userEvent.setup()
     const harness = createModelSelectionHarness({ runtimeOAuth: true })
     const loadRuntimeModelCatalog = harness.api.loadRuntimeModelCatalog.bind(harness.api)
     harness.api.loadRuntimeModelCatalog = vi.fn(async (hostId) => {
       const catalog = await loadRuntimeModelCatalog(hostId)
-      const chatGptProvider = catalog.providers.find((provider) => provider.providerId === 'openai-codex')!
-      chatGptProvider.configured = false
-      chatGptProvider.authSource = 'none'
-      chatGptProvider.availableModelCount = 0
+      catalog.providers.forEach((provider) => {
+        provider.configured = false
+        provider.availableModelCount = 0
+        delete provider.authSource
+      })
       catalog.models.forEach((model) => {
-        if (model.providerId === 'openai-codex') {
-          model.available = false
-          model.usingOAuth = false
-        }
+        model.available = false
+        model.usingOAuth = false
       })
       return catalog
     })
@@ -4709,6 +4908,7 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
     const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
     await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
 
     expect(within(dialog).getByText(/Opening the verified ChatGPT sign-in page/)).toHaveAttribute('role', 'status')
@@ -4757,6 +4957,7 @@ describe('Prime Continuim renderer', () => {
     const trigger = screen.getByRole('button', { name: /Open models and accounts/ })
     await user.click(trigger)
     let dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
     await user.click(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' }))
     await user.click(within(dialog).getByRole('button', { name: 'Cancel sign-in' }))
 
@@ -4779,6 +4980,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(trigger)
     dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    await user.click(await within(dialog).findByRole('button', { name: /ChatGPT Plus\/Pro/ }))
     expect(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
     expect(dialog.querySelector('.runtime-oauth-feedback__message--error')).toHaveTextContent('')
   })
@@ -6609,7 +6811,8 @@ describe('Prime Continuim renderer', () => {
     expect(thinking?.querySelector('.message__thinking-track')).not.toBeNull()
     expect(document.querySelector('.task-state__label')).toHaveTextContent('Working')
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
-    expect(screen.getByText('Working', { selector: '.composer__intent' })).toBeVisible()
+    expect(document.querySelector('.composer__toolbar')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('region', { name: 'Session status' })).getByText('Working')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Stop the active Prime Agent turn' })).toBeEnabled()
 
     await userEvent.setup().click(screen.getByRole('tab', { name: 'Session' }))
@@ -6773,24 +6976,25 @@ describe('Prime Continuim renderer', () => {
     expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('places one native Prime Agent question above the visible composer and releases it on disappearance', async () => {
+  it('uses one native Prime Agent question as the sole command surface and releases it on disappearance', async () => {
     const user = userEvent.setup()
     const harness = createExtensionUiAppHarness()
     render(<App api={harness.api} />)
 
     const title = await screen.findByRole('heading', { name: 'Use the verified migration plan?' })
     const prompt = title.closest('section')!
-    const composer = screen.getByRole('contentinfo')
     expect(document.querySelectorAll('.prime-interaction')).toHaveLength(1)
-    expect(prompt.compareDocumentPosition(composer)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(document.querySelector('.composer-wrap')).not.toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(screen.queryByRole('form', { name: 'Prime Agent prompt' })).not.toBeInTheDocument()
     expect(screen.getAllByText('Response needed').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('Prime Agent is waiting for your answer.').length).toBeGreaterThan(0)
+    expect(within(prompt).getByText(harness.request.message)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Stop the active Prime Agent turn' })).not.toBeInTheDocument()
     expect(screen.queryByText('Prime Agent is ready for another task.')).not.toBeInTheDocument()
 
-    await user.click(within(prompt).getByRole('button', { name: 'Confirm' }))
+    const confirm = within(prompt).getByRole('button', { name: 'Confirm' })
+    await user.click(confirm)
+    expect(confirm).toHaveFocus()
     expect(harness.api.respondToResidentExtensionUi).toHaveBeenCalledWith(
       harness.request,
       { kind: 'confirmed', confirmed: true },
@@ -6803,9 +7007,27 @@ describe('Prime Continuim renderer', () => {
     await waitFor(() => {
       expect(screen.queryByRole('heading', { name: 'Use the verified migration plan?' })).not.toBeInTheDocument()
       expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeEnabled()
+      expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveFocus()
     }, { timeout: 1_500 })
     act(() => harness.publish(stale))
     expect(screen.queryByRole('heading', { name: 'Use the verified migration plan?' })).not.toBeInTheDocument()
+  })
+
+  it('does not move unrelated focus when a Prime Agent question disappears', async () => {
+    const harness = createExtensionUiAppHarness()
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Use the verified migration plan?' })
+    const threadHeading = document.getElementById('thread-heading')!
+    threadHeading.focus()
+    expect(threadHeading).toHaveFocus()
+
+    const next = harness.snapshot()
+    next.residentExtensionUiRequests = []
+    act(() => harness.publish(next))
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeEnabled())
+    expect(threadHeading).toHaveFocus()
   })
 
   it('keeps an uncertain Prime Agent response non-actionable without reopening the composer', async () => {
