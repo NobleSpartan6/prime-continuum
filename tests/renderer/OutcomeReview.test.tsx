@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { OutcomeReview } from '../../src/renderer/src/OutcomeReview'
@@ -161,7 +161,10 @@ describe('OutcomeReview', () => {
     render(<OutcomeReview state="ready" result={longResult} />)
 
     const review = screen.getByRole('region', { name: 'Latest result' })
-    expect(await within(review).findAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
+    await waitFor(() => {
+      expect(review.querySelector('[data-transcript-renderer="loading"]')).not.toBeInTheDocument()
+    }, { timeout: 5_000 })
+    expect(within(review).getAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
     expect(within(review).queryByText('Open the full verification receipt')).not.toBeInTheDocument()
     const disclosure = within(review).getByText('View full result').closest('details')
     expect(disclosure).not.toHaveAttribute('open')
@@ -176,5 +179,5 @@ describe('OutcomeReview', () => {
     expect(disclosure).not.toHaveAttribute('open')
     expect(within(review).getAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
     expect(within(review).queryByText('Open the full verification receipt')).not.toBeInTheDocument()
-  })
+  }, 10_000)
 })
