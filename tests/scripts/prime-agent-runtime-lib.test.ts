@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as runtimeLib from "../../scripts/prime-agent-runtime-lib.mjs";
 import {
   PrimeAgentRuntimeBuildError,
@@ -262,14 +262,27 @@ describe("Prime Agent runtime asset download liveness", () => {
   it("aborts a release fetch that never produces response headers", async () => {
     const cache = await temporaryDirectory("prime-runtime-fetch-timeout-");
     const inputs = downloadInputs(Buffer.from("pinned asset"));
-    const fetchImpl = (() => new Promise<Response>(() => undefined)) as typeof fetch;
+    let markFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolveStarted) => { markFetchStarted = resolveStarted; });
+    const fetchImpl = (() => {
+      markFetchStarted();
+      return new Promise<Response>(() => undefined);
+    }) as typeof fetch;
+    vi.useFakeTimers();
+    try {
+      const rejection = expect(verifyReleaseAssets(inputs as never, cache, {
+        fetchImpl,
+        totalTimeoutMs: 25,
+        noProgressTimeoutMs: 10,
+      })).rejects.toThrow("Download timed out for asset.tgz; check the network or proxy and retry");
 
-    await expect(verifyReleaseAssets(inputs as never, cache, {
-      fetchImpl,
-      totalTimeoutMs: 25,
-      noProgressTimeoutMs: 10,
-    })).rejects.toThrow("Download timed out for asset.tgz; check the network or proxy and retry")
-    expect(await readdir(cache)).toEqual([]);
+      await fetchStarted;
+      await vi.advanceTimersByTimeAsync(25);
+      await rejection;
+      expect(await readdir(cache)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts a response body that stops making progress", async () => {

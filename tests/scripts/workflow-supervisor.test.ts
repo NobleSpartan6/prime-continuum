@@ -14,7 +14,12 @@ import { runSupervisedWorkflowStep } from '../../scripts/workflow-supervised-ste
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, {
+    recursive: true,
+    force: true,
+    maxRetries: process.platform === 'win32' ? 8 : 0,
+    retryDelay: 50,
+  })))
 })
 
 describe('workflow child supervision', () => {
@@ -290,8 +295,8 @@ setInterval(() => undefined, 1000)
         workflow: 'dist',
       })).rejects.toBeInstanceOf(WorkflowChildLeaseError)
 
-      process.kill(childPid, 'SIGKILL')
-      await waitForProcessesToExit([childPid])
+      await terminateTestProcessTree(childPid)
+      await waitForExit(orphan)
       await rejectActiveWorkflowChild({
         lockPath,
         lockToken: main.owner.token,
@@ -299,9 +304,10 @@ setInterval(() => undefined, 1000)
       })
       await expect(readFile(`${lockPath}.child`, 'utf8')).rejects.toThrow()
     } finally {
-      if (supervisedChildPid !== undefined) await terminateTestProcessGroup(supervisedChildPid)
-      if (isProcessAlive(childPid)) process.kill(childPid, 'SIGKILL')
-      await waitForProcessesToExit([childPid])
+      if (supervisedChildPid !== undefined) await terminateTestProcessTree(supervisedChildPid)
+      await terminateTestProcessTree(childPid)
+      await waitForExit(orphan)
+      if (supervisorPid !== undefined) await waitForProcessesToExit([supervisorPid])
       await main.release()
     }
   }, 15_000)
@@ -429,10 +435,26 @@ function isProcessAlive(pid: number) {
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
-async function terminateTestProcessGroup(pid: number) {
+async function terminateTestProcessTree(pid: number) {
   if (!isProcessAlive(pid)) return
+  if (process.platform === 'win32') {
+    const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows'
+    const killer = spawn(join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      killer.once('error', rejectPromise)
+      killer.once('exit', (code) => {
+        if (code === 0 || !isProcessAlive(pid)) resolvePromise()
+        else rejectPromise(new Error(`taskkill failed to retire test process tree ${pid} (exit ${code}).`))
+      })
+    })
+    await waitForProcessesToExit([pid])
+    return
+  }
   try {
-    process.kill(process.platform === 'win32' ? pid : -pid, 'SIGKILL')
+    process.kill(-pid, 'SIGKILL')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
   }
