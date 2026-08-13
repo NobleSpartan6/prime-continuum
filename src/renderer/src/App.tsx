@@ -102,6 +102,13 @@ import type { AgentLaunchpadProps } from './AgentLaunchpad'
 
 const INSPECTOR_TABS = ['Review', 'Session', 'Evidence', 'Context'] as const
 type InspectorTab = (typeof INSPECTOR_TABS)[number]
+type InspectorExecutionState = {
+  autoPresented: boolean
+  dismissed: boolean
+  managed: boolean
+  reviewPresented: boolean
+  touched: boolean
+}
 type ComposerReceiptView = {
   state: ComposerReceiptState
   message: string
@@ -146,6 +153,7 @@ type ResidentThreadFocusTarget = Pick<
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Describe the task before delegating to Prime Agent.'
 const MAX_COMPOSER_DRAFTS = 128
+const MAX_INSPECTOR_EXECUTION_STATES = 128
 const CANDIDATE_PREFLIGHT_REFRESH_MS = 25_000
 const CANDIDATE_EVALUATION_POLL_MS = 1_500
 const WORKBENCH_LAYOUT_STORAGE_KEY = 'prime.renderer.workbench-layout.v1'
@@ -616,6 +624,18 @@ function rememberComposerDraft(drafts: Map<string, string>, authorityKey: string
   if (drafts.size <= MAX_COMPOSER_DRAFTS) return
   const oldestAuthorityKey = drafts.keys().next().value
   if (oldestAuthorityKey !== undefined) drafts.delete(oldestAuthorityKey)
+}
+
+function rememberInspectorExecutionState(
+  states: Map<string, InspectorExecutionState>,
+  authorityKey: string,
+  state: InspectorExecutionState,
+): void {
+  states.delete(authorityKey)
+  states.set(authorityKey, state)
+  if (states.size <= MAX_INSPECTOR_EXECUTION_STATES) return
+  const oldestAuthorityKey = states.keys().next().value
+  if (oldestAuthorityKey !== undefined) states.delete(oldestAuthorityKey)
 }
 
 function threadMatchesHudTarget(thread: ThreadSummary, target: HudTarget): boolean {
@@ -1290,9 +1310,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('Review')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [workbenchLayout, setWorkbenchLayout] = useState(readWorkbenchLayout)
-  const inspectorOpen = workbenchLayout.inspectorOpen
+  const [managedInspectorAuthorityKey, setManagedInspectorAuthorityKey] = useState('')
+  const inspectorOpen = workbenchLayout.inspectorOpen || managedInspectorAuthorityKey !== ''
   const sidebarCollapsed = workbenchLayout.sidebarCollapsed
   const setInspectorOpen = useCallback((value: boolean | ((current: boolean) => boolean)) => {
+    setManagedInspectorAuthorityKey('')
     setWorkbenchLayout((current) => ({
       ...current,
       inspectorOpen: typeof value === 'function' ? value(current.inspectorOpen) : value,
@@ -1351,6 +1373,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
   const inspectorToggleRef = useRef<HTMLButtonElement>(null)
   const inspectorReturnTargetRef = useRef<HTMLElement | null>(null)
+  const inspectorAuthorityKeyRef = useRef('')
+  const inspectorExecutionStatesRef = useRef(new Map<string, InspectorExecutionState>())
   const commandPaletteTriggerRef = useRef<HTMLButtonElement>(null)
   const modelsDialogTriggerRef = useRef<HTMLElement | null>(null)
   const sidebarPanelRef = useRef<HTMLElement>(null)
@@ -1364,7 +1388,38 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   } | null>(null)
   const [resizingPanel, setResizingPanel] = useState<WorkbenchPanel | null>(null)
   const closeSidebar = useCallback(() => setSidebarOpen(false), [])
-  const closeInspector = useCallback(() => setInspectorOpen(false), [])
+  const markInspectorTouched = useCallback((dismissed = false) => {
+    const authorityKey = inspectorAuthorityKeyRef.current
+    if (!authorityKey) return
+    const current = inspectorExecutionStatesRef.current.get(authorityKey)
+    rememberInspectorExecutionState(inspectorExecutionStatesRef.current, authorityKey, {
+      autoPresented: current?.autoPresented ?? false,
+      dismissed: dismissed || current?.dismissed === true,
+      managed: false,
+      reviewPresented: current?.reviewPresented ?? false,
+      touched: true,
+    })
+  }, [])
+  const closeInspector = useCallback(() => {
+    const panel = inspectorPanelRef.current
+    const activeElement = document.activeElement
+    const shouldRestoreFocus = Boolean(
+      panel && activeElement instanceof HTMLElement && panel.contains(activeElement),
+    )
+    const returnTarget = inspectorReturnTargetRef.current ?? inspectorToggleRef.current
+    markInspectorTouched(true)
+    setInspectorOpen(false)
+    if (shouldRestoreFocus) {
+      window.requestAnimationFrame(() => {
+        if (returnTarget?.isConnected) returnTarget.focus()
+        else inspectorToggleRef.current?.focus()
+      })
+    }
+  }, [markInspectorTouched, setInspectorOpen])
+  const selectInspectorTab = useCallback((tab: InspectorTab) => {
+    markInspectorTouched()
+    setInspectorTab(tab)
+  }, [markInspectorTouched])
   const sidebarIsOverlay = useMediaQueryMatch('(max-width: 50rem)')
   const inspectorIsOverlay = useMediaQueryMatch('(max-width: 66rem)')
   const sidebarIsModal = sidebarOpen && sidebarIsOverlay
@@ -1513,12 +1568,16 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     setCommandPaletteOpen(true)
   }, [inspectorIsOverlay, sidebarIsOverlay])
 
-  const openSessionManager = useCallback((trigger: HTMLElement) => {
+  const openInspectorView = useCallback((trigger: HTMLElement, tab: InspectorTab) => {
+    markInspectorTouched()
     inspectorReturnTargetRef.current = trigger
     if (sidebarIsOverlay) setSidebarOpen(false)
-    setInspectorTab('Session')
+    setInspectorTab(tab)
     setInspectorOpen(true)
-  }, [sidebarIsOverlay])
+  }, [markInspectorTouched, setInspectorOpen, sidebarIsOverlay])
+  const openSessionManager = useCallback((trigger: HTMLElement) => {
+    openInspectorView(trigger, 'Session')
+  }, [openInspectorView])
 
   useEffect(() => {
     if (surface === 'hud') return
@@ -1747,6 +1806,129 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const composerDraftAuthorityKey = selectedHost && selectedThread
     ? composerActionAuthorityKey(selectedHost.id, selectedThread)
     : ''
+  const inspectorExecutionAuthorityKey = selectedHost && selectedThread?.executionGenerationId
+    ? composerActionAuthorityKey(selectedHost.id, selectedThread)
+    : ''
+  const selectedSnapshotMatchesExecution = Boolean(
+    snapshot?.snapshotAuthority &&
+    selectedThreadIsMaterialized &&
+    selectedThread?.executionGenerationId &&
+    snapshot.snapshotAuthority.cursor.threadId === (selectedThread.remoteId ?? selectedThread.id) &&
+    snapshot.snapshotAuthority.cursor.executionGenerationId === selectedThread.executionGenerationId
+  )
+  const selectedSnapshotIsFreshAuthoritative = Boolean(
+    selectedSnapshotMatchesExecution &&
+    snapshot?.snapshotAuthority?.source === 'live' &&
+    selectedHost?.connection === 'online' &&
+    selectedHost.activationRequired !== true
+  )
+  const selectedHasActiveChildDelegation = Boolean(
+    selectedRuntime.agentsReported === true &&
+    snapshot?.agents.some((agent) =>
+      agent.status === 'pending' ||
+      agent.status === 'queued' ||
+      agent.status === 'running' ||
+      agent.status === 'waiting'
+    )
+  )
+  const selectedHasCurrentOutcome = Boolean(
+    snapshot?.latestTurnOutcome &&
+    selectedSnapshotMatchesExecution &&
+    outcomeCursorIsCurrent(snapshot)
+  )
+
+  useLayoutEffect(() => {
+    inspectorAuthorityKeyRef.current = inspectorExecutionAuthorityKey
+  }, [inspectorExecutionAuthorityKey])
+
+  useLayoutEffect(() => {
+    if (
+      managedInspectorAuthorityKey &&
+      managedInspectorAuthorityKey !== inspectorExecutionAuthorityKey
+    ) {
+      setManagedInspectorAuthorityKey('')
+    }
+  }, [inspectorExecutionAuthorityKey, managedInspectorAuthorityKey])
+
+  useEffect(() => {
+    if (
+      surface !== 'workbench' ||
+      inspectorIsOverlay ||
+      !inspectorExecutionAuthorityKey ||
+      !selectedSnapshotIsFreshAuthoritative ||
+      !selectedHasActiveChildDelegation
+    ) return
+
+    const current = inspectorExecutionStatesRef.current.get(inspectorExecutionAuthorityKey)
+    if (current?.autoPresented || current?.dismissed || current?.touched) return
+    if (inspectorOpen) {
+      rememberInspectorExecutionState(inspectorExecutionStatesRef.current, inspectorExecutionAuthorityKey, {
+        autoPresented: false,
+        dismissed: false,
+        managed: false,
+        reviewPresented: false,
+        touched: true,
+      })
+      return
+    }
+
+    rememberInspectorExecutionState(inspectorExecutionStatesRef.current, inspectorExecutionAuthorityKey, {
+      autoPresented: true,
+      dismissed: false,
+      managed: true,
+      reviewPresented: false,
+      touched: false,
+    })
+    const activeElement = document.activeElement
+    inspectorReturnTargetRef.current = activeElement instanceof HTMLElement &&
+      activeElement !== document.body &&
+      activeElement !== document.documentElement &&
+      activeElement.isConnected
+      ? activeElement
+      : inspectorToggleRef.current
+    setInspectorTab('Session')
+    setManagedInspectorAuthorityKey(inspectorExecutionAuthorityKey)
+  }, [
+    inspectorExecutionAuthorityKey,
+    inspectorIsOverlay,
+    inspectorOpen,
+    selectedHasActiveChildDelegation,
+    selectedSnapshotIsFreshAuthoritative,
+    surface,
+  ])
+
+  useEffect(() => {
+    if (!selectedHasCurrentOutcome || !inspectorExecutionAuthorityKey || !inspectorOpen) return
+    const current = inspectorExecutionStatesRef.current.get(inspectorExecutionAuthorityKey)
+    if (
+      !current?.managed ||
+      current.touched ||
+      current.dismissed ||
+      current.reviewPresented ||
+      inspectorTab !== 'Session'
+    ) return
+    const activeElement = document.activeElement
+    if (
+      activeElement instanceof HTMLElement &&
+      inspectorPanelRef.current?.contains(activeElement)
+    ) {
+      rememberInspectorExecutionState(inspectorExecutionStatesRef.current, inspectorExecutionAuthorityKey, {
+        ...current,
+        managed: false,
+        touched: true,
+      })
+      return
+    }
+    rememberInspectorExecutionState(inspectorExecutionStatesRef.current, inspectorExecutionAuthorityKey, {
+      ...current,
+      reviewPresented: true,
+    })
+    setInspectorTab('Review')
+  }, [inspectorExecutionAuthorityKey, inspectorOpen, inspectorTab, selectedHasCurrentOutcome])
+
+  const openContinuityInspector = useCallback((trigger: HTMLElement) => {
+    openInspectorView(trigger, selectedHasCurrentOutcome ? 'Review' : 'Session')
+  }, [openInspectorView, selectedHasCurrentOutcome])
 
   useLayoutEffect(() => {
     if (residentExtensionUiOwnsAttention || !residentExtensionUiPromptOwnedFocusRef.current) return
@@ -2835,7 +3017,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       }
       if (command === 'toggle-inspector') {
         setSidebarOpen(false)
-        setInspectorOpen((value) => !value)
+        if (inspectorOpen) {
+          closeInspector()
+        } else {
+          markInspectorTouched()
+          setInspectorOpen(true)
+        }
         return
       }
       if (command === 'models') {
@@ -2862,6 +3049,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     canLoadModelCatalog,
     canManageComputers,
     canProvisionResident,
+    closeInspector,
+    inspectorOpen,
+    markInspectorTouched,
     nativeShellBridge,
     openCommandPalette,
     selectedHost,
@@ -3842,7 +4032,12 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 onClick={(event) => {
                   inspectorReturnTargetRef.current = event.currentTarget
                   setSidebarOpen(false)
-                  setInspectorOpen((value) => !value)
+                  if (inspectorOpen) {
+                    closeInspector()
+                  } else {
+                    markInspectorTouched()
+                    setInspectorOpen(true)
+                  }
                 }}
               >
                 <Icon icon={inspectorOpen ? PanelRightClose : ListChecks} size={18} />
@@ -4065,6 +4260,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             presentation={selectedTaskRun}
             runtime={selectedRuntime}
             agents={snapshot.agents}
+            hasReviewResult={selectedHasCurrentOutcome}
             onDraftChange={rememberComposerText}
             onClearValidation={clearComposerValidation}
             showTaskStarters={!selectedThreadUsesLaunchpad && !selectedRuntimeHasLiveActivity}
@@ -4081,7 +4277,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               modelsDialogTriggerRef.current = trigger
               setModelsOpen(true)
             }}
-            onManageSession={openSessionManager}
+            onManageSession={openContinuityInspector}
             onSubmitText={submitComposerText}
             onStop={() => void stopResidentTurn()}
             onEndResident={(trigger) => void reviewResidentEnd(trigger, selectedResidentEnd)}
@@ -4099,7 +4295,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           taskRun={selectedTaskRun}
           activeTab={inspectorTab}
           open={inspectorOpen}
-          onTabChange={setInspectorTab}
+          onTabChange={selectInspectorTab}
           onClose={closeInspector}
           containerRef={inspectorPanelRef}
           modal={inspectorIsModal}
@@ -4868,6 +5064,7 @@ interface ComposerProps {
   presentation: TaskRunPresentation
   runtime: RuntimeSummary
   agents: WorkbenchSnapshot['agents']
+  hasReviewResult?: boolean
   onDraftChange: (authorityKey: string, value: string) => void
   onClearValidation: () => void
   showTaskStarters?: boolean
@@ -4891,8 +5088,9 @@ function SessionContinuity({
   presentation,
   runtime,
   agents,
+  hasReviewResult = false,
   onManageSession,
-}: Pick<ComposerProps, 'presentation' | 'runtime' | 'agents' | 'onManageSession'>) {
+}: Pick<ComposerProps, 'presentation' | 'runtime' | 'agents' | 'hasReviewResult' | 'onManageSession'>) {
   const isFresh = presentation.kind !== 'disconnected' && presentation.kind !== 'stale'
   const activeAgents = agents.filter((agent) =>
     agent.status === 'pending' ||
@@ -4973,16 +5171,16 @@ function SessionContinuity({
           <button
             className={cx(
               'session-continuity__manage',
-              activeAgents.length > 0 && 'session-continuity__manage--agents',
+              !hasReviewResult && activeAgents.length > 0 && 'session-continuity__manage--agents',
             )}
             type="button"
             onClick={(event) => onManageSession(event.currentTarget)}
           >
             <span className="session-continuity__manage-icon">
-              <Icon icon={activeAgents.length > 0 ? GitFork : MoreHorizontal} size={16} />
+              <Icon icon={hasReviewResult ? CheckCircle2 : activeAgents.length > 0 ? GitFork : MoreHorizontal} size={16} />
             </span>
             <span className="session-continuity__manage-label">
-              {activeAgents.length > 0 ? 'View agents' : 'Session'}
+              {hasReviewResult ? 'Review result' : activeAgents.length > 0 ? 'View agents' : 'Session'}
             </span>
           </button>
         )}
@@ -5020,7 +5218,7 @@ function TaskStarters({
   )
 }
 
-function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, presentation, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
+function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, presentation, runtime, agents, hasReviewResult = false, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
   const [text, setText] = useState(initialText)
   const [starterGuidance, setStarterGuidance] = useState('')
   const submissionInFlightRef = useRef(false)
@@ -5138,8 +5336,9 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 : continuityOwnsVisibleState
                   ? ''
                   : presentation.detail
+  const showModelChip = modelCatalogAvailable && !endLifecyclePresent && !modelSetupPrimary
 
-  if (endCompleted || waitingForExtensionResponse) {
+  if (endCompleted || waitingForExtensionResponse || presentation.kind === 'complete') {
     return (
       <footer className={cx(
         'composer-wrap composer-wrap--compact',
@@ -5149,6 +5348,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
           presentation={presentation}
           runtime={runtime}
           agents={agents}
+          hasReviewResult={hasReviewResult}
           onManageSession={onManageSession}
         />
       </footer>
@@ -5158,7 +5358,13 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
       {showSessionContinuity && presentation.kind !== 'ending' && presentation.kind !== 'stopping' && (
-        <SessionContinuity presentation={presentation} runtime={runtime} agents={agents} onManageSession={onManageSession} />
+        <SessionContinuity
+          presentation={presentation}
+          runtime={runtime}
+          agents={agents}
+          hasReviewResult={hasReviewResult}
+          onManageSession={onManageSession}
+        />
       )}
       {!compactComposer && showTaskStarters && (
         <TaskStarters
@@ -5251,7 +5457,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
 
         <div className="composer__actions">
           <div className="composer__secondary-actions">
-            {modelCatalogAvailable && !endLifecyclePresent && !modelSetupPrimary && (
+            {showModelChip && (
               <button
                 className="model-chip"
                 type="button"

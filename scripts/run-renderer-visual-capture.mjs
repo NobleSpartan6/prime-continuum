@@ -16,6 +16,7 @@ const expectedTargets = [
   ['desktop-idle', 1600, 1000, 'idle', undefined],
   ['desktop-investigation', 1600, 1000, 'idle', undefined],
   ['desktop-rlm-activity', 1200, 800, 'rlm-activity', undefined],
+  ['desktop-rlm-outcome', 1200, 800, 'rlm-outcome', undefined],
   ['desktop-extension-question', 1200, 800, 'extension-ui-confirm', undefined],
   ['mobile-extension-question-390', 390, 844, 'extension-ui-confirm', undefined],
   ['mobile-idle-390', 390, 844, 'idle', undefined],
@@ -199,6 +200,14 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     || ((name === 'desktop-agent-launchpad' || name === 'mobile-agent-launchpad-390') &&
       result.stateEvidence?.launchpadContinuitySuppressed !== true)
     || (name === 'mobile-inspector-390' && result.stateEvidence?.responsiveDrawerBounded !== true)
+    || (!name.startsWith('hud-') && result.stateEvidence?.workbenchShellPresent === true && (
+        result.stateEvidence?.topbarLeadingPresent !== true ||
+        result.stateEvidence?.topbarLeadingBounded !== true ||
+        result.stateEvidence?.topbarLeadingControlVisible !== true ||
+        (width >= 800 && result.stateEvidence?.topbarLeadingMarkVisible !== true)
+      ))
+    || (name === 'desktop-rlm-activity' && result.stateEvidence?.dockedComposerBounded !== true)
+    || (name === 'desktop-rlm-outcome' && result.stateEvidence?.outcomeBranchHierarchyBounded !== true)
     || (name.startsWith('hud-') && (
       result.stateEvidence?.hudSurfaceVisible !== true ||
       result.stateEvidence?.hudStatusVisible !== true ||

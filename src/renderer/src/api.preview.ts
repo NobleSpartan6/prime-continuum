@@ -374,6 +374,7 @@ export type PreviewVisualState =
   | 'reconnecting'
   | 'idle'
   | 'rlm-activity'
+  | 'rlm-outcome'
   | 'extension-ui-confirm'
   | 'launchpad'
   | 'model-selection'
@@ -399,6 +400,7 @@ const PREVIEW_VISUAL_STATES = new Set<PreviewVisualState>([
   'reconnecting',
   'idle',
   'rlm-activity',
+  'rlm-outcome',
   'extension-ui-confirm',
   'launchpad',
   'model-selection',
@@ -734,6 +736,81 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     if (!previewUpdate) return
     previewUpdate.body = previewSimulation(body)
     previewUpdate.detail = previewSimulation(detail)
+  }
+
+  if (visualState === 'rlm-outcome') {
+    const executionGenerationId = 'execution-preview-rlm-outcome'
+    const cursor = {
+      threadId: selectedThread.remoteId ?? selectedThread.id,
+      executionGenerationId,
+      generation: 'cursor-preview-rlm-outcome',
+      sequence: 7,
+    }
+    selectedThread.status = 'complete'
+    selectedThread.workspaceId = 'workspace-preview-rlm-outcome'
+    selectedThread.executionGenerationId = executionGenerationId
+    selectedThread.transcript.push({
+      id: 'block-preview-rlm-outcome',
+      kind: 'assistant',
+      author: 'Prime Agent',
+      time: '9:52 AM',
+      body: previewSimulation('the delegated interface review returned one cohesive result with recursive provenance.'),
+      detail: previewSimulation('fixture outcome only; no provider or host command ran'),
+    })
+    snapshot.snapshotAuthority = {
+      source: 'live',
+      generatedAt: '2026-08-13T13:52:00.000Z',
+      cursor,
+    }
+    snapshot.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-preview-rlm-outcome',
+      receiptId: 'receipt-preview-rlm-outcome',
+      observedAt: '2026-08-13T13:52:00.000Z',
+      observedCursor: cursor,
+      terminalAssistant: {
+        blockId: 'block-preview-rlm-outcome',
+        stopReason: 'stop',
+      },
+    }
+    // Deliberately publish the grandchild before its ancestors. OutcomeReview
+    // must restore recursive provenance rather than trusting snapshot order.
+    snapshot.agents = [
+      {
+        id: 'agent-outcome-proof',
+        parentId: 'agent-outcome-interface',
+        name: 'Responsive proof',
+        role: 'Visual verification',
+        status: 'complete',
+        hostName: 'This computer',
+        answerPreview: previewSimulation('all bounded workbench captures passed.'),
+        repliedSinceTask: true,
+      },
+      {
+        id: 'agent-outcome-lead',
+        name: 'Outcome lead',
+        role: 'RLM coordinator',
+        status: 'complete',
+        hostName: 'devbox',
+        answerPreview: previewSimulation('the final interface direction is ready to review.'),
+        repliedSinceTask: true,
+      },
+      {
+        id: 'agent-outcome-interface',
+        parentId: 'agent-outcome-lead',
+        name: 'Interface branch',
+        role: 'Interaction design',
+        status: 'complete',
+        hostName: 'devbox',
+        answerPreview: previewSimulation('the run map now reveals power without taking over the workspace.'),
+        repliedSinceTask: true,
+      },
+    ]
+    snapshot.runtime.agentsReported = true
+    snapshot.operations.startResidentTurn = true
+    snapshot.operations.stopResidentTurn = false
+    snapshot.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+    return snapshot
   }
 
   if (

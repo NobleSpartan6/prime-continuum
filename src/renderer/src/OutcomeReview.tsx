@@ -7,7 +7,7 @@ import {
   Clock3,
   type LucideIcon,
 } from 'lucide-react'
-import { memo, useId, useState } from 'react'
+import { memo, useId, useMemo, useState, type CSSProperties } from 'react'
 
 import type { AgentSummary, EvidenceSummary } from './api'
 import { TranscriptBody } from './TranscriptBody'
@@ -43,6 +43,14 @@ const NUMBER_FORMATTER = new Intl.NumberFormat()
 const COMPACT_NUMBER_FORMATTER = new Intl.NumberFormat(undefined, { notation: 'compact' })
 const RESULT_DISCLOSURE_CHARACTER_THRESHOLD = 420
 const RESULT_DISCLOSURE_LINE_THRESHOLD = 6
+const MAX_BRANCH_RETURN_VISUAL_DEPTH = 4
+
+interface BranchReturn {
+  agent: AgentSummary
+  depth: number
+  parent?: AgentSummary
+  result: string
+}
 
 function Icon({ icon: IconComponent, size = 15 }: { icon: LucideIcon; size?: number }) {
   return <IconComponent aria-hidden="true" focusable="false" size={size} strokeWidth={1.75} />
@@ -77,6 +85,40 @@ function agentStateLabel(status: AgentSummary['status']): string {
   if (status === 'waiting') return 'Waiting'
   if (status === 'queued') return 'Queued'
   return 'Pending'
+}
+
+function orderedBranchReturns(agents: readonly AgentSummary[] | undefined): BranchReturn[] {
+  if (!agents) return []
+
+  const byId = new Map(agents.map((agent) => [agent.id, agent]))
+  const children = new Map<string, AgentSummary[]>()
+  const roots: AgentSummary[] = []
+
+  for (const agent of agents) {
+    if (agent.parentId && agent.parentId !== agent.id && byId.has(agent.parentId)) {
+      const siblings = children.get(agent.parentId) ?? []
+      siblings.push(agent)
+      children.set(agent.parentId, siblings)
+    } else {
+      roots.push(agent)
+    }
+  }
+
+  const rows: BranchReturn[] = []
+  const visited = new Set<string>()
+  const visit = (agent: AgentSummary, depth: number, parent?: AgentSummary): void => {
+    if (visited.has(agent.id)) return
+    visited.add(agent.id)
+    const result = agentResult(agent)
+    if (result) rows.push({ agent, depth, parent, result })
+    children.get(agent.id)?.forEach((child) => visit(child, depth + 1, agent))
+  }
+
+  roots.forEach((agent) => visit(agent, 0))
+  // Malformed cyclic relationships have no root. Preserve their evidence once
+  // in first-seen order while the visited set keeps traversal bounded.
+  agents.forEach((agent) => visit(agent, 0))
+  return rows
 }
 
 function compactCount(value: number): string {
@@ -128,7 +170,7 @@ export const OutcomeReview = memo(function OutcomeReview({
   const stateMeta = OUTCOME_STATE[state]
   const passedChecks = evidence?.filter((item) => item.status === 'passed').length
   const returnedBranches = childAgents?.filter((agent) => agent.status === 'complete').length
-  const branchReturns = childAgents?.filter((agent) => agentResult(agent) !== undefined) ?? []
+  const branchReturns = useMemo(() => orderedBranchReturns(childAgents), [childAgents])
   const writtenResult = result?.trim()
   const resultIsLong = writtenResult ? resultNeedsDisclosure(writtenResult) : false
 
@@ -230,15 +272,25 @@ export const OutcomeReview = memo(function OutcomeReview({
             <h3 id={`${headingId}-branches`}>Branch returns</h3>
           </div>
           <ul className="outcome-review__list" aria-label="RLM child outcomes">
-            {branchReturns.map((agent) => (
-              <li className="outcome-review__row" key={agent.id} data-agent-state={agent.status}>
+            {branchReturns.map(({ agent, depth, parent, result: branchResult }) => (
+              <li
+                className="outcome-review__row outcome-review__row--branch"
+                key={agent.id}
+                data-agent-state={agent.status}
+                data-branch-depth={depth}
+                data-branch-parent={parent?.id}
+                style={{ '--outcome-branch-depth': Math.min(depth, MAX_BRANCH_RETURN_VISUAL_DEPTH) } as CSSProperties}
+              >
                 <span className="outcome-review__row-icon"><Icon icon={agentIcon(agent.status)} /></span>
                 <span className="outcome-review__row-body">
                   <span className="outcome-review__row-title">
                     <strong>{agentDisplayName(agent)}</strong>
                     <span>{agentStateLabel(agent.status)}</span>
                   </span>
-                  <span>{agentResult(agent)}</span>
+                  {parent ? (
+                    <span className="outcome-review__row-parent">via {agentDisplayName(parent)}</span>
+                  ) : null}
+                  <span>{branchResult}</span>
                 </span>
               </li>
             ))}
