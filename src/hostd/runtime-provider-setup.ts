@@ -32,6 +32,7 @@ export interface MacOSRuntimeProviderSetupHandoffOptions {
   readonly systemOpen?: string;
   readonly environment?: Readonly<NodeJS.ProcessEnv>;
   readonly runOpen?: typeof runMacOSRuntimeProviderSetupOpen;
+  readonly verifySystemOpen?: (path: string) => Promise<void>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -56,6 +57,7 @@ export class MacOSRuntimeProviderSetupHandoff implements RuntimeProviderSetupHan
   private readonly systemOpen: string;
   private readonly environment: Readonly<NodeJS.ProcessEnv>;
   private readonly runOpen: typeof runMacOSRuntimeProviderSetupOpen;
+  private readonly verifySystemOpen: (path: string) => Promise<void>;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private active:
     | { readonly controller: AbortController; readonly result: Promise<RuntimeProviderSetupResult> }
@@ -70,6 +72,7 @@ export class MacOSRuntimeProviderSetupHandoff implements RuntimeProviderSetupHan
     this.systemOpen = boundedAbsolutePath(options.systemOpen ?? SYSTEM_OPEN, "macOS open tool");
     this.environment = options.environment ?? process.env;
     this.runOpen = options.runOpen ?? runMacOSRuntimeProviderSetupOpen;
+    this.verifySystemOpen = options.verifySystemOpen ?? assertRootOwnedExecutable;
     this.sleep = options.sleep ?? delay;
   }
 
@@ -80,7 +83,7 @@ export class MacOSRuntimeProviderSetupHandoff implements RuntimeProviderSetupHan
       this.credentialSecurity.capabilityAvailable?.() === false
     ) return false;
     try {
-      await assertRootOwnedExecutable(this.systemOpen);
+      await this.verifySystemOpen(this.systemOpen);
       return true;
     } catch {
       return false;
@@ -127,7 +130,7 @@ export class MacOSRuntimeProviderSetupHandoff implements RuntimeProviderSetupHan
     let effectAccepted = false;
     try {
       if (this.platform !== "darwin") return { ...base, state: "failed_before_launch" };
-      await assertRootOwnedExecutable(this.systemOpen);
+      await this.verifySystemOpen(this.systemOpen);
       await this.credentialSecurity.assertStillSecure({ force: true });
       const handle = await this.runtimeHandles.acquireVerifiedRuntimeHandle();
       if (handle.identity.releaseVersion !== authority.expectedReleaseVersion) {
