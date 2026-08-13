@@ -59,6 +59,16 @@ const targets = [
     expectedText: 'RLM delegation',
     openInspector: true,
     selectRuntimeTab: true,
+    expectDockedComposerBounded: true,
+  },
+  {
+    name: 'desktop-rlm-outcome',
+    width: 1200,
+    height: 800,
+    visualState: 'rlm-outcome',
+    expectedText: 'Outcome lead',
+    openInspector: true,
+    expectOutcomeBranchHierarchy: true,
   },
   {
     name: 'desktop-extension-question',
@@ -612,6 +622,19 @@ async function capture(target, rendererOrigin) {
       invariant(hierarchyStartsNearTop, `${target.name} hid the agent hierarchy below session details`)
       await delay(150)
     }
+    if (target.expectOutcomeBranchHierarchy) {
+      const branchHierarchyStaged = await browserWindow.webContents.executeJavaScript(`(() => {
+        const panel = document.querySelector('#inspector-panel-review')
+        const heading = [...document.querySelectorAll('.outcome-review__section h3')]
+          .find((candidate) => candidate.textContent?.trim() === 'Branch returns')
+        const branches = heading?.closest('.outcome-review__section')
+        if (!(panel instanceof HTMLElement) || !(branches instanceof HTMLElement)) return false
+        panel.scrollTop += branches.getBoundingClientRect().top - panel.getBoundingClientRect().top
+        return true
+      })()`)
+      invariant(branchHierarchyStaged, `${target.name} did not expose the recursive outcome hierarchy`)
+      await delay(250)
+    }
     if (target.openModelsDialog) {
       // Paint the real native surface offscreen, then use the visible composer
       // action that a person would use. Model, OAuth, and account-refresh
@@ -1097,10 +1120,14 @@ async function capture(target, rendererOrigin) {
       const topbarControls = document.querySelector('.topbar__controls')
       const topbarTitle = document.querySelector('.topbar__thread-copy h1')
       const topbarBrand = document.querySelector('.topbar__brand-name')
+      const topbarSidebarControl = topbarLeading?.querySelector('.topbar__sidebar-control')
+      const topbarMark = topbarLeading?.querySelector('.brand-mark')
       const topbarLeadingRect = topbarLeading?.getBoundingClientRect()
       const topbarThreadRect = topbarThread?.getBoundingClientRect()
       const topbarControlsRect = topbarControls?.getBoundingClientRect()
       const topbarTitleRect = topbarTitle?.getBoundingClientRect()
+      const topbarSidebarControlRect = topbarSidebarControl?.getBoundingClientRect()
+      const topbarMarkRect = topbarMark?.getBoundingClientRect()
       const topbarBrandStyle = topbarBrand ? window.getComputedStyle(topbarBrand) : undefined
       const taskStarters = document.querySelector('.task-starters')
       const taskStartersStyle = taskStarters ? window.getComputedStyle(taskStarters) : undefined
@@ -1114,13 +1141,37 @@ async function capture(target, rendererOrigin) {
       const responsiveInspector = document.querySelector('.inspector')
       const responsiveInspectorRect = responsiveInspector?.getBoundingClientRect()
       const responsiveInspectorStyle = responsiveInspector ? window.getComputedStyle(responsiveInspector) : undefined
+      const outcomeReviewPanelRect = document.querySelector('#inspector-panel-review')?.getBoundingClientRect()
+      const outcomeBranchRows = [...document.querySelectorAll('.outcome-review__row--branch')]
+      const outcomeBranchEvidence = outcomeBranchRows.map((row) => ({
+        title: row.querySelector('.outcome-review__row-title strong')?.textContent?.trim() ?? '',
+        parentLabel: row.querySelector('.outcome-review__row-parent')?.textContent?.trim() ?? '',
+        depth: row.getAttribute('data-branch-depth'),
+        parent: row.getAttribute('data-branch-parent'),
+        rect: row.getBoundingClientRect().toJSON(),
+      }))
       const extensionQuestion = document.querySelector('.prime-interaction')
       const extensionQuestionRect = extensionQuestion?.getBoundingClientRect()
       const extensionConfirm = [...(extensionQuestion?.querySelectorAll('button') ?? [])]
         .find((candidate) => candidate.textContent?.trim() === 'Confirm')
+      const appShell = document.querySelector('.app-shell')
+      const composerWrap = document.querySelector('.composer-wrap')
+      const composer = composerWrap?.querySelector('.composer')
+      const composerActions = composer?.querySelector('.composer__actions')
+      const composerSecondaryActions = composer?.querySelector('.composer__secondary-actions')
+      const composerPrimaryActions = composer?.querySelector('.composer__primary-actions')
+      const composerPrimaryButton = composerPrimaryActions?.querySelector('.button')
+      const composerWrapRect = composerWrap?.getBoundingClientRect()
+      const composerRect = composer?.getBoundingClientRect()
+      const composerPrimaryButtonRect = composerPrimaryButton?.getBoundingClientRect()
+      const composerActionsStyle = composerActions ? window.getComputedStyle(composerActions) : undefined
       return {
+        workbenchShellPresent: Boolean(appShell),
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
+        emptyComposerAbsent: ${Boolean(target.expectOutcomeBranchHierarchy)}
+          ? !document.querySelector('.composer')
+          : undefined,
         composerStatusVisible: Boolean(status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0),
         taskStatusVisible: Boolean(
           (status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0) ||
@@ -1282,6 +1333,39 @@ async function capture(target, rendererOrigin) {
           topbarTitleRect.right <= topbarThreadRect.right + 1 &&
           topbarBrandStyle?.display === 'none'
         ),
+        topbarLeadingPresent: Boolean(topbarLeading),
+        topbarLeadingBounded: Boolean(
+          topbarLeading &&
+          topbarLeading.clientWidth > 0 &&
+          topbarLeading.scrollWidth <= topbarLeading.clientWidth
+        ),
+        topbarLeadingClientWidth: topbarLeading?.clientWidth,
+        topbarLeadingScrollWidth: topbarLeading?.scrollWidth,
+        topbarLeadingEssentialsVisible: Boolean(
+          topbarLeadingRect &&
+          topbarSidebarControlRect &&
+          topbarMarkRect &&
+          topbarSidebarControlRect.width > 0 &&
+          topbarMarkRect.width > 0 &&
+          topbarSidebarControlRect.left >= topbarLeadingRect.left &&
+          topbarSidebarControlRect.right <= topbarLeadingRect.right &&
+          topbarMarkRect.left >= topbarLeadingRect.left &&
+          topbarMarkRect.right <= topbarLeadingRect.right
+        ),
+        topbarLeadingControlVisible: Boolean(
+          topbarLeadingRect &&
+          topbarSidebarControlRect &&
+          topbarSidebarControlRect.width > 0 &&
+          topbarSidebarControlRect.left >= topbarLeadingRect.left &&
+          topbarSidebarControlRect.right <= topbarLeadingRect.right
+        ),
+        topbarLeadingMarkVisible: Boolean(
+          topbarLeadingRect &&
+          topbarMarkRect &&
+          topbarMarkRect.width > 0 &&
+          topbarMarkRect.left >= topbarLeadingRect.left &&
+          topbarMarkRect.right <= topbarLeadingRect.right
+        ),
         boundedTaskStarters: Boolean(
           taskStarters &&
           taskStartersRect &&
@@ -1319,6 +1403,43 @@ async function capture(target, rendererOrigin) {
           responsiveInspectorRect.right <= window.innerWidth &&
           responsiveInspector?.textContent?.includes('Review') &&
           responsiveInspector.textContent.includes('Outcome')
+        ),
+        dockedComposerBounded: Boolean(
+          appShell?.getAttribute('data-inspector-open') === 'true' &&
+          composerWrapRect &&
+          composerRect &&
+          composerPrimaryButtonRect &&
+          composerWrapRect.width > 0 &&
+          composerWrapRect.width <= 44 * 16 &&
+          composerActionsStyle?.flexWrap === 'wrap' &&
+          composer.scrollWidth <= composer.clientWidth &&
+          composerActions && composerActions.scrollWidth <= composerActions.clientWidth &&
+          composerSecondaryActions && composerSecondaryActions.scrollWidth <= composerSecondaryActions.clientWidth &&
+          composerPrimaryActions && composerPrimaryActions.scrollWidth <= composerPrimaryActions.clientWidth &&
+          composerPrimaryButtonRect.left >= composerRect.left &&
+          composerPrimaryButtonRect.right <= composerRect.right
+        ),
+        outcomeBranchEvidence,
+        outcomeBranchHierarchyBounded: Boolean(
+          responsiveInspectorRect &&
+          outcomeReviewPanelRect &&
+          !document.querySelector('.composer') &&
+          outcomeBranchEvidence.length === 3 &&
+          outcomeBranchEvidence[0]?.title === 'Outcome lead' &&
+          outcomeBranchEvidence[1]?.title === 'Interface branch' &&
+          outcomeBranchEvidence[1]?.parentLabel === 'via Outcome lead' &&
+          outcomeBranchEvidence[1]?.depth === '1' &&
+          outcomeBranchEvidence[1]?.parent === 'agent-outcome-lead' &&
+          outcomeBranchEvidence[2]?.title === 'Responsive proof' &&
+          outcomeBranchEvidence[2]?.parentLabel === 'via Interface branch' &&
+          outcomeBranchEvidence[2]?.depth === '2' &&
+          outcomeBranchEvidence[2]?.parent === 'agent-outcome-interface' &&
+          outcomeBranchEvidence.every(({ rect }) =>
+            rect.left >= responsiveInspectorRect.left &&
+            rect.right <= responsiveInspectorRect.right &&
+            rect.top >= outcomeReviewPanelRect.top &&
+            rect.bottom <= Math.min(outcomeReviewPanelRect.bottom, window.innerHeight)
+          )
         ),
       }
     })()`)
@@ -1485,6 +1606,33 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectResponsiveDrawer) {
       invariant(stateEvidence.responsiveDrawerBounded, `${target.name} did not keep the responsive inspector drawer within the viewport`)
+    }
+    if (!target.expectHud && stateEvidence.workbenchShellPresent) {
+      invariant(
+        stateEvidence.topbarLeadingPresent &&
+        stateEvidence.topbarLeadingBounded &&
+        stateEvidence.topbarLeadingControlVisible &&
+        (target.width < 800 || stateEvidence.topbarLeadingMarkVisible),
+        `${target.name} overflowed the desktop titlebar leading region: ${JSON.stringify({
+          clientWidth: stateEvidence.topbarLeadingClientWidth,
+          scrollWidth: stateEvidence.topbarLeadingScrollWidth,
+          controlVisible: stateEvidence.topbarLeadingControlVisible,
+          markVisible: stateEvidence.topbarLeadingMarkVisible,
+        })}`,
+      )
+    }
+    if (target.expectDockedComposerBounded) {
+      invariant(stateEvidence.dockedComposerBounded, `${target.name} did not keep the 512px docked-inspector composer bounded: ${JSON.stringify({ layout, stateEvidence })}`)
+    }
+    if (target.expectOutcomeBranchHierarchy) {
+      invariant(
+        stateEvidence.outcomeBranchHierarchyBounded,
+        `${target.name} did not preserve a bounded parent-first RLM outcome hierarchy: ${JSON.stringify(stateEvidence.outcomeBranchEvidence)}`,
+      )
+      invariant(
+        stateEvidence.emptyComposerAbsent,
+        `${target.name} retained an empty composer below the completed outcome`,
+      )
     }
     const image = await browserWindow.webContents.capturePage()
     const outputPath = join(outputDirectory, `${target.name}.png`)

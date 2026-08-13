@@ -414,6 +414,65 @@ function createIdleResidentApi() {
   return api
 }
 
+function createInspectorLifecycleHarness() {
+  const api = createPreviewRendererApi()
+  let current = structuredClone(previewSnapshot)
+  const listeners = new Set<(snapshot: WorkbenchSnapshot) => void>()
+  const thread = current.threads.find((candidate) => candidate.id === 'thread-complete')
+  const host = current.hosts.find((candidate) => candidate.id === thread?.hostId)
+  if (!thread || !host || !current.runtime.session) throw new Error('Expected the inspector lifecycle fixture')
+  current.selectedThreadId = thread.id
+  current.selectedProjectId = thread.projectId
+  thread.status = 'idle'
+  thread.executionGenerationId = 'execution-inspector-one'
+  thread.workspaceId = 'workspace-inspector-one'
+  host.connection = 'online'
+  host.activationRequired = false
+  current.runtime.session = {
+    ...current.runtime.session,
+    isStreaming: false,
+    isCompacting: false,
+    isBashRunning: false,
+    queuedActionCount: 0,
+    activeToolNames: [],
+  }
+  current.runtime.queue = { pendingCount: 0, paused: false }
+  current.runtime.agentsReported = true
+  current.agents = []
+  current.snapshotAuthority = {
+    source: 'live',
+    generatedAt: '2026-08-13T13:00:00.000Z',
+    cursor: {
+      threadId: thread.id,
+      executionGenerationId: thread.executionGenerationId,
+      generation: 'cursor-inspector-one',
+      sequence: 1,
+    },
+  }
+  delete current.latestTurnOutcome
+  current.operations = {
+    ...current.operations,
+    submitCommands: true,
+    startResidentTurn: true,
+    stopResidentTurn: false,
+  }
+  current.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
+  api.loadWorkbench = vi.fn(async () => structuredClone(current))
+  api.subscribe = vi.fn((listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  })
+  const publish = (next: WorkbenchSnapshot) => {
+    current = structuredClone(next)
+    listeners.forEach((listener) => listener(structuredClone(current)))
+  }
+  return {
+    api,
+    snapshot: () => structuredClone(current),
+    publish,
+  }
+}
+
 function createContinuityApi(options: {
   taskState: WorkbenchSnapshot['threads'][number]['status']
   connection?: WorkbenchSnapshot['hosts'][number]['connection']
@@ -4083,6 +4142,367 @@ describe('Prime Continuim renderer', () => {
     expect(within(sessionPanel).getByRole('heading', { name: 'Manage session' })).toBeVisible()
   })
 
+  it('presents the docked inspector once for fresh child work without stealing focus, then respects dismissal', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const user = userEvent.setup()
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    composer.focus()
+    const active = harness.snapshot()
+    active.agents = [{
+      id: 'inspector-child-one',
+      name: 'Interface auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Reviewing the workbench hierarchy',
+    }]
+    act(() => harness.publish(active))
+
+    const inspectorToggle = document.querySelector<HTMLButtonElement>('.topbar__inspector-control')
+    if (!inspectorToggle) throw new Error('Expected the inspector toggle')
+    await waitFor(() => expect(inspectorToggle).toHaveAttribute('aria-expanded', 'true'))
+    expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
+    expect(composer).toHaveFocus()
+    await waitFor(() => {
+      const saved = window.localStorage.getItem('prime.renderer.workbench-layout.v1')
+      expect(saved).not.toBeNull()
+      expect(JSON.parse(saved!).inspectorOpen).toBe(false)
+    })
+
+    const inspector = document.getElementById('thread-inspector')
+    if (!inspector) throw new Error('Expected the docked inspector')
+    const closeButton = within(inspector).getByRole('button', { name: 'Close inspector' })
+    closeButton.focus()
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(composer).toHaveFocus())
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
+
+    // The same execution stays dismissed even if another fresh child update arrives.
+    const stillActive = harness.snapshot()
+    stillActive.agents = [{
+      ...stillActive.agents[0]!,
+      id: 'inspector-child-one-more',
+      status: 'running',
+      activity: 'Continuing the same execution',
+    }]
+    act(() => harness.publish(stillActive))
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
+
+    const completed = harness.snapshot()
+    completed.agents = [{
+      ...completed.agents[0]!,
+      status: 'complete',
+      activity: 'Review complete',
+      answerPreview: 'The workbench hierarchy is clear.',
+    }]
+    completed.snapshotAuthority = {
+      ...completed.snapshotAuthority!,
+      generatedAt: '2026-08-13T13:00:05.000Z',
+      cursor: { ...completed.snapshotAuthority!.cursor, sequence: 2 },
+    }
+    completed.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-inspector-one',
+      receiptId: 'receipt-inspector-one',
+      observedAt: '2026-08-13T13:00:05.000Z',
+      observedCursor: { ...completed.snapshotAuthority.cursor },
+    }
+    act(() => harness.publish(completed))
+
+    const reviewResult = await screen.findByRole('button', { name: 'Review result' })
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false')
+    await user.click(reviewResult)
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true')
+
+    await user.click(within(inspector).getByRole('button', { name: 'Close inspector' }))
+    const nextExecution = harness.snapshot()
+    const nextThread = nextExecution.threads.find((candidate) => candidate.id === nextExecution.selectedThreadId)!
+    nextThread.executionGenerationId = 'execution-inspector-two'
+    nextExecution.agents = [{
+      ...nextExecution.agents[0]!,
+      id: 'inspector-child-two',
+      status: 'running',
+      activity: 'Reviewing a second execution',
+    }]
+    nextExecution.snapshotAuthority = {
+      source: 'live',
+      generatedAt: '2026-08-13T13:01:00.000Z',
+      cursor: {
+        threadId: nextThread.id,
+        executionGenerationId: nextThread.executionGenerationId,
+        generation: 'cursor-inspector-two',
+        sequence: 1,
+      },
+    }
+    delete nextExecution.latestTurnOutcome
+    act(() => harness.publish(nextExecution))
+
+    await waitFor(() => expect(inspectorToggle).toHaveAttribute('aria-expanded', 'true'))
+    expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('keeps a manually selected inspector tab when the exact outcome arrives', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const user = userEvent.setup()
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+
+    const active = harness.snapshot()
+    active.agents = [{
+      id: 'inspector-child-tab',
+      name: 'Evidence auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Checking evidence',
+    }]
+    act(() => harness.publish(active))
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true'))
+
+    await user.click(screen.getByRole('tab', { name: 'Evidence' }))
+    const completed = harness.snapshot()
+    completed.agents = [{ ...completed.agents[0]!, status: 'complete', activity: 'Evidence checked' }]
+    completed.snapshotAuthority = {
+      ...completed.snapshotAuthority!,
+      generatedAt: '2026-08-13T13:00:05.000Z',
+      cursor: { ...completed.snapshotAuthority!.cursor, sequence: 2 },
+    }
+    completed.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-inspector-tab',
+      receiptId: 'receipt-inspector-tab',
+      observedAt: '2026-08-13T13:00:05.000Z',
+      observedCursor: { ...completed.snapshotAuthority.cursor },
+    }
+    act(() => harness.publish(completed))
+
+    await screen.findByRole('button', { name: 'Review result' })
+    expect(screen.getByRole('tab', { name: 'Evidence' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'false')
+  })
+
+  it('moves an untouched system-presented inspector from Session to the exact Review result', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    const composer = screen.getByRole('textbox', { name: 'Task brief' })
+    composer.focus()
+
+    const active = harness.snapshot()
+    active.agents = [{
+      id: 'inspector-child-review',
+      name: 'Result auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Preparing the result',
+    }]
+    act(() => harness.publish(active))
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true'))
+    expect(composer).toHaveFocus()
+
+    const completed = harness.snapshot()
+    completed.agents = [{
+      ...completed.agents[0]!,
+      status: 'complete',
+      activity: 'Result ready',
+      answerPreview: 'The exact review result is ready.',
+    }]
+    completed.snapshotAuthority = {
+      ...completed.snapshotAuthority!,
+      generatedAt: '2026-08-13T13:00:05.000Z',
+      cursor: { ...completed.snapshotAuthority!.cursor, sequence: 2 },
+    }
+    completed.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-inspector-review',
+      receiptId: 'receipt-inspector-review',
+      observedAt: '2026-08-13T13:00:05.000Z',
+      observedCursor: { ...completed.snapshotAuthority.cursor },
+    }
+    act(() => harness.publish(completed))
+
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true'))
+    expect(composer).toHaveFocus()
+    expect(screen.getByRole('button', { name: 'Review result' })).toBeVisible()
+  })
+
+  it('keeps Session selected when focus is inside the managed inspector as the exact outcome arrives', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+
+    const active = harness.snapshot()
+    active.agents = [{
+      id: 'inspector-child-focused',
+      name: 'Focused auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Reviewing the active session',
+    }]
+    act(() => harness.publish(active))
+    const sessionPanel = await screen.findByRole('tabpanel', { name: 'Session' })
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true'))
+    sessionPanel.focus()
+    expect(sessionPanel).toHaveFocus()
+
+    const completed = harness.snapshot()
+    completed.agents = [{
+      ...completed.agents[0]!,
+      status: 'complete',
+      activity: 'Review complete',
+      answerPreview: 'The exact result is ready.',
+    }]
+    completed.snapshotAuthority = {
+      ...completed.snapshotAuthority!,
+      generatedAt: '2026-08-13T13:00:05.000Z',
+      cursor: { ...completed.snapshotAuthority!.cursor, sequence: 2 },
+    }
+    completed.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-inspector-focused',
+      receiptId: 'receipt-inspector-focused',
+      observedAt: '2026-08-13T13:00:05.000Z',
+      observedCursor: { ...completed.snapshotAuthority.cursor },
+    }
+    act(() => harness.publish(completed))
+
+    await screen.findByRole('button', { name: 'Review result' })
+    expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'false')
+    expect(sessionPanel).toHaveFocus()
+  })
+
+  it('does not auto-open the desktop inspector for cached child activity', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1600 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+
+    const cached = harness.snapshot()
+    cached.snapshotAuthority = { ...cached.snapshotAuthority!, source: 'cached' }
+    cached.agents = [{
+      id: 'inspector-child-cached',
+      name: 'Last reported auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Last reported work',
+    }]
+    act(() => harness.publish(cached))
+
+    await waitFor(() => expect(within(screen.getByRole('region', { name: 'Session status' })).getByRole('button', { name: 'View agents' })).toBeVisible())
+    expect(document.querySelector('.topbar__inspector-control')).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('never auto-opens the inspector as a narrow overlay', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: query.includes('max-width'),
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(() => true),
+      })),
+    })
+    const harness = createInspectorLifecycleHarness()
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+
+    const active = harness.snapshot()
+    active.agents = [{
+      id: 'inspector-child-narrow',
+      name: 'Mobile auditor',
+      role: 'RLM branch',
+      status: 'running',
+      hostName: 'devbox',
+      activity: 'Checking the narrow layout',
+    }]
+    act(() => harness.publish(active))
+
+    await waitFor(() => expect(within(screen.getByRole('region', { name: 'Session status' })).getByRole('button', { name: 'View agents' })).toBeVisible())
+    expect(screen.getByRole('button', { name: 'Open inspector' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('dialog', { name: 'Thread inspector' })).not.toBeInTheDocument()
+  })
+
   it.each([
     { residency: 'resident' as const },
     { residency: 'client_owned' as const },
@@ -5816,6 +6236,15 @@ describe('Prime Continuim renderer', () => {
     expect(review.getByText('Current snapshot proof')).toBeVisible()
     expect(review.getByText('Visual-QA type check')).toBeVisible()
     expect(review.queryByText('Complete')).not.toBeInTheDocument()
+  })
+
+  it('collapses a completed task to its result continuity without an empty composer shell', async () => {
+    render(<App api={createPreviewRendererApi('rlm-outcome')} />)
+
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const continuity = screen.getByRole('region', { name: 'Session status' })
+    expect(within(continuity).getByRole('button', { name: 'Review result' })).toBeVisible()
+    expect(document.querySelector('.composer')).not.toBeInTheDocument()
   })
 
   it('does not attach a newer projection’s goals, branches, usage, or fixture proof to an older turn', async () => {

@@ -16,6 +16,15 @@ const evidence: EvidenceSummary[] = [
 
 const childAgents: AgentSummary[] = [
   {
+    id: 'runtime-audit',
+    parentId: 'interface-audit',
+    name: 'Runtime audit',
+    role: 'Runtime review',
+    status: 'failed',
+    hostName: 'This computer',
+    error: 'Provider access expired before the live check.',
+  },
+  {
     id: 'interface-audit',
     name: 'Long delegated prompt',
     sessionName: 'Interface audit',
@@ -23,14 +32,6 @@ const childAgents: AgentSummary[] = [
     status: 'complete',
     hostName: 'This computer',
     answerPreview: 'Removed the duplicate state rail.',
-  },
-  {
-    id: 'runtime-audit',
-    name: 'Runtime audit',
-    role: 'Runtime review',
-    status: 'failed',
-    hostName: 'This computer',
-    error: 'Provider access expired before the live check.',
   },
 ]
 
@@ -69,6 +70,43 @@ describe('OutcomeReview', () => {
     expect(within(branches).getByText('Interface audit')).toBeVisible()
     expect(within(branches).getByText('Removed the duplicate state rail.')).toBeVisible()
     expect(within(branches).getByText('Provider access expired before the live check.')).toBeVisible()
+    const branchRows = within(branches).getAllByRole('listitem')
+    expect(branchRows[0]).toHaveTextContent('Interface audit')
+    expect(branchRows[1]).toHaveTextContent('Runtime audit')
+    expect(branchRows[1]).toHaveTextContent('via Interface audit')
+    expect(branchRows[1]).toHaveAttribute('data-branch-depth', '1')
+    expect(branchRows[1]).toHaveAttribute('data-branch-parent', 'interface-audit')
+    expect(branchRows[1]?.style.getPropertyValue('--outcome-branch-depth')).toBe('1')
+  })
+
+  it('keeps malformed cyclic branch returns visible once without unbounded traversal', () => {
+    const cyclicAgents: AgentSummary[] = [
+      {
+        id: 'cycle-a',
+        parentId: 'cycle-b',
+        name: 'Cycle A',
+        role: 'Audit A',
+        status: 'complete',
+        hostName: 'This computer',
+        answerPreview: 'A returned.',
+      },
+      {
+        id: 'cycle-b',
+        parentId: 'cycle-a',
+        name: 'Cycle B',
+        role: 'Audit B',
+        status: 'complete',
+        hostName: 'This computer',
+        answerPreview: 'B returned.',
+      },
+    ]
+
+    render(<OutcomeReview state="ready" childAgents={cyclicAgents} />)
+
+    const branches = screen.getByRole('list', { name: 'RLM child outcomes' })
+    expect(within(branches).getAllByRole('listitem')).toHaveLength(2)
+    expect(within(branches).getAllByText('Cycle A')).toHaveLength(1)
+    expect(within(branches).getAllByText('Cycle B')).toHaveLength(1)
   })
 
   it('uses quiet aggregate facts for authoritative empty collections', () => {
