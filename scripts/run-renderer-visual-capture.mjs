@@ -20,6 +20,9 @@ const expectedTargets = [
   ['mobile-extension-question-390', 390, 844, 'extension-ui-confirm', undefined],
   ['mobile-idle-390', 390, 844, 'idle', undefined],
   ['compact-idle-320', 320, 704, 'idle', undefined],
+  ['desktop-ended-empty', 1600, 1000, 'ended-empty', undefined],
+  ['ended-empty-390', 390, 844, 'ended-empty', undefined],
+  ['ended-empty-320', 320, 704, 'ended-empty', undefined],
   ['mobile-inspector-390', 390, 844, 'idle', undefined],
   ['model-selection-dialog-390', 390, 844, 'model-selection', undefined],
   ['model-selection-dialog-short-320', 320, 256, 'model-selection', undefined],
@@ -171,7 +174,11 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
     || ((name === 'mobile-agent-launchpad-390' || name === 'mobile-idle-390' || name === 'compact-idle-320' || name === 'mobile-inspector-390') &&
       result.stateEvidence?.responsiveTopbarBounded !== true)
     || ((name === 'mobile-idle-390' || name === 'compact-idle-320') &&
-      result.stateEvidence?.horizontalTaskStarters !== true)
+      result.stateEvidence?.boundedTaskStarters !== true)
+    || ((name === 'desktop-ended-empty' || name === 'ended-empty-390' || name === 'ended-empty-320') &&
+      result.stateEvidence?.endedEmptyResolved !== true)
+    || ((name === 'desktop-agent-launchpad' || name === 'mobile-agent-launchpad-390') &&
+      result.stateEvidence?.launchpadContinuitySuppressed !== true)
     || (name === 'mobile-inspector-390' && result.stateEvidence?.responsiveDrawerBounded !== true)
     || (name.startsWith('hud-') && (
       result.stateEvidence?.hudSurfaceVisible !== true ||

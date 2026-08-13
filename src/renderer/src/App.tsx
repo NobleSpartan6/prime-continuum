@@ -4585,14 +4585,14 @@ function EndedThreadEmptyState({
 }) {
   return (
     <section className="ended-thread-empty" aria-labelledby="ended-thread-empty-heading">
-      <h2 id="ended-thread-empty-heading">No transcript recorded</h2>
-      <p>This session has ended. Its workspace files are still available.</p>
+      <h2 id="ended-thread-empty-heading">Session ended</h2>
+      <p>No transcript was recorded. Your workspace and files remain available.</p>
       <button
         className={cx('button', canStartNewAgent ? 'button--primary' : 'button--secondary')}
         type="button"
         onClick={(event) => onAction(event.currentTarget)}
       >
-        {canStartNewAgent ? 'New agent' : 'View session'}
+        {canStartNewAgent ? 'Start another task' : 'View session'}
       </button>
     </section>
   )
@@ -5056,6 +5056,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   const textareaDisabled = !(canStartNow || modelSetupPrimary)
   const showPrimaryAction = Boolean(primaryAction && !modelSetupOwnedByLaunchpad && !modelSetupUnavailable)
   const showComposerToolbar = compactComposer || presentation.kind !== 'ready' || Boolean(validationError)
+  const showSessionContinuity = !launchpadOwnsPrimaryAction || presentation.tone !== 'neutral'
 
   if (endCompleted || waitingForExtensionResponse) {
     return (
@@ -5075,7 +5076,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
 
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
-      {presentation.kind !== 'ending' && presentation.kind !== 'stopping' && (
+      {showSessionContinuity && presentation.kind !== 'ending' && presentation.kind !== 'stopping' && (
         <SessionContinuity presentation={presentation} runtime={runtime} agents={agents} onManageSession={onManageSession} />
       )}
       {!compactComposer && showTaskStarters && (

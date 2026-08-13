@@ -1,3 +1,4 @@
+export const REVIEWED_ELECTRON_BUILDER_VERSION: '26.15.3'
 export const WINDOWS_PACKAGING_DENIED_ENVIRONMENT_KEYS: readonly string[]
 
 export function createWindowsElectronBuilderArguments(options?: {
