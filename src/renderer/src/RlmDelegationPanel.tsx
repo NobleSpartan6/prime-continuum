@@ -19,6 +19,7 @@ export interface RlmDelegationPanelProps {
   isFresh: boolean
   rootAvailable: boolean
   rootActive: boolean
+  rootEnded?: boolean
   rootLabel: string
   rootDetail: string
   rootModel?: string
@@ -205,6 +206,7 @@ export const RlmDelegationPanel = memo(function RlmDelegationPanel({
   isFresh,
   rootAvailable,
   rootActive,
+  rootEnded = false,
   rootLabel,
   rootDetail,
   rootModel,
@@ -243,16 +245,16 @@ export const RlmDelegationPanel = memo(function RlmDelegationPanel({
       ) : null}
       <div className="rlm-map" aria-label="Recursive agent hierarchy">
         <div className="rlm-map__root">
-          <span className={`agent-state ${rootActive ? 'agent-state--running' : 'agent-state--waiting'}`} aria-hidden="true">
+          <span className={`agent-state ${rootActive ? 'agent-state--running' : rootEnded ? 'agent-state--complete' : 'agent-state--waiting'}`} aria-hidden="true">
             <Icon icon={GitFork} />
           </span>
           <span className="rlm-map__body">
             <span className="rlm-map__heading">
               <strong>Prime Agent</strong>
-              <span>{rootAvailable ? rootLabel : 'Session not reported'}</span>
+              <span>{rootEnded ? 'Session ended' : rootAvailable ? rootLabel : 'Session not reported'}</span>
             </span>
             <span className="rlm-map__role">Coordinator · main session</span>
-            <span>{rootAvailable ? rootDetail : 'Live coordinator state isn’t reported.'}</span>
+            <span>{rootEnded ? 'The coordinator is no longer running.' : rootAvailable ? rootDetail : 'Live coordinator state isn’t reported.'}</span>
             {rootModel ? <small>{readableModelName(rootModel) ?? rootModel}{rootThinkingLevel ? ` · ${rootThinkingLevel} thinking` : ''}</small> : null}
           </span>
         </div>

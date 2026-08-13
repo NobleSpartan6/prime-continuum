@@ -85,4 +85,24 @@ describe('RlmDelegationPanel', () => {
     expect(screen.getAllByText('Agent B')).toHaveLength(1)
     expect(document.querySelectorAll('[data-runtime-agent]')).toHaveLength(2)
   })
+
+  it('renders an ended coordinator as terminal instead of missing live state', () => {
+    const { container } = render(
+      <RlmDelegationPanel
+        agents={[]}
+        agentsReported
+        isFresh
+        {...root}
+        rootActive={false}
+        rootAvailable={false}
+        rootEnded
+      />,
+    )
+
+    expect(screen.getByText('Session ended')).toBeVisible()
+    expect(screen.getByText('The coordinator is no longer running.')).toBeVisible()
+    expect(screen.queryByText('Session not reported')).not.toBeInTheDocument()
+    expect(screen.queryByText('Live coordinator state isn’t reported.')).not.toBeInTheDocument()
+    expect(container.querySelector('.rlm-map__root .agent-state--complete')).toBeInTheDocument()
+  })
 })

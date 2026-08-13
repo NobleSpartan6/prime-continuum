@@ -1939,6 +1939,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     selectedThread?.residentLifecycle?.state !== 'ended' &&
     composerReceipt.operation !== 'end',
   )
+  const selectedThreadIsEndedAndEmpty = Boolean(
+    selectedThreadIsEmpty && selectedThread?.residentLifecycle?.state === 'ended',
+  )
   const selectedExtensionUiAuthorityKey = selectedThread && selectedHost && selectedThread.executionGenerationId
     ? [
         selectedHost.id,
@@ -3995,6 +3998,17 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 }}
               />
             </Suspense>
+          ) : selectedThreadIsEndedAndEmpty ? (
+            <EndedThreadEmptyState
+              canStartNewAgent={canProvisionResident}
+              onAction={(trigger) => {
+                if (canProvisionResident) {
+                  void chooseResidentWorkspace(trigger)
+                  return
+                }
+                openSessionManager(trigger)
+              }}
+            />
           ) : undefined}
         />
 
@@ -4004,7 +4018,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           onRespond={respondToResidentExtensionUi}
           onDismissResult={dismissResidentExtensionUiResult}
         />
-        <Composer
+        {!selectedThreadIsEndedAndEmpty && <Composer
               authorityKey={composerDraftAuthorityKey}
               initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
               handleRef={composerHandleRef}
@@ -4033,7 +4047,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               onSubmitText={submitComposerText}
               onStop={() => void stopResidentTurn()}
               onEndResident={(trigger) => void reviewResidentEnd(trigger, selectedResidentEnd)}
-        />
+        />}
       </main>
 
       <Inspector
@@ -4549,6 +4563,28 @@ const EMPTY_STREAM_BODY = /^\(no display text\)$/i
 function streamHasVisibleText(body: string): boolean {
   const text = body.trim()
   return text.length > 0 && !EMPTY_STREAM_BODY.test(text)
+}
+
+function EndedThreadEmptyState({
+  canStartNewAgent,
+  onAction,
+}: {
+  canStartNewAgent: boolean
+  onAction: (trigger: HTMLButtonElement) => void
+}) {
+  return (
+    <section className="ended-thread-empty" aria-labelledby="ended-thread-empty-heading">
+      <h2 id="ended-thread-empty-heading">No transcript recorded</h2>
+      <p>This session has ended. Its workspace files are still available.</p>
+      <button
+        className={cx('button', canStartNewAgent ? 'button--primary' : 'button--secondary')}
+        type="button"
+        onClick={(event) => onAction(event.currentTarget)}
+      >
+        {canStartNewAgent ? 'New agent' : 'View session'}
+      </button>
+    </section>
+  )
 }
 
 const Transcript = memo(function Transcript({
@@ -5712,6 +5748,7 @@ function RuntimePanel({
           agentsReported
           isFresh={isFresh}
           rootAvailable={Boolean(session)}
+          rootEnded={thread.residentLifecycle?.state === 'ended'}
           rootActive={Boolean(session && (
             session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
           ))}
@@ -5871,6 +5908,7 @@ function RuntimePanel({
             agentsReported={agentsReported}
             isFresh={isFresh}
             rootAvailable={Boolean(session)}
+            rootEnded={thread.residentLifecycle?.state === 'ended'}
             rootActive={Boolean(session && (
               session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
             ))}
