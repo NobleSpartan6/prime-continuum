@@ -95,90 +95,96 @@ describe("macOS Prime Agent provider setup handoff", () => {
     },
   );
 
-  it("returns opened only after the verified CLI child publishes the one-use handshake", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-provider-handoff-"));
-    temporaryDirectories.push(directory);
-    await chmod(directory, 0o700);
-    const runOpen = vi.fn(async ({ commandPath }: { commandPath: string }) => {
-      const command = await readFile(commandPath, "utf8");
-      const quoted = [...command.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
-      const [handshakePath, _selfPath, nonce] = quoted.slice(-3);
-      await writeFile(handshakePath!, `started:${nonce}`, { flag: "wx", mode: 0o600 });
-      return "accepted" as const;
-    });
-    const handoff = new MacOSRuntimeProviderSetupHandoff({
-      platform: "darwin",
-      systemOpen: join(directory, "reviewed-open"),
-      agentDirectory: directory,
-      runtimeHandles: {
-        acquireVerifiedRuntimeHandle: vi.fn(async () => runtimeHandle("0.7.2", directory)),
-      },
-      credentialSecurity: {
-        prepareAndVerify: vi.fn(async () => undefined),
-        assertStillSecure: vi.fn(async () => undefined),
-        capabilityAvailable: () => true,
-      },
-      runOpen: runOpen as never,
-      verifySystemOpen: async () => undefined,
-      sleep: async () => undefined,
-    });
+  it.runIf(process.platform !== "win32")(
+    "returns opened only after the verified CLI child publishes the one-use handshake",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "prime-provider-handoff-"));
+      temporaryDirectories.push(directory);
+      await chmod(directory, 0o700);
+      const runOpen = vi.fn(async ({ commandPath }: { commandPath: string }) => {
+        const command = await readFile(commandPath, "utf8");
+        const quoted = [...command.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
+        const [handshakePath, _selfPath, nonce] = quoted.slice(-3);
+        await writeFile(handshakePath!, `started:${nonce}`, { flag: "wx", mode: 0o600 });
+        return "accepted" as const;
+      });
+      const handoff = new MacOSRuntimeProviderSetupHandoff({
+        platform: "darwin",
+        systemOpen: join(directory, "reviewed-open"),
+        agentDirectory: directory,
+        runtimeHandles: {
+          acquireVerifiedRuntimeHandle: vi.fn(async () => runtimeHandle("0.7.2", directory)),
+        },
+        credentialSecurity: {
+          prepareAndVerify: vi.fn(async () => undefined),
+          assertStillSecure: vi.fn(async () => undefined),
+          capabilityAvailable: () => true,
+        },
+        runOpen: runOpen as never,
+        verifySystemOpen: async () => undefined,
+        sleep: async () => undefined,
+      });
 
-    await expect(handoff.open({
-      expectedHostId: "host-local",
-      providerId: "anthropic",
-      expectedReleaseVersion: "0.7.2",
-    })).resolves.toEqual({
-      resultVersion: 1,
-      state: "opened",
-      expectedHostId: "host-local",
-      providerId: "anthropic",
-      releaseVersion: "0.7.2",
-    });
-    expect(runOpen).toHaveBeenCalledOnce();
-    const invocation = runOpen.mock.calls[0]![0] as { commandPath: string };
-    expect(await readFile(invocation.commandPath, "utf8").catch(() => "removed")).toBe("removed");
-  });
+      await expect(handoff.open({
+        expectedHostId: "host-local",
+        providerId: "anthropic",
+        expectedReleaseVersion: "0.7.2",
+      })).resolves.toEqual({
+        resultVersion: 1,
+        state: "opened",
+        expectedHostId: "host-local",
+        providerId: "anthropic",
+        releaseVersion: "0.7.2",
+      });
+      expect(runOpen).toHaveBeenCalledOnce();
+      const invocation = runOpen.mock.calls[0]![0] as { commandPath: string };
+      expect(await readFile(invocation.commandPath, "utf8").catch(() => "removed")).toBe("removed");
+    },
+  );
 
-  it("waits through an exact-owned empty handshake instead of inventing a retryable failure", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "prime-provider-handoff-partial-"));
-    temporaryDirectories.push(directory);
-    await chmod(directory, 0o700);
-    let handshakePath = "";
-    let nonce = "";
-    const runOpen = vi.fn(async ({ commandPath }: { commandPath: string }) => {
-      const command = await readFile(commandPath, "utf8");
-      const quoted = [...command.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
-      [handshakePath, , nonce] = quoted.slice(-3) as [string, string, string];
-      await writeFile(handshakePath, "", { flag: "wx", mode: 0o600 });
-      return "accepted" as const;
-    });
-    const sleep = vi.fn(async () => {
-      await writeFile(handshakePath, `started:${nonce}`, { flag: "w", mode: 0o600 });
-    });
-    const handoff = new MacOSRuntimeProviderSetupHandoff({
-      platform: "darwin",
-      systemOpen: join(directory, "reviewed-open"),
-      agentDirectory: directory,
-      runtimeHandles: {
-        acquireVerifiedRuntimeHandle: vi.fn(async () => runtimeHandle("0.7.2", directory)),
-      },
-      credentialSecurity: {
-        prepareAndVerify: vi.fn(async () => undefined),
-        assertStillSecure: vi.fn(async () => undefined),
-        capabilityAvailable: () => true,
-      },
-      runOpen: runOpen as never,
-      verifySystemOpen: async () => undefined,
-      sleep,
-    });
+  it.runIf(process.platform !== "win32")(
+    "waits through an exact-owned empty handshake instead of inventing a retryable failure",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "prime-provider-handoff-partial-"));
+      temporaryDirectories.push(directory);
+      await chmod(directory, 0o700);
+      let handshakePath = "";
+      let nonce = "";
+      const runOpen = vi.fn(async ({ commandPath }: { commandPath: string }) => {
+        const command = await readFile(commandPath, "utf8");
+        const quoted = [...command.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
+        [handshakePath, , nonce] = quoted.slice(-3) as [string, string, string];
+        await writeFile(handshakePath, "", { flag: "wx", mode: 0o600 });
+        return "accepted" as const;
+      });
+      const sleep = vi.fn(async () => {
+        await writeFile(handshakePath, `started:${nonce}`, { flag: "w", mode: 0o600 });
+      });
+      const handoff = new MacOSRuntimeProviderSetupHandoff({
+        platform: "darwin",
+        systemOpen: join(directory, "reviewed-open"),
+        agentDirectory: directory,
+        runtimeHandles: {
+          acquireVerifiedRuntimeHandle: vi.fn(async () => runtimeHandle("0.7.2", directory)),
+        },
+        credentialSecurity: {
+          prepareAndVerify: vi.fn(async () => undefined),
+          assertStillSecure: vi.fn(async () => undefined),
+          capabilityAvailable: () => true,
+        },
+        runOpen: runOpen as never,
+        verifySystemOpen: async () => undefined,
+        sleep,
+      });
 
-    await expect(handoff.open({
-      expectedHostId: "host-local",
-      providerId: "anthropic",
-      expectedReleaseVersion: "0.7.2",
-    })).resolves.toMatchObject({ state: "opened" });
-    expect(sleep).toHaveBeenCalled();
-  });
+      await expect(handoff.open({
+        expectedHostId: "host-local",
+        providerId: "anthropic",
+        expectedReleaseVersion: "0.7.2",
+      })).resolves.toMatchObject({ state: "opened" });
+      expect(sleep).toHaveBeenCalled();
+    },
+  );
 
   it("treats output overflow after the system tool starts as indeterminate", async () => {
     const stdout = new PassThrough();
