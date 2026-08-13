@@ -1105,6 +1105,18 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
           if (this.closed || !(await this.isCurrentBinding(binding))) return;
           this.publishProjectionChange(binding);
         },
+        publishThinkingSelectionProjection: async (command, binding, projection) => {
+          await this.assertCredentialSecurity(true);
+          if (this.closed || !(await this.isCurrentBinding(binding))) {
+            throw new GatewayError(
+              "THINKING_SELECTION_SESSION_AUTHORITY_CHANGED",
+              "The exact resident session authority changed before its proven reasoning projection could be published",
+            );
+          }
+          await this.store.publishResidentModelSelectionProjection(command, binding, projection);
+          if (this.closed || !(await this.isCurrentBinding(binding))) return;
+          this.publishProjectionChange(binding);
+        },
         publishEphemeralProjectionChange: (binding) => {
           if (this.closed) return;
           const slot = residentBindingSlotKeyFor(binding);
@@ -1443,7 +1455,7 @@ function dispatchBindingFor(
 ): ResidentSessionBinding | undefined {
   const contextual = command.command.kind === "prompt" || command.command.kind === "abort"
     ? context?.residentDispatch?.binding
-    : command.command.kind === "model.select"
+    : command.command.kind === "model.select" || command.command.kind === "thinking.select"
       ? context?.residentBinding
       : context?.residentDispatch?.binding ?? context?.residentBinding;
   const binding = contextual ?? preparedBindings.get(

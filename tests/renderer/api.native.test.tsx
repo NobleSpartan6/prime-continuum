@@ -5445,6 +5445,97 @@ describe('NativeRendererApi', () => {
     })).toThrow(StaleHostAuthorityError)
   })
 
+  it('submits one exact session-reported reasoning level and verifies its refreshed projection', async () => {
+    const catalog = recoveryCatalog()
+    catalog.threads[0].status = 'idle'
+    const initialSnapshot = recoverySnapshot(catalog.threads[0], 'Before reasoning selection.')
+    initialSnapshot.runtime.availableThinkingLevels = ['off', 'low', 'medium', 'high', 'max']
+    const selectedSnapshot = structuredClone(initialSnapshot)
+    selectedSnapshot.generatedAt = '2026-08-05T20:00:02.000Z'
+    selectedSnapshot.latestCursor.sequence = 2
+    selectedSnapshot.thread.lastKnownCursor = selectedSnapshot.latestCursor
+    selectedSnapshot.runtime.thinkingLevel = 'max'
+    const submittedReceipt = deferred<unknown>()
+    const submitCommand = vi.fn(() => submittedReceipt.promise)
+    const requestSnapshot = vi.fn(() => ok(selectedSnapshot))
+    const api = new NativeRendererApi({
+      bootstrap: vi.fn(() => ok({
+        cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: initialSnapshot },
+        outbox: [],
+        quarantinedOutboxCount: 0,
+        connection: {
+          ...onlineConnection(),
+          capabilities: [
+            'prime_agent_commands_v2',
+            'prime_agent_thinking_levels_v1',
+            'runtime_model_catalog_v1',
+          ],
+        },
+        appVersion: '0.1.0',
+      })),
+      hostCatalog: vi.fn(() => Promise.reject(new Error('Background refresh intentionally unavailable.'))),
+      requestSnapshot,
+      submitCommand,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHostEvent: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const published: Array<Awaited<ReturnType<typeof api.loadWorkbench>>> = []
+    const unsubscribe = api.subscribe((snapshot) => published.push(snapshot))
+    await expect(api.loadWorkbench()).resolves.toMatchObject({
+      runtime: {
+        session: {
+          thinkingLevel: 'high',
+          availableThinkingLevels: ['off', 'low', 'medium', 'high', 'max'],
+        },
+      },
+      operations: { selectResidentThinkingLevel: true },
+    })
+
+    const request = { threadId: 'thread-one', level: 'max' }
+    const first = api.selectResidentThinkingLevel(request)
+    const duplicate = api.selectResidentThinkingLevel(request)
+    expect(duplicate).toBe(first)
+    await expect(api.selectResidentModel({
+      threadId: 'thread-one',
+      providerId: 'openai-codex',
+      modelId: 'gpt-5.3-codex',
+    })).resolves.toEqual({
+      state: 'rejected',
+      retryable: true,
+      message: 'Another resident session setting is already being verified. Try again after it finishes.',
+    })
+    expect(submitCommand).toHaveBeenCalledOnce()
+    const command = submitCommand.mock.calls[0]![0] as Record<string, unknown>
+    expect(command).toMatchObject({
+      expectedHostId: 'host-local',
+      threadId: 'thread-one',
+      expectedExecutionGenerationId: 'generation-one',
+      kind: 'thinking.select',
+      payload: { level: 'max' },
+      delivery: 'live_only',
+    })
+    submittedReceipt.resolve(ok({
+      hostId: command.expectedHostId,
+      deviceId: command.deviceId,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      executionGenerationId: command.expectedExecutionGenerationId,
+      status: 'completed',
+      durable: true,
+      message: 'Selected max reasoning.',
+    }))
+
+    await expect(Promise.all([first, duplicate])).resolves.toEqual([
+      { state: 'completed', projected: true, message: 'Selected max reasoning.' },
+      { state: 'completed', projected: true, message: 'Selected max reasoning.' },
+    ])
+    expect(requestSnapshot).toHaveBeenCalledWith({ threadId: 'thread-one' })
+    expect(published.at(-1)?.runtime.session?.thinkingLevel).toBe('max')
+    unsubscribe()
+  })
+
   it('fails resident commands closed when exact per-thread readiness is absent or unavailable', async () => {
     const catalog = recoveryCatalog()
     catalog.threads[0].status = 'idle'

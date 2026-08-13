@@ -72,6 +72,13 @@ Reviewed on 2026-08-13.
   uses an explicit host handoff and an authoritative catalog recheck. That
   handoff names the host-owned `PRIME_AGENT_CODING_AGENT_DIR` boundary because
   an ambient Prime Agent terminal otherwise defaults to a different profile.
+- The `v0.7.2` public `DaemonAgentConnection` already exposes
+  `setThinkingLevel`, and its live session snapshot reports the exact dynamic
+  `availableThinkingLevels` for the selected model. Continuim negotiates this
+  separately as `prime_agent_thinking_levels_v1`, never hard-codes level names,
+  and treats a change as a durable, non-replayable resident preference. A
+  completed receipt requires a fresh authoritative projection proving both the
+  selected value and its continued membership in the live reported list.
 - The pinned `docs/extensions.md`, `docs/rpc.md`, public
   `DaemonAgentConnection`, and daemon tests were reviewed for native extension
   UI. Continuim advertises `supportsExtensionUi: true` only through the verified

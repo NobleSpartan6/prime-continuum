@@ -183,6 +183,11 @@ export function mapHostCommandToPrimeRpc(command: CommandEnvelope): PrimeRpcRequ
         "RPC_COMMAND_UNSUPPORTED",
         "Model selection requires an authority-bound resident daemon adapter",
       );
+    case "thinking.select":
+      throw new GatewayError(
+        "RPC_COMMAND_UNSUPPORTED",
+        "Reasoning-level selection requires an authority-bound resident daemon adapter",
+      );
   }
 }
 

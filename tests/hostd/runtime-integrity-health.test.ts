@@ -19,6 +19,7 @@ import {
 import {
   HealthSnapshotSchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   PROTOCOL_VERSION,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RUNTIME_INTEGRITY_CAPABILITY,
@@ -352,6 +353,7 @@ describe("HostService runtime integrity readiness", () => {
     const health = await healthSnapshot(service);
 
     expect(health.capabilities).toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    expect(health.capabilities).toContain(PRIME_AGENT_THINKING_LEVELS_CAPABILITY);
     await service.close();
   });
 
@@ -365,6 +367,7 @@ describe("HostService runtime integrity readiness", () => {
 
       expect(health.capabilities).toContain(RUNTIME_INTEGRITY_CAPABILITY);
       expect(health.capabilities).not.toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+      expect(health.capabilities).not.toContain(PRIME_AGENT_THINKING_LEVELS_CAPABILITY);
       await service.close();
     },
   );
@@ -375,8 +378,11 @@ describe("HostService runtime integrity readiness", () => {
     const { service } = await temporaryService(provider, residentGateway());
 
     expect((await healthSnapshot(service)).capabilities).not.toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    expect((await healthSnapshot(service)).capabilities).not.toContain(PRIME_AGENT_THINKING_LEVELS_CAPABILITY);
     status = "ready";
-    expect((await healthSnapshot(service)).capabilities).toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    const readyCapabilities = (await healthSnapshot(service)).capabilities;
+    expect(readyCapabilities).toContain(PRIME_AGENT_COMMAND_CAPABILITY);
+    expect(readyCapabilities).toContain(PRIME_AGENT_THINKING_LEVELS_CAPABILITY);
     await service.close();
   });
 

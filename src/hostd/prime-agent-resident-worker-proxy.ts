@@ -1011,6 +1011,33 @@ class WorkerDaemonConnectionProxy implements PrimeDaemonAgentConnectionPublic {
     );
   }
 
+  async setThinkingLevel(level: string): Promise<void> {
+    this.assertLive();
+    let normalizedLevel: string;
+    try {
+      normalizedLevel = boundedString(
+        level,
+        RESIDENT_WORKER_LIMITS.maxThinkingLevelCharacters,
+        "thinking level",
+      );
+    } catch (error) {
+      throw new ResidentWorkerTransportError(
+        "RESIDENT_WORKER_INPUT_INVALID",
+        "Resident worker thinking-level selection input is invalid",
+        { outcome: "definitive", operation: "connection.set_thinking_level", cause: error },
+      );
+    }
+    await this.bridge.invoke(
+      "connection.set_thinking_level",
+      { connectionId: this.connectionId, level: normalizedLevel },
+      {
+        timeoutMs: DEFAULT_OPERATION_TIMEOUT_MS,
+        mutation: true,
+        resourceKey: connectionResource(this.connectionId),
+      },
+    );
+  }
+
   async promoteToResident(): Promise<void> {
     this.assertLive();
     await this.bridge.invoke(

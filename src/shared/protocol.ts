@@ -12,6 +12,7 @@ import {
 export {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
+  PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
   RESIDENT_EXTENSION_UI_CAPABILITY,
@@ -598,6 +599,11 @@ export const RuntimeSessionSummarySchema = z.object({
   sessionName: z.string().min(1).max(255).optional(),
   model: z.string().min(1).max(641).optional(),
   thinkingLevel: z.string().min(1).max(64).optional(),
+  availableThinkingLevels: z
+    .array(z.string().min(1).max(64).regex(/^[^\0\r\n]+$/))
+    .max(128)
+    .refine((levels) => new Set(levels).size === levels.length, "Thinking levels must be unique")
+    .optional(),
   serviceTier: z.string().min(1).max(64).optional(),
   isStreaming: z.boolean(),
   isCompacting: z.boolean(),
@@ -1951,6 +1957,7 @@ export const REMOTE_DEVICE_SCOPES = Object.freeze([
   "thread.abort",
   "thread.start",
   "model.select",
+  "thinking.select",
   "approval.resolve",
   "extension_ui.respond",
   "run_location.change",
@@ -2053,6 +2060,12 @@ export const CommandPayloadSchema = z.union([
       kind: z.literal("model.select"),
       providerId: z.string().min(1).max(128).regex(/^[^\0\r\n]+$/),
       modelId: z.string().min(1).max(512).regex(/^[^\0\r\n]+$/),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("thinking.select"),
+      level: z.string().min(1).max(64).regex(/^[^\0\r\n]+$/),
     })
     .strict(),
   z

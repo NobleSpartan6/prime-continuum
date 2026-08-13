@@ -1778,6 +1778,11 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const canMoveThreads = snapshot?.operations.crossHostHandoff ?? false
   const canLoadModelCatalog = api.environment === 'native' && (snapshot?.operations.modelCatalog ?? false)
   const canSelectResidentModel = selectedThreadIsMaterialized && (snapshot?.operations.selectResidentModel ?? false)
+  const canSelectResidentThinkingLevel = Boolean(
+    selectedThreadIsMaterialized &&
+    snapshot?.operations.selectResidentThinkingLevel &&
+    api.selectResidentThinkingLevel,
+  )
   const canConnectRuntimeOAuth = Boolean(
     selectedHost &&
     selectedHost.kind === 'local' &&
@@ -3624,7 +3629,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             threadId={selectedThread?.id}
             executionGenerationId={selectedThread?.executionGenerationId}
             currentModel={selectedRuntime.session?.model}
+            currentThinkingLevel={selectedRuntime.session?.thinkingLevel}
+            availableThinkingLevels={selectedRuntime.session?.availableThinkingLevels}
             canSelectResidentModel={canSelectResidentModel}
+            canSelectResidentThinkingLevel={canSelectResidentThinkingLevel}
             canConnectRuntimeOAuth={canConnectRuntimeOAuth}
             triggerRef={modelsDialogTriggerRef}
             onClose={() => setModelsOpen(false)}
@@ -4180,7 +4188,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         threadId={selectedThread.id}
         executionGenerationId={selectedThread.executionGenerationId}
         currentModel={selectedRuntime.session?.model}
+        currentThinkingLevel={selectedRuntime.session?.thinkingLevel}
+        availableThinkingLevels={selectedRuntime.session?.availableThinkingLevels}
         canSelectResidentModel={canSelectResidentModel}
+        canSelectResidentThinkingLevel={canSelectResidentThinkingLevel}
         canConnectRuntimeOAuth={canConnectRuntimeOAuth}
         triggerRef={modelsDialogTriggerRef}
         onClose={() => setModelsOpen(false)}
@@ -4927,13 +4938,18 @@ function SessionContinuity({
         </span>
         {onManageSession && (
           <button
-            className="session-continuity__manage"
+            className={cx(
+              'session-continuity__manage',
+              activeAgents.length > 0 && 'session-continuity__manage--agents',
+            )}
             type="button"
             onClick={(event) => onManageSession(event.currentTarget)}
           >
-            <span className="session-continuity__manage-icon"><Icon icon={MoreHorizontal} size={16} /></span>
+            <span className="session-continuity__manage-icon">
+              <Icon icon={activeAgents.length > 0 ? GitFork : MoreHorizontal} size={16} />
+            </span>
             <span className="session-continuity__manage-label">
-            {activeAgents.length > 0 ? 'View agents' : 'Session'}
+              {activeAgents.length > 0 ? 'View agents' : 'Session'}
             </span>
           </button>
         )}
@@ -5156,11 +5172,11 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
               <button
                 className="model-chip"
                 type="button"
-                aria-label={`Open models and accounts${runtime.session?.model ? `. Current model: ${runtime.session.model}` : ''}`}
+                aria-label={`Open models and accounts${runtime.session?.model ? `. Current model: ${runtime.session.model}` : ''}${runtime.session?.thinkingLevel ? `. Reasoning: ${runtime.session.thinkingLevel}` : ''}`}
                 onClick={(event) => onOpenModelCatalog(event.currentTarget)}
               >
                 <Icon icon={Bot} size={14} />
-                <span>{runtime.session?.model ?? 'Model catalog'}</span>
+                <span>{runtime.session?.model ?? 'Model catalog'}{runtime.session?.thinkingLevel ? ` · ${runtime.session.thinkingLevel}` : ''}</span>
                 <Icon icon={ChevronDown} size={13} />
               </button>
             )}

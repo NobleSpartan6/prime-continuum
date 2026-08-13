@@ -122,6 +122,25 @@ const targets = [
     expectShortModelsDialog: true,
   },
   {
+    name: 'reasoning-control-dialog-390',
+    width: 390,
+    height: 844,
+    visualState: 'model-selection',
+    expectedText: 'Applies to the next prompt.',
+    expectReasoningControl: true,
+    openModelsDialog: true,
+  },
+  {
+    name: 'reasoning-control-dialog-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'model-selection',
+    expectedText: 'Applies to the next prompt.',
+    expectReasoningControl: true,
+    expectShortModelsDialog: true,
+    openModelsDialog: true,
+  },
+  {
     name: 'prime-oauth-dialog-390',
     width: 390,
     height: 844,
@@ -524,25 +543,37 @@ async function capture(target, rendererOrigin) {
       while (Date.now() < dialogDeadline) {
         const ready = await browserWindow.webContents.executeJavaScript(`(() => {
           const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
-          const action = [...(dialog?.querySelectorAll('button') ?? [])]
-            .find((candidate) => ${target.expectModelAction
-              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
-          return Boolean(dialog && action instanceof HTMLButtonElement && !action.disabled)
+          const action = ${target.expectReasoningControl
+            ? `dialog?.querySelector('select#resident-thinking-level')`
+            : `[...(dialog?.querySelectorAll('button') ?? [])]
+                .find((candidate) => ${target.expectModelAction
+                  ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+                  : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
+          return Boolean(
+            dialog &&
+            (action instanceof HTMLButtonElement || action instanceof HTMLSelectElement) &&
+            !action.disabled
+          )
         })()`)
         if (ready) break
         await delay(25)
       }
       await delay(300)
-      if (target.expectModelAction || target.expectShortModelsDialog) {
+      if (target.expectModelAction || target.expectShortModelsDialog || target.expectReasoningControl) {
         const shortModelScrollEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
           const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
           const catalog = dialog?.querySelector('.model-catalog')
-          const action = [...(dialog?.querySelectorAll('button') ?? [])]
-            .find((candidate) => ${target.expectModelAction
-              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
-          if (!(catalog instanceof HTMLElement) || !(action instanceof HTMLButtonElement) || action.disabled) {
+          const action = ${target.expectReasoningControl
+            ? `dialog?.querySelector('select#resident-thinking-level')`
+            : `[...(dialog?.querySelectorAll('button') ?? [])]
+                .find((candidate) => ${target.expectModelAction
+                  ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+                  : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
+          if (
+            !(catalog instanceof HTMLElement) ||
+            (!(action instanceof HTMLButtonElement) && !(action instanceof HTMLSelectElement)) ||
+            action.disabled
+          ) {
             return { ready: false }
           }
           const catalogRect = catalog.getBoundingClientRect()
@@ -892,11 +923,19 @@ async function capture(target, rendererOrigin) {
       const modelCatalog = modelsDialog?.querySelector('.model-catalog')
       const modelCatalogStyle = modelCatalog ? window.getComputedStyle(modelCatalog) : undefined
       const modelCatalogRect = modelCatalog?.getBoundingClientRect()
-      const modelAction = [...(modelsDialog?.querySelectorAll('button') ?? [])]
-        .find((candidate) => ${target.expectModelAction
-          ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-          : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})
+      const modelAction = ${target.expectReasoningControl
+        ? `modelsDialog?.querySelector('select#resident-thinking-level')`
+        : `[...(modelsDialog?.querySelectorAll('button') ?? [])]
+            .find((candidate) => ${target.expectModelAction
+              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
+              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
       const modelActionRect = modelAction?.getBoundingClientRect()
+      const reasoningControl = modelsDialog?.querySelector('.reasoning-control')
+      const reasoningControlRect = reasoningControl?.getBoundingClientRect()
+      const reasoningLabel = modelsDialog?.querySelector('label[for="resident-thinking-level"]')
+      const reasoningLabelRect = reasoningLabel?.getBoundingClientRect()
+      const reasoningStatus = modelsDialog?.querySelector('#resident-thinking-level-status')
+      const reasoningStatusRect = reasoningStatus?.getBoundingClientRect()
       const modelActionVisible = Boolean(
         modelActionRect &&
         modelCatalogRect &&
@@ -1014,13 +1053,37 @@ async function capture(target, rendererOrigin) {
           candidateEvaluationDialogFooterRect.bottom <= window.innerHeight
         ),
         modelsDialogOpen: Boolean(modelsDialog?.matches('[open]:modal')),
-        modelSelectionActionEnabled: Boolean(modelAction instanceof HTMLButtonElement && !modelAction.disabled),
+        modelSelectionActionEnabled: Boolean(
+          (modelAction instanceof HTMLButtonElement || modelAction instanceof HTMLSelectElement) &&
+          !modelAction.disabled
+        ),
         modelSelectionActionVisible: modelActionVisible,
         modelSelectionUnchanged: Boolean(
-          modelAction instanceof HTMLButtonElement &&
+          (modelAction instanceof HTMLButtonElement || modelAction instanceof HTMLSelectElement) &&
           !modelAction.disabled &&
           !modelsDialog?.querySelector('.model-selection-feedback__message:not(.sr-only)')
         ),
+        reasoningControlOptions: modelAction instanceof HTMLSelectElement
+          ? [...modelAction.options].map((option) => option.value)
+          : [],
+        reasoningControlRect: reasoningControlRect ? {
+          left: reasoningControlRect.left,
+          right: reasoningControlRect.right,
+          top: reasoningControlRect.top,
+          bottom: reasoningControlRect.bottom,
+        } : undefined,
+        reasoningLabelRect: reasoningLabelRect ? {
+          left: reasoningLabelRect.left,
+          right: reasoningLabelRect.right,
+          top: reasoningLabelRect.top,
+          bottom: reasoningLabelRect.bottom,
+        } : undefined,
+        reasoningStatusRect: reasoningStatusRect ? {
+          left: reasoningStatusRect.left,
+          right: reasoningStatusRect.right,
+          top: reasoningStatusRect.top,
+          bottom: reasoningStatusRect.bottom,
+        } : undefined,
         modelCatalogScrollable: Boolean(
           modelCatalog &&
           modelCatalogStyle &&
@@ -1161,6 +1224,26 @@ async function capture(target, rendererOrigin) {
       invariant(stateEvidence.modelSelectionActionEnabled, `${target.name} did not expose its expected enabled action`)
       invariant(stateEvidence.modelSelectionActionVisible, `${target.name} hid its expected action: ${JSON.stringify(stateEvidence)}`)
       invariant(stateEvidence.modelSelectionUnchanged, `${target.name} invoked or locked its non-executing action`)
+    }
+    if (target.expectReasoningControl) {
+      invariant(
+        JSON.stringify(stateEvidence.reasoningControlOptions) === JSON.stringify(['off', 'low', 'medium', 'high', 'max']),
+        `${target.name} did not render only the session-reported reasoning levels: ${JSON.stringify(stateEvidence)}`,
+      )
+      invariant(
+        stateEvidence.reasoningControlRect &&
+        stateEvidence.reasoningLabelRect &&
+        stateEvidence.reasoningStatusRect &&
+        stateEvidence.reasoningControlRect.left >= 0 &&
+        stateEvidence.reasoningControlRect.right <= target.width &&
+        stateEvidence.reasoningControlRect.top >= 0 &&
+        stateEvidence.reasoningControlRect.bottom <= target.height &&
+        stateEvidence.reasoningLabelRect.top >= stateEvidence.reasoningControlRect.top &&
+        stateEvidence.reasoningLabelRect.bottom <= stateEvidence.reasoningControlRect.bottom &&
+        stateEvidence.reasoningStatusRect.top >= stateEvidence.reasoningControlRect.top &&
+        stateEvidence.reasoningStatusRect.bottom <= stateEvidence.reasoningControlRect.bottom,
+        `${target.name} did not keep the complete reasoning control visible: ${JSON.stringify(stateEvidence)}`,
+      )
     }
     if (target.expectShortModelsDialog) {
       invariant(

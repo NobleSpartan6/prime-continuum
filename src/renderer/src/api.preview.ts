@@ -24,6 +24,8 @@ import type {
   ResidentEndPreparation,
   ResidentModelSelectionRequest,
   ResidentModelSelectionResult,
+  ResidentThinkingLevelSelectionRequest,
+  ResidentThinkingLevelSelectionResult,
   ResidentWorkspacePreselection,
   ResidentWorkspaceSelection,
   ResidentWorkspaceSelectionInput,
@@ -729,6 +731,9 @@ function previewSnapshotForVisualState(visualState: PreviewVisualState): Workben
     if (visualState === 'model-selection') {
       snapshot.operations.modelCatalog = true
       snapshot.operations.selectResidentModel = true
+      snapshot.operations.selectResidentThinkingLevel = true
+      session.thinkingLevel = 'high'
+      session.availableThinkingLevels = ['off', 'low', 'medium', 'high', 'max']
     }
     snapshot.composerReceipt = hudActive
       ? {
@@ -1107,6 +1112,12 @@ class BrowserPreviewApi implements RendererApi {
 
   async selectResidentModel(_request: ResidentModelSelectionRequest): Promise<ResidentModelSelectionResult> {
     throw new Error('Resident model selection is available only in the native desktop app.')
+  }
+
+  async selectResidentThinkingLevel(
+    _request: ResidentThinkingLevelSelectionRequest,
+  ): Promise<ResidentThinkingLevelSelectionResult> {
+    throw new Error('Resident reasoning selection is available only in the native desktop app.')
   }
 
   async startRuntimeOAuth(

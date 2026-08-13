@@ -120,6 +120,7 @@ describe("HostStore resident model-selection journal", () => {
     const baseline = modelProjection(fixture.binding, "legacy-provider", "legacy-model");
     const selected = modelProjection(fixture.binding, "openai", "gpt-5", {
       thinkingLevel: "high",
+      availableThinkingLevels: ["off", "low", "medium", "high", "xhigh"],
       serviceTier: "priority",
       maxTokens: 32_768,
     });
@@ -144,6 +145,7 @@ describe("HostStore resident model-selection journal", () => {
       runtime: {
         model: "openai/gpt-5",
         thinkingLevel: "high",
+        availableThinkingLevels: ["off", "low", "medium", "high", "xhigh"],
         serviceTier: "priority",
         context: { usedTokens: 0, maxTokens: 32_768 },
       },
@@ -855,6 +857,198 @@ describe("HostStore resident model-selection journal", () => {
       code: "MODEL_SELECTION_COMMITTED_RECEIPT_INVALID",
     });
   });
+
+  it("commits a same-cursor reasoning level only from exact session-reported proof", async () => {
+    const fixture = await createFixture();
+    const command = thinkingSelectionCommand(fixture.hostId, "thinking-same-cursor", "high");
+    const baseline = modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" });
+    const selected = modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "high" });
+    await fixture.store.publishResidentProjectionSnapshot(fixture.binding, baseline);
+
+    await expect(fixture.store.admitCommand(command, true)).resolves.toMatchObject({
+      duplicate: false,
+      receipt: { status: "admitted", queuePosition: undefined },
+    });
+    await expect(fixture.store.beginModelSelectionDispatch(command)).resolves.toEqual(fixture.binding);
+    await expect(
+      fixture.store.publishResidentModelSelectionProjection(command, fixture.binding, selected),
+    ).resolves.toMatchObject({
+      runtime: {
+        model: "openai/gpt-5",
+        thinkingLevel: "high",
+        availableThinkingLevels: ["off", "low", "medium", "high"],
+      },
+    });
+
+    const attemptPath = await onlyJsonPath(
+      join(fixture.store.paths.root, "model-selection-attempts"),
+      "reasoning-level attempt",
+    );
+    expect(JSON.parse(await readFile(attemptPath, "utf8"))).toMatchObject({
+      state: "projection_committed",
+      projectionProof: { selectedThinkingLevel: "high" },
+    });
+    expect(JSON.parse(await readFile(attemptPath, "utf8")).projectionProof.selectedModel).toBeUndefined();
+
+    await expect(
+      fixture.store.finalizeModelSelectionDispatch(command, {
+        status: "completed",
+        message: "Authoritative reasoning level saved",
+      }),
+    ).resolves.toMatchObject({ status: "completed", error: undefined });
+    expect(await modelAttemptNames(fixture.store)).toEqual([]);
+    expect(await commandStatuses(fixture.store, command.commandId)).toEqual([
+      "received",
+      "admitted",
+      "running",
+      "completed",
+    ]);
+  });
+
+  it("rejects same-cursor reasoning proof when the reported level set also changes", async () => {
+    const fixture = await createFixture();
+    const command = thinkingSelectionCommand(fixture.hostId, "thinking-level-set-changed", "high");
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" }),
+    );
+    await fixture.store.admitCommand(command, true);
+    await fixture.store.beginModelSelectionDispatch(command);
+
+    await expectStoreError(
+      fixture.store.publishResidentModelSelectionProjection(
+        command,
+        fixture.binding,
+        modelProjection(fixture.binding, "openai", "gpt-5", {
+          thinkingLevel: "high",
+          availableThinkingLevels: ["off", "low", "medium"],
+        }),
+      ),
+      "MODEL_SELECTION_PROJECTION_TARGET_MISMATCH",
+    );
+    await expectStoreError(
+      fixture.store.publishResidentModelSelectionProjection(
+        command,
+        fixture.binding,
+        modelProjection(fixture.binding, "openai", "gpt-5", {
+          thinkingLevel: "high",
+          availableThinkingLevels: ["low", "medium", "high"],
+        }),
+      ),
+      "RESIDENT_MODEL_SELECTION_PROJECTION_CONFLICT",
+    );
+    expect((await fixture.store.getThreadSnapshot(command.threadId)).runtime?.thinkingLevel).toBe("off");
+  });
+
+  it("admits reasoning changes only while idle and only for a reported level", async () => {
+    const fixture = await createFixture();
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      activeModelProjection(fixture.binding, "openai", "gpt-5"),
+    );
+    const busy = thinkingSelectionCommand(fixture.hostId, "thinking-busy", "high");
+    await expect(fixture.store.admitCommand(busy, true)).resolves.toMatchObject({
+      receipt: { status: "rejected", error: { code: "RESIDENT_SESSION_BUSY", retryable: true } },
+    });
+
+    const idleProjection = modelProjection(fixture.binding, "openai", "gpt-5", {
+      thinkingLevel: "off",
+      availableThinkingLevels: ["off", "low"],
+    });
+    await fixture.store.publishResidentProjectionSnapshot(fixture.binding, {
+      ...idleProjection,
+      cursor: { ...idleProjection.cursor, sequence: 1 },
+    });
+    const unavailable = thinkingSelectionCommand(fixture.hostId, "thinking-unavailable", "high");
+    await expect(fixture.store.admitCommand(unavailable, true)).resolves.toMatchObject({
+      receipt: {
+        status: "rejected",
+        error: { code: "THINKING_LEVEL_UNAVAILABLE", retryable: false },
+      },
+    });
+    expect(await modelAttemptNames(fixture.store)).toEqual([]);
+  });
+
+  it("turns an interrupted reasoning mutation into uncertain and never replays it", async () => {
+    const fixture = await createFixture();
+    const command = thinkingSelectionCommand(fixture.hostId, "thinking-crash-dispatching", "high");
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" }),
+    );
+    await fixture.store.admitCommand(command, true);
+    await fixture.store.beginModelSelectionDispatch(command);
+
+    const restarted = new HostStore(fixture.directory);
+    await restarted.initialize();
+    const receipt = (await restarted.reconcileCommands([command])).receipts[0];
+    expect(receipt).toMatchObject({
+      status: "uncertain",
+      error: { code: "MODEL_SELECTION_RESTART_UNCERTAIN", retryable: false },
+    });
+    expect(await restarted.admitCommand(command, true)).toEqual({ receipt, duplicate: true });
+    await expectStoreError(restarted.beginModelSelectionDispatch(command), "MODEL_SELECTION_ATTEMPT_MISSING");
+    expect(await commandStatuses(restarted, command.commandId)).toEqual([
+      "received",
+      "admitted",
+      "running",
+      "uncertain",
+    ]);
+  });
+
+  it("recovers a reasoning dispatch marker written before its running receipt without replay", async () => {
+    const fixture = await createFixture();
+    const command = thinkingSelectionCommand(fixture.hostId, "thinking-dispatch-receipt-split", "high");
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" }),
+    );
+    const admission = await fixture.store.admitCommand(command, true);
+    await fixture.store.beginModelSelectionDispatch(command);
+    const receiptPath = await onlyJsonPath(fixture.store.paths.receipts, "reasoning-selection receipt");
+    await atomicWriteJson(receiptPath, admission.receipt);
+
+    const restarted = new HostStore(fixture.directory);
+    await expect(restarted.initialize()).resolves.toBeUndefined();
+    const receipt = (await restarted.reconcileCommands([command])).receipts[0];
+    expect(receipt).toMatchObject({
+      status: "uncertain",
+      error: { code: "MODEL_SELECTION_RESTART_UNCERTAIN", retryable: false },
+    });
+    expect(await modelAttemptNames(restarted)).toEqual([]);
+    expect(await restarted.admitCommand(command, true)).toEqual({ receipt, duplicate: true });
+    await expectStoreError(restarted.beginModelSelectionDispatch(command), "MODEL_SELECTION_ATTEMPT_MISSING");
+  });
+
+  it("keeps urgent Stop independent while a reasoning change still blocks a new prompt", async () => {
+    const fixture = await createFixture();
+    const thinking = thinkingSelectionCommand(fixture.hostId, "thinking-before-stop", "high");
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" }),
+    );
+    await fixture.store.admitCommand(thinking, true);
+    await fixture.store.beginModelSelectionDispatch(thinking);
+
+    const prompt = promptCommand(fixture.hostId, "prompt-during-thinking");
+    await expect(fixture.store.admitCommand(prompt, true)).resolves.toMatchObject({
+      receipt: { status: "rejected", error: { code: "RESIDENT_DISPATCH_ACTIVE", retryable: true } },
+    });
+
+    const externallyActive = activeModelProjection(fixture.binding, "openai", "gpt-5");
+    await fixture.store.publishResidentProjectionSnapshot(fixture.binding, {
+      ...externallyActive,
+      cursor: { ...externallyActive.cursor, sequence: 1 },
+    });
+    const stop = abortCommand(fixture.hostId, "stop-during-thinking");
+    await expect(fixture.store.admitCommand(stop, true)).resolves.toMatchObject({
+      receipt: { status: "admitted" },
+    });
+    await expect(fixture.store.beginResidentDispatch(stop)).resolves.toMatchObject({
+      command: stop,
+      binding: fixture.binding,
+    });
+  });
 });
 
 describe("HostService resident model-selection dispatch", () => {
@@ -924,6 +1118,33 @@ describe("HostService resident model-selection dispatch", () => {
       await service.close();
     },
   );
+
+  it("completes a reasoning change only after the same durable projection proof", async () => {
+    const fixture = await createFixture();
+    const command = thinkingSelectionCommand(fixture.hostId, "thinking-service-published", "high");
+    await fixture.store.publishResidentProjectionSnapshot(
+      fixture.binding,
+      modelProjection(fixture.binding, "openai", "gpt-5", { thinkingLevel: "off" }),
+    );
+    const submit = vi.fn(async (submitted: CommandEnvelope, context?: GatewayDispatchContext) => {
+      if (!context?.residentBinding) throw new Error("resident binding context missing");
+      await fixture.store.publishResidentModelSelectionProjection(
+        submitted,
+        context.residentBinding,
+        modelProjection(context.residentBinding, "openai", "gpt-5", { thinkingLevel: "high" }),
+      );
+      return { disposition: "handled" as const, message: "Fresh authoritative reasoning state saved" };
+    });
+    const service = new HostService(fixture.store, gatewayWith(submit));
+    await service.initialize();
+
+    const response = await submitThroughService(service, command, "thinking-service-request");
+    expect(response).toMatchObject({ ok: true, result: { status: "completed" } });
+    expect((await fixture.store.getThreadSnapshot(command.threadId)).runtime?.thinkingLevel).toBe("high");
+    expect(await modelAttemptNames(fixture.store)).toEqual([]);
+    expect(submit).toHaveBeenCalledOnce();
+    await service.close();
+  });
 
   it("never completes from a handled gateway result without Store publication proof", async () => {
     const fixture = await createFixture();
@@ -1067,6 +1288,23 @@ function modelSelectionCommand(
   };
 }
 
+function thinkingSelectionCommand(
+  expectedHostId: string,
+  commandId: string,
+  level: string,
+): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "thinking-device-1",
+    commandId,
+    expectedHostId,
+    threadId: "test-thread",
+    issuedAt: "2026-08-07T18:01:00.000Z",
+    expectedExecutionGenerationId: "test-execution-1",
+    command: { kind: "thinking.select", level },
+  };
+}
+
 function abortCommand(expectedHostId: string, commandId: string): CommandEnvelope {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -1080,12 +1318,26 @@ function abortCommand(expectedHostId: string, commandId: string): CommandEnvelop
   };
 }
 
+function promptCommand(expectedHostId: string, commandId: string): CommandEnvelope {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "model-prompt-device",
+    commandId,
+    expectedHostId,
+    threadId: "test-thread",
+    issuedAt: "2026-08-07T18:01:10.000Z",
+    expectedExecutionGenerationId: "test-execution-1",
+    command: { kind: "prompt", text: "Run after the reasoning preference settles." },
+  };
+}
+
 function modelProjection(
   residentBinding: ResidentSessionBinding,
   providerId: string,
   modelId: string,
   options: {
     thinkingLevel?: string;
+    availableThinkingLevels?: string[];
     serviceTier?: string;
     maxTokens?: number;
   } = {},
@@ -1108,6 +1360,7 @@ function modelProjection(
       sessionId: residentBinding.sessionId,
       model: `${providerId}/${modelId}`,
       thinkingLevel: options.thinkingLevel ?? "off",
+      availableThinkingLevels: options.availableThinkingLevels ?? ["off", "low", "medium", "high"],
       serviceTier: options.serviceTier ?? "default",
       isStreaming: false,
       isCompacting: false,

@@ -339,7 +339,11 @@ const AgentStateSchema = z
     serviceTier: z.string().min(1).max(64).refine(noControlCharacters),
     availableThinkingLevels: z
       .array(z.string().min(1).max(64).refine(noControlCharacters))
-      .max(128),
+      .max(128)
+      .refine(
+        (levels) => new Set(levels).size === levels.length,
+        "Available thinking levels must be unique",
+      ),
     isStreaming: z.boolean(),
     isCompacting: z.boolean(),
     isBashRunning: z.boolean(),
@@ -871,6 +875,7 @@ function normalizeRuntime(
       : {}),
     ...(model ? { model } : {}),
     thinkingLevel: state.thinkingLevel,
+    availableThinkingLevels: [...state.availableThinkingLevels],
     serviceTier: state.serviceTier,
     isStreaming: state.isStreaming,
     isCompacting: state.isCompacting,

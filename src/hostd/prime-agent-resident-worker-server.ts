@@ -44,6 +44,7 @@ interface WorkerDaemonConnection {
   getResourceSnapshot?(): Promise<unknown>;
   getAvailableModels?(): Promise<unknown>;
   setModel?(provider: string, modelId: string): Promise<unknown>;
+  setThinkingLevel?(level: string): Promise<void>;
   promoteToResident?(): Promise<void>;
   prompt?(
     message: string,
@@ -467,6 +468,21 @@ export class ResidentRuntimeWorkerServer {
         markMutationInvoked();
         return { result: await record.connection.setModel.call(record.connection, providerId, modelId) };
       }
+      case "connection.set_thinking_level": {
+        const input = strictRecord(payload, ["connectionId", "level"], operation);
+        const [, record] = this.requireConnection(input.connectionId);
+        if (typeof record.connection.setThinkingLevel !== "function") {
+          throw new Error("Thinking-level selection is unavailable");
+        }
+        const level = boundedString(
+          input.level,
+          RESIDENT_WORKER_LIMITS.maxThinkingLevelCharacters,
+          "thinking level",
+        );
+        markMutationInvoked();
+        await record.connection.setThinkingLevel.call(record.connection, level);
+        return { result: null };
+      }
       case "connection.promote_to_resident": {
         const [, record] = this.requireConnectionPayload(payload, operation);
         if (typeof record.connection.promoteToResident !== "function") {
@@ -848,6 +864,7 @@ function operationMayMutate(
     operation === "connection.abort" ||
     operation === "connection.respond_extension_ui" ||
     operation === "connection.set_model" ||
+    operation === "connection.set_thinking_level" ||
     operation === "connection.promote_to_resident"
   ) {
     return true;

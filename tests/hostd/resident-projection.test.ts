@@ -348,6 +348,7 @@ describe("resident authoritative snapshot normalization", () => {
         sessionName: "Continuim build",
         model: "openai/gpt-5.2",
         thinkingLevel: "high",
+        availableThinkingLevels: ["off", "low", "medium", "high"],
         serviceTier: "priority",
         messageCount: 3,
         queuedActionCount: 2,
@@ -419,9 +420,20 @@ describe("resident authoritative snapshot normalization", () => {
     expect(Object.isFrozen(projection)).toBe(true);
     expect(Object.isFrozen(projection.selectedModel)).toBe(true);
     expect(Object.isFrozen(projection.runtime)).toBe(true);
+    expect(Object.isFrozen(projection.runtime.availableThinkingLevels)).toBe(true);
     expect(Object.isFrozen(projection.transcript)).toBe(true);
     expect(Object.isFrozen(projection.transcript[0])).toBe(true);
     expect(Object.isFrozen(projection.childAgents[0]?.activity)).toBe(true);
+  });
+
+  it("rejects duplicate session-reported thinking levels at the upstream boundary", () => {
+    const snapshot = validSnapshot();
+    snapshot.state.availableThinkingLevels = ["low", "high", "high"];
+
+    expectProjectionError(
+      () => normalizeResidentProjectionSnapshot(snapshot, validBinding()),
+      "PRIME_PROJECTION_INVALID",
+    );
   });
 
   it("reduces native RLM protocol output to path-free, human-readable delegation events", () => {

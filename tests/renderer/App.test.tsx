@@ -466,6 +466,8 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
   current.runtime.session = {
     ...current.runtime.session,
     model: 'openai-codex/gpt-5.6-sol',
+    thinkingLevel: 'high',
+    availableThinkingLevels: ['off', 'low', 'medium', 'high', 'max'],
     isStreaming: false,
     isCompacting: false,
     isBashRunning: false,
@@ -479,6 +481,7 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
     stopResidentTurn: false,
     modelCatalog: true,
     selectResidentModel: true,
+    selectResidentThinkingLevel: true,
     ...(options.runtimeOAuth ? { runtimeOAuth: true } : {}),
   }
   current.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
@@ -509,6 +512,11 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
     projected: true,
     message: 'Prime Agent selected and verified this model.',
   }))
+  api.selectResidentThinkingLevel = vi.fn(async () => ({
+    state: 'completed' as const,
+    projected: true,
+    message: 'Prime Agent selected and verified this reasoning level.',
+  }))
 
   const publish = (mutate: (snapshot: WorkbenchSnapshot) => void) => {
     const next = structuredClone(current)
@@ -524,6 +532,12 @@ function createModelSelectionHarness(options: { runtimeOAuth?: boolean } = {}) {
       publish((snapshot) => {
         if (!snapshot.runtime.session) throw new Error('Expected the resident model-selection session')
         snapshot.runtime.session.model = model
+      })
+    },
+    publishCurrentThinkingLevel(level: string) {
+      publish((snapshot) => {
+        if (!snapshot.runtime.session) throw new Error('Expected the resident model-selection session')
+        snapshot.runtime.session.thinkingLevel = level
       })
     },
   }
@@ -3762,6 +3776,8 @@ describe('Prime Continuim renderer', () => {
   })
 
   it('keeps the root composer actionable while a background RLM child is working', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    window.dispatchEvent(new Event('resize'))
     const api = createIdleResidentApi()
     const loadWorkbench = api.loadWorkbench.bind(api)
     api.loadWorkbench = vi.fn(async () => {
@@ -3788,6 +3804,11 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByText('Browser auditor · Inspecting the browser harness', {
       selector: '.composer__connection span',
     })).toBeVisible()
+    const viewAgents = within(screen.getByRole('region', { name: 'Session status' }))
+      .getByRole('button', { name: 'View agents' })
+    expect(viewAgents).toHaveClass('session-continuity__manage--agents')
+    expect(viewAgents.querySelector('.lucide-git-fork')).toBeInTheDocument()
+    expect(viewAgents.querySelector('.lucide-ellipsis')).not.toBeInTheDocument()
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     expect(composer).toBeEnabled()
     expect(composer).toHaveAttribute('placeholder', 'Add direction, constraints, or another outcome…')
@@ -3948,6 +3969,9 @@ describe('Prime Continuim renderer', () => {
 
     const continuity = screen.getByRole('region', { name: 'Session status' })
     const manage = within(continuity).getByRole('button', { name: 'Session' })
+    expect(manage).not.toHaveClass('session-continuity__manage--agents')
+    expect(manage.querySelector('.lucide-ellipsis')).toBeInTheDocument()
+    expect(manage.querySelector('.lucide-git-fork')).not.toBeInTheDocument()
     await user.click(manage)
 
     expect(screen.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true')
@@ -4733,6 +4757,94 @@ describe('Prime Continuim renderer', () => {
     dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
     expect(await within(dialog).findByRole('button', { name: 'Connect ChatGPT' })).toBeEnabled()
     expect(dialog.querySelector('.runtime-oauth-feedback__message--error')).toHaveTextContent('')
+  })
+
+  it('keeps reasoning compact, session-reported, and mutually exclusive with model selection', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    const completion = deferred<{
+      state: 'completed'
+      projected: false
+      message: string
+    }>()
+    harness.api.selectResidentThinkingLevel = vi.fn(() => completion.promise)
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    const trigger = screen.getByRole('button', {
+      name: /Current model: openai-codex\/gpt-5\.6-sol.*Reasoning: high/,
+    })
+    expect(trigger).toHaveTextContent('openai-codex/gpt-5.6-sol · high')
+    await user.click(trigger)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const reasoning = await within(dialog).findByRole('combobox', { name: 'Reasoning' })
+    const reasoningStatus = dialog.querySelector<HTMLElement>('#resident-thinking-level-status')
+    expect(reasoningStatus).not.toBeNull()
+    expect(reasoning).toHaveValue('high')
+    expect(within(dialog).getByText('openai-codex/gpt-5.6-sol', { selector: '.reasoning-control__current strong' })).toBeVisible()
+    expect(Array.from((reasoning as HTMLSelectElement).options).map((option) => option.value)).toEqual([
+      'off',
+      'low',
+      'medium',
+      'high',
+      'max',
+    ])
+
+    await user.selectOptions(reasoning, 'max')
+    expect(harness.api.selectResidentThinkingLevel).toHaveBeenCalledWith({
+      threadId: 'thread-seamless',
+      level: 'max',
+    })
+    expect(reasoning).toHaveValue('max')
+    expect(reasoningStatus).toHaveTextContent(/Setting reasoning to max/)
+    within(dialog).getAllByRole('button', { name: /Use model/ }).forEach((button) => expect(button).toBeDisabled())
+
+    await act(async () => {
+      completion.resolve({
+        state: 'completed',
+        projected: false,
+        message: 'Prime Agent selected max reasoning.',
+      })
+      await completion.promise
+    })
+    expect(reasoningStatus).toHaveTextContent(
+      /max reasoning is selected on Prime Agent.*will not resend it/i,
+    )
+    expect(within(dialog).getByRole('button', { name: 'Done' })).toBeEnabled()
+
+    act(() => harness.publishCurrentThinkingLevel('max'))
+    await waitFor(() => expect(within(dialog).getByRole('combobox', { name: 'Reasoning' })).toHaveValue('max'))
+    expect(reasoningStatus).toHaveTextContent('Reasoning is now max.')
+    expect(within(dialog).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Close models and accounts' }))
+    expect(trigger).toHaveTextContent('openai-codex/gpt-5.6-sol · max')
+  })
+
+  it('does not replay a reasoning level after a terminal non-retryable rejection', async () => {
+    const user = userEvent.setup()
+    const harness = createModelSelectionHarness()
+    harness.api.selectResidentThinkingLevel = vi.fn(async () => ({
+      state: 'rejected' as const,
+      retryable: false,
+      message: 'Prime Agent no longer accepts this level.',
+    }))
+
+    render(<App api={harness.api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: /Open models and accounts/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'Models & accounts' })
+    const reasoning = await within(dialog).findByRole('combobox', { name: 'Reasoning' })
+
+    await user.selectOptions(reasoning, 'max')
+    await waitFor(() => expect(dialog.querySelector('#resident-thinking-level-status')).toHaveTextContent(
+      'Prime Agent no longer accepts this level.',
+    ))
+    expect(harness.api.selectResidentThinkingLevel).toHaveBeenCalledTimes(1)
+    expect(within(reasoning).getByRole('option', { name: 'Max' })).toBeDisabled()
+
+    await user.selectOptions(reasoning, 'max')
+    expect(harness.api.selectResidentThinkingLevel).toHaveBeenCalledTimes(1)
   })
 
   it('turns completed host model proof into one clear Done action while awaiting the current-model projection', async () => {

@@ -22,6 +22,7 @@ export const RESIDENT_WORKER_LIMITS = Object.freeze({
   maxPromptCharacters: 65_536,
   maxProviderCharacters: 128,
   maxModelCharacters: 512,
+  maxThinkingLevelCharacters: 64,
   maxExtensionUiValueCharacters: 65_536,
   maxRequestTimeoutMs: 24 * 60 * 60 * 1_000,
   workerReadyTimeoutMs: 15_000,
@@ -43,6 +44,7 @@ export type ResidentWorkerOperation =
   | "connection.get_resource_snapshot"
   | "connection.get_available_models"
   | "connection.set_model"
+  | "connection.set_thinking_level"
   | "connection.promote_to_resident"
   | "connection.prompt"
   | "connection.abort"
@@ -61,6 +63,7 @@ export const RESIDENT_WORKER_OPERATIONS: ReadonlySet<ResidentWorkerOperation> = 
   "connection.get_resource_snapshot",
   "connection.get_available_models",
   "connection.set_model",
+  "connection.set_thinking_level",
   "connection.promote_to_resident",
   "connection.prompt",
   "connection.abort",
