@@ -2001,6 +2001,122 @@ describe("PrimeAgentResidentAdapter session lifecycle", () => {
     await adapter.close();
   });
 
+  it("reconciles a lost kill acknowledgement from exact absence without invoking kill again", async () => {
+    const authority = await issueResidentKillLease("resident-end-lost-ack-reconciled");
+    let sessionPresent = true;
+    const { adapter, state } = createHarness({
+      authorizeResidentKillInvocation: (lease) => authority.store.authorizeResidentKillInvocation(lease),
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: {
+              sessions: sessionPresent
+                ? [liveSummary({ cwd: authority.binding.workspaceDirectory })]
+                : [],
+            },
+          };
+        }
+        if (type === "kill") {
+          sessionPresent = false;
+          throw new Error("root exited before the response was delivered");
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expectRuntimeError(
+      adapter.endResidentSession(authority.lease),
+      "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+    );
+    await expect(adapter.reconcileResidentEnd(authority.binding)).resolves.toEqual({
+      evidenceVersion: 1,
+      operation: "end_reconciliation",
+      binding: authority.binding,
+      disposition: "absent",
+    });
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(1);
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "list")).toHaveLength(2);
+    await adapter.close();
+  });
+
+  it("keeps outcome-unknown End quarantined while the exact session is still live", async () => {
+    const authority = await issueResidentKillLease("resident-end-live-reconciliation");
+    const { adapter, state } = createHarness({
+      requestHandler: async (command) => {
+        const type = (command as { type?: string }).type ?? "unknown";
+        if (type === "list") {
+          return {
+            type: "response",
+            command: "list",
+            success: true,
+            data: { sessions: [liveSummary({ cwd: authority.binding.workspaceDirectory })] },
+          };
+        }
+        return { type: "response", command: type, success: true };
+      },
+    });
+
+    await expect(adapter.reconcileResidentEnd(authority.binding)).resolves.toBeUndefined();
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("does not start or replace a daemon while reconciling an outcome-unknown End", async () => {
+    const authority = await issueResidentKillLease("resident-end-reconciliation-no-spawn");
+    const { adapter, state } = createHarness({ connectOutcomes: ["fail"] });
+
+    await expectRuntimeError(
+      adapter.reconcileResidentEnd(authority.binding),
+      "PRIME_RUNTIME_REQUEST_FAILED",
+    );
+    expect(state.spawnCalls).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+    await adapter.close();
+  });
+
+  it("returns archived reconciliation evidence only for the exact saved session", async () => {
+    const authority = await issueResidentKillLease("resident-end-archived-reconciliation");
+    const { adapter } = createHarness({
+      requestHandler: async () => ({
+        type: "response",
+        command: "list",
+        success: true,
+        data: { sessions: [liveSummary({ lifecycle: "archived", cwd: authority.binding.workspaceDirectory })] },
+      }),
+    });
+
+    await expect(adapter.reconcileResidentEnd(authority.binding)).resolves.toEqual({
+      evidenceVersion: 1,
+      operation: "end_reconciliation",
+      binding: authority.binding,
+      disposition: "archived",
+    });
+    await adapter.close();
+  });
+
+  it("rejects a replacement that reuses the saved session identity", async () => {
+    const authority = await issueResidentKillLease("resident-end-replacement-reconciliation");
+    const { adapter, state } = createHarness({
+      requestHandler: async () => ({
+        type: "response",
+        command: "list",
+        success: true,
+        data: { sessions: [liveSummary({ activeSessionId: "replacement-active", id: "replacement-active" })] },
+      }),
+    });
+
+    await expectRuntimeError(
+      adapter.reconcileResidentEnd(authority.binding),
+      "PRIME_RUNTIME_SESSION_MISMATCH",
+    );
+    expect(state.requests.filter((request) => (request as { type?: string }).type === "kill")).toHaveLength(0);
+    await adapter.close();
+  });
+
   it("detaches only the exact local transport and is idempotent without stopping the worker", async () => {
     const { adapter, state } = createHarness();
     const connection = await adapter.attachResident(binding());

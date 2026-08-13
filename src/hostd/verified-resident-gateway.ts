@@ -72,6 +72,7 @@ type ResidentGatewayAdapter = PrimeAgentGateway & {
   createOwnedCandidate?(input: Parameters<ResidentProvisioningAdapter["createOwnedCandidate"]>[0]): Promise<ResidentOwnedRuntimeCandidate>;
   readStableResidentProjection?(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   endResidentSession?: NonNullable<ResidentProvisioningAdapter["endResidentSession"]>;
+  reconcileResidentEnd?: NonNullable<ResidentProvisioningAdapter["reconcileResidentEnd"]>;
   detachResidentSession?(binding: ResidentSessionBinding): Promise<void>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   listResidentExtensionUiRequests?(binding: ResidentSessionBinding): readonly ResidentExtensionUiRequest[];
@@ -571,7 +572,8 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
     if (
       typeof adapter.createOwnedCandidate !== "function" ||
       typeof adapter.readStableResidentProjection !== "function" ||
-      typeof adapter.endResidentSession !== "function"
+      typeof adapter.endResidentSession !== "function" ||
+      typeof adapter.reconcileResidentEnd !== "function"
     ) {
       throw new ResidentRuntimeContractError(
         "PRIME_RUNTIME_MODULE_INVALID",
@@ -592,6 +594,10 @@ export class VerifiedResidentGateway implements PrimeAgentGateway {
       ) => {
         await this.assertCredentialSecurity(true);
         return adapter.endResidentSession!(lease);
+      },
+      reconcileResidentEnd: async (binding: ResidentSessionBinding) => {
+        await this.assertCredentialSecurity(true);
+        return adapter.reconcileResidentEnd!(binding);
       },
     });
   }

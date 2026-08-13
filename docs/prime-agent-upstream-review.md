@@ -31,12 +31,12 @@ claims. Never replace the pinned runtime with an ambient install.
 
 ## Latest review
 
-Reviewed on 2026-08-12.
+Reviewed on 2026-08-13.
 
 - Latest stable release: `v0.7.2`, published 2026-08-11.
 - Release commit: `83a0f9f9566219551fcb6ffaf7f519a815749a58`.
 - Upstream `main` reviewed at:
-  `0987c1ba7637cbcb99afe9efe1180b838a0aa958` (2026-08-12).
+  `7787f07415d843b9a800f6a4720e0c739bd608e5` (2026-08-13).
 - Continuim runtime pin: `v0.7.2`; no runtime upgrade is required.
 - Release documentation inventory: 96 Markdown/MDX files, including the coding
   agent architecture, daemon, RPC, RLM, sessions, providers, models, skills,
@@ -49,6 +49,16 @@ Reviewed on 2026-08-12.
   SDK/settings documentation; two changelogs describe fullscreen terminal link
   handling. These changes are not part of the stable `v0.7.2` contract and do
   not change Continuim's current runtime pin.
+- Upstream `main` is eight commits ahead of `v0.7.2`. Two source changes landed
+  after the prior review without changing the nine-document delta:
+  `5e268e28` adds unreleased context-aware host request contracts, and
+  `7787f074` retains root-kill cleanup ownership until the kill request settles.
+  Neither contract is part of a stable release, so Continuim retains `v0.7.2`.
+  The root-kill race is handled locally by read-only End reconciliation: after
+  a lost kill acknowledgement, Continuim may complete the saved End only when
+  an exact daemon list proves the bound session absent or archived and proves
+  there is no replacement with the same saved session identity. It never sends
+  a second kill.
 - The `v0.7.2` release contains the worker/session recovery fixes Continuim
   depends on: disconnected workers no longer report ready, timed-out stops
   finish cleanup, zombies are not considered alive, and stale registrations

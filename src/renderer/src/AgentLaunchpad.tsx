@@ -100,7 +100,7 @@ export default function AgentLaunchpad({
             }
           : {
               title: 'Connect a model to begin',
-              detail: 'ChatGPT setup is guided in-app; credentials remain on this computer.',
+              detail: 'Choose a provider and model. Credentials stay on this computer.',
               icon: Bot,
             }
   const visibleSessionPresentation = {
@@ -121,8 +121,8 @@ export default function AgentLaunchpad({
       {showWorkflows && (
         <header className="agent-launchpad__header">
           <span className="agent-launchpad__eyebrow">Prime Agent</span>
-          <h2 id="agent-launchpad-title">What should we build?</h2>
-          <p>Describe the outcome or choose a brief.</p>
+          <h2 id="agent-launchpad-title">Give Prime Agent a goal.</h2>
+          <p>It delegates focused work and folds the result back.</p>
         </header>
       )}
 

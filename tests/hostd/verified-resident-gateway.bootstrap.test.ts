@@ -16,6 +16,7 @@ import {
   ResidentRuntimeContractError,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentEndAcknowledgement,
+  type ResidentEndReconciliationEvidence,
   type ResidentOwnedSessionCreateInput,
   type ResidentRuntimeConnection,
   type ResidentPromptIdleAuthorityEvidence,
@@ -678,6 +679,7 @@ async function gatewayFixture(
     endResidentSession: vi.fn(async () => {
       throw new Error("No resident end was configured for this fixture");
     }),
+    reconcileResidentEnd: vi.fn(async () => undefined),
     attachResident: vi.fn(async (candidate: ResidentSessionBinding) => {
       const connection = attachResidentOverride
         ? await attachResidentOverride(candidate)
@@ -733,6 +735,7 @@ type ResidentGatewayAdapter = PrimeAgentGateway & {
   createOwnedCandidate(input: ResidentOwnedSessionCreateInput): Promise<ResidentOwnedRuntimeCandidate>;
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   endResidentSession(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
+  reconcileResidentEnd(binding: ResidentSessionBinding): Promise<ResidentEndReconciliationEvidence | undefined>;
   attachResident(binding: ResidentSessionBinding): Promise<ResidentRuntimeConnection>;
   reconcileAcknowledgedPromptIdle(
     lease: ResidentPromptReconciliationLease,

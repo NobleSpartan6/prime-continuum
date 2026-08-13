@@ -60,9 +60,11 @@ import { getHostDataPaths, type HostDataPaths } from "./paths";
 import type { ResidentProjectionSnapshot } from "./resident-projection";
 import {
   ResidentEndAcknowledgementSchema,
+  validateResidentEndReconciliationEvidence,
   ResidentSessionBindingSchema,
   validateResidentSessionBinding,
   type ResidentEndAcknowledgement,
+  type ResidentEndReconciliationEvidence,
   type ResidentAbortIdleAuthorityEvidence,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentSessionBinding,
@@ -4358,6 +4360,62 @@ export class HostStore {
       });
       await this.writeResidentLifecycleBoundaryUnlocked(operation, "after_completed");
       return residentLifecycleStatus(operation);
+    });
+  }
+
+  /**
+   * Complete a previously outcome-unknown End only after the verified adapter
+   * proves by exact read-only list that the saved session is absent/archived.
+   */
+  async completeQuarantinedResidentEnd(
+    inputValue: ResidentEndLifecycleOperationInput,
+    evidenceValue: ResidentEndReconciliationEvidence,
+  ): Promise<ResidentLifecycleStatus> {
+    const input = ResidentEndLifecycleOperationInputSchema.parse(inputValue);
+    const evidence = validateResidentEndReconciliationEvidence(evidenceValue);
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const operation = await this.requireExactResidentLifecycleOperationUnlocked("end", input);
+      if (operation.phase === "completed") return residentLifecycleStatus(operation);
+      if (
+        operation.phase !== "quarantined" ||
+        operation.quarantinedFrom !== "kill_dispatching" ||
+        operation.quarantineReason !== "external_outcome_unknown" ||
+        !operation.binding ||
+        !isDeepStrictEqual(evidence.binding, operation.binding)
+      ) {
+        throw residentLifecycleMutationAlreadyCrossed(operation, "resident end reconciliation");
+      }
+      await this.assertResidentLifecycleAuthorityCurrentUnlocked(operation);
+      const {
+        quarantinedFrom: _quarantinedFrom,
+        quarantineReason: _quarantineReason,
+        ...settledOperation
+      } = operation;
+      const acknowledged = ResidentLifecycleOperationRecordSchema.parse({
+        ...settledOperation,
+        phase: "kill_acknowledged",
+        updatedAt: causalNow(operation.updatedAt),
+      });
+      // Publish the read-only reconciliation proof into the existing durable
+      // recovery phase before changing any public projection or binding state.
+      await this.writeResidentLifecycleBoundaryUnlocked(acknowledged, "after_kill_acknowledged");
+      await this.prepareResidentEndProjectionUnlocked(acknowledged);
+      await this.guardResidentLifecycleMaterializationUnlocked(async () => {
+        await this.materializeCompletedResidentBindingUnlocked(acknowledged);
+        await this.supersedeResidentDispatchProofBarriersForEndUnlocked(acknowledged);
+        await this.injectResidentLifecycleFault("after_completed_binding", operation.operationId);
+      });
+      const completedAt = causalNow(acknowledged.updatedAt);
+      const completed = ResidentLifecycleOperationRecordSchema.parse({
+        ...acknowledged,
+        phase: "completed",
+        updatedAt: completedAt,
+        terminalAt: completedAt,
+      });
+      await this.writeResidentLifecycleBoundaryUnlocked(completed, "after_completed");
+      return residentLifecycleStatus(completed);
     });
   }
 

@@ -736,6 +736,70 @@ describe("HostStore resident lifecycle crash boundaries", () => {
     }
   });
 
+  it("recovers reconciliation evidence durably without reopening kill authority", async () => {
+    const fixture = await createFixture();
+    const active = legacyBinding(fixture, "reconciliation-evidence");
+    await fixture.store.persistResidentSessionBinding(active);
+    const input = await endOperationInput(fixture, "end-reconciliation-evidence", "e");
+    let injected = false;
+    const dispatchCrash = new HostStore(fixture.directory, {
+      residentLifecycleFaultInjector(point) {
+        if (!injected && point === "after_kill_dispatching") {
+          injected = true;
+          throw new Error("simulated lost kill response");
+        }
+      },
+    });
+    await dispatchCrash.initialize();
+    await dispatchCrash.prepareResidentEnd(input, active);
+    const lease = await dispatchCrash.beginResidentKill(input);
+    await expect(dispatchCrash.authorizeResidentKillInvocation(lease)).rejects.toThrow("simulated lost kill response");
+
+    const quarantined = new HostStore(fixture.directory);
+    await quarantined.initialize();
+    expect(await quarantined.getResidentLifecycleStatus(input.operationId)).toMatchObject({
+      phase: "quarantined",
+      quarantinedFrom: "kill_dispatching",
+      quarantineReason: "external_outcome_unknown",
+    });
+    const evidence = {
+      evidenceVersion: 1 as const,
+      operation: "end_reconciliation" as const,
+      binding: active,
+      disposition: "absent" as const,
+    };
+    await expect(quarantined.completeQuarantinedResidentEnd(input, {
+      ...evidence,
+      binding: { ...active, sessionId: "replacement-session" },
+    })).rejects.toMatchObject({ code: "RESIDENT_LIFECYCLE_RECONCILIATION_REQUIRED" });
+    expect(await quarantined.getResidentLifecycleStatus(input.operationId)).toMatchObject({ phase: "quarantined" });
+
+    let settlementInjected = false;
+    const settlementCrash = new HostStore(fixture.directory, {
+      residentLifecycleFaultInjector(point) {
+        if (!settlementInjected && point === "after_kill_acknowledged") {
+          settlementInjected = true;
+          throw new Error("simulated reconciliation settlement crash");
+        }
+      },
+    });
+    await settlementCrash.initialize();
+    await expect(settlementCrash.completeQuarantinedResidentEnd(input, evidence)).rejects.toThrow(
+      "simulated reconciliation settlement crash",
+    );
+
+    const restarted = new HostStore(fixture.directory);
+    await restarted.initialize();
+    expect(await restarted.getResidentLifecycleStatus(input.operationId)).toMatchObject({ phase: "completed" });
+    await expect(restarted.beginResidentKill(input)).rejects.toMatchObject({
+      code: "RESIDENT_LIFECYCLE_PHASE_CONFLICT",
+    });
+    expect((await restarted.getThreadSnapshot(active.threadId)).residentLifecycle).toMatchObject({
+      state: "ended",
+      operationId: input.operationId,
+    });
+  });
+
   it.each([
     "after_ending",
     "after_binding_revoked",

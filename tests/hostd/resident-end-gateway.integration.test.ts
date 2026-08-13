@@ -215,6 +215,7 @@ async function gatewayFixture(outcome: "success" | "unknown") {
       createOwnedCandidate: vi.fn(),
       readStableResidentProjection: vi.fn(),
       endResidentSession,
+      reconcileResidentEnd: vi.fn(async () => undefined),
       detachResidentSession,
       attachResident,
       reconcileAcknowledgedPromptIdle: vi.fn(),

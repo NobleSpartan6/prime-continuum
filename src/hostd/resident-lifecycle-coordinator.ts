@@ -10,6 +10,7 @@ import {
   validateResidentOwnedSessionCreateInput,
   type ResidentOwnedSessionCreateInput,
   type ResidentEndAcknowledgement,
+  type ResidentEndReconciliationEvidence,
   type ResidentSessionBinding,
 } from "./resident-runtime";
 import {
@@ -63,6 +64,8 @@ export interface ResidentProvisioningAdapter {
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   /** Root kill accepts no binding or upstream identity outside this opaque Store authority. */
   endResidentSession?(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
+  /** Read-only exact absence/archive proof for a previously dispatched End. */
+  reconcileResidentEnd?(binding: ResidentSessionBinding): Promise<ResidentEndReconciliationEvidence | undefined>;
 }
 
 type ResidentProvisioningStore = Pick<
@@ -85,6 +88,7 @@ type ResidentProvisioningStore = Pick<
   | "failResidentKillBeforeEffect"
   | "acknowledgeResidentKill"
   | "completeAcknowledgedResidentEnd"
+  | "completeQuarantinedResidentEnd"
   | "quarantineResidentLifecycleOutcomeUnknown"
 >;
 
@@ -241,6 +245,13 @@ export class ResidentLifecycleCoordinator {
       await Promise.resolve(this.onEnded(binding)).catch(() => undefined);
       return status;
     }
+    if (
+      status.phase === "quarantined" &&
+      status.quarantinedFrom === "kill_dispatching" &&
+      status.quarantineReason === "external_outcome_unknown"
+    ) {
+      return this.reconcileQuarantinedEnd(input, binding, status);
+    }
     if (isTerminalEndStatus(status) || status.phase === "kill_dispatching") return status;
     if (status.phase !== "ending" || this.closeRequested) return status;
 
@@ -270,13 +281,16 @@ export class ResidentLifecycleCoordinator {
         parsed.data.activeSessionId !== lease.binding.activeSessionId ||
         parsed.data.sessionId !== lease.binding.sessionId
       ) {
-        return this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+        const quarantined = await this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+        return this.reconcileQuarantinedEnd(input, binding, quarantined);
       }
       acknowledgement = parsed.data;
     } catch (error) {
-      return isDefinitiveRuntimeFailureBeforeEffect(error)
-        ? this.store.failResidentKillBeforeEffect(lease)
-        : this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+      if (isDefinitiveRuntimeFailureBeforeEffect(error)) {
+        return this.store.failResidentKillBeforeEffect(lease);
+      }
+      const quarantined = await this.store.quarantineResidentLifecycleOutcomeUnknown(lease);
+      return this.reconcileQuarantinedEnd(input, binding, quarantined);
     }
 
     // Once the adapter resolves, close must still drain this acknowledgement.
@@ -293,6 +307,26 @@ export class ResidentLifecycleCoordinator {
         return this.currentStatusOrThrow(input.operationId, error);
       }
     }
+  }
+
+  private async reconcileQuarantinedEnd(
+    input: ResidentEndLifecycleOperationInput,
+    binding: ResidentSessionBinding,
+    status: ResidentLifecycleStatus,
+  ): Promise<ResidentLifecycleStatus> {
+    let evidence: ResidentEndReconciliationEvidence | undefined;
+    try {
+      const adapter = await this.adapter();
+      evidence = await adapter.reconcileResidentEnd?.(binding);
+    } catch {
+      // Live, ambiguous, or temporarily unreadable state stays quarantined.
+      // Reconciliation is read-only and never resends root kill.
+      return status;
+    }
+    if (!evidence) return status;
+    const completed = await this.store.completeQuarantinedResidentEnd(input, evidence);
+    await Promise.resolve(this.onEnded(binding)).catch(() => undefined);
+    return completed;
   }
 
   private async normalizeRequest(
