@@ -77,6 +77,7 @@ const RESIDENT_THINKING_LEVELS_CAPABILITY = "prime_agent_thinking_levels_v1";
 const RESIDENT_EXTENSION_UI_CAPABILITY = "resident_extension_ui_v1";
 const RESIDENT_LIFECYCLE_CAPABILITY = "resident_lifecycle_v1";
 const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1";
+const RUNTIME_PROVIDER_SETUP_CAPABILITY = "runtime_provider_setup_handoff_v1";
 const CANDIDATE_EVALUATION_CAPABILITY = "candidate_evaluation_probe_v1";
 const EXPECTED_BASE_CAPABILITIES = Object.freeze([
   "resident_control_projection_v1",
@@ -85,6 +86,7 @@ const EXPECTED_BASE_CAPABILITIES = Object.freeze([
   "runtime_model_catalog_v1",
   "runtime_oauth_attempt_v1",
   RUNTIME_OAUTH_CAPABILITY,
+  ...(process.platform === "darwin" ? [RUNTIME_PROVIDER_SETUP_CAPABILITY] : []),
   "snapshot_chunks_v1",
 ].sort());
 const EXPECTED_WARMED_CAPABILITIES = Object.freeze([

@@ -48,7 +48,7 @@ describe('DeferredModelsDialog', () => {
       return (
         <>
           <button ref={triggerRef} type="button" onClick={() => setOpen(true)}>Open models</button>
-          <DeferredModelsDialog api={api} open={open} host={host} canSelectResidentModel={false} canConnectRuntimeOAuth={false} triggerRef={triggerRef} onClose={() => setOpen(false)} />
+          <DeferredModelsDialog api={api} open={open} host={host} canSelectResidentModel={false} canConnectRuntimeOAuth={false} canOpenRuntimeProviderSetup={false} triggerRef={triggerRef} onClose={() => setOpen(false)} />
         </>
       )
     }
@@ -92,6 +92,7 @@ describe('DeferredModelsDialog', () => {
             host={host}
             canSelectResidentModel={false}
             canConnectRuntimeOAuth={false}
+            canOpenRuntimeProviderSetup={false}
             triggerRef={triggerRef}
             onClose={() => setOpen(false)}
           />

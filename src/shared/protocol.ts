@@ -11,6 +11,7 @@ import {
 } from "./runtime-oauth-attempt";
 export {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  HOSTD_GRACEFUL_RETIRE_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
@@ -22,12 +23,14 @@ export {
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY,
   RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   THREAD_HANDOFF_CAPABILITY,
 } from "./capabilities";
 import {
   CANDIDATE_EVALUATION_PROBE_CAPABILITY,
+  HOSTD_GRACEFUL_RETIRE_CAPABILITY,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PRIME_CONTINUIM_SELF_BUILD_EVALUATION_CAPABILITY,
   RESIDENT_CONTROL_PROJECTION_CAPABILITY,
@@ -38,6 +41,7 @@ import {
   RUNTIME_INTEGRITY_REPAIR_CAPABILITY,
   RUNTIME_INTEGRITY_RETRY_CAPABILITY,
   RUNTIME_MODEL_CATALOG_CAPABILITY,
+  RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY,
   RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
   THREAD_HANDOFF_CAPABILITY,
@@ -1433,6 +1437,36 @@ export const RuntimeModelCatalogSnapshotSchema = z
   });
 export type RuntimeModelCatalogSnapshot = z.infer<typeof RuntimeModelCatalogSnapshotSchema>;
 
+/**
+ * Path-free observation of one trusted-local handoff into Prime Agent's own
+ * interactive account setup. This never claims that a provider was connected;
+ * only a later authoritative model-catalog read can establish that fact.
+ */
+export const RuntimeProviderSetupResultSchema = z.discriminatedUnion("state", [
+  z.object({
+    resultVersion: z.literal(1),
+    state: z.literal("opened"),
+    expectedHostId: IdSchema,
+    providerId: IdSchema,
+    releaseVersion: z.string().min(1).max(64),
+  }).strict(),
+  z.object({
+    resultVersion: z.literal(1),
+    state: z.literal("failed_before_launch"),
+    expectedHostId: IdSchema,
+    providerId: IdSchema,
+    releaseVersion: z.string().min(1).max(64),
+  }).strict(),
+  z.object({
+    resultVersion: z.literal(1),
+    state: z.literal("indeterminate"),
+    expectedHostId: IdSchema,
+    providerId: IdSchema,
+    releaseVersion: z.string().min(1).max(64),
+  }).strict(),
+]);
+export type RuntimeProviderSetupResult = z.infer<typeof RuntimeProviderSetupResultSchema>;
+
 const RuntimeOAuthAuthorizationUrlSchema = z
   .string()
   .url()
@@ -2302,6 +2336,30 @@ const RuntimeIntegrityIdentityPartSchema = z
 const RuntimeIntegrityDigestSchema = z.string().length(64).regex(/^[a-f0-9]{64}$/);
 const RuntimeIntegrityTrustAnchorIdSchema = RuntimeIntegrityDigestSchema;
 
+/**
+ * Byte-exact identity of the host service that answered a health request.
+ * Optional on protocol v1 health so remote/legacy hosts can still be
+ * inspected, but a bundled local desktop may require it before attaching.
+ */
+export const HostdBuildIdentitySchema = z
+  .object({
+    contractVersion: z.literal(1),
+    bundleSha256: RuntimeIntegrityDigestSchema,
+    runtimeTrustAnchorId: RuntimeIntegrityTrustAnchorIdSchema.optional(),
+  })
+  .strict();
+export type HostdBuildIdentity = z.infer<typeof HostdBuildIdentitySchema>;
+
+export const HostdRetirementResultSchema = z
+  .object({
+    retirementVersion: z.literal(1),
+    state: z.literal("accepted"),
+    expectedHostId: IdSchema,
+    hostdBuildIdentity: HostdBuildIdentitySchema,
+  })
+  .strict();
+export type HostdRetirementResult = z.infer<typeof HostdRetirementResultSchema>;
+
 export const RuntimeIntegrityTargetSchema = z
   .object({
     runtime: z.literal("prime-agent"),
@@ -2369,6 +2427,8 @@ export const HealthSnapshotSchema = z
   .object({
     protocolVersion: z.literal(PROTOCOL_VERSION),
     hostdVersion: z.string().min(1).max(64),
+    /** Optional in protocol v1 so newer desktops can identify legacy hosts. */
+    hostdBuildIdentity: HostdBuildIdentitySchema.optional(),
     startedAt: IsoDateTimeSchema,
     checkedAt: IsoDateTimeSchema,
     serviceState: z.enum(["starting", "ready", "degraded"]),
@@ -2740,6 +2800,14 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
   z.object({ ...RequestBase, method: z.literal("health.get"), payload: z.object({}) }),
   z.object({
     ...RequestBase,
+    method: z.literal("host.retire"),
+    payload: z.object({
+      expectedHostId: IdSchema,
+      expectedBuildIdentity: HostdBuildIdentitySchema,
+    }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
     method: z.literal("candidate.evaluation.preflight"),
     payload: CandidateEvaluationPreflightRequestSchema,
   }),
@@ -2772,6 +2840,11 @@ export const HostIpcRequestSchema = z.discriminatedUnion("method", [
     ...RequestBase,
     method: z.literal("runtime.model_catalog"),
     payload: z.object({ expectedHostId: IdSchema }).strict(),
+  }),
+  z.object({
+    ...RequestBase,
+    method: z.literal("runtime.provider_setup.open"),
+    payload: z.object({ expectedHostId: IdSchema, providerId: IdSchema }).strict(),
   }),
   z.object({
     ...RequestBase,
@@ -2934,6 +3007,7 @@ const SuccessBase = {
 
 export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
   z.object({ ...SuccessBase, method: z.literal("health.get"), result: HealthSnapshotSchema }),
+  z.object({ ...SuccessBase, method: z.literal("host.retire"), result: HostdRetirementResultSchema }),
   z.object({
     ...SuccessBase,
     method: z.literal("candidate.evaluation.preflight"),
@@ -2960,6 +3034,11 @@ export const HostIpcSuccessResponseSchema = z.discriminatedUnion("method", [
     result: RuntimeIntegritySnapshotSchema,
   }),
   z.object({ ...SuccessBase, method: z.literal("runtime.model_catalog"), result: RuntimeModelCatalogSnapshotSchema }),
+  z.object({
+    ...SuccessBase,
+    method: z.literal("runtime.provider_setup.open"),
+    result: RuntimeProviderSetupResultSchema,
+  }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.start"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.status"), result: RuntimeOAuthSessionSnapshotSchema }),
   z.object({ ...SuccessBase, method: z.literal("oauth.session.cancel"), result: RuntimeOAuthSessionSnapshotSchema }),
@@ -3022,12 +3101,14 @@ export const HostIpcErrorResponseSchema = z.object({
   requestId: IdSchema,
   method: z.enum([
     "health.get",
+    "host.retire",
     "candidate.evaluation.preflight",
     "candidate.evaluation.start",
     "candidate.evaluation.snapshot",
     "runtime.integrity.retry",
     "runtime.integrity.repair",
     "runtime.model_catalog",
+    "runtime.provider_setup.open",
     "oauth.session.start",
     "oauth.session.status",
     "oauth.session.cancel",

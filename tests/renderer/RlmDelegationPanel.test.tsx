@@ -49,6 +49,15 @@ describe('RlmDelegationPanel', () => {
         status: 'waiting',
         hostName: 'This computer',
       },
+      {
+        id: 'failed-child',
+        parentId: 'lead',
+        name: 'Runtime proof',
+        role: 'Runtime audit',
+        status: 'failed',
+        hostName: 'This computer',
+        error: 'The provider session expired.',
+      },
     ]
 
     const { container } = render(
@@ -68,8 +77,10 @@ describe('RlmDelegationPanel', () => {
     expect(within(child as HTMLElement).getByText('via Review lead')).toBeVisible()
     expect(screen.getByText('GPT-5.6 Sol · high thinking')).toBeVisible()
     expect(container.querySelector('.rlm-map__connector')).not.toBeInTheDocument()
-    expect(within(screen.getByLabelText('RLM activity summary')).getByText('2')).toBeVisible()
-    expect(within(screen.getByLabelText('RLM activity summary')).getByText('1')).toBeVisible()
+    const summary = screen.getByLabelText('RLM activity summary')
+    expect(within(summary).getByText('2')).toBeVisible()
+    expect(within(summary).getAllByText('1')).toHaveLength(2)
+    expect(within(summary).getByText('need review')).toBeVisible()
     expect(screen.getByText('View result')).toBeVisible()
   })
 

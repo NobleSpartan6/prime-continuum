@@ -57,6 +57,7 @@ const bridge: PrimeBridge = {
   retryRuntimeIntegrity: (input) => invoke(IPC.retryRuntimeIntegrity, input),
   repairRuntimeIntegrity: (input) => invoke(IPC.repairRuntimeIntegrity, input),
   runtimeModelCatalog: (input) => invoke(IPC.runtimeModelCatalog, input),
+  openRuntimeProviderSetup: (input) => invoke(IPC.openRuntimeProviderSetup, input),
   startRuntimeOAuth: (input) => invoke(IPC.startRuntimeOAuth, input),
   runtimeOAuthStatus: (input) => invoke(IPC.runtimeOAuthStatus, input),
   cancelRuntimeOAuth: (input) => invoke(IPC.cancelRuntimeOAuth, input),

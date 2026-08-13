@@ -648,6 +648,77 @@ describe('DesktopControlService runtime readiness', () => {
     })
     await service.disconnect()
   })
+
+  it('opens provider setup only through the exact verified local runtime authority', async () => {
+    const connection = new TestConnection((method, _index, options, params) => {
+      if (method === 'health.get') {
+        return health({
+          runtime: runtimeSnapshot('ready'),
+          capabilities: [
+            'runtime_model_catalog_v1',
+            'runtime_provider_setup_handoff_v1',
+          ],
+        })
+      }
+      if (method === 'runtime.provider_setup.open') {
+        expect(params).toEqual({ expectedHostId: 'host-a', providerId: 'anthropic' })
+        expect(options).toEqual({ timeoutMs: 20_000 })
+        return {
+          resultVersion: 1,
+          state: 'opened',
+          expectedHostId: 'host-a',
+          providerId: 'anthropic',
+          releaseVersion: '0.7.0',
+        }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest('darwin')
+    await service.connect({ kind: 'local' })
+
+    await expect(service.openRuntimeProviderSetup('host-a', 'anthropic')).resolves.toMatchObject({
+      state: 'opened',
+      expectedHostId: 'host-a',
+      providerId: 'anthropic',
+      releaseVersion: '0.7.0',
+    })
+    await expect(service.openRuntimeProviderSetup('host-b', 'anthropic')).rejects.toMatchObject({
+      code: 'runtime.provider_setup_local_authority_required',
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.provider_setup.open')).toHaveLength(1)
+    await service.disconnect()
+  })
+
+  it('does not repeat an ambiguous provider setup handoff', async () => {
+    const connection = new TestConnection((method) => {
+      if (method === 'health.get') {
+        return health({
+          runtime: runtimeSnapshot('ready'),
+          capabilities: [
+            'runtime_model_catalog_v1',
+            'runtime_provider_setup_handoff_v1',
+          ],
+        })
+      }
+      if (method === 'runtime.provider_setup.open') {
+        throw new ControlError('transport.request_timeout', 'The response was lost.', { retryable: true })
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    connectLocalHostd.mockResolvedValue(connection)
+    const service = await serviceForTest('darwin')
+    await service.connect({ kind: 'local' })
+
+    await expect(service.openRuntimeProviderSetup('host-a', 'anthropic')).resolves.toMatchObject({
+      state: 'indeterminate',
+      expectedHostId: 'host-a',
+      providerId: 'anthropic',
+      releaseVersion: '0.7.0',
+    })
+    expect(connection.requests.filter(({ method }) => method === 'runtime.provider_setup.open')).toHaveLength(1)
+    await service.disconnect()
+  })
 })
 
 function health(options: {

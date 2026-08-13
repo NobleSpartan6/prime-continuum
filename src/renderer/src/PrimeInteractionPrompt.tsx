@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 
 import type {
   ExtensionUiDialogResponse,
@@ -14,6 +14,7 @@ export type PrimeInteractionResponseResult =
 
 export interface PrimeInteractionPromptProps {
   requests: readonly ResidentExtensionUiRequest[]
+  onFocusOwnershipChange?: (ownsFocus: boolean) => void
   onRespond: (
     request: ResidentExtensionUiRequest,
     response: ExtensionUiDialogResponse,
@@ -55,11 +56,13 @@ function primaryLabel(method: ResidentExtensionUiRequest['method']): string {
 function PrimeInteractionForm({
   request,
   waitingCount,
+  onFocusOwnershipChange,
   onRespond,
   onDismissResult,
 }: {
   request: ResidentExtensionUiRequest
   waitingCount: number
+  onFocusOwnershipChange?: PrimeInteractionPromptProps['onFocusOwnershipChange']
   onRespond: PrimeInteractionPromptProps['onRespond']
   onDismissResult?: PrimeInteractionPromptProps['onDismissResult']
 }) {
@@ -67,6 +70,7 @@ function PrimeInteractionForm({
   const titleId = `${id}-title`
   const detailId = `${id}-detail`
   const errorId = `${id}-error`
+  const sectionRef = useRef<HTMLElement>(null)
   const firstControlRef = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>(null)
   const submitLockRef = useRef(false)
   const [value, setValue] = useState(request.method === 'editor' ? request.prefill ?? '' : '')
@@ -81,9 +85,17 @@ function PrimeInteractionForm({
   const dismissibleResult = responseState.kind === 'uncertain' ||
     (responseState.kind === 'rejected' && !responseState.retryable)
 
-  useEffect(() => {
-    firstControlRef.current?.focus({ preventScroll: true })
+  useLayoutEffect(() => {
+    const activeElement = document.activeElement
+    if (!activeElement || activeElement === document.body || !activeElement.isConnected) {
+      firstControlRef.current?.focus({ preventScroll: true })
+    }
   }, [])
+
+  useLayoutEffect(() => () => {
+    const section = sectionRef.current
+    if (section) onFocusOwnershipChange?.(section.contains(document.activeElement))
+  }, [onFocusOwnershipChange])
 
   const deliver = async (response: ExtensionUiDialogResponse) => {
     if (submitLockRef.current) return
@@ -158,11 +170,22 @@ function PrimeInteractionForm({
 
   return (
     <section
+      ref={sectionRef}
       className="prime-interaction"
       aria-labelledby={titleId}
       aria-describedby={describedBy}
       aria-busy={responseState.kind === 'sending' ? 'true' : undefined}
+      onFocusCapture={() => onFocusOwnershipChange?.(true)}
+      onBlurCapture={(event) => {
+        const nextTarget = event.relatedTarget
+        if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+          onFocusOwnershipChange?.(false)
+        }
+      }}
     >
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        Prime Agent needs your response: {request.title}
+      </p>
       <header className="prime-interaction__header">
         <div className="prime-interaction__context">
           <span>Prime Agent asks</span>
@@ -299,32 +322,8 @@ function PrimeInteractionForm({
   )
 }
 
-export function PrimeInteractionPrompt({ requests, onRespond, onDismissResult }: PrimeInteractionPromptProps) {
+export function PrimeInteractionPrompt({ requests, onFocusOwnershipChange, onRespond, onDismissResult }: PrimeInteractionPromptProps) {
   const request = useMemo(() => oldestRequest(requests), [requests])
-  const previousFocusRef = useRef<HTMLElement | null>(null)
-  const visibleRef = useRef(false)
-
-  useLayoutEffect(() => {
-    if (request && !visibleRef.current) {
-      previousFocusRef.current = document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null
-      visibleRef.current = true
-      return
-    }
-
-    if (!request && visibleRef.current) {
-      const previousFocus = previousFocusRef.current
-      previousFocusRef.current = null
-      visibleRef.current = false
-      if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true })
-    }
-  }, [request])
-
-  useEffect(() => () => {
-    const previousFocus = previousFocusRef.current
-    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true })
-  }, [])
 
   if (!request) return null
 
@@ -333,6 +332,7 @@ export function PrimeInteractionPrompt({ requests, onRespond, onDismissResult }:
       key={`${request.executionGenerationId}:${request.requestId}:${request.requestDigest}`}
       request={request}
       waitingCount={requests.length}
+      onFocusOwnershipChange={onFocusOwnershipChange}
       onRespond={onRespond}
       onDismissResult={onDismissResult}
     />

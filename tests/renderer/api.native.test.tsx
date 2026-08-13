@@ -4977,6 +4977,62 @@ describe('NativeRendererApi', () => {
     expect(runtimeModelCatalog).toHaveBeenCalledOnce()
   })
 
+  it('opens provider setup only through the exact trusted-local capability and maps the host result', async () => {
+    const catalog = recoveryCatalog()
+    const snapshot = recoverySnapshot(catalog.threads[0]!, 'Provider setup authority.')
+    const openRuntimeProviderSetup = vi.fn(() => ok({
+      resultVersion: 1,
+      state: 'opened',
+      expectedHostId: 'host-local',
+      providerId: 'anthropic',
+      releaseVersion: '0.7.2',
+    }))
+    const api = new NativeRendererApi({
+      bootstrap: () => ok({
+        cache: {
+          version: 3,
+          activeHostId: 'host-local',
+          entries: {
+            'host-local': { hostId: 'host-local', catalog, lastSnapshot: snapshot },
+          },
+        },
+        outbox: [],
+        connection: {
+          ...onlineConnection(),
+          capabilities: [
+            'runtime_model_catalog_v1',
+            'runtime_provider_setup_handoff_v1',
+          ],
+        },
+        appVersion: '0.1.0',
+      }),
+      openRuntimeProviderSetup,
+      onConnectionState: vi.fn(() => () => undefined),
+      onSnapshot: vi.fn(() => () => undefined),
+      onHandoffProgress: vi.fn(() => () => undefined),
+    })
+    const projection = await api.loadWorkbench()
+
+    expect(projection.operations.runtimeProviderSetup).toBe(true)
+    await expect(api.openRuntimeProviderSetup({
+      hostId: 'host-local',
+      providerId: 'anthropic',
+    })).resolves.toEqual({
+      state: 'opened',
+      message: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+      retryable: false,
+    })
+    expect(openRuntimeProviderSetup).toHaveBeenCalledWith({
+      expectedHostId: 'host-local',
+      providerId: 'anthropic',
+    })
+    await expect(api.openRuntimeProviderSetup({
+      hostId: 'host-remote',
+      providerId: 'anthropic',
+    })).rejects.toMatchObject({ code: 'STALE_HOST_AUTHORITY' })
+    expect(openRuntimeProviderSetup).toHaveBeenCalledOnce()
+  })
+
   it.each([
     {
       label: 'legacy start eligibility without the durable family',

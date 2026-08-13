@@ -208,6 +208,7 @@ describe('resident lifecycle smoke structure', () => {
       'runtime_model_catalog_v1',
       'runtime_oauth_attempt_v1',
       'runtime_oauth_v1',
+      ...(process.platform === 'darwin' ? ['runtime_provider_setup_handoff_v1'] : []),
       'snapshot_chunks_v1',
     ])
     expect(capabilities.warmed).toEqual(

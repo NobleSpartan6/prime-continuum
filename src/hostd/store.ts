@@ -3617,6 +3617,37 @@ export class HostStore {
     });
   }
 
+  /**
+   * Stronger proof used only for voluntary host-service retirement. Every
+   * live resident binding, nonterminal lifecycle, and private mutation attempt
+   * blocks retirement; malformed or inaccessible state also fails closed.
+   */
+  async assertHostRetirementQuiescent(): Promise<void> {
+    return this.exclusive(async () => {
+      this.assertInitialized();
+      this.assertResidentSubsystemAvailable();
+      const [bindings, operations, residentAttempts, modelAttempts, extensionAttempts] = await Promise.all([
+        this.readResidentSessionBindingsUnlocked(),
+        this.readResidentLifecycleOperationsUnlocked(),
+        this.readQuiescenceDirectoryEntriesUnlocked(this.paths.residentDispatchAttempts),
+        this.readQuiescenceDirectoryEntriesUnlocked(this.modelSelectionAttemptsDirectory()),
+        this.readQuiescenceDirectoryEntriesUnlocked(this.paths.extensionUiResponseAttempts),
+      ]);
+      if (
+        bindings.length > 0 ||
+        operations.some((operation) => residentLifecycleOperationIsNonterminal(operation)) ||
+        residentAttempts.length > 0 ||
+        modelAttempts.length > 0 ||
+        extensionAttempts.length > 0
+      ) {
+        throw new HostStoreError(
+          "HOST_RETIRE_RESIDENT_STATE_ACTIVE",
+          "Host retirement is blocked while resident sessions, lifecycle work, or command dispatch state remains active.",
+        );
+      }
+    });
+  }
+
   async getResidentLifecycleStatus(operationIdValue: string): Promise<ResidentLifecycleStatus | undefined> {
     const operationId = IdSchema.parse(operationIdValue);
     return this.exclusive(async () => {
@@ -13542,6 +13573,25 @@ export class HostStore {
 
   private modelSelectionAttemptsDirectory(): string {
     return join(this.paths.root, "model-selection-attempts");
+  }
+
+  private async readQuiescenceDirectoryEntriesUnlocked(directory: string): Promise<readonly string[]> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    if (entries.length > MAX_PENDING_RESIDENT_DISPATCH_ATTEMPTS) {
+      throw new HostStoreError(
+        "HOST_RETIRE_STATE_UNVERIFIABLE",
+        "Host retirement could not prove its bounded command state.",
+      );
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        throw new HostStoreError(
+          "HOST_RETIRE_STATE_UNVERIFIABLE",
+          "Host retirement found unexpected private command state.",
+        );
+      }
+    }
+    return entries.map((entry) => entry.name);
   }
 
   private modelSelectionIdentitiesDirectory(): string {

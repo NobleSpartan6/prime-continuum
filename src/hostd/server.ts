@@ -65,6 +65,8 @@ export interface HostServer {
   close(): Promise<void>;
 }
 
+export const HOST_RETIRE_METHOD = "host.retire";
+
 export interface UnixEndpointOwnership {
   readonly lockPath: string;
   assertOwned(): Promise<void>;
@@ -150,6 +152,7 @@ export async function serveLocalSocket(options: {
       socket,
       TRUSTED_USER_SESSION,
       () => ownershipLeaseController.assertOwned(),
+      () => { void beginShutdown(); },
     )
       .catch(() => {
         socket.destroy();
@@ -329,6 +332,7 @@ export async function runFramedSession(
   writable: Writable,
   context: HostSessionContext,
   assertRequestOwnership?: () => Promise<void>,
+  beginSessionRetirement?: () => void,
 ): Promise<void> {
   const framedAdmission = openFramedSessionAdmission(context);
   let sessionContext = framedAdmission.context;
@@ -464,17 +468,31 @@ export async function runFramedSession(
     // connection's authority immediately.
     if (inputClosed && isOAuthAttemptStartRequest(request)) return;
     const response = await service.handle(request, requestContext);
-    if (stopped) return;
-    // A signal waits only for responses that were already admitted when the
-    // signal was queued. Sustained later traffic cannot starve it, and the
-    // response that causally produced the signal still writes first.
-    await flushSignalsBeforeResponse(requestOrdinal);
-    await serializeWrite(async () => {
-      if (stopped) return;
-      if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
-        await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
+    const retirementAccepted = isAcceptedHostRetirementResponse(request, response);
+    if (stopped) {
+      if (retirementAccepted) beginSessionRetirement?.();
+      return;
+    }
+    try {
+      // A signal waits only for responses that were already admitted when the
+      // signal was queued. Sustained later traffic cannot starve it, and the
+      // response that causally produced the signal still writes first.
+      await flushSignalsBeforeResponse(requestOrdinal);
+      await serializeWrite(async () => {
+        if (stopped) return;
+        if (!(await writeSnapshotResponseIfRequested(writable, request, response))) {
+          await writeJsonFrame(writable, response, DEFAULT_MAX_FRAME_BYTES);
+        }
+      });
+    } finally {
+      // Service admission is already permanently closed once retirement is
+      // accepted. Normally the response has now flushed; if the peer dropped
+      // during that write we must still retire instead of leaving a wedged
+      // daemon that can no longer answer any request.
+      if (retirementAccepted) {
+        beginSessionRetirement?.();
       }
-    });
+    }
   };
   const admitRequest = (request: unknown): void => {
     if (inFlightRequests.size >= MAX_FRAMED_SESSION_IN_FLIGHT_REQUESTS) {
@@ -627,6 +645,15 @@ export async function runFramedSession(
     pendingThreadChanges.clear();
     await writeTail.catch(() => undefined);
   }
+}
+
+function isAcceptedHostRetirementResponse(request: unknown, response: HostIpcResponse): boolean {
+  return isRecord(request) &&
+    request.method === HOST_RETIRE_METHOD &&
+    response.ok &&
+    response.method === HOST_RETIRE_METHOD &&
+    isRecord(response.result) &&
+    response.result.state === "accepted";
 }
 
 function openFramedSessionAdmission(context: HostSessionContext): {

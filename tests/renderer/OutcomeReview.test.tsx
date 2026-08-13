@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { OutcomeReview } from '../../src/renderer/src/OutcomeReview'
@@ -102,5 +102,41 @@ describe('OutcomeReview', () => {
     expect(within(review).getByText('Not reported')).toBeVisible()
     expect(within(review).getByText('No written result yet.')).toBeVisible()
     expect(review.querySelectorAll('.outcome-review__rail, .outcome-review__card')).toHaveLength(0)
+  })
+
+  it('preserves structured long results behind an explicit full-result disclosure', async () => {
+    const longResult = [
+      '## What changed',
+      '',
+      '- Preserved the exact resident authority.',
+      '- Removed duplicate status language.',
+      '- Kept the RLM branch result visible.',
+      '- Bound Review to the exact snapshot.',
+      '- Left provider setup local to the host.',
+      '- Added a durable verification receipt.',
+      '',
+      '`pnpm typecheck` passed for the current candidate.',
+      '',
+      '[Open the full verification receipt](https://example.com/receipt)',
+    ].join('\n')
+
+    render(<OutcomeReview state="ready" result={longResult} />)
+
+    const review = screen.getByRole('region', { name: 'Latest result' })
+    expect(await within(review).findAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
+    expect(within(review).queryByText('Open the full verification receipt')).not.toBeInTheDocument()
+    const disclosure = within(review).getByText('View full result').closest('details')
+    expect(disclosure).not.toHaveAttribute('open')
+
+    fireEvent.click(within(review).getByText('View full result'))
+    expect(disclosure).toHaveAttribute('open')
+    expect(within(review).getAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
+    expect(within(disclosure as HTMLElement).getByText('pnpm typecheck')).toBeVisible()
+    expect(within(disclosure as HTMLElement).getByText('Open the full verification receipt')).toBeVisible()
+
+    fireEvent.click(within(review).getByText('Hide full result'))
+    expect(disclosure).not.toHaveAttribute('open')
+    expect(within(review).getAllByRole('heading', { name: 'What changed' })).toHaveLength(1)
+    expect(within(review).queryByText('Open the full verification receipt')).not.toBeInTheDocument()
   })
 })

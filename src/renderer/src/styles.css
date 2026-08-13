@@ -3139,6 +3139,11 @@ code {
   font-weight: 640;
 }
 
+.rlm-map__summary .rlm-map__summary-attention,
+.rlm-map__summary .rlm-map__summary-attention strong {
+  color: var(--color-warning);
+}
+
 .rlm-map {
   min-inline-size: 0;
   border: 0;
@@ -6927,6 +6932,15 @@ body[data-surface="hud"] {
     justify-self: start;
   }
 
+  .provider-setup-note__actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .provider-setup-note__actions .button {
+    inline-size: 100%;
+  }
+
   .empty-workbench__main {
     align-content: start;
     padding-block: 3rem 1.5rem;
@@ -8026,10 +8040,9 @@ body[data-surface="hud"] {
 }
 
 .message--user {
-  padding-inline: 1rem 0;
+  padding-inline: 0;
   background: transparent;
   border: 0;
-  border-inline-start: 2px solid var(--color-border-strong);
   box-shadow: none;
 }
 
@@ -8721,14 +8734,12 @@ dialog.sheet::backdrop {
 .inline-loading,
 .models-loading {
   border: 1px solid var(--color-border);
-  border-inline-start: 2px solid var(--color-accent);
   border-radius: var(--radius-sm);
 }
 
 .inline-error,
 .models-error {
   border: 1px solid color-mix(in oklch, var(--color-danger) 42%, var(--color-border));
-  border-inline-start: 2px solid var(--color-danger);
   border-radius: var(--radius-sm);
 }
 
@@ -9451,19 +9462,68 @@ dialog.sheet::backdrop {
 }
 
 .outcome-review__result {
-  display: -webkit-box;
   margin: 0;
-  overflow: hidden;
   color: var(--color-text-secondary);
   font-size: 0.8125rem;
   line-height: 1.55;
   overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 5;
+}
+
+.outcome-review__result .transcript-body,
+.outcome-review__result-full .transcript-body {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.outcome-review__result .transcript-body > :first-child,
+.outcome-review__result-full .transcript-body > :first-child {
+  margin-block-start: 0;
+}
+
+.outcome-review__result .transcript-body > :last-child,
+.outcome-review__result-full .transcript-body > :last-child {
+  margin-block-end: 0;
+}
+
+.outcome-review :is(.outcome-review__result, .outcome-review__result-full) .transcript-body :is(h1, h2) {
+  font-size: 0.875rem;
+}
+
+.outcome-review :is(.outcome-review__result, .outcome-review__result-full) .transcript-body :is(h3, h4, h5, h6) {
+  font-size: 0.8125rem;
+}
+
+.outcome-review :is(.outcome-review__result, .outcome-review__result-full) .transcript-body :is(p, ul, ol, pre, blockquote) {
+  margin-block: 0.45rem;
 }
 
 .outcome-review__result--empty {
   color: var(--color-text-muted);
+}
+
+.outcome-review__result-disclosure {
+  margin-block-start: 0.45rem;
+}
+
+.outcome-review__result-disclosure summary {
+  inline-size: fit-content;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  font-weight: 610;
+  cursor: pointer;
+  user-select: none;
+}
+
+.outcome-review__result-disclosure[open] > summary {
+  margin-block-end: 0.65rem;
+}
+
+.outcome-review__result-full {
+  color: var(--color-text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .outcome-review__facts {
@@ -9669,6 +9729,50 @@ dialog.sheet {
 
 dialog.sheet::backdrop {
   background: oklch(0.025 0 0 / 0.76);
+}
+
+.provider-setup-note--handoff {
+  display: block;
+  padding: 0.8rem 0;
+  margin-block-start: 0.75rem;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.provider-setup-note--handoff .provider-setup-note__body {
+  gap: 0.25rem;
+}
+
+.provider-setup-note--handoff strong {
+  color: var(--color-text);
+  font-size: var(--font-ui);
+  font-weight: 620;
+}
+
+.provider-setup-note--handoff .provider-setup-note__actions {
+  margin-block-start: 0.55rem;
+}
+
+.provider-setup-feedback {
+  margin: 0.45rem 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-caption);
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.provider-setup-feedback--success {
+  color: var(--color-success);
+}
+
+.provider-setup-feedback--caution {
+  color: var(--color-warning);
+}
+
+.provider-setup-feedback--error {
+  color: var(--color-danger);
 }
 
 .sheet__header,

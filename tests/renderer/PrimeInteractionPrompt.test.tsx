@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -27,7 +27,7 @@ function request(
 }
 
 describe('PrimeInteractionPrompt', () => {
-  it('shows only the oldest request and advances without losing the original focus target', async () => {
+  it('shows only the oldest request, announces it, and preserves the user’s current focus', async () => {
     const user = userEvent.setup()
     const onRespond = vi.fn(async () => ({ state: 'completed' as const, message: 'Delivered.' }))
     const older = request({ requestId: 'older', method: 'input', title: 'Name the branch', placeholder: 'feature/name' })
@@ -43,14 +43,18 @@ describe('PrimeInteractionPrompt', () => {
     expect(screen.getByRole('heading', { name: 'Name the branch' })).toBeVisible()
     expect(screen.queryByRole('heading', { name: 'Run verification?' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('2 questions waiting')).toHaveTextContent('2 waiting')
-    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Response' })).toHaveFocus())
+    expect(screen.getByText('Prime Agent needs your response: Name the branch')).toHaveAttribute('role', 'status')
+    expect(outside).toHaveFocus()
 
+    await user.tab()
+    expect(screen.getByRole('textbox', { name: 'Response' })).toHaveFocus()
     await user.type(screen.getByRole('textbox', { name: 'Response' }), 'feature/native-ui')
     await user.click(screen.getByRole('button', { name: 'Send' }))
     expect(onRespond).toHaveBeenCalledWith(older, { kind: 'value', value: 'feature/native-ui' })
 
     rerender(<PrimeInteractionPrompt requests={[newer]} onRespond={onRespond} />)
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Confirm' })).toHaveFocus())
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeVisible()
+    outside.focus()
     rerender(<PrimeInteractionPrompt requests={[]} onRespond={onRespond} />)
     expect(outside).toHaveFocus()
 

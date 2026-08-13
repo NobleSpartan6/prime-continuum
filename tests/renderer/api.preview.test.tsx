@@ -115,6 +115,16 @@ describe('browser preview evidence labels', () => {
         canStart: true,
         canStop: false,
       },
+      ...(['provider-handoff-unopened', 'provider-handoff-opened', 'provider-handoff-indeterminate'] as const)
+        .map((visualState) => ({
+          visualState,
+          threadState: 'idle',
+          receiptState: 'idle',
+          operation: undefined,
+          message: 'Ready for a new prompt',
+          canStart: true,
+          canStop: false,
+        })),
       {
         visualState: 'prompt-admission' as const,
         threadState: 'idle',
@@ -214,6 +224,11 @@ describe('browser preview evidence labels', () => {
         expect(snapshot.operations.runtimeOAuth).toBe(true)
         expect(host?.kind).toBe('local')
       }
+      if (expected.visualState.startsWith('provider-handoff-')) {
+        expect(snapshot.operations.modelCatalog).toBe(true)
+        expect(snapshot.operations.runtimeProviderSetup).toBe(true)
+        expect(host?.kind).toBe('local')
+      }
     }
 
     const nonExecutingModelApi = createPreviewRendererApi('model-selection')
@@ -243,13 +258,41 @@ describe('browser preview evidence labels', () => {
       availableModelCount: 0,
       oauthSupported: true,
     })
-    expect(oauthCatalog.models
-      .filter((model) => model.providerId === 'openai-codex')
-      .every((model) => model.available === false && model.usingOAuth === false)).toBe(true)
+    expect(oauthCatalog.providers.every((provider) => !provider.configured && provider.availableModelCount === 0)).toBe(true)
+    expect(oauthCatalog.models.every((model) => model.available === false && model.usingOAuth === false)).toBe(true)
     await expect(oauthApi.startRuntimeOAuth?.({
       hostId: 'host-local',
       providerId: 'openai-codex',
     }, () => undefined)).rejects.toThrow('available only in the native desktop app')
+
+    const openedProviderApi = createPreviewRendererApi('provider-handoff-opened')
+    expect(openedProviderApi.environment).toBe('native')
+    const openedProviderRequest = openedProviderApi.openRuntimeProviderSetup?.({
+      hostId: 'host-local',
+      providerId: 'anthropic',
+    })
+    await vi.advanceTimersByTimeAsync(120)
+    await expect(openedProviderRequest).resolves.toEqual({
+      state: 'opened',
+      message: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+      retryable: false,
+    })
+
+    const indeterminateProviderApi = createPreviewRendererApi('provider-handoff-indeterminate')
+    const indeterminateProviderRequest = indeterminateProviderApi.openRuntimeProviderSetup?.({
+      hostId: 'host-local',
+      providerId: 'anthropic',
+    })
+    await vi.advanceTimersByTimeAsync(120)
+    await expect(indeterminateProviderRequest).resolves.toEqual({
+      state: 'indeterminate',
+      message: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+      retryable: false,
+    })
+    await expect(indeterminateProviderApi.openRuntimeProviderSetup?.({
+      hostId: 'host-devbox',
+      providerId: 'anthropic',
+    })).rejects.toThrow('exact internal visual-QA authority')
 
     const reconnectRequest = createPreviewRendererApi().loadWorkbench()
     await vi.advanceTimersByTimeAsync(120)

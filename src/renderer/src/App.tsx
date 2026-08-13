@@ -216,28 +216,28 @@ const TASK_STARTERS = [
     label: 'Delegate a task',
     description: 'Coordinate bounded RLM workers',
     icon: Network,
-    prompt: 'Delegate with RLM: [outcome, constraints, and done criteria].',
+    prompt: 'Describe the outcome, constraints, branch boundaries, and done criteria…',
   },
   {
     id: 'feature',
     label: 'Build a feature',
     description: 'Inspect, implement, and verify',
     icon: FileCode2,
-    prompt: 'Build: [feature, user outcome, constraints, and done criteria].',
+    prompt: 'Describe the feature, user outcome, constraints, and done criteria…',
   },
   {
     id: 'review',
     label: 'Review the codebase',
     description: 'Audit and fix high-impact issues',
     icon: Search,
-    prompt: 'Review and improve: [area, risks to prioritize, and done criteria].',
+    prompt: 'Describe the area to review, risks to prioritize, and done criteria…',
   },
   {
     id: 'investigate',
     label: 'Investigate an issue',
     description: 'Reproduce and resolve root cause',
     icon: Activity,
-    prompt: 'Investigate: [issue, reproduction details, expected behavior, and done criteria].',
+    prompt: 'Describe the issue, reproduction details, expected behavior, and done criteria…',
   },
 ] as const
 
@@ -1558,6 +1558,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const composerDraftsRef = useRef(new Map<string, string>())
   const composerDraftAuthorityKeyRef = useRef('')
   const composerHandleRef = useRef<ComposerHandle | null>(null)
+  const residentExtensionUiPromptOwnedFocusRef = useRef(false)
+  const setResidentExtensionUiPromptOwnsFocus = useCallback((ownsFocus: boolean) => {
+    residentExtensionUiPromptOwnedFocusRef.current = ownsFocus
+  }, [])
   const residentExtensionUiCompletionTimerRef = useRef<number | undefined>(undefined)
   const suppressedResidentExtensionUiRequestKeysRef = useRef(new Set<string>())
   const hudSelectionRequestRef = useRef('')
@@ -1745,6 +1749,18 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     : ''
 
   useLayoutEffect(() => {
+    if (residentExtensionUiOwnsAttention || !residentExtensionUiPromptOwnedFocusRef.current) return
+    residentExtensionUiPromptOwnedFocusRef.current = false
+    if (!composerHandleRef.current?.focusPrimary()) {
+      window.requestAnimationFrame(() => {
+        if (document.activeElement === document.body) {
+          composerHandleRef.current?.focusPrimary()
+        }
+      })
+    }
+  }, [residentExtensionUiOwnsAttention])
+
+  useLayoutEffect(() => {
     if (composerDraftAuthorityKeyRef.current === composerDraftAuthorityKey) return
     composerDraftAuthorityKeyRef.current = composerDraftAuthorityKey
     composerAuthorityGenerationRef.current += 1
@@ -1759,11 +1775,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     setComposerValidationError((current) => current ? '' : current)
   }, [])
 
-  const selectTaskStarterFromPalette = useCallback((prompt: string) => {
+  const selectTaskStarterFromPalette = useCallback((guidance: string) => {
     if (!composerDraftAuthorityKey) return
-    rememberComposerDraft(composerDraftsRef.current, composerDraftAuthorityKey, prompt)
     clearComposerValidation()
-    composerHandleRef.current?.prefill(composerDraftAuthorityKey, prompt)
+    composerHandleRef.current?.guide(composerDraftAuthorityKey, guidance)
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         document.querySelector<HTMLTextAreaElement>('#thread-composer')?.focus()
@@ -1790,6 +1805,13 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     snapshot?.operations.runtimeOAuth &&
     api.startRuntimeOAuth &&
     api.cancelRuntimeOAuth,
+  )
+  const canOpenRuntimeProviderSetup = Boolean(
+    selectedHost &&
+    selectedHost.kind === 'local' &&
+    selectedHost.connection === 'online' &&
+    snapshot?.operations.runtimeProviderSetup &&
+    api.openRuntimeProviderSetup,
   )
   const canManageComputers = api.environment === 'native'
   const canProvisionResident = snapshot?.operations.provisionResident ?? false
@@ -1945,7 +1967,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     composerReceipt.operation !== 'end',
   )
   const selectedThreadIsEndedAndEmpty = Boolean(
-    selectedThreadIsEmpty && selectedThread?.residentLifecycle?.state === 'ended',
+    selectedThreadIsEmpty && selectedTaskRun.kind === 'ended',
   )
   const selectedExtensionUiAuthorityKey = selectedThread && selectedHost && selectedThread.executionGenerationId
     ? [
@@ -3234,37 +3256,41 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               </div>
             )}
             <Transcript thread={selectedThread} streamingActivity={selectedAgentActivity} />
-            <PrimeInteractionPrompt
-              key={`hud-extension-ui-${residentExtensionUiPromptEpoch}`}
-              requests={selectedResidentExtensionUiRequests}
-              onRespond={respondToResidentExtensionUi}
-              onDismissResult={dismissResidentExtensionUiResult}
-            />
-            <Composer
-              authorityKey={composerDraftAuthorityKey}
-              initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
-              handleRef={composerHandleRef}
-              connection={selectedHost.connection}
-              authorityVerified={!selectedHost.activationRequired}
-              presentation={selectedTaskRun}
-              runtime={selectedRuntime}
-              agents={snapshot.agents}
-              onDraftChange={rememberComposerText}
-              onClearValidation={clearComposerValidation}
-              showTaskStarters={!selectedRuntimeHasLiveActivity}
-              validationError={composerValidationError}
-              receipt={composerReceipt}
-              canStartTurn={canStartResidentTurn}
-              canStopTurn={canStopResidentTurn}
-              canEndResident={false}
-              canResumeResidentEnd={false}
-              residentEndPreparing={false}
-              modelCatalogAvailable={false}
-              onOpenModelCatalog={() => undefined}
-              onSubmitText={submitComposerText}
-              onStop={() => void stopResidentTurn()}
-              onEndResident={() => undefined}
-            />
+            {residentExtensionUiOwnsAttention ? (
+              <PrimeInteractionPrompt
+                key={`hud-extension-ui-${residentExtensionUiPromptEpoch}`}
+                requests={selectedResidentExtensionUiRequests}
+                onFocusOwnershipChange={setResidentExtensionUiPromptOwnsFocus}
+                onRespond={respondToResidentExtensionUi}
+                onDismissResult={dismissResidentExtensionUiResult}
+              />
+            ) : (
+              <Composer
+                authorityKey={composerDraftAuthorityKey}
+                initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
+                handleRef={composerHandleRef}
+                connection={selectedHost.connection}
+                authorityVerified={!selectedHost.activationRequired}
+                presentation={selectedTaskRun}
+                runtime={selectedRuntime}
+                agents={snapshot.agents}
+                onDraftChange={rememberComposerText}
+                onClearValidation={clearComposerValidation}
+                showTaskStarters={!selectedRuntimeHasLiveActivity}
+                validationError={composerValidationError}
+                receipt={composerReceipt}
+                canStartTurn={canStartResidentTurn}
+                canStopTurn={canStopResidentTurn}
+                canEndResident={false}
+                canResumeResidentEnd={false}
+                residentEndPreparing={false}
+                modelCatalogAvailable={false}
+                onOpenModelCatalog={() => undefined}
+                onSubmitText={submitComposerText}
+                onStop={() => void stopResidentTurn()}
+                onEndResident={() => undefined}
+              />
+            )}
           </div>
         </section>
       </main>
@@ -3634,6 +3660,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
             canSelectResidentModel={canSelectResidentModel}
             canSelectResidentThinkingLevel={canSelectResidentThinkingLevel}
             canConnectRuntimeOAuth={canConnectRuntimeOAuth}
+            canOpenRuntimeProviderSetup={canOpenRuntimeProviderSetup}
             triggerRef={modelsDialogTriggerRef}
             onClose={() => setModelsOpen(false)}
           />
@@ -4020,42 +4047,46 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           ) : undefined}
         />
 
-        <PrimeInteractionPrompt
-          key={`workbench-extension-ui-${residentExtensionUiPromptEpoch}`}
-          requests={selectedResidentExtensionUiRequests}
-          onRespond={respondToResidentExtensionUi}
-          onDismissResult={dismissResidentExtensionUiResult}
-        />
-        {!selectedThreadIsEndedAndEmpty && <Composer
-              authorityKey={composerDraftAuthorityKey}
-              initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
-              handleRef={composerHandleRef}
-              connection={selectedHost.connection}
-              authorityVerified={!selectedHost.activationRequired}
-              presentation={selectedTaskRun}
-              runtime={selectedRuntime}
-              agents={snapshot.agents}
-              onDraftChange={rememberComposerText}
-              onClearValidation={clearComposerValidation}
-              showTaskStarters={!selectedThreadUsesLaunchpad && !selectedRuntimeHasLiveActivity}
-              launchpadOwnsPrimaryAction={selectedThreadUsesLaunchpad}
-              validationError={composerValidationError}
-              receipt={composerReceipt}
-              canStartTurn={canStartResidentTurn}
-              canStopTurn={canStopResidentTurn}
-              canEndResident={canEndResident}
-              canResumeResidentEnd={selectedResidentEndReadyForOneAction}
-              residentEndPreparing={residentEndPreparing}
-              modelCatalogAvailable={canLoadModelCatalog}
-              onOpenModelCatalog={(trigger) => {
-                modelsDialogTriggerRef.current = trigger
-                setModelsOpen(true)
-              }}
-              onManageSession={openSessionManager}
-              onSubmitText={submitComposerText}
-              onStop={() => void stopResidentTurn()}
-              onEndResident={(trigger) => void reviewResidentEnd(trigger, selectedResidentEnd)}
-        />}
+        {residentExtensionUiOwnsAttention ? (
+          <PrimeInteractionPrompt
+            key={`workbench-extension-ui-${residentExtensionUiPromptEpoch}`}
+            requests={selectedResidentExtensionUiRequests}
+            onFocusOwnershipChange={setResidentExtensionUiPromptOwnsFocus}
+            onRespond={respondToResidentExtensionUi}
+            onDismissResult={dismissResidentExtensionUiResult}
+          />
+        ) : !selectedThreadIsEndedAndEmpty && (
+          <Composer
+            authorityKey={composerDraftAuthorityKey}
+            initialText={composerDraftsRef.current.get(composerDraftAuthorityKey) ?? ''}
+            handleRef={composerHandleRef}
+            connection={selectedHost.connection}
+            authorityVerified={!selectedHost.activationRequired}
+            presentation={selectedTaskRun}
+            runtime={selectedRuntime}
+            agents={snapshot.agents}
+            onDraftChange={rememberComposerText}
+            onClearValidation={clearComposerValidation}
+            showTaskStarters={!selectedThreadUsesLaunchpad && !selectedRuntimeHasLiveActivity}
+            launchpadOwnsPrimaryAction={selectedThreadUsesLaunchpad}
+            validationError={composerValidationError}
+            receipt={composerReceipt}
+            canStartTurn={canStartResidentTurn}
+            canStopTurn={canStopResidentTurn}
+            canEndResident={canEndResident}
+            canResumeResidentEnd={selectedResidentEndReadyForOneAction}
+            residentEndPreparing={residentEndPreparing}
+            modelCatalogAvailable={canLoadModelCatalog}
+            onOpenModelCatalog={(trigger) => {
+              modelsDialogTriggerRef.current = trigger
+              setModelsOpen(true)
+            }}
+            onManageSession={openSessionManager}
+            onSubmitText={submitComposerText}
+            onStop={() => void stopResidentTurn()}
+            onEndResident={(trigger) => void reviewResidentEnd(trigger, selectedResidentEnd)}
+          />
+        )}
       </main>
 
       <Inspector
@@ -4193,6 +4224,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         canSelectResidentModel={canSelectResidentModel}
         canSelectResidentThinkingLevel={canSelectResidentThinkingLevel}
         canConnectRuntimeOAuth={canConnectRuntimeOAuth}
+        canOpenRuntimeProviderSetup={canOpenRuntimeProviderSetup}
         triggerRef={modelsDialogTriggerRef}
         onClose={() => setModelsOpen(false)}
       />
@@ -4823,7 +4855,8 @@ const Transcript = memo(function Transcript({
 })
 
 interface ComposerHandle {
-  prefill: (expectedAuthorityKey: string, text: string) => boolean
+  guide: (expectedAuthorityKey: string, guidance: string) => boolean
+  focusPrimary: () => boolean
 }
 
 interface ComposerProps {
@@ -4960,23 +4993,23 @@ function SessionContinuity({
 
 function TaskStarters({
   disabled,
-  text,
+  guidance,
   onSelect,
 }: {
   disabled: boolean
-  text: string
-  onSelect: (prompt: string) => void
+  guidance: string
+  onSelect: (guidance: string) => void
 }) {
   return (
-    <div className="task-starters" role="group" aria-label="Start with a task template">
+    <div className="task-starters" role="group" aria-label="Choose task guidance">
       {TASK_STARTERS.map((starter) => (
         <button
           className="task-starters__item"
           type="button"
           key={starter.id}
           disabled={disabled}
-          aria-pressed={text === starter.prompt}
-          title={`${starter.label}. Prefills an editable task and never sends automatically.`}
+          aria-pressed={guidance === starter.prompt}
+          title={`${starter.label}. Sets guidance and focuses the composer. Nothing is sent.`}
           onClick={() => onSelect(starter.prompt)}
         >
           <Icon icon={starter.icon} size={14} />
@@ -4989,29 +5022,53 @@ function TaskStarters({
 
 function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, presentation, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
   const [text, setText] = useState(initialText)
+  const [starterGuidance, setStarterGuidance] = useState('')
   const submissionInFlightRef = useRef(false)
   const committedAuthorityKeyRef = useRef(authorityKey)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const primaryActionRef = useRef<HTMLButtonElement>(null)
 
   useLayoutEffect(() => {
     if (committedAuthorityKeyRef.current === authorityKey) return
     committedAuthorityKeyRef.current = authorityKey
     submissionInFlightRef.current = false
     setText(initialText)
+    setStarterGuidance('')
   }, [authorityKey, initialText])
 
   const replaceDraft = useCallback((nextText: string) => {
     setText(nextText)
+    setStarterGuidance('')
     onDraftChange(authorityKey, nextText)
     onClearValidation()
   }, [authorityKey, onClearValidation, onDraftChange])
 
+  const selectStarterGuidance = useCallback((guidance: string) => {
+    setStarterGuidance(guidance)
+    onClearValidation()
+    textareaRef.current?.focus({ preventScroll: true })
+  }, [onClearValidation])
+
   useImperativeHandle(handleRef, () => ({
-    prefill(expectedAuthorityKey, nextText) {
+    guide(expectedAuthorityKey, guidance) {
       if (expectedAuthorityKey !== authorityKey) return false
-      replaceDraft(nextText)
+      selectStarterGuidance(guidance)
       return true
     },
-  }), [authorityKey, replaceDraft])
+    focusPrimary() {
+      const textarea = textareaRef.current
+      if (textarea && !textarea.disabled) {
+        textarea.focus({ preventScroll: true })
+        return true
+      }
+      const primaryAction = primaryActionRef.current
+      if (primaryAction && !primaryAction.disabled) {
+        primaryAction.focus({ preventScroll: true })
+        return true
+      }
+      return false
+    },
+  }), [authorityKey, selectStarterGuidance])
 
   const primaryAction = presentation.primaryAction
   const submitAction = primaryAction?.kind === 'submit'
@@ -5055,8 +5112,32 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
     : primaryAction?.label
   const textareaDisabled = !(canStartNow || modelSetupPrimary)
   const showPrimaryAction = Boolean(primaryAction && !modelSetupOwnedByLaunchpad && !modelSetupUnavailable)
-  const showComposerToolbar = compactComposer || presentation.kind !== 'ready' || Boolean(validationError)
   const showSessionContinuity = !launchpadOwnsPrimaryAction || presentation.tone !== 'neutral'
+  const continuityOwnsVisibleState = showSessionContinuity &&
+    presentation.kind !== 'ending' &&
+    presentation.kind !== 'stopping'
+  const showComposerToolbar = Boolean(validationError) || (
+    !continuityOwnsVisibleState && (compactComposer || presentation.kind !== 'ready')
+  )
+  const composerHint = waitingForExtensionResponse
+    ? 'Answer the question above to continue'
+    : stopAction
+      ? 'Stop asks Prime Agent to end at the next safe boundary'
+      : finishEndAction
+        ? 'One action left'
+        : endSessionAction
+          ? 'The task, transcript, and workspace files stay'
+          : modelSetupPrimary
+            ? 'Choose a model before delegating this task'
+            : submitAction
+              ? primaryAction.label === 'Reply'
+                ? 'Reply continues this exact resident session · Ctrl or ⌘ + Enter'
+                : 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
+              : reviewAction
+                ? 'Review the exact session state'
+                : continuityOwnsVisibleState
+                  ? ''
+                  : presentation.detail
 
   if (endCompleted || waitingForExtensionResponse) {
     return (
@@ -5082,8 +5163,8 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
       {!compactComposer && showTaskStarters && (
         <TaskStarters
           disabled={!canStartNow || promptSending}
-          text={text}
-          onSelect={replaceDraft}
+          guidance={starterGuidance}
+          onSelect={selectStarterGuidance}
         />
       )}
       <form
@@ -5123,9 +5204,9 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
         aria-busy={promptSending || stopSending || residentEndPreparing ? true : undefined}
       >
         {showComposerToolbar && <div className="composer__toolbar">
-          <span className="composer__intent">
+          {!validationError && !continuityOwnsVisibleState && <span className="composer__intent">
             {presentation.headline}
-          </span>
+          </span>}
           <span className={cx(
             'composer__connection',
             `composer__connection--${statusState}`,
@@ -5144,6 +5225,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
           <>
             <label className="sr-only" htmlFor="thread-composer">Task brief</label>
             <textarea
+              ref={textareaRef}
               id="thread-composer"
               name="message"
               value={text}
@@ -5152,7 +5234,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 ? 'Add the context Prime Agent needs…'
                 : presentation.kind === 'working'
                   ? 'Add direction, constraints, or another outcome…'
-                  : 'Describe the outcome, constraints, and done criteria…'}
+                  : starterGuidance || 'Describe the outcome, constraints, and done criteria…'}
               disabled={textareaDisabled}
               onChange={(event) => replaceDraft(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -5181,27 +5263,12 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 <Icon icon={ChevronDown} size={13} />
               </button>
             )}
-            <span className="composer__hint" id="composer-hint">
-              {waitingForExtensionResponse
-                ? 'Answer the question above to continue'
-                : stopAction
-                  ? 'Stop asks Prime Agent to end at the next safe boundary'
-                : finishEndAction
-                  ? 'One action left'
-                : endSessionAction
-                  ? 'The task, transcript, and workspace files stay'
-                : modelSetupPrimary
-                  ? 'Choose a model before delegating this task'
-                : submitAction
-                  ? primaryAction.label === 'Reply'
-                    ? 'Reply continues this exact resident session · Ctrl or ⌘ + Enter'
-                    : 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
-                  : presentation.detail}
-            </span>
+            {composerHint && <span className="composer__hint" id="composer-hint">{composerHint}</span>}
           </div>
           <div className="composer__primary-actions">
             {showPrimaryAction && (
             <button
+              ref={primaryActionRef}
               id="resident-turn-primary"
               className={cx(
                 'button',
@@ -6721,7 +6788,7 @@ function CommandPaletteDialog({
     ...(snapshot.operations.submitCommands ? TASK_STARTERS.map((starter) => ({
       id: `task:${starter.id}`,
       label: starter.label,
-      detail: 'Prefill an editable task brief; review it before sending',
+      detail: 'Focus the composer with guidance for this workflow',
       group: 'Tasks' as const,
       icon: starter.icon,
       keywords: `${starter.label} task template preset delegate prompt`,

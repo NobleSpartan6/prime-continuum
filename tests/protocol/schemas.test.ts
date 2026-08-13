@@ -6,6 +6,7 @@ import {
   HostIpcRequestSchema,
   HostIpcResponseSchema,
   HostIpcSnapshotTransferEnvelopeSchema,
+  HostdRetirementResultSchema,
   MAX_SNAPSHOT_TRANSFER_BYTES,
   MobilePairingPolicySchema,
   PairedDeviceSchema,
@@ -20,12 +21,79 @@ import {
   ResidentEndRequestSchema,
   ResidentLifecycleStatusSchema,
   RuntimeSessionSummarySchema,
+  RuntimeProviderSetupResultSchema,
   SNAPSHOT_TRANSFER_CHUNK_BYTES,
   SessionCursorSchema,
   ThreadProjectionSnapshotSchema,
 } from "../../src/shared/protocol";
 
 describe("host protocol schemas", () => {
+  it("binds local host retirement to one exact host and build identity", () => {
+    const identity = {
+      contractVersion: 1 as const,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    };
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "request-host-retirement",
+      method: "host.retire",
+      payload: { expectedHostId: "host-local", expectedBuildIdentity: identity },
+    };
+    const result = {
+      retirementVersion: 1,
+      state: "accepted",
+      expectedHostId: "host-local",
+      hostdBuildIdentity: identity,
+    };
+    expect(HostIpcRequestSchema.parse(request)).toEqual(request);
+    expect(HostdRetirementResultSchema.parse(result)).toEqual(result);
+    expect(HostIpcResponseSchema.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: request.requestId,
+      method: request.method,
+      ok: true,
+      result,
+    })).toMatchObject({ ok: true, result });
+    expect(HostIpcRequestSchema.safeParse({
+      ...request,
+      payload: { ...request.payload, force: true },
+    }).success).toBe(false);
+  });
+
+  it("keeps provider setup path-free and exact-authority correlated", () => {
+    const request = {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "request-provider-setup",
+      method: "runtime.provider_setup.open",
+      payload: { expectedHostId: "host-local", providerId: "anthropic" },
+    };
+    const result = {
+      resultVersion: 1,
+      state: "opened",
+      expectedHostId: "host-local",
+      providerId: "anthropic",
+      releaseVersion: "0.7.2",
+    };
+    expect(HostIpcRequestSchema.parse(request)).toEqual(request);
+    expect(RuntimeProviderSetupResultSchema.parse(result)).toEqual(result);
+    expect(HostIpcResponseSchema.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: request.requestId,
+      method: request.method,
+      ok: true,
+      result,
+    })).toMatchObject({ ok: true, result });
+    expect(RuntimeProviderSetupResultSchema.safeParse({
+      ...result,
+      executablePath: "/private/runtime/node",
+    }).success).toBe(false);
+    expect(HostIpcRequestSchema.safeParse({
+      ...request,
+      payload: { ...request.payload, command: "/login" },
+    }).success).toBe(false);
+  });
+
   it("keeps session-reported thinking levels optional, bounded, and unique", () => {
     const runtime = {
       runtime: "prime_agent" as const,
@@ -230,6 +298,23 @@ describe("host protocol schemas", () => {
       capabilities: [],
     };
     expect(HealthSnapshotSchema.parse(base).pairingIdentity).toBeUndefined();
+    expect(HealthSnapshotSchema.parse(base).hostdBuildIdentity).toBeUndefined();
+    expect(HealthSnapshotSchema.parse({
+      ...base,
+      hostdBuildIdentity: {
+        contractVersion: 1,
+        bundleSha256: "a".repeat(64),
+        runtimeTrustAnchorId: "b".repeat(64),
+      },
+    }).hostdBuildIdentity).toEqual({
+      contractVersion: 1,
+      bundleSha256: "a".repeat(64),
+      runtimeTrustAnchorId: "b".repeat(64),
+    });
+    expect(HealthSnapshotSchema.safeParse({
+      ...base,
+      hostdBuildIdentity: { contractVersion: 1, bundleSha256: "0.1.0" },
+    }).success).toBe(false);
     expect(
       HealthSnapshotSchema.parse({
         ...base,

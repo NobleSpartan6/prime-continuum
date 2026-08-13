@@ -5,6 +5,14 @@ import { createConnection, type Socket } from 'node:net'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { App } from 'electron'
+import { parseEmbeddedRuntimeAttestationBytes } from '../../hostd/runtime-attestation'
+import {
+  HOSTD_GRACEFUL_RETIRE_CAPABILITY,
+  HealthSnapshotSchema,
+  HostdRetirementResultSchema,
+  type HealthSnapshot,
+  type HostdBuildIdentity
+} from '../../shared/protocol'
 import {
   resolveCanonicalLocalHostTarget,
   type CanonicalLocalHostTarget
@@ -19,6 +27,7 @@ const PACKAGE_SMOKE_SHUTDOWN_TIMEOUT_MS = 60_000
 const PACKAGE_SMOKE_WRAPPER_IDENTITY = 'prime-continuim-package-smoke-wrapper'
 const packageSmokeHostdChildren = new Set<ChildProcess>()
 const localHostdStarts = new Map<string, Promise<void>>()
+const localHostdReadiness = new Map<string, Promise<void>>()
 
 export interface BundledHostdPaths {
   readonly attestation: string
@@ -265,12 +274,282 @@ export async function ensureAndConnectLocalHostd(app: App): Promise<FramedConnec
   // the same canonical target before touching durable state.
   const target = await localHostdTarget(hostdDataDirectory(), { create: true })
   const { dataDirectory, endpoint } = target
+  const expectedIdentity = await bundledHostdBuildIdentity(app)
+  await ensureCompatibleLocalHostdOnce(app, target, expectedIdentity)
+  return await requireCompatibleLocalHostd(await connectLocalHostd(endpoint), expectedIdentity)
+}
+
+async function ensureCompatibleLocalHostdOnce(
+  app: App,
+  target: CanonicalLocalHostTarget,
+  expectedIdentity: HostdBuildIdentity
+): Promise<void> {
+  return await coordinateLocalHostdReadiness(target.endpoint, async () => {
+    await reconcileLocalHostd(app, target, expectedIdentity)
+  })
+}
+
+/** Coalesces concurrent startup/retirement attempts for one canonical endpoint. */
+export async function coordinateLocalHostdReadiness(
+  endpoint: string,
+  operation: () => Promise<void>
+): Promise<void> {
+  const existing = localHostdReadiness.get(endpoint)
+  if (existing) return await existing
+  const readiness = operation()
+  localHostdReadiness.set(endpoint, readiness)
   try {
-    return await connectLocalHostd(endpoint)
-  } catch {
-    await startBundledHostdOnce(app, endpoint, dataDirectory)
+    await readiness
+  } finally {
+    if (localHostdReadiness.get(endpoint) === readiness) {
+      localHostdReadiness.delete(endpoint)
+    }
   }
-  return await connectLocalHostd(endpoint)
+}
+
+async function reconcileLocalHostd(
+  app: App,
+  target: CanonicalLocalHostTarget,
+  expectedIdentity: HostdBuildIdentity
+): Promise<void> {
+  let connection: FramedConnection
+  try {
+    connection = await connectLocalHostd(target.endpoint)
+  } catch {
+    await startBundledHostdOnce(app, target.endpoint, target.dataDirectory)
+    return
+  }
+
+  let health: HealthSnapshot
+  try {
+    health = HealthSnapshotSchema.parse(
+      await connection.request('health.get', {}, { timeoutMs: 10_000, priority: 'urgent' })
+    )
+  } catch (cause) {
+    connection.close()
+    throw new ControlError(
+      'hostd.compatibility_unverified',
+      'The running local service could not prove its build identity. Finish any active sessions, then stop that service or restart this computer once.',
+      { cause }
+    )
+  }
+
+  const observedIdentity = health.hostdBuildIdentity
+  if (observedIdentity && hostdBuildIdentitiesMatch(observedIdentity, expectedIdentity)) {
+    connection.close()
+    return
+  }
+  if (
+    !observedIdentity ||
+    !health.capabilities.includes(HOSTD_GRACEFUL_RETIRE_CAPABILITY)
+  ) {
+    connection.close()
+    throw legacyHostdRestartRequired(health, expectedIdentity)
+  }
+
+  await replaceVerifiedLocalHostd({
+    connection,
+    health,
+    observedIdentity,
+    expectedIdentity,
+    waitForEndpointAbsence: async () => await waitForLocalHostdEndpointAbsence(target.endpoint),
+    startCurrent: async () => await startBundledHostdOnce(app, target.endpoint, target.dataDirectory)
+  })
+}
+
+interface RetireVerifiedLocalHostdOptions<
+  TConnection extends Pick<FramedConnection, 'request' | 'close'>
+> {
+  readonly connection: TConnection
+  readonly health: HealthSnapshot
+  readonly observedIdentity: HostdBuildIdentity
+  readonly expectedIdentity: HostdBuildIdentity
+  readonly waitForEndpointAbsence: () => Promise<boolean>
+}
+
+export async function replaceVerifiedLocalHostd<
+  TConnection extends Pick<FramedConnection, 'request' | 'close'>
+>(options: RetireVerifiedLocalHostdOptions<TConnection> & {
+  readonly startCurrent: () => Promise<void>
+}): Promise<void> {
+  await retireVerifiedLocalHostd(options)
+  await options.startCurrent()
+}
+
+/** Testable exact-authority edge used by the connect-first upgrade path. */
+export async function retireVerifiedLocalHostd<
+  TConnection extends Pick<FramedConnection, 'request' | 'close'>
+>(options: RetireVerifiedLocalHostdOptions<TConnection>): Promise<void> {
+  let ambiguousTransportFailure: unknown
+  try {
+    const rawRetirement = await options.connection.request(
+      'host.retire',
+      {
+        expectedHostId: options.health.host.hostId,
+        expectedBuildIdentity: options.observedIdentity
+      },
+      { timeoutMs: 10_000, priority: 'urgent' }
+    )
+    const parsedRetirement = HostdRetirementResultSchema.safeParse(rawRetirement)
+    if (!parsedRetirement.success) {
+      throw new ControlError(
+        'hostd.retirement_proof_invalid',
+        'The previous local service returned an invalid retirement proof and was preserved.',
+        { cause: parsedRetirement.error }
+      )
+    }
+    const retirement = parsedRetirement.data
+    if (
+      retirement.expectedHostId !== options.health.host.hostId ||
+      !hostdBuildIdentitiesMatch(retirement.hostdBuildIdentity, options.observedIdentity)
+    ) {
+      throw new ControlError(
+        'hostd.retirement_proof_mismatch',
+        'The previous local service returned a mismatched retirement proof and was preserved.'
+      )
+    }
+  } catch (error) {
+    // A structured host rejection proves retirement was not admitted. A
+    // transport loss is ambiguous: the response may have flushed immediately
+    // before the retiring server closed its socket.
+    if (error instanceof ControlError) {
+      if (error.code.startsWith('transport.')) ambiguousTransportFailure = error
+      else throw error
+    } else {
+      throw new ControlError(
+        'hostd.retirement_unverified',
+        'The previous local service retirement could not be verified and was preserved.',
+        { cause: error }
+      )
+    }
+  } finally {
+    options.connection.close()
+  }
+
+  if (await options.waitForEndpointAbsence()) return
+  throw new ControlError(
+    'hostd.retirement_unconfirmed',
+    'The previous local service did not stop. It was preserved; finish any active sessions, then stop that service or restart this computer once.',
+    {
+      retryable: false,
+      details: {
+        observedBundleSha256: options.observedIdentity.bundleSha256,
+        expectedBundleSha256: options.expectedIdentity.bundleSha256
+      },
+      cause: ambiguousTransportFailure
+    }
+  )
+}
+
+async function waitForLocalHostdEndpointAbsence(endpoint: string): Promise<boolean> {
+  const deadline = Date.now() + LOCAL_HOSTD_DESKTOP_START_DEADLINE_MS
+  let consecutiveFailures = 0
+  while (Date.now() < deadline) {
+    try {
+      const probe = await connectLocalHostd(endpoint)
+      probe.close()
+      consecutiveFailures = 0
+    } catch {
+      consecutiveFailures += 1
+      if (consecutiveFailures >= 2) return true
+    }
+    await delay(125)
+  }
+  return false
+}
+
+function legacyHostdRestartRequired(
+  health: HealthSnapshot,
+  expectedIdentity: HostdBuildIdentity
+): ControlError {
+  return new ControlError(
+    'hostd.legacy_restart_required',
+    'An older background Prime Agent service is still running and cannot be retired safely. Finish any active sessions, then stop that service or restart this computer once before reopening Prime Continuim.',
+    {
+      details: {
+        observedHostdVersion: health.hostdVersion,
+        observedBundleSha256: health.hostdBuildIdentity?.bundleSha256 ?? 'unreported',
+        expectedBundleSha256: expectedIdentity.bundleSha256
+      }
+    }
+  )
+}
+
+function hostdBuildIdentitiesMatch(left: HostdBuildIdentity, right: HostdBuildIdentity): boolean {
+  return left.contractVersion === right.contractVersion &&
+    left.bundleSha256 === right.bundleSha256 &&
+    left.runtimeTrustAnchorId === right.runtimeTrustAnchorId
+}
+
+/**
+ * Reads the exact current hostd/runtime identity from the already-verified
+ * application bytes. The hostd bundle digest changes for every host build;
+ * the trust anchor binds its embedded Prime Agent runtime attestation.
+ */
+export async function bundledHostdBuildIdentity(app: Pick<App, 'isPackaged' | 'getAppPath'>): Promise<HostdBuildIdentity> {
+  const paths = bundledHostdPaths(app)
+  try {
+    await Promise.all([
+      access(paths.attestation),
+      access(paths.hostdScript)
+    ])
+    const [bundleSha256, attestationBytes] = await Promise.all([
+      hashBoundedRegularFile(paths.hostdScript, 256 * 1024 * 1024, 'hostd bundle'),
+      readBoundedRegularFile(paths.attestation, 256 * 1024, 'runtime attestation')
+    ])
+    const { trustAnchorId: runtimeTrustAnchorId } = parseEmbeddedRuntimeAttestationBytes(attestationBytes)
+    return Object.freeze({ contractVersion: 1, bundleSha256, runtimeTrustAnchorId })
+  } catch (cause) {
+    throw new ControlError(
+      'hostd.current_identity_unavailable',
+      'The installed local service identity could not be verified. Repair this Prime Continuim installation.',
+      { cause }
+    )
+  }
+}
+
+export async function requireCompatibleLocalHostd<
+  TConnection extends Pick<FramedConnection, 'request' | 'close'>
+>(
+  connection: TConnection,
+  expectedIdentity: HostdBuildIdentity
+): Promise<TConnection> {
+  try {
+    const health = HealthSnapshotSchema.parse(
+      await connection.request('health.get', {}, { timeoutMs: 10_000, priority: 'urgent' })
+    )
+    const observed = health.hostdBuildIdentity
+    if (!observed) {
+      throw new ControlError(
+        'hostd.legacy_restart_required',
+        'An older background Prime Agent service is still running and cannot be retired safely. Finish any active sessions, then stop that service or restart this computer once before reopening Prime Continuim.',
+        { details: { observedHostdVersion: health.hostdVersion } }
+      )
+    }
+    if (!hostdBuildIdentitiesMatch(observed, expectedIdentity)) {
+      throw new ControlError(
+        'hostd.build_identity_mismatch',
+        'A different verified local service build is still running. Finish any active sessions, then stop that service or restart this computer once before reopening Prime Continuim.',
+        {
+          details: {
+            observedBundleSha256: observed.bundleSha256,
+            expectedBundleSha256: expectedIdentity.bundleSha256,
+            observedRuntimeTrustAnchorId: observed.runtimeTrustAnchorId ?? 'missing',
+            expectedRuntimeTrustAnchorId: expectedIdentity.runtimeTrustAnchorId ?? 'missing'
+          }
+        }
+      )
+    }
+    return connection
+  } catch (error) {
+    connection.close()
+    if (error instanceof ControlError) throw error
+    throw new ControlError(
+      'hostd.compatibility_unverified',
+      'The running local service could not prove that it belongs to this Prime Continuim build. Finish any active sessions, then stop that service or restart this computer once.',
+      { cause: error }
+    )
+  }
 }
 
 async function startBundledHostdOnce(app: App, endpoint: string, dataDirectory: string): Promise<void> {
@@ -519,11 +798,25 @@ async function delay(milliseconds: number): Promise<void> {
 }
 
 async function hashExecutable(executable: string): Promise<string> {
-  const handle = await open(executable, 'r')
+  return await hashBoundedRegularFile(executable, 512 * 1024 * 1024, 'bundled executable')
+}
+
+async function hashBoundedRegularFile(filePath: string, maximumBytes: number, label: string): Promise<string> {
+  const expected = await lstat(filePath)
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.size < 1 || expected.size > maximumBytes) {
+    throw new Error(`The ${label} is outside its regular-file bound.`)
+  }
+  const handle = await open(filePath, 'r')
   try {
     const before = await handle.stat()
-    if (!before.isFile() || before.size < 1 || before.size > 512 * 1024 * 1024) {
-      throw new Error('The bundled executable is outside its size bound.')
+    if (
+      !before.isFile() ||
+      before.dev !== expected.dev ||
+      before.ino !== expected.ino ||
+      before.size !== expected.size ||
+      before.mtimeMs !== expected.mtimeMs
+    ) {
+      throw new Error(`The ${label} changed before it was hashed.`)
     }
     const digest = createHash('sha256')
     const buffer = Buffer.allocUnsafe(256 * 1024)
@@ -536,9 +829,51 @@ async function hashExecutable(executable: string): Promise<string> {
     }
     const after = await handle.stat()
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-      throw new Error('The bundled executable changed while it was hashed.')
+      throw new Error(`The ${label} changed while it was hashed.`)
     }
     return digest.digest('hex')
+  } finally {
+    await handle.close()
+  }
+}
+
+async function readBoundedRegularFile(filePath: string, maximumBytes: number, label: string): Promise<Buffer> {
+  const expected = await lstat(filePath)
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.size < 1 || expected.size > maximumBytes) {
+    throw new Error(`The ${label} is outside its regular-file bound.`)
+  }
+  const handle = await open(filePath, 'r')
+  try {
+    const before = await handle.stat()
+    if (
+      !before.isFile() ||
+      before.dev !== expected.dev ||
+      before.ino !== expected.ino ||
+      before.size !== expected.size ||
+      before.mtimeMs !== expected.mtimeMs
+    ) {
+      throw new Error(`The ${label} changed before it was read.`)
+    }
+    const bytes = Buffer.alloc(before.size)
+    let position = 0
+    while (position < before.size) {
+      const { bytesRead } = await handle.read(bytes, position, before.size - position, position)
+      if (bytesRead <= 0) throw new Error(`The ${label} ended before its recorded size.`)
+      position += bytesRead
+    }
+    const growthProbe = Buffer.allocUnsafe(1)
+    const { bytesRead: growthBytes } = await handle.read(growthProbe, 0, 1, before.size)
+    const after = await handle.stat()
+    if (
+      growthBytes !== 0 ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs
+    ) {
+      throw new Error(`The ${label} changed while it was read.`)
+    }
+    return bytes
   } finally {
     await handle.close()
   }

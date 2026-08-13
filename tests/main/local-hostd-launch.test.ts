@@ -3,17 +3,187 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { ControlError } from '../../src/main/control/errors'
 import {
   bundledHostdEnvironment,
   bundledHostdInvocation,
   bundledHostdLaunchArguments,
   bundledHostdPaths,
   bundledHostdServeArguments,
+  coordinateLocalHostdReadiness,
+  replaceVerifiedLocalHostd,
+  requireCompatibleLocalHostd,
+  retireVerifiedLocalHostd,
   verifyBundledHostExecutables
 } from '../../src/main/control/local-hostd'
 
 describe('bundled hostd launch contract', () => {
+  const buildIdentity = Object.freeze({
+    contractVersion: 1 as const,
+    bundleSha256: 'a'.repeat(64),
+    runtimeTrustAnchorId: 'b'.repeat(64)
+  })
+  const health = (
+    hostdBuildIdentity?: typeof buildIdentity,
+    capabilities: string[] = []
+  ) => ({
+    protocolVersion: 1 as const,
+    hostdVersion: '0.1.0',
+    ...(hostdBuildIdentity ? { hostdBuildIdentity } : {}),
+    startedAt: '2026-08-13T00:00:00.000Z',
+    checkedAt: '2026-08-13T00:00:01.000Z',
+    serviceState: 'ready' as const,
+    host: {
+      hostId: 'host-local',
+      displayName: 'Local Mac',
+      kind: 'local' as const,
+      connectionPaths: [],
+      reachability: 'online' as const,
+      compatibility: 'compatible' as const,
+      platform: { os: 'macos' as const, architecture: 'arm64' as const },
+      attentionCounts: { total: 0, unread: 0, questions: 0, approvals: 0 }
+    },
+    capabilities
+  })
+
+  it('accepts only the exact current hostd bundle and runtime trust anchor', async () => {
+    let closed = false
+    const connection = {
+      request: async <T = unknown>() => health(buildIdentity) as unknown as T,
+      close: () => { closed = true }
+    }
+    await expect(requireCompatibleLocalHostd(connection, buildIdentity)).resolves.toBe(connection)
+    expect(closed).toBe(false)
+  })
+
+  it('preserves a legacy hostd and fails closed instead of launching over it', async () => {
+    let closed = false
+    const connection = {
+      request: async <T = unknown>() => health() as unknown as T,
+      close: () => { closed = true }
+    }
+    await expect(requireCompatibleLocalHostd(connection, buildIdentity)).rejects.toMatchObject({
+      code: 'hostd.legacy_restart_required',
+      retryable: false
+    })
+    expect(closed).toBe(true)
+  })
+
+  it('retires an exact quiescent predecessor and starts the current build only after endpoint absence', async () => {
+    const observedIdentity = { ...buildIdentity, bundleSha256: 'c'.repeat(64) }
+    const predecessorHealth = health(observedIdentity, ['hostd_graceful_retire_v1'])
+    const order: string[] = []
+    const connection = {
+      request: async <T = unknown>(method: string, payload: unknown): Promise<T> => {
+        expect(method).toBe('host.retire')
+        expect(payload).toEqual({
+          expectedHostId: predecessorHealth.host.hostId,
+          expectedBuildIdentity: observedIdentity
+        })
+        order.push('retire')
+        return {
+          retirementVersion: 1,
+          state: 'accepted',
+          expectedHostId: predecessorHealth.host.hostId,
+          hostdBuildIdentity: observedIdentity
+        } as T
+      },
+      close: vi.fn()
+    }
+
+    await replaceVerifiedLocalHostd({
+      connection,
+      health: predecessorHealth,
+      observedIdentity,
+      expectedIdentity: buildIdentity,
+      waitForEndpointAbsence: async () => {
+        order.push('absent')
+        return true
+      },
+      startCurrent: async () => { order.push('start') }
+    })
+
+    expect(order).toEqual(['retire', 'absent', 'start'])
+    expect(connection.close).toHaveBeenCalledOnce()
+  })
+
+  it('does not reinterpret an exact identity-drift rejection as retirement', async () => {
+    const observedIdentity = { ...buildIdentity, bundleSha256: 'c'.repeat(64) }
+    const predecessorHealth = health(observedIdentity, ['hostd_graceful_retire_v1'])
+    const waitForEndpointAbsence = vi.fn(async () => true)
+    const connection = {
+      request: async <T = unknown>(): Promise<T> => {
+        throw new ControlError('host.host_retire_identity_mismatch', 'identity drifted')
+      },
+      close: vi.fn()
+    }
+
+    await expect(retireVerifiedLocalHostd({
+      connection,
+      health: predecessorHealth,
+      observedIdentity,
+      expectedIdentity: buildIdentity,
+      waitForEndpointAbsence
+    })).rejects.toMatchObject({ code: 'host.host_retire_identity_mismatch' })
+    expect(waitForEndpointAbsence).not.toHaveBeenCalled()
+    expect(connection.close).toHaveBeenCalledOnce()
+  })
+
+  it('accepts a dropped retirement response only after endpoint absence is proven', async () => {
+    const observedIdentity = { ...buildIdentity, bundleSha256: 'c'.repeat(64) }
+    const predecessorHealth = health(observedIdentity, ['hostd_graceful_retire_v1'])
+    const dropped = () => ({
+      request: async <T = unknown>(): Promise<T> => {
+        throw new ControlError('transport.ended', 'response dropped', { retryable: true })
+      },
+      close: vi.fn()
+    })
+
+    await expect(retireVerifiedLocalHostd({
+      connection: dropped(),
+      health: predecessorHealth,
+      observedIdentity,
+      expectedIdentity: buildIdentity,
+      waitForEndpointAbsence: async () => true
+    })).resolves.toBeUndefined()
+
+    const startCurrent = vi.fn(async () => undefined)
+    await expect(replaceVerifiedLocalHostd({
+      connection: dropped(),
+      health: predecessorHealth,
+      observedIdentity,
+      expectedIdentity: buildIdentity,
+      waitForEndpointAbsence: async () => false,
+      startCurrent
+    })).rejects.toMatchObject({ code: 'hostd.retirement_unconfirmed' })
+    expect(startCurrent).not.toHaveBeenCalled()
+  })
+
+  it('coalesces concurrent retirement/startup work for one endpoint', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const operation = vi.fn(async () => { await gate })
+    const first = coordinateLocalHostdReadiness('test-endpoint', operation)
+    const second = coordinateLocalHostdReadiness('test-endpoint', operation)
+    expect(operation).toHaveBeenCalledOnce()
+    release()
+    await Promise.all([first, second])
+  })
+
+  it('rejects a different verified build without retiring its sessions', async () => {
+    let closed = false
+    const connection = {
+      request: async <T = unknown>() => health({ ...buildIdentity, bundleSha256: 'c'.repeat(64) }) as unknown as T,
+      close: () => { closed = true }
+    }
+    await expect(requireCompatibleLocalHostd(connection, buildIdentity)).rejects.toMatchObject({
+      code: 'hostd.build_identity_mismatch',
+      retryable: false
+    })
+    expect(closed).toBe(true)
+  })
+
   it('binds a packaged hostd to the exact packaged runtime seed', () => {
     const resources = path.resolve('C:/PrimeContinuim/resources')
     const paths = bundledHostdPaths(

@@ -208,6 +208,17 @@ async function inspectPackageIdentity(appAsarPath, receiptEnvelope) {
   }
 
   const resourcesDirectory = dirname(appAsarPath)
+  const hostdBundlePath = join(resourcesDirectory, 'hostd', 'hostd.cjs')
+  const hostdBundleSha256 = await sha256BoundedRegularFile(
+    hostdBundlePath,
+    256 * 1024 * 1024,
+    'packaged hostd bundle',
+  )
+  const runtimeAttestationBytes = asar.extractFile(appAsarPath, 'out/main/runtime-attestation.json')
+  if (!Buffer.isBuffer(runtimeAttestationBytes) || runtimeAttestationBytes.length < 1 || runtimeAttestationBytes.length > 256 * 1024) {
+    throw new NativeLaunchProofFailure('runtime_attestation_invalid', 'The packaged runtime attestation is not a bounded file.')
+  }
+  const runtimeAttestation = parseRuntimeAttestationIdentity(runtimeAttestationBytes)
   const pointerPath = join(resourcesDirectory, 'runtime-seed', 'current.json')
   const pointerMetadata = await lstat(pointerPath)
   if (!pointerMetadata.isFile() || pointerMetadata.isSymbolicLink() || pointerMetadata.size < 1 || pointerMetadata.size > MAX_POINTER_BYTES) {
@@ -234,18 +245,55 @@ async function inspectPackageIdentity(appAsarPath, receiptEnvelope) {
       platform: pointer.platform,
       arch: pointer.arch,
       appAsarSha256: await sha256File(appAsarPath),
+      hostdBundleSha256,
       mainTreeSha256: treeResults['out/main'].treeSha256,
       preloadTreeSha256: treeResults['out/preload'].treeSha256,
       rendererTreeSha256: treeResults['out/renderer'].treeSha256,
     },
     runtime: {
       releaseVersion: pointer.releaseVersion,
+      runtimeBuildId: runtimeAttestation.runtimeBuildId,
       platform: pointer.platform,
       arch: pointer.arch,
       pointerSha256: sha256(pointerBytes),
       treeSha256: pointer.treeSha256,
       manifestSha256: pointer.manifestSha256,
+      filesSha256: runtimeAttestation.filesSha256,
+      trustAnchorId: sha256(runtimeAttestationBytes),
     },
+  }
+}
+
+function parseRuntimeAttestationIdentity(bytes) {
+  let attestation
+  try {
+    attestation = JSON.parse(bytes.toString('utf8'))
+  } catch {
+    throw new NativeLaunchProofFailure('runtime_attestation_invalid', 'The packaged runtime attestation is not valid JSON.')
+  }
+  const runtime = attestation?.runtime
+  const manifest = attestation?.manifest
+  const tree = attestation?.tree
+  if (
+    runtime?.name !== 'prime-agent' ||
+    typeof runtime.releaseVersion !== 'string' ||
+    typeof runtime.runtimeBuildId !== 'string' ||
+    typeof runtime.platform !== 'string' ||
+    typeof runtime.arch !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(manifest?.sha256 ?? '') ||
+    !/^[a-f0-9]{64}$/.test(tree?.sha256 ?? '') ||
+    !/^[a-f0-9]{64}$/.test(tree?.filesSha256 ?? '')
+  ) {
+    throw new NativeLaunchProofFailure('runtime_attestation_invalid', 'The packaged runtime attestation has no exact runtime identity.')
+  }
+  return {
+    releaseVersion: runtime.releaseVersion,
+    runtimeBuildId: runtime.runtimeBuildId,
+    platform: runtime.platform,
+    arch: runtime.arch,
+    manifestSha256: manifest.sha256,
+    treeSha256: tree.sha256,
+    filesSha256: tree.filesSha256,
   }
 }
 
@@ -317,6 +365,14 @@ function nativeStateExpression(expectedCursor) {
         appVersion: bootstrap.appVersion,
         connectionPhase: bootstrap?.connection?.phase,
         hostId,
+      },
+      liveRuntime: {
+        connectionPath: bootstrap?.connection?.path,
+        hostdBuildIdentity: bootstrap?.connection?.hostdBuildIdentity,
+        readinessKind: bootstrap?.connection?.runtimeReadiness?.kind,
+        readinessStatus: bootstrap?.connection?.runtimeReadiness?.snapshot?.status,
+        trustAnchorId: bootstrap?.connection?.runtimeReadiness?.snapshot?.trustAnchorId,
+        target: bootstrap?.connection?.runtimeReadiness?.snapshot?.target,
       },
       selection: {
         heading: heading?.textContent?.trim(),
@@ -445,6 +501,24 @@ async function sha256File(path) {
   const hash = (await import('node:crypto')).createHash('sha256')
   for await (const chunk of createReadStream(path)) hash.update(chunk)
   return hash.digest('hex')
+}
+
+async function sha256BoundedRegularFile(path, maximumBytes, label) {
+  const before = await lstat(path)
+  if (!before.isFile() || before.isSymbolicLink() || before.size < 1 || before.size > maximumBytes) {
+    throw new NativeLaunchProofFailure('package_file_invalid', `The ${label} is not a bounded regular file.`)
+  }
+  const digest = await sha256File(path)
+  const after = await lstat(path)
+  if (
+    after.dev !== before.dev ||
+    after.ino !== before.ino ||
+    after.size !== before.size ||
+    after.mtimeMs !== before.mtimeMs
+  ) {
+    throw new NativeLaunchProofFailure('package_file_changed', `The ${label} changed while it was read.`)
+  }
+  return digest
 }
 
 function compareUtf8(left, right) {

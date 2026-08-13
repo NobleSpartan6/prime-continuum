@@ -3,12 +3,14 @@ import { stderr, stdin, stdout } from "node:process";
 import { isMainThread } from "node:worker_threads";
 import { resolveCanonicalLocalHostTarget } from "../shared/local-host-target";
 import { HOSTD_VERSION, resolveHostDataDir } from "./paths";
+import { readHostdBuildIdentity } from "./hostd-build-identity";
 import { collectHostProbe } from "./probe";
 import { PairingAuthority, type ChannelCloseFailureDiagnostic } from "./pairing/authority";
 import { readEmbeddedRuntimeAttestationEnvelope } from "./runtime-attestation";
 import { RuntimeInitializationCoordinator } from "./runtime-initialization-coordinator";
 import { VerifiedRuntimeModelCatalog } from "./runtime-model-catalog";
 import { VerifiedRuntimeOAuthComposition } from "./runtime-oauth";
+import { MacOSRuntimeProviderSetupHandoff } from "./runtime-provider-setup";
 import { OAuthAttemptStore } from "./oauth-attempt-store";
 import { VerifiedResidentGateway } from "./verified-resident-gateway";
 import { bridgeStdioToLocalSocket, serveLocalSocket } from "./server";
@@ -23,6 +25,7 @@ import {
 } from "./prime-agent-auth-security";
 
 export * from "./gateway";
+export * from "./hostd-build-identity";
 export * from "./candidate-evaluation";
 export * from "./candidate-evaluation-store";
 export * from "./oauth-session-broker";
@@ -40,6 +43,7 @@ export * from "./runtime-initialization-coordinator";
 export * from "./runtime-integrity-manager";
 export * from "./runtime-model-catalog";
 export * from "./runtime-oauth";
+export * from "./runtime-provider-setup";
 export * from "./verified-resident-gateway";
 export * from "./windows-security-descriptor";
 export * from "./server";
@@ -96,6 +100,10 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
       PRIME_AGENT_CODING_AGENT_DIR: primeAgentDirectory,
     });
     const runtimeAttestation = readEmbeddedRuntimeAttestationEnvelope();
+    const hostdBuildIdentity = await readHostdBuildIdentity(
+      __filename,
+      runtimeAttestation?.trustAnchorId,
+    );
     const runtimeInitialization = runtimeAttestation
         ? new RuntimeInitializationCoordinator({
             paths: store.paths,
@@ -133,6 +141,14 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
           credentialSecurity: primeAgentRuntimeSecurity,
         })
       : undefined;
+    const runtimeProviderSetupHandoff = runtimeInitialization && primeAgentRuntimeSecurity
+      ? new MacOSRuntimeProviderSetupHandoff({
+          runtimeHandles: runtimeInitialization,
+          credentialSecurity: primeAgentRuntimeSecurity,
+          agentDirectory: primeAgentDirectory,
+          environment: primeAgentEnvironment,
+        })
+      : undefined;
     const runtimeOAuthAttemptStore = new OAuthAttemptStore(store.paths);
     const residentGateway = runtimeInitialization
       ? new VerifiedResidentGateway({
@@ -149,8 +165,10 @@ export async function runHostdCli(argv = process.argv.slice(2)): Promise<number>
         onChannelCloseFailure: reportChannelCloseFailure,
       }),
       {
+        hostdBuildIdentity,
         runtimeIntegrityProvider: runtimeInitialization,
         runtimeModelCatalogProvider: runtimeModelCatalog,
+        runtimeProviderSetupHandoff,
         runtimeOAuthComposition,
         runtimeOAuthAttemptStore,
         candidateEvaluationCoordinator: candidateEvaluation,

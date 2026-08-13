@@ -13,6 +13,7 @@ import {
   CatalogProjectionSnapshotSchema,
   CommandEnvelopeSchema,
   CommandReceiptSchema as HostCommandReceiptSchema,
+  HostdBuildIdentitySchema,
   PRIME_AGENT_COMMAND_CAPABILITY,
   PRIME_AGENT_THINKING_LEVELS_CAPABILITY,
   RESIDENT_EXTENSION_UI_CAPABILITY,
@@ -25,6 +26,7 @@ import {
   RUNTIME_MODEL_CATALOG_CAPABILITY,
   RUNTIME_OAUTH_ATTEMPT_CAPABILITY,
   RUNTIME_OAUTH_CAPABILITY,
+  RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY,
   ResidentLifecycleLookupResultSchema,
   ResidentLifecycleStatusSchema,
   ResidentAbortIdleObservedSignalSchema,
@@ -35,6 +37,7 @@ import {
   RuntimeOAuthAttemptCancelResultSchema,
   RuntimeOAuthAttemptStartResultSchema,
   RuntimeOAuthAttemptStatusResultSchema,
+  RuntimeProviderSetupResultSchema,
   StructuredErrorSchema,
   ThreadProjectionSnapshotSchema,
   ThreadChangedEventPayloadSchema,
@@ -45,6 +48,7 @@ import {
   type CandidateEvaluationStartRequest,
   type CandidateEvaluationStatus,
   type CommandEnvelope,
+  type HostdBuildIdentity,
   type RuntimeIntegritySnapshot,
   type RuntimeModelCatalogSnapshot,
   type RuntimeOAuthAttemptAcknowledgeResult,
@@ -53,6 +57,7 @@ import {
   type RuntimeOAuthAttemptStartResult,
   type RuntimeOAuthAttemptStatusResult,
   type RuntimeOAuthSessionSnapshot,
+  type RuntimeProviderSetupResult,
   type ResidentLifecycleLookupResult,
   type ResidentLifecycleStatus,
   type TaskState,
@@ -146,6 +151,15 @@ interface CacheEnvelope extends IndexedProjectionEnvelope {
   targetHostBindings: TargetHostBinding[]
 }
 
+const DEFINITIVE_PROVIDER_SETUP_HOST_REJECTIONS = new Set([
+  'host.host_authority_mismatch',
+  'host.runtime_provider_setup_busy',
+  'host.runtime_provider_setup_unavailable',
+  'host.runtime_provider_unknown',
+  'host.runtime_provider_setup_native_oauth_required',
+  'host.runtime_provider_already_configured',
+])
+
 type ScopedOutboxEntry = OutboxEntry & { hostId: string; command: ClientCommand }
 
 interface OutboxIdentity {
@@ -203,6 +217,7 @@ interface HealthLineage {
   hostId: string
   hostdVersion: string
   startedAt: string
+  hostdBuildIdentityKey?: string
   reportsRuntimeIntegrity: boolean
   runtimeContractVersion?: number
   runtimeTrustAnchorId?: string
@@ -212,6 +227,7 @@ interface HealthLineage {
 interface HealthObservation {
   hostId: string
   capabilities: string[]
+  hostdBuildIdentity?: HostdBuildIdentity
   runtimeReadiness: HostRuntimeReadiness
   lineage: HealthLineage
 }
@@ -425,6 +441,7 @@ export class DesktopControlService extends EventEmitter {
   private target?: ConnectionTarget
   private authorityHostId?: string
   private authorityCapabilities: string[] = []
+  private authorityHostdBuildIdentity?: HostdBuildIdentity
   private authorityRuntimeReadiness?: HostRuntimeReadiness
   private authorityHealthLineage?: HealthLineage
   private healthPollTimer?: NodeJS.Timeout
@@ -703,6 +720,7 @@ export class DesktopControlService extends EventEmitter {
       if (targetChanged || expectedAuthorityChanged) {
         this.authorityHostId = undefined
         this.authorityCapabilities = []
+        this.authorityHostdBuildIdentity = undefined
         this.authorityRuntimeReadiness = undefined
         this.authorityHealthLineage = undefined
       }
@@ -826,6 +844,83 @@ export class DesktopControlService extends EventEmitter {
     )
     this.assertProjectionAuthority(authority, 'runtime model catalog')
     return RuntimeModelCatalogSnapshotSchema.parse(result)
+  }
+
+  async openRuntimeProviderSetup(
+    expectedHostId: string,
+    providerId: string,
+  ): Promise<RuntimeProviderSetupResult> {
+    const authority = this.captureProjectionAuthority()
+    if (
+      authority.hostId !== expectedHostId ||
+      authority.target.kind !== 'local' ||
+      this.state.phase !== 'online' ||
+      this.state.path !== 'local_socket'
+    ) {
+      throw new ControlError(
+        'runtime.provider_setup_local_authority_required',
+        'Prime Agent account setup requires the current verified local computer.',
+        { retryable: true }
+      )
+    }
+    if (!this.authorityCapabilities.includes(RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY)) {
+      throw new ControlError(
+        'runtime.provider_setup_unavailable',
+        'The connected host does not expose verified Prime Agent account setup.',
+        { retryable: true }
+      )
+    }
+    const readiness = this.authorityRuntimeReadiness
+    if (
+      readiness?.kind !== 'reported' ||
+      readiness.hostId !== expectedHostId ||
+      readiness.snapshot.status !== 'ready'
+    ) {
+      throw new ControlError(
+        'runtime.provider_setup_runtime_not_ready',
+        'Prime Agent account setup is unavailable until the verified runtime is ready.',
+        { retryable: true }
+      )
+    }
+    const expectedReleaseVersion = readiness.snapshot.target.releaseVersion
+    let requestMayHaveReachedHost = false
+    try {
+      requestMayHaveReachedHost = true
+      const raw = await authority.connection.request(
+        'runtime.provider_setup.open',
+        { expectedHostId, providerId },
+        { timeoutMs: 20_000 }
+      )
+      const result = RuntimeProviderSetupResultSchema.parse(raw)
+      this.assertProjectionAuthority(authority, 'Prime Agent account setup handoff')
+      if (
+        result.expectedHostId !== expectedHostId ||
+        result.providerId !== providerId ||
+        result.releaseVersion !== expectedReleaseVersion
+      ) {
+        throw new ControlError(
+          'runtime.provider_setup_authority_changed',
+          'Prime Agent account setup returned under different runtime authority.'
+        )
+      }
+      return result
+    } catch (error) {
+      // A structured host rejection proves the request returned before an
+      // ambiguous transport boundary. Transport loss, timeout, schema drift,
+      // or local authority change after enqueue can all race a Terminal
+      // launch, so report an outcome-unknown result and never auto-retry.
+      if (
+        !requestMayHaveReachedHost ||
+        (error instanceof ControlError && DEFINITIVE_PROVIDER_SETUP_HOST_REJECTIONS.has(error.code))
+      ) throw error
+      return RuntimeProviderSetupResultSchema.parse({
+        resultVersion: 1,
+        state: 'indeterminate',
+        expectedHostId,
+        providerId,
+        releaseVersion: expectedReleaseVersion,
+      })
+    }
   }
 
   async candidateEvaluationPreflight(
@@ -3040,6 +3135,7 @@ export class DesktopControlService extends EventEmitter {
       }
       const projectionInvalidated = await this.bindAuthority(target, hostId, generation)
       this.authorityCapabilities = observation.capabilities
+      this.authorityHostdBuildIdentity = observation.hostdBuildIdentity
       this.authorityRuntimeReadiness = observation.runtimeReadiness
       this.authorityHealthLineage = observation.lineage
       this.healthCapabilityWarmupPollsRemaining = target.kind === 'local'
@@ -3410,9 +3506,12 @@ export class DesktopControlService extends EventEmitter {
     this.emit('connection-state', this.getConnectionState())
   }
 
-  private authorityObservationState(): Pick<ConnectionState, 'capabilities' | 'runtimeReadiness'> | Record<string, never> {
+  private authorityObservationState(): Pick<ConnectionState, 'capabilities' | 'hostdBuildIdentity' | 'runtimeReadiness'> | Record<string, never> {
     return {
       ...(this.authorityCapabilities.length > 0 ? { capabilities: [...this.authorityCapabilities] } : {}),
+      ...(this.authorityHostdBuildIdentity
+        ? { hostdBuildIdentity: structuredClone(this.authorityHostdBuildIdentity) }
+        : {}),
       ...(this.authorityRuntimeReadiness && this.authorityRuntimeReadiness.hostId === this.authorityHostId
         ? { runtimeReadiness: structuredClone(this.authorityRuntimeReadiness) }
         : {}),
@@ -3680,6 +3779,7 @@ export class DesktopControlService extends EventEmitter {
       runtimeReadinessSemanticKey(this.authorityRuntimeReadiness) !==
         runtimeReadinessSemanticKey(observation.runtimeReadiness)
     this.authorityCapabilities = observation.capabilities
+    this.authorityHostdBuildIdentity = observation.hostdBuildIdentity
     this.authorityRuntimeReadiness = observation.runtimeReadiness
     this.authorityHealthLineage = observation.lineage
     if (
@@ -3689,7 +3789,7 @@ export class DesktopControlService extends EventEmitter {
     ) {
       this.revokeResidentWorkspacePreselections('authority_changed')
     }
-    const { capabilities: _capabilities, runtimeReadiness: _runtimeReadiness, ...base } = this.state
+    const { capabilities: _capabilities, hostdBuildIdentity: _hostdBuildIdentity, runtimeReadiness: _runtimeReadiness, ...base } = this.state
     const next = { ...base, ...this.authorityObservationState() }
     if (semanticChange) this.setState(next)
     else this.state = next
@@ -7019,6 +7119,13 @@ function observationFromHealth(value: unknown): HealthObservation {
     throw new ControlError('protocol.health_lineage_missing', 'The host health response did not include a stable service lineage.')
   }
   const capabilities = capabilitiesFromHealth(health)
+  const parsedHostdBuildIdentity = HostdBuildIdentitySchema.safeParse(health?.hostdBuildIdentity)
+  if (health?.hostdBuildIdentity !== undefined && !parsedHostdBuildIdentity.success) {
+    throw new ControlError('protocol.hostd_build_identity_invalid', 'The host service build identity was invalid.')
+  }
+  const hostdBuildIdentity = parsedHostdBuildIdentity.success
+    ? parsedHostdBuildIdentity.data
+    : undefined
   const rawRuntimeIntegrity = health?.runtimeIntegrity
   const reportsRuntimeIntegrity = rawRuntimeIntegrity !== undefined
   if (reportsRuntimeIntegrity !== capabilities.includes(RUNTIME_INTEGRITY_CAPABILITY)) {
@@ -7093,11 +7200,13 @@ function observationFromHealth(value: unknown): HealthObservation {
   return {
     hostId,
     capabilities,
+    ...(hostdBuildIdentity ? { hostdBuildIdentity } : {}),
     runtimeReadiness,
     lineage: {
       hostId,
       hostdVersion,
       startedAt,
+      ...(hostdBuildIdentity ? { hostdBuildIdentityKey: JSON.stringify(hostdBuildIdentity) } : {}),
       reportsRuntimeIntegrity,
       ...(runtimeIntegrity
         ? {
@@ -7125,6 +7234,7 @@ function assertSameHealthLineage(expected: HealthLineage, received: HealthLineag
       'hostId',
       'hostdVersion',
       'startedAt',
+      'hostdBuildIdentityKey',
       'reportsRuntimeIntegrity',
       'runtimeContractVersion',
       'runtimeTrustAnchorId',

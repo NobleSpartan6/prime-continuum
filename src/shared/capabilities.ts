@@ -6,6 +6,11 @@ export const RUNTIME_INTEGRITY_CAPABILITY = "runtime_integrity_v1" as const;
 export const RUNTIME_INTEGRITY_RETRY_CAPABILITY = "runtime_integrity_retry_v1" as const;
 export const RUNTIME_INTEGRITY_REPAIR_CAPABILITY = "runtime_integrity_repair_v1" as const;
 export const RUNTIME_MODEL_CATALOG_CAPABILITY = "runtime_model_catalog_v1" as const;
+/** Exact-identity, quiescence-gated retirement for trusted local upgrades. */
+export const HOSTD_GRACEFUL_RETIRE_CAPABILITY = "hostd_graceful_retire_v1" as const;
+/** Trusted-local handoff into the exact verified Prime Agent account profile. */
+export const RUNTIME_PROVIDER_SETUP_HANDOFF_CAPABILITY =
+  "runtime_provider_setup_handoff_v1" as const;
 export const RUNTIME_OAUTH_CAPABILITY = "runtime_oauth_v1" as const;
 export const RUNTIME_OAUTH_ATTEMPT_CAPABILITY = "runtime_oauth_attempt_v1" as const;
 export const PRIME_AGENT_COMMAND_CAPABILITY = "prime_agent_commands_v2" as const;

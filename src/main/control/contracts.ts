@@ -16,8 +16,10 @@ import type {
   ResidentLifecycleStatus,
   RuntimeIntegritySnapshot,
   RuntimeIntegrityTarget,
+  HostdBuildIdentity,
   RuntimeModelCatalogSnapshot,
-  RuntimeOAuthSessionSnapshot
+  RuntimeOAuthSessionSnapshot,
+  RuntimeProviderSetupResult,
 } from '../../shared/protocol'
 
 export const IPC = {
@@ -36,6 +38,7 @@ export const IPC = {
   retryRuntimeIntegrity: 'prime:runtime:integrity:retry',
   repairRuntimeIntegrity: 'prime:runtime:integrity:repair',
   runtimeModelCatalog: 'prime:runtime:model-catalog',
+  openRuntimeProviderSetup: 'prime:runtime:provider-setup:open',
   startRuntimeOAuth: 'prime:runtime:oauth:start',
   runtimeOAuthStatus: 'prime:runtime:oauth:status',
   cancelRuntimeOAuth: 'prime:runtime:oauth:cancel',
@@ -154,6 +157,8 @@ export interface ConnectionState {
   attempt: number
   /** Versioned features advertised by the verified host health handshake. */
   capabilities?: string[]
+  /** Exact path-free identity reported by this hostd build, when supported. */
+  hostdBuildIdentity?: HostdBuildIdentity
   /** Last integrity-readiness observation for this exact verified host authority. */
   runtimeReadiness?: HostRuntimeReadiness
   error?: StructuredError
@@ -479,6 +484,10 @@ export interface PrimeBridge {
   retryRuntimeIntegrity(input: { expectedHostId: string }): Promise<Result<RuntimeIntegritySnapshot>>
   repairRuntimeIntegrity(input: RuntimeIntegrityRepairInput): Promise<Result<RuntimeIntegritySnapshot>>
   runtimeModelCatalog(input: { expectedHostId: string }): Promise<Result<RuntimeModelCatalogSnapshot>>
+  openRuntimeProviderSetup(input: {
+    expectedHostId: string
+    providerId: string
+  }): Promise<Result<RuntimeProviderSetupResult>>
   startRuntimeOAuth(input: { expectedHostId: string; providerId: string }): Promise<Result<RuntimeOAuthSessionView>>
   runtimeOAuthStatus(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>
   cancelRuntimeOAuth(input: { expectedHostId: string; sessionId: string }): Promise<Result<RuntimeOAuthSessionView>>

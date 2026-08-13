@@ -16,6 +16,7 @@ const outputDirectory = join(repositoryRoot, 'out', 'visual-qa')
 const resultPath = join(outputDirectory, 'capture-result.json')
 const errorPath = join(outputDirectory, 'capture-error.txt')
 const visualQaUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36 PrimeContinuimVisualQA/1'
+const providerHandoffEvidenceBoundary = 'Internal renderer preview: layout only; no Terminal launch, provider login, or account refresh.'
 const targets = [
   {
     name: 'desktop-agent-launchpad',
@@ -190,6 +191,85 @@ const targets = [
     expectShortModelsDialog: true,
   },
   {
+    name: 'provider-handoff-unopened-390',
+    width: 390,
+    height: 844,
+    visualState: 'provider-handoff-unopened',
+    expectedText: 'Open Prime Agent, run /login, and choose Anthropic (Claude Pro/Max).',
+    expectProviderSetupAction: 'Open Prime Agent',
+    expectProviderSetupState: 'unopened',
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
+    name: 'provider-handoff-unopened-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'provider-handoff-unopened',
+    expectedText: 'Open Prime Agent, run /login, and choose Anthropic (Claude Pro/Max).',
+    expectProviderSetupAction: 'Open Prime Agent',
+    expectProviderSetupState: 'unopened',
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    expectShortModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
+    name: 'provider-handoff-opened-390',
+    width: 390,
+    height: 844,
+    visualState: 'provider-handoff-opened',
+    expectedText: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+    expectProviderSetupAction: 'Check account',
+    expectProviderSetupState: 'opened',
+    triggerProviderSetup: true,
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
+    name: 'provider-handoff-opened-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'provider-handoff-opened',
+    expectedText: 'Prime Agent opened. Run /login, choose your provider, then return here.',
+    expectProviderSetupAction: 'Check account',
+    expectProviderSetupState: 'opened',
+    triggerProviderSetup: true,
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    expectShortModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
+    name: 'provider-handoff-indeterminate-390',
+    width: 390,
+    height: 844,
+    visualState: 'provider-handoff-indeterminate',
+    expectedText: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+    expectProviderSetupAction: 'Check account',
+    expectProviderSetupState: 'indeterminate',
+    triggerProviderSetup: true,
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
+    name: 'provider-handoff-indeterminate-short-320',
+    width: 320,
+    height: 256,
+    visualState: 'provider-handoff-indeterminate',
+    expectedText: 'Prime Agent may already be open. Check your windows first; Prime Continuim won’t repeat this request.',
+    expectProviderSetupAction: 'Check account',
+    expectProviderSetupState: 'indeterminate',
+    triggerProviderSetup: true,
+    selectProviderId: 'anthropic',
+    openModelsDialog: true,
+    expectShortModelsDialog: true,
+    evidenceBoundary: providerHandoffEvidenceBoundary,
+  },
+  {
     name: 'desktop-prompt-admission',
     width: 1200,
     height: 800,
@@ -341,6 +421,19 @@ function invariant(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+function modelsActionExpression(target, dialogVariable) {
+  if (target.expectReasoningControl) {
+    return `${dialogVariable}?.querySelector('select#resident-thinking-level')`
+  }
+  if (target.expectModelAction) {
+    return `[...(${dialogVariable}?.querySelectorAll('button') ?? [])]
+      .find((candidate) => candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)})`
+  }
+  const expectedText = target.expectOAuthAction ?? target.expectProviderSetupAction
+  return `[...(${dialogVariable}?.querySelectorAll('button') ?? [])]
+    .find((candidate) => candidate.textContent?.trim() === ${JSON.stringify(expectedText)})`
+}
+
 async function waitForSurface(browserWindow, target) {
   const selector = target.expectHud
     ? `.hud-${target.expectHud}`
@@ -475,19 +568,22 @@ async function capture(target, rendererOrigin) {
           return {
             inspectorOpen: document.querySelector('.app-shell')?.getAttribute('data-inspector-open') === 'true',
             starterSelected: starter?.getAttribute('aria-pressed') === 'true',
-            composerPrefilled: composer instanceof HTMLTextAreaElement && composer.value === 'Investigate: [issue, reproduction details, expected behavior, and done criteria].',
+            composerGuided: composer instanceof HTMLTextAreaElement &&
+              composer.value === '' &&
+              composer.placeholder === 'Describe the issue, reproduction details, expected behavior, and done criteria…' &&
+              document.activeElement === composer,
           }
         })()`)
         if (
           (!target.openInspector || workbenchInteraction.inspectorOpen) &&
-          (!target.selectTaskStarter || (workbenchInteraction.starterSelected && workbenchInteraction.composerPrefilled))
+          (!target.selectTaskStarter || (workbenchInteraction.starterSelected && workbenchInteraction.composerGuided))
         ) break
         await delay(25)
       }
       invariant(!target.openInspector || workbenchInteraction?.inspectorOpen, `${target.name} did not open the inspector`)
       invariant(!target.selectTaskStarter || (
-        workbenchInteraction?.starterSelected && workbenchInteraction?.composerPrefilled
-      ), `${target.name} did not prefill the selected task starter`)
+        workbenchInteraction?.starterSelected && workbenchInteraction?.composerGuided
+      ), `${target.name} did not focus the composer with the selected task guidance`)
       await delay(500)
     }
     if (target.selectRuntimeTab) {
@@ -518,9 +614,9 @@ async function capture(target, rendererOrigin) {
     }
     if (target.openModelsDialog) {
       // Paint the real native surface offscreen, then use the visible composer
-      // action that a person would use. The model actions themselves remain
-      // untouched: this target is evidence for discoverability and reachability,
-      // never an execution fixture.
+      // action that a person would use. Model, OAuth, and account-refresh
+      // actions remain untouched. Provider handoff outcomes are exercised only
+      // by the in-memory preview API; this harness cannot launch Terminal.
       browserWindow.setPosition(-10_000, -10_000, false)
       browserWindow.showInactive()
       const modelTriggerEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
@@ -570,36 +666,50 @@ async function capture(target, rendererOrigin) {
           await delay(25)
         }
       }
+      if (target.triggerProviderSetup) {
+        const providerSetupDeadline = Date.now() + 10_000
+        let providerSetupTriggered = false
+        while (Date.now() < providerSetupDeadline) {
+          providerSetupTriggered = await browserWindow.webContents.executeJavaScript(`(() => {
+            const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
+            const action = [...(dialog?.querySelectorAll('button') ?? [])]
+              .find((candidate) => candidate.textContent?.trim() === 'Open Prime Agent')
+            if (!(action instanceof HTMLButtonElement) || action.disabled) return false
+            action.click()
+            return true
+          })()`)
+          if (providerSetupTriggered) break
+          await delay(25)
+        }
+        invariant(providerSetupTriggered, `${target.name} did not expose the initial provider handoff action`)
+      }
       const dialogDeadline = Date.now() + 10_000
       while (Date.now() < dialogDeadline) {
         const ready = await browserWindow.webContents.executeJavaScript(`(() => {
           const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
-          const action = ${target.expectReasoningControl
-            ? `dialog?.querySelector('select#resident-thinking-level')`
-            : `[...(dialog?.querySelectorAll('button') ?? [])]
-                .find((candidate) => ${target.expectModelAction
-                  ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-                  : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
+          const action = ${modelsActionExpression(target, 'dialog')}
           return Boolean(
             dialog &&
             (action instanceof HTMLButtonElement || action instanceof HTMLSelectElement) &&
-            !action.disabled
+            !action.disabled &&
+            document.body.innerText.includes(${JSON.stringify(target.expectedText)})
           )
         })()`)
         if (ready) break
         await delay(25)
       }
       await delay(300)
-      if (target.expectModelAction || target.expectShortModelsDialog || target.expectReasoningControl) {
+      if (
+        target.expectModelAction ||
+        target.expectOAuthAction ||
+        target.expectProviderSetupAction ||
+        target.expectShortModelsDialog ||
+        target.expectReasoningControl
+      ) {
         const shortModelScrollEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
           const dialog = document.querySelector('dialog[open][aria-labelledby="models-title"]')
           const catalog = dialog?.querySelector('.model-catalog')
-          const action = ${target.expectReasoningControl
-            ? `dialog?.querySelector('select#resident-thinking-level')`
-            : `[...(dialog?.querySelectorAll('button') ?? [])]
-                .find((candidate) => ${target.expectModelAction
-                  ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-                  : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
+          const action = ${modelsActionExpression(target, 'dialog')}
           if (
             !(catalog instanceof HTMLElement) ||
             (!(action instanceof HTMLButtonElement) && !(action instanceof HTMLSelectElement)) ||
@@ -905,6 +1015,8 @@ async function capture(target, rendererOrigin) {
     const stateEvidence = await browserWindow.webContents.executeJavaScript(`(() => {
       const status = document.querySelector('.composer__connection')
       const statusStyle = status ? window.getComputedStyle(status) : undefined
+      const sessionStatus = document.querySelector('.session-continuity')
+      const sessionStatusRect = sessionStatus?.getBoundingClientRect()
       const residentDialog = document.querySelector('dialog[aria-labelledby="resident-provision-title"]')
       const residentDialogStyle = residentDialog ? window.getComputedStyle(residentDialog) : undefined
       const residentDialogRect = residentDialog?.getBoundingClientRect()
@@ -954,13 +1066,11 @@ async function capture(target, rendererOrigin) {
       const modelCatalog = modelsDialog?.querySelector('.model-catalog')
       const modelCatalogStyle = modelCatalog ? window.getComputedStyle(modelCatalog) : undefined
       const modelCatalogRect = modelCatalog?.getBoundingClientRect()
-      const modelAction = ${target.expectReasoningControl
-        ? `modelsDialog?.querySelector('select#resident-thinking-level')`
-        : `[...(modelsDialog?.querySelectorAll('button') ?? [])]
-            .find((candidate) => ${target.expectModelAction
-              ? `candidate.getAttribute('aria-label') === ${JSON.stringify(target.expectModelAction)}`
-              : `candidate.textContent?.trim() === ${JSON.stringify(target.expectOAuthAction)}`})`}
+      const modelAction = ${modelsActionExpression(target, 'modelsDialog')}
       const modelActionRect = modelAction?.getBoundingClientRect()
+      const providerSetupOpenAction = [...(modelsDialog?.querySelectorAll('button') ?? [])]
+        .find((candidate) => candidate.textContent?.trim() === 'Open Prime Agent' || candidate.textContent?.trim() === 'Try again')
+      const providerSetupFeedback = modelsDialog?.querySelector('.provider-setup-feedback:not(.sr-only)')
       const reasoningControl = modelsDialog?.querySelector('.reasoning-control')
       const reasoningControlRect = reasoningControl?.getBoundingClientRect()
       const reasoningLabel = modelsDialog?.querySelector('label[for="resident-thinking-level"]')
@@ -1012,6 +1122,11 @@ async function capture(target, rendererOrigin) {
         expectedTextPresent: document.body.innerText.includes(${JSON.stringify(target.expectedText)}),
         compactComposer: Boolean(document.querySelector('.composer--compact')),
         composerStatusVisible: Boolean(status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0),
+        taskStatusVisible: Boolean(
+          (status && statusStyle && statusStyle.display !== 'none' && status.getBoundingClientRect().height > 0) ||
+          (sessionStatusRect && sessionStatusRect.width > 0 && sessionStatusRect.height > 0 &&
+            sessionStatus?.textContent?.includes(${JSON.stringify(target.expectedText)}))
+        ),
         extensionQuestionVisible: Boolean(
           extensionQuestionRect &&
           extensionQuestionRect.width > 0 &&
@@ -1101,6 +1216,12 @@ async function capture(target, rendererOrigin) {
           !modelAction.disabled &&
           !modelsDialog?.querySelector('.model-selection-feedback__message:not(.sr-only)')
         ),
+        providerSetupActionText: modelAction?.textContent?.trim(),
+        providerSetupActionPrimary: Boolean(modelAction?.classList.contains('button--primary')),
+        providerSetupRepeatSuppressed: !providerSetupOpenAction,
+        providerSetupFeedbackText: providerSetupFeedback?.textContent?.trim(),
+        providerSetupFeedbackRole: providerSetupFeedback?.getAttribute('role'),
+        providerSetupLayoutEvidenceOnly: ${JSON.stringify(Boolean(target.evidenceBoundary))},
         reasoningControlOptions: modelAction instanceof HTMLSelectElement
           ? [...modelAction.options].map((option) => option.value)
           : [],
@@ -1209,7 +1330,7 @@ async function capture(target, rendererOrigin) {
       `${target.name} did not render its expected resident-state copy: ${JSON.stringify(stateEvidence)}`,
     )
     if (target.expectStatusVisible || target.expectCompactStatus) {
-      invariant(stateEvidence.composerStatusVisible, `${target.name} hid its resident-state copy`)
+      invariant(stateEvidence.taskStatusVisible, `${target.name} hid its resident-state copy`)
     }
     if (target.expectCompactStatus) {
       invariant(stateEvidence.compactComposer, `${target.name} did not render the compact resident composer`)
@@ -1283,7 +1404,30 @@ async function capture(target, rendererOrigin) {
       invariant(stateEvidence.modelsDialogOpen, `${target.name} did not open Models & accounts as a modal dialog`)
       invariant(stateEvidence.modelSelectionActionEnabled, `${target.name} did not expose its expected enabled action`)
       invariant(stateEvidence.modelSelectionActionVisible, `${target.name} hid its expected action: ${JSON.stringify(stateEvidence)}`)
-      invariant(stateEvidence.modelSelectionUnchanged, `${target.name} invoked or locked its non-executing action`)
+      if (!target.triggerProviderSetup) {
+        invariant(stateEvidence.modelSelectionUnchanged, `${target.name} invoked or locked its non-executing action`)
+      }
+    }
+    if (target.expectProviderSetupState) {
+      invariant(
+        stateEvidence.providerSetupActionText === target.expectProviderSetupAction &&
+        stateEvidence.providerSetupLayoutEvidenceOnly,
+        `${target.name} did not preserve its QA-only provider handoff action: ${JSON.stringify(stateEvidence)}`,
+      )
+      if (target.expectProviderSetupState === 'unopened') {
+        invariant(
+          !stateEvidence.providerSetupRepeatSuppressed && !stateEvidence.providerSetupFeedbackText,
+          `${target.name} did not preserve the unopened provider handoff state: ${JSON.stringify(stateEvidence)}`,
+        )
+      } else {
+        invariant(
+          stateEvidence.providerSetupActionPrimary &&
+          stateEvidence.providerSetupRepeatSuppressed &&
+          stateEvidence.providerSetupFeedbackRole === 'status' &&
+          stateEvidence.providerSetupFeedbackText === target.expectedText,
+          `${target.name} did not suppress repeat provider handoff after ${target.expectProviderSetupState}: ${JSON.stringify(stateEvidence)}`,
+        )
+      }
     }
     if (target.expectReasoningControl) {
       invariant(

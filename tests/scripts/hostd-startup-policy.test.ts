@@ -57,6 +57,7 @@ describe('bundled hostd startup deadline policy', () => {
         'resident_lifecycle_v1',
         'runtime_model_catalog_v1',
         'runtime_oauth_v1',
+        ...(process.platform === 'darwin' ? ['runtime_provider_setup_handoff_v1'] : []),
       ],
     })
 

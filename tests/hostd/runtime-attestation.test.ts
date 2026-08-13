@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { build } from "esbuild";
 import { describe, expect, it } from "vitest";
 import {
+  parseEmbeddedRuntimeAttestationBytes,
   parseEmbeddedRuntimeAttestationRecord,
   readEmbeddedRuntimeAttestation,
 } from "../../src/hostd/runtime-attestation";
@@ -112,6 +113,7 @@ describe("release runtime attestation", () => {
     const record = createEmbeddedRuntimeAttestationRecord(bytes);
     const extracted = extractEmbeddedRuntimeAttestation(Buffer.from(`const releaseRecord = ${JSON.stringify(record)};`));
     const envelope = parseEmbeddedRuntimeAttestationRecord(record);
+    const bytesEnvelope = parseEmbeddedRuntimeAttestationBytes(bytes);
 
     expect(extracted).toEqual(bytes);
     expect(parseRuntimeAttestation(extracted)).toEqual(attestation);
@@ -119,6 +121,7 @@ describe("release runtime attestation", () => {
       attestation,
       trustAnchorId: createHash("sha256").update(bytes).digest("hex"),
     });
+    expect(bytesEnvelope).toEqual(envelope);
     expect(Object.isFrozen(envelope)).toBe(true);
     expect(Object.isFrozen(envelope.attestation)).toBe(true);
   });

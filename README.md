@@ -40,7 +40,9 @@ The first run may download and verify the repository's pinned Node and Prime Age
 
 1. Select **New agent** and choose a workspace folder.
 2. Open **Models & accounts**.
-3. Connect ChatGPT, or configure another provider through Prime Agent.
+3. Connect ChatGPT, or on a local Mac choose **Open Prime Agent**, complete
+   `/login` in Terminal, then choose **Check account**. SSH and relay setup stay
+   manual.
 4. Select an available model, write the task, and choose **Delegate task**.
 5. Open **Session** to follow RLM branches, browser readiness, and runtime state.
 
