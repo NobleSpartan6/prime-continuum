@@ -286,17 +286,30 @@ export function uniqueExactVisibleModelRowIndex(rows, expected) {
   return exact !== undefined && rows[exact].visibleSelectActionCount === 1 ? exact : undefined;
 }
 
-export function parseVisibleModelRowMetadata(markup) {
-  if (typeof markup !== "string" || markup.length < 1 || markup.length > 256 * 1024) {
+export function parseVisibleModelRowMetadata(serializedMetadata) {
+  if (
+    typeof serializedMetadata !== "string" || serializedMetadata.length < 1 ||
+    serializedMetadata.length > 4_096
+  ) {
     fail("model_selection", "MODEL_NOT_SELECTED");
   }
-  const metadata = [...markup.matchAll(/<bdi(?:\s[^>]*)?>([\s\S]*?)<\/bdi>/giu)]
-    .map((match) => visibleHtmlText(match[1] ?? ""));
+  let metadata;
+  try {
+    metadata = JSON.parse(serializedMetadata);
+  } catch {
+    fail("model_selection", "MODEL_NOT_SELECTED");
+  }
   if (
-    metadata.length !== 2 || metadata[0].length < 1 || metadata[0].length > 255 ||
-    !MODEL_ID.test(metadata[1])
+    !Array.isArray(metadata) || metadata.length !== 2 ||
+    typeof metadata[0] !== "string" || typeof metadata[1] !== "string"
   ) fail("model_selection", "MODEL_NOT_SELECTED");
-  return Object.freeze({ providerDisplayName: metadata[0], modelId: metadata[1] });
+  const providerDisplayName = normalizeVisibleText(metadata[0]);
+  const modelId = normalizeVisibleText(metadata[1]);
+  if (
+    providerDisplayName.length < 1 || providerDisplayName.length > 255 ||
+    !MODEL_ID.test(modelId)
+  ) fail("model_selection", "MODEL_NOT_SELECTED");
+  return Object.freeze({ providerDisplayName, modelId });
 }
 
 export function validateStopTransition(active, terminal, journalEvidence) {
@@ -689,16 +702,8 @@ function validVisibleStreamObservation(value) {
     typeof value.visibleAssistantText === "string" && value.visibleAssistantText.length > 0 && value.visibleAssistantText.length <= 1024 * 1024;
 }
 
-function visibleHtmlText(value) {
-  return value
-    .replace(/<[^>]+>/gu, " ")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replace(/\s+/gu, " ")
-    .trim();
+function normalizeVisibleText(value) {
+  return value.replace(/\s+/gu, " ").trim();
 }
 
 async function sha256File(path) {

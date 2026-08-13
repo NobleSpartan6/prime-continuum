@@ -181,8 +181,17 @@ describe('installed Prime Agent provider E2E contract', () => {
 
   it('binds model mutation to one exact visible provider/model row despite ambiguous substring results', () => {
     expect(parseVisibleModelRowMetadata(
-      '<article class="model-row"><span><bdi>ChatGPT Plus/Pro &amp; Team</bdi> · <bdi>gpt-5</bdi></span></article>',
+      JSON.stringify([' ChatGPT Plus/Pro & Team ', 'gpt-5']),
     )).toEqual({ providerDisplayName: 'ChatGPT Plus/Pro & Team', modelId: 'gpt-5' })
+    expect(parseVisibleModelRowMetadata(
+      JSON.stringify(['ChatGPT &amp;lt; Team', 'gpt-5']),
+    )).toEqual({ providerDisplayName: 'ChatGPT &amp;lt; Team', modelId: 'gpt-5' })
+    expect(() => parseVisibleModelRowMetadata(
+      '<bdi>ChatGPT Plus/Pro</bdi><bdi>gpt-5</bdi>',
+    )).toThrowError(expect.objectContaining({ code: 'MODEL_NOT_SELECTED' }))
+    expect(() => parseVisibleModelRowMetadata(JSON.stringify(['ChatGPT Plus/Pro']))).toThrowError(
+      expect.objectContaining({ code: 'MODEL_NOT_SELECTED' }),
+    )
     const rows = [
       { providerId: 'openai-codex', providerDisplayName: 'ChatGPT Plus/Pro', modelId: 'gpt-5', visibleSelectActionCount: 1 },
       { providerId: 'openai-codex', providerDisplayName: 'ChatGPT Plus/Pro', modelId: 'gpt-5-codex', visibleSelectActionCount: 1 },
@@ -360,7 +369,13 @@ describe('installed Prime Agent provider E2E contract', () => {
     expect(source).toContain('controller.clickExactVisibleModelRow({')
     expect(source).toContain('uniqueExactVisibleModelRowIndex(candidates, expected)')
     expect(source).toContain('providerAttributes.get("data-provider-id") === expected?.providerId')
-    expect(source).toContain('parseVisibleModelRowMetadata(await this.nodeOuterHtml(rowNodeId))')
+    expect(source).toContain('const metadataNodeIds = await this.queryNodesWithin(rowNodeId, "bdi")')
+    expect(source).not.toContain('this.visibleNodePoint(metadataNodeId, true)')
+    expect(source).toContain('parseVisibleModelRowMetadata(JSON.stringify(metadataText))')
+    expect(source).toContain('functionDeclaration: NODE_INNER_TEXT_FUNCTION')
+    expect(source).toContain('this.cdp.request("DOM.resolveNode"')
+    expect(source).not.toContain('DOM.getOuterHTML')
+    expect(source).not.toContain('function htmlText')
     expect(source).not.toContain('controller.clickVisible(MODEL_SELECT_SELECTOR')
     expect(source.indexOf('controller.clickVisible(MODELS_CLOSE_SELECTOR')).toBeLessThan(
       source.indexOf('controller.typeVisible(COMPOSER_SELECTOR'),

@@ -78,6 +78,7 @@ const THREAD_ID = "prime-agent-provider-e2e-thread";
 const EXECUTION_GENERATION_ID = "prime-agent-provider-e2e-execution-1";
 const PROVISION_OPERATION_ID = "prime-agent-provider-e2e-provision-1";
 const SNAPSHOT_READ_FUNCTION = "function(input){return globalThis.prime.requestSnapshot(input)}";
+const NODE_INNER_TEXT_FUNCTION = "function(){return this.innerText}";
 const MODELS_TRIGGER_TEXT = "Models & accounts";
 const CONNECT_TEXT = "Connect ChatGPT";
 const OPENAI_PROVIDER_SELECTOR = '[data-provider-filter][data-provider-id="openai-codex"]';
@@ -1332,7 +1333,13 @@ class WorkbenchController {
           const candidates = [];
           for (const rowNodeId of await this.queryNodes(".model-row")) {
             if (!(await this.visibleNodePoint(rowNodeId, true))) continue;
-            const metadata = parseVisibleModelRowMetadata(await this.nodeOuterHtml(rowNodeId));
+            const metadataNodeIds = await this.queryNodesWithin(rowNodeId, "bdi");
+            if (metadataNodeIds.length !== 2) fail("model_selection", "MODEL_NOT_SELECTED");
+            const metadataText = [];
+            for (const metadataNodeId of metadataNodeIds) {
+              metadataText.push(await this.nodeText(metadataNodeId));
+            }
+            const metadata = parseVisibleModelRowMetadata(JSON.stringify(metadataText));
             if (!metadata) fail("model_selection", "MODEL_NOT_SELECTED");
             const visibleActions = [];
             for (const actionNodeId of await this.queryNodesWithin(rowNodeId, MODEL_SELECT_SELECTOR)) {
@@ -1458,19 +1465,33 @@ class WorkbenchController {
   }
 
   async nodeText(nodeId) {
-    return htmlText(await this.nodeOuterHtml(nodeId));
+    if (!Number.isSafeInteger(nodeId) || nodeId < 1) fail("renderer", "CDP_PROTOCOL_INVALID");
+    const resolved = await this.cdp.request("DOM.resolveNode", {
+      nodeId,
+      executionContextId: this.executionContextId,
+    }, this.sessionId);
+    const objectId = resolved?.object?.objectId;
+    if (typeof objectId !== "string" || objectId.length < 1 || objectId.length > 1_024) {
+      fail("renderer", "CDP_PROTOCOL_INVALID");
+    }
+    try {
+      const response = await this.cdp.request("Runtime.callFunctionOn", {
+        functionDeclaration: NODE_INNER_TEXT_FUNCTION,
+        objectId,
+        returnByValue: true,
+      }, this.sessionId);
+      const value = bridgeValue(response);
+      if (typeof value !== "string" || value.length > 256 * 1024) {
+        fail("renderer", "CDP_PROTOCOL_INVALID");
+      }
+      return value.replace(/\s+/gu, " ").trim();
+    } finally {
+      await this.cdp.request("Runtime.releaseObject", { objectId }, this.sessionId);
+    }
   }
 
   async nodeDisabled(nodeId) {
     return (await this.nodeAttributes(nodeId)).has("disabled");
-  }
-
-  async nodeOuterHtml(nodeId) {
-    const response = await this.cdp.request("DOM.getOuterHTML", { nodeId }, this.sessionId);
-    if (typeof response.outerHTML !== "string" || response.outerHTML.length > 256 * 1024) {
-      fail("renderer", "CDP_PROTOCOL_INVALID");
-    }
-    return response.outerHTML;
   }
 
   async nodeAttributes(nodeId) {
@@ -1633,22 +1654,6 @@ function bridgeValue(response) {
     fail("renderer", "CDP_PROTOCOL_INVALID");
   }
   return response.result.value;
-}
-
-function htmlText(value) {
-  return value
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/giu, " ")
-    .replace(/<[^>]+>/gu, " ")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&hellip;", "…")
-    .replaceAll("&#x2026;", "…")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replace(/\s+/gu, " ")
-    .trim();
 }
 
 async function observeVisiblePromptStream(controller) {
