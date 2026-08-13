@@ -324,10 +324,12 @@ describe("runtime model catalog", () => {
         "2026-08-07T12:00:00.000Z",
       );
       const read = vi.fn(async () => catalog);
+      const invalidate = vi.fn();
       let capabilityReady = true;
       const service = new HostService(store, undefined, undefined, {
         runtimeModelCatalogProvider: {
           read,
+          invalidate,
           capabilityReady: vi.fn(async () => capabilityReady),
         },
       });
@@ -348,6 +350,7 @@ describe("runtime model catalog", () => {
       }, TRUSTED_USER_SESSION);
       expect(response).toMatchObject({ ok: true, method: "runtime.model_catalog", result: catalog });
       expect(read).toHaveBeenCalledOnce();
+      expect(invalidate).toHaveBeenCalledOnce();
 
       const staleAuthority = await service.handle({
         protocolVersion: PROTOCOL_VERSION,
@@ -357,6 +360,7 @@ describe("runtime model catalog", () => {
       }, TRUSTED_USER_SESSION);
       expect(staleAuthority).toMatchObject({ ok: false, error: { code: "HOST_AUTHORITY_MISMATCH" } });
       expect(read).toHaveBeenCalledOnce();
+      expect(invalidate).toHaveBeenCalledOnce();
 
       capabilityReady = false;
       const driftedHealth = await service.handle({

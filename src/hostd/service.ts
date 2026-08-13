@@ -761,6 +761,11 @@ export class HostService {
             "The verified Prime Agent model catalog is not available on this host.",
           );
         }
+        // A model catalog request is an explicit user-facing observation. Do
+        // not let the provider's short process-local cache hide credentials
+        // that were just added through Prime Agent's external `/login` flow.
+        // Concurrent reads still share the provider's single active refresh.
+        this.runtimeModelCatalogProvider.invalidate?.();
         return this.runtimeModelCatalogProvider.read();
       }
       case "oauth.session.start":

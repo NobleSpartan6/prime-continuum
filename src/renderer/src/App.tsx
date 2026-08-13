@@ -526,21 +526,6 @@ function residentLifecycleMutationBlockedDetail(
     : 'Resident lifecycle control is unavailable for this verified host. You can still check the exact setup status here.'
 }
 
-function AttentionDiagnostic({ item }: { item: WorkbenchSnapshot['attention'][number] }) {
-  if (!item.diagnostic) return null
-  return (
-    <span className="attention-diagnostic">
-      <code>{item.diagnostic.code}{item.diagnostic.diagnosticId ? ` · ${item.diagnostic.diagnosticId}` : ''}</code>
-      <span>{item.diagnostic.message}</span>
-      <em>
-        {item.diagnostic.retryable
-          ? 'Reconnect and inspect the current thread state before retrying.'
-          : 'Do not retry automatically. Inspect the current thread state.'}
-      </em>
-    </span>
-  )
-}
-
 function attentionDiagnosticText(item: WorkbenchSnapshot['attention'][number]): string {
   if (!item.diagnostic) return ''
   return [
@@ -943,7 +928,7 @@ function hudStatusPresentation(
     label: presentation.headline,
     detail: presentation.detail,
     icon: taskRunIcon(presentation.iconKey),
-    tone: presentation.kind === 'disconnected'
+    tone: presentation.kind === 'disconnected' || presentation.kind === 'stale'
       ? 'offline'
       : presentation.tone === 'active'
         ? 'working'
@@ -956,6 +941,7 @@ function hudStatusPresentation(
               : 'ready',
     needsWorkbench:
       presentation.kind === 'disconnected' ||
+      presentation.kind === 'stale' ||
       presentation.kind === 'needs_attention' ||
       presentation.kind === 'waiting_for_response' ||
       presentation.kind === 'model_setup' ||
@@ -1065,12 +1051,11 @@ function readableModelName(model: string | undefined): string | undefined {
 }
 
 function hudSessionPresentation(
-  status: HudStatusPresentation,
+  presentation: TaskRunPresentation,
   runtime: RuntimeSummary,
   agents: WorkbenchSnapshot['agents'],
 ): HudSessionPresentation {
   let activeAgentCount = 0
-  let firstActiveAgent: WorkbenchSnapshot['agents'][number] | undefined
   for (const agent of agents) {
     if (
       agent.status !== 'pending' &&
@@ -1079,32 +1064,10 @@ function hudSessionPresentation(
       agent.status !== 'waiting'
     ) continue
     activeAgentCount += 1
-    firstActiveAgent ??= agent
   }
 
-  const activeTool = runtime.session?.activeToolNames[0]
-  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
-  const inactiveActivity = status.tone === 'ready'
-    ? 'Ready for another task'
-    : status.tone === 'done'
-      ? 'Latest task complete'
-      : status.tone === 'offline'
-        ? 'Cached transcript · reconnect in workbench'
-        : status.tone === 'failed'
-          ? 'Review the failed turn in workbench'
-          : 'Review needed in workbench'
-  const activity = status.tone === 'working'
-    ? activeTool
-      ? `Using ${activeTool}`
-      : firstActiveAgent?.activity
-        ? `${agentDisplayName(firstActiveAgent)} · ${firstActiveAgent.activity}`
-        : firstActiveAgent
-          ? `${agentDisplayName(firstActiveAgent)} is working`
-          : activeGoal?.objective ?? status.detail
-    : inactiveActivity
-
   return {
-    activity,
+    activity: presentation.detail,
     model: readableModelName(runtime.session?.model),
     activeAgentCount,
     browserReadiness: runtime.browserExecution?.readiness,
@@ -1937,6 +1900,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       selectedRuntime.session.model !== 'unknown/unknown' &&
       !selectedRuntime.session.model.startsWith('unknown/'),
     ),
+    snapshotFresh: snapshot?.snapshotAuthority?.source !== 'cached',
     activity: {
       live: selectedThread?.status === 'running' || selectedRuntimeHasLiveActivity,
       fresh: Boolean(
@@ -1956,6 +1920,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       conflictingMutation: false,
       canStart: canStartResidentTurn,
       canStop: canStopResidentTurn,
+      canEnd: canEndResident,
       canFinishEnd: selectedResidentEndReadyForOneAction,
       canReview: selectedThreadIsMaterialized,
       canSetUpModel: canLoadModelCatalog,
@@ -3124,20 +3089,14 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     }
 
     const status = hudStatusPresentation(selectedTaskRun)
-    const sessionPresentation = hudSessionPresentation(status, selectedRuntime, snapshot.agents)
+    const sessionPresentation = hudSessionPresentation(selectedTaskRun, selectedRuntime, snapshot.agents)
     const hasSessionFacts = Boolean(
       sessionPresentation.model ||
       sessionPresentation.activeAgentCount > 0 ||
       sessionPresentation.browserReadiness,
     )
-    const reviewActionLabel = selectedThread.status === 'needs_approval' || selectedThread.status === 'waiting'
-        ? 'Reply in workbench'
-        : status.tone === 'failed'
-          ? 'Review failure'
-          : 'Review in workbench'
-    const buddyDetail = status.tone === 'ready' || status.tone === 'done'
-      ? selectedThread.title
-      : sessionPresentation.activity
+    const reviewActionLabel = 'Open workbench'
+    const buddyDetail = sessionPresentation.activity
     if (hudState.state === 'buddy') {
       return (
         <main
@@ -3279,10 +3238,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               handleRef={composerHandleRef}
               connection={selectedHost.connection}
               authorityVerified={!selectedHost.activationRequired}
-              hostName={selectedHost.name}
-              taskState={selectedThread.status}
               presentation={selectedTaskRun}
-              sessionEnded={selectedThread.residentLifecycle?.state === 'ended'}
               runtime={selectedRuntime}
               agents={snapshot.agents}
               onDraftChange={rememberComposerText}
@@ -3294,7 +3250,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               canStopTurn={canStopResidentTurn}
               canEndResident={false}
               canResumeResidentEnd={false}
-              sessionNeedsRecovery={selectedSessionNeedsRecovery}
               residentEndPreparing={false}
               modelCatalogAvailable={false}
               onOpenModelCatalog={() => undefined}
@@ -4055,10 +4010,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               handleRef={composerHandleRef}
               connection={selectedHost.connection}
               authorityVerified={!selectedHost.activationRequired}
-              hostName={selectedHost.name}
-              taskState={selectedThread.status}
               presentation={selectedTaskRun}
-              sessionEnded={selectedThread.residentLifecycle?.state === 'ended'}
               runtime={selectedRuntime}
               agents={snapshot.agents}
               onDraftChange={rememberComposerText}
@@ -4071,7 +4023,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               canStopTurn={canStopResidentTurn}
               canEndResident={canEndResident}
               canResumeResidentEnd={selectedResidentEndReadyForOneAction}
-              sessionNeedsRecovery={selectedSessionNeedsRecovery}
               residentEndPreparing={residentEndPreparing}
               modelCatalogAvailable={canLoadModelCatalog}
               onOpenModelCatalog={(trigger) => {
@@ -4518,11 +4469,18 @@ function Sidebar({
                     <span className="attention-list__icon">
                       <Icon icon={item.kind === 'approval' ? ShieldCheck : item.kind === 'question' ? MessageSquare : AlertCircle} size={15} />
                     </span>
-                    <span>
-                      <strong>{item.title}</strong>
-                      <small>{item.hostName}</small>
-                      <AttentionDiagnostic item={item} />
-                    </span>
+                      <span>
+                        <strong>{item.title}</strong>
+                        <small>
+                          <bdi>{item.hostName}</bdi>
+                          {item.diagnostic && (
+                            <>
+                              <span aria-hidden="true"> · </span>
+                              <span>{item.diagnostic.retryable ? 'Review status' : 'Do not retry'}</span>
+                            </>
+                          )}
+                        </small>
+                      </span>
                   </button>
                   <AttentionDiagnosticCopy item={item} />
                 </li>
@@ -4827,10 +4785,7 @@ interface ComposerProps {
   handleRef: RefObject<ComposerHandle | null>
   connection: ConnectionState
   authorityVerified: boolean
-  hostName: string
-  taskState: TaskState
   presentation: TaskRunPresentation
-  sessionEnded: boolean
   runtime: RuntimeSummary
   agents: WorkbenchSnapshot['agents']
   onDraftChange: (authorityKey: string, value: string) => void
@@ -4843,7 +4798,6 @@ interface ComposerProps {
   canStopTurn: boolean
   canEndResident: boolean
   canResumeResidentEnd: boolean
-  sessionNeedsRecovery: boolean
   residentEndPreparing: boolean
   modelCatalogAvailable: boolean
   onOpenModelCatalog: (trigger: HTMLElement) => void
@@ -4854,70 +4808,18 @@ interface ComposerProps {
 }
 
 function SessionContinuity({
-  connection,
-  authorityVerified,
-  taskState,
   presentation,
-  sessionEnded,
   runtime,
   agents,
-  receipt,
-  sessionNeedsRecovery,
   onManageSession,
-}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'taskState' | 'presentation' | 'sessionEnded' | 'runtime' | 'agents' | 'receipt' | 'sessionNeedsRecovery' | 'onManageSession'>) {
-  const isFresh = connection === 'online' && authorityVerified
-  const reportedGoals = runtime.goals
-  const activeGoal = reportedGoals?.find((goal) => goal.state === 'active')
-  const interruptedGoal = reportedGoals?.find((goal) => goal.state !== 'complete')
-  const displayedGoal = activeGoal ?? interruptedGoal
-  const baseContinuity = {
-    label: presentation.headline,
-    detail: presentation.detail,
-    icon: taskRunIcon(presentation.iconKey),
-    tone: presentation.kind === 'ended'
-      ? 'ended' as const
-      : presentation.kind === 'disconnected'
-        ? 'reconnecting' as const
-        : presentation.tone === 'active'
-          ? 'working' as const
-          : presentation.tone === 'warning' || presentation.tone === 'danger'
-            ? 'needs-you' as const
-            : 'ready' as const,
-  }
+}: Pick<ComposerProps, 'presentation' | 'runtime' | 'agents' | 'onManageSession'>) {
+  const isFresh = presentation.kind !== 'disconnected' && presentation.kind !== 'stale'
   const activeAgents = agents.filter((agent) =>
     agent.status === 'pending' ||
     agent.status === 'queued' ||
     agent.status === 'running' ||
     agent.status === 'waiting'
   )
-  const activity = agentActivityPresentation(runtime, agents)
-  const sessionReportsActivity = isFresh && presentation.kind === 'working'
-  const attentionCopy = sessionNeedsRecovery
-    ? 'Saved thread'
-    : taskState === 'needs_approval'
-      ? 'Reply requested'
-      : taskState === 'waiting'
-        ? 'Input required'
-        : taskState === 'failed'
-          ? 'Review session'
-          : 'Review status'
-  const goalCopy = sessionEnded
-    ? 'Saved thread retained'
-    : receipt.operation === 'end'
-    ? receipt.state === 'idle'
-      ? 'Saved thread retained'
-      : receipt.retryable === true
-        ? 'End ready'
-        : receipt.state === 'uncertain' || receipt.state === 'rejected'
-          ? 'Review required'
-          : 'Finishing session'
-    : presentation.kind === 'waiting_for_response'
-      ? 'Prime Agent asked a question'
-    : presentation.kind === 'needs_attention'
-      ? attentionCopy
-      : sessionReportsActivity
-        ? activity.detail
-        : displayedGoal?.objective ?? (reportedGoals ? 'No active goal' : 'Goal state unavailable')
   const session = runtime.session
   const queuedActions = session?.queuedActionCount
   const hostCommands = runtime.queue?.pendingCount
@@ -4952,44 +4854,41 @@ function SessionContinuity({
         : runtime.queue
           ? 'No host commands queued'
           : 'Queue state unavailable'
-  const queueCopy = receipt.operation === 'end'
-    ? receipt.state === 'idle'
-      ? 'Saved thread retained'
-      : receipt.retryable === true
-        ? 'No End request sent'
-        : receipt.state === 'uncertain' || receipt.state === 'rejected'
-          ? 'Status needs review'
-          : 'Checking completion'
-    : isFresh || queueStateCopy === 'Queue state unavailable'
-      ? queueStateCopy
-      : `Cached · ${queueStateCopy}`
-  const continuity = baseContinuity
+  const queueCopy = isFresh || queueStateCopy === 'Queue state unavailable'
+    ? queueStateCopy
+    : `Last reported · ${queueStateCopy}`
+  const continuityTone = presentation.kind === 'ended'
+    ? 'ended' as const
+    : presentation.kind === 'disconnected' || presentation.kind === 'stale'
+      ? 'reconnecting' as const
+      : presentation.tone === 'active'
+        ? 'working' as const
+        : presentation.tone === 'warning' || presentation.tone === 'danger'
+          ? 'needs-you' as const
+          : 'ready' as const
 
   return (
     <section className="session-continuity" aria-label="Session status">
       <span
-        className={cx('session-continuity__state', `session-continuity__state--${continuity.tone}`)}
-        title={`${continuity.label}: ${continuity.detail}`}
+        className={cx('session-continuity__state', `session-continuity__state--${continuityTone}`)}
+        title={`${presentation.headline}: ${presentation.detail}`}
       >
-        <Icon icon={continuity.icon} size={14} />
+        <Icon icon={taskRunIcon(presentation.iconKey)} size={14} />
       </span>
       <span className="session-continuity__body">
         <span className="session-continuity__summary">
           <span className="session-continuity__label">
-            {continuity.label}
+            {presentation.headline}
           </span>
           <span aria-hidden="true">·</span>
-          <strong title={displayedGoal?.objective}>{goalCopy}</strong>
+          <strong>{presentation.detail}</strong>
         </span>
-        <small>{continuity.detail}</small>
       </span>
       <span className="session-continuity__actions">
-        {!(receipt.operation === 'end' && receipt.state === 'idle') && (
-          <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
-            <Icon icon={runtime.queue?.paused ? Clock3 : activeAgents.length > 0 ? GitFork : queueShowsExactBinding ? ShieldCheck : ListChecks} size={13} />
-            <span title={queueCopy}>{queueCopy}</span>
-          </span>
-        )}
+        <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
+          <Icon icon={runtime.queue?.paused ? Clock3 : activeAgents.length > 0 ? GitFork : queueShowsExactBinding ? ShieldCheck : ListChecks} size={13} />
+          <span title={queueCopy}>{queueCopy}</span>
+        </span>
         {onManageSession && (
           <button
             className="session-continuity__manage"
@@ -4998,13 +4897,7 @@ function SessionContinuity({
           >
             <span className="session-continuity__manage-icon"><Icon icon={MoreHorizontal} size={16} /></span>
             <span className="session-continuity__manage-label">
-            {receipt.operation === 'end'
-              ? receipt.retryable === true
-                ? 'Session details'
-                : receipt.state === 'uncertain' || receipt.state === 'rejected'
-                  ? 'Review ending'
-                  : 'View status'
-              : activeAgents.length > 0 ? 'View agents' : 'Session'}
+            {activeAgents.length > 0 ? 'View agents' : 'Session'}
             </span>
           </button>
         )}
@@ -5042,7 +4935,7 @@ function TaskStarters({
   )
 }
 
-function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, hostName, taskState, presentation, sessionEnded, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, sessionNeedsRecovery, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
+function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, presentation, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
   const [text, setText] = useState(initialText)
   const submissionInFlightRef = useRef(false)
   const committedAuthorityKeyRef = useRef(authorityKey)
@@ -5068,133 +4961,49 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
     },
   }), [authorityKey, replaceDraft])
 
-  const disconnected = connection !== 'online'
-  const projectionReportsRunning = taskState === 'running'
-  const promptSending = receipt.operation === 'prompt' && receipt.state === 'sending'
-  const promptAwaitingProof = receipt.operation === 'prompt' && receipt.state === 'sent'
-  const promptOutcomeUnknown = receipt.operation === 'prompt' && receipt.state === 'uncertain'
-  const stopSending = receipt.operation === 'abort' && receipt.state === 'sending'
-  const stopAwaitingProof = receipt.operation === 'abort' && receipt.state === 'sent'
-  const endLifecyclePresent = receipt.operation === 'end'
-  const endCompleted = sessionEnded
-  const endOutcomeUnknown = endLifecyclePresent && receipt.state === 'uncertain'
-  const endPending = endLifecyclePresent && !endCompleted
-  const endReadyToFinish = Boolean(
-    endPending &&
-    (receipt.retryable === true || endOutcomeUnknown) &&
-    canResumeResidentEnd &&
-    !disconnected &&
-    authorityVerified,
-  )
-  const endWaitingForControls = Boolean(
-    endPending &&
-    receipt.retryable === true &&
-    !endReadyToFinish,
-  )
-  const abortControlPending = Boolean(
-    receipt.operation === 'abort' &&
-    (receipt.state === 'sending' || receipt.state === 'sent' || receipt.state === 'uncertain'),
-  )
-  const promptControlPending = promptAwaitingProof || promptOutcomeUnknown
-  const residentControlPending = abortControlPending || promptControlPending || endPending
-  const running = projectionReportsRunning || canStopTurn || residentControlPending
-  const backgroundLiveActivity = Boolean(
-    !running &&
-    connection === 'online' &&
-    authorityVerified &&
-    runtimeHasLiveActivity(runtime, agents),
-  )
-  const residentAttached = runtime.session?.residency === 'resident' && Boolean(runtime.session.activeSessionId && runtime.session.sessionId)
-  const canStartNow = canStartTurn && !disconnected
-  const replyRequested = canStartNow && (taskState === 'waiting' || taskState === 'needs_approval')
-  const canStopNow = canStopTurn && !disconnected
-  const retryingStop = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable !== false
-  const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
-  const waitingForExtensionResponse = presentation.kind === 'waiting_for_response'
-  const controlMode = running || endLifecyclePresent || waitingForExtensionResponse
-  const canAct = waitingForExtensionResponse ? false : endLifecyclePresent ? false : running ? canStopNow : canStartNow
-  const sessionRecoveryAvailable = Boolean(
-    sessionNeedsRecovery &&
-    !disconnected &&
-    authorityVerified &&
-    residentAttached &&
-    !running &&
-    !endLifecyclePresent &&
-    !canStartNow &&
-    canEndResident,
-  )
-  const unavailableCopy = disconnected
-    ? residentControlPending
-      ? `Resident control is retained locally. Reconnect to ${hostName} for authoritative status.`
-      : `Reconnect to ${hostName} to verify this resident turn.`
-    : !residentAttached
-      ? 'Resident control is unavailable until this host reports an existing attached Prime Agent session.'
-      : running
-        ? 'Prime Agent does not report a stoppable active turn.'
-        : sessionNeedsRecovery
-          ? 'Prime Agent could not attach this saved session. End it, then start a new agent.'
-          : 'This resident session is not ready for a new prompt. Refresh the thread or reconnect its host.'
-  const defaultStatus = presentation.detail
-  const receiptStatusCopy = endWaitingForControls
-    ? 'Waiting for resident controls'
-    : endReadyToFinish
-      ? 'No End request sent'
-    : stopAwaitingProof
-      ? 'Waiting for authoritative idle proof'
-    : stopOutcomeUnknown
-      ? receipt.message || 'The Stop outcome needs review'
-    : backgroundLiveActivity && receipt.state === 'idle'
-      ? defaultStatus
-    : !canAct && !running && !endLifecyclePresent
-      ? defaultStatus
-    : receipt.operation && receipt.state !== 'idle'
-      ? receipt.message || defaultStatus
-      : disconnected
-        ? defaultStatus
-        : receipt.message || defaultStatus
-  const statusCopy = validationError || receiptStatusCopy
-  const statusState = validationError || receipt.state === 'rejected'
-    ? 'rejected'
-    : receipt.state === 'idle' && !canAct
-      ? 'waiting_for_connection'
-      : receipt.state
-  const announceComposerReceipt = Boolean(receipt.operation && receipt.state !== 'idle')
-  const modelSetupPrimary = presentation.primaryAction?.kind === 'setup_model'
+  const primaryAction = presentation.primaryAction
+  const submitAction = primaryAction?.kind === 'submit'
+  const stopAction = primaryAction?.kind === 'stop'
+  const finishEndAction = primaryAction?.kind === 'finish_end'
+  const endSessionAction = primaryAction?.kind === 'end_session'
+  const reviewAction = primaryAction?.kind === 'review_status'
+  const modelSetupPrimary = primaryAction?.kind === 'setup_model'
   const modelSetupOwnedByLaunchpad = modelSetupPrimary && launchpadOwnsPrimaryAction
   const modelSetupUnavailable = presentation.kind === 'model_setup' && !modelSetupPrimary
-  const passiveEndReview = endLifecyclePresent && presentation.primaryAction?.kind === 'review_status'
-  const primaryLabel = residentEndPreparing
+  const promptSending = presentation.kind === 'starting' && receipt.state === 'sending'
+  const stopSending = presentation.kind === 'stopping' && receipt.state === 'sending'
+  const endLifecyclePresent = presentation.kind === 'ending'
+  const endCompleted = presentation.kind === 'ended'
+  const waitingForExtensionResponse = presentation.kind === 'waiting_for_response'
+  const controlMode = presentation.kind === 'starting' ||
+    presentation.kind === 'working' ||
+    presentation.kind === 'stopping' ||
+    endLifecyclePresent ||
+    waitingForExtensionResponse
+  const compactComposer = !submitAction && !modelSetupPrimary
+  const canStartNow = submitAction && canStartTurn && connection === 'online' && authorityVerified
+  const canStopNow = stopAction && canStopTurn && connection === 'online' && authorityVerified
+  const canFinishEndNow = finishEndAction && canResumeResidentEnd && connection === 'online' && authorityVerified
+  const canEndNow = endSessionAction && canEndResident && connection === 'online' && authorityVerified
+  const statusCopy = validationError || presentation.detail
+  const statusState = validationError || presentation.tone === 'danger'
+    ? 'rejected'
+    : presentation.tone === 'warning'
+      ? 'uncertain'
+      : presentation.kind === 'disconnected' || presentation.kind === 'stale' || presentation.kind === 'preparing'
+      ? 'waiting_for_connection'
+      : presentation.tone === 'active'
+        ? 'sending'
+        : presentation.tone === 'success'
+          ? 'sent'
+          : 'idle'
+  const announceComposerReceipt = presentation.tone !== 'neutral' && presentation.tone !== 'muted'
+  const primaryLabel = residentEndPreparing && (finishEndAction || endSessionAction)
     ? 'Finishing…'
-    : presentation.primaryAction?.label ?? (endLifecyclePresent
-    ? endCompleted
-      ? 'Session ended'
-      : endReadyToFinish
-        ? endOutcomeUnknown ? 'Try ending again' : 'Finish ending'
-        : endOutcomeUnknown
-          ? 'End outcome unknown'
-          : endWaitingForControls
-            ? 'End saved'
-          : 'Finishing session'
-    : running
-    ? stopOutcomeUnknown
-      ? 'Outcome unknown'
-      : disconnected
-      ? 'Reconnect to verify'
-      : stopSending
-      ? 'Requesting stop'
-      : stopAwaitingProof
-        ? 'Stop accepted'
-      : retryingStop
-        ? 'Try stop again'
-        : 'Stop'
-    : promptSending
-      ? 'Submitting prompt'
-      : disconnected
-      ? 'Reconnect to delegate'
-      : replyRequested ? 'Reply' : 'Delegate task')
-  const compactComposer = controlMode
-  const textareaDisabled = !canStartNow
-  const intentCopy = presentation.headline
+    : primaryAction?.label
+  const textareaDisabled = !(canStartNow || modelSetupPrimary)
+  const showPrimaryAction = Boolean(primaryAction && !modelSetupOwnedByLaunchpad && !modelSetupUnavailable)
+  const showComposerToolbar = compactComposer || presentation.kind !== 'ready' || Boolean(validationError)
 
   if (endCompleted || waitingForExtensionResponse) {
     return (
@@ -5203,15 +5012,9 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
         endCompleted && 'composer-wrap--terminal',
       )}>
         <SessionContinuity
-          connection={connection}
-          authorityVerified={authorityVerified}
-          taskState={taskState}
           presentation={presentation}
-          sessionEnded={sessionEnded}
           runtime={runtime}
           agents={agents}
-          receipt={receipt}
-          sessionNeedsRecovery={sessionNeedsRecovery}
           onManageSession={onManageSession}
         />
       </footer>
@@ -5220,8 +5023,8 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
 
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
-      {!endLifecyclePresent && !abortControlPending && (
-        <SessionContinuity connection={connection} authorityVerified={authorityVerified} taskState={taskState} presentation={presentation} sessionEnded={sessionEnded} runtime={runtime} agents={agents} receipt={receipt} sessionNeedsRecovery={sessionNeedsRecovery} onManageSession={onManageSession} />
+      {presentation.kind !== 'ending' && presentation.kind !== 'stopping' && (
+        <SessionContinuity presentation={presentation} runtime={runtime} agents={agents} onManageSession={onManageSession} />
       )}
       {!compactComposer && showTaskStarters && (
         <TaskStarters
@@ -5236,7 +5039,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
           compactComposer && 'composer--compact',
           controlMode && 'composer--running',
           endLifecyclePresent && 'composer--ending',
-          endReadyToFinish && 'composer--end-ready',
+          finishEndAction && 'composer--end-ready',
         )}
         onSubmit={(event) => {
           event.preventDefault()
@@ -5259,51 +5062,30 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
             }
           })
         }}
-        aria-label={endLifecyclePresent
+        aria-label={endLifecyclePresent || endSessionAction
           ? 'Resident session ending'
-          : running
+          : stopAction
             ? 'Prime Agent controls'
             : 'Prime Agent prompt'}
         aria-busy={promptSending || stopSending || residentEndPreparing ? true : undefined}
       >
-        <div className="composer__toolbar">
+        {showComposerToolbar && <div className="composer__toolbar">
           <span className="composer__intent">
-            {intentCopy}
+            {presentation.headline}
           </span>
           <span className={cx(
             'composer__connection',
             `composer__connection--${statusState}`,
             Boolean(validationError) && 'composer__connection--validation',
           )}>
-            {!validationError && receipt.state === 'sending' && <Icon icon={Loader2} size={13} />}
-            {!validationError && (receipt.state === 'waiting_for_connection' || (receipt.state === 'idle' && !canAct)) && <Icon icon={Clock3} size={13} />}
-            {!validationError && receipt.state === 'sent' && <Icon icon={Check} size={13} />}
-            {!validationError && receipt.state === 'uncertain' && receipt.retryable !== false && <Icon icon={RefreshCw} size={13} />}
-            {!validationError && receipt.state === 'uncertain' && receipt.retryable === false && <Icon icon={AlertCircle} size={13} />}
-            {(Boolean(validationError) || receipt.state === 'rejected') && <Icon icon={AlertCircle} size={13} />}
+            {!validationError && presentation.tone === 'active' && <Icon icon={Loader2} size={13} />}
+            {!validationError && (presentation.kind === 'disconnected' || presentation.kind === 'stale' || presentation.kind === 'preparing') && <Icon icon={Clock3} size={13} />}
+            {!validationError && presentation.tone === 'success' && <Icon icon={Check} size={13} />}
+            {!validationError && presentation.tone === 'warning' && <Icon icon={AlertCircle} size={13} />}
+            {(Boolean(validationError) || presentation.tone === 'danger') && <Icon icon={AlertCircle} size={13} />}
             <span id={validationError ? 'composer-message-error' : undefined}>{statusCopy}</span>
           </span>
-        </div>
-
-        {sessionRecoveryAvailable && (
-          <div className="composer-recovery" role="note">
-            <span className="composer-recovery__icon"><Icon icon={RefreshCw} size={15} /></span>
-            <span className="composer-recovery__copy">
-              <strong>End this inactive session</strong>
-              <small>Your saved thread stays in this project. Start a new agent afterward.</small>
-            </span>
-            <button
-              className="button button--secondary composer-recovery__action"
-              type="button"
-              disabled={residentEndPreparing}
-              aria-busy={residentEndPreparing || undefined}
-              onClick={(event) => onEndResident(event.currentTarget)}
-            >
-              <Icon icon={residentEndPreparing ? Loader2 : Square} size={13} />
-              {residentEndPreparing ? 'Ending…' : 'End session'}
-            </button>
-          </div>
-        )}
+        </div>}
 
         {!compactComposer && (
           <>
@@ -5313,15 +5095,11 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
               name="message"
               value={text}
               rows={2}
-              placeholder={disconnected
-                ? 'Reconnect to verify this resident session'
-                : canStartNow
-                  ? replyRequested
-                    ? 'Add the context Prime Agent needs…'
-                    : backgroundLiveActivity
-                    ? 'Add direction, constraints, or another outcome…'
-                    : 'Describe the outcome, constraints, and done criteria…'
-                  : 'Resident prompt unavailable'}
+              placeholder={primaryAction?.kind === 'submit' && primaryAction.label === 'Reply'
+                ? 'Add the context Prime Agent needs…'
+                : presentation.kind === 'working'
+                  ? 'Add direction, constraints, or another outcome…'
+                  : 'Describe the outcome, constraints, and done criteria…'}
               disabled={textareaDisabled}
               onChange={(event) => replaceDraft(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -5338,15 +5116,6 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
 
         <div className="composer__actions">
           <div className="composer__secondary-actions">
-            {(endOutcomeUnknown || stopOutcomeUnknown || passiveEndReview) && onManageSession && (
-              <button
-                className="button button--quiet"
-                type="button"
-                onClick={(event) => onManageSession(event.currentTarget)}
-              >
-                Review status
-              </button>
-            )}
             {modelCatalogAvailable && !endLifecyclePresent && !modelSetupPrimary && (
               <button
                 className="model-chip"
@@ -5360,97 +5129,75 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
               </button>
             )}
             <span className="composer__hint" id="composer-hint">
-              {endLifecyclePresent
-                ? endCompleted
-                  ? 'The saved thread and workspace remain available'
-                  : endReadyToFinish
-                    ? 'One action left'
-                    : endWaitingForControls
-                      ? 'Waiting for resident controls'
-                    : 'Prime Continuim is checking for completion automatically'
-                : waitingForExtensionResponse
+              {waitingForExtensionResponse
                 ? 'Answer the question above to continue'
-                : running
-                ? disconnected
-                  ? unavailableCopy
-                  : 'Stop asks Prime Agent to end at the next safe boundary'
+                : stopAction
+                  ? 'Stop asks Prime Agent to end at the next safe boundary'
+                : finishEndAction
+                  ? 'One action left'
+                : endSessionAction
+                  ? 'The task, transcript, and workspace files stay'
                 : modelSetupPrimary
                   ? 'Choose a model before delegating this task'
-                : canStartNow
-                  ? replyRequested
+                : submitAction
+                  ? primaryAction.label === 'Reply'
                     ? 'Reply continues this exact resident session · Ctrl or ⌘ + Enter'
                     : 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
-                  : unavailableCopy}
+                  : presentation.detail}
             </span>
           </div>
           <div className="composer__primary-actions">
-            {!waitingForExtensionResponse && ((!endLifecyclePresent && !stopAwaitingProof && !stopOutcomeUnknown) || endReadyToFinish) &&
-              !modelSetupOwnedByLaunchpad &&
-              !modelSetupUnavailable && (
+            {showPrimaryAction && (
             <button
               id="resident-turn-primary"
               className={cx(
                 'button',
-                endReadyToFinish ? 'button--primary' : controlMode ? 'button--stop' : 'button--primary',
-                !controlMode && !modelSetupPrimary && !text.trim() && 'button--empty',
+                stopAction ? 'button--stop' : 'button--primary',
+                submitAction && !text.trim() && 'button--empty',
               )}
-              type={controlMode || modelSetupPrimary ? 'button' : 'submit'}
-              disabled={!modelSetupPrimary && ((endLifecyclePresent && (!endReadyToFinish || residentEndPreparing)) || (!endLifecyclePresent && (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending)))}
-              aria-busy={endLifecyclePresent && residentEndPreparing ? true : undefined}
+              type={submitAction ? 'submit' : 'button'}
+              disabled={submitAction
+                ? !canStartNow || promptSending
+                : stopAction
+                  ? !canStopNow || stopSending
+                  : finishEndAction
+                    ? !canFinishEndNow || residentEndPreparing
+                    : endSessionAction
+                      ? !canEndNow || residentEndPreparing
+                      : modelSetupPrimary
+                        ? !modelCatalogAvailable
+                        : reviewAction
+                          ? !onManageSession
+                          : true}
+              aria-busy={(finishEndAction || endSessionAction) && residentEndPreparing ? true : undefined}
               aria-label={modelSetupPrimary
                 ? 'Open models and accounts to choose a model'
-                : endLifecyclePresent
-                ? endCompleted
-                  ? 'Resident session ended; the saved thread and workspace remain available'
-                  : endReadyToFinish
-                    ? residentEndPreparing
-                      ? 'Finishing this resident session'
-                      : endOutcomeUnknown
-                        ? 'Try ending this resident session again'
-                        : 'Finish ending this resident session'
-                    : endOutcomeUnknown
-                      ? 'Resident end outcome unknown; inspect the durable lifecycle status'
-                      : endWaitingForControls
-                        ? 'End saved; waiting for resident controls'
-                      : 'Resident session is finishing'
-                : running
-                ? disconnected
-                  ? 'Reconnect to verify and control this resident turn'
-                  : stopOutcomeUnknown
-                  ? 'Stop outcome unknown; inspect the current thread state'
-                  : stopSending
-                    ? 'Safe Stop request is being sent'
-                    : stopAwaitingProof
-                      ? 'Stop accepted; waiting for authoritative idle proof'
-                  : retryingStop
-                    ? 'Try stopping the active Prime Agent turn again'
-                    : 'Stop the active Prime Agent turn'
-                : promptSending
-                  ? 'Prompt is awaiting durable host admission'
-                  : undefined}
+                : finishEndAction
+                  ? 'Finish ending this resident session'
+                  : endSessionAction
+                    ? 'End this inactive resident session'
+                    : stopAction
+                      ? 'Stop the active Prime Agent turn'
+                      : undefined}
               onClick={modelSetupPrimary
                 ? (event) => onOpenModelCatalog(event.currentTarget)
-                : endReadyToFinish
-                ? (event) => onEndResident(event.currentTarget)
-                : !endLifecyclePresent && running ? onStop : undefined}
+                : finishEndAction || endSessionAction
+                  ? (event) => onEndResident(event.currentTarget)
+                  : stopAction
+                    ? onStop
+                    : reviewAction && onManageSession
+                      ? (event) => onManageSession(event.currentTarget)
+                      : undefined}
             >
               {modelSetupPrimary
                 ? <Icon icon={Bot} size={15} />
-                : endLifecyclePresent
-                ? endCompleted
-                  ? <Icon icon={Check} size={15} />
-                  : endReadyToFinish
-                    ? <Icon icon={residentEndPreparing ? Loader2 : ArrowRight} size={15} strokeWidth={2} />
-                    : endOutcomeUnknown
-                      ? <Icon icon={AlertCircle} size={15} />
-                      : <Icon icon={Clock3} size={15} />
-                : stopSending || promptSending
-                ? <Icon icon={Loader2} size={15} />
-                : stopAwaitingProof
-                  ? <Icon icon={Check} size={15} />
-                : running
-                  ? <Icon icon={Square} size={13} strokeWidth={2.25} />
-                  : <Icon icon={ArrowRight} size={15} strokeWidth={2} />}
+                : finishEndAction || endSessionAction
+                  ? <Icon icon={residentEndPreparing ? Loader2 : ArrowRight} size={15} strokeWidth={2} />
+                  : stopAction
+                    ? <Icon icon={stopSending ? Loader2 : Square} size={13} strokeWidth={2.25} />
+                    : reviewAction
+                      ? <Icon icon={ArrowRight} size={15} strokeWidth={2} />
+                      : <Icon icon={promptSending ? Loader2 : ArrowRight} size={15} strokeWidth={2} />}
               {primaryLabel}
             </button>
             )}
@@ -5463,7 +5210,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
           aria-live={announceComposerReceipt ? 'polite' : undefined}
           aria-atomic={announceComposerReceipt ? true : undefined}
         >
-          {validationError ? '' : receiptStatusCopy}
+          {validationError ? '' : presentation.detail}
         </span>
       </form>
     </footer>
@@ -5901,9 +5648,6 @@ function RuntimePanel({
   const visibleSkills = resourceInventory?.skills.slice(0, 8) ?? []
   const readinessCopy = runtimeReadinessCopy(host.runtimeReadiness)
   const agentsReported = runtime.agentsReported === true
-  const hasAnyRuntimeReport = Boolean(
-    session || agentsReported || runtime.goals !== undefined || runtime.schedules !== undefined,
-  )
   const reportedAgents = agentsReported ? snapshot.agents : []
   const hasReportedBranches = agentsReported && reportedAgents.length > 0
   const runningAgents = reportedAgents.filter((agent) => agent.status === 'running').length
@@ -5915,7 +5659,7 @@ function RuntimePanel({
     runtime.goals === undefined ? 'Goals not reported' : `${activeGoals.length} active`,
     agentsReported ? `${reportedAgents.length} agents` : 'Agents not reported',
   ].join(' · ')
-  const isFresh = host.connection === 'online'
+  const isFresh = host.connection === 'online' && taskRun.kind !== 'disconnected' && taskRun.kind !== 'stale'
   const sessionId = session?.activeSessionId ?? session?.sessionId
   const residentEndOperation = thread.executionGenerationId
     ? snapshot.residentLifecycleOperations.find((operation) =>
@@ -5959,15 +5703,7 @@ function RuntimePanel({
       <PanelHeading
         icon={Bot}
         title="Agent session"
-        meta={!hasAnyRuntimeReport
-          ? 'Current thread · runtime not reported'
-          : !session
-            ? 'Current thread · session not reported'
-            : !agentsReported
-              ? isFresh ? 'Current thread · agent activity not reported' : 'Agent activity not reported · cached host state'
-              : isFresh
-                ? `Current thread · ${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} running`
-                : `${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} last reported running · cached host state`}
+        meta={taskRun.detail}
       />
 
       {hasReportedBranches && (
@@ -5989,7 +5725,7 @@ function RuntimePanel({
       <section className="runtime-section" aria-labelledby="runtime-session-heading">
         <div className="runtime-section__heading">
           <h3 id="runtime-session-heading">Overview</h3>
-          {!isFresh && session && <span className="runtime-badge runtime-badge--warning">Cached state</span>}
+          {!isFresh && session && <span className="runtime-badge runtime-badge--warning">Last reported</span>}
           {isFresh && session && (session.isStreaming || session.isBashRunning || session.isCompacting || session.retryAttempt > 0) && (
             <span className="runtime-badges" aria-label="Runtime activity">
               {session.isStreaming && <span className="runtime-badge">Streaming</span>}
@@ -6017,7 +5753,8 @@ function RuntimePanel({
               </dd>
             </div>
           )}
-          <div><dt>Turn</dt><dd>{taskRun.headline}</dd></div>
+          <div><dt>Task</dt><dd>{taskRun.headline}</dd></div>
+          <div><dt>Status</dt><dd>{taskRun.detail}</dd></div>
           <div><dt>Continuity</dt><dd>{continuityCopy}</dd></div>
         </dl>
         {(sessionId || thread.executionGenerationId || thread.workspaceId) && (

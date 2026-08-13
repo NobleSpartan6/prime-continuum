@@ -21,6 +21,7 @@ export type TaskRunPresentationKind =
   | 'complete'
   | 'ready'
   | 'model_setup'
+  | 'stale'
   | 'preparing'
 
 export type TaskRunPresentationTone =
@@ -44,6 +45,7 @@ export type TaskRunIconKey =
 
 export type TaskRunPrimaryAction =
   | { kind: 'finish_end'; label: 'Finish ending' }
+  | { kind: 'end_session'; label: 'End session' }
   | { kind: 'review_status'; label: 'Review status' }
   | { kind: 'stop'; label: 'Stop' }
   | { kind: 'submit'; label: 'Delegate task' | 'Reply' }
@@ -68,6 +70,7 @@ export interface TaskRunPresentationAuthority {
   /** Action-specific grants. These never imply general mutation authority. */
   canStart: boolean
   canStop: boolean
+  canEnd: boolean
   canFinishEnd: boolean
   canReview: boolean
   canSetUpModel: boolean
@@ -87,6 +90,8 @@ export interface TaskRunPresentationInput {
   endReadyToFinish: boolean
   endPhase?: 'ending' | 'kill_dispatching' | 'kill_acknowledged' | 'quarantined' | 'completed'
   modelReady: boolean
+  /** False when the selected workbench snapshot is explicitly cached. */
+  snapshotFresh: boolean
   activity: {
     live: boolean
     fresh: boolean
@@ -102,6 +107,7 @@ export interface TaskRunPresentationInput {
 }
 
 const FINISH_END_ACTION: TaskRunPrimaryAction = { kind: 'finish_end', label: 'Finish ending' }
+const END_SESSION_ACTION: TaskRunPrimaryAction = { kind: 'end_session', label: 'End session' }
 const REVIEW_STATUS_ACTION: TaskRunPrimaryAction = { kind: 'review_status', label: 'Review status' }
 const STOP_ACTION: TaskRunPrimaryAction = { kind: 'stop', label: 'Stop' }
 const SUBMIT_ACTION: TaskRunPrimaryAction = { kind: 'submit', label: 'Delegate task' }
@@ -126,6 +132,7 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
   const mutationReady = Boolean(
     connected &&
     authorityVerified &&
+    input.snapshotFresh &&
     input.authority.mutation &&
     !input.authority.conflictingMutation,
   )
@@ -214,20 +221,9 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
     return {
       kind: 'ending',
       headline: 'End saved',
-      detail: 'Waiting for resident controls.',
+      detail: 'Waiting for resident controls',
       tone: 'warning',
       iconKey: 'clock',
-      ...(canReview ? { primaryAction: REVIEW_STATUS_ACTION } : {}),
-    }
-  }
-
-  if (input.sessionNeedsRecovery) {
-    return {
-      kind: 'needs_attention',
-      headline: 'Restart session',
-      detail: 'Prime Agent could not attach this saved session.',
-      tone: 'warning',
-      iconKey: 'alert-circle',
       ...(canReview ? { primaryAction: REVIEW_STATUS_ACTION } : {}),
     }
   }
@@ -286,6 +282,50 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
     }
   }
 
+  const receiptPending =
+    input.receipt.state === 'sending' ||
+    input.receipt.state === 'sent' ||
+    input.receipt.state === 'queued'
+  const canStop = mutationReady && input.authority.canStop
+  const freshLiveActivity = input.activity.live && input.activity.fresh
+
+  if (input.receipt.operation === 'abort' && receiptPending) {
+    return {
+      kind: 'stopping',
+      headline: 'Stopping',
+      detail: input.receipt.state === 'sending'
+        ? 'Requesting a safe boundary from Prime Agent.'
+        : 'Waiting for authoritative idle proof',
+      tone: 'active',
+      iconKey: 'square',
+    }
+  }
+
+  if (input.receipt.operation === 'prompt' && receiptPending) {
+    return {
+      kind: 'starting',
+      headline: 'Starting',
+      detail: input.receipt.state === 'sending'
+        ? 'Delegating the task to Prime Agent.'
+        : 'Prime Agent owns the task. Waiting for fresh activity.',
+      tone: 'active',
+      iconKey: 'send',
+      ...(canStop ? { primaryAction: STOP_ACTION } : {}),
+    }
+  }
+
+  if (!input.snapshotFresh) {
+    return {
+      kind: 'stale',
+      headline: 'Cached status',
+      detail: input.taskState === 'running'
+        ? 'Last reported working. Waiting for a fresh session update.'
+        : 'Waiting for a fresh session update.',
+      tone: 'muted',
+      iconKey: 'refresh',
+    }
+  }
+
   if (taskNeedsInput) {
     const canReply = mutationReady && input.authority.canStart
     return {
@@ -302,45 +342,35 @@ export function taskRunPresentation(input: Readonly<TaskRunPresentationInput>): 
     }
   }
 
-  const receiptPending =
-    input.receipt.state === 'sending' ||
-    input.receipt.state === 'sent' ||
-    input.receipt.state === 'queued'
-  const canStop = mutationReady && input.authority.canStop
-  const freshLiveActivity = input.activity.live && input.activity.fresh
-
-  if (input.receipt.operation === 'abort' && receiptPending) {
+  if (input.sessionNeedsRecovery) {
+    const canEnd = mutationReady && input.authority.canEnd
     return {
-      kind: 'stopping',
-      headline: 'Stopping',
-      detail: input.receipt.state === 'sending'
-        ? 'Requesting a safe boundary from Prime Agent.'
-        : 'Stop was accepted. Waiting for authoritative idle proof.',
-      tone: 'active',
-      iconKey: 'square',
-    }
-  }
-
-  if (input.receipt.operation === 'prompt' && receiptPending) {
-    return {
-      kind: 'starting',
-      headline: 'Starting',
-      detail: input.receipt.state === 'sending'
-        ? 'Delegating the task to Prime Agent.'
-        : 'Prime Agent owns the task. Waiting for fresh activity.',
-      tone: 'active',
-      iconKey: 'send',
+      kind: 'needs_attention',
+      headline: 'Session unavailable',
+      detail: 'End this inactive session to start a new agent. Your task and files stay.',
+      tone: 'warning',
+      iconKey: 'alert-circle',
+      ...(canEnd
+        ? { primaryAction: END_SESSION_ACTION }
+        : canReview
+          ? { primaryAction: REVIEW_STATUS_ACTION }
+          : {}),
     }
   }
 
   if (freshLiveActivity || canStop) {
+    const canDelegate = mutationReady && input.authority.canStart
     return {
       kind: 'working',
       headline: 'Working',
       detail: input.activity.detail || 'Prime Agent is working on this task.',
       tone: 'active',
       iconKey: 'activity',
-      ...(canStop ? { primaryAction: STOP_ACTION } : {}),
+      ...(canStop
+        ? { primaryAction: STOP_ACTION }
+        : canDelegate
+          ? { primaryAction: SUBMIT_ACTION }
+          : {}),
     }
   }
 

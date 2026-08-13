@@ -94,6 +94,12 @@ authenticate a provider, promote or commit a result, package an installer,
 sign an artifact, or prove a non-Windows release. Those are separate
 implementation and release gates.
 
+The separate [native launch-proof capture](native-launch-proof.md) can bind a
+packaged app's main, preload, renderer, and runtime bytes back to one passing
+self-build receipt while recording visible evidence from an operator-completed
+real RLM run. It remains correlation evidence and does not widen this gate's
+assurance boundary.
+
 ## Native evaluation coordinator
 
 The Windows desktop can start this same runner from the **Evidence** panel for
