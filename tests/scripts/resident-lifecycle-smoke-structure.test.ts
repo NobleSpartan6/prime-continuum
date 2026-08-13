@@ -202,6 +202,7 @@ describe('resident lifecycle smoke structure', () => {
       smokeSource.indexOf('function assertReadyRuntimeHealth(', smokeSource.indexOf('async function waitForResidentReadiness(')),
     )
     expect(capabilities.base).toEqual([
+      'hostd_graceful_retire_v1',
       'resident_control_projection_v1',
       'resident_lifecycle_v1',
       'runtime_integrity_v1',
@@ -220,6 +221,8 @@ describe('resident lifecycle smoke structure', () => {
     expect(readiness).not.toContain('lastHealth.capabilities.includes(CANDIDATE_EVALUATION_CAPABILITY)')
     expect(smokeSource).toContain('Ready health resident thinking capability differs from exact binding state')
     expect(smokeSource).toContain('Ready health resident extension UI capability differs from exact binding state')
+    expect(smokeSource).toContain('assertTrustedLocalRetirementIdentity(health)')
+    expect(smokeSource).toContain('bundleSha256: createHash("sha256").update(hostdBytes).digest("hex")')
     expect(smokeSource).toContain('const residentDaemonSocketRoot = await realpath(tmpdir());')
     expect(smokeSource).toContain('residentDaemonEndpoint(dataDirectory, residentDaemonSocketRoot)')
   })

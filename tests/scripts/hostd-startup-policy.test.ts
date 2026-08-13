@@ -47,6 +47,7 @@ describe('bundled hostd startup deadline policy', () => {
   it('keeps custody-backed model discovery in the bounded warmed-capability contract', () => {
     expect(materializeRuntimeInitializationCapabilitySets()).toEqual({
       base: [
+        'hostd_graceful_retire_v1',
         'resident_control_projection_v1',
         'runtime_integrity_v1',
         'runtime_oauth_attempt_v1',
@@ -67,6 +68,8 @@ describe('bundled hostd startup deadline policy', () => {
     expect(assertionEnd).toBeGreaterThan(assertionStart)
     const assertionSource = runtimeInitializationSmokeSource.slice(assertionStart, assertionEnd)
     expect(assertionSource).toContain('...(requireWarmedCapabilities ? WARMED_CAPABILITIES : [])')
+    expect(assertionSource).toContain('assertTrustedLocalRetirementIdentity(health)')
+    expect(runtimeInitializationSmokeSource).toContain('bundleSha256: createHash("sha256").update(hostdBytes).digest("hex")')
     expect(assertionSource).not.toMatch(/\.\.\.BASE_HEALTH_CAPABILITIES,\s*MODEL_CATALOG_CAPABILITY/)
   })
 })
