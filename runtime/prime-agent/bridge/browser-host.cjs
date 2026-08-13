@@ -12,7 +12,7 @@ const {
 } = require("./browser-bridge-launch-journal.cjs");
 
 const CONTROL_PROTOCOL = "prime-continuim.browser-control.v1";
-const COMMIT_TIMEOUT_MS = 20_000;
+const COMMIT_TIMEOUT_MS = 60_000;
 const WATCHDOG_INTERVAL_MS = 200;
 const launchPath = exactArgument("--prime-launch-journal=");
 const metadataPath = exactArgument("--prime-browser-metadata=");

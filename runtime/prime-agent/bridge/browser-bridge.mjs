@@ -26,7 +26,8 @@ import { browserSessionStateKeys, residentBrowserAuthority } from "./browser-bri
 const PROTOCOL = "prime-continuim.browser.v1";
 const BRIDGE_VERSION = 1;
 const PLAYWRIGHT_VERSION = "1.63.0-alpha-2026-08-05";
-const START_TIMEOUT_MS = 15_000;
+const DOCTOR_TIMEOUT_MS = 15_000;
+const START_TIMEOUT_MS = 30_000;
 const POLL_MS = 40;
 const require = createRequire(import.meta.url);
 const {
@@ -85,11 +86,21 @@ async function main() {
       await withBrowserSessionLock(state.directory, () => openVerifiedBrowser(environment, state, args));
       return;
     case "close":
+      await withBrowserSessionLock(
+        state.directory,
+        () => closeOne(state, args, false),
+        { deadOwnerGraceMs: 0 },
+      );
+      return;
     case "detach":
       await withBrowserSessionLock(state.directory, () => closeOne(state, args, false));
       return;
     case "delete-data":
-      await withBrowserSessionLock(state.directory, () => closeOne(state, args, true));
+      await withBrowserSessionLock(
+        state.directory,
+        () => closeOne(state, args, true),
+        { deadOwnerGraceMs: 0 },
+      );
       return;
     case "close-all":
     case "kill-all":
@@ -151,9 +162,9 @@ async function doctor(environment, json) {
         join(dirname(import.meta.filename), "browser-doctor-host.cjs"),
         `--prime-doctor-owner-pid=${process.pid}`,
       ],
-      timeout: START_TIMEOUT_MS,
+      timeout: DOCTOR_TIMEOUT_MS,
     });
-    const page = await application.firstWindow({ timeout: START_TIMEOUT_MS });
+    const page = await application.firstWindow({ timeout: DOCTOR_TIMEOUT_MS });
     await page.goto("data:text/html,<title>Prime%20Continuim%20browser%20probe</title><main>ready</main>");
     if (await page.locator("main").textContent() !== "ready") {
       throw new Error("The browser probe did not observe its expected document.");

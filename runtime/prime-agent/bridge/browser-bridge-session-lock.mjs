@@ -12,6 +12,7 @@ const TOKEN_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[
 export async function withBrowserSessionLock(sessionDirectory, action, options = {}) {
   const now = options.now ?? Date.now;
   const ownerStatus = options.ownerStatus ?? browserLockOwnerStatus;
+  const deadOwnerGraceMs = boundedDeadOwnerGraceMs(options.deadOwnerGraceMs);
   const lockPath = join(sessionDirectory, "operation.lock");
   const token = randomUUID();
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -22,7 +23,11 @@ export async function withBrowserSessionLock(sessionDirectory, action, options =
         await removeExactOperationRecord(lockPath, token).catch(() => undefined);
       }
     }
-    if (attempt === 0 && await reclaimDeadBrowserLock(sessionDirectory, lockPath, { now, ownerStatus })) continue;
+    if (attempt === 0 && await reclaimDeadBrowserLock(
+      sessionDirectory,
+      lockPath,
+      { deadOwnerGraceMs, now, ownerStatus },
+    )) continue;
     throw busyError();
   }
   throw busyError();
@@ -30,7 +35,9 @@ export async function withBrowserSessionLock(sessionDirectory, action, options =
 
 async function reclaimDeadBrowserLock(sessionDirectory, lockPath, options) {
   const operation = await readOperationRecord(lockPath);
-  if (!operation || options.now() - operation.mtimeMs <= STALE_LOCK_MS) return false;
+  if (!operation) return false;
+  const ageMs = options.now() - operation.mtimeMs;
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs < options.deadOwnerGraceMs) return false;
   if (options.ownerStatus(operation.pid) !== "dead") return false;
 
   // Reclaim claims are immutable generations scoped to this exact operation
@@ -197,6 +204,14 @@ function validPid(value) {
 
 function validToken(value) {
   return typeof value === "string" && TOKEN_PATTERN.test(value);
+}
+
+function boundedDeadOwnerGraceMs(value) {
+  const grace = value ?? STALE_LOCK_MS;
+  if (!Number.isSafeInteger(grace) || grace < 0 || grace > STALE_LOCK_MS) {
+    throw new TypeError("Browser dead-owner grace must be a bounded integer.");
+  }
+  return grace;
 }
 
 function browserLockOwnerStatus(pid) {

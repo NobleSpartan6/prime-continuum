@@ -39,6 +39,7 @@ const DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 30 * 1000;
 const DOWNLOAD_FETCH_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 250;
 const BROWSER_SMOKE_ACTION_TIMEOUT_MS = 30_000;
+const BROWSER_SMOKE_OPEN_TIMEOUT_MS = 45_000;
 const BROWSER_SMOKE_SCREENSHOT_TIMEOUT_MS = 40_000;
 const REVIEWED_RUNTIME_EXCLUDED_BASENAMES = [".gitkeep"];
 const REVIEWED_RUNTIME_EXCLUDED_SUFFIXES = [".d.ts", ".d.mts", ".d.cts", ".map"];
@@ -1130,7 +1131,8 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
     [entrypoints.browserBridge, `--session=${session}`, ...args],
     { cwd: scratchDirectory, env: environment, timeoutMs },
   );
-  let opened = false;
+  let launchAttempted = false;
+  let retirementProven = false;
   try {
     const doctor = await commandRunner(runtimeExecutable, [entrypoints.browserBridge, "doctor", "--json"], {
       cwd: scratchDirectory,
@@ -1158,8 +1160,11 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
       '<button type="button" onclick="this.textContent=\'After\'">Before</button>',
       '<input aria-label="Name">',
     ].join(""));
-    await invoke(["open", `data:text/html,${page}`]);
-    opened = true;
+    // Electron startup can cross the ordinary command deadline on a cold,
+    // resource-constrained host. Keep this one outer custody bound above the
+    // bridge's exact readiness deadline without weakening any other command.
+    launchAttempted = true;
+    await invoke(["open", `data:text/html,${page}`], BROWSER_SMOKE_OPEN_TIMEOUT_MS);
     const snapshot = await invoke(["snapshot"]);
     const snapshotText = String(snapshot.stdout);
     const reference = /button\s+"Before"[^\n]*\[ref=(e\d+)\]/.exec(snapshotText)?.[1] ??
@@ -1179,8 +1184,8 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
       throw buildError("Browser smoke screenshot is not a PNG.");
     }
     await invoke(["close"]);
-    opened = false;
     await assertBrowserSmokeStateRetired(stateDirectory);
+    retirementProven = true;
     return Object.freeze({
       verified: true,
       protocol: PINNED_BROWSER_BRIDGE.protocol,
@@ -1189,8 +1194,14 @@ export async function smokeBrowserBridge(runtimeDirectory, options = {}) {
       operations: Object.freeze(["doctor", "open", "snapshot", "find", "click", "eval", "screenshot", "close"]),
     });
   } finally {
-    if (opened) await invoke(["close"], 10_000).catch(() => undefined);
-    await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
+    if (launchAttempted && !retirementProven) {
+      // Failed or timed-out startup can still leave an exact nonce/PID-bound
+      // host alive. Preserve its evidence unless a bounded close both succeeds
+      // and proves all private launch state retired.
+      await invoke(["close"], 10_000);
+      await assertBrowserSmokeStateRetired(stateDirectory);
+    }
+    await rm(scratchDirectory, { recursive: true, force: true });
   }
 }
 
