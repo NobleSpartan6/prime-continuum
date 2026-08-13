@@ -253,7 +253,7 @@ describe("HostService resident end causal recovery", () => {
     await service.close();
   });
 
-  it("quarantines a dispatching restart and an exact retry never invokes kill again", async () => {
+  it("reconciles a dispatching restart from exact absence and never invokes kill again", async () => {
     const fixture = await serviceFixture();
     const dispatchMarked = deferred<void>();
     const acknowledge = deferred<void>();
@@ -303,12 +303,19 @@ describe("HostService resident end causal recovery", () => {
     expect(killCalls).toBe(1);
 
     const retryAdapter = vi.fn();
+    const reconcileResidentEnd = vi.fn(async (binding: ResidentSessionBinding) => ({
+      evidenceVersion: 1 as const,
+      operation: "end_reconciliation" as const,
+      binding,
+      disposition: "absent" as const,
+    }));
     const retryCoordinator = new ResidentLifecycleCoordinator({
       store: restarted,
       adapter: async () => ({
         createOwnedCandidate: undefined as never,
         readStableResidentProjection: undefined as never,
         endResidentSession: retryAdapter,
+        reconcileResidentEnd,
       }),
     });
     const retryService = new HostService(restarted, lifecycleGateway(retryCoordinator, fixture.binding));
@@ -318,11 +325,56 @@ describe("HostService resident end causal recovery", () => {
     }, TRUSTED_USER_SESSION)).resolves.toMatchObject({
       ok: true,
       method: "resident.end",
-      result: { phase: "quarantined" },
+      result: { phase: "completed" },
     });
     expect(retryAdapter).not.toHaveBeenCalled();
+    expect(reconcileResidentEnd).toHaveBeenCalledOnce();
     expect(killCalls).toBe(1);
+    expect((await restarted.getThreadSnapshot(fixture.binding.threadId)).residentLifecycle).toMatchObject({
+      state: "ended",
+      operationId: fixture.endRequest.operationId,
+    });
     await Promise.all([service.close(), retryService.close()]);
+  });
+
+  it("finishes the same End action when exact absence follows a lost kill response", async () => {
+    const fixture = await serviceFixture();
+    const endResidentSession = vi.fn(async (lease: ResidentKillLease) => {
+      await fixture.store.authorizeResidentKillInvocation(lease);
+      throw new ResidentRuntimeContractError(
+        "PRIME_RUNTIME_MUTATION_OUTCOME_UNKNOWN",
+        "The root kill response was lost after invocation.",
+      );
+    });
+    const reconcileResidentEnd = vi.fn(async (binding: ResidentSessionBinding) => ({
+      evidenceVersion: 1 as const,
+      operation: "end_reconciliation" as const,
+      binding,
+      disposition: "absent" as const,
+    }));
+    const coordinator = new ResidentLifecycleCoordinator({
+      store: fixture.store,
+      adapter: async () => ({
+        createOwnedCandidate: undefined as never,
+        readStableResidentProjection: undefined as never,
+        endResidentSession,
+        reconcileResidentEnd,
+      }),
+    });
+    const service = new HostService(fixture.store, lifecycleGateway(coordinator, fixture.binding));
+
+    await expect(service.handle(endProtocolRequest(fixture), TRUSTED_USER_SESSION)).resolves.toMatchObject({
+      ok: true,
+      method: "resident.end",
+      result: { phase: "completed" },
+    });
+    expect(endResidentSession).toHaveBeenCalledOnce();
+    expect(reconcileResidentEnd).toHaveBeenCalledOnce();
+    expect((await fixture.store.getThreadSnapshot(fixture.binding.threadId)).residentLifecycle).toMatchObject({
+      state: "ended",
+      operationId: fixture.endRequest.operationId,
+    });
+    await service.close();
   });
 });
 

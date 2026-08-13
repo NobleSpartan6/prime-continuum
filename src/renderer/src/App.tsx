@@ -216,28 +216,28 @@ const TASK_STARTERS = [
     label: 'Delegate a task',
     description: 'Coordinate bounded RLM workers',
     icon: Network,
-    prompt: 'Delegate and complete this task: [describe the outcome, constraints, and done criteria]. First define a concrete goal. Use RLM orchestration where it improves speed or quality: delegate only bounded, independent subtasks to child agents; keep dependent or tightly coupled work with the parent; integrate their findings and resolve conflicts; verify the complete result; and persist concise reusable lessons in the workspace’s established instruction or knowledge files when appropriate. Do not add concurrency for its own sake. Report changed files, checks, and any remaining risks.',
+    prompt: 'Delegate with RLM: [outcome, constraints, and done criteria].',
   },
   {
     id: 'feature',
     label: 'Build a feature',
     description: 'Inspect, implement, and verify',
     icon: FileCode2,
-    prompt: 'Build the requested feature in this workspace. Start by inspecting the relevant code and AGENTS.md, state a concise plan, and implement the smallest complete change. Delegate bounded independent work through native RLM only when it improves speed or quality. Use the verified browser when visual or web behavior needs proof. Integrate all findings, run the most relevant checks, and report the changed files plus any remaining risks.',
+    prompt: 'Build: [feature, user outcome, constraints, and done criteria].',
   },
   {
     id: 'review',
     label: 'Review the codebase',
     description: 'Audit and fix high-impact issues',
     icon: Search,
-    prompt: 'Review this codebase for the highest-impact correctness, performance, accessibility, and maintainability issues. Ground every finding in concrete files and rank the work by severity. Use native RLM child agents for independent audit lanes when useful, then reconcile their evidence before changing code. Fix the issues that are safe and well-scoped, use the verified browser for UI proof when applicable, run relevant checks, and report what remains.',
+    prompt: 'Review and improve: [area, risks to prioritize, and done criteria].',
   },
   {
     id: 'investigate',
     label: 'Investigate an issue',
     description: 'Reproduce and resolve root cause',
     icon: Activity,
-    prompt: 'Investigate the reported issue in this workspace. Reproduce it if possible, using the verified browser when the issue is visual or web-facing. Inspect the relevant code and AGENTS.md, identify the root cause, delegate only independent evidence gathering through native RLM when helpful, implement the smallest complete fix, run the most relevant regression checks, and report the cause, changed files, verification, and any remaining uncertainty.',
+    prompt: 'Investigate: [issue, reproduction details, expected behavior, and done criteria].',
   },
 ] as const
 
@@ -3822,7 +3822,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                   onChange={(event) => openMoveThread(event.target.value, event.currentTarget)}
                 >
                   {compatibleHosts.map((host) => (
-                    <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
+                    <option key={host.id} value={host.id}>{host.name} · {host.connectionPath}</option>
                   ))}
                 </select>
                 <Icon icon={ChevronDown} size={14} />
@@ -4545,7 +4545,7 @@ function Sidebar({
                   onChange={(event) => onMoveThread(event.target.value, event.currentTarget)}
                 >
                   {compatibleHosts.map((host) => (
-                    <option key={host.id} value={host.id}>{host.name} — {connectionLabel(host.connection)}</option>
+                    <option key={host.id} value={host.id}>{host.name} · {host.connectionPath}</option>
                   ))}
                 </select>
                 <Icon icon={ChevronDown} size={14} />
@@ -4941,8 +4941,8 @@ function SessionContinuity({
     ? `Host queue paused · ${hostCommands ?? 0} pending`
     : hostCommands !== undefined && hostCommands > 0
       ? `${hostCommands} host ${hostCommands === 1 ? 'command' : 'commands'} queued${queuedActions ? ` · ${queuedActions} session ${queuedActions === 1 ? 'action' : 'actions'}` : ''}`
-      : taskState === 'running' && activeAgents.length > 0
-        ? `${activeAgents.length} ${activeAgents.length === 1 ? 'branch' : 'branches'} active`
+      : activeAgents.length > 0
+        ? `${activeAgents.length} ${activeAgents.length === 1 ? 'branch' : 'branches'} ${isFresh ? 'active' : 'last reported active'}`
       : queueShowsExactBinding
         ? exactBindingCopy
       : queuedActions !== undefined
@@ -4986,7 +4986,7 @@ function SessionContinuity({
       <span className="session-continuity__actions">
         {!(receipt.operation === 'end' && receipt.state === 'idle') && (
           <span className={cx('session-continuity__queue', runtime.queue?.paused && 'session-continuity__queue--paused')}>
-            <Icon icon={runtime.queue?.paused ? Clock3 : taskState === 'running' && activeAgents.length > 0 ? GitFork : queueShowsExactBinding ? ShieldCheck : ListChecks} size={13} />
+            <Icon icon={runtime.queue?.paused ? Clock3 : activeAgents.length > 0 ? GitFork : queueShowsExactBinding ? ShieldCheck : ListChecks} size={13} />
             <span title={queueCopy}>{queueCopy}</span>
           </span>
         )}
@@ -5004,7 +5004,7 @@ function SessionContinuity({
                 : receipt.state === 'uncertain' || receipt.state === 'rejected'
                   ? 'Review ending'
                   : 'View status'
-              : 'Session'}
+              : activeAgents.length > 0 ? 'View agents' : 'Session'}
             </span>
           </button>
         )}
@@ -5710,10 +5710,13 @@ function outcomeReviewProps(
     : undefined
   const displayedGoal = activeGoal ?? terminalGoal
   const terminalAssistant = exactOutcome?.terminalAssistant
-  // Preview fixtures have explicit authored evidence. Native Git/check values
-  // remain unavailable until a cursor-bound collector owns their provenance.
-  const changedFileCount = currentTelemetryMatchesOutcome && environment === 'preview'
-    ? snapshot.gitSummary?.changedFileCount ?? project.dirtyFiles
+  // Native aggregate proof is safe to show only when it belongs to the same
+  // exact snapshot cursor as the reviewed outcome. Paths remain undisclosed.
+  const changedFileCount = currentTelemetryMatchesOutcome
+    ? snapshot.gitSummary?.changedFileCount ?? (environment === 'preview' ? project.dirtyFiles : undefined)
+    : undefined
+  const currentSnapshotEvidence = currentTelemetryMatchesOutcome && snapshot.evidence.length > 0
+    ? snapshot.evidence
     : undefined
   const resultBlock = terminalAssistant
     ? thread.transcript.find((block) => block.id === terminalAssistant.blockId && block.kind === 'assistant')
@@ -5759,9 +5762,7 @@ function outcomeReviewProps(
     state,
     ...(displayedGoal?.objective ? { objective: displayedGoal.objective } : {}),
     ...(resultBlock?.body.trim() ? { result: resultBlock.body.trim() } : {}),
-    ...(currentTelemetryMatchesOutcome && environment === 'preview' && snapshot.evidence.length > 0
-      ? { evidence: snapshot.evidence }
-      : {}),
+    ...(currentSnapshotEvidence ? { evidence: currentSnapshotEvidence } : {}),
     ...(currentTelemetryMatchesOutcome && runtime.agentsReported === true
       ? { childAgents: snapshot.agents }
       : {}),
@@ -5769,6 +5770,7 @@ function outcomeReviewProps(
     ...(displayedGoal?.tokensUsed !== undefined ? { tokensUsed: displayedGoal.tokensUsed } : {}),
     ...(displayedGoal?.timeUsedSeconds !== undefined ? { timeUsedSeconds: displayedGoal.timeUsedSeconds } : {}),
     ...(snapshot.snapshotAuthority?.source ? { snapshotSource: snapshot.snapshotAuthority.source } : {}),
+    ...((changedFileCount !== undefined || currentSnapshotEvidence) ? { proofScope: 'current_snapshot' as const } : {}),
   }
 }
 
@@ -5903,6 +5905,7 @@ function RuntimePanel({
     session || agentsReported || runtime.goals !== undefined || runtime.schedules !== undefined,
   )
   const reportedAgents = agentsReported ? snapshot.agents : []
+  const hasReportedBranches = agentsReported && reportedAgents.length > 0
   const runningAgents = reportedAgents.filter((agent) => agent.status === 'running').length
   const rootActivity = agentActivityPresentation(runtime, reportedAgents)
   const visibleGoals = runtime.goals?.slice(0, goalLimit)
@@ -5966,6 +5969,22 @@ function RuntimePanel({
                 ? `Current thread · ${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} running`
                 : `${runningAgents} ${runningAgents === 1 ? 'agent' : 'agents'} last reported running · cached host state`}
       />
+
+      {hasReportedBranches && (
+        <RlmDelegationPanel
+          agents={reportedAgents}
+          agentsReported
+          isFresh={isFresh}
+          rootAvailable={Boolean(session)}
+          rootActive={Boolean(session && (
+            session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
+          ))}
+          rootLabel={rootActivity.label}
+          rootDetail={rootActivity.detail}
+          rootModel={session?.model}
+          rootThinkingLevel={session?.thinkingLevel}
+        />
+      )}
 
       <section className="runtime-section" aria-labelledby="runtime-session-heading">
         <div className="runtime-section__heading">
@@ -6109,19 +6128,21 @@ function RuntimePanel({
             </>
           )}
         </div>
-        <RlmDelegationPanel
-          agents={reportedAgents}
-          agentsReported={agentsReported}
-          isFresh={isFresh}
-          rootAvailable={Boolean(session)}
-          rootActive={Boolean(session && (
-            session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
-          ))}
-          rootLabel={rootActivity.label}
-          rootDetail={rootActivity.detail}
-          rootModel={session?.model}
-          rootThinkingLevel={session?.thinkingLevel}
-        />
+        {!hasReportedBranches && (
+          <RlmDelegationPanel
+            agents={reportedAgents}
+            agentsReported={agentsReported}
+            isFresh={isFresh}
+            rootAvailable={Boolean(session)}
+            rootActive={Boolean(session && (
+              session.isStreaming || session.isBashRunning || session.isCompacting || runningAgents > 0
+            ))}
+            rootLabel={rootActivity.label}
+            rootDetail={rootActivity.detail}
+            rootModel={session?.model}
+            rootThinkingLevel={session?.thinkingLevel}
+          />
+        )}
       </section>
 
       <section className="runtime-section" aria-labelledby="runtime-capabilities-heading">

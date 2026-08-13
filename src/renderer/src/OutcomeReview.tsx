@@ -27,6 +27,8 @@ export interface OutcomeReviewProps {
   timeUsedSeconds?: number
   /** Exact snapshot freshness. Omitted only for non-native previews. */
   snapshotSource?: 'live' | 'cached'
+  /** Aggregate facts belong to the exact current snapshot, not the turn receipt. */
+  proofScope?: 'current_snapshot'
 }
 
 const OUTCOME_STATE: Record<OutcomeReviewState, { icon: LucideIcon; label: string }> = {
@@ -98,6 +100,7 @@ export const OutcomeReview = memo(function OutcomeReview({
   tokensUsed,
   timeUsedSeconds,
   snapshotSource,
+  proofScope,
 }: OutcomeReviewProps) {
   const headingId = useId()
   const stateMeta = OUTCOME_STATE[state]
@@ -122,7 +125,10 @@ export const OutcomeReview = memo(function OutcomeReview({
         {result?.trim() || (state === 'working' ? 'Prime Agent is still working.' : 'No written result yet.')}
       </p>
 
-      <dl className="outcome-review__facts" aria-label="Outcome facts">
+      {proofScope === 'current_snapshot' ? (
+        <p className="outcome-review__proof-scope">Current snapshot proof</p>
+      ) : null}
+      <dl className="outcome-review__facts" aria-label={proofScope === 'current_snapshot' ? 'Current snapshot proof facts' : 'Outcome facts'}>
         <div>
           <dt>Changes</dt>
           <dd>{changedFileCount === undefined ? '—' : compactCount(changedFileCount)}</dd>

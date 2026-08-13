@@ -22,14 +22,14 @@ const targets = [
     width: 1600,
     height: 1000,
     visualState: 'launchpad',
-    expectedText: 'What should we build?',
+    expectedText: 'Give Prime Agent a goal.',
   },
   {
     name: 'mobile-agent-launchpad-390',
     width: 390,
     height: 844,
     visualState: 'launchpad',
-    expectedText: 'What should we build?',
+    expectedText: 'Give Prime Agent a goal.',
     expectResponsiveTopbar: true,
   },
   {
@@ -428,7 +428,7 @@ async function capture(target, rendererOrigin) {
           return {
             inspectorOpen: document.querySelector('.app-shell')?.getAttribute('data-inspector-open') === 'true',
             starterSelected: starter?.getAttribute('aria-pressed') === 'true',
-            composerPrefilled: composer instanceof HTMLTextAreaElement && composer.value.includes('Investigate the reported issue in this workspace'),
+            composerPrefilled: composer instanceof HTMLTextAreaElement && composer.value === 'Investigate: [issue, reproduction details, expected behavior, and done criteria].',
           }
         })()`)
         if (
@@ -460,10 +460,13 @@ async function capture(target, rendererOrigin) {
         await delay(25)
       }
       invariant(runtimeVisible, `${target.name} did not render the agent hierarchy`)
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const hierarchy = document.querySelector('#inspector-panel-session .runtime-subsection--rlm')
-        hierarchy?.scrollIntoView({ block: 'start', inline: 'nearest' })
+      const hierarchyStartsNearTop = await browserWindow.webContents.executeJavaScript(`(() => {
+        const panel = document.querySelector('#inspector-panel-session')
+        const hierarchy = panel?.querySelector('.runtime-subsection--rlm')
+        if (!(panel instanceof HTMLElement) || !(hierarchy instanceof HTMLElement)) return false
+        return hierarchy.getBoundingClientRect().top - panel.getBoundingClientRect().top < 180
       })()`)
+      invariant(hierarchyStartsNearTop, `${target.name} hid the agent hierarchy below session details`)
       await delay(150)
     }
     if (target.openModelsDialog) {

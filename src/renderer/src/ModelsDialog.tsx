@@ -1,4 +1,4 @@
-import { AlertCircle, Bot, CheckCircle2, Info, Loader2, LockKeyhole, RefreshCw, Search, ShieldCheck, X, type LucideIcon } from 'lucide-react'
+import { AlertCircle, Bot, CheckCircle2, Copy, Info, Loader2, LockKeyhole, RefreshCw, Search, ShieldCheck, X, type LucideIcon } from 'lucide-react'
 import {
   useDeferredValue,
   useEffect,
@@ -107,12 +107,14 @@ export default function ModelsDialog({
   const [showAllModels, setShowAllModels] = useState(false)
   const [visibleModelLimit, setVisibleModelLimit] = useState(MODEL_REVEAL_INCREMENT)
   const [loadAttempt, setLoadAttempt] = useState(0)
+  const [providerLoginCopyState, setProviderLoginCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const providerNavRef = useRef<HTMLDivElement>(null)
   const contentRootRef = useRef<HTMLDivElement>(null)
   const completedSelectionActionRef = useRef<HTMLButtonElement>(null)
   const selectionRequestRef = useRef(0)
   const oauthRequestRef = useRef(0)
   const activeOAuthRequestRef = useRef<RuntimeOAuthRequest | null>(null)
+  const refreshProviderIdRef = useRef<string | undefined>(undefined)
   const dialogOpenRef = useRef(open)
   const selectionAuthorityKey = JSON.stringify([host.id, threadId ?? '', executionGenerationId ?? ''])
   const oauthAuthorityKey = JSON.stringify([host.id])
@@ -157,22 +159,30 @@ export default function ModelsDialog({
     setShowAllProviders(false)
     setShowAllModels(false)
     setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+    setProviderLoginCopyState('idle')
     void api.loadRuntimeModelCatalog(host.id)
       .then((nextCatalog) => {
         if (!cancelled) {
           setCatalog(nextCatalog)
+          const refreshProviderId = refreshProviderIdRef.current
+          refreshProviderIdRef.current = undefined
           const chatGptProvider = nextCatalog.providers.find((provider) =>
             provider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && provider.oauthSupported,
           )
           // Sol setup should open on the one provider this desktop can connect
           // safely even when an unrelated runtime provider is already ready.
-          setSelectedProviderId(chatGptProvider && !chatGptProvider.configured
-            ? chatGptProvider.providerId
-            : 'all')
+          setSelectedProviderId(
+            refreshProviderId && nextCatalog.providers.some((provider) => provider.providerId === refreshProviderId)
+              ? refreshProviderId
+              : chatGptProvider && !chatGptProvider.configured
+                ? chatGptProvider.providerId
+                : 'all',
+          )
         }
       })
       .catch((reason: unknown) => {
         if (cancelled) return
+        refreshProviderIdRef.current = undefined
         setCatalog(null)
         setError(
           isStaleHostAuthorityError(reason)
@@ -309,7 +319,27 @@ export default function ModelsDialog({
 
   const selectProvider = (providerId: string) => {
     setSelectedProviderId(providerId)
+    setProviderLoginCopyState('idle')
     setVisibleModelLimit(MODEL_REVEAL_INCREMENT)
+  }
+
+  const copyProviderSetupSteps = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable')
+      const providerName = selectedProvider?.displayName ?? 'the provider'
+      await navigator.clipboard.writeText(
+        `In Prime Agent on ${host.name}, run /login, choose ${providerName}, complete sign-in, then return to Prime Continuim and select Refresh accounts.`,
+      )
+      setProviderLoginCopyState('copied')
+    } catch {
+      setProviderLoginCopyState('error')
+    }
+  }
+
+  const refreshProviderAccounts = () => {
+    refreshProviderIdRef.current = selectedProviderId
+    setProviderLoginCopyState('idle')
+    setLoadAttempt((attempt) => attempt + 1)
   }
 
   const toggleProviderCatalog = () => {
@@ -626,29 +656,23 @@ export default function ModelsDialog({
                 >
                   <span><Icon icon={LockKeyhole} size={16} /></span>
                   <div className="provider-setup-note__body">
-                    <strong>{selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && selectedProvider.oauthSupported
-                      ? 'Connect ChatGPT'
-                      : selectedProvider.oauthSupported ? 'OAuth is supported by Prime Agent' : 'Provider setup is required'}</strong>
-                    {selectedProvider.providerId === PRIME_AGENT_CHATGPT_OAUTH_PROVIDER_ID && selectedProvider.oauthSupported ? (
+                    <strong>{selectedProviderCanConnect ? 'Connect ChatGPT' : 'Sign in with Prime Agent'}</strong>
+                    {selectedProviderCanConnect ? (
                       <>
                         <p>
-                          {selectedProviderCanConnect
-                            ? <>Connect ChatGPT on <bdi>{host.name}</bdi>. Sign-in opens in your browser; this view never receives the authorization URL or credential.</>
-                            : <>Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. This desktop can connect ChatGPT only when the trusted local host advertises OAuth support.</>}
+                          Connect ChatGPT on <bdi>{host.name}</bdi>. Sign-in opens in your browser; this view never receives the authorization URL or credential.
                         </p>
-                        {selectedProviderCanConnect && (
-                          <div className="provider-setup-note__actions">
-                            <button
-                              className="button button--secondary"
-                              type="button"
-                              disabled={oauthLocksConnect}
-                              onClick={() => void startProviderOAuth()}
-                            >
-                              <Icon icon={oauthInProgress ? Loader2 : ShieldCheck} size={14} />
-                              {oauthInProgress ? 'Signing in…' : 'Connect ChatGPT'}
-                            </button>
-                          </div>
-                        )}
+                        <div className="provider-setup-note__actions">
+                          <button
+                            className="button button--secondary"
+                            type="button"
+                            disabled={oauthLocksConnect}
+                            onClick={() => void startProviderOAuth()}
+                          >
+                            <Icon icon={oauthInProgress ? Loader2 : ShieldCheck} size={14} />
+                            {oauthInProgress ? 'Signing in…' : 'Connect ChatGPT'}
+                          </button>
+                        </div>
                         <details className="provider-setup-note__storage">
                           <summary>Credential storage</summary>
                           <p>
@@ -657,9 +681,33 @@ export default function ModelsDialog({
                         </details>
                       </>
                     ) : (
-                      <p>
-                        Open Prime Agent on <bdi>{host.name}</bdi> and run <code>/login</code>. Credential material stays on this host; only secret-free status reaches Continuim’s host protocol and renderer.
-                      </p>
+                      <>
+                        <p>
+                          Run <code>/login</code> in Prime Agent on <bdi>{host.name}</bdi>, then refresh accounts here. Credentials stay on that computer.
+                        </p>
+                        <div className="provider-setup-note__actions">
+                          <button className="button button--secondary" type="button" onClick={() => void copyProviderSetupSteps()}>
+                            <Icon icon={providerLoginCopyState === 'copied' ? CheckCircle2 : Copy} size={14} />
+                            {providerLoginCopyState === 'copied' ? 'Copied setup steps' : 'Copy setup steps'}
+                          </button>
+                          <button className="button button--quiet" type="button" onClick={refreshProviderAccounts}>
+                            <Icon icon={RefreshCw} size={14} />
+                            Refresh accounts
+                          </button>
+                        </div>
+                        <p
+                          className={cx('provider-setup-note__feedback', providerLoginCopyState !== 'error' && 'sr-only')}
+                          role="status"
+                          aria-live="polite"
+                          aria-atomic="true"
+                        >
+                          {providerLoginCopyState === 'copied'
+                            ? 'Copied provider setup steps.'
+                            : providerLoginCopyState === 'error'
+                              ? <>Copy unavailable. Enter <code>/login</code> in Prime Agent.</>
+                              : ''}
+                        </p>
+                      </>
                     )}
                   </div>
                 </div>

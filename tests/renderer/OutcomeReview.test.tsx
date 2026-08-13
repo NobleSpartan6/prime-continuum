@@ -46,6 +46,7 @@ describe('OutcomeReview', () => {
         changedFileCount={9}
         tokensUsed={12_400}
         timeUsedSeconds={125}
+        proofScope="current_snapshot"
       />,
     )
 
@@ -53,6 +54,7 @@ describe('OutcomeReview', () => {
     expect(review).toHaveAttribute('data-outcome-state', 'complete')
     expect(within(review).getByText('Complete')).toBeVisible()
     expect(within(review).getByText('The exact resident generation completed and passed its local checks.')).toBeVisible()
+    expect(within(review).getByText('Current snapshot proof')).toBeVisible()
 
     const facts = review.querySelector('.outcome-review__facts')!
     expect(within(facts).getByText('9')).toBeVisible()

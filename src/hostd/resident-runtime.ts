@@ -1015,6 +1015,34 @@ export const ResidentEndAcknowledgementSchema = z
   .strict();
 export type ResidentEndAcknowledgement = z.infer<typeof ResidentEndAcknowledgementSchema>;
 
+/** Read-only exact session evidence for settling an outcome-unknown End. */
+export const ResidentEndReconciliationEvidenceSchema = z
+  .object({
+    evidenceVersion: z.literal(1),
+    operation: z.literal("end_reconciliation"),
+    binding: ResidentSessionBindingSchema,
+    disposition: z.enum(["absent", "archived"]),
+  })
+  .strict();
+export interface ResidentEndReconciliationEvidence {
+  readonly evidenceVersion: 1;
+  readonly operation: "end_reconciliation";
+  readonly binding: ResidentSessionBinding;
+  readonly disposition: "absent" | "archived";
+}
+
+export function validateResidentEndReconciliationEvidence(
+  value: unknown,
+): ResidentEndReconciliationEvidence {
+  const parsed = ResidentEndReconciliationEvidenceSchema.parse(value);
+  return Object.freeze({
+    evidenceVersion: parsed.evidenceVersion,
+    operation: parsed.operation,
+    binding: validateResidentSessionBinding(parsed.binding),
+    disposition: parsed.disposition,
+  });
+}
+
 /** Host-owned connection handle. It intentionally exposes no upstream state or event DTO. */
 export interface ResidentRuntimeConnection {
   readonly binding: ResidentSessionBinding;
@@ -1061,6 +1089,8 @@ export interface ResidentRuntimeAdapter {
   readStableResidentProjection(binding: ResidentSessionBinding): Promise<ResidentProjectionSnapshot>;
   /** Consume one opaque Store-issued authority to invoke at most one exact root kill. */
   endResidentSession(lease: ResidentKillLease): Promise<ResidentEndAcknowledgement>;
+  /** Read-only proof that a previously dispatched root kill left no exact live session. */
+  reconcileResidentEnd(binding: ResidentSessionBinding): Promise<ResidentEndReconciliationEvidence | undefined>;
   /** Release only a matching process-local transport; never stops or completes Prime state. */
   detachResidentSession(binding: ResidentSessionBinding): Promise<void>;
   close(): Promise<void>;

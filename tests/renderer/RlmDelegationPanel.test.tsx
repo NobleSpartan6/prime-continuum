@@ -65,7 +65,7 @@ describe('RlmDelegationPanel', () => {
     expect(grandchild).toHaveAttribute('data-rlm-depth', '2')
     expect(child).toHaveAttribute('data-rlm-parent', 'lead')
     expect(child).toHaveAccessibleName('Accessibility review, delegated by Review lead')
-    expect(within(child as HTMLElement).getByText('Delegated by Review lead')).toHaveClass('sr-only')
+    expect(within(child as HTMLElement).getByText('via Review lead')).toBeVisible()
     expect(screen.getByText('GPT-5.6 Sol · high thinking')).toBeVisible()
     expect(container.querySelector('.rlm-map__connector')).not.toBeInTheDocument()
     expect(within(screen.getByLabelText('RLM activity summary')).getByText('2')).toBeVisible()

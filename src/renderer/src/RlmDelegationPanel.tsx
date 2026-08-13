@@ -173,9 +173,7 @@ function AgentBranchRow({ branch, isFresh }: { branch: AgentBranch; isFresh: boo
             <strong>{agentDisplayName(agent)}</strong>
             <span>{statusCopy}</span>
           </span>
-          <span className="sr-only">
-            {parent ? `Delegated by ${agentDisplayName(parent)}` : 'Delegated RLM branch'}
-          </span>
+          {parent ? <small className="rlm-map__parent">via {agentDisplayName(parent)}</small> : null}
           <span>{agent.activity ?? (resultPreview ? agent.role : agent.recap ?? agent.role)}</span>
           <small>
             {agent.model ? (readableModelName(agent.model) ?? agent.model) : 'Inherited model'}

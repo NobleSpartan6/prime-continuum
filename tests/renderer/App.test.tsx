@@ -3769,8 +3769,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Investigate an issue' }))
 
-    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue in this workspace')
-    expect((composer as HTMLTextAreaElement).value).toContain('identify the root cause')
+    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
     expect(api.sendComposer).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Investigate an issue' })).toHaveAttribute('aria-pressed', 'true')
 
@@ -3790,11 +3789,7 @@ describe('Prime Continuim renderer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Delegate a task' }))
 
-    expect((composer as HTMLTextAreaElement).value).toContain('First define a concrete goal')
-    expect((composer as HTMLTextAreaElement).value).toContain('bounded, independent subtasks to child agents')
-    expect((composer as HTMLTextAreaElement).value).toContain('integrate their findings and resolve conflicts')
-    expect((composer as HTMLTextAreaElement).value).toContain('verify the complete result')
-    expect((composer as HTMLTextAreaElement).value).toContain('persist concise reusable lessons')
+    expect((composer as HTMLTextAreaElement).value).toBe('Delegate with RLM: [outcome, constraints, and done criteria].')
     expect(api.sendComposer).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Delegate a task' })).toHaveAttribute('aria-pressed', 'true')
   })
@@ -3815,8 +3810,8 @@ describe('Prime Continuim renderer', () => {
     })
 
     render(<App api={api} />)
-    expect(await screen.findByRole('heading', { name: 'What should we build?' })).toBeVisible()
-    expect(screen.getByText('Describe the outcome or choose a brief.')).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Give Prime Agent a goal.' })).toBeVisible()
+    expect(screen.getByText('It delegates focused work and folds the result back.')).toBeVisible()
     expect(screen.getByText('Choose a model', { selector: '.agent-launchpad__setup-copy strong' })).toBeVisible()
     expect(screen.getByText('Connect a provider and choose the model for this task.', {
       selector: '.agent-launchpad__setup-copy small',
@@ -3827,7 +3822,7 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: /Investigate an issue.*Reproduce and resolve root cause/ }))
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
-    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue')
+    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
     expect(api.sendComposer).not.toHaveBeenCalled()
 
     expect(screen.queryByRole('button', { name: 'Open models and accounts to choose a model' })).not.toBeInTheDocument()
@@ -3879,7 +3874,7 @@ describe('Prime Continuim renderer', () => {
 
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
-    expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue in this workspace')
+    expect((composer as HTMLTextAreaElement).value).toBe('Investigate: [issue, reproduction details, expected behavior, and done criteria].')
     expect(screen.queryByRole('dialog', { name: 'Search and commands' })).not.toBeInTheDocument()
     expect(api.sendComposer).not.toHaveBeenCalled()
   })
@@ -4414,10 +4409,20 @@ describe('Prime Continuim renderer', () => {
     expect(allProviders).toHaveFocus()
 
     await user.click(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ }))
-    expect(within(dialog).getByText('OAuth is supported by Prime Agent')).toBeVisible()
+    expect(within(dialog).getByText('Sign in with Prime Agent')).toBeVisible()
     expect(within(dialog).getByText('0 available with current setup · 2 listed by the runtime')).toBeVisible()
     expect(within(dialog).getByText('/login')).toBeVisible()
-    expect(within(dialog).getByText(/Credential material stays on this host/)).toBeVisible()
+    expect(within(dialog).getByText(/Credentials stay on that computer/)).toBeVisible()
+    await user.click(within(dialog).getByRole('button', { name: 'Copy setup steps' }))
+    expect(await navigator.clipboard.readText()).toBe(
+      'In Prime Agent on devbox, run /login, choose Anthropic (Claude Pro/Max), complete sign-in, then return to Prime Continuim and select Refresh accounts.',
+    )
+    expect(within(dialog).getByRole('button', { name: 'Copied setup steps' })).toBeVisible()
+    expect(within(dialog).getByText('Copied provider setup steps.')).toHaveAttribute('role', 'status')
+    await user.click(within(dialog).getByRole('button', { name: 'Refresh accounts' }))
+    await waitFor(() => expect(loadRuntimeModelCatalog).toHaveBeenCalledTimes(2))
+    expect(await within(dialog).findByText('Sign in with Prime Agent')).toBeVisible()
+    expect(within(dialog).getByRole('button', { name: /Anthropic \(Claude Pro\/Max\)/ })).toHaveAttribute('aria-pressed', 'true')
     expect(within(dialog).getByText('No available models match')).toBeVisible()
 
     await user.click(within(dialog).getByRole('button', { name: 'All models' }))
@@ -5198,7 +5203,7 @@ describe('Prime Continuim renderer', () => {
     expect(within(runtimePanel).getByRole('heading', { name: 'RLM delegation' })).toBeVisible()
     expect(within(runtimePanel).getByText(/delegates focused work, then folds results/i)).toBeVisible()
     expect(within(runtimePanel).getByText('Coordinator · main session')).toBeVisible()
-    expect(within(runtimePanel).getAllByText('Delegated by Workbench lead')).toHaveLength(2)
+    expect(within(runtimePanel).getAllByText('via Workbench lead')).toHaveLength(2)
     const rlmSummary = within(runtimePanel).getByLabelText('RLM activity summary')
     expect(within(rlmSummary).getByText('2')).toBeVisible()
     expect(within(rlmSummary).getByText('1')).toBeVisible()
@@ -5329,7 +5334,7 @@ describe('Prime Continuim renderer', () => {
 
   it('reviews only an exact terminal assistant outcome and labels cached authority', async () => {
     const user = userEvent.setup()
-    const api: RendererApi = createPreviewRendererApi()
+    const api: RendererApi = asNativeFixture(createPreviewRendererApi())
     const snapshot = structuredClone(previewSnapshot)
     const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)!
     const terminalBlock = thread.transcript.find((block) => block.id === 'block-5')!
@@ -5380,6 +5385,8 @@ describe('Prime Continuim renderer', () => {
     expect(review.getByText('Last reported · Ready to review')).toBeVisible()
     expect(review.getByText(terminalBlock.body)).toBeVisible()
     expect(review.getByText('4')).toBeVisible()
+    expect(review.getByText('Current snapshot proof')).toBeVisible()
+    expect(review.getByText('Visual-QA type check')).toBeVisible()
     expect(review.queryByText('Complete')).not.toBeInTheDocument()
   })
 

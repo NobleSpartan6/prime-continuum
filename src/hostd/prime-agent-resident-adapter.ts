@@ -46,6 +46,7 @@ import {
   type ResidentDispatchOperation,
   type ResidentDispatchResult,
   type ResidentEndAcknowledgement,
+  type ResidentEndReconciliationEvidence,
   type ResidentGenerationDispatchLease,
   type ResidentPromptIdleAuthorityEvidence,
   type ResidentPromptIdleReconciliationRequest,
@@ -1081,6 +1082,16 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     return this.enqueue(() => this.endResidentSessionOnce(lease));
   }
 
+  reconcileResidentEnd(bindingValue: ResidentSessionBinding): Promise<ResidentEndReconciliationEvidence | undefined> {
+    let binding: ResidentSessionBinding;
+    try {
+      binding = validateResidentSessionBinding(bindingValue);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.enqueue(() => this.reconcileResidentEndOnce(binding));
+  }
+
   detachResidentSession(bindingValue: ResidentSessionBinding): Promise<void> {
     let binding: ResidentSessionBinding;
     try {
@@ -1218,6 +1229,70 @@ export class PrimeAgentResidentAdapter implements ResidentRuntimeAdapter, PrimeA
     } finally {
       // Local cleanup must never replace a confirmed acknowledgement or an
       // outcome-unknown fence with a replayable-looking failure.
+      closeDaemonClientQuietly(client);
+    }
+  }
+
+  private async reconcileResidentEndOnce(
+    binding: ResidentSessionBinding,
+  ): Promise<ResidentEndReconciliationEvidence | undefined> {
+    this.assertOpen();
+    let client: PrimeDaemonClientPublic | undefined;
+    try {
+      // Recovery must observe only the daemon that handled the original End.
+      // Never spawn or replace a daemon while deciding whether a kill landed.
+      const runtimeModule = await this.loadModule();
+      const opened = await this.openValidatedClient(runtimeModule);
+      client = opened.client;
+      assertRuntimeCompatibilityMatchesBinding(opened.compatibility, binding);
+      const response = await requestDaemon(
+        client,
+        { type: "list" },
+        this.options.requestTimeoutMs,
+        "list",
+      );
+      const sessions = parseLiveSessionList(response.data);
+      const matchingSessions = sessions.filter(
+        (candidate) => candidate.activeSessionId === binding.activeSessionId,
+      );
+      if (matchingSessions.length > 1) {
+        throw new ResidentRuntimeContractError(
+          "PRIME_RUNTIME_RESPONSE_INVALID",
+          "Prime Agent returned an ambiguous resident active-session identity.",
+          { details: { activeSessionId: binding.activeSessionId } },
+        );
+      }
+      const summary = matchingSessions[0];
+      if (summary) {
+        assertSummaryMatchesBinding(summary, binding);
+        if (summary.lifecycle !== "archived") return undefined;
+      } else {
+        const replacement = sessions.find(
+          (candidate) =>
+            candidate.sessionId === binding.sessionId ||
+            (binding.sessionFile !== undefined && candidate.sessionFile === binding.sessionFile),
+        );
+        if (replacement) {
+          throw new ResidentRuntimeContractError(
+            "PRIME_RUNTIME_SESSION_MISMATCH",
+            "The saved Prime Agent session is active under a different runtime identity.",
+            { details: { activeSessionId: binding.activeSessionId } },
+          );
+        }
+      }
+
+      // This method is deliberately read-only. It settles only the saved local
+      // End operation after exact absence/archive proof; it never invokes kill.
+      this.forceCloseResidentTransport(binding.activeSessionId);
+      return Object.freeze({
+        evidenceVersion: 1,
+        operation: "end_reconciliation",
+        binding,
+        disposition: summary ? "archived" : "absent",
+      });
+    } catch (error) {
+      throw normalizeRuntimeError(error, "Prime Agent resident end reconciliation failed.");
+    } finally {
       closeDaemonClientQuietly(client);
     }
   }
