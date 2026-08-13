@@ -1255,14 +1255,14 @@ describe('Prime Continuim renderer', () => {
     expect(screen.queryByRole('button', { name: 'Open floating session HUD' })).not.toBeInTheDocument()
   })
 
-  it('shows approval as Needs you and routes review to the workbench without a fake approval control', async () => {
+  it('shows an upstream input request as Reply needed and routes Reply to the workbench without a fake approval control', async () => {
     const user = userEvent.setup()
     const harness = createHudHarness({ taskState: 'needs_approval' })
     render(<App api={harness.api} surface="hud" />)
 
-    expect(await screen.findByText('Needs you', { selector: '.hud-status strong' })).toBeVisible()
-    const review = screen.getByRole('button', { name: 'Review approval' })
-    expect(review.closest('.hud-notice')).toHaveTextContent(/approval needs review in the full workbench/i)
+    expect(await screen.findByText('Reply needed', { selector: '.hud-status strong' })).toBeVisible()
+    const review = screen.getByRole('button', { name: 'Reply in workbench' })
+    expect(review.closest('.hud-notice')).toHaveTextContent(/waiting for more context/i)
     expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
     await user.click(review)
     expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
@@ -1331,17 +1331,17 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     const continuity = await screen.findByRole('region', { name: 'Session status' })
-    expect(within(continuity).getByRole('status')).toHaveTextContent('Needs you')
+    expect(within(continuity).getByRole('status')).toHaveTextContent('Restart session')
     expect(within(continuity).getByText(/could not attach this saved session/i)).toBeVisible()
-    expect(within(continuity).getByText('Restart session')).toBeVisible()
+    expect(within(continuity).getByText('Saved thread')).toBeVisible()
     expect(within(continuity).queryByText('Using ipython')).not.toBeInTheDocument()
     expect(within(continuity).queryByText('No active goal')).not.toBeInTheDocument()
-    expect(await screen.findByText('Session needs a restart')).toBeVisible()
+    expect(await screen.findByText('Restart session', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
-    expect(await screen.findByTitle('Task state: Needs you')).toBeVisible()
-    expect(screen.getByRole('button', { name: /Test Thread/i })).toHaveTextContent(/Needs you.*Test Thread/i)
+    expect(await screen.findByTitle('Task state: Restart session')).toBeVisible()
+    expect(screen.getByRole('button', { name: /Test Thread/i })).toHaveTextContent(/Restart session.*Test Thread/i)
     expect(screen.getByText('End this inactive session')).toBeVisible()
-    expect(screen.getByText('Session needs a restart', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Restart session', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getByRole('textbox', { name: 'Task brief' })).toBeDisabled()
     expect(screen.getByText(/saved thread stays in this project/i)).toBeVisible()
     expect(screen.queryByText('Ready to send')).not.toBeInTheDocument()
@@ -1407,12 +1407,12 @@ describe('Prime Continuim renderer', () => {
     api.endResident = vi.fn(async () => endResult.promise)
     render(<App api={api} />)
 
-    expect(await screen.findByText('Ready to close', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByText('End saved', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getByRole('form', { name: 'Resident session ending' })).toBeVisible()
     expect(screen.getByRole('main')).not.toHaveClass('thread-view--launchpad')
     expect(screen.queryByRole('region', { name: 'Session status' })).not.toBeInTheDocument()
-    expect(screen.getByTitle('Task state: Finish ending')).toBeVisible()
-    expect(screen.getByRole('button', { name: /Finish ending.*Frame protocol boundaries/i })).toBeVisible()
+    expect(screen.getByTitle('Task state: End saved')).toBeVisible()
+    expect(screen.getByRole('button', { name: /End saved.*Frame protocol boundaries/i })).toBeVisible()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
     expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Delegate a task.*Coordinate bounded RLM workers/ })).not.toBeInTheDocument()
@@ -1562,10 +1562,10 @@ describe('Prime Continuim renderer', () => {
     }
     render(<App api={api} />)
 
-    expect(await screen.findByTitle('Task state: Finish ending')).toBeVisible()
-    expect(await screen.findByText('Ready to close', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByTitle('Task state: End saved')).toBeVisible()
+    expect(await screen.findByText('End saved', { selector: '.composer__intent' })).toBeVisible()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Frame protocol boundaries/i })).toHaveTextContent(/Finish ending/i)
+    expect(screen.getByRole('button', { name: /Frame protocol boundaries/i })).toHaveTextContent(/End saved/i)
     expect(screen.getByRole('button', { name: 'Finish ending this resident session' })).toBeEnabled()
     expect(screen.getAllByRole('button', { name: 'Finish ending this resident session' })).toHaveLength(1)
     expect(screen.queryByText(/Waiting for resident controls/i)).not.toBeInTheDocument()
@@ -1611,8 +1611,8 @@ describe('Prime Continuim renderer', () => {
 
     await waitFor(() => {
       const terminalStatus = screen.getByRole('region', { name: 'Session status' })
-      expect(within(terminalStatus).getByRole('status')).toHaveTextContent('Ended')
-      expect(within(terminalStatus).getByText('Saved thread retained')).toBeVisible()
+      expect(within(terminalStatus).getByRole('status')).toHaveTextContent('Session ended')
+      expect(within(terminalStatus).getByText(/task, transcript, and workspace files remain available/i)).toBeVisible()
     })
     expect(screen.queryByRole('form', { name: 'Resident session ending' })).not.toBeInTheDocument()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
@@ -1653,7 +1653,7 @@ describe('Prime Continuim renderer', () => {
     }
     render(<App api={api} />)
 
-    expect(await screen.findByTitle('Task state: Ended')).toBeVisible()
+    expect(await screen.findByTitle('Task state: Session ended')).toBeVisible()
     expect(screen.queryByRole('heading', { name: 'Check end status' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
   })
@@ -1668,7 +1668,7 @@ describe('Prime Continuim renderer', () => {
     Object.defineProperty(api, 'environment', { configurable: true, value: 'native' })
     render(<App api={api} />)
 
-    expect(await screen.findByText('Finishing resident session', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByText('Ending session', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Resident session is finishing' })).not.toBeInTheDocument()
     expect(screen.getByText('Prime Continuim is checking for completion automatically')).toBeVisible()
     await waitFor(() => expect(api.residentLifecycleStatus).toHaveBeenCalledWith({
@@ -1710,9 +1710,9 @@ describe('Prime Continuim renderer', () => {
     }
     render(<App api={api} />)
 
-    expect(await screen.findByTitle('Task state: Needs you')).toBeVisible()
-    expect(screen.getByRole('button', { name: /Needs you.*Frame protocol boundaries/i })).toBeVisible()
-    expect(screen.getByText('End outcome unknown', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByTitle('Task state: End needs review')).toBeVisible()
+    expect(screen.getByRole('button', { name: /End needs review.*Frame protocol boundaries/i })).toBeVisible()
+    expect(screen.getByText('End needs review', { selector: '.composer__intent' })).toBeVisible()
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
     expect(screen.queryByText('Ready to delegate')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /outcome unknown/i })).not.toBeInTheDocument()
@@ -3452,21 +3452,21 @@ describe('Prime Continuim renderer', () => {
 
     expect(await screen.findByRole('heading', { name: 'Seamless remote experience' })).toBeVisible()
     expect(document.querySelector('.topbar__brand-name')).toHaveTextContent('Prime Continuim')
-    expect(screen.getByText('Last seen running', { selector: '.task-state__label' })).toBeVisible()
+    expect(screen.getByText('Reconnecting', { selector: '.task-state__label' })).toBeVisible()
     expect(document.querySelector('.task-state')).toHaveClass('task-state--stale')
     expect(screen.getAllByText(/Reconnecting… Last synchronized 12 s ago/).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
-    expect(screen.getByText('Resident status unverified', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Reconnecting', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByText('Active resident turn', { selector: '.composer__intent' })).not.toBeInTheDocument()
     expect(screen.queryByText(/Prime Agent is working · Stop requests a safe boundary/i)).not.toBeInTheDocument()
-    expect(screen.getAllByText(/Last reported running on devbox · current status unverified/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
+    expect(screen.getAllByText(/Saved activity is available while devbox reconnects/i).some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Reconnect to verify and control this resident turn' })).toHaveTextContent('Reconnect to verify')
     expect(screen.getByText(/cached transcript is still available/i)).toBeVisible()
     const continuity = screen.getByRole('region', { name: 'Session status' })
     expect(within(continuity).getByRole('status')).toHaveTextContent('Reconnecting')
-    expect(within(continuity).getByText('Reconnecting to devbox. Saved activity is available; current status is unverified.')).toBeVisible()
+    expect(within(continuity).getByText('Saved activity is available while devbox reconnects.')).toBeVisible()
     expect(within(continuity).queryByText(/after this window closes/i)).not.toBeInTheDocument()
     const receiptDetails = screen.getByText('Receipt details').closest('details')
     expect(receiptDetails).not.toHaveAttribute('open')
@@ -3633,7 +3633,7 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     expect(screen.queryByRole('button', { name: /steer/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /follow up/i })).not.toBeInTheDocument()
-    expect(screen.getByText('Delegate a task', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Ready', { selector: '.composer__intent' })).toBeVisible()
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     expect(composer).toHaveAttribute('placeholder', 'Describe the outcome, constraints, and done criteria…')
     expect(composer).toHaveAttribute('aria-describedby', 'composer-hint composer-status')
@@ -3672,7 +3672,7 @@ describe('Prime Continuim renderer', () => {
 
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
     expect(screen.getByText('Working', { selector: '.composer__intent' })).toBeVisible()
-    expect(screen.getByText('Browser auditor · Inspecting the browser harness · you can add direction', {
+    expect(screen.getByText('Browser auditor · Inspecting the browser harness', {
       selector: '.composer__connection span',
     })).toBeVisible()
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
@@ -3724,7 +3724,7 @@ describe('Prime Continuim renderer', () => {
 
   it('turns a fresh resident thread into a guided agent launchpad without duplicating composer starters', async () => {
     const user = userEvent.setup()
-    const api = createIdleResidentApi()
+    const api = asNativeFixture(createIdleResidentApi())
     api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
     const loadWorkbench = api.loadWorkbench.bind(api)
     api.loadWorkbench = vi.fn(async () => {
@@ -3740,7 +3740,10 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
     expect(await screen.findByRole('heading', { name: 'What should we build?' })).toBeVisible()
     expect(screen.getByText('Describe the outcome or choose a brief.')).toBeVisible()
-    expect(screen.getByText('Connect a model to begin')).toBeVisible()
+    expect(screen.getByText('Choose a model', { selector: '.agent-launchpad__setup-copy strong' })).toBeVisible()
+    expect(screen.getByText('Connect a provider and choose the model for this task.', {
+      selector: '.agent-launchpad__setup-copy small',
+    })).toBeVisible()
     expect(document.querySelector('.agent-launchpad__capabilities')).not.toBeInTheDocument()
     expect(document.querySelector('.task-starters')).not.toBeInTheDocument()
 
@@ -3748,6 +3751,36 @@ describe('Prime Continuim renderer', () => {
     const composer = screen.getByRole('textbox', { name: 'Task brief' })
     await waitFor(() => expect(composer).toHaveFocus())
     expect((composer as HTMLTextAreaElement).value).toContain('Investigate the reported issue')
+    expect(api.sendComposer).not.toHaveBeenCalled()
+
+    expect(screen.queryByRole('button', { name: 'Open models and accounts to choose a model' })).not.toBeInTheDocument()
+    const setupModel = screen.getByRole('button', { name: 'Set up model' })
+    await user.click(setupModel)
+    expect(await screen.findByRole('dialog', { name: 'Models & accounts' })).toBeVisible()
+    expect(api.sendComposer).not.toHaveBeenCalled()
+  })
+
+  it('opens model setup from the composer instead of submitting without a selected model', async () => {
+    const user = userEvent.setup()
+    const api = asNativeFixture(createIdleResidentApi())
+    api.sendComposer = vi.fn(async () => ({ state: 'sent', message: 'Sent' }))
+    const loadWorkbench = api.loadWorkbench.bind(api)
+    api.loadWorkbench = vi.fn(async () => {
+      const snapshot = await loadWorkbench()
+      if (!snapshot.runtime.session) throw new Error('Expected the selected resident fixture')
+      snapshot.runtime.session.model = 'unknown/unknown'
+      return snapshot
+    })
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Audit SSH discovery' })
+    expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
+
+    const setupModel = screen.getByRole('button', { name: 'Open models and accounts to choose a model' })
+    expect(setupModel).toHaveTextContent('Set up model')
+    await user.click(setupModel)
+
+    expect(await screen.findByRole('dialog', { name: 'Models & accounts' })).toBeVisible()
     expect(api.sendComposer).not.toHaveBeenCalled()
   })
 
@@ -3775,9 +3808,9 @@ describe('Prime Continuim renderer', () => {
   })
 
   it.each([
-    { taskState: 'idle' as const, expectedStatus: 'Ready', expectedDetail: 'Resident workstation is ready for another delegated task.' },
-    { taskState: 'waiting' as const, expectedStatus: 'Needs you', expectedDetail: 'Prime Agent needs your input on Resident workstation before it can continue.' },
-    { taskState: 'running' as const, connection: 'reconnecting' as const, expectedStatus: 'Reconnecting', expectedDetail: 'Reconnecting to Resident workstation. Saved activity is available; current status is unverified.' },
+    { taskState: 'idle' as const, expectedStatus: 'Ready', expectedDetail: 'Prime Agent is ready for another task.' },
+    { taskState: 'waiting' as const, expectedStatus: 'Reply needed', expectedDetail: 'Prime Agent is waiting for more context.' },
+    { taskState: 'running' as const, connection: 'reconnecting' as const, expectedStatus: 'Reconnecting', expectedDetail: 'Saved activity is available while Resident workstation reconnects.' },
   ])('announces $expectedStatus continuity without moving focus', async ({ taskState, connection, expectedStatus, expectedDetail }) => {
     render(<App api={createContinuityApi({ taskState, ...(connection ? { connection } : {}) })} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
@@ -3812,25 +3845,16 @@ describe('Prime Continuim renderer', () => {
   })
 
   it.each([
-    {
-      residency: 'resident' as const,
-      expected: 'Prime Agent keeps working on Resident workstation after this window closes.',
-      promisesOffload: true,
-    },
-    {
-      residency: 'client_owned' as const,
-      expected: 'Prime Agent is working on Resident workstation while this client remains attached.',
-      promisesOffload: false,
-    },
-  ])('describes working $residency authority without overstating offload', async ({ residency, expected, promisesOffload }) => {
+    { residency: 'resident' as const },
+    { residency: 'client_owned' as const },
+  ])('uses one Working presentation for $residency execution without inventing continuity', async ({ residency }) => {
     render(<App api={createContinuityApi({ taskState: 'running', residency })} />)
     await screen.findByRole('heading', { name: 'Audit SSH discovery' })
     const continuity = screen.getByRole('region', { name: 'Session status' })
 
     expect(within(continuity).getByRole('status')).toHaveTextContent('Working')
-    expect(within(continuity).getByText(expected)).toBeVisible()
-    expect(continuity).toHaveTextContent(promisesOffload ? 'after this window closes' : 'while this client remains attached')
-    if (!promisesOffload) expect(continuity).not.toHaveTextContent('after this window closes')
+    expect(within(continuity).getAllByText('Preparing the next visible update')).toHaveLength(2)
+    expect(continuity).not.toHaveTextContent(/after this window closes|while this client remains attached/i)
   })
 
   it('focuses and describes an empty composer submission, then clears the error while typing', async () => {
@@ -3930,25 +3954,25 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: 'Delegate task' }))
 
     await waitFor(() => expect(api.sendComposer).toHaveBeenCalledTimes(1))
-    expect(screen.getByText('Admitting resident prompt', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Prompt is awaiting durable host admission' })).toHaveTextContent('Submitting prompt')
     expect(screen.getByRole('form', { name: 'Prime Agent prompt' })).toHaveAttribute('aria-busy', 'true')
     expect(within(transcript).queryByText(prompt)).not.toBeInTheDocument()
     const continuity = screen.getByRole('region', { name: 'Session status' })
     expect(within(continuity).getByText('Starting')).toBeVisible()
-    expect(within(continuity).getByText(/Delegating this task to Prime Agent/)).toBeVisible()
+    expect(within(continuity).getByText('Delegating the task to Prime Agent.')).toBeVisible()
     expect(continuity.querySelector('.session-continuity__state')).toHaveClass('session-continuity__state--working')
-    expect(continuity.querySelector('.session-continuity__state .lucide-activity')).toBeInTheDocument()
+    expect(continuity.querySelector('.session-continuity__state .lucide-arrow-right')).toBeInTheDocument()
 
     await act(async () => {
       admission.resolve({ state: 'sent', message: 'Sent · durably admitted by host' })
       await admission.promise
     })
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Task brief' })).not.toBeInTheDocument())
-    expect(screen.getByText('Prompt owned by Prime Agent', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
     expect(document.querySelector('.composer-wrap')).toHaveClass('composer-wrap--compact')
     expect(within(continuity).getByText('Starting')).toBeVisible()
-    expect(within(continuity).getByText(/Prime Agent owns this task.*waiting for authoritative activity/)).toBeVisible()
+    expect(within(continuity).getByText('Prime Agent owns the task. Waiting for fresh activity.')).toBeVisible()
 
     const authoritative = structuredClone(snapshot)
     const selected = authoritative.threads.find((thread) => thread.id === authoritative.selectedThreadId)
@@ -4005,13 +4029,13 @@ describe('Prime Continuim renderer', () => {
     const stop = await screen.findByRole('button', { name: 'Stop the active Prime Agent turn' })
     expect(stop).toBeEnabled()
     expect(stop).toHaveTextContent('Stop')
-    expect(screen.getByText('Prompt owned by Prime Agent')).toBeVisible()
+    expect(screen.getByText('Starting', { selector: '.composer__intent' })).toBeVisible()
     expect(within(screen.getByRole('region', { name: 'Thread transcript' })).queryByText(prompt)).not.toBeInTheDocument()
 
     await user.click(stop)
     expect(api.abortThread).toHaveBeenCalledOnce()
     expect(api.abortThread).toHaveBeenCalledWith('thread-complete')
-    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getAllByText('Waiting for authoritative idle proof').some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.queryByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })).not.toBeInTheDocument()
   })
@@ -4037,8 +4061,8 @@ describe('Prime Continuim renderer', () => {
 
     render(<App api={api} />)
 
-    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
-    expect(screen.queryByText('Delegate a task', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    expect(await screen.findByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.queryByText('Ready', { selector: '.composer__intent' })).not.toBeInTheDocument()
     expect(screen.getAllByText('Waiting for authoritative idle proof').some((element) => !element.classList.contains('sr-only'))).toBe(true)
     expect(screen.queryByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })).not.toBeInTheDocument()
     expect(api.abortThread).not.toHaveBeenCalled()
@@ -4098,7 +4122,7 @@ describe('Prime Continuim renderer', () => {
     expect(stop).toBeEnabled()
     await user.click(stop)
     expect(api.abortThread).toHaveBeenCalledOnce()
-    expect(await screen.findByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(await screen.findByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
     expect(stop).not.toBeInTheDocument()
 
     const delayedPromptEvent = structuredClone(active)
@@ -4108,7 +4132,7 @@ describe('Prime Continuim renderer', () => {
       operation: 'prompt',
     }
     await act(async () => publish?.(delayedPromptEvent))
-    expect(screen.getByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })).not.toBeInTheDocument()
 
     await act(async () => {
@@ -4119,7 +4143,7 @@ describe('Prime Continuim renderer', () => {
       }
       await promptAdmission.promise.catch(() => undefined)
     })
-    expect(screen.getByText('Stop accepted', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Stop accepted; waiting for authoritative idle proof' })).not.toBeInTheDocument()
     expect(api.abortThread).toHaveBeenCalledOnce()
 
@@ -4136,7 +4160,7 @@ describe('Prime Continuim renderer', () => {
     idle.operations.stopResidentTurn = false
     idle.composerReceipt = { state: 'idle', message: 'Ready for a new prompt' }
     await act(async () => publish?.(idle))
-    expect(screen.queryByText('Stop accepted', { selector: '.composer__intent' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Stopping', { selector: '.composer__intent' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Delegate task' })).toBeEnabled()
     if (promptOutcome === 'response') expect(screen.getByRole('textbox', { name: 'Task brief' })).toHaveValue('')
     },
@@ -4174,7 +4198,7 @@ describe('Prime Continuim renderer', () => {
       active.composerReceipt = { state: 'sent', message: 'Prompt owned', operation: 'prompt' }
       await act(async () => publish?.(active))
       await user.click(screen.getByRole('button', { name: 'Stop the active Prime Agent turn' }))
-      expect(screen.getByText('Requesting safe stop', { selector: '.composer__intent' })).toBeVisible()
+      expect(screen.getByText('Stopping', { selector: '.composer__intent' })).toBeVisible()
       expect(screen.getByRole('button', { name: 'Safe Stop request is being sent' })).toHaveTextContent('Requesting stop')
 
       const idle = structuredClone(active)
@@ -5201,8 +5225,9 @@ describe('Prime Continuim renderer', () => {
     await user.click(screen.getByRole('button', { name: 'Open inspector' }))
     const reviewPanel = screen.getByRole('tabpanel', { name: 'Review' })
     expect(within(reviewPanel).queryByRole('button')).not.toBeInTheDocument()
-    expect(within(reviewPanel).getByRole('region', { name: 'Implement the seamless remote workbench' })).toBeVisible()
-    expect(within(reviewPanel).getByText('Working')).toBeVisible()
+    expect(within(reviewPanel).getByRole('region', { name: 'Latest result' })).toBeVisible()
+    expect(within(reviewPanel).getByText('Not reported')).toBeVisible()
+    expect(within(reviewPanel).queryByText('Working')).not.toBeInTheDocument()
     expect(within(reviewPanel).getByText('6')).toBeVisible()
     expect(within(reviewPanel).queryByText('App.tsx')).not.toBeInTheDocument()
 
@@ -5746,7 +5771,7 @@ describe('Prime Continuim renderer', () => {
 
     expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'New thread' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Running.*Seamless remote experience/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /Reconnecting.*Seamless remote experience/i })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Search projects and threads' })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
@@ -6267,7 +6292,7 @@ describe('Prime Continuim renderer', () => {
     expect(thinking?.querySelector('.message__thinking-track')).not.toBeNull()
     expect(document.querySelector('.task-state__label')).toHaveTextContent('Working')
     expect(document.querySelector('.agent-launchpad')).not.toBeInTheDocument()
-    expect(screen.getByText('Resident turn owned', { selector: '.composer__intent' })).toBeVisible()
+    expect(screen.getByText('Working', { selector: '.composer__intent' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Stop the active Prime Agent turn' })).toBeEnabled()
 
     await userEvent.setup().click(screen.getByRole('tab', { name: 'Session' }))

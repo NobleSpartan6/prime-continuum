@@ -5779,6 +5779,50 @@ describe('NativeRendererApi', () => {
     expect(published.at(-1)?.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
   })
 
+  it.each(['waiting', 'needs_approval'] as const)(
+    'keeps an exact idle resident %s state replyable through the ordinary durable prompt path',
+    async (status) => {
+      const catalog = recoveryCatalog()
+      catalog.threads[0].status = status
+      const snapshot = recoverySnapshot(catalog.threads[0], 'Prime Agent asked for more input.')
+      const bridge = {
+        bootstrap: vi.fn(() => ok({
+          cache: { version: 2, projectionHostId: 'host-local', catalog, lastSnapshot: snapshot },
+          outbox: [],
+          connection: onlineConnection(),
+          appVersion: '0.1.0',
+        })),
+        hostCatalog: vi.fn(() => ok(catalog)),
+        requestSnapshot: vi.fn(() => ok(snapshot)),
+        submitCommand: vi.fn((input: Record<string, unknown>) => ok({
+          hostId: input.expectedHostId,
+          deviceId: input.deviceId,
+          commandId: input.commandId,
+          threadId: input.threadId,
+          executionGenerationId: input.expectedExecutionGenerationId,
+          status: 'admitted',
+          durable: true,
+        })),
+        onConnectionState: vi.fn(() => () => undefined),
+        onSnapshot: vi.fn(() => () => undefined),
+        onHostEvent: vi.fn(() => () => undefined),
+        onHandoffProgress: vi.fn(() => () => undefined),
+      }
+      const api = new NativeRendererApi(bridge)
+      const view = await api.loadWorkbench()
+
+      expect(view.operations).toMatchObject({ startResidentTurn: true, stopResidentTurn: false })
+      await expect(api.sendComposer({ threadId: 'thread-one', text: 'Here is the missing context.' }))
+        .resolves.toMatchObject({ state: 'sent' })
+      expect(bridge.submitCommand).toHaveBeenCalledOnce()
+      expect(bridge.submitCommand).toHaveBeenCalledWith(expect.objectContaining({
+        threadId: 'thread-one',
+        kind: 'thread.prompt',
+        payload: { text: 'Here is the missing context.' },
+      }))
+    },
+  )
+
   it.each(['response', 'error'] as const)(
     'keeps a newer Stop through prompt idle proof and retires it only after abort proof despite a late %s',
     async (stopOutcome) => {

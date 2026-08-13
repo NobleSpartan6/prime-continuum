@@ -22,6 +22,8 @@ export interface AgentLaunchpadProps {
   hostName: string
   model?: string
   sessionState: 'ready' | 'preparing' | 'needs-input' | 'needs-recovery'
+  headline?: string
+  detail?: string
   browserReady: boolean
   skillCount?: number
   diagnosticCount?: number
@@ -56,6 +58,8 @@ export default function AgentLaunchpad({
   hostName,
   model,
   sessionState,
+  headline,
+  detail,
   browserReady,
   skillCount,
   diagnosticCount,
@@ -78,8 +82,8 @@ export default function AgentLaunchpad({
       }
     : sessionState === 'needs-input'
       ? {
-          title: 'Session needs your input',
-          detail: 'Open Session to review the current question, approval, or failure.',
+          title: 'Prime Agent is waiting for you',
+          detail: 'Reply below to continue this exact resident session.',
           icon: AlertCircle,
         }
       : sessionState === 'preparing'
@@ -99,6 +103,11 @@ export default function AgentLaunchpad({
               detail: 'ChatGPT setup is guided in-app; credentials remain on this computer.',
               icon: Bot,
             }
+  const visibleSessionPresentation = {
+    ...sessionPresentation,
+    ...(headline ? { title: headline } : {}),
+    ...(detail ? { detail } : {}),
+  }
   const modelActionAvailable = canOpenModels && (
     sessionState === 'ready' || sessionState === 'preparing'
   )
@@ -136,9 +145,9 @@ export default function AgentLaunchpad({
         </span>
         <span className="agent-launchpad__setup-copy">
           {showWorkflows
-            ? <strong>{sessionPresentation.title}</strong>
-            : <h2 id="agent-launchpad-title">{sessionPresentation.title}</h2>}
-          <small>{sessionPresentation.detail}</small>
+            ? <strong>{visibleSessionPresentation.title}</strong>
+            : <h2 id="agent-launchpad-title">{visibleSessionPresentation.title}</h2>}
+          <small>{visibleSessionPresentation.detail}</small>
         </span>
         {modelActionAvailable && (
           <button

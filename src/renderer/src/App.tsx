@@ -89,6 +89,11 @@ import { installHudClickThrough } from './hud-click-through'
 import { TranscriptBody } from './TranscriptBody'
 import { RlmDelegationPanel } from './RlmDelegationPanel'
 import { OutcomeReview, type OutcomeReviewProps } from './OutcomeReview'
+import {
+  taskRunPresentation,
+  type TaskRunIconKey,
+  type TaskRunPresentation,
+} from './TaskRunPresentation'
 import { DeferredModelsDialog } from './DeferredModelsDialog'
 import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, Suspense, lazy, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { AgentLaunchpadProps } from './AgentLaunchpad'
@@ -862,7 +867,7 @@ function taskLabel(status: TaskState): string {
     idle: 'Ready',
     running: 'Running',
     waiting: 'Waiting',
-    needs_approval: 'Needs approval',
+    needs_approval: 'Needs you',
     complete: 'Complete',
     failed: 'Failed',
   }
@@ -874,17 +879,43 @@ function taskIcon(status: TaskState): LucideIcon {
     idle: Circle,
     running: Activity,
     waiting: Clock3,
-    needs_approval: ShieldCheck,
+    needs_approval: AlertCircle,
     complete: CheckCircle2,
     failed: AlertCircle,
   }
   return icons[status]
 }
 
+function taskRunIcon(iconKey: TaskRunIconKey): LucideIcon {
+  const icons: Record<TaskRunIconKey, LucideIcon> = {
+    activity: Activity,
+    'alert-circle': AlertCircle,
+    'check-circle': CheckCircle2,
+    clock: Clock3,
+    model: Bot,
+    refresh: RefreshCw,
+    send: ArrowRight,
+    square: Square,
+    'wifi-off': WifiOff,
+  }
+  return icons[iconKey]
+}
+
+function taskRunStateClass(presentation: TaskRunPresentation): TaskState | 'stale' {
+  switch (presentation.tone) {
+    case 'active': return 'running'
+    case 'warning': return 'needs_approval'
+    case 'danger': return 'failed'
+    case 'success': return 'complete'
+    case 'muted': return 'stale'
+    case 'neutral': return 'idle'
+  }
+}
+
 type HudStatusTone = 'ready' | 'working' | 'needs-you' | 'offline' | 'done' | 'failed'
 
 interface HudStatusPresentation {
-  label: 'Ready' | 'Working' | 'Needs you' | 'Offline' | 'Done' | 'Failed'
+  label: string
   detail: string
   icon: LucideIcon
   tone: HudStatusTone
@@ -892,77 +923,28 @@ interface HudStatusPresentation {
 }
 
 function hudStatusPresentation(
-  thread: ThreadSummary,
-  connection: ConnectionState,
-  receipt: ComposerReceiptView,
+  presentation: TaskRunPresentation,
 ): HudStatusPresentation {
-  if (connection !== 'online' || receipt.state === 'waiting_for_connection') {
-    return {
-      label: 'Offline',
-      detail: 'The cached transcript is available. Return to the workbench to restore local authority.',
-      icon: WifiOff,
-      tone: 'offline',
-      needsWorkbench: true,
-    }
-  }
-  if (receipt.state === 'uncertain') {
-    return {
-      label: 'Needs you',
-      detail: 'The last control outcome is uncertain. Review authoritative state in the workbench.',
-      icon: AlertCircle,
-      tone: 'needs-you',
-      needsWorkbench: true,
-    }
-  }
-  if (receipt.state === 'rejected' || thread.status === 'failed') {
-    return {
-      label: 'Failed',
-      detail: receipt.message || 'Prime Agent reported a failure. Review the thread in the workbench.',
-      icon: AlertCircle,
-      tone: 'failed',
-      needsWorkbench: true,
-    }
-  }
-  if (thread.status === 'needs_approval' || thread.status === 'waiting') {
-    return {
-      label: 'Needs you',
-      detail: thread.status === 'needs_approval'
-        ? 'An approval needs review in the full workbench.'
-        : 'Prime Agent is waiting for input. Open the workbench for the full review surface.',
-      icon: thread.status === 'needs_approval' ? ShieldCheck : Clock3,
-      tone: 'needs-you',
-      needsWorkbench: true,
-    }
-  }
-  if (
-    thread.status === 'running' ||
-    receipt.state === 'sending' ||
-    receipt.state === 'sent' ||
-    receipt.state === 'queued'
-  ) {
-    return {
-      label: 'Working',
-      detail: 'Prime Agent is working in this resident thread.',
-      icon: Activity,
-      tone: 'working',
-      needsWorkbench: false,
-    }
-  }
-  if (thread.status === 'complete') {
-    return {
-      label: 'Done',
-      detail: 'Prime Agent completed the latest task.',
-      icon: CheckCircle2,
-      tone: 'done',
-      needsWorkbench: false,
-    }
-  }
   return {
-    label: 'Ready',
-    detail: 'Prime Agent is ready for another prompt.',
-    icon: Circle,
-    tone: 'ready',
-    needsWorkbench: false,
+    label: presentation.headline,
+    detail: presentation.detail,
+    icon: taskRunIcon(presentation.iconKey),
+    tone: presentation.kind === 'disconnected'
+      ? 'offline'
+      : presentation.tone === 'active'
+        ? 'working'
+        : presentation.tone === 'danger'
+          ? 'failed'
+          : presentation.tone === 'warning'
+            ? 'needs-you'
+            : presentation.tone === 'success'
+              ? 'done'
+              : 'ready',
+    needsWorkbench:
+      presentation.kind === 'disconnected' ||
+      presentation.kind === 'needs_attention' ||
+      presentation.kind === 'model_setup' ||
+      presentation.primaryAction?.kind === 'finish_end',
   }
 }
 
@@ -1879,11 +1861,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     surface,
   ])
 
-  const selectedResidentEndTask = residentEndTaskPresentation(
-    selectedResidentEnd,
-    selectedThread,
-    selectedResidentEndReadyForOneAction,
-  )
   const canEndResident = Boolean(
     snapshot?.operations.endResident === true &&
     selectedThreadIsMaterialized &&
@@ -1900,13 +1877,50 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     selectedThread?.status !== 'running' &&
     !canStopResidentTurn,
   )
-  const launchpadSessionState: AgentLaunchpadProps['sessionState'] = selectedSessionNeedsRecovery
-    ? 'needs-recovery'
-    : selectedThread?.status === 'waiting' || selectedThread?.status === 'needs_approval' || selectedThread?.status === 'failed'
-      ? 'needs-input'
-      : canStartResidentTurn
-        ? 'ready'
-        : 'preparing'
+  const selectedTaskRun = taskRunPresentation({
+    hostName: selectedHost?.name ?? '',
+    connection: selectedHost?.connection ?? 'offline',
+    taskState: selectedThread?.status ?? 'idle',
+    sessionEnded: selectedThread?.residentLifecycle?.state === 'ended',
+    sessionNeedsRecovery: selectedSessionNeedsRecovery,
+    endOperationPresent: selectedResidentEnd !== undefined || composerReceipt.operation === 'end',
+    endReadyToFinish: selectedResidentEndReadyForOneAction,
+    endPhase: selectedResidentEnd?.lastStatus?.phase === 'ending' ||
+      selectedResidentEnd?.lastStatus?.phase === 'kill_dispatching' ||
+      selectedResidentEnd?.lastStatus?.phase === 'kill_acknowledged' ||
+      selectedResidentEnd?.lastStatus?.phase === 'quarantined' ||
+      selectedResidentEnd?.lastStatus?.phase === 'completed'
+        ? selectedResidentEnd.lastStatus.phase
+        : undefined,
+    modelReady: Boolean(
+      selectedRuntime.session?.model &&
+      selectedRuntime.session.model !== 'unknown/unknown' &&
+      !selectedRuntime.session.model.startsWith('unknown/'),
+    ),
+    activity: {
+      live: selectedThread?.status === 'running' || selectedRuntimeHasLiveActivity,
+      fresh: selectedHost?.connection === 'online' && selectedHost.activationRequired !== true,
+      detail: selectedThread?.status === 'running' || selectedRuntimeHasLiveActivity
+        ? agentActivityPresentation(selectedRuntime, snapshot?.agents ?? []).detail
+        : undefined,
+    },
+    receipt: composerReceipt,
+    authority: {
+      verified: selectedHost?.activationRequired !== true,
+      mutation: selectedThreadIsMaterialized && selectedHost?.connection === 'online',
+      conflictingMutation: false,
+      canStart: canStartResidentTurn,
+      canStop: canStopResidentTurn,
+      canFinishEnd: selectedResidentEndReadyForOneAction,
+      canReview: selectedThreadIsMaterialized,
+      canSetUpModel: canLoadModelCatalog,
+    },
+  })
+  const launchpadSessionState: AgentLaunchpadProps['sessionState'] = selectedTaskRun.kind === 'ready'
+    ? 'ready'
+    : selectedTaskRun.kind === 'needs_attention'
+      ? selectedSessionNeedsRecovery ? 'needs-recovery' : 'needs-input'
+      : 'preparing'
   const selectedThreadUsesLaunchpad = Boolean(
     selectedThreadIsEmpty &&
     !selectedRuntimeHasLiveActivity &&
@@ -2988,16 +3002,14 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       return showBoundary('The pinned thread is not currently materialized as an attached resident Prime Agent session.')
     }
 
-    const status = hudStatusPresentation(selectedThread, selectedHost.connection, composerReceipt)
+    const status = hudStatusPresentation(selectedTaskRun)
     const sessionPresentation = hudSessionPresentation(status, selectedRuntime, snapshot.agents)
     const hasSessionFacts = Boolean(
       sessionPresentation.model ||
       sessionPresentation.activeAgentCount > 0 ||
       sessionPresentation.browserReadiness,
     )
-    const reviewActionLabel = selectedThread.status === 'needs_approval'
-      ? 'Review approval'
-      : selectedThread.status === 'waiting'
+    const reviewActionLabel = selectedThread.status === 'needs_approval' || selectedThread.status === 'waiting'
         ? 'Reply in workbench'
         : status.tone === 'failed'
           ? 'Review failure'
@@ -3142,6 +3154,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
+              presentation={selectedTaskRun}
               sessionEnded={selectedThread.residentLifecycle?.state === 'ended'}
               runtime={selectedRuntime}
               agents={snapshot.agents}
@@ -3567,26 +3580,9 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         ? connectionCopy(selectedHost.connection, selectedHost)
         : ''
   )
-  const taskStateIsStale = isDisconnected && !['complete', 'failed'].includes(selectedThread.status)
-  const visibleTaskState = selectedResidentEndTask?.label ?? (selectedSessionNeedsRecovery
-    ? 'Needs you'
-    : taskStateIsStale
-    ? `Last seen ${taskLabel(selectedThread.status).toLowerCase()}`
-    : selectedRuntimeHasLiveActivity
-    ? 'Working'
-    : taskLabel(selectedThread.status))
-  const visibleTaskStateClass = selectedResidentEndTask?.state ?? (selectedSessionNeedsRecovery
-    ? 'needs_approval'
-    : taskStateIsStale
-      ? 'stale'
-      : selectedRuntimeHasLiveActivity
-        ? 'running'
-      : selectedThread.status)
-  const VisibleTaskStateIcon = selectedResidentEndTask?.icon ?? (selectedSessionNeedsRecovery
-    ? AlertCircle
-    : selectedRuntimeHasLiveActivity
-      ? Activity
-    : taskIcon(selectedThread.status))
+  const visibleTaskState = selectedTaskRun.headline
+  const visibleTaskStateClass = taskRunStateClass(selectedTaskRun)
+  const VisibleTaskStateIcon = taskRunIcon(selectedTaskRun.iconKey)
   const sidebarExpanded = sidebarIsOverlay ? sidebarOpen : !sidebarCollapsed
   const shellStyle = {
     '--sidebar-width': `${workbenchLayout.sidebarWidth}px`,
@@ -3738,6 +3734,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         snapshot={snapshot}
         selectedProjectId={selectedProject.id}
         selectedThreadId={selectedThread.id}
+        selectedTaskRun={selectedTaskRun}
         selectedSessionNeedsRecovery={selectedSessionNeedsRecovery}
         selectedResidentEndReadyForOneAction={selectedResidentEndReadyForOneAction}
         onSelectProject={selectProject}
@@ -3899,6 +3896,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
                 hostName={selectedHost.name}
                 model={selectedRuntime.session?.model}
                 sessionState={launchpadSessionState}
+                headline={selectedTaskRun.headline}
+                detail={selectedTaskRun.detail}
                 browserReady={selectedRuntime.browserExecution?.readiness === 'ready'}
                 skillCount={selectedRuntime.session?.resourceInventory?.skills.length}
                 diagnosticCount={selectedRuntime.session?.resourceInventory
@@ -3925,12 +3924,14 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
               authorityVerified={!selectedHost.activationRequired}
               hostName={selectedHost.name}
               taskState={selectedThread.status}
+              presentation={selectedTaskRun}
               sessionEnded={selectedThread.residentLifecycle?.state === 'ended'}
               runtime={selectedRuntime}
               agents={snapshot.agents}
               onDraftChange={rememberComposerText}
               onClearValidation={clearComposerValidation}
               showTaskStarters={!selectedThreadUsesLaunchpad && !selectedRuntimeHasLiveActivity}
+              launchpadOwnsPrimaryAction={selectedThreadUsesLaunchpad}
               validationError={composerValidationError}
               receipt={composerReceipt}
               canStartTurn={canStartResidentTurn}
@@ -3958,6 +3959,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           selectedProject={selectedProject}
           selectedHost={selectedHost}
           runtime={selectedRuntime}
+          taskRun={selectedTaskRun}
           activeTab={inspectorTab}
           open={inspectorOpen}
           onTabChange={setInspectorTab}
@@ -4104,6 +4106,7 @@ interface SidebarProps {
   snapshot: WorkbenchSnapshot
   selectedProjectId: string
   selectedThreadId: string
+  selectedTaskRun: TaskRunPresentation
   selectedSessionNeedsRecovery: boolean
   selectedResidentEndReadyForOneAction: boolean
   onSelectProject: (projectId: string) => void
@@ -4137,6 +4140,7 @@ function Sidebar({
   snapshot,
   selectedProjectId,
   selectedThreadId,
+  selectedTaskRun,
   selectedSessionNeedsRecovery,
   selectedResidentEndReadyForOneAction,
   onSelectProject,
@@ -4320,8 +4324,13 @@ function Sidebar({
                   thread,
                   thread.id === selectedThreadId && selectedResidentEndReadyForOneAction,
                 )
-                const visibleState = endTask?.label ?? (needsRecovery ? 'Needs you' : taskLabel(thread.status))
-                const stateClass = endTask?.state ?? (needsRecovery ? 'needs_approval' : thread.status)
+                const selected = thread.id === selectedThreadId
+                const visibleState = selected
+                  ? selectedTaskRun.headline
+                  : endTask?.label ?? (needsRecovery ? 'Needs you' : taskLabel(thread.status))
+                const stateClass = selected
+                  ? taskRunStateClass(selectedTaskRun)
+                  : endTask?.state ?? (needsRecovery ? 'needs_approval' : thread.status)
                 return (
                   <li key={thread.id}>
                     <button
@@ -4686,12 +4695,14 @@ interface ComposerProps {
   authorityVerified: boolean
   hostName: string
   taskState: TaskState
+  presentation: TaskRunPresentation
   sessionEnded: boolean
   runtime: RuntimeSummary
   agents: WorkbenchSnapshot['agents']
   onDraftChange: (authorityKey: string, value: string) => void
   onClearValidation: () => void
   showTaskStarters?: boolean
+  launchpadOwnsPrimaryAction?: boolean
   validationError: string
   receipt: ComposerReceiptView
   canStartTurn: boolean
@@ -4708,182 +4719,37 @@ interface ComposerProps {
   onEndResident: (trigger: HTMLElement) => void
 }
 
-type SessionContinuityTone = 'ready' | 'working' | 'needs-you' | 'reconnecting' | 'ended'
-
-function sessionContinuityPresentation(
-  connection: ConnectionState,
-  authorityVerified: boolean,
-  hostName: string,
-  taskState: TaskState,
-  sessionEnded: boolean,
-  runtime: RuntimeSummary,
-  receipt: ComposerReceiptView,
-  canStartTurn: boolean,
-  sessionNeedsRecovery: boolean,
-): { label: 'Ready' | 'Starting' | 'Working' | 'Needs you' | 'Reconnecting' | 'Ending' | 'Ended'; detail: string; icon: LucideIcon; tone: SessionContinuityTone } {
-  if (sessionEnded) {
-    return {
-      label: 'Ended',
-      detail: `The resident session on ${hostName} ended. The saved thread and workspace remain available.`,
-      icon: CheckCircle2,
-      tone: 'ended',
-    }
-  }
-
-  if (connection !== 'online' || !authorityVerified) {
-    return {
-      label: 'Reconnecting',
-      detail: `Reconnecting to ${hostName}. Saved activity is available; current status is unverified.`,
-      icon: RefreshCw,
-      tone: 'reconnecting',
-    }
-  }
-
-  if (receipt.operation === 'end') {
-    if (receipt.state === 'uncertain' || receipt.state === 'rejected') {
-      return {
-        label: 'Needs you',
-        detail: `The resident End outcome on ${hostName} is unknown. Prime Continuim will not send another End; review its retained status.`,
-        icon: AlertCircle,
-        tone: 'needs-you',
-      }
-    }
-    if (receipt.state === 'idle') {
-      return {
-        label: 'Ended',
-        detail: `The resident session on ${hostName} ended. The saved thread and workspace remain available.`,
-        icon: CheckCircle2,
-        tone: 'ended',
-      }
-    }
-    if (receipt.retryable === true) {
-      return {
-        label: 'Needs you',
-        detail: 'One action left.',
-        icon: AlertCircle,
-        tone: 'needs-you',
-      }
-    }
-    return {
-      label: 'Ending',
-      detail: receipt.message || `Finishing the resident session on ${hostName}.`,
-      icon: Clock3,
-      tone: 'working',
-    }
-  }
-
-  const residentControlOperation = receipt.operation === 'prompt' || receipt.operation === 'abort'
-  if (residentControlOperation && (receipt.state === 'uncertain' || receipt.state === 'rejected')) {
-    const operation = receipt.operation === 'abort' ? 'Stop' : 'delegated task'
-    return {
-      label: 'Needs you',
-      detail: receipt.state === 'uncertain'
-        ? `The last ${operation} outcome on ${hostName} is unknown. Inspect the resident thread before another action.`
-        : `The last ${operation} request was not accepted on ${hostName}. Review the composer before trying again.`,
-      icon: AlertCircle,
-      tone: 'needs-you',
-    }
-  }
-
-  if (
-    receipt.operation === 'prompt'
-    && (receipt.state === 'sending' || receipt.state === 'sent')
-    && taskState !== 'running'
-  ) {
-    return {
-      label: 'Starting',
-      detail: receipt.state === 'sending'
-        ? `Delegating this task to Prime Agent on ${hostName}.`
-        : `Prime Agent owns this task on ${hostName}; waiting for authoritative activity.`,
-      icon: Activity,
-      tone: 'working',
-    }
-  }
-
-  if (receipt.operation === 'abort' && (receipt.state === 'sending' || receipt.state === 'sent')) {
-    return {
-      label: 'Working',
-      detail: receipt.state === 'sending'
-        ? `Requesting a safe stop on ${hostName}.`
-        : `Stop was accepted on ${hostName}; waiting for authoritative idle proof.`,
-      icon: Activity,
-      tone: 'working',
-    }
-  }
-
-  if (taskState === 'waiting' || taskState === 'needs_approval' || taskState === 'failed') {
-    return {
-      label: 'Needs you',
-      detail: taskState === 'failed'
-        ? `Prime Agent needs review on ${hostName} before work can continue.`
-        : `Prime Agent needs your input on ${hostName} before it can continue.`,
-      icon: taskState === 'needs_approval' ? ShieldCheck : AlertCircle,
-      tone: 'needs-you',
-    }
-  }
-
-  const session = runtime.session
-  const verifiedResident = Boolean(
-    session?.residency === 'resident' &&
-    session.activeSessionId &&
-    session.sessionId,
-  )
-
-  if (taskState === 'running') {
-    return {
-      label: 'Working',
-      detail: verifiedResident
-        ? `Prime Agent keeps working on ${hostName} after this window closes.`
-        : session?.residency === 'client_owned'
-          ? `Prime Agent is working on ${hostName} while this client remains attached.`
-          : `Prime Agent is working on ${hostName}. Resident offload is not verified.`,
-      icon: Activity,
-      tone: 'working',
-    }
-  }
-
-  if (verifiedResident && !canStartTurn) {
-    return {
-      label: 'Needs you',
-      detail: sessionNeedsRecovery
-        ? `Prime Agent could not attach this saved session on ${hostName}. End it, then start a new agent in this workspace.`
-        : `This resident session is not ready for a new prompt on ${hostName}.`,
-      icon: AlertCircle,
-      tone: 'needs-you',
-    }
-  }
-
-  return {
-    label: 'Ready',
-    detail: verifiedResident
-      ? `${hostName} is ready for another delegated task.`
-      : session?.residency === 'client_owned'
-        ? `${hostName} is ready. Tasks run only while this client remains attached.`
-        : `${hostName} is ready, but resident offload is not verified.`,
-    icon: taskState === 'complete' ? CheckCircle2 : Circle,
-    tone: 'ready',
-  }
-}
-
 function SessionContinuity({
   connection,
   authorityVerified,
-  hostName,
   taskState,
+  presentation,
   sessionEnded,
   runtime,
   agents,
   receipt,
-  canStartTurn,
   sessionNeedsRecovery,
   onManageSession,
-}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'hostName' | 'taskState' | 'sessionEnded' | 'runtime' | 'agents' | 'receipt' | 'canStartTurn' | 'sessionNeedsRecovery' | 'onManageSession'>) {
+}: Pick<ComposerProps, 'connection' | 'authorityVerified' | 'taskState' | 'presentation' | 'sessionEnded' | 'runtime' | 'agents' | 'receipt' | 'sessionNeedsRecovery' | 'onManageSession'>) {
   const isFresh = connection === 'online' && authorityVerified
   const reportedGoals = runtime.goals
   const activeGoal = reportedGoals?.find((goal) => goal.state === 'active')
   const interruptedGoal = reportedGoals?.find((goal) => goal.state !== 'complete')
   const displayedGoal = activeGoal ?? interruptedGoal
-  const baseContinuity = sessionContinuityPresentation(connection, authorityVerified, hostName, taskState, sessionEnded, runtime, receipt, canStartTurn, sessionNeedsRecovery)
+  const baseContinuity = {
+    label: presentation.headline,
+    detail: presentation.detail,
+    icon: taskRunIcon(presentation.iconKey),
+    tone: presentation.kind === 'ended'
+      ? 'ended' as const
+      : presentation.kind === 'disconnected'
+        ? 'reconnecting' as const
+        : presentation.tone === 'active'
+          ? 'working' as const
+          : presentation.tone === 'warning' || presentation.tone === 'danger'
+            ? 'needs-you' as const
+            : 'ready' as const,
+  }
   const activeAgents = agents.filter((agent) =>
     agent.status === 'pending' ||
     agent.status === 'queued' ||
@@ -4891,19 +4757,11 @@ function SessionContinuity({
     agent.status === 'waiting'
   )
   const activity = agentActivityPresentation(runtime, agents)
-  const sessionReportsActivity = Boolean(
-    isFresh &&
-    (baseContinuity.label === 'Ready' || baseContinuity.label === 'Starting' || baseContinuity.label === 'Working') && (
-    taskState === 'running' ||
-    ((taskState === 'idle' || taskState === 'complete') && (
-      runtimeHasLiveActivity(runtime, agents)
-    ))
-    ),
-  )
+  const sessionReportsActivity = isFresh && presentation.kind === 'working'
   const attentionCopy = sessionNeedsRecovery
-    ? 'Restart session'
+    ? 'Saved thread'
     : taskState === 'needs_approval'
-      ? 'Approval required'
+      ? 'Reply requested'
       : taskState === 'waiting'
         ? 'Input required'
         : taskState === 'failed'
@@ -4919,7 +4777,7 @@ function SessionContinuity({
         : receipt.state === 'uncertain' || receipt.state === 'rejected'
           ? 'Review required'
           : 'Finishing session'
-    : baseContinuity.label === 'Needs you'
+    : presentation.kind === 'needs_attention'
       ? attentionCopy
       : sessionReportsActivity
         ? activity.detail
@@ -4969,14 +4827,7 @@ function SessionContinuity({
     : isFresh || queueStateCopy === 'Queue state unavailable'
       ? queueStateCopy
       : `Cached · ${queueStateCopy}`
-  const continuity = sessionReportsActivity && baseContinuity.label === 'Ready'
-    ? {
-        label: 'Working' as const,
-        detail: activity.detail,
-        icon: Activity,
-        tone: 'working' as const,
-      }
-    : baseContinuity
+  const continuity = baseContinuity
 
   return (
     <section className="session-continuity" aria-label="Session status">
@@ -5055,7 +4906,7 @@ function TaskStarters({
   )
 }
 
-function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, hostName, taskState, sessionEnded, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, sessionNeedsRecovery, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
+function Composer({ authorityKey, initialText, handleRef, connection, authorityVerified, hostName, taskState, presentation, sessionEnded, runtime, agents, onDraftChange, onClearValidation, showTaskStarters = true, launchpadOwnsPrimaryAction = false, validationError, receipt, canStartTurn, canStopTurn, canEndResident, canResumeResidentEnd, sessionNeedsRecovery, residentEndPreparing, modelCatalogAvailable, onOpenModelCatalog, onManageSession, onSubmitText, onStop, onEndResident }: ComposerProps) {
   const [text, setText] = useState(initialText)
   const submissionInFlightRef = useRef(false)
   const committedAuthorityKeyRef = useRef(authorityKey)
@@ -5119,6 +4970,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   )
   const residentAttached = runtime.session?.residency === 'resident' && Boolean(runtime.session.activeSessionId && runtime.session.sessionId)
   const canStartNow = canStartTurn && !disconnected
+  const replyRequested = canStartNow && (taskState === 'waiting' || taskState === 'needs_approval')
   const canStopNow = canStopTurn && !disconnected
   const retryingStop = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable !== false
   const stopOutcomeUnknown = running && receipt.operation === 'abort' && receipt.state === 'uncertain' && receipt.retryable === false
@@ -5145,23 +4997,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
         : sessionNeedsRecovery
           ? 'Prime Agent could not attach this saved session. End it, then start a new agent.'
           : 'This resident session is not ready for a new prompt. Refresh the thread or reconnect its host.'
-  const defaultStatus = disconnected
-    ? residentControlPending
-      ? `Resident control retained · reconnect to ${hostName} for authoritative status`
-      : projectionReportsRunning
-        ? `Last reported running on ${hostName} · current status unverified`
-        : unavailableCopy
-    : running
-    ? !projectionReportsRunning && receipt.operation === 'prompt'
-      ? 'Prompt accepted · waiting for authoritative resident activity'
-      : canStopNow
-      ? 'Prime Agent is working · Stop requests a safe boundary'
-      : 'Waiting for authoritative resident activity'
-    : backgroundLiveActivity
-      ? `${agentActivityPresentation(runtime, agents).detail} · you can add direction`
-    : canStartTurn
-      ? 'Ready to delegate a task'
-      : unavailableCopy
+  const defaultStatus = presentation.detail
   const receiptStatusCopy = endWaitingForControls
     ? 'Waiting for resident controls'
     : endReadyToFinish
@@ -5185,11 +5021,16 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
     : receipt.state === 'idle' && !canAct
       ? 'waiting_for_connection'
       : receipt.state
-  const primaryLabel = endLifecyclePresent
+  const modelSetupPrimary = presentation.primaryAction?.kind === 'setup_model'
+  const modelSetupOwnedByLaunchpad = modelSetupPrimary && launchpadOwnsPrimaryAction
+  const modelSetupUnavailable = presentation.kind === 'model_setup' && !modelSetupPrimary
+  const primaryLabel = residentEndPreparing
+    ? 'Finishing…'
+    : presentation.primaryAction?.label ?? (endLifecyclePresent
     ? endCompleted
       ? 'Session ended'
       : endReadyToFinish
-        ? residentEndPreparing ? 'Finishing…' : endOutcomeUnknown ? 'Try ending again' : 'Finish ending'
+        ? endOutcomeUnknown ? 'Try ending again' : 'Finish ending'
         : endOutcomeUnknown
           ? 'End outcome unknown'
           : endWaitingForControls
@@ -5211,44 +5052,10 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
       ? 'Submitting prompt'
       : disconnected
       ? 'Reconnect to delegate'
-      : 'Delegate task'
+      : replyRequested ? 'Reply' : 'Delegate task')
   const compactComposer = controlMode
   const textareaDisabled = !canStartNow
-  const intentCopy = endLifecyclePresent
-    ? endCompleted
-      ? 'Resident session ended'
-      : endReadyToFinish
-        ? endOutcomeUnknown ? 'End needs one retry' : 'Ready to close'
-        : endOutcomeUnknown
-          ? 'End outcome unknown'
-          : endWaitingForControls
-            ? 'End saved'
-          : 'Finishing resident session'
-    : stopOutcomeUnknown
-    ? 'Stop needs review'
-    : retryingStop
-      ? 'Stop outcome uncertain'
-      : stopSending
-        ? 'Requesting safe stop'
-        : stopAwaitingProof
-          ? 'Stop accepted'
-          : promptOutcomeUnknown
-            ? 'Prompt outcome uncertain'
-            : promptSending
-              ? 'Admitting resident prompt'
-              : promptAwaitingProof
-                ? 'Prompt owned by Prime Agent'
-                   : running
-                  ? disconnected
-                    ? 'Resident status unverified'
-                    : projectionReportsRunning
-                      ? 'Active resident turn'
-                      : 'Resident turn owned'
-                  : sessionNeedsRecovery
-                    ? 'Session needs a restart'
-                    : backgroundLiveActivity
-                      ? 'Working'
-                      : 'Delegate a task'
+  const intentCopy = presentation.headline
 
   if (endCompleted) {
     return (
@@ -5256,13 +5063,12 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
         <SessionContinuity
           connection={connection}
           authorityVerified={authorityVerified}
-          hostName={hostName}
           taskState={taskState}
+          presentation={presentation}
           sessionEnded={sessionEnded}
           runtime={runtime}
           agents={agents}
           receipt={receipt}
-          canStartTurn={canStartTurn}
           sessionNeedsRecovery={sessionNeedsRecovery}
           onManageSession={onManageSession}
         />
@@ -5273,7 +5079,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
   return (
     <footer className={cx('composer-wrap', compactComposer && 'composer-wrap--compact')}>
       {!endLifecyclePresent && !abortControlPending && (
-        <SessionContinuity connection={connection} authorityVerified={authorityVerified} hostName={hostName} taskState={taskState} sessionEnded={sessionEnded} runtime={runtime} agents={agents} receipt={receipt} canStartTurn={canStartTurn} sessionNeedsRecovery={sessionNeedsRecovery} onManageSession={onManageSession} />
+        <SessionContinuity connection={connection} authorityVerified={authorityVerified} taskState={taskState} presentation={presentation} sessionEnded={sessionEnded} runtime={runtime} agents={agents} receipt={receipt} sessionNeedsRecovery={sessionNeedsRecovery} onManageSession={onManageSession} />
       )}
       {!compactComposer && showTaskStarters && (
         <TaskStarters
@@ -5368,7 +5174,9 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
               placeholder={disconnected
                 ? 'Reconnect to verify this resident session'
                 : canStartNow
-                  ? backgroundLiveActivity
+                  ? replyRequested
+                    ? 'Add the context Prime Agent needs…'
+                    : backgroundLiveActivity
                     ? 'Add direction, constraints, or another outcome…'
                     : 'Describe the outcome, constraints, and done criteria…'
                   : 'Resident prompt unavailable'}
@@ -5397,7 +5205,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 Review status
               </button>
             )}
-            {modelCatalogAvailable && !endLifecyclePresent && (
+            {modelCatalogAvailable && !endLifecyclePresent && !modelSetupPrimary && (
               <button
                 className="model-chip"
                 type="button"
@@ -5422,24 +5230,32 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 ? disconnected
                   ? unavailableCopy
                   : 'Stop asks Prime Agent to end at the next safe boundary'
+                : modelSetupPrimary
+                  ? 'Choose a model before delegating this task'
                 : canStartNow
-                  ? 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
+                  ? replyRequested
+                    ? 'Reply continues this exact resident session · Ctrl or ⌘ + Enter'
+                    : 'Include the outcome, constraints, and done criteria · Ctrl or ⌘ + Enter'
                   : unavailableCopy}
             </span>
           </div>
           <div className="composer__primary-actions">
-            {((!endLifecyclePresent && !stopAwaitingProof && !stopOutcomeUnknown) || endReadyToFinish) && (
+            {((!endLifecyclePresent && !stopAwaitingProof && !stopOutcomeUnknown) || endReadyToFinish) &&
+              !modelSetupOwnedByLaunchpad &&
+              !modelSetupUnavailable && (
             <button
               id="resident-turn-primary"
               className={cx(
                 'button',
                 endReadyToFinish ? 'button--primary' : controlMode ? 'button--stop' : 'button--primary',
-                !controlMode && !text.trim() && 'button--empty',
+                !controlMode && !modelSetupPrimary && !text.trim() && 'button--empty',
               )}
-              type={controlMode ? 'button' : 'submit'}
-              disabled={(endLifecyclePresent && (!endReadyToFinish || residentEndPreparing)) || (!endLifecyclePresent && (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending))}
+              type={controlMode || modelSetupPrimary ? 'button' : 'submit'}
+              disabled={!modelSetupPrimary && ((endLifecyclePresent && (!endReadyToFinish || residentEndPreparing)) || (!endLifecyclePresent && (running ? !canStopNow || stopSending || stopAwaitingProof || stopOutcomeUnknown : !canStartNow || promptSending)))}
               aria-busy={endLifecyclePresent && residentEndPreparing ? true : undefined}
-              aria-label={endLifecyclePresent
+              aria-label={modelSetupPrimary
+                ? 'Open models and accounts to choose a model'
+                : endLifecyclePresent
                 ? endCompleted
                   ? 'Resident session ended; the saved thread and workspace remain available'
                   : endReadyToFinish
@@ -5468,11 +5284,15 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
                 : promptSending
                   ? 'Prompt is awaiting durable host admission'
                   : undefined}
-              onClick={endReadyToFinish
+              onClick={modelSetupPrimary
+                ? (event) => onOpenModelCatalog(event.currentTarget)
+                : endReadyToFinish
                 ? (event) => onEndResident(event.currentTarget)
                 : !endLifecyclePresent && running ? onStop : undefined}
             >
-              {endLifecyclePresent
+              {modelSetupPrimary
+                ? <Icon icon={Bot} size={15} />
+                : endLifecyclePresent
                 ? endCompleted
                   ? <Icon icon={Check} size={15} />
                   : endReadyToFinish
@@ -5507,6 +5327,7 @@ interface InspectorProps {
   selectedProject: WorkbenchSnapshot['projects'][number]
   selectedHost: HostSummary
   runtime: RuntimeSummary
+  taskRun: TaskRunPresentation
   activeTab: InspectorTab
   open: boolean
   onTabChange: (tab: InspectorTab) => void
@@ -5522,7 +5343,7 @@ interface InspectorProps {
   onEndResident: (trigger: HTMLElement, recovery?: ResidentLifecycleOperationSummary) => void
 }
 
-function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHost, runtime, activeTab, open, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentLifecycleBusy, residentEndPreparing, residentEndError, onCheckResident, onEndResident }: InspectorProps) {
+function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHost, runtime, taskRun, activeTab, open, onTabChange, onClose, containerRef, modal, inert, canEndResident, residentLifecycleBusy, residentEndPreparing, residentEndError, onCheckResident, onEndResident }: InspectorProps) {
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const activateRelativeTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex = index
@@ -5586,6 +5407,7 @@ function Inspector({ api, snapshot, selectedThread, selectedProject, selectedHos
           selectedProject={selectedProject}
           selectedHost={selectedHost}
           runtime={runtime}
+          taskRun={taskRun}
           activeTab={activeTab}
           open={open}
           canEndResident={canEndResident}
@@ -5608,6 +5430,7 @@ type InspectorPanelContentProps = Pick<
   | 'selectedProject'
   | 'selectedHost'
   | 'runtime'
+  | 'taskRun'
   | 'activeTab'
   | 'open'
   | 'canEndResident'
@@ -5625,6 +5448,7 @@ const InspectorPanelContent = memo(function InspectorPanelContent({
   selectedProject,
   selectedHost,
   runtime,
+  taskRun,
   activeTab,
   canEndResident,
   residentLifecycleBusy,
@@ -5640,6 +5464,7 @@ const InspectorPanelContent = memo(function InspectorPanelContent({
         thread={selectedThread}
         project={selectedProject}
         runtime={runtime}
+        taskRun={taskRun}
         environment={api.environment}
       />
     )
@@ -5652,6 +5477,7 @@ const InspectorPanelContent = memo(function InspectorPanelContent({
         thread={selectedThread}
         host={selectedHost}
         runtime={runtime}
+        taskRun={taskRun}
         canEndResident={canEndResident}
         residentLifecycleBusy={residentLifecycleBusy}
         endPreparing={residentEndPreparing}
@@ -5709,6 +5535,7 @@ function outcomeReviewProps(
   thread: ThreadSummary,
   project: WorkbenchSnapshot['projects'][number],
   runtime: RuntimeSummary,
+  taskRun: TaskRunPresentation,
   environment: RendererApi['environment'],
 ): OutcomeReviewProps {
   const exactOutcome = snapshot.latestTurnOutcome
@@ -5716,15 +5543,21 @@ function outcomeReviewProps(
   // may only decorate an exact prior outcome while both share the same cursor;
   // otherwise a later turn could be presented as evidence for an older one.
   const currentTelemetryMatchesOutcome = !exactOutcome || outcomeCursorIsCurrent(snapshot)
-  const activeGoal = currentTelemetryMatchesOutcome
+  const currentTaskIsWorking = taskRun.kind === 'working'
+  const currentTaskIsComplete = taskRun.kind === 'complete'
+  const currentTaskNeedsReview = taskRun.kind === 'needs_attention'
+  const activeGoal = currentTelemetryMatchesOutcome && currentTaskIsWorking
     ? runtime.goals?.find((goal) => goal.state === 'active')
     : undefined
   const onlyGoal = currentTelemetryMatchesOutcome && runtime.goals?.length === 1
     ? runtime.goals[0]
     : undefined
-  const terminalGoal = activeGoal || (onlyGoal?.state !== 'complete' && onlyGoal?.state !== 'error')
-    ? undefined
-    : onlyGoal
+  const terminalGoal = (
+    (onlyGoal?.state === 'complete' && currentTaskIsComplete) ||
+    (onlyGoal?.state === 'error' && currentTaskNeedsReview)
+  )
+    ? onlyGoal
+    : undefined
   const displayedGoal = activeGoal ?? terminalGoal
   const terminalAssistant = exactOutcome?.terminalAssistant
   // Preview fixtures have explicit authored evidence. Native Git/check values
@@ -5740,24 +5573,14 @@ function outcomeReviewProps(
     : undefined
   const hasLiveRuntimeActivity = Boolean(
     currentTelemetryMatchesOutcome &&
-    snapshot.snapshotAuthority?.source !== 'cached'
-    && (
-      Boolean(activeGoal)
-      || runtime.session?.isStreaming
-      || runtime.session?.isCompacting
-      || runtime.session?.isBashRunning
-      || (runtime.session?.queuedActionCount ?? 0) > 0
-      || snapshot.agents.some((agent) => agent.status === 'running' || agent.status === 'waiting')
-      || snapshot.evidence.some((item) => item.status === 'running')
-      || promptReceiptState === 'sending'
-      || promptReceiptState === 'sent'
-      || promptReceiptState === 'queued'
-    ),
+    snapshot.snapshotAuthority?.source !== 'cached' &&
+    currentTaskIsWorking,
   )
   const needsReview = Boolean(
     currentTelemetryMatchesOutcome
     && (
-    thread.status === 'needs_approval'
+    currentTaskNeedsReview
+    || thread.status === 'needs_approval'
     || thread.status === 'failed'
     || snapshot.attention.some((item) => item.threadId === thread.id)
     || snapshot.evidence.some((item) => item.status === 'warning')
@@ -5804,15 +5627,17 @@ function ReviewPanel({
   thread,
   project,
   runtime,
+  taskRun,
   environment,
 }: {
   snapshot: WorkbenchSnapshot
   thread: ThreadSummary
   project: WorkbenchSnapshot['projects'][number]
   runtime: RuntimeSummary
+  taskRun: TaskRunPresentation
   environment: RendererApi['environment']
 }) {
-  const outcome = outcomeReviewProps(snapshot, thread, project, runtime, environment)
+  const outcome = outcomeReviewProps(snapshot, thread, project, runtime, taskRun, environment)
   return (
     <div className="inspector-content inspector-content--review">
       <OutcomeReview {...outcome} />
@@ -5896,6 +5721,7 @@ function RuntimePanel({
   thread,
   host,
   runtime,
+  taskRun,
   canEndResident,
   residentLifecycleBusy,
   endPreparing,
@@ -5907,6 +5733,7 @@ function RuntimePanel({
   thread: ThreadSummary
   host: HostSummary
   runtime: RuntimeSummary
+  taskRun: TaskRunPresentation
   canEndResident: boolean
   residentLifecycleBusy: boolean
   endPreparing: boolean
@@ -6021,7 +5848,7 @@ function RuntimePanel({
               </dd>
             </div>
           )}
-          <div><dt>Turn</dt><dd>{residentEndPresentation?.label ?? (isFresh && runtimeHasLiveActivity(runtime, reportedAgents) ? 'Working' : taskLabel(thread.status))}</dd></div>
+          <div><dt>Turn</dt><dd>{taskRun.headline}</dd></div>
           <div><dt>Continuity</dt><dd>{continuityCopy}</dd></div>
         </dl>
         {(sessionId || thread.executionGenerationId || thread.workspaceId) && (

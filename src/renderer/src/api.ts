@@ -2642,9 +2642,7 @@ function nativeProjection(input: NativeProjectionInput): WorkbenchSnapshot {
     !residentTurnActive &&
     !retainedPromptOwned &&
     !promptDispatchPending &&
-    !abortCommandPending &&
-    selectedThread?.status !== 'waiting' &&
-    selectedThread?.status !== 'needs_approval',
+    !abortCommandPending,
   )
   const activeAccountHostReady = Boolean(
     activeHostHasAuthority && (!selectedThread || selectedHostHasAuthority),
