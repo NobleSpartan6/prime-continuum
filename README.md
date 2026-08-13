@@ -44,7 +44,7 @@ The first run may download and verify the repository's pinned Node and Prime Age
 4. Select an available model, write the task, and choose **Delegate task**.
 5. Open **Session** to follow RLM branches, browser readiness, and runtime state.
 
-Closing the window detaches the UI; it does not end a resident session. Use **End resident session** when you want Prime Agent to stop while preserving the task, transcript, and workspace files.
+Closing the window detaches the UI; it does not end a resident session. Use **End session** when you want Prime Agent to stop while preserving the task, transcript, and workspace files.
 
 ## Development
 

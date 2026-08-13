@@ -88,7 +88,6 @@ const COMPOSER_SELECTOR = "#thread-composer";
 const PRIMARY_ACTION_SELECTOR = "#resident-turn-primary";
 const VISIBLE_ASSISTANT_BODY_SELECTOR = "#thread-transcript .message--assistant.message--streaming .message__body";
 const INSPECTOR_OPEN_SELECTOR = 'button[aria-label="Open inspector"]';
-const END_CONFIRMATION_SELECTOR = '.resident-end-dialog__confirmation input[type="checkbox"]';
 const UIA_CLOSE_HELPER_SOURCE = String.raw`
 using System;
 using System.Collections.Generic;
@@ -520,10 +519,8 @@ try {
     await controller.clickVisible(INSPECTOR_OPEN_SELECTOR, 30_000);
   }
   await controller.clickVisibleText("button", "Runtime", 30_000);
-  await controller.clickVisibleText("button", "End resident session…", 30_000);
-  await controller.clickVisible(END_CONFIRMATION_SELECTOR, 30_000);
   runState.endOutcomeUncertain = true;
-  await controller.clickVisibleText("button", "End resident session", 30_000);
+  await controller.clickVisibleText("button", "End session", 30_000);
   const terminalProjection = await controller.waitForSnapshot({ threadId: THREAD_ID }, (snapshot) =>
     snapshot?.residentLifecycle?.state === "ended" && snapshot?.runtime === undefined,
   END_DEADLINE_MS);

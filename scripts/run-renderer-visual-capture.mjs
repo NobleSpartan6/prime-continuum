@@ -33,8 +33,6 @@ const expectedTargets = [
   ['ssh-registered-workspace-dialog-short-320', 320, 256, 'ssh-registered-workspace', undefined],
   ['resident-dialog-390', 390, 844, 'resident-start', undefined],
   ['resident-dialog-short-320', 320, 256, 'resident-start', undefined],
-  ['resident-end-dialog-390', 390, 844, 'resident-end-review', undefined],
-  ['resident-end-dialog-short-320', 320, 256, 'resident-end-review', undefined],
   ['resident-recovery-320', 320, 704, 'resident-recovery', undefined],
   ['resident-recovery-short-320', 320, 256, 'resident-recovery', undefined],
   ['candidate-evaluation-dialog-390', 390, 844, 'candidate-evaluation-review', undefined],
@@ -55,6 +53,8 @@ const obsoleteCaptures = [
   'codex-signed-out-short-320.png',
   'codex-ready-390.png',
   'codex-ready-short-320.png',
+  'resident-end-dialog-390.png',
+  'resident-end-dialog-short-320.png',
 ]
 
 // Hostd owns a separate pinned Node executable, but a developer shell can
@@ -145,8 +145,6 @@ for (const [name, width, height, visualState, surface] of expectedTargets) {
       !(result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogScrollHeight >
         result.stateEvidence?.registeredWorkspaceTriggerEvidence?.catalogClientHeight)
     )) ||
-    ((name === 'resident-end-dialog-390' || name === 'resident-end-dialog-short-320') && result.stateEvidence?.residentEndDialogOpen !== true) ||
-    (name === 'resident-end-dialog-short-320' && result.stateEvidence?.residentEndDialogContentReachable !== true) ||
     ((name === 'candidate-evaluation-dialog-390' || name === 'candidate-evaluation-dialog-short-320') && result.stateEvidence?.candidateEvaluationDialogOpen !== true) ||
     (name === 'candidate-evaluation-dialog-short-320' && result.stateEvidence?.candidateEvaluationDialogContentReachable !== true) ||
     ((name.startsWith('model-selection-dialog-') || name.startsWith('prime-oauth-dialog-')) && (

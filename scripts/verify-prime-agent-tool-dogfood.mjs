@@ -252,7 +252,7 @@ try {
 
   runState.stage = "cleanup";
   stderr.write(
-    "Restart and no-replay proof passed. In the reopened app, open Session, choose End resident session…, and confirm End session. " +
+    "Restart and no-replay proof passed. In the reopened app, open Session and choose End session once. " +
     "Do not quit the app yet. Waiting for exact terminal lifecycle evidence…\n",
   );
   const ended = await waitForEndedResident(

@@ -3968,23 +3968,17 @@ dialog.sheet--resident {
   inline-size: min(calc(100% - 2rem), 34rem);
 }
 
-dialog.sheet--resident-end {
-  inline-size: min(calc(100% - 2rem), 40rem);
-}
-
 dialog.sheet--candidate-evaluation {
   inline-size: min(calc(100% - 2rem), 42rem);
 }
 
 .sheet--resident .sheet__frame,
-.sheet--resident-end .sheet__frame,
 .sheet--candidate-evaluation .sheet__frame {
   block-size: auto;
   max-block-size: min(calc(100dvh - 2rem), 38rem);
 }
 
 .sheet--resident .sheet__scroll,
-.sheet--resident-end .sheet__scroll,
 .sheet--candidate-evaluation .sheet__scroll {
   max-block-size: min(24rem, calc(100dvh - 12rem));
 }
@@ -3992,13 +3986,6 @@ dialog.sheet--candidate-evaluation {
 .sheet__title-icon--warning {
   color: var(--color-warning);
   background: var(--color-warning-soft);
-}
-
-.resident-end-dialog__body {
-  display: grid;
-  grid-auto-rows: max-content;
-  align-content: start;
-  gap: 0.75rem;
 }
 
 .candidate-evaluation-dialog__body {
@@ -4027,54 +4014,6 @@ dialog.sheet--candidate-evaluation {
   block-size: 1rem;
   margin-block-start: 0.15rem;
   accent-color: var(--color-accent);
-}
-
-.resident-end-dialog__distinction {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 0.55rem;
-  padding-block: 0.7rem;
-  color: var(--color-text-secondary);
-  background: transparent;
-  border-block-start: 1px solid var(--color-border);
-  border-radius: 0;
-  font-size: var(--font-meta);
-  line-height: 1.4;
-}
-
-.resident-end-dialog__distinction svg {
-  color: var(--color-warning);
-}
-
-.resident-end-dialog__distinction span {
-  min-inline-size: 0;
-}
-
-.resident-end-dialog__confirmation {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
-  min-block-size: 3rem;
-  gap: 0.65rem;
-  padding: 0.75rem 0.8rem;
-  background: var(--color-surface-raised);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  font-size: var(--font-ui);
-  font-weight: 560;
-  line-height: 1.4;
-}
-
-.resident-end-dialog__confirmation:has(input:focus-visible) {
-  outline: 2px solid var(--color-focus);
-  outline-offset: 2px;
-}
-
-.resident-end-dialog__confirmation input {
-  inline-size: 1rem;
-  block-size: 1rem;
-  margin-block-start: 0.12rem;
 }
 
 .resident-provision__fields {
@@ -6912,7 +6851,6 @@ body[data-surface="hud"] {
 
   .empty-workbench__actions .button,
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button,
   .sheet--candidate-evaluation .sheet__footer .button {
     inline-size: 100%;
   }
@@ -7514,40 +7452,33 @@ body[data-surface="hud"] {
   }
 
   dialog.sheet--resident,
-  dialog.sheet--resident-end,
   dialog.sheet--candidate-evaluation {
     max-block-size: calc(100dvh - 0.5rem);
   }
 
   .sheet--resident .sheet__frame,
-  .sheet--resident-end .sheet__frame,
   .sheet--candidate-evaluation .sheet__frame {
     max-block-size: calc(100dvh - 0.5rem);
   }
 
   .sheet--resident .sheet__header,
   .sheet--resident .sheet__footer,
-  .sheet--resident-end .sheet__header,
-  .sheet--resident-end .sheet__footer,
   .sheet--candidate-evaluation .sheet__header,
   .sheet--candidate-evaluation .sheet__footer {
     padding: 0.5rem 0.75rem;
   }
 
   .sheet--resident .sheet__header,
-  .sheet--resident-end .sheet__header,
   .sheet--candidate-evaluation .sheet__header {
     min-block-size: 3.25rem;
   }
 
   .sheet--resident .sheet__title-icon,
-  .sheet--resident-end .sheet__title-icon,
   .sheet--candidate-evaluation .sheet__title-icon {
     display: none;
   }
 
   .sheet--resident .sheet__title-group p,
-  .sheet--resident-end .sheet__title-group p,
   .sheet--candidate-evaluation .sheet__title-group p {
     display: -webkit-box;
     overflow: hidden;
@@ -7571,14 +7502,12 @@ body[data-surface="hud"] {
   }
 
   .sheet--resident .sheet__scroll,
-  .sheet--resident-end .sheet__scroll,
   .sheet--candidate-evaluation .sheet__scroll {
     max-block-size: none;
     padding: 0.65rem 0.75rem;
   }
 
   .sheet--resident .sheet__footer,
-  .sheet--resident-end .sheet__footer,
   .sheet--candidate-evaluation .sheet__footer {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -7590,7 +7519,6 @@ body[data-surface="hud"] {
   }
 
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button,
   .sheet--candidate-evaluation .sheet__footer .button {
     inline-size: 100%;
     min-block-size: 2.25rem;
@@ -7598,7 +7526,6 @@ body[data-surface="hud"] {
   }
 
   .sheet--resident .sheet__footer .button svg,
-  .sheet--resident-end .sheet__footer .button svg,
   .sheet--candidate-evaluation .sheet__footer .button svg {
     display: none;
   }
@@ -7616,13 +7543,11 @@ body[data-surface="hud"] {
 
 @media (max-width: 38rem) and (max-height: 28rem) {
   .sheet--resident .sheet__footer,
-  .sheet--resident-end .sheet__footer,
   .sheet--candidate-evaluation .sheet__footer {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button,
   .sheet--candidate-evaluation .sheet__footer .button {
     min-inline-size: 0;
     white-space: normal;
@@ -8565,8 +8490,7 @@ dialog.sheet::backdrop {
   padding-inline: 2.7rem 0.1rem;
 }
 
-.resident-provision__fixed-details,
-.resident-end-dialog__impact {
+.resident-provision__fixed-details {
   display: grid;
   gap: 0;
   margin: 0;
@@ -8576,15 +8500,7 @@ dialog.sheet::backdrop {
   border-radius: var(--radius-md);
 }
 
-.resident-end-dialog__impact {
-  overflow: visible;
-  background: transparent;
-  border: 0;
-  border-radius: 0;
-}
-
-.resident-provision__fixed-details > div,
-.resident-end-dialog__impact > div {
+.resident-provision__fixed-details > div {
   display: grid;
   grid-template-columns: minmax(5rem, 0.45fr) minmax(0, 1fr);
   align-items: center;
@@ -8593,41 +8509,17 @@ dialog.sheet::backdrop {
   padding: 0.7rem 0.8rem;
 }
 
-.resident-provision__fixed-details > div + div,
-.resident-end-dialog__impact > div + div {
+.resident-provision__fixed-details > div + div {
   border-block-start: 1px solid var(--color-border);
 }
 
-.resident-end-dialog__impact > div {
-  min-block-size: 2.75rem;
-  padding-inline: 0;
-}
-
-.resident-provision__fixed-details dd,
-.resident-end-dialog__impact dd {
+.resident-provision__fixed-details dd {
   min-inline-size: 0;
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--color-text);
   font-size: var(--font-ui);
   font-weight: 540;
-}
-
-.resident-end-dialog__impact dt {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--color-text-secondary);
-  font-size: var(--font-meta);
-  font-weight: 620;
-}
-
-.resident-end-dialog__impact dt svg {
-  color: var(--color-accent);
-}
-
-.resident-end-dialog__impact > div:first-child dt svg {
-  color: var(--color-warning);
 }
 
 .candidate-evaluation__boundary--dialog,
@@ -8638,7 +8530,6 @@ dialog.sheet::backdrop {
 }
 
 .candidate-evaluation-dialog__confirmation,
-.resident-end-dialog__confirmation,
 .consent-row,
 .choice-list label {
   padding: 0.8rem;
@@ -8648,7 +8539,6 @@ dialog.sheet::backdrop {
 }
 
 .candidate-evaluation-dialog__confirmation:has(input:checked),
-.resident-end-dialog__confirmation:has(input:checked),
 .consent-row:has(input:checked),
 .choice-list label:has(input:checked) {
   background: var(--color-surface-accent);
@@ -8751,8 +8641,7 @@ dialog.sheet::backdrop {
     padding-inline: 0;
   }
 
-  .resident-provision__fixed-details > div,
-  .resident-end-dialog__impact > div {
+  .resident-provision__fixed-details > div {
     grid-template-columns: 1fr;
     gap: 0.2rem;
   }
@@ -8768,14 +8657,12 @@ dialog.sheet::backdrop {
 
 @media (max-width: 38rem) and (min-height: 28.01rem) {
   .sheet--resident .sheet__footer,
-  .sheet--resident-end .sheet__footer,
   .sheet--candidate-evaluation .sheet__footer {
     align-items: center;
     flex-direction: row;
   }
 
   .sheet--resident .sheet__footer .button,
-  .sheet--resident-end .sheet__footer .button,
   .sheet--candidate-evaluation .sheet__footer .button {
     inline-size: auto;
   }
@@ -9671,10 +9558,6 @@ dialog.sheet::backdrop {
 
 .sheet__footer {
   background: color-mix(in oklch, var(--color-surface) 82%, var(--color-surface-raised));
-}
-
-.resident-end-dialog__impact > div {
-  min-block-size: 3rem;
 }
 
 @media (max-width: 46rem) {

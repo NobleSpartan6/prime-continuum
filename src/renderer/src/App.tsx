@@ -62,7 +62,6 @@ import {
   type LocalSetupStage,
   type LocalSetupSummary,
   type RendererApi,
-  type ResidentEndPreparation,
   type ResidentLifecycleOperationSummary,
   type ResidentWorkspacePreselection,
   type ResidentWorkspaceSelection,
@@ -137,12 +136,6 @@ type ResidentThreadFocusTarget = Pick<
   ResidentLifecycleStatusResult,
   'expectedHostId' | 'threadId' | 'executionGenerationId'
 >
-type ResidentEndDialogContext = {
-  preparation: ResidentEndPreparation
-  threadTitle: string
-  hostName: string
-  inactiveRecovery: boolean
-}
 const PRIME_AGENT_INSTALL_COMMAND = 'curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh'
 const EMPTY_COMPOSER_ERROR = 'Describe the task before delegating to Prime Agent.'
 const MAX_COMPOSER_DRAFTS = 128
@@ -513,13 +506,13 @@ function residentLifecycleMutationBlockedDetail(
     return 'Open the saved workspace and its original source thread to continue. You can still check the exact setup status here.'
   }
   if (block === 'active_resident') {
-    return 'Another resident session owns this workspace. Open or select the resident thread, then choose End resident session in Session. You can still check this exact status here.'
+    return 'Another resident session owns this workspace. Open or select that thread, then choose End session in Session. You can still check its status here.'
   }
   if (block === 'setup_recovery') {
     return 'Another resident setup holds this workspace. Continue or inspect that setup before resuming this one. You can still check this exact status here.'
   }
   if (block === 'target_not_selected') {
-    return 'Open or select the resident thread, then choose End resident session in Session. You can still check this exact end status here.'
+    return 'Open or select the resident thread, then choose End session in Session. You can still check its end status here.'
   }
   return operationKind === 'end'
     ? 'Resident end control is unavailable for this verified host. You can still check the exact end status here.'
@@ -1371,7 +1364,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const [residentLifecycleFeedback, setResidentLifecycleFeedback] = useState('')
   const [residentRecoveryReference, setResidentRecoveryReference] = useState<ResidentLifecycleRecoveryReference | null>(null)
   const [residentThreadFocusTarget, setResidentThreadFocusTarget] = useState<ResidentThreadFocusTarget | null>(null)
-  const [residentEndContext, setResidentEndContext] = useState<ResidentEndDialogContext | null>(null)
   const [residentEndPreparing, setResidentEndPreparing] = useState(false)
   const [residentEndError, setResidentEndError] = useState('')
   const [moveThreadOpen, setMoveThreadOpen] = useState(false)
@@ -1391,7 +1383,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
   const localSetupDiagnosticRequestRef = useRef(0)
   const residentPreselectionAttemptedRef = useRef(new Set<string>())
   const previousLocalSetupStageRef = useRef<LocalSetupStage | undefined>(undefined)
-  const residentEndReturnTargetRef = useRef<HTMLElement | null>(null)
   const locationTriggerRef = useRef<HTMLSelectElement>(null)
   const moveThreadTriggerRef = useRef<HTMLElement>(null)
   const sidebarToggleRef = useRef<HTMLButtonElement>(null)
@@ -2030,21 +2021,8 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
     ) {
       setResidentThreadFocusTarget(null)
     }
-    if (
-      activeResidentLifecycleHostId &&
-      residentEndContext &&
-      (
-        residentEndContext.preparation.expectedHostId !== activeResidentLifecycleHostId ||
-        !selectedThread ||
-        (selectedThread.remoteId ?? selectedThread.id) !== residentEndContext.preparation.threadId ||
-        selectedThread.executionGenerationId !== residentEndContext.preparation.executionGenerationId
-      )
-    ) {
-      setResidentEndContext(null)
-    }
   }, [
     activeResidentLifecycleHostId,
-    residentEndContext,
     residentRecoveryReference,
     residentThreadFocusTarget,
     residentProvisionOrigin,
@@ -2584,7 +2562,7 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       )
       if (conflictingAuthority) {
         setResidentWorkspaceError(conflictingAuthority === 'active_resident'
-          ? 'Open or select the resident thread that owns this workspace, then choose End resident session in Session before creating another thread.'
+          ? 'Open or select the resident thread that owns this workspace, then choose End session in Session before creating another thread.'
           : 'Continue or inspect the earlier resident setup for this workspace before starting another thread.')
         window.requestAnimationFrame(() => trigger.focus())
         return
@@ -2809,9 +2787,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
           candidate.executionGenerationId === recoveryEnd.executionGenerationId,
         )
       : selectedThread
-    const host = snapshot?.hosts.find((candidate) =>
-      candidate.id === (recoveryEnd?.expectedHostId ?? thread?.hostId),
-    )
     const expectedHostId = recoveryEnd?.expectedHostId ?? thread?.hostId
     const projectId = recoveryEnd?.projectId ?? thread?.projectId
     const workspaceId = recoveryEnd?.workspaceId ?? thread?.workspaceId
@@ -2822,11 +2797,10 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
       window.requestAnimationFrame(() => trigger.focus())
       return
     }
-    residentEndReturnTargetRef.current = trigger
     setResidentEndError('')
     setResidentEndPreparing(true)
     try {
-      const preparation = await api.prepareResidentEnd({
+      let preparation = await api.prepareResidentEnd({
         expectedHostId,
         projectId,
         workspaceId,
@@ -2834,42 +2808,46 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         executionGenerationId,
         ...(recoveryEnd ? { resumeOperationId: recoveryEnd.operationId } : {}),
       })
-      if (recoveryEnd?.lastStatus?.phase === 'ending' || recoveryEnd?.state === 'outcome_unknown') {
-        const status = await api.endResident({
+      let status = await api.endResident({
+        confirmationToken: preparation.confirmationToken,
+        consent: true,
+      })
+      // A fresh End may first persist the one-use request without dispatching
+      // it. Continue that same operation once so the user action remains one
+      // click; the host's durable operation identity prevents another kill.
+      if (!recoveryEnd && status.phase === 'ending') {
+        preparation = await api.prepareResidentEnd({
+          expectedHostId: status.expectedHostId,
+          projectId: status.projectId,
+          workspaceId: status.workspaceId,
+          threadId: status.threadId,
+          executionGenerationId: status.executionGenerationId,
+          resumeOperationId: status.operationId,
+        })
+        status = await api.endResident({
           confirmationToken: preparation.confirmationToken,
           consent: true,
         })
-        setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
-        if (status.phase === 'completed') {
-          setResidentThreadFocusTarget({
-            expectedHostId: status.expectedHostId,
-            threadId: status.threadId,
-            executionGenerationId: status.executionGenerationId,
-          })
-        } else {
-          window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
-        }
-        return
       }
-      setResidentEndContext({
-        preparation,
-        threadTitle: thread?.title ?? 'Resident thread',
-        hostName: host?.name ?? 'this computer',
-        inactiveRecovery: Boolean(
-          !recoveryEnd &&
-          thread?.id === selectedThread?.id &&
-          canEndResident &&
-          !canStartResidentTurn &&
-          selectedRuntime.session?.residency === 'resident'
-        ),
-      })
+      setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
+      if (status.phase === 'completed') {
+        setResidentThreadFocusTarget({
+          expectedHostId: status.expectedHostId,
+          threadId: status.threadId,
+          executionGenerationId: status.executionGenerationId,
+        })
+      } else if (trigger.isConnected) {
+        window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
+      }
     } catch (error) {
       setResidentEndError(error instanceof Error
         ? error.message
         : recoveryEnd
           ? 'The saved End request could not be finished.'
-          : 'The resident session could not be prepared for review.')
-      window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
+          : 'The resident session could not be ended.')
+      if (trigger.isConnected) {
+        window.requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
+      }
     } finally {
       setResidentEndPreparing(false)
     }
@@ -4052,23 +4030,6 @@ export default function App({ api: suppliedApi, surface = 'workbench', initialTh
         onCommitted={residentProvisionCommitted}
       />
 
-      <ResidentEndDialog
-        api={api}
-        context={residentEndContext}
-        triggerRef={residentEndReturnTargetRef}
-        onClose={() => setResidentEndContext(null)}
-        onSettled={(status) => {
-          setResidentLifecycleFeedback(residentLifecycleAnnouncement(status))
-          if (status.phase === 'completed') {
-            setResidentThreadFocusTarget({
-              expectedHostId: status.expectedHostId,
-              threadId: status.threadId,
-              executionGenerationId: status.executionGenerationId,
-            })
-          }
-        }}
-      />
-
       <CommandPaletteDialog
         open={commandPaletteOpen}
         snapshot={snapshot}
@@ -4232,7 +4193,7 @@ function Sidebar({
           <div className="sidebar__registered-resident">
             <small>
               {registeredWorkspaceCreateBlock === 'active_resident'
-                ? 'A resident session already owns this workspace. Open or select that resident thread, then choose End resident session in Session before creating another.'
+                ? 'A resident session already owns this workspace. Open or select that thread, then choose End session in Session before creating another.'
                 : 'An earlier resident setup still holds this workspace. Continue or inspect that setup below before starting another thread.'}
             </small>
           </div>
@@ -5391,7 +5352,7 @@ function Composer({ authorityKey, initialText, handleRef, connection, authorityV
               onClick={(event) => onEndResident(event.currentTarget)}
             >
               <Icon icon={residentEndPreparing ? Loader2 : Square} size={13} />
-              {residentEndPreparing ? 'Preparing…' : 'End session…'}
+              {residentEndPreparing ? 'Ending…' : 'End session'}
             </button>
           </div>
         )}
@@ -5730,6 +5691,19 @@ function PanelHeading({ icon, title, meta }: { icon: LucideIcon; title: string; 
   )
 }
 
+function outcomeCursorIsCurrent(snapshot: WorkbenchSnapshot): boolean {
+  const outcome = snapshot.latestTurnOutcome
+  const current = snapshot.snapshotAuthority?.cursor
+  return Boolean(
+    outcome &&
+    current &&
+    outcome.observedCursor.threadId === current.threadId &&
+    outcome.observedCursor.executionGenerationId === current.executionGenerationId &&
+    outcome.observedCursor.generation === current.generation &&
+    outcome.observedCursor.sequence === current.sequence,
+  )
+}
+
 function outcomeReviewProps(
   snapshot: WorkbenchSnapshot,
   thread: ThreadSummary,
@@ -5737,16 +5711,27 @@ function outcomeReviewProps(
   runtime: RuntimeSummary,
   environment: RendererApi['environment'],
 ): OutcomeReviewProps {
-  const activeGoal = runtime.goals?.find((goal) => goal.state === 'active')
-  const onlyGoal = runtime.goals?.length === 1 ? runtime.goals[0] : undefined
+  const exactOutcome = snapshot.latestTurnOutcome
+  // Goals, children, checks, and usage describe the current projection. They
+  // may only decorate an exact prior outcome while both share the same cursor;
+  // otherwise a later turn could be presented as evidence for an older one.
+  const currentTelemetryMatchesOutcome = !exactOutcome || outcomeCursorIsCurrent(snapshot)
+  const activeGoal = currentTelemetryMatchesOutcome
+    ? runtime.goals?.find((goal) => goal.state === 'active')
+    : undefined
+  const onlyGoal = currentTelemetryMatchesOutcome && runtime.goals?.length === 1
+    ? runtime.goals[0]
+    : undefined
   const terminalGoal = activeGoal || (onlyGoal?.state !== 'complete' && onlyGoal?.state !== 'error')
     ? undefined
     : onlyGoal
   const displayedGoal = activeGoal ?? terminalGoal
-  const exactOutcome = snapshot.latestTurnOutcome
   const terminalAssistant = exactOutcome?.terminalAssistant
-  const changedFileCount = snapshot.gitSummary?.changedFileCount
-    ?? (environment === 'preview' ? project.dirtyFiles : undefined)
+  // Preview fixtures have explicit authored evidence. Native Git/check values
+  // remain unavailable until a cursor-bound collector owns their provenance.
+  const changedFileCount = currentTelemetryMatchesOutcome && environment === 'preview'
+    ? snapshot.gitSummary?.changedFileCount ?? project.dirtyFiles
+    : undefined
   const resultBlock = terminalAssistant
     ? thread.transcript.find((block) => block.id === terminalAssistant.blockId && block.kind === 'assistant')
     : undefined
@@ -5754,6 +5739,7 @@ function outcomeReviewProps(
     ? snapshot.composerReceipt.state
     : undefined
   const hasLiveRuntimeActivity = Boolean(
+    currentTelemetryMatchesOutcome &&
     snapshot.snapshotAuthority?.source !== 'cached'
     && (
       Boolean(activeGoal)
@@ -5769,6 +5755,8 @@ function outcomeReviewProps(
     ),
   )
   const needsReview = Boolean(
+    currentTelemetryMatchesOutcome
+    && (
     thread.status === 'needs_approval'
     || thread.status === 'failed'
     || snapshot.attention.some((item) => item.threadId === thread.id)
@@ -5776,7 +5764,8 @@ function outcomeReviewProps(
     || snapshot.agents.some((agent) => agent.status === 'failed' || agent.status === 'cancelled')
     || promptReceiptState === 'uncertain'
     || promptReceiptState === 'rejected'
-    || promptReceiptState === 'waiting_for_connection',
+    || promptReceiptState === 'waiting_for_connection'
+    ),
   )
   let state: OutcomeReviewProps['state'] = 'unknown'
   if (terminalAssistant?.stopReason === 'error' || terminalAssistant?.stopReason === 'aborted') {
@@ -5797,8 +5786,12 @@ function outcomeReviewProps(
     state,
     ...(displayedGoal?.objective ? { objective: displayedGoal.objective } : {}),
     ...(resultBlock?.body.trim() ? { result: resultBlock.body.trim() } : {}),
-    ...(snapshot.evidence.length > 0 ? { evidence: snapshot.evidence } : {}),
-    ...(runtime.agentsReported === true ? { childAgents: snapshot.agents } : {}),
+    ...(currentTelemetryMatchesOutcome && environment === 'preview' && snapshot.evidence.length > 0
+      ? { evidence: snapshot.evidence }
+      : {}),
+    ...(currentTelemetryMatchesOutcome && runtime.agentsReported === true
+      ? { childAgents: snapshot.agents }
+      : {}),
     ...(changedFileCount !== undefined ? { changedFileCount } : {}),
     ...(displayedGoal?.tokensUsed !== undefined ? { tokensUsed: displayedGoal.tokensUsed } : {}),
     ...(displayedGoal?.timeUsedSeconds !== undefined ? { timeUsedSeconds: displayedGoal.timeUsedSeconds } : {}),
@@ -6084,7 +6077,7 @@ function RuntimePanel({
                 onClick={(event) => onEndResident(event.currentTarget)}
               >
                 <Icon icon={endPreparing ? Loader2 : Square} size={14} />
-                {endPreparing ? 'Preparing…' : 'End resident session…'}
+                {endPreparing ? 'Ending…' : 'End session'}
               </button>
             )}
             {!canEndResident && !endPreparing && (
@@ -6964,7 +6957,7 @@ function CommandPaletteDialog({
     }] : []),
     ...(canEndResident ? [{
       id: 'command:end-resident',
-      label: 'End resident session…',
+      label: 'End session',
       detail: 'Permanently stop this runtime while preserving the saved thread and workspace',
       group: 'Commands' as const,
       icon: AlertCircle,
@@ -8250,289 +8243,6 @@ function ResidentProvisionAttempt({
         </footer>
       </form>
     </NativeDialog>
-  )
-}
-
-function ResidentEndDialog({
-  api,
-  context,
-  triggerRef,
-  onClose,
-  onSettled,
-}: {
-  api: RendererApi
-  context: ResidentEndDialogContext | null
-  triggerRef: RefObject<HTMLElement | null>
-  onClose: () => void
-  onSettled: (status: ResidentLifecycleStatusResult) => void
-}) {
-  const [submitting, setSubmitting] = useState(false)
-  const [settled, setSettled] = useState(false)
-  const [canCheckStatus, setCanCheckStatus] = useState(false)
-  const [checking, setChecking] = useState(false)
-  const [resumeStatus, setResumeStatus] = useState<ResidentLifecycleStatusResult | null>(null)
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
-  const resultRef = useRef<HTMLParagraphElement>(null)
-  const resumeButtonRef = useRef<HTMLButtonElement>(null)
-
-  useEffect(() => {
-    if (!context) return
-    setSubmitting(false)
-    setSettled(false)
-    setCanCheckStatus(false)
-    setChecking(false)
-    setResumeStatus(null)
-    setMessage('')
-    setError('')
-  }, [context])
-
-  useEffect(() => {
-    if (!context || !settled) return
-    window.requestAnimationFrame(() => (resumeStatus ? resumeButtonRef.current : resultRef.current)?.focus())
-  }, [context, resumeStatus, settled])
-
-  const applyEndStatus = (status: ResidentLifecycleStatusResult) => {
-    setSettled(true)
-    onSettled(status)
-    if (status.phase === 'completed') {
-      setResumeStatus(null)
-      setCanCheckStatus(false)
-      setMessage('Agent session ended. Your task, transcript, and workspace are still here.')
-    } else if (status.phase === 'ending') {
-      setResumeStatus(status)
-      setCanCheckStatus(false)
-      setMessage('End saved. Finish to send it.')
-    } else if (status.phase === 'quarantined') {
-      setResumeStatus(null)
-      setCanCheckStatus(false)
-      setMessage('Ending stopped at an uncertain boundary.')
-      setError('Prime Continuim will not send another kill. Copy the recovery diagnostic and inspect the durable host state.')
-    } else {
-      setResumeStatus(null)
-      setCanCheckStatus(true)
-      setMessage('Prime Agent received the End request. Checking completion will not send it again.')
-    }
-  }
-
-  const executeEnd = async (
-    preparation: ResidentEndPreparation,
-    resumeOnce: boolean,
-  ) => {
-    setSettled(false)
-    setResumeStatus(null)
-    setCanCheckStatus(false)
-    setError('')
-    setMessage('Ending session…')
-    setSubmitting(true)
-    try {
-      let status = await api.endResident({
-        confirmationToken: preparation.confirmationToken,
-        consent: true,
-      })
-      if (resumeOnce && status.phase === 'ending') {
-        setMessage('Finishing session…')
-        const resumedPreparation = await api.prepareResidentEnd({
-          expectedHostId: status.expectedHostId,
-          projectId: status.projectId,
-          workspaceId: status.workspaceId,
-          threadId: status.threadId,
-          executionGenerationId: status.executionGenerationId,
-          resumeOperationId: status.operationId,
-        })
-        status = await api.endResident({
-          confirmationToken: resumedPreparation.confirmationToken,
-          consent: true,
-        })
-      }
-      applyEndStatus(status)
-      if (status.phase !== 'ending' && status.phase !== 'quarantined') onClose()
-    } catch (reason) {
-      setSettled(true)
-      setResumeStatus(null)
-      if (isResidentEndSourceCursorChangedError(reason)) {
-        setCanCheckStatus(false)
-        setError(reason instanceof Error
-          ? reason.message
-          : 'Resident state changed after this end review.')
-        setMessage('No End request was admitted. Close this review, refresh the task, and review the action again.')
-      } else {
-        setCanCheckStatus(true)
-        setError(reason instanceof Error
-          ? reason.message
-          : 'The resident End outcome could not be confirmed.')
-        setMessage('Check the saved lifecycle status. Prime Continuim will not send another kill automatically.')
-      }
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!context || submitting || settled) return
-    await executeEnd(context.preparation, true)
-  }
-
-  const finishPendingEnd = async () => {
-    if (!resumeStatus || submitting || checking) return
-    setSettled(false)
-    setResumeStatus(null)
-    setError('')
-    setMessage('Finishing session…')
-    setSubmitting(true)
-    try {
-      const preparation = await api.prepareResidentEnd({
-        expectedHostId: resumeStatus.expectedHostId,
-        projectId: resumeStatus.projectId,
-        workspaceId: resumeStatus.workspaceId,
-        threadId: resumeStatus.threadId,
-        executionGenerationId: resumeStatus.executionGenerationId,
-        resumeOperationId: resumeStatus.operationId,
-      })
-      await executeEnd(preparation, false)
-    } catch (reason) {
-      setSettled(true)
-      setCanCheckStatus(true)
-      setError(reason instanceof Error ? reason.message : 'Unable to continue the saved End request.')
-      setMessage('The saved request was not sent again. Check its status before another action.')
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const checkStatus = async () => {
-    if (!context || checking) return
-    setChecking(true)
-    setError('')
-    setMessage('Checking the durable resident end status…')
-    try {
-      const status = await api.residentLifecycleStatus({
-        expectedHostId: context.preparation.expectedHostId,
-        operationId: context.preparation.operationId,
-      })
-      if (!status) {
-        setCanCheckStatus(false)
-        setMessage('No durable status is available yet. The end outcome remains unknown, so Prime Continuim will not send another kill. Close this review and use Check status from recovery.')
-        return
-      }
-      if (status.kind !== 'end') {
-        setCanCheckStatus(false)
-        setError('The host returned a different lifecycle operation for this end review.')
-        setMessage('No permanent action was retried.')
-      } else {
-        applyEndStatus(status)
-      }
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The durable resident end status is unavailable.')
-      setMessage('Status could not be checked. No permanent action was retried.')
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  return (
-    <NativeDialog
-      open={context !== null}
-      labelledBy="resident-end-title"
-      describedBy="resident-end-description"
-      triggerRef={triggerRef}
-      onClose={onClose}
-      className="sheet--resident-end"
-      dismissible={!submitting}
-    >
-      <form className="sheet__frame" onSubmit={submit} aria-busy={submitting || checking}>
-        <header className="sheet__header">
-          <div className="sheet__title-group">
-            <span className="sheet__title-icon sheet__title-icon--warning"><Icon icon={AlertCircle} size={18} /></span>
-            <div>
-              <h2 id="resident-end-title">
-                End agent session?
-              </h2>
-              <p id="resident-end-description">
-                Stop Prime Agent for “{context?.threadTitle ?? 'this task'}”.
-              </p>
-            </div>
-          </div>
-          <button className="icon-button" type="button" aria-label="Close session review" onClick={onClose} disabled={submitting}>
-            <Icon icon={X} size={17} />
-          </button>
-        </header>
-
-        <div className="sheet__scroll resident-end-dialog__body">
-          <dl className="resident-end-dialog__impact">
-            <div>
-              <dt><Icon icon={Square} size={14} /> Ends</dt>
-              <dd>{`Prime Agent on ${context?.hostName ?? 'this computer'}`}</dd>
-            </div>
-            <div>
-              <dt><Icon icon={Check} size={14} /> Keeps</dt>
-              <dd>Task, transcript, and workspace files</dd>
-            </div>
-          </dl>
-          <div className="resident-end-dialog__distinction" role="note">
-            <Icon icon={Info} size={16} />
-            <span>Closing the app keeps this agent running. If it already stopped, only its saved session is cleared.</span>
-          </div>
-          <p id="resident-end-error" className="form-error" role="alert">{error}</p>
-          <p
-            ref={resultRef}
-            className="form-status"
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            tabIndex={settled ? -1 : undefined}
-          >
-            {message}
-          </p>
-        </div>
-
-        <footer className="sheet__footer">
-          <button
-            className="button button--secondary"
-            type="button"
-            data-dialog-autofocus
-            onClick={onClose}
-            disabled={submitting || checking}
-          >
-            {settled ? 'Close' : 'Cancel'}
-          </button>
-          {settled && canCheckStatus && (
-            <button className="button button--secondary" type="button" onClick={() => void checkStatus()} disabled={checking}>
-              <Icon icon={checking ? Loader2 : RefreshCw} size={14} />
-              {checking ? 'Checking…' : 'Check status'}
-            </button>
-          )}
-          {settled && resumeStatus && (
-            <button
-              ref={resumeButtonRef}
-              className="button button--stop"
-              type="button"
-              onClick={() => void finishPendingEnd()}
-              disabled={submitting || checking}
-            >
-              <Icon icon={Square} size={14} />
-              Finish ending
-            </button>
-          )}
-          {!settled && (
-            <button className="button button--stop" type="submit" aria-label="End agent session" disabled={submitting}>
-              <Icon icon={submitting ? Loader2 : Square} size={14} />
-              {submitting ? 'Ending…' : 'End session'}
-            </button>
-          )}
-        </footer>
-      </form>
-    </NativeDialog>
-  )
-}
-
-function isResidentEndSourceCursorChangedError(reason: unknown): boolean {
-  return (
-    typeof reason === 'object' &&
-    reason !== null &&
-    'code' in reason &&
-    (reason as { code?: unknown }).code === 'host.resident_end_source_cursor_changed'
   )
 }
 

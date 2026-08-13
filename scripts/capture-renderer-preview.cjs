@@ -213,23 +213,6 @@ const targets = [
     expectShortResidentDialog: true,
   },
   {
-    name: 'resident-end-dialog-390',
-    width: 390,
-    height: 844,
-    visualState: 'resident-end-review',
-    expectedText: 'End agent session?',
-    openResidentEndDialog: true,
-  },
-  {
-    name: 'resident-end-dialog-short-320',
-    width: 320,
-    height: 256,
-    visualState: 'resident-end-review',
-    expectedText: 'End agent session?',
-    openResidentEndDialog: true,
-    expectShortResidentEndDialog: true,
-  },
-  {
     name: 'resident-recovery-320',
     width: 320,
     height: 704,
@@ -755,38 +738,6 @@ async function capture(target, rendererOrigin) {
       // 180ms sheet transition and the following compositor frame.
       await delay(300)
     }
-    if (target.openResidentEndDialog) {
-      browserWindow.setPosition(-10_000, -10_000, false)
-      browserWindow.showInactive()
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const runtimeTab = [...document.querySelectorAll('[role="tab"]')]
-          .find((candidate) => candidate.textContent?.trim() === 'Session')
-        if (!(runtimeTab instanceof HTMLButtonElement)) throw new Error('Runtime inspector tab was not found')
-        runtimeTab.click()
-      })()`)
-      const actionDeadline = Date.now() + 10_000
-      while (Date.now() < actionDeadline) {
-        const actionReady = await browserWindow.webContents.executeJavaScript(
-          `Boolean(document.querySelector('button.resident-end-trigger:not([disabled])'))`,
-        )
-        if (actionReady) break
-        await delay(25)
-      }
-      await browserWindow.webContents.executeJavaScript(`(() => {
-        const button = document.querySelector('button.resident-end-trigger:not([disabled])')
-        if (!(button instanceof HTMLButtonElement)) throw new Error('Resident end action was not found')
-        button.click()
-      })()`)
-      const dialogDeadline = Date.now() + 10_000
-      while (Date.now() < dialogDeadline) {
-        const open = await browserWindow.webContents.executeJavaScript(
-          `Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]'))`,
-        )
-        if (open) break
-        await delay(25)
-      }
-      await delay(300)
-    }
     if (target.openCandidateEvaluationDialog) {
       browserWindow.setPosition(-10_000, -10_000, false)
       browserWindow.showInactive()
@@ -912,12 +863,6 @@ async function capture(target, rendererOrigin) {
         rect.top >= Math.max(0, containerRect.top) &&
         rect.bottom <= Math.min(window.innerHeight, containerRect.bottom)
       )
-      const residentEndDialog = document.querySelector('dialog[aria-labelledby="resident-end-title"]')
-      const residentEndDialogScroll = residentEndDialog?.querySelector('.sheet__scroll')
-      const residentEndDialogScrollStyle = residentEndDialogScroll ? window.getComputedStyle(residentEndDialogScroll) : undefined
-      const residentEndDialogFooterRect = residentEndDialog?.querySelector('.sheet__footer')?.getBoundingClientRect()
-      const residentEndImpactRect = residentEndDialog?.querySelector('.resident-end-dialog__impact')?.getBoundingClientRect()
-      const residentEndDistinctionRect = residentEndDialog?.querySelector('.resident-end-dialog__distinction')?.getBoundingClientRect()
       const candidateEvaluationDialog = document.querySelector('dialog[aria-labelledby="candidate-evaluation-dialog-title"]')
       const candidateEvaluationDialogScroll = candidateEvaluationDialog?.querySelector('.sheet__scroll')
       const candidateEvaluationDialogScrollStyle = candidateEvaluationDialogScroll ? window.getComputedStyle(candidateEvaluationDialogScroll) : undefined
@@ -1024,29 +969,6 @@ async function capture(target, rendererOrigin) {
           residentDialogFooterRect &&
           residentDialogFooterRect.height > 0 &&
           residentDialogFooterRect.bottom <= window.innerHeight
-        ),
-        residentEndDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="resident-end-title"]')),
-        residentEndDialogScrollTop: residentEndDialogScroll?.scrollTop,
-        residentEndDialogScrollHeight: residentEndDialogScroll?.scrollHeight,
-        residentEndDialogScrollClientHeight: residentEndDialogScroll?.clientHeight,
-        residentEndImpactRect: residentEndImpactRect ? {
-          top: residentEndImpactRect.top,
-          bottom: residentEndImpactRect.bottom,
-          height: residentEndImpactRect.height,
-        } : undefined,
-        residentEndDistinctionRect: residentEndDistinctionRect ? {
-          top: residentEndDistinctionRect.top,
-          bottom: residentEndDistinctionRect.bottom,
-          height: residentEndDistinctionRect.height,
-        } : undefined,
-        residentEndDialogContentReachable: Boolean(
-          residentEndDialogScroll &&
-          residentEndDialogScrollStyle &&
-          (residentEndDialogScrollStyle.overflowY === 'auto' || residentEndDialogScrollStyle.overflowY === 'scroll') &&
-          residentEndDialogScroll.clientHeight >= 48 &&
-          residentEndDialogFooterRect &&
-          residentEndDialogFooterRect.height > 0 &&
-          residentEndDialogFooterRect.bottom <= window.innerHeight
         ),
         candidateEvaluationDialogOpen: Boolean(document.querySelector('dialog[open][aria-labelledby="candidate-evaluation-dialog-title"]')),
         candidateEvaluationDialogContentReachable: Boolean(
@@ -1185,12 +1107,6 @@ async function capture(target, rendererOrigin) {
     }
     if (target.expectShortResidentDialog) {
       invariant(stateEvidence.residentDialogContentReachable, `${target.name} did not keep the resident form and actions reachable`)
-    }
-    if (target.openResidentEndDialog) {
-      invariant(stateEvidence.residentEndDialogOpen, `${target.name} did not open the resident end review`)
-    }
-    if (target.expectShortResidentEndDialog) {
-      invariant(stateEvidence.residentEndDialogContentReachable, `${target.name} did not keep the resident end review and actions reachable`)
     }
     if (target.openCandidateEvaluationDialog) {
       invariant(stateEvidence.candidateEvaluationDialogOpen, `${target.name} did not open the candidate evaluation review`)

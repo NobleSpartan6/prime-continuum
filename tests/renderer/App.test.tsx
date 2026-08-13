@@ -1268,7 +1268,7 @@ describe('Prime Continuim renderer', () => {
     expect(harness.api.hudReturnToWorkbench).toHaveBeenCalledOnce()
   })
 
-  it('requires one confirmation, then dismisses the sheet once End is admitted', async () => {
+  it('ends a live resident session with one explicit action', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
     const endResult = deferred<ReturnType<typeof residentEndStatus>>()
@@ -1276,25 +1276,18 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('tab', { name: 'Session' }))
-    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus())
-    expect(within(dialog).getByText(/Closing the app keeps this agent running/)).toBeVisible()
-
-    expect(within(dialog).getByText('Task, transcript, and workspace files')).toBeVisible()
-    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
+    const end = screen.getByRole('button', { name: 'End session' })
+    await user.click(end)
+    expect(api.prepareResidentEnd).toHaveBeenCalledTimes(1)
     expect(api.endResident).toHaveBeenCalledTimes(1)
-    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled()
-    fireEvent.keyDown(dialog, { key: 'Escape' })
-    expect(dialog).toBeVisible()
-
+    expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
     endResult.resolve(residentEndStatus('kill_dispatching'))
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Ending…' })).not.toBeInTheDocument())
     expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
     expect(api.endResident).toHaveBeenCalledTimes(1)
   })
 
-  it('carries one confirmed End through one safe pre-effect resume', async () => {
+  it('carries one-click End through one safe pre-effect resume', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
     api.endResident = vi.fn()
@@ -1303,12 +1296,9 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('tab', { name: 'Session' }))
-    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
+    await user.click(screen.getByRole('button', { name: 'End session' }))
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
-    expect(api.prepareResidentEnd).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(api.prepareResidentEnd).toHaveBeenCalledTimes(2))
     expect(api.prepareResidentEnd).toHaveBeenLastCalledWith(expect.objectContaining({
       resumeOperationId: 'resident-end-operation-one',
       expectedHostId: 'host-local',
@@ -1356,36 +1346,33 @@ describe('Prime Continuim renderer', () => {
     expect(screen.getByText(/saved thread stays in this project/i)).toBeVisible()
     expect(screen.queryByText('Ready to send')).not.toBeInTheDocument()
 
-    const recover = screen.getByRole('button', { name: 'End session…' })
+    const recover = screen.getByRole('button', { name: 'End session' })
+    api.endResident = vi.fn(async () => residentEndStatus('kill_dispatching'))
     expect(recover).toBeEnabled()
     recover.focus()
     await user.keyboard('{Enter}')
 
     expect(api.prepareResidentEnd).toHaveBeenCalledOnce()
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    expect(dialog).toBeVisible()
-    expect(within(dialog).getByText(/If it already stopped, only its saved session is cleared/)).toBeVisible()
-    expect(within(dialog).queryByText(/no Stop is sent/i)).not.toBeInTheDocument()
+    expect(api.endResident).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
   })
 
   it('dismisses an admitted End without inviting another kill', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
+    api.endResident = vi.fn(async () => residentEndStatus('kill_dispatching'))
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('tab', { name: 'Session' }))
-    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    api.endResident = vi.fn(async () => residentEndStatus('kill_dispatching'))
-    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
+    await user.click(screen.getByRole('button', { name: 'End session' }))
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument())
+    await waitFor(() => expect(api.endResident).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
     expect(api.endResident).toHaveBeenCalledTimes(1)
     expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
   })
 
-  it('allows a fresh review only after the exact stale-cursor rejection', async () => {
+  it('surfaces an exact stale-cursor rejection without opening a second confirmation', async () => {
     const user = userEvent.setup()
     const api = createResidentEndApi()
     const staleConsent = Object.assign(
@@ -1396,13 +1383,10 @@ describe('Prime Continuim renderer', () => {
     render(<App api={api} />)
 
     await user.click(await screen.findByRole('tab', { name: 'Session' }))
-    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
+    await user.click(screen.getByRole('button', { name: 'End session' }))
 
-    expect(await within(dialog).findByText(/No End request was admitted/i)).toBeVisible()
-    expect(within(dialog).getByText(/refresh the task.*review the action again/i)).toBeVisible()
-    expect(within(dialog).queryByRole('button', { name: 'Check status' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Resident state changed after end consent was reviewed/i)
+    expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
     expect(api.endResident).toHaveBeenCalledTimes(1)
     expect(api.residentLifecycleStatus).not.toHaveBeenCalled()
   })
@@ -1798,12 +1782,12 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-    expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
+    expect(screen.getByText(/open or select that thread.*End session in Session/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
 
     await user.click(screen.getByRole('tab', { name: 'Session' }))
-    expect(screen.getByRole('button', { name: 'End resident session…' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
 
   it('keeps status available while a committed sibling resident suppresses create in the same saved workspace', async () => {
@@ -1814,7 +1798,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-    expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
+    expect(screen.getByText(/open or select that thread.*End session in Session/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
@@ -1873,7 +1857,7 @@ describe('Prime Continuim renderer', () => {
       render(<App api={harness.api} />)
 
       expect(await screen.findByText(/resident session already owns this workspace/i)).toBeVisible()
-      expect(screen.getByText(/open or select that resident thread.*End resident session in Session/i)).toBeVisible()
+      expect(screen.getByText(/open or select that thread.*End session in Session/i)).toBeVisible()
       expect(screen.queryByText(/earlier resident setup still holds this workspace/i)).not.toBeInTheDocument()
       expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     },
@@ -1953,7 +1937,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     const card = await screen.findByRole('region', { name: 'End saved' })
-    expect(within(card).getByText(/open or select the resident thread.*End resident session in Session/i)).toBeVisible()
+    expect(within(card).getByText(/open or select the resident thread.*End session in Session/i)).toBeVisible()
     expect(within(card).queryByRole('button', { name: 'Finish ending' })).not.toBeInTheDocument()
     expect(within(card).getByRole('button', { name: 'Check status' })).toBeEnabled()
     expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
@@ -1977,7 +1961,7 @@ describe('Prime Continuim renderer', () => {
     render(<App api={harness.api} />)
 
     await user.click(await screen.findByRole('tab', { name: 'Session' }))
-    await user.click(screen.getByRole('button', { name: 'End resident session…' }))
+    await user.click(screen.getByRole('button', { name: 'End session' }))
     expect(harness.api.prepareResidentEnd).toHaveBeenCalledWith({
       expectedHostId: 'host-devbox',
       projectId: 'project-prime',
@@ -1985,13 +1969,11 @@ describe('Prime Continuim renderer', () => {
       threadId: 'thread-seamless',
       executionGenerationId: 'generation-prime-ssh',
     })
-    const dialog = await screen.findByRole('dialog', { name: 'End agent session?' })
-    await user.click(within(dialog).getByRole('button', { name: 'End agent session' }))
-    expect(harness.api.endResident).toHaveBeenCalledWith({
-      confirmationToken: 'registered-end-confirmation-one',
-      consent: true,
-    })
     await waitFor(() => {
+      expect(harness.api.endResident).toHaveBeenCalledWith({
+        confirmationToken: 'registered-end-confirmation-one',
+        consent: true,
+      })
       expect(harness.api.prepareResidentEnd).toHaveBeenLastCalledWith({
         expectedHostId: 'host-devbox',
         projectId: 'project-prime',
@@ -2001,8 +1983,8 @@ describe('Prime Continuim renderer', () => {
         resumeOperationId: 'registered-end-operation-one',
       })
       expect(harness.api.endResident).toHaveBeenCalledTimes(2)
-      expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
     })
+    expect(screen.queryByRole('dialog', { name: 'End agent session?' })).not.toBeInTheDocument()
   })
 
   it('closes a saved-workspace authorization when the selected source generation changes', async () => {
@@ -2035,7 +2017,7 @@ describe('Prime Continuim renderer', () => {
     await screen.findByRole('heading', { name: 'Seamless remote experience' })
     expect(screen.queryByRole('button', { name: 'New resident thread in this workspace' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('tab', { name: 'Session' }))
-    expect(screen.queryByRole('button', { name: 'End resident session…' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument()
     expect(harness.api.selectResidentWorkspace).not.toHaveBeenCalled()
     expect(harness.api.prepareResidentEnd).not.toHaveBeenCalled()
   })
@@ -2311,7 +2293,7 @@ describe('Prime Continuim renderer', () => {
 
     const fallback = await screen.findByRole('region', { name: 'Setup paused safely' })
     expect(within(fallback).getByText(/another resident session owns this workspace/i)).toBeVisible()
-    expect(within(fallback).getByText(/open or select the resident thread.*End resident session in Session/i)).toBeVisible()
+    expect(within(fallback).getByText(/open or select that thread.*End session in Session/i)).toBeVisible()
     expect(fallback).not.toHaveTextContent(/lifecycle control is unavailable/i)
     expect(within(fallback).queryByRole('button', { name: 'Use saved workspace' })).not.toBeInTheDocument()
     expect(within(fallback).getByRole('button', { name: 'Check status' })).toBeEnabled()
@@ -5289,6 +5271,81 @@ describe('Prime Continuim renderer', () => {
     expect(review.getByText('Last reported · Ready to review')).toBeVisible()
     expect(review.getByText(terminalBlock.body)).toBeVisible()
     expect(review.getByText('4')).toBeVisible()
+    expect(review.queryByText('Complete')).not.toBeInTheDocument()
+  })
+
+  it('does not attach a newer projection’s goals, branches, usage, or fixture proof to an older turn', async () => {
+    const user = userEvent.setup()
+    const api: RendererApi = createPreviewRendererApi()
+    const snapshot = structuredClone(previewSnapshot)
+    const thread = snapshot.threads.find((candidate) => candidate.id === snapshot.selectedThreadId)!
+    const terminalBlock = thread.transcript.find((block) => block.id === 'block-5')!
+    thread.status = 'idle'
+    snapshot.runtime.session = {
+      ...snapshot.runtime.session!,
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      queuedActionCount: 0,
+      activeToolNames: [],
+    }
+    snapshot.runtime.goals = [{
+      id: 'newer-goal',
+      objective: 'A later task that must not decorate the reviewed turn',
+      state: 'complete',
+      tokensUsed: 42_000,
+      timeUsedSeconds: 90,
+    }]
+    snapshot.agents = [{
+      id: 'newer-child',
+      name: 'Later branch',
+      role: 'Unrelated later work',
+      status: 'complete',
+      hostName: 'This computer',
+      answerPreview: 'This belongs to a later projection.',
+    }]
+    snapshot.runtime.agentsReported = true
+    snapshot.latestTurnOutcome = {
+      outcomeVersion: 1,
+      commandId: 'command-review-older',
+      receiptId: 'receipt-review-older',
+      observedAt: '2026-08-07T13:49:00.000Z',
+      observedCursor: {
+        threadId: thread.id,
+        executionGenerationId: 'generation-review-one',
+        generation: 'generation-review-one',
+        sequence: 5,
+      },
+      terminalAssistant: { blockId: terminalBlock.id, stopReason: 'stop' },
+    }
+    snapshot.snapshotAuthority = {
+      source: 'live',
+      generatedAt: '2026-08-07T13:50:00.000Z',
+      cursor: {
+        ...snapshot.latestTurnOutcome.observedCursor,
+        sequence: 6,
+      },
+    }
+    snapshot.gitSummary = {
+      stagedFiles: 1,
+      unstagedFiles: 2,
+      untrackedFiles: 1,
+      changedFileCount: 4,
+      knownDetail: false,
+    }
+    api.loadWorkbench = vi.fn(async () => structuredClone(snapshot))
+    api.subscribe = vi.fn(() => () => undefined)
+
+    render(<App api={api} />)
+    await screen.findByRole('heading', { name: 'Seamless remote experience' })
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }))
+
+    const review = within(screen.getByRole('tabpanel', { name: 'Review' }))
+    expect(review.getByText('Ready to review')).toBeVisible()
+    expect(review.getByText(terminalBlock.body)).toBeVisible()
+    expect(review.getAllByText('—')).toHaveLength(4)
+    expect(review.queryByText('A later task that must not decorate the reviewed turn')).not.toBeInTheDocument()
+    expect(review.queryByText('This belongs to a later projection.')).not.toBeInTheDocument()
     expect(review.queryByText('Complete')).not.toBeInTheDocument()
   })
 

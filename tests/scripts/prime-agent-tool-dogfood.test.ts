@@ -620,7 +620,7 @@ describe('explicit Sol/RLM/browser dogfood contract', () => {
     expect(daemonCleanup).toContain('terminatedIdentityCount')
     expect(daemonCleanup).toContain('retiredProcessGroupCount')
     expect(daemonCleanup).not.toContain('shutdownDaemonAndWait')
-    expect(source).toContain('End resident session…')
+    expect(source).toContain('choose End session once')
     expect(source).toContain('Quit the isolated Prime Continuim app now (Cmd+Q)')
     expect(source).not.toContain('shutdown --force')
     expect(daemonCleanup).not.toContain('force: true')
